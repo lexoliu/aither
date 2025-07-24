@@ -59,7 +59,8 @@ use schemars::Schema;
 ///     .max_tokens(1000)
 ///     .seed(42);
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Parameters {
     /// Sampling temperature.
     ///
@@ -193,6 +194,7 @@ impl_with_methods! {
 ///     .with_ability(Ability::Vision);
 /// ```
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct Profile {
     /// The name of the model.
@@ -230,6 +232,7 @@ pub struct Profile {
 /// pricing.web_search = 0.005; // $0.005 per search
 /// ```
 #[derive(Debug, Clone, PartialEq, PartialOrd, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct Pricing {
     /// Price per prompt token.
@@ -413,6 +416,7 @@ impl Profile {
 /// let has_vision = abilities.contains(&Ability::Vision);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Ability {
     /// The model can use external tools/functions.
     ToolUse,

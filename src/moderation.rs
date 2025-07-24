@@ -18,7 +18,8 @@ pub trait Moderation {
 }
 
 /// The result of a moderation operation.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ModerationResult {
     /// Indicates whether the content was flagged.
     flagged: bool,
@@ -68,7 +69,8 @@ impl ModerationResult {
 }
 
 /// Categories of content moderation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ModerationCategory {
     /// Hate category with a confidence score.
     Hate {

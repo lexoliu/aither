@@ -274,7 +274,8 @@ impl Debug for Tools {
 /// Tool definition including schema for language models.
 ///
 /// Used to provide language models with information about available [`Tool`]s.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ToolDefinition {
     /// Tool name.
     pub name: &'static str,

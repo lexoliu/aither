@@ -65,7 +65,8 @@ use url::Url;
 /// Defines the role of a message sender in a conversation.
 /// Each role has specific semantics and is typically handled differently
 /// by AI language models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Role {
     /// User message.
     ///
@@ -105,7 +106,8 @@ pub enum Role {
 /// let msg_with_attachment = Message::user("Check out this image")
 ///     .with_attachment("https://example.com/image.jpg");
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Message {
     attachments: Vec<Url>,
     annotation: Vec<Annotation>,
@@ -156,7 +158,8 @@ impl Message {
 /// * `content` - Description or summary of the URL content  
 /// * `start` - Start character index of the URL in the message content
 /// * `end` - End character index of the URL in the message content
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UrlAnnotation {
     /// The annotated URL.
     pub url: Url,
@@ -225,7 +228,8 @@ impl UrlAnnotation {
 /// # Variants
 ///
 /// * `Url` - Annotation for a URL mentioned in the message content
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Annotation {
     /// URL annotation. See [`UrlAnnotation`].
     Url(UrlAnnotation),

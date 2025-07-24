@@ -5,7 +5,6 @@ use crate::{
     llm::{Message, Tool, model::Parameters, tool::Tools, try_collect},
 };
 
-#[derive(Debug)]
 /// A struct representing an Assistant that interacts with a language model (LLM),
 /// manages a collection of messages, and provides access to various tools.
 ///
@@ -20,6 +19,7 @@ use crate::{
 ///   various tasks.
 /// - `llm`: The language model instance used by the Assistant for generating
 ///   responses or performing language-related tasks.
+#[derive(Debug)]
 pub struct Assistant<LLM: LanguageModel> {
     messages: Vec<Message>,
     tools: Tools,

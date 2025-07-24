@@ -76,7 +76,8 @@ macro_rules! impl_image_generator {
 impl_image_generator!(Arc, Box);
 
 /// Represents a prompt for image generation, including text and optional images.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Prompt {
     /// The text description for the image generation.
     text: String,
@@ -141,7 +142,8 @@ impl From<&str> for Prompt {
 }
 
 /// Represents the size (width and height) of an image.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Size {
     /// The width of the image in pixels.
     width: u32,
