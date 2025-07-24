@@ -267,7 +267,8 @@ pub mod assistant;
 pub mod message;
 /// Model profiles and capabilities.
 pub mod model;
-mod provider;
+/// Provider module for managing language model providers and their configurations.
+pub mod provider;
 /// Tool system for function calling.
 pub mod tool;
 use crate::llm::{model::Parameters, tool::Tools};
@@ -335,7 +336,7 @@ pub trait LanguageModel: Sized + Send + Sync + 'static {
     /// Returns model profile and capabilities.
     ///
     /// See [`Profile`] for details on model metadata.
-    fn profile(&self) -> Profile;
+    fn profile(&self) -> impl Future<Output = Profile> + Send;
 }
 
 macro_rules! impl_language_model {
@@ -383,7 +384,7 @@ macro_rules! impl_language_model {
                     T::categorize(self, text)
                 }
 
-                fn profile(&self) -> Profile {
+                fn profile(&self) -> impl Future<Output = Profile> + Send {
                     T::profile(self)
                 }
             }

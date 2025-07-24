@@ -40,8 +40,7 @@
 //! ```
 
 use alloc::{string::String, vec::Vec};
-
-use crate::llm::tool::Tools;
+use schemars::Schema;
 
 /// Parameters for configuring the behavior of a language model.
 ///
@@ -120,14 +119,20 @@ pub struct Parameters {
     ///
     /// Generation stops when any of these strings are encountered.
     pub stop: Option<Vec<String>>,
-    /// Tools available to the model.
-    ///
-    /// Defines what external functions the model can call.
-    pub tools: Tools,
     /// Tool choices available to the model.
     ///
     /// Specifies which tools the model is allowed to use.
     pub tool_choice: Option<Vec<String>>,
+
+    /// Whether to enable structured outputs.
+    ///
+    /// When true, the model will attempt to return outputs in a structured format (e.g., JSON).
+    pub structured_outputs: bool,
+
+    /// The expected response format schema.
+    ///
+    /// When set, the model will attempt to return outputs matching this schema.
+    pub response_format: Option<Schema>,
 }
 
 macro_rules! impl_with_methods {
@@ -192,6 +197,10 @@ impl_with_methods! {
 pub struct Profile {
     /// The name of the model.
     pub name: String,
+    /// The author of the model.
+    pub author: String,
+    /// The slug of the model.
+    pub slug: String,
     /// A description of the model.
     pub description: String,
     /// The abilities supported by the model.
@@ -306,11 +315,15 @@ impl Profile {
     /// ```
     pub fn new(
         name: impl Into<String>,
+        author: impl Into<String>,
+        slug: impl Into<String>,
         description: impl Into<String>,
         context_length: u32,
     ) -> Self {
         Self {
             name: name.into(),
+            author: author.into(),
+            slug: slug.into(),
             description: description.into(),
             abilities: Vec::new(),
             context_length,
@@ -417,7 +430,7 @@ mod tests {
 
     #[test]
     fn profile_creation() {
-        let profile = Profile::new("test-model", "A test model", 4096);
+        let profile = Profile::new("Test model", "test", "test-model", "A test model", 4096);
 
         assert_eq!(profile.name, "test-model");
         assert_eq!(profile.description, "A test model");
@@ -428,8 +441,14 @@ mod tests {
 
     #[test]
     fn profile_with_single_ability() {
-        let profile =
-            Profile::new("vision-model", "A vision model", 8192).with_ability(Ability::Vision);
+        let profile = Profile::new(
+            "Test vision model",
+            "test",
+            "vision-model",
+            "A vision model",
+            8192,
+        )
+        .with_ability(Ability::Vision);
 
         assert_eq!(profile.abilities.len(), 1);
         assert_eq!(profile.abilities[0], Ability::Vision);
@@ -438,8 +457,14 @@ mod tests {
     #[test]
     fn profile_with_multiple_abilities() {
         let abilities = [Ability::ToolUse, Ability::Vision, Ability::Audio];
-        let profile =
-            Profile::new("multimodal-model", "A multimodal model", 16384).with_abilities(abilities);
+        let profile = Profile::new(
+            "Test",
+            "test",
+            "multimodal-model",
+            "A multimodal model",
+            16384,
+        )
+        .with_abilities(abilities);
 
         assert_eq!(profile.abilities.len(), 3);
         assert_eq!(profile.abilities, abilities);
@@ -459,7 +484,14 @@ mod tests {
             input_cache_write: 0.0001,
         };
 
-        let profile = Profile::new("paid-model", "A paid model", 2048).with_pricing(pricing);
+        let profile = Profile::new(
+            "Test paid model",
+            "test",
+            "paid-model",
+            "A paid model",
+            2048,
+        )
+        .with_pricing(pricing);
 
         assert!(profile.pricing.is_some());
         let profile_pricing = profile.pricing.unwrap();
@@ -486,7 +518,7 @@ mod tests {
             input_cache_write: 0.001,
         };
 
-        let profile = Profile::new("full-model", "A full-featured model", 32768)
+        let profile = Profile::new("Test", "test", "full-model", "A full-featured model", 32768)
             .with_ability(Ability::ToolUse)
             .with_ability(Ability::Vision)
             .with_abilities([Ability::Audio, Ability::WebSearch])
@@ -523,7 +555,7 @@ mod tests {
 
     #[test]
     fn profile_debug() {
-        let profile = Profile::new("debug-model", "A debug model", 1024);
+        let profile = Profile::new("Test model", "test", "debug-model", "A debug model", 1024);
         let debug_str = alloc::format!("{profile:?}");
         assert!(debug_str.contains("debug-model"));
         assert!(debug_str.contains("A debug model"));
@@ -532,8 +564,8 @@ mod tests {
 
     #[test]
     fn profile_clone() {
-        let original =
-            Profile::new("original", "Original model", 2048).with_ability(Ability::Vision);
+        let original = Profile::new("Test model", "test", "original", "Original model", 2048)
+            .with_ability(Ability::Vision);
         let cloned = original.clone();
 
         assert_eq!(original.name, cloned.name);
