@@ -10,10 +10,8 @@ impl ChatCompletionChunk {
     pub(crate) fn into_text(self) -> Option<String> {
         let mut buffer = String::new();
         for choice in self.choices {
-            if let Some(parts) = choice.delta.content {
-                for part in parts {
-                    buffer.push_str(&part.into_text());
-                }
+            if let Some(content) = choice.delta.content {
+                buffer.push_str(&content.into_text());
             }
         }
         if buffer.is_empty() {
@@ -32,7 +30,23 @@ struct ChunkChoice {
 #[derive(Debug, Deserialize, Default)]
 struct DeltaMessage {
     #[serde(default)]
-    content: Option<Vec<DeltaContent>>,
+    content: Option<MessageContent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Blocks(Vec<DeltaContent>),
+    Text(String),
+}
+
+impl MessageContent {
+    fn into_text(self) -> String {
+        match self {
+            Self::Blocks(parts) => parts.into_iter().map(|part| part.into_text()).collect(),
+            Self::Text(text) => text,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

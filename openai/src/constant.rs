@@ -1,7 +1,15 @@
-//! `OpenAI` model constants
+//! Model & endpoint constants
 //!
-//! These constants only cover **stable, recommended, non-snapshot** model names.
+//! These constants only cover **stable, recommended, non-snapshot** model names
+//! plus well-known OpenAI-compatible API base URLs.
 //! Users can always pass custom strings for newer snapshot models.
+
+/// Default `OpenAI` API base URL (chat, embeddings, etc.).
+pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// [`Deepseek`](https://api-docs.deepseek.com)'s OpenAI-compatible base URL.
+pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
+/// [`OpenRouter`](https://openrouter.ai)'s OpenAI-compatible base URL.
+pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 // ============================================================
 // 1. GPT-5 FAMILY (Latest, reasoning-enhanced large models)

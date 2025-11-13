@@ -1,4 +1,6 @@
-use crate::{DEFAULT_BASE_URL, client::OpenAI, error::OpenAIError};
+use crate::{
+    DEEPSEEK_BASE_URL, DEFAULT_BASE_URL, OPENROUTER_BASE_URL, client::OpenAI, error::OpenAIError,
+};
 use aither_core::llm::{
     LanguageModelProvider, model::Profile as ModelProfile, provider::Profile as ProviderProfile,
 };
@@ -22,6 +24,18 @@ impl OpenAIProvider {
                 organization: None,
             }),
         }
+    }
+
+    /// Convenience constructor targeting [`Deepseek`](https://api-docs.deepseek.com)'s API.
+    #[must_use]
+    pub fn deepseek(api_key: impl Into<String>) -> Self {
+        Self::new(api_key).base_url(DEEPSEEK_BASE_URL)
+    }
+
+    /// Convenience constructor targeting [`OpenRouter`](https://openrouter.ai)'s API.
+    #[must_use]
+    pub fn openrouter(api_key: impl Into<String>) -> Self {
+        Self::new(api_key).base_url(OPENROUTER_BASE_URL)
     }
 
     /// Override the REST base URL (useful for Azure or sandboxes).

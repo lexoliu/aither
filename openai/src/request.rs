@@ -215,9 +215,9 @@ pub fn convert_tools(definitions: Vec<ToolDefinition>) -> Option<Vec<ToolPayload
             .map(|tool| ToolPayload {
                 r#type: "function",
                 function: ToolFunction {
-                    name: tool.name.to_string(),
-                    description: tool.description.to_string(),
-                    parameters: schema_to_value(&tool.arguments),
+                    name: tool.name().to_string(),
+                    description: tool.description().to_string(),
+                    parameters: schema_to_value(tool.arguments_schema()),
                 },
             })
             .collect(),

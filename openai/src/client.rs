@@ -1,7 +1,7 @@
 use crate::{
-    DEFAULT_AUDIO_FORMAT, DEFAULT_AUDIO_MODEL, DEFAULT_AUDIO_VOICE, DEFAULT_BASE_URL,
-    DEFAULT_EMBEDDING_DIM, DEFAULT_EMBEDDING_MODEL, DEFAULT_IMAGE_MODEL, DEFAULT_MODEL,
-    DEFAULT_MODERATION_MODEL, DEFAULT_TRANSCRIPTION_MODEL,
+    DEEPSEEK_BASE_URL, DEFAULT_AUDIO_FORMAT, DEFAULT_AUDIO_MODEL, DEFAULT_AUDIO_VOICE,
+    DEFAULT_BASE_URL, DEFAULT_EMBEDDING_DIM, DEFAULT_EMBEDDING_MODEL, DEFAULT_IMAGE_MODEL,
+    DEFAULT_MODEL, DEFAULT_MODERATION_MODEL, DEFAULT_TRANSCRIPTION_MODEL, OPENROUTER_BASE_URL,
     error::OpenAIError,
     request::{ChatCompletionRequest, ParameterSnapshot, convert_tools, to_chat_messages},
     response::{ChatCompletionChunk, should_skip_event},
@@ -30,6 +30,16 @@ impl OpenAI {
     /// Create a new client using the provided API key and default model.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::builder(api_key).build()
+    }
+
+    /// Create a client configured for [`Deepseek`](https://api-docs.deepseek.com)'s OpenAI-compatible endpoint.
+    pub fn deepseek(api_key: impl Into<String>) -> Self {
+        Self::builder(api_key).base_url(DEEPSEEK_BASE_URL).build()
+    }
+
+    /// Create a client configured for [`OpenRouter`](https://openrouter.ai)'s OpenAI-compatible endpoint.
+    pub fn openrouter(api_key: impl Into<String>) -> Self {
+        Self::builder(api_key).base_url(OPENROUTER_BASE_URL).build()
     }
 
     /// Start building an [`OpenAI`] client with custom configuration.
