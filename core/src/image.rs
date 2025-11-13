@@ -28,7 +28,7 @@ pub trait ImageGenerator {
         &self,
         prompt: Prompt,
         size: Size,
-    ) -> impl Stream<Item = Result<Data, Self::Error>> + Unpin + Send;
+    ) -> impl Stream<Item = Result<Data, Self::Error>> + Send;
 
     /// Edit an image using a prompt and a mask.
     ///
@@ -44,7 +44,7 @@ pub trait ImageGenerator {
         &self,
         prompt: Prompt,
         mask: &[u8],
-    ) -> impl Stream<Item = Result<Data, Self::Error>> + Unpin + Send;
+    ) -> impl Stream<Item = Result<Data, Self::Error>> + Send;
 }
 
 macro_rules! impl_image_generator {
@@ -57,7 +57,7 @@ macro_rules! impl_image_generator {
                     &self,
                     prompt: Prompt,
                     size: Size,
-                ) -> impl Stream<Item = Result<Data, Self::Error>> + Unpin + Send {
+                ) -> impl Stream<Item = Result<Data, Self::Error>> + Send {
                     T::create(self, prompt, size)
                 }
 
@@ -65,7 +65,7 @@ macro_rules! impl_image_generator {
                     &self,
                     prompt: Prompt,
                     mask: &[u8],
-                ) -> impl Stream<Item = Result<Data, Self::Error>> + Unpin + Send {
+                ) -> impl Stream<Item = Result<Data, Self::Error>> + Send {
                     T::edit(self, prompt, mask)
                 }
             }

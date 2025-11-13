@@ -6,7 +6,6 @@
 //! ## Core Components
 //!
 //! - **[`LanguageModel`]** - The main trait for text generation and conversation
-//! - **[`TextStream`]** - Unified streaming interface for text responses with dual Stream/Future support
 //! - **[`Request`]** - Encapsulates messages, tools, and parameters for model calls
 //! - **[`Message`]** - Represents individual messages in a conversation
 //! - **[`Tool`]** - Function calling interface for extending model capabilities
@@ -131,69 +130,6 @@
 //! );
 //! ```
 //!
-//! ## Advanced Features
-//!
-//! ### Working with Text Streams
-//!
-//! The [`TextStream`] trait provides a unified interface for handling streaming text responses.
-//! It implements both `Stream<Item = Result<String, Error>>` for chunk-by-chunk processing
-//! and `IntoFuture<Output = Result<String, Error>>` for collecting complete responses.
-//!
-//! ```rust
-//! use aither::llm::{LanguageModel, TextStream, Request, Message};
-//! use futures_lite::StreamExt;
-//!
-//! // Process text as it streams in (useful for real-time display)
-//! async fn stream_chat_response(model: impl LanguageModel) -> aither::Result {
-//!     let request = Request::new([Message::user("Tell me a story about robots")]);
-//!     let mut stream = model.respond(request);
-//!     
-//!     let mut complete_story = String::new();
-//!     while let Some(chunk) = stream.next().await {
-//!         let text = chunk?;
-//!         print!("{}", text); // Display each chunk as it arrives
-//!         complete_story.push_str(&text);
-//!     }
-//!     
-//!     Ok(complete_story)
-//! }
-//!
-//! // Collect complete response using IntoFuture (simpler for batch processing)
-//! async fn get_complete_response(model: impl LanguageModel) -> aither::Result {
-//!     let request = Request::new([Message::user("Explain machine learning")]);
-//!     let stream = model.respond(request);
-//!     
-//!     // TextStream implements IntoFuture, so you can await it directly
-//!     let explanation = stream.await?;
-//!     Ok(explanation)
-//! }
-//!
-//! // Generic function that works with any TextStream implementation
-//! async fn process_any_stream<S: TextStream>(stream: S) -> Result<String, S::Error> {
-//!     // Can either iterate through chunks...
-//!     let mut result = String::new();
-//!     let mut stream = stream;
-//!     while let Some(chunk) = stream.next().await {
-//!         result.push_str(&chunk?);
-//!     }
-//!     Ok(result)
-//!     
-//!     // ...or collect everything at once
-//!     // stream.await
-//! }
-//!
-//! // Convert any Stream<Item = Result<String, E>> into a TextStream
-//! use futures_lite::stream;
-//!
-//! async fn custom_text_stream() {
-//!     let chunks = vec!["Hello, ", "streaming ", "world!"];
-//!     let chunk_stream = stream::iter(chunks).map(|s| Ok::<String, std::io::Error>(s.to_string()));
-//!     
-//!     let text_stream = aither::llm::stream::text_stream(chunk_stream);
-//!     let complete_text = text_stream.await.unwrap();
-//!     assert_eq!(complete_text, "Hello, streaming world!");
-//! }
-//! ```
 //!
 //! ### Text Summarization
 //!
