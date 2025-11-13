@@ -57,13 +57,13 @@ impl ModerationResult {
 
     /// Returns the number of detected violations.
     #[must_use]
-    pub fn violation_count(&self) -> usize {
+    pub const fn violation_count(&self) -> usize {
         self.categories.len()
     }
 
     /// Returns whether any violations were detected.
     #[must_use]
-    pub fn has_violations(&self) -> bool {
+    pub const fn has_violations(&self) -> bool {
         !self.categories.is_empty()
     }
 }

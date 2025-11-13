@@ -9,7 +9,7 @@ edition = "2024"
 authors = ["Lexo Liu <me@lexo.cool>"]
 license = "MIT"
 repository = "https://github.com/lexoliu/aither"
-rust-version = "1.85"
+rust-version = "1.87"
 
 [workspace.lints]
 rust.missing_docs = "warn"
