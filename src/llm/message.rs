@@ -9,7 +9,7 @@
 //! ## Creating basic messages
 //!
 //! ```rust
-//! use ai_types::llm::{Message, Role};
+//! use aither::llm::{Message, Role};
 //!
 //! // Using convenience constructors
 //! let user_msg = Message::user("Hello, how are you?");
@@ -23,7 +23,7 @@
 //! ## Adding attachments
 //!
 //! ```rust
-//! use ai_types::llm::Message;
+//! use aither::llm::Message;
 //! use url::Url;
 //!
 //! let message = Message::user("Check out this image")
@@ -40,7 +40,7 @@
 //! ## Working with annotations
 //!
 //! ```rust
-//! use ai_types::llm::{Message, Annotation, UrlAnnotation};
+//! use aither::llm::{Message, Annotation, UrlAnnotation};
 //! use url::Url;
 //!
 //! let annotation =Annotation::url(
@@ -94,7 +94,7 @@ pub enum Role {
 /// # Example
 ///
 /// ```rust
-/// use ai_types::llm::{Message, Role};
+/// use aither::llm::{Message, Role};
 /// use url::Url;
 ///
 /// // Create messages using convenience constructors
@@ -187,7 +187,7 @@ impl UrlAnnotation {
     /// # Example
     ///
     /// ```rust
-    /// use ai_types::llm::UrlAnnotation;
+    /// use aither::llm::UrlAnnotation;
     /// use url::Url;
     ///
     /// let annotation = UrlAnnotation::new(
@@ -316,7 +316,7 @@ impl Message {
     /// # Example
     ///
     /// ```rust
-    /// use ai_types::llm::Message;
+    /// use aither::llm::Message;
     /// use url::Url;
     ///
     /// let urls = [
@@ -344,7 +344,7 @@ impl Message {
     /// # Example
     ///
     /// ```rust
-    /// use ai_types::llm::{Message, Annotation, UrlAnnotation};
+    /// use aither::llm::{Message, Annotation, UrlAnnotation};
     /// use url::Url;
     ///
     /// let url_annotation = UrlAnnotation::new(
@@ -387,7 +387,7 @@ impl Annotation {
     /// # Example
     ///
     /// ```rust
-    /// use ai_types::llm::{Annotation};
+    /// use aither::llm::{Annotation};
     /// use url::Url;
     ///
     /// let url_annotation = Annotation::url(

@@ -1,6 +1,6 @@
 //! # Tool Macro Examples
 //!
-//! This example demonstrates various ways to use the `#[tool]` macro from `ai-types-derive`
+//! This example demonstrates various ways to use the `#[tool]` macro from `aither-derive`
 //! to convert async functions into AI tools.
 //!
 //! Run this example with: `cargo run --example tool_macro`
@@ -8,8 +8,8 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(missing_docs)]
 #![allow(clippy::unused_async)]
-use ai_types::Result;
-use ai_types_derive::tool;
+use aither::Result;
+use aither_derive::tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -52,7 +52,7 @@ pub struct GenerateImageArgs {
 
 // Tool with complex documented arguments using a single struct parameter
 #[tool(description = "Generate an image from a text prompt")]
-pub async fn generate_image(args: GenerateImageArgs) -> ai_types::Result<String> {
+pub async fn generate_image(args: GenerateImageArgs) -> aither::Result<String> {
     let file_name = format!("image_{}.png", args.prompt.replace(' ', "_"));
     // Simulate image generation
     Ok(format!(

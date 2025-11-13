@@ -36,9 +36,9 @@
 //! maintaining the same interface.
 //!
 //! ```rust
-//! use ai_types::EmbeddingModel;
+//! use aither::EmbeddingModel;
 //!
-//! async fn example<T: EmbeddingModel>(model: &T) -> ai_types::Result<()> {
+//! async fn example<T: EmbeddingModel>(model: &T) -> aither::Result<()> {
 //!     // Get the embedding dimension
 //!     let dim = model.dim();
 //!     println!("Model produces {}-dimensional embeddings", dim);
@@ -78,7 +78,7 @@ pub type Embedding = Vec<f32>;
 /// # Example
 ///
 /// ```rust
-/// use ai_types::EmbeddingModel;
+/// use aither::EmbeddingModel;
 ///
 /// struct MyEmbedding {
 ///     api_key: String,
@@ -89,7 +89,7 @@ pub type Embedding = Vec<f32>;
 ///         1536 // OpenAI text-embedding-ada-002 dimension
 ///     }
 ///     
-///     async fn embed(&self, text: &str) -> ai_types::Result<Vec<f32>> {
+///     async fn embed(&self, text: &str) -> aither::Result<Vec<f32>> {
 ///         // In a real implementation, this would call the embedding API
 ///         Ok(vec![0.0; self.dim()])
 ///     }

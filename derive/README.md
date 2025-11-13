@@ -1,18 +1,18 @@
-# ai-types-derive
+# aither-derive
 
 > **📖 Documentation:** For comprehensive documentation with examples, see the inline code documentation in [`src/lib.rs`](./src/lib.rs) and the example file [`examples/tool_macro.rs`](../examples/tool_macro.rs).
 
 Procedural macros for converting Rust functions into AI tools that can be called by language models.
 
-This crate provides the `#[tool]` attribute macro that automatically generates the necessary boilerplate code to make your async functions callable by AI models through the `ai-types` framework.
+This crate provides the `#[tool]` attribute macro that automatically generates the necessary boilerplate code to make your async functions callable by AI models through the `aither` framework.
 
 ## Quick Start
 
 Transform any async function into an AI tool by adding the `#[tool]` attribute:
 
 ```rust
-use ai_types::Result;
-use ai_types_derive::tool;
+use aither::Result;
+use aither_derive::tool;
 
 #[tool(description = "Get the current UTC time")]
 pub async fn get_time() -> Result<&'static str> {

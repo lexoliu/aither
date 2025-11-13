@@ -10,13 +10,13 @@ pub type Data = Vec<u8>;
 /// # Example
 ///
 /// ```rust
-/// use ai_types::AudioGenerator;
+/// use aither::AudioGenerator;
 /// use futures_core::Stream;
 ///
 /// struct MyAudioGen;
 ///
 /// impl AudioGenerator for MyAudioGen {
-///     fn generate(&self, prompt: &str) -> impl Stream<Item = ai_types::audio::Data> + Send {
+///     fn generate(&self, prompt: &str) -> impl Stream<Item = aither::audio::Data> + Send {
 ///         futures_lite::stream::iter(Some(vec![0u8; 1024]))
 ///     }
 /// }
@@ -33,7 +33,7 @@ pub trait AudioGenerator {
 /// # Example
 ///
 /// ```rust
-/// use ai_types::AudioTranscriber;
+/// use aither::AudioTranscriber;
 /// use futures_core::Stream;
 ///
 /// struct MyTranscriber;

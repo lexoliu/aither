@@ -8,7 +8,7 @@ members = [
 edition = "2024"
 authors = ["Lexo Liu <me@lexo.cool>"]
 license = "MIT"
-repository = "https://github.com/lexoliu/ai-types"
+repository = "https://github.com/lexoliu/aither"
 rust-version = "1.85"
 
 [workspace.lints]
@@ -25,11 +25,11 @@ clippy.nursery = "warn"
 clippy.cargo = "warn"
 
 [workspace.dependencies]
-ai-types = { path = "."}
-ai-types-derive = { path = "./derive", version = "0.1.0"}
+aither = { path = "."}
+aither-derive = { path = "./derive", version = "0.1.0"}
 
 [package]
-name = "ai-types"
+name = "aither"
 version = "0.2.0"
 edition.workspace = true
 authors.workspace = true
@@ -37,7 +37,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Providing unified trait abstractions for AI models"
-documentation = "https://docs.rs/ai-types"
+documentation = "https://docs.rs/aither"
 keywords = ["ai", "llm", "embedding", "image-generation", "no-std"]
 categories = ["api-bindings", "no-std"]
 readme = "./README.md"
@@ -55,7 +55,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-ai-types-derive = { workspace = true, optional = true}
+aither-derive = { workspace = true, optional = true}
 anyhow = { version = "1.0", default-features = false }
 async-stream = "0.3.6"
 futures-core = { version = "0.3.31", default-features = false}
@@ -78,7 +78,7 @@ futures-lite = { version = "2.6"}
 [features]
 default = ["derive", "serde"]
 serde = ["serde/derive","url/serde"]
-derive = ["ai-types-derive"]
+derive = ["aither-derive"]
 
 [lints]
 workspace = true

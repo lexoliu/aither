@@ -1,13 +1,13 @@
 [package]
-name = "ai-types-derive"
+name = "aither-derive"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Procedural macros for ai-types - convert functions into AI tools"
-documentation = "https://docs.rs/ai-types-derive"
+description = "Procedural macros for aither - convert functions into AI tools"
+documentation = "https://docs.rs/aither-derive"
 keywords = ["ai", "llm", "procedural-macros", "tools"]
 categories = ["development-tools::procedural-macro-helpers"]
 

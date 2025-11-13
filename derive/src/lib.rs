@@ -1,17 +1,17 @@
-//! # ai-types-derive
+//! # aither-derive
 //!
 //! Procedural macros for converting Rust functions into AI tools that can be called by language models.
 //!
 //! This crate provides the `#[tool]` attribute macro that automatically generates the necessary
-//! boilerplate code to make your async functions callable by AI models through the `ai-types` framework.
+//! boilerplate code to make your async functions callable by AI models through the `aither` framework.
 //!
 //! ## Quick Start
 //!
 //! Transform any async function into an AI tool by adding the `#[tool]` attribute:
 //!
 //! ```rust
-//! use ai_types::Result;
-//! use ai_types_derive::tool;
+//! use aither::Result;
+//! use aither_derive::tool;
 //!
 //! #[tool(description = "Get the current UTC time")]
 //! pub async fn get_time() -> Result<&'static str> {
@@ -143,7 +143,7 @@ impl Parse for ToolArgs {
 /// Converts an async function into an AI tool that can be called by language models.
 ///
 /// This procedural macro generates the necessary boilerplate code to make your function
-/// callable through the `ai-types::llm::Tool` trait.
+/// callable through the `aither::llm::Tool` trait.
 ///
 /// # Arguments
 ///
@@ -156,8 +156,8 @@ impl Parse for ToolArgs {
 /// ## Basic Usage (No Parameters)
 ///
 /// ```rust
-/// use ai_types::Result;
-/// use ai_types_derive::tool;
+/// use aither::Result;
+/// use aither_derive::tool;
 ///
 /// #[tool(description = "Get the current system time")]
 /// pub async fn current_time() -> Result<String> {
@@ -215,7 +215,7 @@ impl Parse for ToolArgs {
 /// For a function named `search`, the macro generates:
 ///
 /// 1. A `SearchArgs` struct (if the function has multiple parameters)
-/// 2. A `Search` struct that implements `ai_types::llm::Tool`
+/// 2. A `Search` struct that implements `aither::llm::Tool`
 /// 3. All necessary trait implementations for JSON schema generation and deserialization
 ///
 /// # Requirements
@@ -294,17 +294,17 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
         #[derive(::core::default::Default,::core::fmt::Debug)]
         #fn_vis struct #tool_struct_name;
 
-        impl ::ai_types::llm::Tool for #tool_struct_name {
+        impl ::aither::llm::Tool for #tool_struct_name {
             const NAME: &'static str = #tool_name;
             const DESCRIPTION: &'static str = #description;
             type Arguments = #args_type;
 
-            async fn call(&mut self, args: Self::Arguments) -> ::ai_types::Result {
+            async fn call(&mut self, args: Self::Arguments) -> ::aither::Result {
                 #extractor
-                let result: ::ai_types::Result<_> = #call_expr;
-                let result: ::ai_types::Result<String> = result.map(|value|{
+                let result: ::aither::Result<_> = #call_expr;
+                let result: ::aither::Result<String> = result.map(|value|{
                     // Convert the result to a JSON string
-                    ::ai_types::llm::tool::json(&value)
+                    ::aither::llm::tool::json(&value)
                 });
                 result
             }

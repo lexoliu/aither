@@ -8,7 +8,7 @@
 //! ## Creating a model profile
 //!
 //! ```rust
-//! use ai_types::llm::model::{Profile, Ability, Pricing};
+//! use aither::llm::model::{Profile, Ability, Pricing};
 //!
 //! let mut pricing = Pricing::default();
 //!
@@ -30,7 +30,7 @@
 //! ## Configuring model parameters
 //!
 //! ```rust
-//! use ai_types::llm::model::Parameters;
+//! use aither::llm::model::Parameters;
 //!
 //! let params = Parameters::default()
 //!     .temperature(0.7)
@@ -51,7 +51,7 @@ use schemars::Schema;
 /// # Examples
 ///
 /// ```rust
-/// use ai_types::llm::model::Parameters;
+/// use aither::llm::model::Parameters;
 ///
 /// let params = Parameters::default()
 ///     .temperature(0.7)
@@ -187,7 +187,7 @@ impl_with_methods! {
 /// # Examples
 ///
 /// ```rust
-/// use ai_types::llm::model::{Profile, Ability, Pricing};
+/// use aither::llm::model::{Profile, Ability, Pricing};
 ///
 /// let profile = Profile::new("gpt-4", "GPT-4 Turbo", 128000)
 ///     .with_ability(Ability::ToolUse)
@@ -222,7 +222,7 @@ pub struct Profile {
 /// # Examples
 ///
 /// ```rust
-/// use ai_types::llm::model::Pricing;
+/// use aither::llm::model::Pricing;
 ///
 /// let mut pricing = Pricing::default();
 ///
@@ -262,7 +262,7 @@ pub struct Pricing {
 /// # Examples
 ///
 /// ```rust
-/// use ai_types::llm::model::SupportedParameters;
+/// use aither::llm::model::SupportedParameters;
 ///
 /// let mut support = SupportedParameters::default();
 ///
@@ -312,7 +312,7 @@ impl Profile {
     /// # Examples
     ///
     /// ```rust
-    /// use ai_types::llm::model::Profile;
+    /// use aither::llm::model::Profile;
     ///
     /// let profile = Profile::new("gpt-4", "GPT-4 Turbo", 128000);
     /// ```
@@ -343,7 +343,7 @@ impl Profile {
     /// # Examples
     ///
     /// ```rust
-    /// use ai_types::llm::model::{Profile, Ability};
+    /// use aither::llm::model::{Profile, Ability};
     ///
     /// let profile = Profile::new("vision-model", "A vision-capable model", 8192)
     ///     .with_ability(Ability::Vision);
@@ -362,7 +362,7 @@ impl Profile {
     /// # Examples
     ///
     /// ```rust
-    /// use ai_types::llm::model::{Profile, Ability};
+    /// use aither::llm::model::{Profile, Ability};
     ///
     /// let abilities = [Ability::ToolUse, Ability::Vision, Ability::Audio];
     /// let profile = Profile::new("multimodal", "A multimodal model", 32768)
@@ -383,7 +383,7 @@ impl Profile {
     /// # Examples
     ///
     /// ```rust
-    /// use ai_types::llm::model::{Profile, Pricing};
+    /// use aither::llm::model::{Profile, Pricing};
     ///
     /// let mut pricing = Pricing::default();
     ///
@@ -409,7 +409,7 @@ impl Profile {
 /// # Examples
 ///
 /// ```rust
-/// use ai_types::llm::model::Ability;
+/// use aither::llm::model::Ability;
 ///
 /// // Check if a model supports vision
 /// let abilities = [Ability::Vision, Ability::ToolUse];

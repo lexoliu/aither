@@ -17,7 +17,7 @@
 //! ## Quick Start
 //!
 //! ```rust
-//! use ai_types::llm::Tool;
+//! use aither::llm::Tool;
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //!
@@ -38,7 +38,7 @@
 //!     const DESCRIPTION: &str = "Performs basic math operations";
 //!     type Arguments = MathArgs;
 //!
-//!     async fn call(&mut self, args: Self::Arguments) -> ai_types::Result {
+//!     async fn call(&mut self, args: Self::Arguments) -> aither::Result {
 //!         let result = match args.operation.as_str() {
 //!             "add" => args.a + args.b,
 //!             "subtract" => args.a - args.b,
@@ -141,7 +141,7 @@
 
 // Re-export procedural macros
 #[cfg(feature = "derive")]
-pub use ai_types_derive::tool;
+pub use aither_derive::tool;
 
 use crate::Result;
 use alloc::format;
@@ -158,7 +158,7 @@ use serde::{Serialize, de::DeserializeOwned};
 /// # Example
 ///
 /// ```rust
-/// use ai_types::llm::Tool;
+/// use aither::llm::Tool;
 /// use schemars::JsonSchema;
 /// use serde::Deserialize;
 ///
@@ -176,7 +176,7 @@ use serde::{Serialize, de::DeserializeOwned};
 ///     const DESCRIPTION: &str = "Performs basic mathematical operations";
 ///     type Arguments = CalculatorArgs;
 ///     
-///     async fn call(&mut self, args: Self::Arguments) -> ai_types::Result {
+///     async fn call(&mut self, args: Self::Arguments) -> aither::Result {
 ///         match args.operation.as_str() {
 ///             "add" => Ok((args.a + args.b).to_string()),
 ///             "subtract" => Ok((args.a - args.b).to_string()),
@@ -252,7 +252,7 @@ impl<T: Tool> ToolImpl for T {
 /// # Example
 ///
 /// ```rust
-/// use ai_types::llm::tool::Tools;
+/// use aither::llm::tool::Tools;
 ///
 /// let mut tools = Tools::new();
 /// // tools.register(Calculator);

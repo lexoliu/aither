@@ -16,7 +16,7 @@
 //! ### Basic Conversation
 //!
 //! ```rust
-//! use ai_types::llm::{LanguageModel, Request, Message};
+//! use aither::llm::{LanguageModel, Request, Message};
 //! use futures_lite::StreamExt;
 //!
 //! async fn chat_with_model(model: impl LanguageModel) -> Result<String, Box<dyn std::error::Error>> {
@@ -41,7 +41,7 @@
 //! ### Multi-turn Conversation
 //!
 //! ```rust
-//! use ai_types::llm::{Request, Message};
+//! use aither::llm::{Request, Message};
 //!
 //! let messages = [
 //!     Message::system("You are a helpful coding assistant"),
@@ -56,7 +56,7 @@
 //! ### Structured Output Generation
 //!
 //! ```rust
-//! use ai_types::llm::{LanguageModel, Request, Message};
+//! use aither::llm::{LanguageModel, Request, Message};
 //! use serde::{Deserialize, Serialize};
 //! use schemars::JsonSchema;
 //!
@@ -67,7 +67,7 @@
 //!     humidity: i32,
 //! }
 //!
-//! async fn get_weather_data(model: impl LanguageModel) -> ai_types::Result<WeatherResponse> {
+//! async fn get_weather_data(model: impl LanguageModel) -> aither::Result<WeatherResponse> {
 //!     let request = Request::oneshot(
 //!         "Extract weather information from the following text",
 //!         "It's 22°C and sunny with 65% humidity today"
@@ -80,7 +80,7 @@
 //! ### Function Calling with Tools
 //!
 //! ```rust
-//! use ai_types::llm::{Request, Message, Tool};
+//! use aither::llm::{Request, Message, Tool};
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //!
@@ -98,7 +98,7 @@
 //!     const DESCRIPTION: &str = "Performs basic arithmetic operations";
 //!     type Arguments = CalculatorArgs;
 //!
-//!     async fn call(&mut self, args: Self::Arguments) -> ai_types::Result {
+//!     async fn call(&mut self, args: Self::Arguments) -> aither::Result {
 //!         let result = match args.operation.as_str() {
 //!             "add" => args.x + args.y,
 //!             "subtract" => args.x - args.y,
@@ -119,7 +119,7 @@
 //! ### Model Configuration
 //!
 //! ```rust
-//! use ai_types::llm::{Request, Message, model::Parameters};
+//! use aither::llm::{Request, Message, model::Parameters};
 //!
 //! let request = Request::new([
 //!     Message::user("Write a creative story")
@@ -140,11 +140,11 @@
 //! and `IntoFuture<Output = Result<String, Error>>` for collecting complete responses.
 //!
 //! ```rust
-//! use ai_types::llm::{LanguageModel, TextStream, Request, Message};
+//! use aither::llm::{LanguageModel, TextStream, Request, Message};
 //! use futures_lite::StreamExt;
 //!
 //! // Process text as it streams in (useful for real-time display)
-//! async fn stream_chat_response(model: impl LanguageModel) -> ai_types::Result {
+//! async fn stream_chat_response(model: impl LanguageModel) -> aither::Result {
 //!     let request = Request::new([Message::user("Tell me a story about robots")]);
 //!     let mut stream = model.respond(request);
 //!     
@@ -159,7 +159,7 @@
 //! }
 //!
 //! // Collect complete response using IntoFuture (simpler for batch processing)
-//! async fn get_complete_response(model: impl LanguageModel) -> ai_types::Result {
+//! async fn get_complete_response(model: impl LanguageModel) -> aither::Result {
 //!     let request = Request::new([Message::user("Explain machine learning")]);
 //!     let stream = model.respond(request);
 //!     
@@ -189,7 +189,7 @@
 //!     let chunks = vec!["Hello, ", "streaming ", "world!"];
 //!     let chunk_stream = stream::iter(chunks).map(|s| Ok::<String, std::io::Error>(s.to_string()));
 //!     
-//!     let text_stream = ai_types::llm::stream::text_stream(chunk_stream);
+//!     let text_stream = aither::llm::stream::text_stream(chunk_stream);
 //!     let complete_text = text_stream.await.unwrap();
 //!     assert_eq!(complete_text, "Hello, streaming world!");
 //! }
@@ -198,7 +198,7 @@
 //! ### Text Summarization
 //!
 //! ```rust
-//! use ai_types::llm::LanguageModel;
+//! use aither::llm::LanguageModel;
 //! use futures_lite::StreamExt;
 //!
 //! async fn summarize_text(model: impl LanguageModel, text: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -216,7 +216,7 @@
 //! ### Text Categorization
 //!
 //! ```rust
-//! use ai_types::llm::LanguageModel;
+//! use aither::llm::LanguageModel;
 //! use schemars::JsonSchema;
 //! use serde::{Deserialize, Serialize};
 //!
@@ -236,7 +236,7 @@
 //!     reasoning: String,
 //! }
 //!
-//! async fn categorize_document(model: impl LanguageModel, text: &str) -> ai_types::Result<ClassificationResult> {
+//! async fn categorize_document(model: impl LanguageModel, text: &str) -> aither::Result<ClassificationResult> {
 //!     model.categorize::<ClassificationResult>(text).await
 //! }
 //! ```
@@ -246,14 +246,14 @@
 //! Messages support rich content including file attachments and URL annotations:
 //!
 //! ```rust
-//! use ai_types::llm::{Message, UrlAnnotation, Annotation};
+//! use aither::llm::{Message, UrlAnnotation, Annotation};
 //! use url::Url;
 //!
 //! let message = Message::user("Check this documentation")
 //!     .with_attachment("file:///path/to/doc.pdf")
 //!     .with_annotation(
 //!         Annotation::url(
-//!             "https://docs.rs/ai-types",
+//!             "https://docs.rs/aither",
 //!             "AI Types Documentation",
 //!             "Rust crate for AI model abstractions",
 //!             0,

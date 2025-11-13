@@ -1,13 +1,13 @@
 <div align="center">
-<img src="logo.svg" alt="ai-types logo" width="150" height="150">
+<img src="logo.svg" alt="aither logo" width="150" height="150">
 
-# ai-types
+# aither
 
 Providing unified trait abstractions for AI models
 
 
-[![Crates.io](https://img.shields.io/crates/v/ai-types.svg)](https://crates.io/crates/ai-types)
-[![Documentation](https://docs.rs/ai-types/badge.svg)](https://docs.rs/ai-types)
+[![Crates.io](https://img.shields.io/crates/v/aither.svg)](https://crates.io/crates/aither)
+[![Documentation](https://docs.rs/aither/badge.svg)](https://docs.rs/aither)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org)
 
@@ -20,7 +20,7 @@ Unified trait abstractions for AI models in Rust. Switch between OpenAI, Anthrop
 
 ```text
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Your App      │───▶│    ai-types      │◀───│   Providers     │
+│   Your App      │───▶│    aither      │◀───│   Providers     │
 │                 │    │   (this crate)   │    │                 │
 │ - Chat bots     │    │                  │    │ - openai        │
 │ - Search        │    │ - LanguageModel  │    │ - anthropic     │
@@ -54,16 +54,16 @@ Unified trait abstractions for AI models in Rust. Switch between OpenAI, Anthrop
 
 ```toml
 [dependencies]
-ai-types = "0.0.1"
+aither = "0.0.1"
 ```
 
 ### Basic Chat Bot
 
 ```rust
-use ai_types::{LanguageModel, llm::{Message, Request}};
+use aither::{LanguageModel, llm::{Message, Request}};
 use futures_lite::StreamExt;
 
-async fn chat_example(model: impl LanguageModel) -> ai_types::Result {
+async fn chat_example(model: impl LanguageModel) -> aither::Result {
     let messages = [
         Message::system("You are a helpful assistant"),
         Message::user("What's the capital of France?")
@@ -86,11 +86,11 @@ async fn chat_example(model: impl LanguageModel) -> ai_types::Result {
 The `TextStream` trait provides a unified interface for streaming text responses from language models. It implements both `Stream` for chunk-by-chunk processing and `IntoFuture` for collecting the complete response.
 
 ```rust
-use ai_types::{TextStream, LanguageModel, llm::{Request, Message}};
+use aither::{TextStream, LanguageModel, llm::{Request, Message}};
 use futures_lite::StreamExt;
 
 // Process text as it streams in
-async fn process_streaming_response(model: impl LanguageModel) -> ai_types::Result {
+async fn process_streaming_response(model: impl LanguageModel) -> aither::Result {
     let request = Request::new([Message::user("Write a poem about Rust")]);
     let mut stream = model.respond(request);
     
@@ -105,7 +105,7 @@ async fn process_streaming_response(model: impl LanguageModel) -> ai_types::Resu
 }
 
 // Collect complete response using IntoFuture
-async fn get_complete_response(model: impl LanguageModel) -> ai_types::Result {
+async fn get_complete_response(model: impl LanguageModel) -> aither::Result {
     let request = Request::new([Message::user("Explain quantum computing")]);
     let stream = model.respond(request);
     
@@ -132,7 +132,7 @@ async fn stream_to_completion<S: TextStream>(stream: S) -> Result<String, S::Err
 ### Function Calling
 
 ```rust
-use ai_types::{LanguageModel, llm::{Message, Request, Tool}};
+use aither::{LanguageModel, llm::{Message, Request, Tool}};
 use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
 
@@ -149,12 +149,12 @@ impl Tool for WeatherTool {
     const DESCRIPTION: &str = "Get current weather for a location";
     type Arguments = WeatherQuery;
     
-    async fn call(&mut self, args: Self::Arguments) -> ai_types::Result {
+    async fn call(&mut self, args: Self::Arguments) -> aither::Result {
         Ok(format!("Weather in {}: 22°C, sunny", args.location))
     }
 }
 
-async fn weather_bot(model: impl LanguageModel) -> ai_types::Result {
+async fn weather_bot(model: impl LanguageModel) -> aither::Result {
     let request = Request::new([
         Message::user("What's the weather like in Tokyo?")
     ]).with_tool(WeatherTool);
@@ -167,12 +167,12 @@ async fn weather_bot(model: impl LanguageModel) -> ai_types::Result {
 ### Semantic Search
 
 ```rust
-use ai_types::EmbeddingModel;
+use aither::EmbeddingModel;
 
 async fn find_similar_docs(
     model: impl EmbeddingModel,
     query: &str,
-) -> ai_types::Result<Vec<f32>> {
+) -> aither::Result<Vec<f32>> {
     let query_embedding = model.embed(query).await?;
     println!("Embedding dimension: {}", query_embedding.len());
     Ok(query_embedding)
@@ -182,10 +182,10 @@ async fn find_similar_docs(
 ### Progressive Image Generation
 
 ```rust
-use ai_types::{ImageGenerator, image::{Prompt, Size}};
+use aither::{ImageGenerator, image::{Prompt, Size}};
 use futures_lite::StreamExt;
 
-async fn generate_image(generator: impl ImageGenerator) -> ai_types::Result<Vec<u8>> {
+async fn generate_image(generator: impl ImageGenerator) -> aither::Result<Vec<u8>> {
     let prompt = Prompt::new("A beautiful sunset over mountains");
     let size = Size::square(1024);
     

@@ -47,5 +47,5 @@ jobs:
 
       - name: Check that packages can be built
         run: |
-          cargo package -p ai-types-derive --allow-dirty
-          cargo package -p ai-types --allow-dirty
+          cargo package -p aither-derive --allow-dirty
+          cargo package -p aither --allow-dirty

@@ -1,4 +1,4 @@
-//! # ai-types
+//! # aither
 //!
 //! **Write AI applications that work with any provider** 🚀
 //!
@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-//! │   Your App      │───▶│    ai-types      │◀───│   Providers     │
+//! │   Your App      │───▶│    aither      │◀───│   Providers     │
 //! │                 │    │   (this crate)   │    │                 │
 //! │ - Chat bots     │    │                  │    │ - openai        │
 //! │ - Search        │    │ - LanguageModel  │    │ - anthropic     │
@@ -35,10 +35,10 @@
 //! ### Basic Chat Bot
 //!
 //! ```rust
-//! use ai_types::{LanguageModel, llm::{Message, Request}};
+//! use aither::{LanguageModel, llm::{Message, Request}};
 //! use futures_lite::StreamExt;
 //!
-//! async fn chat_example(model: impl LanguageModel) -> ai_types::Result {
+//! async fn chat_example(model: impl LanguageModel) -> aither::Result {
 //!     let messages = [
 //!         Message::system("You are a helpful assistant"),
 //!         Message::user("What's the capital of France?")
@@ -54,7 +54,7 @@
 //! ### Structured Output with Tools
 //!
 //! ```rust
-//! use ai_types::{LanguageModel, llm::{Message, Request, Tool}};
+//! use aither::{LanguageModel, llm::{Message, Request, Tool}};
 //! use serde::{Deserialize, Serialize};
 //! use schemars::JsonSchema;
 //!
@@ -71,12 +71,12 @@
 //!     const DESCRIPTION: &str = "Get current weather for a location";
 //!     type Arguments = WeatherQuery;
 //!     
-//!     async fn call(&mut self, args: Self::Arguments) -> ai_types::Result {
+//!     async fn call(&mut self, args: Self::Arguments) -> aither::Result {
 //!         Ok(format!("Weather in {}: 22°C, sunny", args.location))
 //!     }
 //! }
 //!
-//! async fn weather_bot(model: impl LanguageModel) -> ai_types::Result {
+//! async fn weather_bot(model: impl LanguageModel) -> aither::Result {
 //!     let request = Request::new(vec![
 //!         Message::user("What's the weather like in Tokyo?")
 //!     ]).with_tool(WeatherTool);
@@ -92,13 +92,13 @@
 //! ### Semantic Search with Embeddings
 //!
 //! ```rust
-//! use ai_types::EmbeddingModel;
+//! use aither::EmbeddingModel;
 //!
 //! async fn find_similar_docs(
 //!     model: impl EmbeddingModel,
 //!     query: &str,
 //!     documents: &[&str]
-//! ) -> ai_types::Result<Vec<f32>> {
+//! ) -> aither::Result<Vec<f32>> {
 //!     // Convert query to vector
 //!     let query_embedding = model.embed(query).await?;
 //!     
@@ -112,7 +112,7 @@
 //! ### Progressive Image Generation
 //!
 //! ```rust
-//! use ai_types::{ImageGenerator, image::{Prompt, Size}};
+//! use aither::{ImageGenerator, image::{Prompt, Size}};
 //! use futures_lite::StreamExt;
 //!
 //! async fn generate_image(generator: impl ImageGenerator) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -138,8 +138,8 @@
 //!
 
 #![doc(
-    html_logo_url = "https://raw.githubusercontent.com/lexoliu/ai-types/main/logo.svg",
-    html_favicon_url = "https://raw.githubusercontent.com/lexoliu/ai-types/main/logo.svg"
+    html_logo_url = "https://raw.githubusercontent.com/lexoliu/aither/main/logo.svg",
+    html_favicon_url = "https://raw.githubusercontent.com/lexoliu/aither/main/logo.svg"
 )]
 #![no_std]
 extern crate alloc;
