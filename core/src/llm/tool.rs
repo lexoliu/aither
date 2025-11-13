@@ -142,6 +142,7 @@
 // Re-export procedural macros
 #[cfg(feature = "derive")]
 pub use aither_derive::tool;
+use alloc::borrow::Cow;
 
 use crate::Result;
 use alloc::format;
@@ -193,11 +194,11 @@ use serde::{Serialize, de::DeserializeOwned};
 ///     }
 /// }
 /// ```
-pub trait Tool: Send + Sync + 'static {
+pub trait Tool: Send + Sync {
     /// Tool name. Must be unique.
-    const NAME: &str;
+    fn name(&self) -> Cow<'static, str>;
     /// Tool description for the language model.
-    const DESCRIPTION: &str;
+    fn description(&self) -> Cow<'static, str>;
 
     /// Tool arguments type. Must implement [`schemars::JsonSchema`] and [`serde::de::DeserializeOwned`].
     type Arguments: JsonSchema + DeserializeOwned;
@@ -239,8 +240,8 @@ impl<T: Tool> ToolImpl for T {
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: Self::NAME,
-            description: Self::DESCRIPTION,
+            name: self.name(),
+            description: self.description(),
             arguments: schema_for!(T::Arguments),
         }
     }
@@ -278,22 +279,40 @@ impl Debug for Tools {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ToolDefinition {
     /// Tool name.
-    pub name: &'static str,
+    name: Cow<'static, str>,
     /// Tool description.
-    pub description: &'static str,
+    description: Cow<'static, str>,
     /// JSON schema for tool arguments.
-    pub arguments: Schema,
+    arguments: Schema,
 }
 
 impl ToolDefinition {
     /// Creates a tool definition for a given tool type.
     #[must_use]
-    pub fn new<T: Tool>() -> Self {
+    pub fn new<T: Tool>(tool: &T) -> Self {
         Self {
-            name: T::NAME,
-            description: T::DESCRIPTION,
+            name: tool.name(),
+            description: tool.description(),
             arguments: schema_for!(T::Arguments),
         }
+    }
+
+    /// Returns the tool's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the tool's description.
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// Returns the JSON schema for the tool's arguments.
+    #[must_use]
+    pub const fn arguments_schema(&self) -> &Schema {
+        &self.arguments
     }
 }
 
@@ -323,7 +342,7 @@ impl Tools {
     /// The tool must implement [`Tool`] and be `'static`.
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
         self.tools
-            .insert(T::NAME.to_string(), Box::new(tool) as Box<dyn ToolImpl>);
+            .insert(tool.name().to_string(), Box::new(tool) as Box<dyn ToolImpl>);
     }
 
     /// Removes a tool from the registry.
@@ -363,8 +382,12 @@ mod tests {
     struct Calculator;
 
     impl Tool for Calculator {
-        const NAME: &str = "calculator";
-        const DESCRIPTION: &str = "Performs basic mathematical operations";
+        fn name(&self) -> Cow<'static, str> {
+            "calculator".into()
+        }
+        fn description(&self) -> Cow<'static, str> {
+            "Performs basic mathematical operations".into()
+        }
         type Arguments = CalculatorArgs;
 
         async fn call(&mut self, args: Self::Arguments) -> Result {
@@ -395,8 +418,12 @@ mod tests {
     struct Greeter;
 
     impl Tool for Greeter {
-        const NAME: &str = "greeter";
-        const DESCRIPTION: &str = "Greets a person by name";
+        fn name(&self) -> Cow<'static, str> {
+            "greeter".into()
+        }
+        fn description(&self) -> Cow<'static, str> {
+            "Greets a person by name".into()
+        }
         type Arguments = GreetArgs;
 
         async fn call(&mut self, args: Self::Arguments) -> Result {
@@ -418,7 +445,8 @@ mod tests {
 
     #[test]
     fn tool_definition_creation() {
-        let definition = ToolDefinition::new::<Calculator>();
+        let calculator = Calculator;
+        let definition = ToolDefinition::new(&calculator);
 
         assert_eq!(definition.name, "calculator");
         assert_eq!(
@@ -626,7 +654,8 @@ mod tests {
 
     #[test]
     fn tool_definition_debug() {
-        let definition = ToolDefinition::new::<Calculator>();
+        let calculator = Calculator;
+        let definition = ToolDefinition::new(&calculator);
         let debug_str = format!("{definition:?}");
 
         assert!(debug_str.contains("ToolDefinition"));
@@ -636,7 +665,8 @@ mod tests {
 
     #[test]
     fn tool_definition_clone() {
-        let original = ToolDefinition::new::<Calculator>();
+        let calculator = Calculator;
+        let original = ToolDefinition::new(&calculator);
         let cloned = original.clone();
 
         assert_eq!(original.name, cloned.name);

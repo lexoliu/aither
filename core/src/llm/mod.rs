@@ -231,7 +231,7 @@ fn oneshot(system: impl Into<String>, user: impl Into<String>) -> [Message; 2] {
 /// Language models for text generation and conversation.
 ///
 /// See the [module documentation](crate::llm) for examples and usage patterns.
-pub trait LanguageModel: Sized + Send + Sync + 'static {
+pub trait LanguageModel: Sized + Send + Sync {
     /// The error type returned by this language model.
     type Error: core::error::Error + Send + Sync + 'static;
 
@@ -331,6 +331,47 @@ macro_rules! impl_language_model {
 mod prompts;
 
 impl_language_model!(Arc, Box);
+
+impl<T: LanguageModel> LanguageModel for &T {
+    type Error = T::Error;
+
+    fn respond(
+        &self,
+        messages: &[Message],
+        tools: &mut Tools,
+        parameters: &Parameters,
+    ) -> impl Stream<Item = Result<String, Self::Error>> + Send {
+        T::respond(self, messages, tools, parameters)
+    }
+
+    fn generate<U: JsonSchema + DeserializeOwned>(
+        &self,
+        messages: &[Message],
+        tools: &mut Tools,
+        parameters: &Parameters,
+    ) -> impl Future<Output = crate::Result<U>> + Send {
+        T::generate(self, messages, tools, parameters)
+    }
+
+    fn complete(&self, prefix: &str) -> impl Stream<Item = Result<String, Self::Error>> + Send {
+        T::complete(self, prefix)
+    }
+
+    fn summarize(&self, text: &str) -> impl Stream<Item = Result<String, Self::Error>> + Send {
+        T::summarize(self, text)
+    }
+
+    fn categorize<U: JsonSchema + DeserializeOwned>(
+        &self,
+        text: &str,
+    ) -> impl Future<Output = crate::Result<U>> + Send {
+        T::categorize(self, text)
+    }
+
+    fn profile(&self) -> impl Future<Output = Profile> + Send {
+        T::profile(self)
+    }
+}
 
 /// Collects all chunks from a stream of `Result<String, Err>` into a single `String`.
 ///

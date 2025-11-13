@@ -64,7 +64,7 @@ impl<LLM: LanguageModel> Assistant<LLM> {
     /// # Returns
     /// Returns the updated Assistant instance with the tool registered.
     #[must_use]
-    pub fn tool(mut self, tool: impl Tool) -> Self {
+    pub fn tool(mut self, tool: impl Tool + 'static) -> Self {
         self.tools.register(tool);
         self
     }

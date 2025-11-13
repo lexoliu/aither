@@ -295,8 +295,12 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
         #fn_vis struct #tool_struct_name;
 
         impl ::aither::llm::Tool for #tool_struct_name {
-            const NAME: &'static str = #tool_name;
-            const DESCRIPTION: &'static str = #description;
+            fn name(&self) -> ::aither::__hidden::CowStr {
+                #tool_name.into()
+            }
+            fn description(&self) -> ::aither::__hidden::CowStr {
+                #description.into()
+            }
             type Arguments = #args_type;
 
             async fn call(&mut self, args: Self::Arguments) -> ::aither::Result {
