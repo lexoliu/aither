@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = [
-    "derive",
+members = ["claude",
+    "derive", "openai",
 ]
 
 [workspace.package]
@@ -27,6 +27,7 @@ clippy.cargo = "warn"
 [workspace.dependencies]
 aither = { path = "."}
 aither-derive = { path = "./derive", version = "0.1.0"}
+zenwave = { path = "../zenwave"}
 
 [package]
 name = "aither"

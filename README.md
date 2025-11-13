@@ -20,7 +20,7 @@ Unified trait abstractions for AI models in Rust. Switch between OpenAI, Anthrop
 
 ```text
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Your App      │───▶│    aither      │◀───│   Providers     │
+│   Your App      │───▶│    aither        │◀───│   Providers     │
 │                 │    │   (this crate)   │    │                 │
 │ - Chat bots     │    │                  │    │ - openai        │
 │ - Search        │    │ - LanguageModel  │    │ - anthropic     │
