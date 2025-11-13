@@ -42,7 +42,7 @@ pub use provider::OpenAIProvider;
 mod constant;
 pub use constant::*;
 
-pub(crate) const DEFAULT_MODEL: &str = GPT5_MINI;
+pub(crate) const DEFAULT_MODEL: &str = GPT5_CHAT_LATEST;
 pub(crate) const DEFAULT_BASE_URL: &str = OPENAI_BASE_URL;
 pub(crate) const DEFAULT_EMBEDDING_MODEL: &str = EMBEDDING_SMALL;
 pub(crate) const DEFAULT_EMBEDDING_DIM: usize = 1536;
