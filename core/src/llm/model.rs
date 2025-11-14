@@ -426,6 +426,8 @@ pub enum Ability {
     Audio,
     /// The model can perform web searches natively.
     WebSearch,
+    /// The model can directly read and reason over PDF or document attachments.
+    Pdf,
 }
 
 #[cfg(test)]

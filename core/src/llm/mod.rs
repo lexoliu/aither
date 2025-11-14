@@ -394,17 +394,27 @@ async fn generate<T: JsonSchema + DeserializeOwned, M: LanguageModel>(
     tools: &mut Tools,
     parameters: &Parameters,
 ) -> crate::Result<T> {
-    let schema = json(&schema_for!(T));
-
-    let prompt = prompts::generate(&schema);
     let mut messages = messages.to_vec();
-    messages.push(Message::system(prompt));
-    let stream = model.respond(&messages, tools, parameters);
-    let response = try_collect(stream).await?;
 
-    let value: T = serde_json::from_str(&response)?;
+    let schema = schema_for!(T);
 
-    Ok(value)
+    // If it is a string, we are not required to set up structured generation and JSON schema.
+    let json = if schema.as_value().is_string() {
+        let stream = model.respond(&messages, tools, parameters);
+        let response = try_collect(stream).await?; // Note: this string do not have double quotes around it, so it is not a JSON string.
+        // Let's encode it as JSON string.
+        serde_json::to_string(&response)?
+    } else {
+        let schema = json(&schema);
+
+        let prompt = prompts::generate(&schema);
+        messages.push(Message::system(prompt));
+        let stream = model.respond(&messages, tools, parameters);
+        try_collect(stream).await?
+    };
+
+    serde_json::from_str::<T>(&json)
+        .map_err(|err| anyhow::Error::new(err).context("failed to parse structured output"))
 }
 
 fn summarize<M: LanguageModel>(

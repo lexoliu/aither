@@ -1,0 +1,13 @@
+[package]
+name = "aither-fs"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aither-core.workspace = true
+anyhow = "1.0"
+schemars = "1.1"
+serde = { version = "1.0", features = ["derive"] }

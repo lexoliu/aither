@@ -12,5 +12,15 @@ aither-core.workspace = true
 anyhow = "1.0.100"
 schemars = "1.1.0"
 serde = { version = "1.0.228", features = ["derive"] }
+aither-websearch = { workspace = true, optional = true }
+aither-fs = { workspace = true, optional = true }
+aither-command = { workspace = true, optional = true }
+futures-lite = "*"
+[features]
+default = []
+websearch = ["dep:aither-websearch"]
+filesystem = ["dep:aither-fs"]
+command = ["dep:aither-command"]
+full = ["websearch", "filesystem", "command"]
 [lints]
 workspace = true

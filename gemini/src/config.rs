@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use aither_core::llm::model::Ability;
+
 /// Gemini REST base URL used by the Developer API.
 pub const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -40,6 +42,7 @@ impl GeminiBackend {
                 image_model: Some(sanitize_model(DEFAULT_IMAGE_MODEL)),
                 tts_model: Some(sanitize_model(DEFAULT_TTS_MODEL)),
                 tts_voice: DEFAULT_TTS_VOICE.to_string(),
+                native_abilities: vec![Ability::Pdf],
             }),
         }
     }
@@ -100,6 +103,27 @@ impl GeminiBackend {
     pub(crate) fn config(&self) -> Arc<GeminiConfig> {
         self.inner.clone()
     }
+
+    /// Declare native capabilities exposed by the selected Gemini model.
+    #[must_use]
+    pub fn with_native_capabilities(
+        mut self,
+        abilities: impl IntoIterator<Item = Ability>,
+    ) -> Self {
+        let cfg = Arc::make_mut(&mut self.inner);
+        for ability in abilities {
+            if !cfg.native_abilities.contains(&ability) {
+                cfg.native_abilities.push(ability);
+            }
+        }
+        self
+    }
+
+    /// Declare a single native capability.
+    #[must_use]
+    pub fn with_native_capability(self, ability: Ability) -> Self {
+        self.with_native_capabilities([ability])
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +137,7 @@ pub(crate) struct GeminiConfig {
     pub(crate) image_model: Option<String>,
     pub(crate) tts_model: Option<String>,
     pub(crate) tts_voice: String,
+    pub(crate) native_abilities: Vec<Ability>,
 }
 
 impl GeminiConfig {

@@ -1,8 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["claude",
-    "derive", "openai","core"
-, "gemini", "agent"]
+members = [
+    "claude",
+    "derive",
+    "openai",
+    "core",
+    "gemini",
+    "agent",
+    "tools/websearch",
+    "tools/fs",
+    "tools/command",
+]
 
 [workspace.package]
 edition = "2024"
@@ -29,6 +37,9 @@ aither = { path = "."}
 aither-core = { path = "./core"}
 aither-derive = { path = "./derive", version = "0.1.0"}
 zenwave = { path = "../zenwave"}
+aither-websearch = { path = "./tools/websearch" }
+aither-fs = { path = "./tools/fs" }
+aither-command = { path = "./tools/command" }
 
 [dependencies]
 aither-core.workspace = true

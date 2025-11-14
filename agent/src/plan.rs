@@ -1,3 +1,5 @@
+use core::future::Future;
+
 use aither_core::{
     LanguageModel, Result,
     llm::{Message, model::Parameters},
@@ -28,28 +30,28 @@ impl Planner for DefaultPlanner {
         state: &mut AgentState,
         goal: &str,
     ) -> Result<PlanOutcome> {
-        // Build a planning prompt that incorporates the goal and current context
-        let system_prompt = "You are a strategic planner. Break down the given goal into concrete, actionable steps. Or ";
-
-        let mut messages = vec![Message::system(system_prompt), Message::user(goal)];
-
-        // Include relevant history if available
-        if !state.history.is_empty() {
-            messages.insert(
-                1,
-                Message::user(format!("Previous context: {:?}", state.history.last())),
-            );
+        let mut system_prompt = String::from(
+            "You are an expert planner. Always reason first, then return JSON that matches the target schema.",
+        );
+        if let Some(summary) = state.capability_summary() {
+            system_prompt.push_str("\n\nAvailable capabilities:\n");
+            system_prompt.push_str(&summary);
         }
+        let mut messages = vec![Message::system(system_prompt)];
+        messages.extend(state.messages());
+        messages.push(Message::user(format!(
+            "Plan steps to achieve: {goal}. If the goal is already complete, mark status as Completed."
+        )));
 
-        // Request a plan from the LLM
-        let tasks: Vec<String> = llm
+        let response: PlanResponse = llm
             .generate(&messages, &mut state.tools, &Parameters::default())
             .await
-            .context("Fail to create task todo list, try again please.")?;
+            .context("failed to build task list")?;
 
-        let tasks = TodoList::new(tasks);
-
-        Ok(PlanOutcome::NeedsMoreSteps(tasks))
+        match response.status {
+            PlanStatus::Completed { result } => Ok(PlanOutcome::Completed(result)),
+            PlanStatus::Steps { tasks } => Ok(PlanOutcome::NeedsMoreSteps(TodoList::new(tasks))),
+        }
     }
 }
 
@@ -60,4 +62,16 @@ pub enum PlanOutcome {
     Completed(String),
     /// More steps are needed, represented by a TodoList.
     NeedsMoreSteps(TodoList),
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct PlanResponse {
+    status: PlanStatus,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum PlanStatus {
+    Completed { result: String },
+    Steps { tasks: Vec<String> },
 }

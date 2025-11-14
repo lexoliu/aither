@@ -43,7 +43,7 @@ enum MessageContent {
 impl MessageContent {
     fn into_text(self) -> String {
         match self {
-            Self::Blocks(parts) => parts.into_iter().map(|part| part.into_text()).collect(),
+            Self::Blocks(parts) => parts.into_iter().map(DeltaContent::into_text).collect(),
             Self::Text(text) => text,
         }
     }

@@ -203,14 +203,20 @@ impl LanguageModel for OpenAI {
     fn profile(&self) -> impl Future<Output = ModelProfile> + Send {
         let cfg = self.inner.clone();
         async move {
-            ModelProfile::new(
+            let mut profile = ModelProfile::new(
                 cfg.chat_model.clone(),
                 "OpenAI",
                 cfg.chat_model.clone(),
                 "OpenAI GPT family model",
                 128_000,
             )
-            .with_ability(Ability::ToolUse)
+            .with_ability(Ability::ToolUse);
+            for ability in &cfg.native_abilities {
+                if !profile.abilities.contains(ability) {
+                    profile.abilities.push(*ability);
+                }
+            }
+            profile
         }
     }
 }
@@ -230,6 +236,7 @@ pub struct Builder {
     transcription_model: String,
     moderation_model: String,
     organization: Option<String>,
+    native_abilities: Vec<Ability>,
 }
 
 impl Builder {
@@ -247,6 +254,7 @@ impl Builder {
             transcription_model: DEFAULT_TRANSCRIPTION_MODEL.to_string(),
             moderation_model: DEFAULT_MODERATION_MODEL.to_string(),
             organization: None,
+            native_abilities: Vec::new(),
         }
     }
 
@@ -331,6 +339,32 @@ impl Builder {
         self
     }
 
+    /// Declare extra native capabilities (e.g., web search, PDF understanding) supported by the upstream model.
+    #[must_use]
+    pub fn native_capabilities(
+        mut self,
+        abilities: impl IntoIterator<Item = Ability>,
+    ) -> Self {
+        for ability in abilities {
+            if !self.native_abilities.contains(&ability) {
+                self.native_abilities.push(ability);
+            }
+        }
+        self
+    }
+
+    /// Mark this model as having built-in web search support.
+    #[must_use]
+    pub fn enable_native_web_search(self) -> Self {
+        self.native_capabilities([Ability::WebSearch])
+    }
+
+    /// Mark this model as having native PDF/document understanding.
+    #[must_use]
+    pub fn enable_native_pdf(self) -> Self {
+        self.native_capabilities([Ability::Pdf])
+    }
+
     /// Consume the builder and create an [`OpenAI`] client.
     #[must_use]
     pub fn build(self) -> OpenAI {
@@ -348,6 +382,7 @@ impl Builder {
                 transcription_model: self.transcription_model,
                 moderation_model: self.moderation_model,
                 organization: self.organization,
+                native_abilities: self.native_abilities,
             }),
         }
     }
@@ -367,6 +402,7 @@ pub struct Config {
     pub(crate) transcription_model: String,
     pub(crate) moderation_model: String,
     pub(crate) organization: Option<String>,
+    pub(crate) native_abilities: Vec<Ability>,
 }
 
 impl Config {

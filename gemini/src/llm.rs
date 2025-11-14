@@ -67,7 +67,7 @@ impl LanguageModel for GeminiBackend {
                                 .await
                                 .map_err(|err| GeminiError::Api(err.to_string()))?;
                             let response_value = serde_json::from_str::<Value>(&tool_output)
-                                .unwrap_or_else(|_| Value::String(tool_output));
+                                .unwrap_or(Value::String(tool_output));
                             contents.push(GeminiContent::function_response(
                                 call.name.clone(),
                                 response_value,
@@ -112,14 +112,20 @@ impl LanguageModel for GeminiBackend {
         let cfg = self.config();
         async move {
             let display = cfg.text_model.trim_start_matches("models/").to_string();
-            Profile::new(
+            let mut profile = Profile::new(
                 display.clone(),
                 "google",
                 display,
                 "Gemini Developer API model",
                 1_000_000,
             )
-            .with_abilities([Ability::ToolUse, Ability::Vision, Ability::Audio])
+            .with_abilities([Ability::ToolUse, Ability::Vision, Ability::Audio]);
+            for ability in &cfg.native_abilities {
+                if !profile.abilities.contains(ability) {
+                    profile.abilities.push(*ability);
+                }
+            }
+            profile
         }
     }
 }
@@ -135,9 +141,10 @@ fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<Gemin
                 }
                 system.push_str(message.content());
             }
-            Role::User => contents.push(GeminiContent::text("user", message.content())),
+            Role::User | Role::Tool => {
+                contents.push(GeminiContent::text("user", message.content()));
+            }
             Role::Assistant => contents.push(GeminiContent::text("model", message.content())),
-            Role::Tool => contents.push(GeminiContent::text("user", message.content())),
         }
     }
 
@@ -153,13 +160,18 @@ fn build_generation_config(
     parameters: &Parameters,
     modalities: Option<Vec<String>>,
 ) -> Option<GenerationConfig> {
-    let mut config = GenerationConfig::default();
-    config.temperature = parameters.temperature;
-    config.top_p = parameters.top_p;
-    config.top_k = parameters.top_k;
-    config.max_output_tokens = parameters.max_tokens.map(|value| value as i32);
-    config.stop_sequences = parameters.stop.clone();
-    config.response_modalities = modalities;
+    let mut config = GenerationConfig {
+        temperature: parameters.temperature,
+        top_p: parameters.top_p,
+        top_k: parameters.top_k,
+        max_output_tokens: parameters.max_tokens.map(
+            #[allow(clippy::cast_possible_wrap)]
+            |value| value as i32,
+        ),
+        stop_sequences: parameters.stop.clone(),
+        response_modalities: modalities,
+        ..Default::default()
+    };
     if let Some(schema) = &parameters.response_format {
         config.response_mime_type = Some("application/json".into());
         config.response_schema = Some(schema_to_value(schema));
@@ -211,5 +223,5 @@ fn convert_tool_definitions(defs: Vec<ToolDefinition>) -> Vec<GeminiTool> {
 }
 
 fn schema_to_value(schema: &Schema) -> Value {
-    serde_json::to_value(schema).unwrap_or_else(|_| Value::Object(Default::default()))
+    serde_json::to_value(schema).unwrap_or_else(|_| Value::Object(serde_json::Map::default()))
 }
