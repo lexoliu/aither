@@ -1,3 +1,4 @@
+use aither_core::llm::ResponseChunk;
 use serde::Deserialize;
 use zenwave::sse::Event;
 
@@ -7,18 +8,21 @@ pub struct ChatCompletionChunk {
 }
 
 impl ChatCompletionChunk {
-    pub(crate) fn into_text(self) -> Option<String> {
-        let mut buffer = String::new();
+    pub(crate) fn into_chunk(self) -> ResponseChunk {
+        let mut chunk = ResponseChunk::default();
         for choice in self.choices {
             if let Some(content) = choice.delta.content {
-                buffer.push_str(&content.into_text());
+                for text in content.into_segments() {
+                    chunk.push_text(text);
+                }
+            }
+            if let Some(reasoning) = choice.delta.reasoning {
+                for step in reasoning.into_segments() {
+                    chunk.push_reasoning(step);
+                }
             }
         }
-        if buffer.is_empty() {
-            None
-        } else {
-            Some(buffer)
-        }
+        chunk
     }
 }
 
@@ -31,6 +35,16 @@ struct ChunkChoice {
 struct DeltaMessage {
     #[serde(default)]
     content: Option<MessageContent>,
+    #[serde(
+        default,
+        alias = "reasoning",
+        alias = "reasoning_content",
+        alias = "reasoningContent",
+        alias = "thinking",
+        alias = "thinking_content",
+        alias = "thinkingContent"
+    )]
+    reasoning: Option<MessageContent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,10 +55,16 @@ enum MessageContent {
 }
 
 impl MessageContent {
-    fn into_text(self) -> String {
+    fn into_segments(self) -> Vec<String> {
         match self {
             Self::Blocks(parts) => parts.into_iter().map(DeltaContent::into_text).collect(),
-            Self::Text(text) => text,
+            Self::Text(text) => {
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![text]
+                }
+            }
         }
     }
 }

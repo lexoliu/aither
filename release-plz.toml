@@ -1,0 +1,51 @@
+[workspace]
+git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "aither"
+path = "."
+
+[[package]]
+name = "aither-core"
+path = "core"
+git_tag_name = "core-v{{ version }}"
+
+[[package]]
+name = "aither-derive"
+path = "derive"
+git_tag_name = "derive-v{{ version }}"
+
+[[package]]
+name = "aither-openai"
+path = "openai"
+git_tag_name = "openai-v{{ version }}"
+
+[[package]]
+name = "aither-claude"
+path = "claude"
+git_tag_name = "claude-v{{ version }}"
+
+[[package]]
+name = "aither-gemini"
+path = "gemini"
+git_tag_name = "gemini-v{{ version }}"
+
+[[package]]
+name = "aither-agent"
+path = "agent"
+git_tag_name = "agent-v{{ version }}"
+
+[[package]]
+name = "aither-websearch"
+path = "tools/websearch"
+git_tag_name = "websearch-v{{ version }}"
+
+[[package]]
+name = "aither-fs"
+path = "tools/fs"
+git_tag_name = "fs-v{{ version }}"
+
+[[package]]
+name = "aither-command"
+path = "tools/command"
+git_tag_name = "command-v{{ version }}"

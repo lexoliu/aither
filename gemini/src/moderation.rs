@@ -29,6 +29,7 @@ impl Moderation for GeminiBackend {
                 }),
                 tools: Vec::new(),
                 tool_config: None,
+                thinking_config: None,
                 safety_settings: default_safety_settings(),
             };
             let model_id = cfg.text_model.clone();

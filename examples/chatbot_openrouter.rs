@@ -4,10 +4,8 @@
 
 use std::io::{self, Write};
 
-use aither_core::{
-    LanguageModel,
-    llm::{Message, model::Parameters, tool::Tools},
-};
+use aither::llm::LLMRequest;
+use aither_core::{LanguageModel, llm::Message};
 use aither_openai::{GPT5_MINI, OpenAI};
 use anyhow::{Context, Result};
 use futures_lite::{StreamExt, pin};
@@ -21,8 +19,6 @@ async fn main() -> Result<()> {
     let mut messages = vec![Message::system(
         "You are a friendly Rust assistant. Answer concisely.",
     )];
-    let params = Parameters::default();
-    let mut tools = Tools::new();
     let stdin = io::stdin();
 
     loop {
@@ -46,7 +42,7 @@ async fn main() -> Result<()> {
 
         println!("Model>");
         let response = {
-            let stream = model.respond(&messages, &mut tools, &params);
+            let stream = model.respond(LLMRequest::new(messages.as_slice()));
             pin!(stream);
             let mut response = String::new();
             while let Some(chunk) = stream.next().await {

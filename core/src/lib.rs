@@ -2,8 +2,10 @@
 //!
 //! **Write AI applications that work with any provider** 🚀
 //!
-//! This crate provides unified trait abstractions for AI models, letting you write code once
-//! and switch between providers (`OpenAI`, `Anthropic`, local models, etc.) without changing your application logic.
+//! `aither-core` hosts the no-std trait APIs that power the rest of the workspace. Use it directly
+//! (or through the top-level [`aither`](https://crates.io/crates/aither) crate) to describe portable
+//! language models, embeddings, moderation, image/audio generators, and more.
+//! Every provider crate simply implements these traits.
 //!
 //!
 //! ```text
@@ -22,7 +24,7 @@
 //!
 //! | Capability | Trait | Description |
 //! |------------|-------|-------------|
-//! | **Language Models** | [`LanguageModel`] | Text generation, conversations, structured output |
+//! | **Language Models** | [`LanguageModel`] / [`llm::LLMResponse`] | Streaming chat, reasoning summaries, structured output |
 //! | **Embeddings** | [`EmbeddingModel`] | Convert text to vectors for semantic search |
 //! | **Image Generation** | [`ImageGenerator`] | Create images with progressive quality improvement |
 //! | **Text-to-Speech** | [`AudioGenerator`] | Generate speech audio from text |
@@ -31,29 +33,36 @@
 //!
 //! ## Examples
 //!
-//! ### Basic Chat Bot
+//! ### Streaming Responses with Reasoning
 //!
 //! ```rust
-//! use aither::{LanguageModel, llm::{Message, Request}};
-//! use futures_lite::StreamExt;
+//! use aither_core::llm::{LanguageModel, Message, Request, model::Parameters, LLMResponse};
+//! use futures_lite::{future::poll_fn, StreamExt};
+//! use core::pin::Pin;
 //!
-//! async fn chat_example(model: impl LanguageModel) -> aither::Result {
-//!     let messages = [
-//!         Message::system("You are a helpful assistant"),
-//!         Message::user("What's the capital of France?")
-//!     ];
-//!     
-//!     let request = Request::new(messages);
+//! async fn reasoning_demo(model: impl LanguageModel) -> aither_core::Result {
+//!     let request = Request::new([
+//!         Message::user("Explain how rainbows form like I'm five."),
+//!     ])
+//!     .with_parameters(Parameters::default().include_reasoning(true));
+//!
 //!     let mut response = model.respond(request);
-//!     
-//!     Ok(response.await?)
+//!     while let Some(step) = poll_fn(|cx| Pin::new(&mut response).poll_reasoning_next(cx)).await {
+//!         println!("thinking: {}", step?);
+//!     }
+//!
+//!     let mut answer = String::new();
+//!     while let Some(chunk) = response.next().await {
+//!         answer.push_str(&chunk?);
+//!     }
+//!     Ok(answer)
 //! }
 //! ```
 //!
 //! ### Structured Output with Tools
 //!
 //! ```rust
-//! use aither::{LanguageModel, llm::{Message, Request, Tool}};
+//! use aither_core::{LanguageModel, llm::{Message, Request, Tool}};
 //! use serde::{Deserialize, Serialize};
 //! use schemars::JsonSchema;
 //!
@@ -75,7 +84,7 @@
 //!     }
 //! }
 //!
-//! async fn weather_bot(model: impl LanguageModel) -> aither::Result {
+//! async fn weather_bot(model: impl LanguageModel) -> aither_core::Result {
 //!     let request = Request::new(vec![
 //!         Message::user("What's the weather like in Tokyo?")
 //!     ]).with_tool(WeatherTool);
@@ -91,13 +100,13 @@
 //! ### Semantic Search with Embeddings
 //!
 //! ```rust
-//! use aither::EmbeddingModel;
+//! use aither_core::EmbeddingModel;
 //!
 //! async fn find_similar_docs(
 //!     model: impl EmbeddingModel,
 //!     query: &str,
 //!     documents: &[&str]
-//! ) -> aither::Result<Vec<f32>> {
+//! ) -> aither_core::Result<Vec<f32>> {
 //!     // Convert query to vector
 //!     let query_embedding = model.embed(query).await?;
 //!     
@@ -111,7 +120,7 @@
 //! ### Progressive Image Generation
 //!
 //! ```rust
-//! use aither::{ImageGenerator, image::{Prompt, Size}};
+//! use aither_core::{ImageGenerator, image::{Prompt, Size}};
 //! use futures_lite::StreamExt;
 //!
 //! async fn generate_image(generator: impl ImageGenerator) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -133,6 +142,14 @@
 //!     Ok(final_image) // Return the final highest-quality image
 //! }
 //! ```
+//!
+//! ## Modules
+//!
+//! - [`audio`] — text-to-speech and transcription traits.
+//! - [`embedding`] — turn text into dense vectors.
+//! - [`image`] — image generation + editing APIs.
+//! - [`llm`] — request builders, messages, provider traits, reasoning streams.
+//! - [`moderation`] — moderation scoring traits.
 //!
 //!
 

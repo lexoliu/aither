@@ -15,6 +15,8 @@ pub struct GenerateContentRequest {
     pub(crate) tools: Vec<GeminiTool>,
     #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
     pub(crate) tool_config: Option<ToolConfig>,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking_config: Option<ThinkingConfig>,
     #[serde(
         rename = "safetySettings",
         default,
@@ -64,6 +66,14 @@ impl GeminiContent {
             .iter()
             .find_map(|part| part.function_call.clone())
     }
+
+    pub(crate) fn reasoning_chunks(&self) -> Vec<String> {
+        let mut chunks = Vec::new();
+        for part in &self.parts {
+            part.collect_reasoning(&mut chunks);
+        }
+        chunks
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +86,8 @@ pub struct Part {
     function_call: Option<FunctionCall>,
     #[serde(rename = "functionResponse", skip_serializing_if = "Option::is_none")]
     function_response: Option<FunctionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<Value>,
 }
 
 impl Part {
@@ -85,6 +97,7 @@ impl Part {
             inline_data: None,
             function_call: None,
             function_response: None,
+            metadata: None,
         }
     }
 
@@ -94,6 +107,7 @@ impl Part {
             inline_data: Some(InlineData::new("image/png", data)),
             function_call: None,
             function_response: None,
+            metadata: None,
         }
     }
 
@@ -103,6 +117,7 @@ impl Part {
             inline_data: Some(InlineData::new("application/octet-stream", data)),
             function_call: None,
             function_response: None,
+            metadata: None,
         }
     }
 
@@ -112,6 +127,7 @@ impl Part {
             inline_data: Some(InlineData::new("audio/wav", data)),
             function_call: None,
             function_response: None,
+            metadata: None,
         }
     }
 
@@ -121,7 +137,40 @@ impl Part {
             inline_data: None,
             function_call: None,
             function_response: Some(FunctionResponse { name, response }),
+            metadata: None,
         }
+    }
+
+    fn collect_reasoning(&self, output: &mut Vec<String>) {
+        if let Some(meta) = &self.metadata {
+            collect_reasoning_values(meta, output, false);
+        }
+    }
+}
+
+fn collect_reasoning_values(value: &Value, output: &mut Vec<String>, matched: bool) {
+    match value {
+        Value::String(text) => {
+            if matched && !text.is_empty() {
+                output.push(text.clone());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_reasoning_values(item, output, matched);
+            }
+        }
+        Value::Object(map) => {
+            for (key, val) in map {
+                let key_lower = key.to_ascii_lowercase();
+                let next_matched = matched
+                    || key_lower.contains("reason")
+                    || key_lower.contains("think")
+                    || key_lower.contains("summary");
+                collect_reasoning_values(val, output, next_matched);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -330,4 +379,12 @@ pub struct EmbedContentResponse {
 #[derive(Debug, Deserialize)]
 pub struct EmbeddingValue {
     pub(crate) values: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThinkingConfig {
+    #[serde(rename = "includeThinking")]
+    pub(crate) include_thinking: bool,
+    #[serde(rename = "tokenBudget", skip_serializing_if = "Option::is_none")]
+    pub(crate) token_budget: Option<i32>,
 }

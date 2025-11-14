@@ -59,7 +59,7 @@ use schemars::Schema;
 ///     .max_tokens(1000)
 ///     .seed(42);
 /// ```
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Parameters {
     /// Sampling temperature.
@@ -125,6 +125,15 @@ pub struct Parameters {
     /// Specifies which tools the model is allowed to use.
     pub tool_choice: Option<Vec<String>>,
 
+    /// Preferred reasoning effort when supported.
+    pub reasoning_effort: Option<ReasoningEffort>,
+
+    /// Thinking budget (in tokens) for providers that split reasoning and response phases.
+    pub reasoning_budget_tokens: Option<u32>,
+
+    /// Whether the provider should include reasoning summaries in the response stream.
+    pub include_reasoning: bool,
+
     /// Whether to enable structured outputs.
     ///
     /// When true, the model will attempt to return outputs in a structured format (e.g., JSON).
@@ -175,6 +184,48 @@ impl_with_methods! {
         logprobs: bool,
         top_logprobs: u8,
         stop: Vec<String>,
+        reasoning_budget_tokens: u32,
+    }
+}
+
+impl Parameters {
+    /// Sets whether providers should include reasoning summaries.
+    #[must_use]
+    pub const fn include_reasoning(mut self, include: bool) -> Self {
+        self.include_reasoning = include;
+        self
+    }
+
+    /// Sets the preferred reasoning effort.
+    #[must_use]
+    pub const fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+}
+
+/// Effort levels available for reasoning-focused models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Fastest, least compute-intensive reasoning.
+    Low,
+    /// Balanced reasoning depth.
+    Medium,
+    /// Maximum reasoning depth and accuracy.
+    High,
+}
+
+impl ReasoningEffort {
+    /// Returns the string representation expected by providers.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
     }
 }
 

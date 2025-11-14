@@ -1,14 +1,11 @@
 use aither_core::{
     LanguageModel,
     llm::{
-        Message, Role,
+        LLMRequest, Message, ReasoningStream, ResponseChunk, Role,
         model::{Ability, Parameters, Profile},
-        tool::{ToolDefinition, Tools},
+        tool::ToolDefinition,
     },
 };
-use async_stream::try_stream;
-use futures_core::Stream;
-use futures_lite::{StreamExt, pin};
 use schemars::Schema;
 use serde_json::Value;
 
@@ -18,7 +15,7 @@ use crate::{
     error::GeminiError,
     types::{
         FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration, GeminiContent, GeminiTool,
-        GenerateContentRequest, GenerationConfig, ToolConfig,
+        GenerateContentRequest, GenerationConfig, ThinkingConfig, ToolConfig,
     },
 };
 
@@ -27,85 +24,144 @@ const MAX_TOOL_ITERATIONS: usize = 8;
 impl LanguageModel for GeminiBackend {
     type Error = GeminiError;
 
+    #[allow(clippy::too_many_lines)]
     fn respond(
         &self,
-        messages: &[Message],
-        tools: &mut Tools,
-        parameters: &Parameters,
-    ) -> impl Stream<Item = Result<String, Self::Error>> + Send {
+        request: LLMRequest,
+    ) -> impl aither_core::llm::LLMResponse<Error = Self::Error> {
+        enum State<'tools> {
+            Processing {
+                iterations: usize,
+                contents: Vec<GeminiContent>,
+                tools: Option<&'tools mut aither_core::llm::tool::Tools>,
+            },
+            Done,
+        }
+
         let cfg = self.config();
-        let (system_instruction, mut contents) = messages_to_gemini(messages);
-        let tool_defs = tools.definitions();
-        let tool_config = build_tool_config(parameters, !tool_defs.is_empty());
+        let (messages, parameters, tools) = request.into_parts();
+        let (system_instruction, contents) = messages_to_gemini(&messages);
+        let tool_defs = tools.as_ref().map(|t| t.definitions()).unwrap_or_default();
+        let tool_config = build_tool_config(&parameters, !tool_defs.is_empty());
         let tools_payload = convert_tool_definitions(tool_defs);
-        let generation_config = build_generation_config(parameters, None);
+        let generation_config = build_generation_config(&parameters, None);
+        let thinking_config = build_thinking_config(&parameters);
 
-        try_stream! {
-            let mut iterations = 0usize;
-            loop {
-                iterations += 1;
-                if iterations > MAX_TOOL_ITERATIONS {
-                    Err(GeminiError::Api("exceeded Gemini tool calling iteration limit".into()))?;
-                }
-                let request = GenerateContentRequest {
-                    system_instruction: system_instruction.clone(),
-                    contents: contents.clone(),
-                    generation_config: generation_config.clone(),
-                    tools: tools_payload.clone(),
-                    tool_config: tool_config.clone(),
-                    safety_settings: Vec::new(),
-                };
-                let response = call_generate(cfg.clone(), &cfg.text_model, request).await?;
-                if let Some(candidate) = response.primary_candidate() {
-                    if let Some(content) = &candidate.content {
-                        if let Some(call) = content.first_function_call() {
-                            contents.push(content.clone());
-                            let args_json =
-                                serde_json::to_string(&call.args).unwrap_or_else(|_| "{}".to_string());
-                            let tool_output = tools
-                                .call(&call.name, args_json)
-                                .await
-                                .map_err(|err| GeminiError::Api(err.to_string()))?;
-                            let response_value = serde_json::from_str::<Value>(&tool_output)
-                                .unwrap_or(Value::String(tool_output));
-                            contents.push(GeminiContent::function_response(
-                                call.name.clone(),
-                                response_value,
-                            ));
-                            continue;
-                        }
+        let stream = futures_lite::stream::unfold(
+            State::Processing {
+                iterations: 0,
+                contents,
+                tools,
+            },
+            move |state| {
+                let cfg = cfg.clone();
+                let system_instruction = system_instruction.clone();
+                let generation_config = generation_config.clone();
+                let tools_payload = tools_payload.clone();
+                let tool_config = tool_config.clone();
+                let thinking_config = thinking_config.clone();
 
-                        for text in content.text_chunks() {
-                            if !text.is_empty() {
-                                yield text;
-                            }
-                        }
-                        contents.push(content.clone());
-                        break;
+                async move {
+                    let (iterations, mut contents, mut tools) = match state {
+                        State::Processing {
+                            iterations,
+                            contents,
+                            tools,
+                        } => (iterations, contents, tools),
+                        State::Done => return None,
+                    };
+
+                    let next_iteration = iterations + 1;
+                    if next_iteration > MAX_TOOL_ITERATIONS {
+                        return Some((
+                            Err(GeminiError::Api(
+                                "exceeded Gemini tool calling iteration limit".into(),
+                            )),
+                            State::Done,
+                        ));
                     }
+
+                    let request = GenerateContentRequest {
+                        system_instruction: system_instruction.clone(),
+                        contents: contents.clone(),
+                        generation_config: generation_config.clone(),
+                        tools: tools_payload.clone(),
+                        tool_config: tool_config.clone(),
+                        thinking_config: thinking_config.clone(),
+                        safety_settings: Vec::new(),
+                    };
+
+                    let response = match call_generate(cfg.clone(), &cfg.text_model, request).await
+                    {
+                        Ok(r) => r,
+                        Err(e) => return Some((Err(e), State::Done)),
+                    };
+
+                    let Some(candidate) = response.primary_candidate() else {
+                        return Some((
+                            Err(GeminiError::Api("Gemini response missing candidate".into())),
+                            State::Done,
+                        ));
+                    };
+
+                    let Some(content) = &candidate.content else {
+                        return Some((
+                            Err(GeminiError::Api("Gemini response missing content".into())),
+                            State::Done,
+                        ));
+                    };
+
+                    if let Some(call) = content.first_function_call() {
+                        contents.push(content.clone());
+                        let args_json =
+                            serde_json::to_string(&call.args).unwrap_or_else(|_| "{}".to_string());
+                        let tool_output = if let Some(t) = &mut tools {
+                            match t.call(&call.name, &args_json).await {
+                                Ok(output) => output,
+                                Err(err) => {
+                                    return Some((
+                                        Err(GeminiError::Api(err.to_string())),
+                                        State::Done,
+                                    ));
+                                }
+                            }
+                        } else {
+                            return Some((
+                                Err(GeminiError::Api(
+                                    "Tool call requested but no tools available".into(),
+                                )),
+                                State::Done,
+                            ));
+                        };
+                        let response_value = serde_json::from_str::<Value>(&tool_output)
+                            .unwrap_or(Value::String(tool_output));
+                        contents.push(GeminiContent::function_response(
+                            call.name.clone(),
+                            response_value,
+                        ));
+                        return Some((
+                            Ok(ResponseChunk::default()),
+                            State::Processing {
+                                iterations: next_iteration,
+                                contents,
+                                tools,
+                            },
+                        ));
+                    }
+
+                    let mut chunk = ResponseChunk::default();
+                    for text in content.text_chunks() {
+                        chunk.push_text(text);
+                    }
+                    for reasoning in content.reasoning_chunks() {
+                        chunk.push_reasoning(reasoning);
+                    }
+                    Some((Ok(chunk), State::Done))
                 }
+            },
+        );
 
-                // No candidate -> treat as empty response.
-                break;
-            }
-        }
-    }
-
-    fn complete(&self, prefix: &str) -> impl Stream<Item = Result<String, Self::Error>> + Send {
-        let messages = [
-            Message::system("Continue the supplied text."),
-            Message::user(prefix),
-        ];
-        let mut tools = Tools::new();
-        let params = Parameters::default();
-        let model = self.clone();
-        try_stream! {
-            let stream = model.respond(&messages, &mut tools, &params);
-            pin!(stream);
-            while let Some(chunk) = stream.next().await {
-                yield chunk?;
-            }
-        }
+        ReasoningStream::new(stream)
     }
 
     fn profile(&self) -> impl core::future::Future<Output = Profile> + Send {
@@ -201,6 +257,22 @@ fn build_tool_config(parameters: &Parameters, has_tools: bool) -> Option<ToolCon
                 FunctionCallingMode::Auto
             },
             allowed_function_names: allowed,
+        }),
+    })
+}
+
+fn build_thinking_config(parameters: &Parameters) -> Option<ThinkingConfig> {
+    if !parameters.include_reasoning && parameters.reasoning_budget_tokens.is_none() {
+        return None;
+    }
+    Some(ThinkingConfig {
+        include_thinking: parameters.include_reasoning
+            || parameters.reasoning_budget_tokens.is_some(),
+        token_budget: parameters.reasoning_budget_tokens.map(|tokens| {
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                tokens as i32
+            }
         }),
     })
 }

@@ -2,7 +2,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::{
     LanguageModel,
-    llm::{Message, Tool, model::Parameters, tool::Tools, try_collect},
+    llm::{LLMRequest, Message, Tool, tool::Tools, try_collect},
 };
 
 /// A struct representing an Assistant that interacts with a language model (LLM),
@@ -78,8 +78,8 @@ impl<LLM: LanguageModel> Assistant<LLM> {
     /// Returns an error if the language model fails to generate a response or if message processing fails.
     pub async fn send(&mut self, message: impl Into<String>) -> anyhow::Result<()> {
         self.messages.push(Message::user(message));
-        let binding = Parameters::default();
-        let stream = self.llm.respond(&self.messages, &mut self.tools, &binding);
+        let request = LLMRequest::new(self.messages.as_slice()).with_tools(&mut self.tools);
+        let stream = self.llm.respond(request);
 
         let response = try_collect(stream).await?;
         self.messages.push(Message::assistant(response));

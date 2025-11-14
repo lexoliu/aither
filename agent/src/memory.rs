@@ -1,6 +1,6 @@
 use aither_core::{
     LanguageModel, Result,
-    llm::{Message, model::Parameters, tool::Tools},
+    llm::{Message, oneshot, tool::Tools},
 };
 use anyhow::Context;
 
@@ -136,7 +136,7 @@ impl ContextStrategy {
                 }
 
                 let dialogue = format_messages(&overflow);
-                let summary_text = summarize(llm, tools, instructions, dialogue).await?;
+                let summary_text = compress(llm, instructions, dialogue).await?;
                 let summary_message =
                     Message::system(format!("Compressed context:\n{summary_text}"));
                 memory.push_summary(summary_message);
@@ -154,23 +154,22 @@ fn format_messages(messages: &[Message]) -> String {
         .join("\n")
 }
 
-async fn summarize<LLM: LanguageModel>(
+async fn compress<LLM: LanguageModel>(
     llm: &LLM,
-    tools: &mut Tools,
     instructions: &str,
     dialogue: String,
 ) -> Result<String> {
-    let messages = [
-        Message::system(
-            "You are a memory compressor. Compress the conversation without losing key facts.",
-        ),
-        Message::user(format!(
-            "Instructions: {instructions}\nConversation:\n{dialogue}"
-        )),
-    ];
+    let system = if instructions.is_empty() {
+        "You are a memory compressor. Compress the conversation without losing key facts.".into()
+    } else {
+        format!(
+            "You are a memory compressor. Compress the conversation without losing key facts. \
+             Follow these extra instructions: {instructions}"
+        )
+    };
 
     let summary: String = llm
-        .generate(&messages, tools, &Parameters::default())
+        .generate(oneshot(system, dialogue))
         .await
         .context("Context compression failed")?;
 

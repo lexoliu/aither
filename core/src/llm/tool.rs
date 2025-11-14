@@ -201,7 +201,7 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> Cow<'static, str>;
 
     /// Tool arguments type. Must implement [`schemars::JsonSchema`] and [`serde::de::DeserializeOwned`].
-    type Arguments: JsonSchema + DeserializeOwned;
+    type Arguments: Send + JsonSchema + DeserializeOwned;
 
     /// Executes the tool with the provided arguments.
     ///
@@ -226,16 +226,22 @@ pub fn json<T: Serialize>(value: &T) -> String {
 }
 
 trait ToolImpl: Send + Sync {
-    fn call(&mut self, args: String) -> Pin<Box<dyn Future<Output = Result> + Send + '_>>;
+    fn call(&mut self, args: &str) -> Pin<Box<dyn Future<Output = Result> + Send + '_>>;
     fn definition(&self) -> ToolDefinition;
 }
 
 impl<T: Tool> ToolImpl for T {
-    fn call(&mut self, args: String) -> Pin<Box<dyn Future<Output = Result> + Send + '_>> {
-        Box::pin(async move {
-            let arguments: T::Arguments = serde_json::from_str(&args)?;
-            self.call(arguments).await
-        })
+    fn call(&mut self, args: &str) -> Pin<Box<dyn Future<Output = Result> + Send + '_>> {
+        let Ok(arguments) = serde_json::from_str::<T::Arguments>(args) else {
+            return Box::pin(async move {
+                Err(anyhow::Error::msg(format!(
+                    "Failed to parse arguments for tool '{}'",
+                    self.name()
+                )))
+            });
+        };
+
+        Box::pin(async move { self.call(arguments).await })
     }
 
     fn definition(&self) -> ToolDefinition {
@@ -261,7 +267,7 @@ impl<T: Tool> ToolImpl for T {
 /// // let result = tools.call("calculator", r#"{"operation": "add", "a": 5, "b": 3}"#).await;
 /// ```
 pub struct Tools {
-    tools: BTreeMap<String, Box<dyn ToolImpl>>,
+    tools: BTreeMap<Cow<'static, str>, Box<dyn ToolImpl>>,
 }
 
 impl Debug for Tools {
@@ -342,7 +348,7 @@ impl Tools {
     /// The tool must implement [`Tool`] and be `'static`.
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
         self.tools
-            .insert(tool.name().to_string(), Box::new(tool) as Box<dyn ToolImpl>);
+            .insert(tool.name(), Box::new(tool) as Box<dyn ToolImpl>);
     }
 
     /// Removes a tool from the registry.
@@ -356,7 +362,7 @@ impl Tools {
     ///
     /// Returns an error if the tool is not found, arguments cannot be parsed,
     /// or tool execution fails.
-    pub async fn call(&mut self, name: &str, args: String) -> Result {
+    pub async fn call(&mut self, name: &str, args: &str) -> Result {
         if let Some(tool) = self.tools.get_mut(name) {
             tool.call(args).await
         } else {
@@ -479,10 +485,7 @@ mod tests {
         assert_eq!(definitions[0].name, "calculator");
 
         let result = tools
-            .call(
-                "calculator",
-                r#"{"operation": "add", "a": 5, "b": 3}"#.to_string(),
-            )
+            .call("calculator", r#"{"operation": "add", "a": 5, "b": 3}"#)
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "8");
@@ -495,10 +498,7 @@ mod tests {
 
         // Test addition
         let result = tools
-            .call(
-                "calculator",
-                r#"{"operation": "add", "a": 10, "b": 5}"#.to_string(),
-            )
+            .call("calculator", r#"{"operation": "add", "a": 10, "b": 5}"#)
             .await;
         assert_eq!(result.unwrap(), "15");
 
@@ -506,26 +506,20 @@ mod tests {
         let result = tools
             .call(
                 "calculator",
-                r#"{"operation": "subtract", "a": 10, "b": 3}"#.to_string(),
+                r#"{"operation": "subtract", "a": 10, "b": 3}"#,
             )
             .await;
         assert_eq!(result.unwrap(), "7");
 
         // Test multiplication
         let result = tools
-            .call(
-                "calculator",
-                r#"{"operation": "multiply", "a": 4, "b": 3}"#.to_string(),
-            )
+            .call("calculator", r#"{"operation": "multiply", "a": 4, "b": 3}"#)
             .await;
         assert_eq!(result.unwrap(), "12");
 
         // Test division
         let result = tools
-            .call(
-                "calculator",
-                r#"{"operation": "divide", "a": 15, "b": 3}"#.to_string(),
-            )
+            .call("calculator", r#"{"operation": "divide", "a": 15, "b": 3}"#)
             .await;
         assert_eq!(result.unwrap(), "5");
     }
@@ -536,10 +530,7 @@ mod tests {
         tools.register(Calculator);
 
         let result = tools
-            .call(
-                "calculator",
-                r#"{"operation": "divide", "a": 10, "b": 0}"#.to_string(),
-            )
+            .call("calculator", r#"{"operation": "divide", "a": 10, "b": 0}"#)
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Division by zero"));
@@ -551,10 +542,7 @@ mod tests {
         tools.register(Calculator);
 
         let result = tools
-            .call(
-                "calculator",
-                r#"{"operation": "modulo", "a": 10, "b": 3}"#.to_string(),
-            )
+            .call("calculator", r#"{"operation": "modulo", "a": 10, "b": 3}"#)
             .await;
         assert!(result.is_err());
         assert!(
@@ -586,16 +574,11 @@ mod tests {
 
         // Test both tools
         let calc_result = tools
-            .call(
-                "calculator",
-                r#"{"operation": "add", "a": 2, "b": 3}"#.to_string(),
-            )
+            .call("calculator", r#"{"operation": "add", "a": 2, "b": 3}"#)
             .await;
         assert_eq!(calc_result.unwrap(), "5");
 
-        let greet_result = tools
-            .call("greeter", r#"{"name": "Alice"}"#.to_string())
-            .await;
+        let greet_result = tools.call("greeter", r#"{"name": "Alice"}"#).await;
         assert_eq!(greet_result.unwrap(), "Hello, Alice!");
     }
 
@@ -603,7 +586,7 @@ mod tests {
     async fn tool_not_found() {
         let mut tools = Tools::new();
 
-        let result = tools.call("nonexistent", "{}".to_string()).await;
+        let result = tools.call("nonexistent", "{}").await;
         assert!(result.is_err());
         assert!(
             result
@@ -618,7 +601,7 @@ mod tests {
         let mut tools = Tools::new();
         tools.register(Calculator);
 
-        let result = tools.call("calculator", "invalid json".to_string()).await;
+        let result = tools.call("calculator", "invalid json").await;
         assert!(result.is_err());
     }
 

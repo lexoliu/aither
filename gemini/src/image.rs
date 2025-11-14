@@ -1,6 +1,6 @@
 use aither_core::image::{Data as ImageData, ImageGenerator, Prompt, Size};
-use async_stream::try_stream;
 use futures_core::Stream;
+use futures_lite::StreamExt;
 
 use crate::{
     client::call_generate,
@@ -20,7 +20,13 @@ impl ImageGenerator for GeminiBackend {
         let cfg = self.config();
         let text = prompt.text().to_owned();
         let images = prompt.images().to_vec();
-        try_stream! {
+        let size_desc = format!(
+            "Generate an image roughly {}x{} pixels.",
+            size.width(),
+            size.height()
+        );
+
+        futures_lite::stream::iter(vec![async move {
             let model = cfg.image_model.clone().ok_or_else(|| {
                 GeminiError::Api("image generation is disabled for this Gemini backend".into())
             })?;
@@ -28,11 +34,7 @@ impl ImageGenerator for GeminiBackend {
             for image in images {
                 parts.push(Part::inline_image(image));
             }
-            parts.push(Part::text(format!(
-                "Generate an image roughly {}x{} pixels.",
-                size.width(),
-                size.height()
-            )));
+            parts.push(Part::text(size_desc));
 
             let request = GenerateContentRequest {
                 system_instruction: None,
@@ -43,20 +45,27 @@ impl ImageGenerator for GeminiBackend {
                 }),
                 tools: Vec::new(),
                 tool_config: None,
+                thinking_config: None,
                 safety_settings: Vec::new(),
             };
-            let response = call_generate(cfg.clone(), &model, request).await?;
-            if let Some(candidate) = response.primary_candidate() {
-                if let Some(content) = &candidate.content {
-                    for part in &content.parts {
-                        if let Some(inline) = &part.inline_data {
-                            let bytes = inline.decode()?;
-                            yield bytes;
-                        }
-                    }
-                }
-            }
-        }
+            call_generate(cfg, &model, request).await
+        }])
+        .then(|fut| fut)
+        .filter_map(Result::ok)
+        .flat_map(|response| {
+            let parts = response
+                .primary_candidate()
+                .and_then(|candidate| candidate.content.as_ref())
+                .map(|content| content.parts.clone())
+                .unwrap_or_default();
+            futures_lite::stream::iter(parts)
+                .filter_map(|part| {
+                    part.inline_data
+                        .as_ref()
+                        .and_then(|inline| inline.decode().ok())
+                })
+                .map(Ok)
+        })
     }
 
     fn edit(
@@ -68,12 +77,15 @@ impl ImageGenerator for GeminiBackend {
         let mask_bytes = mask.to_vec();
         let text = prompt.text().to_owned();
         let base_image = prompt.images().first().cloned();
-        try_stream! {
+
+        futures_lite::stream::iter(vec![async move {
             let model = cfg.image_model.clone().ok_or_else(|| {
                 GeminiError::Api("image generation is disabled for this Gemini backend".into())
             })?;
             let base_image = base_image.ok_or_else(|| {
-                GeminiError::Api("image editing requires Prompt::with_image to supply a base image".into())
+                GeminiError::Api(
+                    "image editing requires Prompt::with_image to supply a base image".into(),
+                )
             })?;
             let mut parts = vec![Part::inline_image(base_image)];
             if !mask_bytes.is_empty() {
@@ -91,19 +103,26 @@ impl ImageGenerator for GeminiBackend {
                 }),
                 tools: Vec::new(),
                 tool_config: None,
+                thinking_config: None,
                 safety_settings: Vec::new(),
             };
-            let response = call_generate(cfg.clone(), &model, request).await?;
-            if let Some(candidate) = response.primary_candidate() {
-                if let Some(content) = &candidate.content {
-                    for part in &content.parts {
-                        if let Some(inline) = &part.inline_data {
-                            let bytes = inline.decode()?;
-                            yield bytes;
-                        }
-                    }
-                }
-            }
-        }
+            call_generate(cfg, &model, request).await
+        }])
+        .then(|fut| fut)
+        .filter_map(Result::ok)
+        .flat_map(|response| {
+            let parts = response
+                .primary_candidate()
+                .and_then(|candidate| candidate.content.as_ref())
+                .map(|content| content.parts.clone())
+                .unwrap_or_default();
+            futures_lite::stream::iter(parts)
+                .filter_map(|part| {
+                    part.inline_data
+                        .as_ref()
+                        .and_then(|inline| inline.decode().ok())
+                })
+                .map(Ok)
+        })
     }
 }

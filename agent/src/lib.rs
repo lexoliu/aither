@@ -71,7 +71,7 @@ impl AgentConfig {
                     .into(),
             },
             max_iterations: 64,
-            mode: AgentMode::Coder,
+            mode: AgentMode::Coder(Coder),
         }
     }
 
@@ -108,13 +108,17 @@ pub enum AgentMode {
     /// Companion agent for conversational interactions.
     Companion,
     /// Coder agent with filesystem and command execution capabilities.
-    Coder,
+    Coder(Coder),
     /// Knowledge base agent with read-only filesystem access.
     KnowledgeBase {
         /// Root directory for knowledge base access.
         root: PathBuf,
     },
 }
+
+/// Dedicated type representing the coder operating mode.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Coder;
 
 /// An autonomous agent that plans and executes actions to achieve goals using a language model.
 #[derive(Debug)]
@@ -231,7 +235,7 @@ where
     fn bootstrap_mode_tools(&mut self) {
         match &self.config.mode {
             AgentMode::Generic | AgentMode::Companion => {}
-            AgentMode::Coder => {
+            AgentMode::Coder(_) => {
                 #[cfg(feature = "filesystem")]
                 {
                     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

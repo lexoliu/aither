@@ -9,14 +9,13 @@ use crate::{
 use aither_core::{
     LanguageModel,
     llm::{
-        Message,
-        model::{Ability, Parameters, Profile as ModelProfile},
-        tool::Tools,
+        LLMRequest, LLMResponse, ReasoningStream,
+        model::{Ability, Profile as ModelProfile},
+        oneshot,
     },
 };
-use async_stream::try_stream;
 use futures_core::Stream;
-use futures_lite::{StreamExt, pin};
+use futures_lite::StreamExt;
 use std::{future::Future, sync::Arc};
 use zenwave::{Client, client, header};
 
@@ -131,18 +130,15 @@ impl OpenAI {
 impl LanguageModel for OpenAI {
     type Error = OpenAIError;
 
-    fn respond(
-        &self,
-        messages: &[Message],
-        tools: &mut Tools,
-        parameters: &Parameters,
-    ) -> impl Stream<Item = Result<String, Self::Error>> + Send {
+    fn respond(&self, mut request: LLMRequest) -> impl LLMResponse<Error = Self::Error> {
         let cfg = self.inner.clone();
-        let payload_messages = to_chat_messages(messages);
-        let snapshot = ParameterSnapshot::from(parameters);
-        let openai_tools = convert_tools(tools.definitions());
+        let payload_messages = to_chat_messages(request.messages());
+        let snapshot = ParameterSnapshot::from(request.parameters());
+        let openai_tools = request
+            .tools()
+            .map(|tools| convert_tools(tools.definitions()));
 
-        try_stream! {
+        let init_future = async move {
             let endpoint = cfg.request_url("/chat/completions");
             let mut backend = client();
             let mut builder = backend.post(endpoint);
@@ -161,43 +157,40 @@ impl LanguageModel for OpenAI {
                 true,
             );
 
-            builder = builder.json_body(&request).map_err(OpenAIError::from)?;
-            let mut stream = builder.sse().await.map_err(OpenAIError::from)?;
+            builder
+                .json_body(&request)
+                .map_err(OpenAIError::from)?
+                .sse()
+                .await
+                .map_err(OpenAIError::from)
+        };
 
-            while let Some(event) = stream.next().await {
-                let event = event.map_err(OpenAIError::from)?;
-                if should_skip_event(&event) {
-                    continue;
-                }
-                if event.text_data() == "[DONE]" {
-                    break;
-                }
-                let chunk: ChatCompletionChunk =
-                    serde_json::from_str(event.text_data()).map_err(OpenAIError::from)?;
-                if let Some(text) = chunk.into_text() {
-                    if !text.is_empty() {
-                        yield text;
-                    }
-                }
-            }
-        }
+        let events = futures_lite::stream::iter(vec![init_future])
+            .then(|fut| fut)
+            .filter_map(Result::ok)
+            .flatten();
+
+        let chunks = events
+            .filter_map(|event| match &event {
+                Ok(e) if should_skip_event(e) => None,
+                Ok(e) if e.text_data() == "[DONE]" => None,
+                _ => Some(event),
+            })
+            .map(|event| match event {
+                Ok(e) => serde_json::from_str::<ChatCompletionChunk>(e.text_data())
+                    .map(ChatCompletionChunk::into_chunk)
+                    .map_err(OpenAIError::from),
+                Err(err) => Err(OpenAIError::from(err)),
+            });
+
+        ReasoningStream::new(chunks)
     }
 
     fn complete(&self, prefix: &str) -> impl Stream<Item = Result<String, Self::Error>> + Send {
-        let messages = vec![
-            Message::system("Continue the user provided text without additional commentary."),
-            Message::user(prefix),
-        ];
-        let model = self.clone();
-        try_stream! {
-            let mut tools = Tools::new();
-            let parameters = Parameters::default();
-            let stream = model.respond(&messages, &mut tools, &parameters);
-            pin!(stream);
-            while let Some(chunk) = stream.next().await {
-                yield chunk?;
-            }
-        }
+        self.respond(oneshot(
+            "Continue the user provided text without additional commentary.",
+            prefix,
+        ))
     }
 
     fn profile(&self) -> impl Future<Output = ModelProfile> + Send {

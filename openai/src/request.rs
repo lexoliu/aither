@@ -1,4 +1,8 @@
-use aither_core::llm::{Annotation, Message, Role, model::Parameters, tool::ToolDefinition};
+use aither_core::llm::{
+    Annotation, Message, Role,
+    model::{Parameters, ReasoningEffort},
+    tool::ToolDefinition,
+};
 use schemars::Schema;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -19,6 +23,7 @@ pub struct ParameterSnapshot {
     pub(crate) tool_choice: Option<Vec<String>>,
     pub(crate) logprobs: Option<bool>,
     pub(crate) top_logprobs: Option<u8>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl From<&Parameters> for ParameterSnapshot {
@@ -40,6 +45,7 @@ impl From<&Parameters> for ParameterSnapshot {
             tool_choice: value.tool_choice.clone(),
             logprobs: value.logprobs,
             top_logprobs: value.top_logprobs,
+            reasoning_effort: value.reasoning_effort,
         }
     }
 }
@@ -75,6 +81,8 @@ pub struct ChatCompletionRequest {
     tool_choice: Option<ToolChoicePayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormatPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningPayload>,
 }
 
 impl ChatCompletionRequest {
@@ -102,6 +110,7 @@ impl ChatCompletionRequest {
             tools,
             tool_choice: tool_choice(params),
             response_format: response_format(params),
+            reasoning: reasoning(params),
         }
     }
 }
@@ -154,6 +163,12 @@ struct JsonSchemaPayload {
     strict: Option<bool>,
 }
 
+#[derive(Debug, Serialize)]
+struct ReasoningPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<&'static str>,
+}
+
 pub fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
     messages
         .iter()
@@ -204,24 +219,18 @@ fn flatten_content(message: &Message) -> String {
     content
 }
 
-pub fn convert_tools(definitions: Vec<ToolDefinition>) -> Option<Vec<ToolPayload>> {
-    if definitions.is_empty() {
-        return None;
-    }
-
-    Some(
-        definitions
-            .into_iter()
-            .map(|tool| ToolPayload {
-                r#type: "function",
-                function: ToolFunction {
-                    name: tool.name().to_string(),
-                    description: tool.description().to_string(),
-                    parameters: schema_to_value(tool.arguments_schema()),
-                },
-            })
-            .collect(),
-    )
+pub fn convert_tools(definitions: Vec<ToolDefinition>) -> Vec<ToolPayload> {
+    definitions
+        .into_iter()
+        .map(|tool| ToolPayload {
+            r#type: "function",
+            function: ToolFunction {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: schema_to_value(tool.arguments_schema()),
+            },
+        })
+        .collect()
 }
 
 fn schema_to_value(schema: &Schema) -> Value {
@@ -261,4 +270,10 @@ fn response_format(params: &ParameterSnapshot) -> Option<ResponseFormatPayload> 
                 None
             }
         })
+}
+
+fn reasoning(params: &ParameterSnapshot) -> Option<ReasoningPayload> {
+    params.reasoning_effort.map(|effort| ReasoningPayload {
+        effort: Some(effort.as_str()),
+    })
 }

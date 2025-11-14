@@ -3,7 +3,7 @@ use crate::{
     error::OpenAIError,
 };
 use aither_core::audio::{AudioGenerator, AudioTranscriber, Data};
-use async_stream::stream;
+use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use zenwave::{
@@ -15,10 +15,9 @@ impl AudioGenerator for OpenAI {
     fn generate(&self, prompt: &str) -> impl futures_core::Stream<Item = Data> + Send {
         let cfg = self.config();
         let text = prompt.to_owned();
-        stream! {
-            let result = synthesize(cfg, text).await;
-            yield handle_audio_result(result, "synthesis");
-        }
+        futures_lite::stream::iter(vec![synthesize(cfg, text)])
+            .then(|fut| fut)
+            .map(|result| handle_audio_result(result, "synthesis"))
     }
 }
 
@@ -26,10 +25,9 @@ impl AudioTranscriber for OpenAI {
     fn transcribe(&self, audio: &[u8]) -> impl futures_core::Stream<Item = String> + Send {
         let cfg = self.config();
         let payload = audio.to_vec();
-        stream! {
-            let result = transcribe_once(cfg, payload).await;
-            yield handle_transcription_result(result);
-        }
+        futures_lite::stream::iter(vec![transcribe_once(cfg, payload)])
+            .then(|fut| fut)
+            .map(handle_transcription_result)
     }
 }
 

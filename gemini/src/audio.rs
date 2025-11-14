@@ -1,5 +1,5 @@
 use aither_core::audio::{AudioGenerator, AudioTranscriber, Data as AudioData};
-use async_stream::stream;
+use futures_lite::StreamExt;
 
 use crate::{
     client::call_generate,
@@ -15,10 +15,9 @@ impl AudioGenerator for GeminiBackend {
     fn generate(&self, prompt: &str) -> impl futures_core::Stream<Item = AudioData> + Send {
         let cfg = self.config();
         let text = prompt.to_owned();
-        stream! {
-            let result = synthesize_audio(cfg, text).await;
-            yield handle_audio_result(result, "tts");
-        }
+        futures_lite::stream::iter(vec![synthesize_audio(cfg, text)])
+            .then(|fut| fut)
+            .map(|result| handle_audio_result(result, "tts"))
     }
 }
 
@@ -26,10 +25,9 @@ impl AudioTranscriber for GeminiBackend {
     fn transcribe(&self, audio: &[u8]) -> impl futures_core::Stream<Item = String> + Send {
         let cfg = self.config();
         let payload = audio.to_vec();
-        stream! {
-            let result = transcribe_audio(cfg, payload).await;
-            yield handle_transcription_result(result);
-        }
+        futures_lite::stream::iter(vec![transcribe_audio(cfg, payload)])
+            .then(|fut| fut)
+            .map(handle_transcription_result)
     }
 }
 
@@ -56,6 +54,7 @@ async fn synthesize_audio(
         }),
         tools: Vec::new(),
         tool_config: None,
+        thinking_config: None,
         safety_settings: Vec::new(),
     };
     let response = call_generate(cfg, &model, request).await?;
@@ -88,6 +87,7 @@ async fn transcribe_audio(
         generation_config: None,
         tools: Vec::new(),
         tool_config: None,
+        thinking_config: None,
         safety_settings: Vec::new(),
     };
     let response = call_generate(cfg.clone(), &cfg.text_model, request).await?;

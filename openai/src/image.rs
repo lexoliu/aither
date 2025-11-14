@@ -3,9 +3,9 @@ use crate::{
     error::OpenAIError,
 };
 use aither_core::image::{Data, ImageGenerator, Prompt, Size};
-use async_stream::try_stream;
 use base64::{Engine as _, engine::general_purpose};
 use futures_core::Stream;
+use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use zenwave::{
@@ -24,12 +24,12 @@ impl ImageGenerator for OpenAI {
         let cfg = self.config();
         let prompt_text = prompt.text().to_owned();
         let size_token = format_size(size);
-        try_stream! {
-            let images = generate_images(cfg, prompt_text, size_token).await?;
-            for image in images {
-                yield image;
-            }
-        }
+        futures_lite::stream::iter(vec![generate_images(cfg, prompt_text, size_token)])
+            .then(|fut| fut)
+            .map(|result| result.map(futures_lite::stream::iter).ok())
+            .filter_map(core::convert::identity)
+            .flatten()
+            .map(Ok)
     }
 
     fn edit(
@@ -44,13 +44,20 @@ impl ImageGenerator for OpenAI {
             OpenAIError::Api("image editing requires a base image via Prompt::with_image".into())
         });
         let mask_bytes = mask.to_vec();
-        try_stream! {
-            let base_image = base?;
-            let images = edit_image(cfg, prompt_text, size_token, base_image, mask_bytes).await?;
-            for image in images {
-                yield image;
-            }
-        }
+        futures_lite::stream::iter(base).flat_map(move |base_image| {
+            futures_lite::stream::iter(vec![edit_image(
+                cfg.clone(),
+                prompt_text.clone(),
+                size_token.clone(),
+                base_image,
+                mask_bytes.clone(),
+            )])
+            .then(|fut| fut)
+            .map(|result| result.map(futures_lite::stream::iter).ok())
+            .filter_map(core::convert::identity)
+            .flatten()
+            .map(Ok)
+        })
     }
 }
 

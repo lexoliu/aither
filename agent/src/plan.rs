@@ -2,7 +2,7 @@ use core::future::Future;
 
 use aither_core::{
     LanguageModel, Result,
-    llm::{Message, model::Parameters},
+    llm::{LLMRequest, Message},
 };
 use anyhow::Context;
 use schemars::JsonSchema;
@@ -41,12 +41,12 @@ impl Planner for DefaultPlanner {
         }
         let mut messages = vec![Message::system(system_prompt)];
         messages.extend(state.messages());
-        messages.push(Message::user(format!(
+        messages.push(Message::system(format!(
             "Plan steps to achieve: {goal}. If the goal is already complete, mark status as Completed."
         )));
 
         let response: PlanResponse = llm
-            .generate(&messages, &mut state.tools, &Parameters::default())
+            .generate(LLMRequest::new(messages).with_tools(&mut state.tools))
             .await
             .context("failed to build task list")?;
 
