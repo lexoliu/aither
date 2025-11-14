@@ -5,12 +5,12 @@ use aither_core::llm::model::Ability;
 /// Gemini REST base URL used by the Developer API.
 pub const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
-pub(crate) const USER_AGENT: &str = "aither-gemini/0.1";
-pub(crate) const DEFAULT_MODEL: &str = "gemini-2.0-flash";
-pub(crate) const DEFAULT_EMBEDDING_MODEL: &str = "gemini-embedding-001";
-pub(crate) const DEFAULT_IMAGE_MODEL: &str = "gemini-2.5-flash-image";
-pub(crate) const DEFAULT_TTS_MODEL: &str = "gemini-2.5-flash-preview-tts";
-pub(crate) const DEFAULT_TTS_VOICE: &str = "Kore";
+pub const USER_AGENT: &str = "aither-gemini/0.1";
+pub const DEFAULT_MODEL: &str = "gemini-2.0-flash";
+pub const DEFAULT_EMBEDDING_MODEL: &str = "gemini-embedding-001";
+pub const DEFAULT_IMAGE_MODEL: &str = "gemini-2.5-flash-image";
+pub const DEFAULT_TTS_MODEL: &str = "gemini-2.5-flash-preview-tts";
+pub const DEFAULT_TTS_VOICE: &str = "Kore";
 
 /// Authentication strategy supported by the Gemini backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +127,7 @@ impl GeminiBackend {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct GeminiConfig {
+pub struct GeminiConfig {
     pub(crate) api_key: String,
     pub(crate) base_url: String,
     pub(crate) auth: AuthMode,
@@ -147,7 +147,7 @@ impl GeminiConfig {
             self.base_url.trim_end_matches('/'),
             suffix.trim_start_matches('/')
         );
-        if let AuthMode::Query = self.auth {
+        if self.auth == AuthMode::Query {
             let separator = if url.contains('?') { '&' } else { '?' };
             url.push(separator);
             url.push_str("key=");
@@ -162,7 +162,7 @@ impl GeminiConfig {
     }
 }
 
-pub(crate) fn sanitize_model(model: impl Into<String>) -> String {
+pub fn sanitize_model(model: impl Into<String>) -> String {
     let model = model.into();
     if model.starts_with("models/") {
         model

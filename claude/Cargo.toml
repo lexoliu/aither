@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "Claude provider integration for aither"
+readme = "../README.md"
+keywords = ["ai", "llm", "claude", "anthropic"]
+categories = ["api-bindings"]
 
 [dependencies]
 

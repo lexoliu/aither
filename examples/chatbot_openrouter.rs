@@ -1,4 +1,4 @@
-//! Streaming CLI chatbot using OpenRouter (defaults to DeepSeek).
+//! Streaming CLI chatbot using `OpenRouter` (defaults to `DeepSeek`).
 //! Requires `OPENROUTER_API_KEY` in your environment.
 //! Run: `cargo run --example chatbot_openrouter`
 

@@ -30,6 +30,7 @@ impl TodoList {
         }
     }
 
+    /// Creates a new `TodoList` from a vector of items.
     #[must_use]
     pub const fn from_items(tasks: Vec<TodoListItem>) -> Self {
         Self { tasks }
@@ -97,6 +98,7 @@ impl TodoList {
     }
 }
 
+/// A single item in the todo list.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TodoListItem {
     /// The description of the task to be completed.
@@ -106,11 +108,13 @@ pub struct TodoListItem {
 }
 
 impl TodoListItem {
+    /// Returns the description of the task.
     #[must_use]
     pub const fn description(&self) -> &str {
         self.description.as_str()
     }
 
+    /// Returns whether the task has been completed.
     #[must_use]
     pub const fn completed(&self) -> bool {
         self.completed
@@ -165,24 +169,33 @@ pub struct SharedTodoList {
 }
 
 impl SharedTodoList {
+    /// Creates a new shared todo list.
+    #[must_use]
     pub fn new(list: TodoList) -> Self {
         Self {
             inner: Arc::new(Mutex::new(list)),
         }
     }
 
+    /// Returns a mutex guard for accessing the todo list.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
     pub fn guard(&self) -> MutexGuard<'_, TodoList> {
         self.inner.lock().expect("Shared todo list mutex poisoned")
     }
 
+    /// Executes a function with a reference to the todo list.
     pub fn with<R>(&self, f: impl FnOnce(&TodoList) -> R) -> R {
         let guard = self.guard();
-        f(&*guard)
+        f(&guard)
     }
 
+    /// Executes a function with a mutable reference to the todo list.
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut TodoList) -> R) -> R {
         let mut guard = self.guard();
-        f(&mut *guard)
+        f(&mut guard)
     }
 }
 
@@ -217,6 +230,7 @@ impl Tool for SharedTodoList {
                 guard.update(tasks);
             }
         }
+        drop(guard);
         Ok("Todo list updated.".into())
     }
 }

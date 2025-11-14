@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::config::sanitize_model;
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct GenerateContentRequest {
+pub struct GenerateContentRequest {
     #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
     pub(crate) system_instruction: Option<GeminiContent>,
     pub(crate) contents: Vec<GeminiContent>,
@@ -24,7 +24,7 @@ pub(crate) struct GenerateContentRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct GeminiContent {
+pub struct GeminiContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) role: Option<String>,
     pub(crate) parts: Vec<Part>,
@@ -67,7 +67,7 @@ impl GeminiContent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Part {
+pub struct Part {
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     #[serde(rename = "inlineData", skip_serializing_if = "Option::is_none")]
@@ -115,7 +115,7 @@ impl Part {
         }
     }
 
-    pub(crate) fn function_response(name: String, response: Value) -> Self {
+    pub(crate) const fn function_response(name: String, response: Value) -> Self {
         Self {
             text: None,
             inline_data: None,
@@ -126,7 +126,7 @@ impl Part {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct InlineData {
+pub struct InlineData {
     #[serde(rename = "mimeType")]
     mime_type: String,
     data: String,
@@ -146,26 +146,26 @@ impl InlineData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct FunctionCall {
+pub struct FunctionCall {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) args: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct FunctionResponse {
+pub struct FunctionResponse {
     pub(crate) name: String,
     pub(crate) response: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct GeminiTool {
+pub struct GeminiTool {
     #[serde(rename = "functionDeclarations")]
     pub(crate) function_declarations: Vec<FunctionDeclaration>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct FunctionDeclaration {
+pub struct FunctionDeclaration {
     pub(crate) name: String,
     pub(crate) description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,7 +173,7 @@ pub(crate) struct FunctionDeclaration {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub(crate) struct ToolConfig {
+pub struct ToolConfig {
     #[serde(
         rename = "functionCallingConfig",
         skip_serializing_if = "Option::is_none"
@@ -182,7 +182,7 @@ pub(crate) struct ToolConfig {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct FunctionCallingConfig {
+pub struct FunctionCallingConfig {
     pub(crate) mode: FunctionCallingMode,
     #[serde(
         rename = "allowedFunctionNames",
@@ -193,13 +193,13 @@ pub(crate) struct FunctionCallingConfig {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(crate) enum FunctionCallingMode {
+pub enum FunctionCallingMode {
     Auto,
     Any,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct GenerationConfig {
+pub struct GenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,7 +221,7 @@ pub(crate) struct GenerationConfig {
 }
 
 impl GenerationConfig {
-    pub(crate) fn is_meaningful(&self) -> bool {
+    pub(crate) const fn is_meaningful(&self) -> bool {
         self.temperature.is_some()
             || self.top_p.is_some()
             || self.top_k.is_some()
@@ -235,25 +235,25 @@ impl GenerationConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct SpeechConfig {
+pub struct SpeechConfig {
     #[serde(rename = "voiceConfig", skip_serializing_if = "Option::is_none")]
     pub(crate) voice_config: Option<VoiceConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct VoiceConfig {
+pub struct VoiceConfig {
     #[serde(rename = "prebuiltVoiceConfig")]
     pub(crate) prebuilt: PrebuiltVoiceConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PrebuiltVoiceConfig {
+pub struct PrebuiltVoiceConfig {
     #[serde(rename = "voiceName")]
     pub(crate) voice_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct SafetySetting {
+pub struct SafetySetting {
     pub(crate) category: &'static str,
     pub(crate) threshold: &'static str,
 }
@@ -268,7 +268,7 @@ impl SafetySetting {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct GenerateContentResponse {
+pub struct GenerateContentResponse {
     #[serde(default)]
     pub(crate) candidates: Vec<Candidate>,
     #[serde(rename = "promptFeedback")]
@@ -283,14 +283,14 @@ impl GenerateContentResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Candidate {
+pub struct Candidate {
     pub(crate) content: Option<GeminiContent>,
     #[serde(rename = "safetyRatings", default)]
     pub(crate) safety_ratings: Vec<SafetyRating>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct PromptFeedback {
+pub struct PromptFeedback {
     #[serde(rename = "safetyRatings", default)]
     pub(crate) safety_ratings: Vec<SafetyRating>,
     #[serde(rename = "blockReason")]
@@ -299,7 +299,7 @@ pub(crate) struct PromptFeedback {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct SafetyRating {
+pub struct SafetyRating {
     pub(crate) category: String,
     #[serde(default)]
     pub(crate) probability: Option<String>,
@@ -308,7 +308,7 @@ pub(crate) struct SafetyRating {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct EmbedContentRequest {
+pub struct EmbedContentRequest {
     pub(crate) model: String,
     pub(crate) content: GeminiContent,
 }
@@ -323,11 +323,11 @@ impl EmbedContentRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct EmbedContentResponse {
+pub struct EmbedContentResponse {
     pub(crate) embedding: EmbeddingValue,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct EmbeddingValue {
+pub struct EmbeddingValue {
     pub(crate) values: Vec<f32>,
 }

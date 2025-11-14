@@ -1,7 +1,8 @@
-use std::{borrow::Cow, path::PathBuf, process::Command};
+use std::{borrow::Cow, path::PathBuf};
 
 use aither_core::llm::{Tool, tool::json};
 use anyhow::{Context, Result, bail};
+use async_process::Command;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -63,13 +64,13 @@ impl CommandTool {
     }
 
     fn ensure_allowed(&self, program: &str) -> Result<()> {
-        if let Some(allowed) = &self.allowed {
-            if !allowed.iter().any(|entry| entry == program) {
-                bail!(
-                    "Program '{program}' is not allowed. Allowed commands: {}",
-                    allowed.join(", ")
-                );
-            }
+        if let Some(allowed) = &self.allowed
+            && !allowed.iter().any(|entry| entry == program)
+        {
+            bail!(
+                "Program '{program}' is not allowed. Allowed commands: {}",
+                allowed.join(", ")
+            );
         }
         Ok(())
     }
@@ -105,6 +106,7 @@ impl Tool for CommandTool {
             .args(&arguments.args)
             .current_dir(&working_dir)
             .output()
+            .await
             .with_context(|| {
                 format!(
                     "failed to execute '{}' in {}",

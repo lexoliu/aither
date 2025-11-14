@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "Google Gemini provider integration for aither"
+readme = "../README.md"
+keywords = ["ai", "llm", "gemini", "google"]
+categories = ["api-bindings"]
 
 [dependencies]
 aither-core.workspace = true

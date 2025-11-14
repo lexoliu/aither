@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "AI agent framework with planning, memory, and tool execution for aither"
+readme = "../README.md"
+keywords = ["ai", "agent", "llm", "planning"]
+categories = ["api-bindings"]
 
 [dependencies]
 aither-core.workspace = true
@@ -15,7 +19,6 @@ serde = { version = "1.0.228", features = ["derive"] }
 aither-websearch = { workspace = true, optional = true }
 aither-fs = { workspace = true, optional = true }
 aither-command = { workspace = true, optional = true }
-futures-lite = "*"
 [features]
 default = []
 websearch = ["dep:aither-websearch"]

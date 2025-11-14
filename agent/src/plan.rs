@@ -21,6 +21,8 @@ pub trait Planner: Send + Sync {
     ) -> impl Future<Output = Result<PlanOutcome>> + Send;
 }
 
+/// Default planner implementation that uses the LLM to generate plans.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct DefaultPlanner;
 
 impl Planner for DefaultPlanner {
@@ -60,7 +62,7 @@ impl Planner for DefaultPlanner {
 pub enum PlanOutcome {
     /// The plan has been completed with the given result.
     Completed(String),
-    /// More steps are needed, represented by a TodoList.
+    /// More steps are needed, represented by a `TodoList`.
     NeedsMoreSteps(TodoList),
 }
 

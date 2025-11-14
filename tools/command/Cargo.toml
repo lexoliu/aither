@@ -5,9 +5,14 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Command execution tool for aither agents"
+readme = "../../README.md"
+keywords = ["ai", "agent", "tool", "command"]
+categories = ["api-bindings"]
 
 [dependencies]
 aither-core.workspace = true
 anyhow = "1.0"
 schemars = "1.1"
 serde = { version = "1.0", features = ["derive"] }
+async-process = "2.3"

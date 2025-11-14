@@ -3,7 +3,6 @@ use aither_core::{
     llm::{Message, model::Parameters, tool::Tools},
 };
 use anyhow::Context;
-use futures_lite::StreamExt;
 
 /// Rolling memory that keeps both long-term summaries and the most recent messages.
 #[derive(Debug, Clone, Default)]
@@ -13,24 +12,31 @@ pub struct ConversationMemory {
 }
 
 impl ConversationMemory {
+    /// Adds a new message to the recent conversation history.
     pub fn push(&mut self, message: Message) {
         self.recent.push(message);
     }
 
+    /// Extends the recent conversation history with multiple messages.
     pub fn extend(&mut self, messages: impl IntoIterator<Item = Message>) {
         for message in messages {
             self.push(message);
         }
     }
 
+    /// Adds a new summary message to the long-term summaries.
     pub fn push_summary(&mut self, summary: Message) {
         self.summaries.push(summary);
     }
 
-    pub fn len_recent(&self) -> usize {
+    /// Returns the number of recent messages stored.
+    #[must_use]
+    pub const fn len_recent(&self) -> usize {
         self.recent.len()
     }
 
+    /// Returns all messages in the memory, combining summaries and recent messages.
+    #[must_use]
     pub fn all(&self) -> Vec<Message> {
         self.summaries
             .iter()
@@ -39,14 +45,19 @@ impl ConversationMemory {
             .collect()
     }
 
+    /// Returns the last message in the memory, prioritizing recent messages.
+    #[must_use]
     pub fn last(&self) -> Option<&Message> {
         self.recent.last().or_else(|| self.summaries.last())
     }
 
-    pub fn is_empty(&self) -> bool {
+    /// Checks if the memory is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.summaries.is_empty() && self.recent.is_empty()
     }
 
+    /// Drains the oldest messages from recent history, keeping only the specified number.
     pub fn drain_oldest(&mut self, keep: usize) -> Vec<Message> {
         if keep >= self.recent.len() {
             return Vec::new();
@@ -54,6 +65,7 @@ impl ConversationMemory {
         self.recent.drain(..self.recent.len() - keep).collect()
     }
 
+    /// Clears all messages from memory.
     pub fn clear(&mut self) {
         self.summaries.clear();
         self.recent.clear();
@@ -66,11 +78,17 @@ pub enum ContextStrategy {
     /// Never compress. Good for short-lived conversations or models with very large context windows.
     Unlimited,
     /// Keep a hard sliding window of the most recent `max_messages` exchanges.
-    SlidingWindow { max_messages: usize },
+    SlidingWindow {
+        /// Maximum number of messages to retain in the sliding window.
+        max_messages: usize,
+    },
     /// Summarize older context while keeping the last `retain_recent` messages verbatim.
     Summarize {
+        /// Maximum number of messages before compression is triggered.
         max_messages: usize,
+        /// Number of recent messages to keep verbatim after summarization.
         retain_recent: usize,
+        /// Instructions for how to summarize the conversation.
         instructions: String,
     },
 }
@@ -82,6 +100,11 @@ impl ContextStrategy {
         (max_messages, retain_recent)
     }
 
+    /// Maintains the conversation memory according to the strategy, compressing if necessary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if summarization fails when using the `Summarize` strategy.
     pub async fn maintain<LLM: LanguageModel>(
         &self,
         llm: &LLM,
@@ -89,12 +112,12 @@ impl ContextStrategy {
         memory: &mut ConversationMemory,
     ) -> Result<()> {
         match self {
-            ContextStrategy::Unlimited => Ok(()),
-            ContextStrategy::SlidingWindow { max_messages } => {
+            Self::Unlimited => Ok(()),
+            Self::SlidingWindow { max_messages } => {
                 memory.drain_oldest(*max_messages);
                 Ok(())
             }
-            ContextStrategy::Summarize {
+            Self::Summarize {
                 max_messages,
                 retain_recent,
                 instructions,

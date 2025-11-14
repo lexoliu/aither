@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "Core trait abstractions for aither"
+readme = "../README.md"
+keywords = ["ai", "llm", "traits", "no-std"]
+categories = ["api-bindings", "no-std"]
 
 [dependencies]
 aither-derive = { workspace = true, optional = true}

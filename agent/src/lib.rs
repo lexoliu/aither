@@ -19,10 +19,15 @@ pub use aither_fs as filesystem;
 #[cfg(feature = "websearch")]
 pub use aither_websearch as websearch;
 
+/// Execution strategies for running plan steps.
 pub mod execute;
+/// Memory management and context compression.
 pub mod memory;
+/// Planning strategies for breaking down goals.
 pub mod plan;
+/// Sub-agent creation and management.
 pub mod sub_agent;
+/// Todo list management and tracking.
 pub mod todo;
 
 use crate::{
@@ -36,13 +41,18 @@ use crate::{
 /// Agent-wide configuration describing context compression, iteration limits, and mode presets.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// Strategy for managing conversation context and compression.
     pub context: ContextStrategy,
+    /// Maximum number of planning iterations before giving up.
     pub max_iterations: usize,
+    /// Operating mode that determines default tools and behavior.
     pub mode: AgentMode,
 }
 
 impl AgentConfig {
-    pub fn companion() -> Self {
+    /// Creates a companion agent configuration with unlimited context.
+    #[must_use]
+    pub const fn companion() -> Self {
         Self {
             context: ContextStrategy::Unlimited,
             max_iterations: 64,
@@ -50,6 +60,8 @@ impl AgentConfig {
         }
     }
 
+    /// Creates a coder agent configuration with context summarization.
+    #[must_use]
     pub fn coder() -> Self {
         Self {
             context: ContextStrategy::Summarize {
@@ -63,6 +75,7 @@ impl AgentConfig {
         }
     }
 
+    /// Creates a knowledge base agent configuration with filesystem access.
     pub fn knowledge_base(root: impl Into<PathBuf>) -> Self {
         Self {
             context: ContextStrategy::Summarize {
@@ -90,12 +103,20 @@ impl Default for AgentConfig {
 /// Describes ready-to-use profiles that tweak defaults and tooling.
 #[derive(Debug, Clone)]
 pub enum AgentMode {
+    /// Generic agent with no special tools or configuration.
     Generic,
+    /// Companion agent for conversational interactions.
     Companion,
+    /// Coder agent with filesystem and command execution capabilities.
     Coder,
-    KnowledgeBase { root: PathBuf },
+    /// Knowledge base agent with read-only filesystem access.
+    KnowledgeBase {
+        /// Root directory for knowledge base access.
+        root: PathBuf,
+    },
 }
 
+/// An autonomous agent that plans and executes actions to achieve goals using a language model.
 #[derive(Debug)]
 pub struct Agent<LLM, PlannerImpl, ExecutorImpl> {
     llm: LLM,
@@ -110,18 +131,22 @@ impl<LLM> Agent<LLM, plan::DefaultPlanner, execute::DefaultExecutor>
 where
     LLM: LanguageModel,
 {
+    /// Creates a new agent with default configuration.
     pub fn new(llm: LLM) -> Self {
         Self::with_config(llm, AgentConfig::default())
     }
 
+    /// Creates a new agent with the specified configuration.
     pub fn with_config(llm: LLM, config: AgentConfig) -> Self {
         Self::custom(llm, plan::DefaultPlanner, execute::DefaultExecutor, config)
     }
 
+    /// Creates a companion agent for conversational interactions.
     pub fn companion(llm: LLM) -> Self {
         Self::with_config(llm, AgentConfig::companion())
     }
 
+    /// Creates a coder agent with filesystem and command execution capabilities.
     pub fn coder(llm: LLM) -> Self {
         Self::with_config(llm, AgentConfig::coder())
     }
@@ -133,6 +158,7 @@ where
     PlannerImpl: Planner,
     ExecutorImpl: Executor,
 {
+    /// Creates an agent with custom planner and executor implementations.
     pub fn custom(
         llm: LLM,
         planner: PlannerImpl,
@@ -149,6 +175,11 @@ where
         }
     }
 
+    /// Runs the agent to achieve the specified goal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the agent exceeds max iterations or planning/execution fails.
     pub async fn run(&mut self, goal: &str) -> aither_core::Result<String> {
         self.ensure_initialized().await;
         if self.state.memory.is_empty() {
@@ -196,6 +227,7 @@ where
         }
     }
 
+    #[allow(clippy::missing_const_for_fn, clippy::needless_pass_by_ref_mut)]
     fn bootstrap_mode_tools(&mut self) {
         match &self.config.mode {
             AgentMode::Generic | AgentMode::Companion => {}
@@ -205,12 +237,15 @@ where
                     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                     self.mount_filesystem(root, true);
                 }
-                #[cfg(feature = "cli")]
+                #[cfg(feature = "command")]
                 {
                     self.enable_shell(None);
                 }
             }
-            AgentMode::KnowledgeBase { root } => {
+            AgentMode::KnowledgeBase {
+                #[cfg_attr(not(feature = "filesystem"), allow(unused_variables))]
+                root,
+            } => {
                 #[cfg(feature = "filesystem")]
                 {
                     self.mount_filesystem(root.clone(), false);
@@ -238,18 +273,22 @@ where
         Ok(())
     }
 
-    pub fn profile(&self) -> Option<&ModelProfile> {
+    /// Returns the model profile if available.
+    pub const fn profile(&self) -> Option<&ModelProfile> {
         self.state.profile()
     }
 
+    /// Checks if the model has a native ability.
     pub fn has_native_ability(&self, ability: Ability) -> bool {
         self.state.has_native_ability(ability)
     }
 
+    /// Registers a tool for the agent to use.
     pub fn register_tool<T: Tool + 'static>(&mut self, tool: T) {
         self.state.register_tool(tool);
     }
 
+    /// Mounts a filesystem tool with the specified root directory.
     #[cfg(feature = "filesystem")]
     pub fn mount_filesystem(&mut self, root: impl Into<PathBuf>, allow_writes: bool) {
         let tool = if allow_writes {
@@ -260,16 +299,19 @@ where
         self.register_tool(tool);
     }
 
-    #[cfg(feature = "cli")]
+    /// Enables command execution with optional restrictions.
+    #[cfg(feature = "command")]
     pub fn enable_shell(&mut self, allowed_commands: impl Into<Option<Vec<String>>>) {
-        let mut tool =
-            cli::CommandTool::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let mut tool = command::CommandTool::new(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        );
         if let Some(commands) = allowed_commands.into() {
             tool = tool.restrict_to(commands);
         }
         self.register_tool(tool);
     }
 
+    /// Enables web search with the specified provider.
     #[cfg(feature = "websearch")]
     pub fn enable_websearch<P>(&mut self, provider: P)
     where
@@ -281,6 +323,7 @@ where
         self.register_tool(websearch::WebSearchTool::new(provider));
     }
 
+    /// Converts this agent into a sub-agent with the specified name and description.
     pub fn into_subagent(
         self,
         name: impl Into<String>,
@@ -300,51 +343,69 @@ fn next_pending(todo: &SharedTodoList) -> Option<(usize, String)> {
     })
 }
 
+/// State container for agent tools, memory, and model profile.
 #[derive(Debug, Default)]
 pub struct AgentState {
+    /// Tools registered for the agent.
     pub tools: Tools,
+    /// Optional todo list for tracking progress.
     pub todo: Option<SharedTodoList>,
+    /// Conversation memory.
     pub memory: ConversationMemory,
     profile: Option<ModelProfile>,
 }
 
 impl AgentState {
+    /// Attaches a todo list to the agent state and registers it as a tool.
     pub fn attach_todo(&mut self, todo: TodoList) {
         let shared = SharedTodoList::new(todo);
         self.register_tool(shared.clone());
         self.todo = Some(shared);
     }
 
+    /// Returns all messages in the conversation memory.
+    #[must_use]
     pub fn messages(&self) -> Vec<Message> {
         self.memory.all()
     }
 
+    /// Registers a tool for the agent to use.
     pub fn register_tool<T: Tool + 'static>(&mut self, tool: T) {
         self.tools.register(tool);
     }
 
-    pub fn tools(&self) -> &Tools {
+    /// Returns a reference to the tools.
+    #[must_use]
+    pub const fn tools(&self) -> &Tools {
         &self.tools
     }
 
-    pub fn tools_mut(&mut self) -> &mut Tools {
+    /// Returns a mutable reference to the tools.
+    pub const fn tools_mut(&mut self) -> &mut Tools {
         &mut self.tools
     }
 
-    pub fn profile(&self) -> Option<&ModelProfile> {
+    /// Returns the model profile if available.
+    #[must_use]
+    pub const fn profile(&self) -> Option<&ModelProfile> {
         self.profile.as_ref()
     }
 
+    /// Sets the model profile.
     pub fn set_profile(&mut self, profile: ModelProfile) {
         self.profile = Some(profile);
     }
 
+    /// Checks if the model has a native ability.
+    #[must_use]
     pub fn has_native_ability(&self, ability: Ability) -> bool {
         self.profile
             .as_ref()
-            .map_or(false, |profile| profile.abilities.contains(&ability))
+            .is_some_and(|profile| profile.abilities.contains(&ability))
     }
 
+    /// Returns a summary of available capabilities including model abilities and tools.
+    #[must_use]
     pub fn capability_summary(&self) -> Option<String> {
         let mut sections = Vec::new();
         if let Some(profile) = &self.profile {
@@ -375,7 +436,7 @@ impl AgentState {
     }
 }
 
-fn ability_label(ability: Ability) -> &'static str {
+const fn ability_label(ability: Ability) -> &'static str {
     match ability {
         Ability::ToolUse => "tool_use",
         Ability::Vision => "vision",

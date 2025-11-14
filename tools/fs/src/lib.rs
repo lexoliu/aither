@@ -1,11 +1,9 @@
-use std::{
-    borrow::Cow,
-    fs::{self, OpenOptions},
-    path::PathBuf,
-};
+use std::{borrow::Cow, path::PathBuf};
 
 use aither_core::llm::{Tool, tool::json};
 use anyhow::{Context, Result, anyhow, bail};
+use async_fs::{OpenOptions, create_dir_all, read_dir, read_to_string, write};
+use futures_lite::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +27,7 @@ impl FileSystemTool {
 
     fn builder(root: impl Into<PathBuf>) -> Self {
         let mut root = root.into();
-        let _ = fs::create_dir_all(&root);
+        let _ = std::fs::create_dir_all(&root);
         let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
         root = canonical_root.clone();
 
@@ -57,14 +55,14 @@ impl FileSystemTool {
         self
     }
 
-    fn resolve(&self, relative: Option<&str>, create: bool) -> Result<PathBuf> {
+    async fn resolve(&self, relative: Option<&str>, create: bool) -> Result<PathBuf> {
         let candidate = match relative {
             Some(path) if !path.is_empty() => self.root.join(path),
             _ => self.root.clone(),
         };
 
         if create && let Some(parent) = candidate.parent() {
-            fs::create_dir_all(parent).with_context(|| {
+            create_dir_all(parent).await.with_context(|| {
                 format!(
                     "Unable to create parent directories for {}",
                     candidate.display()
@@ -121,40 +119,48 @@ impl Tool for FileSystemTool {
     async fn call(&mut self, arguments: Self::Arguments) -> aither_core::Result {
         let response = match arguments {
             FsOperation::Read { path } => {
-                let target = self.resolve(Some(&path), false)?;
-                fs::read_to_string(&target)
+                let target = self.resolve(Some(&path), false).await?;
+                read_to_string(&target)
+                    .await
                     .with_context(|| format!("failed to read {}", target.display()))?
             }
             FsOperation::Write { path, contents } => {
                 self.ensure_writable()?;
-                let target = self.resolve(Some(&path), true)?;
-                fs::write(&target, contents)
+                let target = self.resolve(Some(&path), true).await?;
+                write(&target, contents)
+                    .await
                     .with_context(|| format!("failed to write {}", target.display()))?;
                 format!("Wrote {}", target.display())
             }
             FsOperation::Append { path, contents } => {
                 self.ensure_writable()?;
-                let target = self.resolve(Some(&path), true)?;
+                let target = self.resolve(Some(&path), true).await?;
                 let mut file = OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&target)
+                    .await
                     .with_context(|| format!("failed to open {}", target.display()))?;
-                use std::io::Write;
+                use futures_lite::AsyncWriteExt;
                 file.write_all(contents.as_bytes())
+                    .await
                     .with_context(|| format!("failed to append {}", target.display()))?;
                 format!("Appended {}", target.display())
             }
             FsOperation::List { path } => {
-                let target = self.resolve(path.as_deref(), false)?;
-                let entries = fs::read_dir(&target)
-                    .with_context(|| format!("failed to list {}", target.display()))?
-                    .filter_map(|entry| entry.ok())
-                    .map(|entry| DirEntry {
-                        name: entry.file_name().to_string_lossy().into_owned(),
-                        is_dir: entry.path().is_dir(),
-                    })
-                    .collect::<Vec<_>>();
+                let target = self.resolve(path.as_deref(), false).await?;
+                let mut dir = read_dir(&target)
+                    .await
+                    .with_context(|| format!("failed to list {}", target.display()))?;
+                let mut entries = Vec::new();
+                while let Some(entry) = dir.next().await {
+                    if let Ok(entry) = entry {
+                        entries.push(DirEntry {
+                            name: entry.file_name().to_string_lossy().into_owned(),
+                            is_dir: entry.path().is_dir(),
+                        });
+                    }
+                }
                 json(&entries)
             }
         };

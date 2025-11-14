@@ -11,7 +11,7 @@ use crate::{
     },
 };
 
-pub(crate) async fn call_generate(
+pub async fn call_generate(
     cfg: Arc<GeminiConfig>,
     model: &str,
     request: GenerateContentRequest,
@@ -24,7 +24,7 @@ pub(crate) async fn call_generate(
     .await
 }
 
-pub(crate) async fn embed_content(
+pub async fn embed_content(
     cfg: Arc<GeminiConfig>,
     request: EmbedContentRequest,
 ) -> Result<EmbedContentResponse, GeminiError> {
@@ -36,6 +36,7 @@ pub(crate) async fn embed_content(
     .await
 }
 
+#[allow(clippy::future_not_send)]
 async fn post_json<T: for<'de> serde::Deserialize<'de>, S: Serialize>(
     cfg: Arc<GeminiConfig>,
     endpoint: String,
@@ -44,7 +45,7 @@ async fn post_json<T: for<'de> serde::Deserialize<'de>, S: Serialize>(
     let mut backend = client();
     let mut builder = backend.post(endpoint);
     builder = builder.header(header::USER_AGENT.as_str(), USER_AGENT);
-    if let AuthMode::Header = cfg.auth {
+    if cfg.auth == AuthMode::Header {
         builder = builder.header("x-goog-api-key", cfg.api_key.clone());
     }
     builder = builder.json_body(body).map_err(GeminiError::from)?;

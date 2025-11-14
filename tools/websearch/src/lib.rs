@@ -25,7 +25,11 @@ pub struct SearchResult {
 }
 
 pub trait SearchProvider: Send + Sync {
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>>;
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<SearchResult>>> + Send;
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +77,7 @@ where
 
     async fn call(&mut self, arguments: Self::Arguments) -> aither_core::Result {
         let limit = arguments.limit.clamp(1, 10);
-        let results = self.provider.search(&arguments.query, limit)?;
+        let results = self.provider.search(&arguments.query, limit).await?;
         Ok(json(&results))
     }
 }
@@ -102,7 +106,7 @@ impl Default for InMemorySearchProvider {
 }
 
 impl SearchProvider for InMemorySearchProvider {
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         let needle = query.to_lowercase();
         let mut matches: Vec<_> = self
             .corpus
