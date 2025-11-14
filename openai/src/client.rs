@@ -341,10 +341,7 @@ impl Builder {
 
     /// Declare extra native capabilities (e.g., web search, PDF understanding) supported by the upstream model.
     #[must_use]
-    pub fn native_capabilities(
-        mut self,
-        abilities: impl IntoIterator<Item = Ability>,
-    ) -> Self {
+    pub fn native_capabilities(mut self, abilities: impl IntoIterator<Item = Ability>) -> Self {
         for ability in abilities {
             if !self.native_abilities.contains(&ability) {
                 self.native_abilities.push(ability);
