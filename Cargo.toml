@@ -37,7 +37,7 @@ clippy.multiple_crate_versions = { level = "allow", priority = 1}
 aither = { path = "."}
 aither-core = { path = "./core"}
 aither-derive = { path = "./derive", version = "0.1.0"}
-zenwave = { path = "../zenwave"}
+zenwave = { git = "https://github.com/zen-rs/zenwave" }
 aither-websearch = { path = "./tools/websearch" }
 aither-fs = { path = "./tools/fs" }
 aither-command = { path = "./tools/command" }
@@ -67,7 +67,7 @@ futures-lite = { version = "2.6"}
 
 [package]
 name = "aither"
-version = "0.2.0"
+version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

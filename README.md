@@ -53,7 +53,7 @@ Unified trait abstractions for AI models in Rust. Switch between OpenAI, Anthrop
 
 ```toml
 [dependencies]
-aither = "0.0.1"
+aither = "0.1.0"
 ```
 
 ### Basic Chat Bot

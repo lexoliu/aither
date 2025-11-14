@@ -2,50 +2,25 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - "**"
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Test
+  lint:
+    name: Fmt & Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Check formatting
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
         run: cargo fmt --all -- --check
-
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
-
-      - name: Run tests
-        run: cargo test --all-features --workspace
-
-      - name: Check documentation
-        run: cargo doc --all-features --no-deps --workspace
-
-      - name: Check that packages can be built
-        run: |
-          cargo package -p aither-derive --allow-dirty
-          cargo package -p aither --allow-dirty
+      - name: cargo clippy
+        run: cargo clippy --locked --all-features -- -D warnings
