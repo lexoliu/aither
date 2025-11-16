@@ -1,0 +1,22 @@
+[package]
+name = "aither-rag"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "High-performance Retrieval-Augmented Generation store backed by a parallel in-memory vector database"
+
+[dependencies]
+aither-core = { path = "../core" }
+anyhow = { version = "1.0", default-features = false, features = ["std"] }
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros"] }
