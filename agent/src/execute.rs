@@ -1,4 +1,5 @@
 use aither_core::Result;
+use core::future::Future;
 
 use crate::AgentState;
 
@@ -9,7 +10,11 @@ pub trait Executor: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the step execution fails.
-    fn execute(&self, step: &str, state: &AgentState) -> Result<String>;
+    fn execute(
+        &self,
+        step: &str,
+        state: &AgentState,
+    ) -> impl Future<Output = Result<String>> + Send;
 }
 
 /// Default executor that only simulates execution.
@@ -17,7 +22,7 @@ pub trait Executor: Send + Sync {
 pub struct DefaultExecutor;
 
 impl Executor for DefaultExecutor {
-    fn execute(&self, _step: &str, _state: &AgentState) -> Result<String> {
+    async fn execute(&self, _step: &str, _state: &AgentState) -> Result<String> {
         todo!()
     }
 }

@@ -108,7 +108,7 @@ impl ContextStrategy {
     pub async fn maintain<LLM: LanguageModel>(
         &self,
         llm: &LLM,
-        tools: &mut Tools,
+        _tools: &mut Tools,
         memory: &mut ConversationMemory,
     ) -> Result<()> {
         match self {

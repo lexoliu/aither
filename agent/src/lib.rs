@@ -19,16 +19,25 @@ pub use aither_fs as filesystem;
 #[cfg(feature = "websearch")]
 pub use aither_websearch as websearch;
 
+/// Opinionated wrappers around [`Agent`] for coding workflows.
+pub mod coder;
 /// Execution strategies for running plan steps.
 pub mod execute;
 /// Memory management and context compression.
 pub mod memory;
 /// Planning strategies for breaking down goals.
 pub mod plan;
+/// Deep research agent with streaming findings.
+#[cfg(feature = "websearch")]
+pub mod research;
 /// Sub-agent creation and management.
 pub mod sub_agent;
 /// Todo list management and tracking.
 pub mod todo;
+
+pub use coder::Coder;
+#[cfg(feature = "websearch")]
+pub use research::DeepResearchAgent;
 
 use crate::{
     execute::Executor,
@@ -38,55 +47,70 @@ use crate::{
     todo::{SharedTodoList, TodoList},
 };
 
-/// Agent-wide configuration describing context compression, iteration limits, and mode presets.
+/// Agent-wide configuration describing context compression, iteration limits, and default tooling.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// Strategy for managing conversation context and compression.
-    pub context: ContextStrategy,
-    /// Maximum number of planning iterations before giving up.
-    pub max_iterations: usize,
-    /// Operating mode that determines default tools and behavior.
-    pub mode: AgentMode,
+    context: ContextStrategy,
+    max_iterations: usize,
+    tooling: ToolingConfig,
 }
 
 impl AgentConfig {
-    /// Creates a companion agent configuration with unlimited context.
+    /// Creates a new agent configuration from its fields.
     #[must_use]
-    pub const fn companion() -> Self {
+    pub const fn new(
+        context: ContextStrategy,
+        max_iterations: usize,
+        tooling: ToolingConfig,
+    ) -> Self {
         Self {
-            context: ContextStrategy::Unlimited,
-            max_iterations: 64,
-            mode: AgentMode::Companion,
+            context,
+            max_iterations,
+            tooling,
         }
     }
 
-    /// Creates a coder agent configuration with context summarization.
+    /// Returns the current context strategy.
     #[must_use]
-    pub fn coder() -> Self {
-        Self {
-            context: ContextStrategy::Summarize {
-                max_messages: 48,
-                retain_recent: 12,
-                instructions: "Keep file paths, commands, and compiler diagnostics verbatim."
-                    .into(),
-            },
-            max_iterations: 64,
-            mode: AgentMode::Coder(Coder),
-        }
+    pub const fn context(&self) -> &ContextStrategy {
+        &self.context
     }
 
-    /// Creates a knowledge base agent configuration with filesystem access.
-    pub fn knowledge_base(root: impl Into<PathBuf>) -> Self {
-        Self {
-            context: ContextStrategy::Summarize {
-                max_messages: 60,
-                retain_recent: 10,
-                instructions: "Preserve cited facts, source filenames, and any numerical data."
-                    .into(),
-            },
-            max_iterations: 80,
-            mode: AgentMode::KnowledgeBase { root: root.into() },
-        }
+    /// Sets the context strategy.
+    pub fn set_context(&mut self, context: ContextStrategy) {
+        self.context = context;
+    }
+
+    /// Returns the iteration cap.
+    #[must_use]
+    pub const fn max_iterations(&self) -> usize {
+        self.max_iterations
+    }
+
+    /// Sets the iteration cap.
+    #[must_use]
+    pub const fn with_max_iterations(mut self, max_iterations: usize) -> Self {
+        self.max_iterations = max_iterations;
+        self
+    }
+
+    /// Updates the iteration cap in place.
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn set_max_iterations(&mut self, max_iterations: usize) {
+        self.max_iterations = max_iterations;
+    }
+
+    /// Returns the tooling configuration.
+    #[must_use]
+    pub const fn tooling(&self) -> &ToolingConfig {
+        &self.tooling
+    }
+
+    /// Returns a mutable reference to the tooling configuration.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn tooling_mut(&mut self) -> &mut ToolingConfig {
+        &mut self.tooling
     }
 }
 
@@ -95,30 +119,119 @@ impl Default for AgentConfig {
         Self {
             context: ContextStrategy::SlidingWindow { max_messages: 32 },
             max_iterations: 48,
-            mode: AgentMode::Generic,
+            tooling: ToolingConfig::none(),
         }
     }
 }
 
-/// Describes ready-to-use profiles that tweak defaults and tooling.
+/// Configures which tools are mounted automatically when an [`Agent`] starts.
 #[derive(Debug, Clone)]
-pub enum AgentMode {
-    /// Generic agent with no special tools or configuration.
-    Generic,
-    /// Companion agent for conversational interactions.
-    Companion,
-    /// Coder agent with filesystem and command execution capabilities.
-    Coder(Coder),
-    /// Knowledge base agent with read-only filesystem access.
-    KnowledgeBase {
-        /// Root directory for knowledge base access.
-        root: PathBuf,
-    },
+pub struct ToolingConfig {
+    filesystem: Option<FileSystemAccess>,
+    enable_shell: bool,
 }
 
-/// Dedicated type representing the coder operating mode.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Coder;
+/// Describes how the agent should mount filesystem access relative to a root directory.
+#[derive(Debug, Clone)]
+pub struct FileSystemAccess {
+    root: Option<PathBuf>,
+    allow_writes: bool,
+}
+
+impl FileSystemAccess {
+    /// Mounts the current working directory with the specified permissions.
+    #[must_use]
+    pub const fn working_directory(allow_writes: bool) -> Self {
+        Self {
+            root: None,
+            allow_writes,
+        }
+    }
+
+    /// Mounts a read-only filesystem rooted at the provided path.
+    #[must_use]
+    pub fn read_only(root: impl Into<PathBuf>) -> Self {
+        Self::rooted(root, false)
+    }
+
+    /// Mounts a read-write filesystem rooted at the provided path.
+    #[must_use]
+    pub fn read_write(root: impl Into<PathBuf>) -> Self {
+        Self::rooted(root, true)
+    }
+
+    fn rooted(root: impl Into<PathBuf>, allow_writes: bool) -> Self {
+        Self {
+            root: Some(root.into()),
+            allow_writes,
+        }
+    }
+
+    /// Returns the configured root directory.
+    #[must_use]
+    pub const fn root(&self) -> Option<&PathBuf> {
+        self.root.as_ref()
+    }
+
+    /// Returns whether write operations are permitted.
+    #[must_use]
+    pub const fn allow_writes(&self) -> bool {
+        self.allow_writes
+    }
+}
+
+impl ToolingConfig {
+    /// Creates a new tooling configuration.
+    #[must_use]
+    pub const fn new(filesystem: Option<FileSystemAccess>, enable_shell: bool) -> Self {
+        Self {
+            filesystem,
+            enable_shell,
+        }
+    }
+
+    /// Disables all additional tooling.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self::new(None, false)
+    }
+
+    /// Enables tooling suited for coding workflows.
+    #[must_use]
+    pub const fn coder() -> Self {
+        Self::new(Some(FileSystemAccess::working_directory(true)), true)
+    }
+
+    /// Returns the optional filesystem access.
+    #[must_use]
+    pub const fn filesystem(&self) -> Option<&FileSystemAccess> {
+        self.filesystem.as_ref()
+    }
+
+    /// Sets the filesystem access.
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn set_filesystem(&mut self, access: Option<FileSystemAccess>) {
+        self.filesystem = access;
+    }
+
+    /// Enables or disables shell access.
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn set_enable_shell(&mut self, enable: bool) {
+        self.enable_shell = enable;
+    }
+
+    /// Returns whether shell tooling is enabled.
+    #[must_use]
+    pub const fn enable_shell(&self) -> bool {
+        self.enable_shell
+    }
+}
+
+impl Default for ToolingConfig {
+    fn default() -> Self {
+        Self::none()
+    }
+}
 
 /// An autonomous agent that plans and executes actions to achieve goals using a language model.
 #[derive(Debug)]
@@ -143,16 +256,6 @@ where
     /// Creates a new agent with the specified configuration.
     pub fn with_config(llm: LLM, config: AgentConfig) -> Self {
         Self::custom(llm, plan::DefaultPlanner, execute::DefaultExecutor, config)
-    }
-
-    /// Creates a companion agent for conversational interactions.
-    pub fn companion(llm: LLM) -> Self {
-        Self::with_config(llm, AgentConfig::companion())
-    }
-
-    /// Creates a coder agent with filesystem and command execution capabilities.
-    pub fn coder(llm: LLM) -> Self {
-        Self::with_config(llm, AgentConfig::coder())
     }
 }
 
@@ -194,9 +297,9 @@ where
                 .push(Message::user(format!("New goal: {goal}")));
         }
 
-        for _ in 0..self.config.max_iterations {
+        for _ in 0..self.config.max_iterations() {
             self.config
-                .context
+                .context()
                 .maintain(&self.llm, &mut self.state.tools, &mut self.state.memory)
                 .await?;
 
@@ -209,14 +312,14 @@ where
                 }
                 PlanOutcome::NeedsMoreSteps(todo) => {
                     self.state.attach_todo(todo);
-                    self.execute_pending_steps()?;
+                    self.execute_pending_steps().await?;
                 }
             }
         }
 
         Err(anyhow!(
             "agent hit {} iterations without converging",
-            self.config.max_iterations
+            self.config.max_iterations()
         ))
     }
 
@@ -226,39 +329,28 @@ where
             self.state.set_profile(profile);
         }
         if !self.tools_configured {
-            self.bootstrap_mode_tools();
+            self.bootstrap_tools();
             self.tools_configured = true;
         }
     }
 
     #[allow(clippy::missing_const_for_fn, clippy::needless_pass_by_ref_mut)]
-    fn bootstrap_mode_tools(&mut self) {
-        match &self.config.mode {
-            AgentMode::Generic | AgentMode::Companion => {}
-            AgentMode::Coder(_) => {
-                #[cfg(feature = "filesystem")]
-                {
-                    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                    self.mount_filesystem(root, true);
-                }
-                #[cfg(feature = "command")]
-                {
-                    self.enable_shell(None);
-                }
-            }
-            AgentMode::KnowledgeBase {
-                #[cfg_attr(not(feature = "filesystem"), allow(unused_variables))]
-                root,
-            } => {
-                #[cfg(feature = "filesystem")]
-                {
-                    self.mount_filesystem(root.clone(), false);
-                }
-            }
+    fn bootstrap_tools(&mut self) {
+        #[cfg(feature = "filesystem")]
+        if let Some(fs) = self.config.tooling().filesystem() {
+            let root = fs
+                .root()
+                .cloned()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            self.mount_filesystem(root, fs.allow_writes());
+        }
+        #[cfg(feature = "command")]
+        if self.config.tooling().enable_shell() {
+            self.enable_shell(None);
         }
     }
 
-    fn execute_pending_steps(&mut self) -> aither_core::Result<()> {
+    async fn execute_pending_steps(&mut self) -> aither_core::Result<()> {
         let Some(todo) = self.state.todo.clone() else {
             return Ok(());
         };
@@ -267,7 +359,7 @@ where
             let step_memory = Message::assistant(format!("Executing: {description}"));
             self.state.memory.push(step_memory);
 
-            let result = self.executor.execute(&description, &self.state)?;
+            let result = self.executor.execute(&description, &self.state).await?;
             let completion = Message::assistant(format!("Result: {result}"));
             self.state.memory.push(completion);
 
