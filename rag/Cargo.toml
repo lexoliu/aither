@@ -12,11 +12,16 @@ description = "High-performance Retrieval-Augmented Generation store backed by a
 aither-core = { path = "../core" }
 anyhow = { version = "1.0", default-features = false, features = ["std"] }
 rayon = "1.10"
-serde = { version = "1.0", features = ["derive"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+schemars = { version = "1.0", features = ["derive"] }
+futures-lite = { version = "2.6", features = ["std"] }
+futures-core = { version = "0.3", default-features = false, features = ["alloc"] }
+async-channel = "2.3"
 
 [features]
 default = []
-serde = ["dep:serde"]
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros"] }
+tempfile = "3.10"

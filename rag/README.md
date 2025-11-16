@@ -12,15 +12,17 @@ High-performance Retrieval-Augmented Generation plumbing for any embedding model
 
 - 🔌 **Plug in any embedder** – Works with `aither-core`/`aither` embedders (OpenAI, Gemini, local adapters, etc.).
 - ⚡ **Built-in vector DB** – SIMD-friendly cosine similarity with Rayon parallelism scales to hundreds of thousands of vectors.
-- 🧱 **Tiny API surface** – Only three async methods: `.insert()`, `.delete()`, `.query()`.
-- 🧾 **Metadata-first** – Store arbitrary key/value metadata with each chunk for filtering and citations.
-- 🧪 **Test friendly** – Ships with an in-memory mock embedder example; no network calls required.
+- 📁 **Directory ingestion** – `Rag::index_directory` walks any folder, indexes files, and streams progress updates.
+- 💾 **Snapshot persistence** – Store embeddings to disk with `set_index_dir`/`load_index`.
+- 🧰 **LLM Tool ready** – `Rag` implements the `Tool` trait so models can call it directly.
+- 🧱 **Low-level access** – Use `RagStore` for manual control when you only need insert/delete/query primitives.
 
 ## Quick Start
 
 ```rust
-use aither_rag::{Document, RagStore};
+use aither_rag::{IndexStage, Rag, RagToolArgs};
 use aither_core::EmbeddingModel;
+use futures_lite::StreamExt;
 
 #[derive(Clone)]
 struct DemoEmbedder;
@@ -38,10 +40,25 @@ impl EmbeddingModel for DemoEmbedder {
 
 #[tokio::main]
 async fn main() -> aither_core::Result<()> {
-    let rag = RagStore::new(DemoEmbedder);
-    rag.insert(Document::new("rust-book", "Rust is a systems programming language.")).await?;
-    let hits = rag.query("What is Rust?", 1).await?;
-    println!("Top result: {} ({:.3})", hits[0].document.id, hits[0].score);
+    let rag = Rag::new(DemoEmbedder);
+    rag.set_index_dir("./.rag-index")?;
+
+    let mut job = rag.index_directory("./notes")?;
+    while let Some(progress) = job.next().await {
+        if let Some(path) = progress.path.as_ref() {
+            println!("[{}/{}] {:?} {}", progress.processed, progress.total, progress.stage, path.display());
+        }
+    }
+    job.await?;
+
+    let response = rag
+        .clone()
+        .call(RagToolArgs {
+            query: "What is Rust?".into(),
+            top_k: 1,
+        })
+        .await?;
+    println!("LLM-friendly response: {response}");
     Ok(())
 }
 ```
@@ -54,9 +71,20 @@ A complete runnable demo lives in [`examples/basic.rs`](examples/basic.rs):
 cargo run -p aither-rag --example basic
 ```
 
-It wires a tiny deterministic embedder into `RagStore`, ingests a few knowledge snippets, and prints the retrieval hits for a sample question.
+It wires a tiny deterministic embedder into the high-level `Rag` helper, indexes a temporary directory while streaming progress, persists the snapshot, and finishes by exercising the tool interface.
 
 ## API Overview
+
+### High-level `Rag`
+
+| Method | Description |
+| ------ | ----------- |
+| `Rag::set_index_dir(path)` | Configure where snapshots are written (`index.json`). |
+| `Rag::load_index()` | Hydrate the in-memory store from the snapshot directory. |
+| `Rag::index_directory(path)` | Walk a directory tree; returns an `IndexingJob` implementing both `Future` and `Stream`. |
+| `Rag::call(args)` | Invoke the tool interface—perfect for LLM function calling. |
+
+### Low-level `RagStore`
 
 | Method | Description |
 | ------ | ----------- |

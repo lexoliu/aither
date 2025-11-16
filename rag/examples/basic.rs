@@ -1,7 +1,9 @@
 //! Basic RAG flow using the in-memory store and a toy embedder.
 
-use aither_core::{EmbeddingModel, Result};
-use aither_rag::{Document, Metadata, RagStore};
+use aither_core::{EmbeddingModel, Result, llm::Tool};
+use aither_rag::{IndexStage, Rag, RagToolArgs};
+use futures_lite::StreamExt;
+use std::{env, fs, path::PathBuf};
 
 #[derive(Clone)]
 struct DemoEmbedder;
@@ -23,38 +25,71 @@ impl EmbeddingModel for DemoEmbedder {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let rag = RagStore::new(DemoEmbedder);
+    let rag = Rag::new(DemoEmbedder);
+    let working_dir = prepare_source_tree()?;
+    let index_dir = working_dir.join("index");
+    rag.set_index_dir(&index_dir)?;
 
-    let docs = [
-        Document::with_metadata(
-            "rag-basics",
-            "Retrieval-Augmented Generation uses embeddings to fetch context.",
-            Metadata::from([("source".into(), "notes".into())]),
-        ),
-        Document::with_metadata(
-            "chunking",
-            "Chunking splits large files into overlapping passages for indexing.",
-            Metadata::from([("source".into(), "docs".into())]),
-        ),
-        Document::with_metadata(
-            "rust",
-            "Rust focuses on performance and safety using ownership and borrowing.",
-            Metadata::from([("source".into(), "book".into())]),
-        ),
-    ];
-
-    for doc in docs {
-        rag.insert(doc).await?;
+    println!("Indexing {}", working_dir.display());
+    let mut job = rag.index_directory(working_dir.join("notes"))?;
+    while let Some(progress) = job.next().await {
+        match progress.stage {
+            IndexStage::Enumerating => println!("Scanning files..."),
+            IndexStage::Embedding | IndexStage::Embedded => {
+                if let Some(path) = progress.path.as_ref() {
+                    println!(
+                        "[{}/{}] Indexed {}",
+                        progress.processed,
+                        progress.total,
+                        path.display()
+                    );
+                }
+            }
+            IndexStage::Persisting => println!("Persisting snapshot..."),
+            IndexStage::Finished => println!("Done indexing!"),
+            IndexStage::Skipped { ref reason } => {
+                if let Some(path) = progress.path.as_ref() {
+                    eprintln!("Skipped {}: {}", path.display(), reason);
+                }
+            }
+        }
     }
+    let indexed = job.await?;
+    println!(
+        "Indexed {indexed} files. Snapshot stored at {}",
+        index_dir.display()
+    );
 
-    let results = rag.query("How do I prep documents for RAG?", 2).await?;
-    println!("Top matches:");
-    for (rank, hit) in results.iter().enumerate() {
-        println!(
-            "{rank}: {} (score = {:.3}) - {}",
-            hit.document.id, hit.score, hit.document.text
-        );
-    }
+    let mut tool_rag = rag.clone();
+    let response = tool_rag
+        .call(RagToolArgs {
+            query: "How do I prep documents for RAG?".into(),
+            top_k: 2,
+        })
+        .await?;
+    println!("Tool response: {response}");
 
     Ok(())
+}
+
+fn prepare_source_tree() -> Result<PathBuf> {
+    let base = env::temp_dir().join("aither-rag-demo");
+    if base.exists() {
+        fs::remove_dir_all(&base)?;
+    }
+    let notes_dir = base.join("notes");
+    fs::create_dir_all(&notes_dir)?;
+    fs::write(
+        notes_dir.join("rag.txt"),
+        "Retrieval-Augmented Generation uses embeddings plus vector search.",
+    )?;
+    fs::write(
+        notes_dir.join("chunking.md"),
+        "Chunking splits large files into overlapping windows for indexing.",
+    )?;
+    fs::write(
+        notes_dir.join("rust.md"),
+        "Rust focuses on performance and safety using ownership and borrowing.",
+    )?;
+    Ok(base)
 }
