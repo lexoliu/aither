@@ -6,7 +6,10 @@ members = [
     "openai",
     "core",
     "gemini",
+    "llama",
     "agent",
+    "rag",
+    "mem0",
     "tools/websearch",
     "tools/fs",
     "tools/command",
@@ -58,6 +61,7 @@ url = { version = "2.5", default-features = false }
 [dev-dependencies]
 aither-openai = { path = "./openai" }
 aither-gemini = { path = "./gemini" }
+aither-mem0 = { path = "./mem0" }
 tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread"] }
 tokio-test = "0.4"
 schemars = { version = "1.0" }

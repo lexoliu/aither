@@ -191,7 +191,7 @@ async fn generate_image(generator: impl ImageGenerator) -> aither::Result<Vec<u8
 | `aither-openai` | Provider bindings for OpenAI-compatible chat, images, audio, and moderation |
 | `aither-gemini` | Google Gemini bindings with tool looping and thinking budgets |
 | `aither-rag` | Retrieval-Augmented Generation helper with a parallel in-memory vector DB |
-| `aither-llama` | Local llama.cpp wrapper that shells out to the official CLI |
+| `aither-llama` | Local llama.cpp wrapper that statically links llama.cpp |
 | `derive/` | Proc-macro helpers for tool schemas (`#[tool]`) |
 | `examples/` | Runnable flows for chat, research, and tool macros |
 
