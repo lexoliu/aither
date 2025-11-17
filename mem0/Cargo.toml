@@ -1,0 +1,22 @@
+[package]
+name = "aither-mem0"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Mem0-style long term memory orchestrator for Aither agents"
+
+[dependencies]
+aither-core = { path = "../core" }
+anyhow = { version = "1.0", features = ["std"] }
+schemars = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+time = { version = "0.3", features = ["formatting", "macros", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros"] }
+aither-openai = { path = "../openai" }
+aither-gemini = { path = "../gemini" }
