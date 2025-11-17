@@ -1,7 +1,7 @@
 //! Mem0 extraction/update demo backed by Gemini.
 //!
 //! Inspired by and thanks to the “Memo: Building Production-Ready AI Agents with
-//! Scalable Long-Term Memory” paper (https://arxiv.org/abs/2504.19413).
+//! Scalable Long-Term Memory” paper (<https://arxiv.org/abs/2504.19413>).
 //! This example runs the dense-memory variant, so no graph database is required.
 //!
 //! Requirements:
