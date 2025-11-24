@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use zenwave::{Client, client, header};
+use zenwave::{Client, client, error::BoxHttpError, header};
 
 use crate::{
     config::{AuthMode, GeminiConfig, USER_AGENT},
@@ -48,6 +48,9 @@ async fn post_json<T: for<'de> serde::Deserialize<'de>, S: Serialize>(
     if cfg.auth == AuthMode::Header {
         builder = builder.header("x-goog-api-key", cfg.api_key.clone());
     }
-    builder = builder.json_body(body).map_err(GeminiError::from)?;
-    builder.json().await.map_err(GeminiError::from)
+    builder = builder.json_body(body);
+    builder
+        .json()
+        .await
+        .map_err(|error| GeminiError::Http(BoxHttpError::from(Box::new(error))))
 }

@@ -5,7 +5,7 @@ use crate::{
 use aither_core::{EmbeddingModel, Result as CoreResult};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use zenwave::{Client, client, header};
+use zenwave::{Client, client, error::BoxHttpError, header};
 
 impl EmbeddingModel for OpenAI {
     fn dim(&self) -> usize {
@@ -35,8 +35,11 @@ async fn embed_once(cfg: Arc<Config>, input: String) -> Result<Vec<f32>, OpenAIE
         model: &cfg.embedding_model,
         input: &input,
     };
-    builder = builder.json_body(&request).map_err(OpenAIError::from)?;
-    let response: EmbeddingResponse = builder.json().await.map_err(OpenAIError::from)?;
+    builder = builder.json_body(&request);
+    let response: EmbeddingResponse = builder
+        .json()
+        .await
+        .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
     response
         .data
         .into_iter()

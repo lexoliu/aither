@@ -157,12 +157,7 @@ impl LanguageModel for OpenAI {
                 true,
             );
 
-            builder
-                .json_body(&request)
-                .map_err(OpenAIError::from)?
-                .sse()
-                .await
-                .map_err(OpenAIError::from)
+            builder.json_body(&request).sse().await
         };
 
         let events = futures_lite::stream::iter(vec![init_future])

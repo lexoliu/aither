@@ -1,11 +1,11 @@
 use std::fmt;
-use zenwave::{BodyError, Error as HttpError, sse::ParseError as SseParseError};
+use zenwave::{BodyError, error::BoxHttpError, sse::ParseError as SseParseError};
 
 /// Errors that can arise when calling the `OpenAI` API.
 #[derive(Debug)]
 pub enum OpenAIError {
     /// HTTP layer errors.
-    Http(HttpError),
+    Http(BoxHttpError),
     /// Response body parsing failures.
     Body(BodyError),
     /// SSE parsing failures.
@@ -32,12 +32,6 @@ impl fmt::Display for OpenAIError {
 }
 
 impl std::error::Error for OpenAIError {}
-
-impl From<HttpError> for OpenAIError {
-    fn from(value: HttpError) -> Self {
-        Self::Http(value)
-    }
-}
 
 impl From<BodyError> for OpenAIError {
     fn from(value: BodyError) -> Self {

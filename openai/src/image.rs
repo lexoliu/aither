@@ -9,7 +9,9 @@ use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use zenwave::{
-    Client, client, header,
+    Client, client,
+    error::BoxHttpError,
+    header,
     multipart::{MultipartPart, encode as encode_multipart},
 };
 
@@ -81,8 +83,11 @@ async fn generate_images(
         response_format: "b64_json",
         n: 1,
     };
-    builder = builder.json_body(&request).map_err(OpenAIError::from)?;
-    let response: ImageResponse = builder.json().await.map_err(OpenAIError::from)?;
+    builder = builder.json_body(&request);
+    let response: ImageResponse = builder
+        .json()
+        .await
+        .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
     response.into_images()
 }
 
@@ -122,7 +127,10 @@ async fn edit_image(
         format!("multipart/form-data; boundary={boundary}"),
     );
     builder = builder.bytes_body(body);
-    let response: ImageResponse = builder.json().await.map_err(OpenAIError::from)?;
+    let response: ImageResponse = builder
+        .json()
+        .await
+        .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
     response.into_images()
 }
 

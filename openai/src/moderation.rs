@@ -5,7 +5,7 @@ use crate::{
 use aither_core::moderation::{Moderation, ModerationCategory, ModerationResult};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, future::Future, sync::Arc};
-use zenwave::{Client, client, header};
+use zenwave::{Client, client, error::BoxHttpError, header};
 
 impl Moderation for OpenAI {
     type Error = OpenAIError;
@@ -34,8 +34,12 @@ async fn moderate_once(cfg: Arc<Config>, content: String) -> Result<ModerationRe
         model: &cfg.moderation_model,
         input: &content,
     };
-    builder = builder.json_body(&request).map_err(OpenAIError::from)?;
-    let response: ModerationResponse = builder.json().await.map_err(OpenAIError::from)?;
+    builder = builder.json_body(&request);
+    let response: ModerationResponse = builder
+        .json()
+        .await
+        .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
+
     response.into_result()
 }
 

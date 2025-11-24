@@ -7,7 +7,9 @@ use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use zenwave::{
-    Client, client, header,
+    Client, client,
+    error::BoxHttpError,
+    header,
     multipart::{MultipartPart, encode as encode_multipart},
 };
 
@@ -47,8 +49,12 @@ async fn synthesize(cfg: Arc<Config>, text: String) -> Result<Vec<u8>, OpenAIErr
         voice: &cfg.audio_voice,
         format: &cfg.audio_format,
     };
-    builder = builder.json_body(&request).map_err(OpenAIError::from)?;
-    let bytes = builder.bytes().await.map_err(OpenAIError::from)?;
+    builder = builder.json_body(&request);
+    let bytes = builder
+        .bytes()
+        .await
+        .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
+
     Ok(bytes.to_vec())
 }
 
@@ -75,7 +81,11 @@ async fn transcribe_once(cfg: Arc<Config>, audio: Vec<u8>) -> Result<String, Ope
     );
     builder = builder.bytes_body(body);
 
-    let response: TranscriptionResponse = builder.json().await.map_err(OpenAIError::from)?;
+    let response: TranscriptionResponse = builder
+        .json()
+        .await
+        .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
+
     Ok(response.text)
 }
 

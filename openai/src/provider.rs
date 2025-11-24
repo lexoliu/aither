@@ -6,7 +6,7 @@ use aither_core::llm::{
 };
 use serde::Deserialize;
 use std::{future::Future, sync::Arc};
-use zenwave::{Client, client, header};
+use zenwave::{Client, client, error::BoxHttpError, header};
 
 /// Provider capable of listing and instantiating `OpenAI` models.
 #[derive(Clone, Debug)]
@@ -80,7 +80,10 @@ impl LanguageModelProvider for OpenAIProvider {
             if let Some(org) = &cfg.organization {
                 builder = builder.header("OpenAI-Organization", org.clone());
             }
-            let response: ModelListResponse = builder.json().await.map_err(OpenAIError::from)?;
+            let response: ModelListResponse = builder
+                .json()
+                .await
+                .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
             Ok(response
                 .data
                 .into_iter()
