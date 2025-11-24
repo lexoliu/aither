@@ -1,6 +1,6 @@
 //! Retrieval-Augmented Generation helper crate.
 //!
-//! The [`RagStore`] type glues any [`EmbeddingModel`](aither_core::EmbeddingModel) to a built-in
+//! The [`RagStore`] type glues any [`EmbeddingModel`] to a built-in
 //! parallel vector index, exposing a tiny API surface:
 //! - [`RagStore::insert`] – chunk/index new documents.
 //! - [`RagStore::delete`] – drop vectors by identifier.

@@ -12,7 +12,7 @@
 //!
 //! - [`Tool`] - Trait for defining executable tools
 //! - [`Tools`] - Registry for managing multiple tools  
-//! - [`ToolDefinition`] - Metadata and schema for LLM consumption
+//! - [`tool::ToolDefinition`] - Metadata and schema for LLM consumption
 //!
 //! ## Quick Start
 //!

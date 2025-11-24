@@ -7,7 +7,7 @@
 //!
 //! - **[`LanguageModel`]** - The main trait for text generation and conversation
 //! - **[`LLMRequest`]** - Encapsulates messages, tools, and parameters for model calls
-//! - **[`LLMResponse`] - Trait for streaming responses with reasoning steps
+//! - **[`LLMResponse`]** - Trait for streaming responses with reasoning steps
 //! - **[`Message`]** - Represents individual messages in a conversation
 //! - **[`Tool`]** - Function calling interface for extending model capabilities
 //!

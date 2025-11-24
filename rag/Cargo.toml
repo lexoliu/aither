@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "High-performance Retrieval-Augmented Generation store backed by a parallel in-memory vector database"
+keywords = ["rag", "embedding", "vector-database", "search"]
+categories = ["api-bindings", "database"]
 
 [dependencies]
 aither-core = { path = "../core" }

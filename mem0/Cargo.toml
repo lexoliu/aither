@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Mem0-style long term memory orchestrator for Aither agents"
+keywords = ["memory", "agent", "llm", "rag", "long-term-memory"]
+categories = ["api-bindings", "ai"]
 
 [dependencies]
 aither-core = { path = "../core" }

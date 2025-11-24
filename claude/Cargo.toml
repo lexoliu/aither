@@ -12,6 +12,7 @@ keywords = ["ai", "llm", "claude", "anthropic"]
 categories = ["api-bindings"]
 
 [dependencies]
+aither-core = { workspace = true }
 
 [lints]
 workspace = true

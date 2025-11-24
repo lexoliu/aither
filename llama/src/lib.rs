@@ -5,7 +5,7 @@
 //! instance loads a GGUF checkpoint, and every [`LanguageModel::respond`]
 //! call spins up a dedicated inference session so calls can run concurrently.
 //! Standard llama.cpp sampling controls (temperature, top-p, repetition
-//! penalties, stop sequences, etc.) are wired into [`crate::llm::model::Parameters`].
+//! penalties, stop sequences, etc.) are wired into [`aither_core::llm::model::Parameters`].
 //!
 //! ```no_run
 //! use aither::llm::{LanguageModel, LLMRequest, Message};
