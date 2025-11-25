@@ -29,7 +29,6 @@ impl Moderation for GeminiBackend {
                 }),
                 tools: Vec::new(),
                 tool_config: None,
-                thinking_config: None,
                 safety_settings: default_safety_settings(),
             };
             let model_id = cfg.text_model.clone();
@@ -60,11 +59,10 @@ impl Moderation for GeminiBackend {
 fn default_safety_settings() -> Vec<SafetySetting> {
     vec![
         SafetySetting::new("HARM_CATEGORY_HATE_SPEECH"),
-        SafetySetting::new("HARM_CATEGORY_SEXUAL"),
+        SafetySetting::new("HARM_CATEGORY_SEXUALLY_EXPLICIT"),
         SafetySetting::new("HARM_CATEGORY_DANGEROUS_CONTENT"),
-        SafetySetting::new("HARM_CATEGORY_HARASSMENT_ABUSE"),
+        SafetySetting::new("HARM_CATEGORY_HARASSMENT"),
         SafetySetting::new("HARM_CATEGORY_CIVIC_INTEGRITY"),
-        SafetySetting::new("HARM_CATEGORY_SEXUAL_AND_GENDER_IDENTITY"),
     ]
 }
 
@@ -80,14 +78,9 @@ fn to_moderation_category(rating: &SafetyRating) -> Option<ModerationCategory> {
     let score = probability_to_score(rating.probability.as_deref());
     match rating.category.as_str() {
         "HARM_CATEGORY_HATE_SPEECH" => Some(ModerationCategory::Hate { score }),
-        "HARM_CATEGORY_HARASSMENT_ABUSE" => Some(ModerationCategory::Harassment { score }),
-        "HARM_CATEGORY_SEXUAL" | "HARM_CATEGORY_SEXUAL_AND_GENDER_IDENTITY" => {
-            Some(ModerationCategory::Sexual { score })
-        }
-        "HARM_CATEGORY_DANGEROUS_CONTENT" | "HARM_CATEGORY_VIOLENCE" => {
-            Some(ModerationCategory::Violence { score })
-        }
-        "HARM_CATEGORY_SELF_HARM" => Some(ModerationCategory::SelfHarm { score }),
+        "HARM_CATEGORY_HARASSMENT" => Some(ModerationCategory::Harassment { score }),
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT" => Some(ModerationCategory::Sexual { score }),
+        "HARM_CATEGORY_DANGEROUS_CONTENT" => Some(ModerationCategory::Violence { score }),
         _ => None,
     }
 }

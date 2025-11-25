@@ -6,7 +6,7 @@ use crate::{
     client::call_generate,
     config::GeminiBackend,
     error::GeminiError,
-    types::{GeminiContent, GenerateContentRequest, GenerationConfig, Part},
+    types::{GeminiContent, GenerateContentRequest, GenerationConfig, ImageConfig, Part},
 };
 
 impl ImageGenerator for GeminiBackend {
@@ -20,11 +20,7 @@ impl ImageGenerator for GeminiBackend {
         let cfg = self.config();
         let text = prompt.text().to_owned();
         let images = prompt.images().to_vec();
-        let size_desc = format!(
-            "Generate an image roughly {}x{} pixels.",
-            size.width(),
-            size.height()
-        );
+        let aspect_ratio = map_size_to_aspect_ratio(size);
 
         futures_lite::stream::iter(vec![async move {
             let model = cfg.image_model.clone().ok_or_else(|| {
@@ -34,18 +30,19 @@ impl ImageGenerator for GeminiBackend {
             for image in images {
                 parts.push(Part::inline_image(image));
             }
-            parts.push(Part::text(size_desc));
 
             let request = GenerateContentRequest {
                 system_instruction: None,
                 contents: vec![GeminiContent::with_parts("user", parts)],
                 generation_config: Some(GenerationConfig {
-                    response_modalities: Some(vec!["IMAGE".into()]),
+                    image_config: Some(ImageConfig {
+                        aspect_ratio: Some(aspect_ratio),
+                        image_size: None,
+                    }),
                     ..GenerationConfig::default()
                 }),
                 tools: Vec::new(),
                 tool_config: None,
-                thinking_config: None,
                 safety_settings: Vec::new(),
             };
             call_generate(cfg, &model, request).await
@@ -97,13 +94,9 @@ impl ImageGenerator for GeminiBackend {
             let request = GenerateContentRequest {
                 system_instruction: None,
                 contents: vec![GeminiContent::with_parts("user", parts)],
-                generation_config: Some(GenerationConfig {
-                    response_modalities: Some(vec!["IMAGE".into()]),
-                    ..GenerationConfig::default()
-                }),
+                generation_config: Some(GenerationConfig::default()),
                 tools: Vec::new(),
                 tool_config: None,
-                thinking_config: None,
                 safety_settings: Vec::new(),
             };
             call_generate(cfg, &model, request).await
@@ -124,5 +117,25 @@ impl ImageGenerator for GeminiBackend {
                 })
                 .map(Ok)
         })
+    }
+}
+
+fn map_size_to_aspect_ratio(size: Size) -> String {
+    if size.width() == size.height() {
+        "1:1".into()
+    } else if size.width() > size.height() {
+        if size.width() * 9 == size.height() * 16 {
+            "16:9".into()
+        } else if size.width() * 3 == size.height() * 4 {
+            "4:3".into()
+        } else {
+            "16:9".into() // Default landscape
+        }
+    } else if size.width() * 16 == size.height() * 9 {
+        "9:16".into()
+    } else if size.width() * 4 == size.height() * 3 {
+        "3:4".into()
+    } else {
+        "9:16".into() // Default portrait
     }
 }

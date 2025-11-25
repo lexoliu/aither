@@ -143,6 +143,7 @@
 #[cfg(feature = "derive")]
 pub use aither_derive::tool;
 use alloc::borrow::Cow;
+use serde_json::Value;
 
 use crate::Result;
 use alloc::format;
@@ -209,14 +210,25 @@ pub trait Tool: Send + Sync {
     fn call(&mut self, arguments: Self::Arguments) -> impl Future<Output = Result> + Send;
 }
 
-/// Serializes a value to JSON string.
+/// Utility to convert a serializable value to a pretty-printed JSON string.
 ///
-/// Convenience function for tools that need to return JSON responses.
-/// Uses [`serde_json::to_string_pretty`] internally.
-///
-/// # Panics
-///
-/// Panics if the value cannot be serialized to JSON.
+/// # Example
+/// ```rust
+/// use aither::llm::tool::json;
+/// use serde::Serialize;
+/// #[derive(Serialize)]
+/// struct Data {
+///     name: String,
+///     value: u32,
+/// }
+/// let data = Data {
+///     name: "example".to_string(),
+///     value: 42,
+/// };
+/// let json_str = json(&data);
+/// println!("{}", json_str);
+/// ```
+#[must_use]
 pub fn json<T: Serialize>(value: &T) -> String {
     let value = serde_json::to_value(value).expect("Failed to convert value to JSON");
 
@@ -230,9 +242,25 @@ trait ToolImpl: Send + Sync {
     fn definition(&self) -> ToolDefinition;
 }
 
+fn is_object<T: JsonSchema>() -> bool {
+    let schema = schema_for!(T);
+    let value: Value = schema.to_value();
+
+    matches!(value.get("type").and_then(Value::as_str), Some("object"))
+        || value.get("properties").is_some()
+}
+
 impl<T: Tool> ToolImpl for T {
     fn call(&mut self, args: &str) -> Pin<Box<dyn Future<Output = Result> + Send + '_>> {
-        let Ok(arguments) = serde_json::from_str::<T::Arguments>(args) else {
+        let is_object = is_object::<T::Arguments>();
+
+        let result = if is_object {
+            serde_json::from_str::<T::Arguments>(args)
+        } else {
+            serde_json::from_str::<ToolArgument<T::Arguments>>(args).map(|wrapper| wrapper.value)
+        };
+
+        let Ok(arguments) = result else {
             return Box::pin(async move {
                 Err(anyhow::Error::msg(format!(
                     "Failed to parse arguments for tool '{}'",
@@ -245,11 +273,7 @@ impl<T: Tool> ToolImpl for T {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: self.name(),
-            description: self.description(),
-            arguments: schema_for!(T::Arguments),
-        }
+        ToolDefinition::new(self)
     }
 }
 
@@ -296,10 +320,16 @@ impl ToolDefinition {
     /// Creates a tool definition for a given tool type.
     #[must_use]
     pub fn new<T: Tool>(tool: &T) -> Self {
+        let mut arguments = schema_for!(T::Arguments);
+
+        if !is_object::<T::Arguments>() {
+            arguments = schema_for!(ToolArgument<T::Arguments>);
+        }
+
         Self {
             name: tool.name(),
             description: tool.description(),
-            arguments: schema_for!(T::Arguments),
+            arguments,
         }
     }
 
@@ -315,10 +345,41 @@ impl ToolDefinition {
         &self.description
     }
 
-    /// Returns the JSON schema for the tool's arguments.
+    /// Return an OpenAI-compatible JSON schema for the tool's arguments.
+    ///
+    /// This schema would have an object type at the root, as required by OpenAI.
     #[must_use]
-    pub const fn arguments_schema(&self) -> &Schema {
-        &self.arguments
+    pub fn arguments_openai_schema(&self) -> serde_json::Value {
+        let mut inner = self.arguments.clone().to_value();
+        clean_schema(&mut inner);
+
+        inner
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+struct ToolArgument<T> {
+    value: T,
+}
+
+fn clean_schema(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("$schema");
+            map.remove("$id");
+            map.remove("title");
+            map.remove("definitions");
+
+            for v in map.values_mut() {
+                clean_schema(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                clean_schema(v);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -133,6 +133,16 @@ where
     }
 }
 
+// ReasoningStream/ReasoningFuture are Send when the inner stream/error are Send.
+unsafe impl<S, E> Send for ReasoningStream<S, E>
+where
+    S: Stream<Item = Result<ResponseChunk, E>> + Send,
+    E: core::error::Error + Send,
+{
+}
+
+unsafe impl<S, E> Send for ReasoningFuture<S, E> where ReasoningStream<S, E>: Send {}
+
 impl<S, E> Stream for ReasoningStream<S, E>
 where
     S: Stream<Item = Result<ResponseChunk, E>>,

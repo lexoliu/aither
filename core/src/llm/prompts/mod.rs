@@ -12,7 +12,7 @@ Requirements:
 - All required fields must be present
 - Use appropriate data types (strings, numbers, booleans, arrays, objects)
 - Ensure proper JSON syntax with correct quotes, brackets, and commas
-- Do not include any text before or after the JSON
+- Do not include any text before or after the JSON, no quotes, no code blocks, no explanations
 
 Example format: {{"field1": "value1", "field2": 123}}"#
     )

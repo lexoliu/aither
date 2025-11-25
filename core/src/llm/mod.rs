@@ -213,9 +213,16 @@ mod response;
 pub mod tool;
 
 use crate::llm::{model::Parameters, tool::Tools};
-use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-use anyhow::bail;
-use core::{future::Future, pin::Pin, task::Poll};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
+use anyhow::{Context, anyhow, bail};
+use core::{any::TypeId, future::Future, pin::Pin, task::Poll};
 use futures_core::Stream;
 use futures_lite::{StreamExt, pin};
 pub use message::{Annotation, Message, Role, UrlAnnotation};
@@ -227,6 +234,7 @@ pub use researcher::{
 pub use response::{ReasoningStream, ResponseChunk};
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 pub use tool::Tool;
 
 use crate::llm::{model::Profile, tool::json};
@@ -249,7 +257,9 @@ use crate::llm::{model::Profile, tool::json};
 ///
 /// Implementors must also implement `IntoFuture` to allow collecting the full response.
 pub trait LLMResponse:
-    Stream<Item = Result<String, Self::Error>> + IntoFuture<Output = Result<String, Self::Error>> + Send
+    Stream<Item = Result<String, Self::Error>>
+    + IntoFuture<Output = Result<String, Self::Error>, IntoFuture: Send>
+    + Send
 {
     /// The error type returned by this response stream.
     type Error: core::error::Error + Send + Sync + 'static;
@@ -479,12 +489,9 @@ mod prompts;
 
 impl_language_model!(Arc, Box);
 
-/// Collects all chunks from a stream of `Result<String, Err>` into a single `String`.
-///
-/// # Errors
-///
-/// Returns an error if any chunk in the stream is an `Err`.
-pub async fn try_collect<S, Err>(stream: S) -> Result<String, Err>
+// Internal helper, please use `LLMResponse::into_future` directly, it is more ergonomic.
+// For instance, you can use `.await` on the response to collect the full text.
+pub(crate) async fn try_collect<S, Err>(stream: S) -> Result<String, Err>
 where
     S: Stream<Item = Result<String, Err>>,
 {
@@ -495,7 +502,7 @@ where
         .await
 }
 
-async fn structured_generate<T: JsonSchema + DeserializeOwned, M: LanguageModel>(
+async fn structured_generate<T: JsonSchema + DeserializeOwned + 'static, M: LanguageModel>(
     model: &M,
     mut request: LLMRequest<'_>,
 ) -> crate::Result<T> {
@@ -512,13 +519,13 @@ async fn structured_generate<T: JsonSchema + DeserializeOwned, M: LanguageModel>
 
         let prompt = prompts::generate(&schema);
         request.messages.push(Message::system(prompt));
+        request.parameters.structured_outputs = true;
 
         let stream = model.respond(request);
         try_collect(stream).await?
     };
 
-    serde_json::from_str::<T>(&json)
-        .map_err(|err| anyhow::Error::new(err).context("failed to parse structured output"))
+    parse_json_with_recovery(&json)
 }
 
 /// Convenience helper that creates a single system + user [`LLMRequest`].
@@ -541,4 +548,213 @@ async fn categorize_text<T: JsonSchema + DeserializeOwned + 'static, M: Language
 ) -> crate::Result<T> {
     let request = oneshot("Categorize text by provided schema", text);
     model.generate(request).await
+}
+
+fn parse_json_with_recovery<T: DeserializeOwned + 'static>(json: &str) -> crate::Result<T> {
+    let trimmed = json.trim();
+    let mut last_error: Option<serde_json::Error> = None;
+    let mut last_candidate: Option<String> = None;
+
+    for candidate in build_json_candidates(trimmed) {
+        match serde_json::from_str::<T>(&candidate) {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                last_error = Some(err);
+                last_candidate = Some(candidate);
+            }
+        }
+    }
+
+    if is_string_type::<T>() {
+        if let Some(candidate) = last_candidate.clone() {
+            if let Ok(value) = serde_json::from_str::<Value>(&candidate) {
+                let text = match value {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                let encoded = serde_json::to_string(&text)
+                    .map_err(|err| anyhow!(err))
+                    .context("failed to encode fallback string while parsing structured output")?;
+                if let Ok(value) = serde_json::from_str::<T>(&encoded) {
+                    return Ok(value);
+                }
+            }
+        }
+    }
+
+    let primary = last_error
+        .map(anyhow::Error::new)
+        .unwrap_or_else(|| anyhow!("structured output was empty or missing JSON block"));
+    let snippet = last_candidate
+        .as_deref()
+        .unwrap_or(trimmed)
+        .chars()
+        .take(500)
+        .collect::<String>();
+    Err(primary.context(format!(
+        "failed to parse structured output; sample: {snippet}"
+    )))
+}
+
+fn strip_code_fences(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let fence_start = trimmed.find("```")?;
+    let after_fence = &trimmed[fence_start + 3..];
+    let mut lines = after_fence.lines();
+    let _maybe_lang = lines.next(); // optional language tag
+    let body = lines.collect::<Vec<_>>().join("\n");
+    let content = if let Some(end) = body.rfind("```") {
+        &body[..end]
+    } else {
+        &body
+    };
+
+    let cleaned = content.trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+fn extract_json_block(raw: &str) -> Option<String> {
+    if let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}')) {
+        if end >= start {
+            let candidate = &raw[start..=end];
+            if !candidate.trim().is_empty() {
+                return Some(candidate.trim().to_string());
+            }
+        }
+    }
+    if let (Some(start), Some(end)) = (raw.find('['), raw.rfind(']')) {
+        if end >= start {
+            let candidate = &raw[start..=end];
+            if !candidate.trim().is_empty() {
+                return Some(candidate.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn build_json_candidates(raw: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    // 1) Raw
+    if !raw.is_empty() {
+        candidates.push(raw.to_string());
+    }
+
+    // 2) Code fences
+    if let Some(fenced) = strip_code_fences(raw) {
+        candidates.push(fenced);
+    }
+
+    // 3) Extract first JSON object/array
+    if let Some(block) = extract_json_block(raw) {
+        candidates.push(block);
+    }
+
+    // 4) Unquote JSON encoded as a single string
+    if let Some(dequoted) = dequote_json_string(raw) {
+        candidates.push(dequoted);
+    }
+
+    // 5) Drop leading "json"/"JSON" labels
+    if let Some(stripped) = strip_leading_label(raw, "json") {
+        candidates.push(stripped);
+    }
+
+    // Remove duplicates while preserving order.
+    let mut deduped = Vec::new();
+    for candidate in candidates {
+        if deduped.iter().all(|seen| seen != &candidate) {
+            deduped.push(candidate);
+        }
+    }
+    deduped
+}
+
+fn dequote_json_string(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if !(trimmed.starts_with('"') && trimmed.ends_with('"')) {
+        return None;
+    }
+    let inner: String = serde_json::from_str(trimmed).ok()?;
+    if inner.trim().is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
+fn strip_leading_label(raw: &str, label: &str) -> Option<String> {
+    let trimmed = raw.trim_start();
+    if !trimmed.to_ascii_lowercase().starts_with(label) {
+        return None;
+    }
+    let stripped = trimmed[label.len()..]
+        .trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == '-')
+        .trim();
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
+fn is_string_type<T: 'static>() -> bool {
+    TypeId::of::<T>() == TypeId::of::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_json_with_recovery;
+    use alloc::string::String;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct Foo {
+        a: u8,
+    }
+
+    #[test]
+    fn parses_plain_json() {
+        let foo: Foo = parse_json_with_recovery(r#"{"a":1}"#).unwrap();
+        assert_eq!(foo, Foo { a: 1 });
+    }
+
+    #[test]
+    fn parses_code_fence_json() {
+        let foo: Foo = parse_json_with_recovery("```json\n{\"a\":2}\n```").unwrap();
+        assert_eq!(foo, Foo { a: 2 });
+    }
+
+    #[test]
+    fn parses_embedded_block() {
+        let foo: Foo = parse_json_with_recovery("noise {\"a\":3} trailing").unwrap();
+        assert_eq!(foo, Foo { a: 3 });
+    }
+
+    #[test]
+    fn parses_quoted_json_string() {
+        let foo: Foo = parse_json_with_recovery(r#""{\"a\":4}""#).unwrap();
+        assert_eq!(foo, Foo { a: 4 });
+    }
+
+    #[test]
+    fn parses_labeled_json() {
+        let foo: Foo = parse_json_with_recovery("json {\"a\":5}").unwrap();
+        assert_eq!(foo, Foo { a: 5 });
+    }
+
+    #[test]
+    fn coerces_object_to_string() {
+        let value: String =
+            parse_json_with_recovery(r#"{"title":"summary","type":"content"}"#).unwrap();
+        assert!(
+            value.contains("\"title\":\"summary\"") && value.contains("\"type\":\"content\""),
+            "unexpected value: {value}"
+        );
+    }
 }

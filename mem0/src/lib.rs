@@ -1,688 +1,368 @@
-//! Mem0-inspired long-term memory pipeline without the graph add-on.
-//!
-//! This crate implements the extraction/update workflow described in the
-//! “Memo: Building Production-Ready AI Agents with Scalable Long-Term Memory”
-//! paper. The pipeline keeps a rolling summary of the conversation, extracts
-//! salient facts from each exchange, and updates a dense vector store by asking
-//! an LLM to choose `ADD`, `UPDATE`, `DELETE`, or `NOOP` operations.
-//!
-//! The focus of this crate is the base Mem0 variant (no graph database). The
-//! [`Mem0`] struct owns everything you need:
-//! - Maintains a conversation summary refreshed every few exchanges.
-//! - Runs the extraction phase with a configurable recency window.
-//! - Evaluates candidates against similar memories and applies the correct
-//!   operation selected by the LLM.
-//! - Exposes a simple cosine-similarity store for downstream recall.
+use std::str::FromStr;
+use std::sync::Arc;
 
-use std::{collections::BTreeMap, fmt::Write};
+use aither_core::embedding::EmbeddingModel;
+use aither_core::llm::{LLMRequest, LanguageModel, Message, Tool};
+use anyhow::Context;
+use llm::{Action, ExtractedFacts, MemoryDecision};
+use store::{MemoryStore, SearchFilters};
+use tracing::debug;
+use uuid::Uuid;
 
-use aither_core::{
-    EmbeddingModel, LanguageModel, Result,
-    llm::{Message, oneshot},
-};
-use anyhow::{Context, anyhow};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
+pub mod error;
+pub mod llm;
+pub mod store;
 
-/// Arbitrary metadata linked to each stored memory.
-pub type Metadata = BTreeMap<String, String>;
+pub use error::{Mem0Error, Result};
+pub use store::{InMemoryStore, Memory, SearchResult};
 
-/// Configures the Mem0 pipeline behaviour.
-#[derive(Debug, Clone)]
-pub struct Mem0Config {
-    recency_window: usize,
-    similar_memories: usize,
-    summary_refresh_interval: usize,
-    summary_instructions: String,
-    extraction_instructions: String,
-    update_instructions: String,
+pub struct SearchTool<L, E, S> {
+    inner: Mem0<L, E, S>,
 }
 
-impl Default for Mem0Config {
-    fn default() -> Self {
-        Self {
-            recency_window: 10,
-            similar_memories: 10,
-            summary_refresh_interval: 6,
-            summary_instructions: "Summarize the whole dialogue tracking stable facts, \
-                long-term preferences, and relationship details. Keep it under 200 words."
-                .into(),
-            extraction_instructions: "Extract compact memories from the new exchange. \
-                Each memory must mention who said it, the concrete fact, and when it happened \
-                if time information is available. Reject chit-chat."
-                .into(),
-            update_instructions: "ADD when the candidate fact is new. UPDATE when it \
-                complements an existing memory (return the merged memory). DELETE when the \
-                candidate contradicts an older memory. NOOP when the fact is irrelevant."
-                .into(),
-        }
-    }
-}
-
-impl Mem0Config {
-    /// Sets the extraction recency window `m`.
-    #[must_use]
-    pub fn with_recency_window(mut self, value: usize) -> Self {
-        self.recency_window = value.max(2);
-        self
-    }
-
-    /// Sets how many similar memories are inspected during the update phase.
-    #[must_use]
-    pub fn with_similar_memories(mut self, value: usize) -> Self {
-        self.similar_memories = value.max(1);
-        self
-    }
-
-    /// Sets how often (in processed exchanges) the summary is refreshed.
-    #[must_use]
-    pub fn with_summary_refresh_interval(mut self, value: usize) -> Self {
-        self.summary_refresh_interval = value.max(1);
-        self
-    }
-
-    /// Overrides the instructions used while refreshing the conversation summary.
-    #[must_use]
-    pub fn with_summary_instructions(mut self, instructions: impl Into<String>) -> Self {
-        self.summary_instructions = instructions.into();
-        self
-    }
-
-    /// Overrides the memory extraction instructions.
-    #[must_use]
-    pub fn with_extraction_instructions(mut self, instructions: impl Into<String>) -> Self {
-        self.extraction_instructions = instructions.into();
-        self
-    }
-
-    /// Overrides the update instructions.
-    #[must_use]
-    pub fn with_update_instructions(mut self, instructions: impl Into<String>) -> Self {
-        self.update_instructions = instructions.into();
-        self
-    }
-
-    /// Returns the configured recency window.
-    #[must_use]
-    pub const fn recency_window(&self) -> usize {
-        self.recency_window
-    }
-
-    /// Returns the configured summary refresh cadence.
-    #[must_use]
-    pub const fn summary_refresh_interval(&self) -> usize {
-        self.summary_refresh_interval
-    }
-
-    /// Returns the `s` hyper-parameter (neighbor count).
-    #[must_use]
-    pub const fn similar_memories(&self) -> usize {
-        self.similar_memories
-    }
-}
-
-/// Importance level returned by the extraction step.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryImportance {
-    /// Critical persona or preference information.
-    Critical,
-    /// Useful for future conversations.
-    Important,
-    /// Lightweight background or situational context.
-    Contextual,
-}
-
-impl Default for MemoryImportance {
-    fn default() -> Self {
-        Self::Important
-    }
-}
-
-/// Structured payload returned by the extraction and update stages.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-pub struct MemoryPayload {
-    /// Textual representation of the memory.
-    pub content: String,
-    /// Optional participant identifier.
-    pub speaker: Option<String>,
-    /// Free-form timestamp (the pipeline normalizes it later if desired).
-    pub timestamp: Option<String>,
-    /// How important the fact is.
-    #[serde(default)]
-    pub importance: MemoryImportance,
-    /// Additional metadata, e.g., tags or external identifiers.
-    #[serde(default)]
-    pub metadata: Metadata,
-}
-
-impl MemoryPayload {
-    fn is_empty(&self) -> bool {
-        self.content.trim().is_empty()
-    }
-}
-
-/// Represents a stored memory fact.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryEntry {
-    /// Stable identifier generated by the store.
-    pub id: String,
-    /// Stored payload.
-    pub payload: MemoryPayload,
-    /// Creation timestamp.
-    pub created_at: OffsetDateTime,
-    /// Last update timestamp.
-    pub updated_at: OffsetDateTime,
-    embedding: Vec<f32>,
-}
-
-impl MemoryEntry {
-    fn context(&self, score: f32) -> MemoryContext {
-        MemoryContext {
-            id: self.id.clone(),
-            payload: self.payload.clone(),
-            score,
-        }
-    }
-}
-
-/// Lightweight projection used to show similar memories to the LLM.
-#[derive(Debug, Clone, Serialize)]
-struct MemoryContext {
-    id: String,
-    payload: MemoryPayload,
-    score: f32,
-}
-
-/// Cosine-similarity store keeping all memories in memory.
-#[derive(Debug, Clone)]
-pub struct MemoryStore {
-    entries: Vec<MemoryEntry>,
-    next_id: u64,
-    dimension: usize,
-}
-
-impl MemoryStore {
-    /// Creates an empty store sized to the embedder dimension.
-    #[must_use]
-    pub fn new(dimension: usize) -> Self {
-        Self {
-            entries: Vec::new(),
-            next_id: 1,
-            dimension,
-        }
-    }
-
-    /// Returns all stored entries.
-    #[must_use]
-    pub fn entries(&self) -> &[MemoryEntry] {
-        self.entries.as_slice()
-    }
-
-    fn insert(&mut self, payload: MemoryPayload, embedding: Vec<f32>) -> MemoryEntry {
-        let now = OffsetDateTime::now_utc();
-        let id = format!("mem-{}", self.next_id);
-        self.next_id += 1;
-
-        let entry = MemoryEntry {
-            id,
-            payload,
-            created_at: now,
-            updated_at: now,
-            embedding,
-        };
-        self.entries.push(entry.clone());
-        entry
-    }
-
-    fn update(
-        &mut self,
-        id: &str,
-        payload: MemoryPayload,
-        embedding: Vec<f32>,
-    ) -> Option<MemoryEntry> {
-        let now = OffsetDateTime::now_utc();
-        let entry = self.entries.iter_mut().find(|entry| entry.id == id)?;
-        entry.payload = payload;
-        entry.embedding = embedding;
-        entry.updated_at = now;
-        Some(entry.clone())
-    }
-
-    fn remove(&mut self, id: &str) -> Option<MemoryEntry> {
-        if let Some(pos) = self.entries.iter().position(|entry| entry.id == id) {
-            Some(self.entries.remove(pos))
-        } else {
-            None
-        }
-    }
-
-    fn top_similar(&self, vector: &[f32], top_k: usize) -> Vec<MemoryContext> {
-        if vector.len() != self.dimension || self.entries.is_empty() || top_k == 0 {
-            return Vec::new();
-        }
-
-        let mut scored = self
-            .entries
-            .iter()
-            .map(|entry| {
-                let score = cosine_similarity(vector, &entry.embedding);
-                entry.context(score)
-            })
-            .collect::<Vec<_>>();
-
-        scored.sort_by(|a, b| b.score.total_cmp(&a.score));
-        scored.truncate(top_k);
-        scored
-    }
-
-    fn recall(&self, vector: &[f32], top_k: usize) -> Vec<MemoryEntry> {
-        if vector.len() != self.dimension {
-            return Vec::new();
-        }
-
-        let mut scored = self
-            .entries
-            .iter()
-            .map(|entry| {
-                let score = cosine_similarity(vector, &entry.embedding);
-                (entry, score)
-            })
-            .collect::<Vec<_>>();
-
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-        scored.truncate(top_k);
-        scored.into_iter().map(|(entry, _)| entry.clone()).collect()
-    }
-}
-
-/// Outcome produced after applying an update operation.
-#[derive(Debug, Clone)]
-pub struct MemoryChange {
-    /// Operation that was executed.
-    pub operation: OperationKind,
-    /// Entry affected by the change (where applicable).
-    pub entry: Option<MemoryEntry>,
-    /// Raw target identifier returned by the update LLM.
-    pub target: Option<String>,
-    /// Optional reasoning string supplied by the model.
-    pub reasoning: Option<String>,
-}
-
-/// High-level Mem0 orchestrator that maintains summaries and a memory store.
-#[derive(Debug)]
-pub struct Mem0<LLM, EMB> {
-    llm: LLM,
-    embedder: EMB,
-    config: Mem0Config,
-    store: MemoryStore,
-    history: Vec<Message>,
-    summary: Option<String>,
-    processed_pairs: usize,
-}
-
-impl<LLM, EMB> Mem0<LLM, EMB>
+impl<L, E, S> Tool for SearchTool<L, E, S>
 where
-    LLM: LanguageModel,
-    EMB: EmbeddingModel,
+    L: LanguageModel,
+    E: EmbeddingModel,
+    S: MemoryStore,
 {
-    /// Creates a Mem0 instance with the default configuration.
-    #[must_use]
-    pub fn new(llm: LLM, embedder: EMB) -> Self {
-        Self::with_config(llm, embedder, Mem0Config::default())
+    type Arguments = String;
+    fn name(&self) -> std::borrow::Cow<'static, str> {
+        "search_memories".into()
     }
 
-    /// Creates a Mem0 instance with custom configuration.
-    #[must_use]
-    pub fn with_config(llm: LLM, embedder: EMB, config: Mem0Config) -> Self {
-        let store = MemoryStore::new(embedder.dim());
+    fn description(&self) -> std::borrow::Cow<'static, str> {
+        "Search for relevant memories based on a query string.".into()
+    }
+
+    async fn call(&mut self, arguments: Self::Arguments) -> aither_core::Result {
+        Ok(self
+            .inner
+            .retrieve_formatted(&arguments, 50)
+            .await
+            .context("Fail to retrive memory")?)
+    }
+}
+
+pub struct AddFactTool<L, E, S> {
+    inner: Mem0<L, E, S>,
+}
+
+impl<L, E, S> Tool for AddFactTool<L, E, S>
+where
+    L: LanguageModel,
+    E: EmbeddingModel,
+    S: MemoryStore,
+{
+    type Arguments = Vec<String>;
+    fn name(&self) -> std::borrow::Cow<'static, str> {
+        "add_fact".into()
+    }
+
+    fn description(&self) -> std::borrow::Cow<'static, str> {
+        "Add a new fact to memory.".into()
+    }
+
+    async fn call(&mut self, arguments: Self::Arguments) -> aither_core::Result {
+        self.inner
+            .add_fact(arguments)
+            .await
+            .context("Fail to add fact")?;
+        Ok("Fact(s) added successfully.".into())
+    }
+}
+
+/// Configuration for Mem0.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Number of similar memories to retrieve for update context.
+    pub retrieve_count: usize,
+    /// User ID to associate with memories.
+    pub user_id: Option<String>,
+    /// Agent ID to associate with memories.
+    pub agent_id: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
         Self {
-            llm,
-            embedder,
-            config,
-            store,
-            history: Vec::new(),
-            summary: None,
-            processed_pairs: 0,
+            retrieve_count: 5,
+            user_id: None,
+            agent_id: None,
+        }
+    }
+}
+
+/// Mem0 memory manager.
+struct Mem0Inner<L, E, S> {
+    new_facts: async_lock::RwLock<Vec<String>>, // Store new facts temporarily
+    extraction_in_progress: async_lock::Mutex<()>, // If this is locked, fact extraction is in progress
+    llm: L,
+    embedder: E,
+    store: async_lock::RwLock<S>,
+    config: Config,
+}
+
+pub struct Mem0<L, E, S> {
+    inner: Arc<Mem0Inner<L, E, S>>,
+}
+
+impl<L, E, S> Clone for Mem0<L, E, S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<L, E, S> Mem0<L, E, S>
+where
+    L: LanguageModel,
+    E: EmbeddingModel,
+    S: MemoryStore,
+{
+    /// Create a new Mem0 instance.
+    pub fn new(llm: L, embedder: E, store: S, config: Config) -> Self {
+        Self {
+            inner: Arc::new(Mem0Inner {
+                new_facts: async_lock::RwLock::new(Vec::new()),
+                llm,
+                embedder,
+                store: async_lock::RwLock::new(store),
+                config,
+                extraction_in_progress: async_lock::Mutex::new(()),
+            }),
         }
     }
 
-    /// Returns the current configuration.
-    #[must_use]
-    pub const fn config(&self) -> &Mem0Config {
-        &self.config
-    }
-
-    /// Returns the current long-term summary, if one exists.
-    #[must_use]
-    pub fn summary(&self) -> Option<&str> {
-        self.summary.as_deref()
-    }
-
-    /// Returns all stored memories.
-    #[must_use]
-    pub fn memories(&self) -> &[MemoryEntry] {
-        self.store.entries()
-    }
-
-    /// Ingests the latest message pair (assistant/user or user/assistant).
+    /// Add a new interaction to memory.
     ///
-    /// This performs the extraction and update phases. The returned vector
-    /// enumerates every change made to the memory store.
-    pub async fn ingest_exchange(
-        &mut self,
-        previous: Message,
-        current: Message,
-    ) -> Result<Vec<MemoryChange>> {
-        self.history.push(previous.clone());
-        self.history.push(current.clone());
-        self.processed_pairs = self.processed_pairs.saturating_add(1);
-        self.refresh_summary_if_needed().await?;
+    /// This triggers the extraction and update pipeline:
+    /// 1. Extract facts from the messages.
+    /// 2. For each fact, retrieve similar memories.
+    /// 3. Decide on an operation (Add, Update, Delete, Noop).
+    /// 4. Execute the operation.
+    pub async fn add(&self, messages: &[Message]) -> Result<()> {
+        // 1. Extract facts
+        let facts = self.extract_facts(messages).await?;
 
-        let summary = self
-            .summary()
-            .map_or_else(|| "No summary available".to_string(), ToString::to_string);
-        let backlog = self.recent_backlog();
+        self.add_fact(facts).await?;
 
-        let extracted = self
-            .extract_memories(&summary, &backlog, &previous, &current)
-            .await?;
-
-        let mut changes = Vec::new();
-        for mut payload in extracted {
-            if payload.is_empty() {
-                continue;
-            }
-
-            if payload.importance == MemoryImportance::Contextual {
-                payload
-                    .metadata
-                    .entry("priority".into())
-                    .or_insert_with(|| "contextual".into());
-            }
-
-            let embedding = self.embedder.embed(&payload.content).await?;
-            let similar = self
-                .store
-                .top_similar(&embedding, self.config.similar_memories());
-
-            let decision = self.decide_operation(&summary, &payload, &similar).await?;
-
-            if let Some(change) = self.apply_decision(decision, payload, embedding).await? {
-                changes.push(change);
-            }
-        }
-
-        Ok(changes)
-    }
-
-    /// Performs a semantic recall across the stored memories.
-    pub async fn recall(&self, query: &str, top_k: usize) -> Result<Vec<MemoryEntry>> {
-        let vector = self.embedder.embed(query).await?;
-        Ok(self.store.recall(&vector, top_k))
-    }
-
-    async fn refresh_summary_if_needed(&mut self) -> Result<()> {
-        if self.history.is_empty() {
-            return Ok(());
-        }
-
-        let needs_refresh = self.summary.is_none()
-            || self.processed_pairs % self.config.summary_refresh_interval() == 0;
-        if !needs_refresh {
-            return Ok(());
-        }
-
-        let dialogue = format_messages(&self.history);
-        let system = "You maintain a rolling summary of a conversation for a memory module.";
-        let user = format!(
-            "{instructions}\n\nConversation:\n{dialogue}",
-            instructions = self.config.summary_instructions
-        );
-
-        let request = oneshot(system, user);
-        let summary: String = self.llm.generate(request).await?;
-        let trimmed = summary.trim();
-        if !trimmed.is_empty() {
-            self.summary = Some(trimmed.to_string());
-        }
         Ok(())
     }
 
-    fn recent_backlog(&self) -> Vec<Message> {
-        if self.history.len() <= 2 {
-            return Vec::new();
-        }
+    /// Add new facts to memory.
+    /// Tip: This method batches fact additions for efficiency and accuracy.
+    /// Put it simply, only one fact extraction task is running at a time. Facts added at this moment will be queued and processed together.
+    /// And the caller have to wait if you `.await` this method.
+    ///
+    /// So if you doesn't mind the result of adding facts, you can spawn a task to call this method.
+    pub async fn add_fact(&self, facts: Vec<String>) -> Result<()> {
+        self.inner.new_facts.write_blocking().extend(facts); // very fast operation
 
-        let total = self.history.len().saturating_sub(2);
-        let keep = self.config.recency_window().min(total);
-        self.history[total - keep..total].to_vec()
-    }
+        // Waiting for any ongoing extraction to finish
+        let lock = self.inner.extraction_in_progress.lock().await;
+        // let's take all facts yet
 
-    async fn extract_memories(
-        &self,
-        summary: &str,
-        backlog: &[Message],
-        previous: &Message,
-        current: &Message,
-    ) -> Result<Vec<MemoryPayload>> {
-        let context = if backlog.is_empty() {
-            "No additional backlog supplied.".to_string()
-        } else {
-            format_messages(backlog)
+        let facts = {
+            let mut nf = self.inner.new_facts.write_blocking();
+            std::mem::take(&mut *nf)
         };
 
-        let prompt = format!(
-            "# Summary\n{summary}\n\n# Recent backlog\n{context}\n\n# Latest exchange\n{}\n{}\n\n\
-             Instructions: {}\nReturn JSON following the schema.",
-            format_message(previous),
-            format_message(current),
-            self.config.extraction_instructions
-        );
-        let request = oneshot(
-            "You are a precision memory extractor. Only emit factual memories.",
-            prompt,
-        );
+        let store = &self.inner.store;
 
-        let ExtractionBatch { memories } = self.llm.generate(request).await?;
-        Ok(memories)
+        for fact in facts {
+            // 2. Embed the fact for search
+            let embedding = self
+                .inner
+                .embedder
+                .embed(&fact)
+                .await
+                .map_err(|e| Mem0Error::Embedding(e.into()))?;
+
+            debug!("Embedding generated for fact: {}", fact);
+
+            // 3. Retrieve similar memories
+            let filters = SearchFilters {
+                user_id: self.inner.config.user_id.clone(),
+                agent_id: self.inner.config.agent_id.clone(),
+            };
+            let existing_memories = store
+                .read_blocking()
+                .search(&embedding, self.inner.config.retrieve_count, filters)
+                .await?;
+
+            debug!(
+                "Found {} similar existing memories for fact.",
+                existing_memories.len()
+            );
+
+            // 4. Decide operation
+            let decision = self.decide_operation(&fact, &existing_memories).await?;
+
+            // 5. Execute operation
+            match decision.action {
+                Action::Add => {
+                    let mut memory = Memory::new(fact, embedding);
+                    if let Some(uid) = &self.inner.config.user_id {
+                        memory = memory.with_user_id(uid);
+                    }
+                    if let Some(aid) = &self.inner.config.agent_id {
+                        memory = memory.with_agent_id(aid);
+                    }
+
+                    store.write_blocking().add(memory).await?;
+                }
+                Action::Update => {
+                    if let (Some(id_str), Some(content)) =
+                        (decision.memory_id, decision.new_content)
+                    {
+                        if let Ok(id) = Uuid::from_str(&id_str) {
+                            // For update, we usually re-embed the new content.
+                            let new_embedding = self
+                                .inner
+                                .embedder
+                                .embed(&content)
+                                .await
+                                .map_err(|e| Mem0Error::Llm(e.into()))?;
+
+                            // Fetch existing to check existence
+                            if let Some(mut existing) = store.read_blocking().get(id).await? {
+                                existing.content = content;
+                                existing.embedding = new_embedding;
+                                existing.updated_at = time::OffsetDateTime::now_utc();
+                                store.write_blocking().update(existing).await?;
+                            }
+                        }
+                    }
+                }
+                Action::Delete => {
+                    if let Some(id_str) = decision.memory_id {
+                        if let Ok(id) = Uuid::from_str(&id_str) {
+                            store.write_blocking().delete(id).await?;
+                        }
+                    }
+                }
+                Action::Noop => {} // No operation needed
+            }
+        }
+
+        drop(lock); // release the lock
+
+        Ok(())
+    }
+
+    /// Search for relevant memories.
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<store::SearchResult>> {
+        let embedding = self
+            .inner
+            .embedder
+            .embed(query)
+            .await
+            .map_err(|e| Mem0Error::Llm(e.into()))?;
+        let filters = SearchFilters {
+            user_id: self.inner.config.user_id.clone(),
+            agent_id: self.inner.config.agent_id.clone(),
+        };
+        self.inner
+            .store
+            .read_blocking()
+            .search(&embedding, limit, filters)
+            .await
+    }
+
+    pub fn add_fact_tool(&self) -> AddFactTool<L, E, S> {
+        AddFactTool {
+            inner: self.clone(),
+        }
+    }
+
+    pub fn search_tool(&self) -> SearchTool<L, E, S> {
+        SearchTool {
+            inner: self.clone(),
+        }
+    }
+
+    /// Return all stored memories.
+    pub async fn memories(&self) -> Result<Vec<Memory>> {
+        self.inner.store.read_blocking().all().await
+    }
+
+    /// Retrieve relevant memories and format them for context injection.
+    pub async fn retrieve_formatted(&self, query: &str, limit: usize) -> Result<String> {
+        let results = self.search(query, limit).await?;
+        if results.is_empty() {
+            return Ok(String::new());
+        }
+
+        let formatted = results
+            .into_iter()
+            .map(|r| format!("- {}", r.memory.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Ok(format!("Relevant Memories:\n{}", formatted))
+    }
+
+    async fn extract_facts(&self, messages: &[Message]) -> Result<Vec<String>> {
+        // Format messages for the prompt
+        let context = messages
+            .iter()
+            .map(|m| format!("{:?}: {}", m.role(), m.content()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let system_prompt = include_str!("../prompts/extractor.txt");
+
+        let request = LLMRequest::new(vec![
+            Message::system(system_prompt),
+            Message::user(format!(
+                "Extract facts from the following conversation:\n\n{}",
+                context
+            )),
+        ]);
+
+        let extracted: ExtractedFacts = self
+            .inner
+            .llm
+            .generate(request)
+            .await
+            .map_err(|e| Mem0Error::Llm(e.into()))?;
+        Ok(extracted.facts)
     }
 
     async fn decide_operation(
         &self,
-        summary: &str,
-        candidate: &MemoryPayload,
-        similar: &[MemoryContext],
-    ) -> Result<OperationDecision> {
-        let context_json =
-            serde_json::to_string_pretty(similar).context("failed to encode similar memories")?;
-        let candidate_json =
-            serde_json::to_string_pretty(candidate).context("failed to encode candidate memory")?;
+        fact: &str,
+        existing_memories: &[store::SearchResult],
+    ) -> Result<MemoryDecision> {
+        let memories_context = existing_memories
+            .iter()
+            .map(|r| format!("ID: {}\nContent: {}\n", r.memory.id, r.memory.content))
+            .collect::<Vec<_>>()
+            .join("\n---\n");
 
-        let prompt = format!(
-            "Summary:\n{summary}\n\nCandidate memory:\n{candidate_json}\n\n\
-             Similar memories (descending similarity):\n{context_json}\n\n\
-             {instructions}\nReturn a JSON object that contains the operation, optional \
-             target id, optional merged memory payload, and concise reasoning.",
-            instructions = self.config.update_instructions
+        let system_prompt = include_str!("../prompts/manager.txt");
+
+        let user_prompt = format!(
+            "New Fact: {}\n\nExisting Memories:\n{}\n\nDecide the operation.",
+            fact, memories_context
         );
 
-        let request = oneshot("You maintain a consistent memory database.", prompt);
-        self.llm.generate(request).await
-    }
+        let request = LLMRequest::new(vec![
+            Message::system(system_prompt),
+            Message::user(user_prompt),
+        ]);
 
-    async fn apply_decision(
-        &mut self,
-        mut decision: OperationDecision,
-        candidate: MemoryPayload,
-        candidate_embedding: Vec<f32>,
-    ) -> Result<Option<MemoryChange>> {
-        match decision.action {
-            OperationKind::Add => {
-                let payload = decision
-                    .merged_memory
-                    .take()
-                    .unwrap_or_else(|| candidate.clone());
-                let entry = self.store.insert(payload, candidate_embedding);
-                Ok(Some(MemoryChange {
-                    operation: OperationKind::Add,
-                    entry: Some(entry),
-                    target: decision.target.take(),
-                    reasoning: decision.reasoning.take(),
-                }))
-            }
-            OperationKind::Update => {
-                let target = decision
-                    .target
-                    .clone()
-                    .ok_or_else(|| anyhow!("update operation missing target id"))?;
-                let payload = decision
-                    .merged_memory
-                    .take()
-                    .unwrap_or_else(|| candidate.clone());
-                let embedding = if payload.content == candidate.content {
-                    candidate_embedding
-                } else {
-                    self.embedder.embed(&payload.content).await?
-                };
-                let entry = self
-                    .store
-                    .update(&target, payload, embedding)
-                    .ok_or_else(|| anyhow!("target {target} not found for update"))?;
-                Ok(Some(MemoryChange {
-                    operation: OperationKind::Update,
-                    entry: Some(entry),
-                    target: Some(target),
-                    reasoning: decision.reasoning.take(),
-                }))
-            }
-            OperationKind::Delete => {
-                let target = decision
-                    .target
-                    .clone()
-                    .ok_or_else(|| anyhow!("delete operation missing target id"))?;
-                let entry = self
-                    .store
-                    .remove(&target)
-                    .ok_or_else(|| anyhow!("target {target} not found for delete"))?;
-                Ok(Some(MemoryChange {
-                    operation: OperationKind::Delete,
-                    entry: Some(entry),
-                    target: Some(target),
-                    reasoning: decision.reasoning.take(),
-                }))
-            }
-            OperationKind::Noop => Ok(None),
-        }
-    }
-}
+        debug!("Deciding operation for fact: {}", fact);
 
-/// Structured decision returned by the update model.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct OperationDecision {
-    /// Operation to execute.
-    pub action: OperationKind,
-    /// Target memory identifier for `UPDATE` and `DELETE`.
-    #[serde(default)]
-    pub target: Option<String>,
-    /// Optional merged payload for `UPDATE`/`ADD`.
-    #[serde(default)]
-    pub merged_memory: Option<MemoryPayload>,
-    /// Optional explanation for auditing.
-    #[serde(default)]
-    pub reasoning: Option<String>,
-}
+        let decision: MemoryDecision = self
+            .inner
+            .llm
+            .generate(request)
+            .await
+            .map_err(|e| Mem0Error::Llm(e.into()))?;
 
-/// Operations supported by the Mem0 update phase.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationKind {
-    /// Insert a new memory entry.
-    Add,
-    /// Merge the candidate into an existing memory.
-    Update,
-    /// Remove an outdated memory.
-    Delete,
-    /// Skip the candidate.
-    Noop,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct ExtractionBatch {
-    memories: Vec<MemoryPayload>,
-}
-
-fn format_messages(messages: &[Message]) -> String {
-    let mut out = String::new();
-    for message in messages {
-        let _ = writeln!(out, "{}", format_message(message));
-    }
-    out.trim().to_string()
-}
-
-fn format_message(message: &Message) -> String {
-    format!(
-        "{role:?}: {content}",
-        role = message.role(),
-        content = message.content()
-    )
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0;
-    let mut mag_a = 0.0;
-    let mut mag_b = 0.0;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        mag_a += x * x;
-        mag_b += y * y;
-    }
-    if mag_a == 0.0 || mag_b == 0.0 {
-        return 0.0;
-    }
-    dot / (mag_a.sqrt() * mag_b.sqrt())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cosine_similarity_behaves() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![1.0, 1.0, 0.0];
-        let c = vec![0.0, 1.0, 0.0];
-
-        assert!(cosine_similarity(&a, &b) > cosine_similarity(&a, &c));
-        assert!((cosine_similarity(&a, &a) - 1.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn memory_store_insert_update_delete() {
-        let mut store = MemoryStore::new(3);
-        let payload = MemoryPayload {
-            content: "Alice loves hiking".into(),
-            speaker: Some("alice".into()),
-            importance: MemoryImportance::Important,
-            ..MemoryPayload::default()
-        };
-        let embedding = vec![0.5, 0.1, 0.2];
-        let entry = store.insert(payload.clone(), embedding.clone());
-        assert_eq!(store.entries().len(), 1);
-
-        let updated_payload = MemoryPayload {
-            content: "Alice loves night hiking".into(),
-            ..payload
-        };
-        let updated = store
-            .update(&entry.id, updated_payload.clone(), embedding.clone())
-            .unwrap();
-        assert_eq!(updated.payload.content, updated_payload.content);
-        assert_eq!(store.entries().len(), 1);
-
-        let removed = store.remove(&entry.id).unwrap();
-        assert_eq!(removed.id, entry.id);
-        assert!(store.entries().is_empty());
+        Ok(decision)
     }
 }

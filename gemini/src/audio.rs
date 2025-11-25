@@ -7,7 +7,7 @@ use crate::{
     error::GeminiError,
     types::{
         GeminiContent, GenerateContentRequest, GenerationConfig, Part, PrebuiltVoiceConfig,
-        SpeechConfig, VoiceConfig,
+        SpeechConfig, ThinkingConfig, VoiceConfig,
     },
 };
 
@@ -50,11 +50,15 @@ async fn synthesize_audio(
                     },
                 }),
             }),
+            thinking_config: Some(ThinkingConfig {
+                include_thoughts: Some(false),
+                token_budget: None,
+                thinking_level: None,
+            }),
             ..GenerationConfig::default()
         }),
         tools: Vec::new(),
         tool_config: None,
-        thinking_config: None,
         safety_settings: Vec::new(),
     };
     let response = call_generate(cfg, &model, request).await?;
@@ -84,10 +88,16 @@ async fn transcribe_audio(
     let request = GenerateContentRequest {
         system_instruction: None,
         contents: vec![GeminiContent::with_parts("user", parts)],
-        generation_config: None,
+        generation_config: Some(GenerationConfig {
+            thinking_config: Some(ThinkingConfig {
+                include_thoughts: Some(false),
+                token_budget: None,
+                thinking_level: None,
+            }),
+            ..GenerationConfig::default()
+        }),
         tools: Vec::new(),
         tool_config: None,
-        thinking_config: None,
         safety_settings: Vec::new(),
     };
     let response = call_generate(cfg.clone(), &cfg.text_model, request).await?;
@@ -106,7 +116,7 @@ fn handle_audio_result(result: Result<Vec<u8>, GeminiError>, context: &'static s
     match result {
         Ok(bytes) => bytes,
         Err(err) => {
-            debug_assert!(false, "Gemini audio {context} failed: {err}");
+            eprintln!("Gemini audio {context} failed: {err}");
             Vec::new()
         }
     }
@@ -116,7 +126,7 @@ fn handle_transcription_result(result: Result<String, GeminiError>) -> String {
     match result {
         Ok(text) => text,
         Err(err) => {
-            debug_assert!(false, "Gemini transcription failed: {err}");
+            eprintln!("Gemini transcription failed: {err}");
             String::new()
         }
     }

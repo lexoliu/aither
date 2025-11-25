@@ -227,7 +227,7 @@ pub fn convert_tools(definitions: Vec<ToolDefinition>) -> Vec<ToolPayload> {
             function: ToolFunction {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
-                parameters: schema_to_value(tool.arguments_schema()),
+                parameters: tool.arguments_openai_schema(),
             },
         })
         .collect()

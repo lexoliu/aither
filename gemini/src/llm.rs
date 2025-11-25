@@ -1,13 +1,15 @@
 use aither_core::{
-    LanguageModel,
+    Error, LanguageModel,
     llm::{
         LLMRequest, Message, ReasoningStream, ResponseChunk, Role,
-        model::{Ability, Parameters, Profile},
+        model::{Ability, Parameters, Profile, ReasoningEffort},
         tool::ToolDefinition,
     },
 };
-use schemars::Schema;
-use serde_json::Value;
+use schemars::{JsonSchema, Schema};
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
+use tracing::debug;
 
 use crate::{
     client::call_generate,
@@ -15,9 +17,11 @@ use crate::{
     error::GeminiError,
     types::{
         FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration, GeminiContent, GeminiTool,
-        GenerateContentRequest, GenerationConfig, ThinkingConfig, ToolConfig,
+        GenerateContentRequest, GenerationConfig, GoogleSearch, PromptFeedback, SafetyRating,
+        ThinkingConfig, ToolConfig,
     },
 };
+use schemars::schema_for;
 
 const MAX_TOOL_ITERATIONS: usize = 8;
 
@@ -43,9 +47,29 @@ impl LanguageModel for GeminiBackend {
         let (system_instruction, contents) = messages_to_gemini(&messages);
         let tool_defs = tools.as_ref().map(|t| t.definitions()).unwrap_or_default();
         let tool_config = build_tool_config(&parameters, !tool_defs.is_empty());
-        let tools_payload = convert_tool_definitions(tool_defs);
+        let mut gemini_tools_payload: Vec<GeminiTool> = Vec::new();
+
+        // Add function declarations from aither-core Tools
+        if !tool_defs.is_empty() {
+            gemini_tools_payload.push(GeminiTool::FunctionTool {
+                function_declarations: convert_tool_definitions(tool_defs),
+            });
+        }
+
+        // Add native Google Search tool if enabled in parameters
+        if parameters.websearch {
+            gemini_tools_payload.push(GeminiTool::GoogleSearchTool {
+                google_search: GoogleSearch {},
+            });
+        }
+
+        // Add native Code Execution tool if enabled in parameters
+        if parameters.code_execution {
+            gemini_tools_payload.push(GeminiTool::CodeExecutionTool {
+                code_execution: crate::types::CodeExecution {},
+            });
+        }
         let generation_config = build_generation_config(&parameters, None);
-        let thinking_config = build_thinking_config(&parameters);
 
         let stream = futures_lite::stream::unfold(
             State::Processing {
@@ -57,9 +81,8 @@ impl LanguageModel for GeminiBackend {
                 let cfg = cfg.clone();
                 let system_instruction = system_instruction.clone();
                 let generation_config = generation_config.clone();
-                let tools_payload = tools_payload.clone();
+                let gemini_tools_payload = gemini_tools_payload.clone();
                 let tool_config = tool_config.clone();
-                let thinking_config = thinking_config.clone();
 
                 async move {
                     let (iterations, mut contents, mut tools) = match state {
@@ -85,11 +108,12 @@ impl LanguageModel for GeminiBackend {
                         system_instruction: system_instruction.clone(),
                         contents: contents.clone(),
                         generation_config: generation_config.clone(),
-                        tools: tools_payload.clone(),
+                        tools: gemini_tools_payload.clone(),
                         tool_config: tool_config.clone(),
-                        thinking_config: thinking_config.clone(),
                         safety_settings: Vec::new(),
                     };
+
+                    debug!("Gemini request: {:?}", request);
 
                     let response = match call_generate(cfg.clone(), &cfg.text_model, request).await
                     {
@@ -97,11 +121,15 @@ impl LanguageModel for GeminiBackend {
                         Err(e) => return Some((Err(e), State::Done)),
                     };
 
+                    debug!("Gemini response: {:?}", response);
+
                     let Some(candidate) = response.primary_candidate() else {
-                        return Some((
-                            Err(GeminiError::Api("Gemini response missing candidate".into())),
-                            State::Done,
-                        ));
+                        let message = if let Some(feedback) = &response.prompt_feedback {
+                            format_prompt_feedback(feedback)
+                        } else {
+                            "Gemini response missing candidate".to_string()
+                        };
+                        return Some((Err(GeminiError::Api(message)), State::Done));
                     };
 
                     let Some(content) = &candidate.content else {
@@ -133,12 +161,22 @@ impl LanguageModel for GeminiBackend {
                                 State::Done,
                             ));
                         };
-                        let response_value = serde_json::from_str::<Value>(&tool_output)
-                            .unwrap_or(Value::String(tool_output));
-                        contents.push(GeminiContent::function_response(
-                            call.name.clone(),
-                            response_value,
-                        ));
+
+                        let response_value = match serde_json::from_str::<Value>(&tool_output) {
+                            Ok(Value::Object(map)) => Value::Object(map),
+                            Ok(other) => {
+                                let mut map = Map::new();
+                                map.insert("result".to_string(), other);
+                                Value::Object(map)
+                            }
+                            Err(_) => {
+                                let mut map = Map::new();
+                                map.insert("result".to_string(), Value::String(tool_output));
+                                Value::Object(map)
+                            }
+                        };
+                        contents.push(GeminiContent::function_response(call.name, response_value));
+
                         return Some((
                             Ok(ResponseChunk::default()),
                             State::Processing {
@@ -153,6 +191,22 @@ impl LanguageModel for GeminiBackend {
                     for text in content.text_chunks() {
                         chunk.push_text(text);
                     }
+
+                    for part in &content.parts {
+                        if let Some(code) = &part.executable_code {
+                            let code_block = format!(
+                                "\n```{}\n{}\n```\n",
+                                code.language.to_lowercase(),
+                                code.code
+                            );
+                            chunk.push_text(code_block);
+                        }
+                        if let Some(result) = &part.code_execution_result {
+                            let output_block = format!("\n```output\n{}\n```\n", result.output);
+                            chunk.push_text(output_block);
+                        }
+                    }
+
                     for reasoning in content.reasoning_chunks() {
                         chunk.push_reasoning(reasoning);
                     }
@@ -162,6 +216,24 @@ impl LanguageModel for GeminiBackend {
         );
 
         ReasoningStream::new(stream)
+    }
+
+    fn generate<T: JsonSchema + DeserializeOwned + 'static>(
+        &self,
+        mut request: LLMRequest,
+    ) -> impl core::future::Future<Output = aither_core::Result<T>> + Send {
+        let schema = schema_for!(T);
+        let mut params = request.parameters().clone();
+        params.structured_outputs = true;
+        params.response_format = Some(schema);
+        request = request.with_parameters(params);
+
+        let stream = self.respond(request);
+        async move {
+            let text = stream.await?;
+            serde_json::from_str::<T>(&text)
+                .map_err(|err| Error::new(err).context("failed to parse structured output"))
+        }
     }
 
     fn profile(&self) -> impl core::future::Future<Output = Profile> + Send {
@@ -187,16 +259,10 @@ impl LanguageModel for GeminiBackend {
 }
 
 fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<GeminiContent>) {
-    let mut system = String::new();
     let mut contents = Vec::new();
     for message in messages {
         match message.role() {
-            Role::System => {
-                if !system.is_empty() {
-                    system.push_str("\n\n");
-                }
-                system.push_str(message.content());
-            }
+            Role::System => contents.push(GeminiContent::text("user", message.content())),
             Role::User | Role::Tool => {
                 contents.push(GeminiContent::text("user", message.content()));
             }
@@ -204,18 +270,42 @@ fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<Gemin
         }
     }
 
-    let system_instruction = if system.is_empty() {
-        None
-    } else {
-        Some(GeminiContent::text("user", system))
-    };
-    (system_instruction, contents)
+    (None, contents)
+}
+
+fn format_prompt_feedback(feedback: &PromptFeedback) -> String {
+    let reason = feedback
+        .block_reason
+        .as_deref()
+        .unwrap_or("unknown reason")
+        .to_string();
+    if feedback.safety_ratings.is_empty() {
+        return format!("Gemini response blocked: {reason}");
+    }
+
+    let ratings = feedback
+        .safety_ratings
+        .iter()
+        .map(format_safety_rating)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Gemini response blocked: {reason}; safety: {ratings}")
+}
+
+fn format_safety_rating(rating: &SafetyRating) -> String {
+    let status = rating
+        .blocked
+        .map(|b| if b { "blocked" } else { "allowed" })
+        .unwrap_or("unspecified");
+    let probability = rating.probability.as_deref().unwrap_or("unknown");
+    format!("{} ({status}, probability: {probability})", rating.category)
 }
 
 fn build_generation_config(
     parameters: &Parameters,
     modalities: Option<Vec<String>>,
 ) -> Option<GenerationConfig> {
+    let thinking_config = build_thinking_config(parameters);
     let mut config = GenerationConfig {
         temperature: parameters.temperature,
         top_p: parameters.top_p,
@@ -226,11 +316,12 @@ fn build_generation_config(
         ),
         stop_sequences: parameters.stop.clone(),
         response_modalities: modalities,
+        thinking_config,
         ..Default::default()
     };
     if let Some(schema) = &parameters.response_format {
         config.response_mime_type = Some("application/json".into());
-        config.response_schema = Some(schema_to_value(schema));
+        config.response_json_schema = Some(schema.clone().to_value());
     } else if parameters.structured_outputs {
         config.response_mime_type = Some("application/json".into());
     }
@@ -262,38 +353,36 @@ fn build_tool_config(parameters: &Parameters, has_tools: bool) -> Option<ToolCon
 }
 
 fn build_thinking_config(parameters: &Parameters) -> Option<ThinkingConfig> {
-    if !parameters.include_reasoning && parameters.reasoning_budget_tokens.is_none() {
+    if !parameters.include_reasoning {
         return None;
     }
     Some(ThinkingConfig {
-        include_thinking: parameters.include_reasoning
-            || parameters.reasoning_budget_tokens.is_some(),
-        token_budget: parameters.reasoning_budget_tokens.map(|tokens| {
-            #[allow(clippy::cast_possible_wrap)]
-            {
-                tokens as i32
+        include_thoughts: Some(parameters.include_reasoning),
+        token_budget: parameters.reasoning_effort.map(|effort| match effort {
+            ReasoningEffort::Minimum => 0,
+            ReasoningEffort::Low => 1024,
+            ReasoningEffort::Medium => 4096,
+            ReasoningEffort::High => 10240,
+        }),
+        thinking_level: parameters.reasoning_effort.map(|effort| {
+            // Gemini does not have a direct mapping for Minimum, so we map it to Low.
+            match effort {
+                ReasoningEffort::Minimum => "low",
+                ReasoningEffort::Low => "low",
+                ReasoningEffort::Medium => "medium",
+                ReasoningEffort::High => "high",
             }
+            .to_string()
         }),
     })
 }
 
-fn convert_tool_definitions(defs: Vec<ToolDefinition>) -> Vec<GeminiTool> {
-    if defs.is_empty() {
-        return Vec::new();
-    }
-    let declarations = defs
-        .into_iter()
+fn convert_tool_definitions(defs: Vec<ToolDefinition>) -> Vec<FunctionDeclaration> {
+    defs.into_iter()
         .map(|tool| FunctionDeclaration {
             name: tool.name().to_string(),
             description: tool.description().to_string(),
-            parameters: Some(schema_to_value(tool.arguments_schema())),
+            parameters: Some(tool.arguments_openai_schema()),
         })
-        .collect();
-    vec![GeminiTool {
-        function_declarations: declarations,
-    }]
-}
-
-fn schema_to_value(schema: &Schema) -> Value {
-    serde_json::to_value(schema).unwrap_or_else(|_| Value::Object(serde_json::Map::default()))
+        .collect()
 }

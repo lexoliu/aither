@@ -128,9 +128,6 @@ pub struct Parameters {
     /// Preferred reasoning effort when supported.
     pub reasoning_effort: Option<ReasoningEffort>,
 
-    /// Thinking budget (in tokens) for providers that split reasoning and response phases.
-    pub reasoning_budget_tokens: Option<u32>,
-
     /// Whether the provider should include reasoning summaries in the response stream.
     pub include_reasoning: bool,
 
@@ -143,6 +140,10 @@ pub struct Parameters {
     ///
     /// When set, the model will attempt to return outputs matching this schema.
     pub response_format: Option<Schema>,
+    /// Whether to enable native Search tool for grounding.
+    pub websearch: bool,
+    /// Whether to enable native Code Execution tool.
+    pub code_execution: bool,
 }
 
 macro_rules! impl_with_methods {
@@ -184,7 +185,6 @@ impl_with_methods! {
         logprobs: bool,
         top_logprobs: u8,
         stop: Vec<String>,
-        reasoning_budget_tokens: u32,
     }
 }
 
@@ -202,6 +202,20 @@ impl Parameters {
         self.reasoning_effort = Some(effort);
         self
     }
+
+    /// Sets whether to enable native Google Search tool.
+    #[must_use]
+    pub const fn websearch(mut self, enabled: bool) -> Self {
+        self.websearch = enabled;
+        self
+    }
+
+    /// Sets whether to enable native Code Execution tool.
+    #[must_use]
+    pub const fn code_execution(mut self, enabled: bool) -> Self {
+        self.code_execution = enabled;
+        self
+    }
 }
 
 /// Effort levels available for reasoning-focused models.
@@ -209,7 +223,10 @@ impl Parameters {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
-    /// Fastest, least compute-intensive reasoning.
+    /// Minimum reasoning effort.
+    Minimum,
+
+    /// Compute-intensive reasoning.
     Low,
     /// Balanced reasoning depth.
     Medium,
@@ -222,6 +239,7 @@ impl ReasoningEffort {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Minimum => "minimum",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",

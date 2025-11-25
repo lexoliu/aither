@@ -37,6 +37,7 @@ clippy.cargo = "warn"
 clippy.multiple_crate_versions = { level = "allow", priority = 1}
 
 [workspace.dependencies]
+tracing = "0.1.41"
 aither = { path = "."}
 aither-core = { path = "./core"}
 aither-derive = { path = "./derive", version = "0.1.0"}
@@ -78,11 +79,14 @@ aither-command = { workspace = true, optional = true }
 aither-openai = { path = "./openai" }
 aither-gemini = { path = "./gemini" }
 aither-mem0 = { path = "./mem0" }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+aither-rag = { path = "./rag" }
 tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread"] }
 tokio-test = "0.4"
 schemars = { version = "1.0" }
 serde = { version = "1.0", features = ["derive"] }
 futures-lite = { version = "2.6"}
+crossterm = "0.28"
 
 [package]
 name = "aither"

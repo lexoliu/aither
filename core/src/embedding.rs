@@ -107,7 +107,7 @@ pub type Embedding = Vec<f32>;
 /// - Batch multiple texts when possible to reduce API calls
 /// - Consider caching embeddings for frequently used texts
 /// - Be aware of rate limits when using cloud-based embedding services
-pub trait EmbeddingModel {
+pub trait EmbeddingModel: Send + Sized + Send + Sync {
     /// Returns the embedding vector dimension.
     ///
     /// This value determines the length of vectors returned by [`embed`](EmbeddingModel::embed).

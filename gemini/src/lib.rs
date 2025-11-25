@@ -40,7 +40,27 @@ mod error;
 mod image;
 mod llm;
 mod moderation;
+mod provider;
 mod types;
 
 pub use config::{AuthMode, GEMINI_API_BASE_URL, GeminiBackend};
 pub use error::GeminiError;
+pub use provider::GeminiProvider;
+
+/// Create a Gemini backend configured to use the `gemini-2.5-pro` model.
+#[must_use]
+pub fn gemini_2_5_pro(key: impl Into<String>) -> GeminiBackend {
+    GeminiBackend::new(key).with_text_model("gemini-2.5-pro")
+}
+
+/// Create a Gemini backend configured to use the `gemini-2.5-flash` model.
+#[must_use]
+pub fn gemini_2_5_flash(key: impl Into<String>) -> GeminiBackend {
+    GeminiBackend::new(key).with_text_model("gemini-2.5-flash")
+}
+
+/// Create a Gemini backend configured to use the `gemini-2.5-flash-lite` model.
+#[must_use]
+pub fn gemini_2_5_flash_lite(key: impl Into<String>) -> GeminiBackend {
+    GeminiBackend::new(key).with_text_model("gemini-2.5-flash-lite")
+}

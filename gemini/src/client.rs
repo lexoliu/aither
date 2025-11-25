@@ -37,20 +37,53 @@ pub async fn embed_content(
 }
 
 #[allow(clippy::future_not_send)]
-async fn post_json<T: for<'de> serde::Deserialize<'de>, S: Serialize>(
+async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Serialize>(
     cfg: Arc<GeminiConfig>,
     endpoint: String,
     body: &S,
 ) -> Result<T, GeminiError> {
-    let mut backend = client();
-    let mut builder = backend.post(endpoint);
-    builder = builder.header(header::USER_AGENT.as_str(), USER_AGENT);
-    if cfg.auth == AuthMode::Header {
-        builder = builder.header("x-goog-api-key", cfg.api_key.clone());
+    let debug = std::env::var("AITHER_GEMINI_DEBUG").as_deref() == Ok("1");
+    if debug {
+        if let Ok(json) = serde_json::to_string_pretty(body) {
+            eprintln!("Gemini request to {endpoint}:\n{json}");
+        }
+        if cfg.auth == AuthMode::Query {
+            eprintln!("Gemini using query auth (key redacted)");
+        }
     }
-    builder = builder.json_body(body);
-    builder
-        .json()
-        .await
-        .map_err(|error| GeminiError::Http(BoxHttpError::from(Box::new(error))))
+
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut backend = client();
+        let mut builder = backend.post(endpoint.clone());
+        builder = builder.header(header::USER_AGENT.as_str(), USER_AGENT);
+        if cfg.auth == AuthMode::Header {
+            builder = builder.header("x-goog-api-key", cfg.api_key.clone());
+        }
+        builder = builder.json_body(body);
+
+        match builder.json().await {
+            Ok(res) => {
+                if debug {
+                    if let Ok(json) = serde_json::to_string_pretty(&res) {
+                        eprintln!("Gemini response from {endpoint}:\n{json}");
+                    }
+                }
+                return Ok(res);
+            }
+            Err(error) => {
+                let msg = error.to_string();
+                let is_connect = msg.to_ascii_lowercase().contains("connect");
+                let should_retry = is_connect && attempt < 3;
+                if !should_retry {
+                    return Err(GeminiError::Http(BoxHttpError::from(Box::new(error))));
+                }
+                if debug {
+                    eprintln!("Gemini connect error, retrying attempt {attempt}: {msg}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200 * attempt as u64));
+            }
+        }
+    }
 }

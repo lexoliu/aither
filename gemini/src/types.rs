@@ -15,8 +15,6 @@ pub struct GenerateContentRequest {
     pub(crate) tools: Vec<GeminiTool>,
     #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
     pub(crate) tool_config: Option<ToolConfig>,
-    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
-    pub(crate) thinking_config: Option<ThinkingConfig>,
     #[serde(
         rename = "safetySettings",
         default,
@@ -86,6 +84,13 @@ pub struct Part {
     function_call: Option<FunctionCall>,
     #[serde(rename = "functionResponse", skip_serializing_if = "Option::is_none")]
     function_response: Option<FunctionResponse>,
+    #[serde(rename = "executableCode", skip_serializing_if = "Option::is_none")]
+    pub(crate) executable_code: Option<ExecutableCode>,
+    #[serde(
+        rename = "codeExecutionResult",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) code_execution_result: Option<CodeExecutionResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<Value>,
 }
@@ -97,6 +102,8 @@ impl Part {
             inline_data: None,
             function_call: None,
             function_response: None,
+            executable_code: None,
+            code_execution_result: None,
             metadata: None,
         }
     }
@@ -107,6 +114,8 @@ impl Part {
             inline_data: Some(InlineData::new("image/png", data)),
             function_call: None,
             function_response: None,
+            executable_code: None,
+            code_execution_result: None,
             metadata: None,
         }
     }
@@ -117,6 +126,8 @@ impl Part {
             inline_data: Some(InlineData::new("application/octet-stream", data)),
             function_call: None,
             function_response: None,
+            executable_code: None,
+            code_execution_result: None,
             metadata: None,
         }
     }
@@ -127,6 +138,8 @@ impl Part {
             inline_data: Some(InlineData::new("audio/wav", data)),
             function_call: None,
             function_response: None,
+            executable_code: None,
+            code_execution_result: None,
             metadata: None,
         }
     }
@@ -137,6 +150,8 @@ impl Part {
             inline_data: None,
             function_call: None,
             function_response: Some(FunctionResponse { name, response }),
+            executable_code: None,
+            code_execution_result: None,
             metadata: None,
         }
     }
@@ -195,6 +210,18 @@ impl InlineData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutableCode {
+    pub(crate) language: String,
+    pub(crate) code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeExecutionResult {
+    pub(crate) outcome: String,
+    pub(crate) output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub(crate) name: String,
     #[serde(default)]
@@ -208,10 +235,27 @@ pub struct FunctionResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct GeminiTool {
-    #[serde(rename = "functionDeclarations")]
-    pub(crate) function_declarations: Vec<FunctionDeclaration>,
+#[serde(untagged)] // This allows deserialization to try matching one variant after another
+pub enum GeminiTool {
+    FunctionTool {
+        #[serde(rename = "functionDeclarations")]
+        function_declarations: Vec<FunctionDeclaration>,
+    },
+    GoogleSearchTool {
+        #[serde(rename = "googleSearch")]
+        google_search: GoogleSearch,
+    },
+    CodeExecutionTool {
+        #[serde(rename = "codeExecution")]
+        code_execution: CodeExecution,
+    },
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoogleSearch {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeExecution {}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FunctionDeclaration {
@@ -261,12 +305,33 @@ pub struct GenerationConfig {
     pub(crate) stop_sequences: Option<Vec<String>>,
     #[serde(rename = "responseMimeType", skip_serializing_if = "Option::is_none")]
     pub(crate) response_mime_type: Option<String>,
-    #[serde(rename = "responseSchema", skip_serializing_if = "Option::is_none")]
-    pub(crate) response_schema: Option<Value>,
+    #[serde(rename = "responseJsonSchema", skip_serializing_if = "Option::is_none")]
+    pub(crate) response_json_schema: Option<Value>,
     #[serde(rename = "responseModalities", skip_serializing_if = "Option::is_none")]
     pub(crate) response_modalities: Option<Vec<String>>,
     #[serde(rename = "speechConfig", skip_serializing_if = "Option::is_none")]
     pub(crate) speech_config: Option<SpeechConfig>,
+    #[serde(rename = "imageConfig", skip_serializing_if = "Option::is_none")]
+    pub(crate) image_config: Option<ImageConfig>,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking_config: Option<ThinkingConfig>,
+    #[serde(rename = "candidateCount", skip_serializing_if = "Option::is_none")]
+    pub(crate) candidate_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) seed: Option<i32>,
+    #[serde(rename = "presencePenalty", skip_serializing_if = "Option::is_none")]
+    pub(crate) presence_penalty: Option<f32>,
+    #[serde(rename = "frequencyPenalty", skip_serializing_if = "Option::is_none")]
+    pub(crate) frequency_penalty: Option<f32>,
+    #[serde(rename = "responseLogprobs", skip_serializing_if = "Option::is_none")]
+    pub(crate) response_logprobs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) logprobs: Option<i32>,
+    #[serde(
+        rename = "enableEnhancedCivicAnswers",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) enable_enhanced_civic_answers: Option<bool>,
 }
 
 impl GenerationConfig {
@@ -277,10 +342,27 @@ impl GenerationConfig {
             || self.max_output_tokens.is_some()
             || self.stop_sequences.is_some()
             || self.response_mime_type.is_some()
-            || self.response_schema.is_some()
+            || self.response_json_schema.is_some()
             || self.response_modalities.is_some()
             || self.speech_config.is_some()
+            || self.image_config.is_some()
+            || self.thinking_config.is_some()
+            || self.candidate_count.is_some()
+            || self.seed.is_some()
+            || self.presence_penalty.is_some()
+            || self.frequency_penalty.is_some()
+            || self.response_logprobs.is_some()
+            || self.logprobs.is_some()
+            || self.enable_enhanced_civic_answers.is_some()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageConfig {
+    #[serde(rename = "aspectRatio", skip_serializing_if = "Option::is_none")]
+    pub(crate) aspect_ratio: Option<String>,
+    #[serde(rename = "imageSize", skip_serializing_if = "Option::is_none")]
+    pub(crate) image_size: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,7 +398,7 @@ impl SafetySetting {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GenerateContentResponse {
     #[serde(default)]
     pub(crate) candidates: Vec<Candidate>,
@@ -331,14 +413,16 @@ impl GenerateContentResponse {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Candidate {
     pub(crate) content: Option<GeminiContent>,
+    #[serde(rename = "finishReason", default)]
+    pub(crate) finish_reason: Option<String>,
     #[serde(rename = "safetyRatings", default)]
     pub(crate) safety_ratings: Vec<SafetyRating>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PromptFeedback {
     #[serde(rename = "safetyRatings", default)]
     pub(crate) safety_ratings: Vec<SafetyRating>,
@@ -347,7 +431,7 @@ pub struct PromptFeedback {
     pub(crate) block_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SafetyRating {
     pub(crate) category: String,
     #[serde(default)]
@@ -371,20 +455,22 @@ impl EmbedContentRequest {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct EmbedContentResponse {
     pub(crate) embedding: EmbeddingValue,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct EmbeddingValue {
     pub(crate) values: Vec<f32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingConfig {
-    #[serde(rename = "includeThinking")]
-    pub(crate) include_thinking: bool,
+    #[serde(rename = "includeThoughts", skip_serializing_if = "Option::is_none")]
+    pub(crate) include_thoughts: Option<bool>,
     #[serde(rename = "tokenBudget", skip_serializing_if = "Option::is_none")]
     pub(crate) token_budget: Option<i32>,
+    #[serde(rename = "thinkingLevel", skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking_level: Option<String>, // enum in doc, string here for simplicity
 }
