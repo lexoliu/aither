@@ -1,20 +1,14 @@
 [workspace]
-git_tag_name = "v{{ version }}"
-# Enable changelog updates in README and other markdown files
-changelog_update = true
+pr_draft = false
+changelog_config = "cliff.toml"
+pr_labels = ["release"]
+git_release_name = "v{{ version }}"
+commit_message = "chore(release): {{ crate_name }} v{{ version }} [skip ci]"
+
 
 [[package]]
 name = "aither"
 path = "."
-# Update version references in README
-[[package.changelog_updates]]
-path = "README.md"
-search = "crates/v/aither\\.svg\\)](https://crates\\.io/crates/aither)"
-replace = "crates/v/{{version}}.svg)](https://crates.io/crates/aither)"
-[[package.changelog_updates]]
-path = "README.md"
-search = "docs\\.rs/aither/badge\\.svg\\)](https://docs\\.rs/aither)"
-replace = "docs.rs/aither/badge.svg)](https://docs.rs/aither/{{version}})"
 
 [[package]]
 name = "aither-core"
@@ -60,3 +54,9 @@ git_tag_name = "fs-v{{ version }}"
 name = "aither-command"
 path = "tools/command"
 git_tag_name = "command-v{{ version }}"
+
+
+[[package.files_to_update]]
+path = "README.md"
+search = 'aither = "[0-9]+\.[0-9]+(\.[0-9]+)?"'
+replace = 'aither = "{{ version }}"'
