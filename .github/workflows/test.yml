@@ -20,6 +20,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.os }}
-      - run: cargo build --verbose
       - run: cargo test --verbose --all-features
-      - run: cargo test --doc
