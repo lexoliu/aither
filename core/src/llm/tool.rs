@@ -150,6 +150,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::BTreeMap};
+use core::any::Any;
 use core::fmt::Debug;
 use core::{future::Future, pin::Pin};
 use schemars::{JsonSchema, Schema, schema_for};
@@ -237,7 +238,7 @@ pub fn json<T: Serialize>(value: &T) -> String {
         .map_or_else(|| format!("{value:#}"), ToString::to_string)
 }
 
-trait ToolImpl: Send + Sync {
+trait ToolImpl: Send + Sync + Any {
     fn call(&mut self, args: &str) -> Pin<Box<dyn Future<Output = Result> + Send + '_>>;
     fn definition(&self) -> ToolDefinition;
 }
@@ -250,7 +251,7 @@ fn is_object<T: JsonSchema>() -> bool {
         || value.get("properties").is_some()
 }
 
-impl<T: Tool> ToolImpl for T {
+impl<T: Tool + 'static> ToolImpl for T {
     fn call(&mut self, args: &str) -> Pin<Box<dyn Future<Output = Result> + Send + '_>> {
         let is_object = is_object::<T::Arguments>();
 
@@ -398,6 +399,32 @@ impl Tools {
         }
     }
 
+    /// Retrieves a tool by type.
+    ///
+    /// Returns `None` if the tool is not found.
+    #[must_use]
+    pub fn get<T>(&self) -> Option<&T>
+    where
+        T: Tool + 'static,
+    {
+        self.tools
+            .values()
+            .find_map(|tool| (tool as &dyn Any).downcast_ref::<T>())
+    }
+
+    /// Retrieves a mutable reference to a tool by type.
+    ///
+    /// Returns `None` if the tool is not found.
+    #[must_use]
+    pub fn get_mut<T>(&mut self) -> Option<&mut T>
+    where
+        T: Tool + 'static,
+    {
+        self.tools
+            .values_mut()
+            .find_map(|tool| (tool as &mut dyn Any).downcast_mut::<T>())
+    }
+
     /// Returns definitions of all registered tools.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -408,8 +435,15 @@ impl Tools {
     ///
     /// The tool must implement [`Tool`] and be `'static`.
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
-        self.tools
-            .insert(tool.name(), Box::new(tool) as Box<dyn ToolImpl>);
+        let name = tool.name();
+        // Check if conflict exists
+        assert!(
+            !self.tools.contains_key(&name),
+            "Tool with name '{}' is already registered",
+            name
+        );
+
+        self.tools.insert(name, Box::new(tool) as Box<dyn ToolImpl>);
     }
 
     /// Removes a tool from the registry.

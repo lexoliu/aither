@@ -1,12 +1,7 @@
 name: Tests
 
 on:
-  push:
-    branches:
-      - "**"
-    tags:
-      - "v*"
-  pull_request:
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,7 +11,7 @@ jobs:
     name: Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         os:
           - ubuntu-latest
@@ -29,7 +24,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test  --all-features
+        run: cargo test --all-features
 
   wasm:
     name: wasm32 build
@@ -42,4 +37,4 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: cargo build (wasm)
-        run: cargo build  --all-features --target wasm32-unknown-unknown
+        run: cargo build --all-features --target wasm32-unknown-unknown

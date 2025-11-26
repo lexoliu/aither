@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use aither_core::{
     LanguageModel,
     llm::{
-        Message, Tool,
-        model::{Ability, Profile as ModelProfile},
+        LLMRequest, Message, Tool,
+        model::{Ability, Parameters, Profile as ModelProfile},
         tool::Tools,
     },
 };
@@ -44,7 +44,7 @@ use crate::{
     memory::{ContextStrategy, ConversationMemory},
     plan::{PlanOutcome, Planner},
     sub_agent::SubAgent,
-    todo::{SharedTodoList, TodoList},
+    todo::TodoList,
 };
 
 /// Agent-wide configuration describing context compression, iteration limits, and default tooling.
@@ -351,21 +351,59 @@ where
     }
 
     async fn execute_pending_steps(&mut self) -> aither_core::Result<()> {
-        let Some(todo) = self.state.todo.clone() else {
-            return Ok(());
-        };
-
-        while let Some((index, description)) = next_pending(&todo) {
-            let step_memory = Message::assistant(format!("Executing: {description}"));
-            self.state.memory.push(step_memory);
+        while let Some((index, description)) = self.next_pending_step() {
+            self.state
+                .memory
+                .push(Message::assistant(format!("Executing: {description}")));
 
             let result = self.executor.execute(&description, &self.state).await?;
-            let completion = Message::assistant(format!("Result: {result}"));
-            self.state.memory.push(completion);
+            self.state
+                .memory
+                .push(Message::assistant(format!("Result: {result}")));
 
-            todo.with_mut(|list| list.tick(index));
+            self.request_todo_update(index, &description, &result).await?;
+
+            if self.is_step_pending(&description) {
+                break;
+            }
         }
 
+        Ok(())
+    }
+
+    fn next_pending_step(&self) -> Option<(usize, String)> {
+        next_pending(self.state.tools())
+    }
+
+    fn is_step_pending(&self, description: &str) -> bool {
+        self.state.tools().get::<TodoList>().is_some_and(|todo| {
+            todo.pending()
+                .any(|item| item.description() == description)
+        })
+    }
+
+    async fn request_todo_update(
+        &mut self,
+        index: usize,
+        description: &str,
+        result: &str,
+    ) -> aither_core::Result<()> {
+        let mut parameters = Parameters::default();
+        parameters.tool_choice = Some(vec![TodoList::TOOL_NAME.to_string()]);
+
+        let mut messages = vec![Message::system(
+            "Update the todo list only by calling the todo_list_updater tool. Do not mark tasks complete in plain text.",
+        )];
+        messages.extend(self.state.memory.all());
+        messages.push(Message::assistant(format!(
+            "Task {index} ({description}) finished with result: {result}. Call the todo_list_updater tool to record progress and keep the list accurate."
+        )));
+
+        let request = LLMRequest::new(messages)
+            .with_parameters(parameters)
+            .with_tools(self.state.tools_mut());
+
+        let _ = self.llm.respond(request).into_future().await?;
         Ok(())
     }
 
@@ -429,9 +467,9 @@ where
     }
 }
 
-fn next_pending(todo: &SharedTodoList) -> Option<(usize, String)> {
-    todo.with(|list| {
-        list.items()
+fn next_pending(tools: &Tools) -> Option<(usize, String)> {
+    tools.get::<TodoList>().and_then(|todo| {
+        todo.items()
             .iter()
             .enumerate()
             .find(|(_, item)| !item.completed())
@@ -443,20 +481,16 @@ fn next_pending(todo: &SharedTodoList) -> Option<(usize, String)> {
 #[derive(Debug, Default)]
 pub struct AgentState {
     /// Tools registered for the agent.
-    pub tools: Tools,
-    /// Optional todo list for tracking progress.
-    pub todo: Option<SharedTodoList>,
+    tools: Tools,
     /// Conversation memory.
-    pub memory: ConversationMemory,
+    memory: ConversationMemory,
     profile: Option<ModelProfile>,
 }
 
 impl AgentState {
     /// Attaches a todo list to the agent state and registers it as a tool.
     pub fn attach_todo(&mut self, todo: TodoList) {
-        let shared = SharedTodoList::new(todo);
-        self.register_tool(shared.clone());
-        self.todo = Some(shared);
+        self.register_tool(todo);
     }
 
     /// Returns all messages in the conversation memory.

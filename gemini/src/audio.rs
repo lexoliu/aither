@@ -3,7 +3,7 @@ use futures_lite::StreamExt;
 
 use crate::{
     client::call_generate,
-    config::GeminiBackend,
+    config::{GeminiBackend, GeminiConfig},
     error::GeminiError,
     types::{
         GeminiContent, GenerateContentRequest, GenerationConfig, Part, PrebuiltVoiceConfig,
@@ -31,10 +31,7 @@ impl AudioTranscriber for GeminiBackend {
     }
 }
 
-async fn synthesize_audio(
-    cfg: std::sync::Arc<crate::config::GeminiConfig>,
-    text: String,
-) -> Result<Vec<u8>, GeminiError> {
+async fn synthesize_audio(cfg: &GeminiConfig, text: String) -> Result<Vec<u8>, GeminiError> {
     let model = cfg.tts_model.clone().ok_or_else(|| {
         GeminiError::Api("audio generation is disabled for this Gemini backend".into())
     })?;
@@ -77,10 +74,7 @@ async fn synthesize_audio(
     ))
 }
 
-async fn transcribe_audio(
-    cfg: std::sync::Arc<crate::config::GeminiConfig>,
-    audio: Vec<u8>,
-) -> Result<String, GeminiError> {
+async fn transcribe_audio(cfg: &GeminiConfig, audio: Vec<u8>) -> Result<String, GeminiError> {
     let mut parts = vec![Part::inline_audio(audio)];
     parts.push(Part::text(
         "Transcribe the audio verbatim in the original language.",
@@ -100,7 +94,7 @@ async fn transcribe_audio(
         tool_config: None,
         safety_settings: Vec::new(),
     };
-    let response = call_generate(cfg.clone(), &cfg.text_model, request).await?;
+    let response = call_generate(cfg, &cfg.text_model, request).await?;
     if let Some(candidate) = response.primary_candidate() {
         if let Some(content) = &candidate.content {
             let text = content.text_chunks().join("");

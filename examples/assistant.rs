@@ -1,7 +1,6 @@
 //! Terminal-based AI assistant backed by Gemini with RAG + Mem0.
 //!
 //! Features:
-//! - Streamed responses from `gemini-2.0-flash`.
 //! - Native Google Search + Code Execution enabled on every turn.
 //! - `/file <path>` to index a local file into the RAG store.
 //! - `/mem0` to inspect stored long-term memories.
@@ -15,7 +14,6 @@ use std::{
     fs,
     io::{self, Write},
     path::Path,
-    sync::Arc,
     time::Duration,
 };
 

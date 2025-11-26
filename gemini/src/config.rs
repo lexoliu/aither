@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use aither_core::llm::model::Ability;
 
 /// Gemini REST base URL used by the Developer API.
@@ -24,7 +22,7 @@ pub enum AuthMode {
 /// Native Gemini backend wired up to the `aither` traits.
 #[derive(Clone, Debug)]
 pub struct GeminiBackend {
-    inner: Arc<GeminiConfig>,
+    inner: GeminiConfig,
 }
 
 impl GeminiBackend {
@@ -32,7 +30,7 @@ impl GeminiBackend {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            inner: Arc::new(GeminiConfig {
+            inner: GeminiConfig {
                 api_key: api_key.into(),
                 base_url: GEMINI_API_BASE_URL.to_string(),
                 auth: AuthMode::Query,
@@ -43,65 +41,63 @@ impl GeminiBackend {
                 tts_model: Some(sanitize_model(DEFAULT_TTS_MODEL)),
                 tts_voice: DEFAULT_TTS_VOICE.to_string(),
                 native_abilities: vec![Ability::Pdf],
-            }),
+            },
         }
     }
 
     /// Override the REST base URL (useful for sandboxes or proxies).
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.inner).base_url = base_url.into();
+        self.inner.base_url = base_url.into();
         self
     }
 
     /// Select header-based authentication.
     #[must_use]
     pub fn with_auth_mode(mut self, mode: AuthMode) -> Self {
-        Arc::make_mut(&mut self.inner).auth = mode;
+        self.inner.auth = mode;
         self
     }
 
     /// Override the default chat model.
     #[must_use]
     pub fn with_text_model(mut self, model: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.inner).text_model = sanitize_model(model);
+        self.inner.text_model = sanitize_model(model);
         self
     }
 
     /// Override the embedding model and (optionally) its dimensionality.
     #[must_use]
     pub fn with_embedding_model(mut self, model: impl Into<String>, dim: usize) -> Self {
-        let cfg = Arc::make_mut(&mut self.inner);
-        cfg.embedding_model = sanitize_model(model);
-        cfg.embedding_dimensions = dim;
+        self.inner.embedding_model = sanitize_model(model);
+        self.inner.embedding_dimensions = dim;
         self
     }
 
     /// Override the optional image model.
     #[must_use]
     pub fn with_image_model(mut self, model: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.inner).image_model = Some(sanitize_model(model));
+        self.inner.image_model = Some(sanitize_model(model));
         self
     }
 
     /// Disable image generation support.
     #[must_use]
     pub fn without_image_model(mut self) -> Self {
-        Arc::make_mut(&mut self.inner).image_model = None;
+        self.inner.image_model = None;
         self
     }
 
     /// Override the optional text-to-speech model + voice.
     #[must_use]
     pub fn with_tts(mut self, model: impl Into<String>, voice: impl Into<String>) -> Self {
-        let cfg = Arc::make_mut(&mut self.inner);
-        cfg.tts_model = Some(sanitize_model(model));
-        cfg.tts_voice = voice.into();
+        self.inner.tts_model = Some(sanitize_model(model));
+        self.inner.tts_voice = voice.into();
         self
     }
 
-    pub(crate) fn config(&self) -> Arc<GeminiConfig> {
-        self.inner.clone()
+    pub(crate) const fn config(&self) -> &GeminiConfig {
+        &self.inner
     }
 
     /// Declare native capabilities exposed by the selected Gemini model.
@@ -110,10 +106,9 @@ impl GeminiBackend {
         mut self,
         abilities: impl IntoIterator<Item = Ability>,
     ) -> Self {
-        let cfg = Arc::make_mut(&mut self.inner);
         for ability in abilities {
-            if !cfg.native_abilities.contains(&ability) {
-                cfg.native_abilities.push(ability);
+            if !self.inner.native_abilities.contains(&ability) {
+                self.inner.native_abilities.push(ability);
             }
         }
         self

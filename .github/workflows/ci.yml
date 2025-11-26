@@ -5,13 +5,34 @@ on:
     branches:
       - "**"
   pull_request:
+    branches:
+      - "**"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  skip-check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.check.outputs.should_skip }}
+    steps:
+      - id: check
+        run: |
+          if [[ "${{ github.event.head_commit.message }}" == *"release-plz"* ]] && [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "should_skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_skip=false" >> $GITHUB_OUTPUT
+          fi
+
   lint:
     name: Fmt & Clippy
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,3 +45,76 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --all-features -- -D warnings
+
+  feature-check:
+    name: Feature Combinations
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-hack
+      - name: cargo hack check
+        run: cargo hack check --feature-powerset --no-dev-deps -p aither
+
+  docs:
+    name: Documentation
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc
+        run: cargo doc --all-features --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  typos:
+    name: Typos
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@master
+
+  audit:
+    name: Security Audit
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  unused-deps:
+    name: Unused Dependencies
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@cargo-machete
+      - name: cargo machete
+        run: cargo machete
+
+  tests:
+    name: Tests
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    uses: ./.github/workflows/test.yml

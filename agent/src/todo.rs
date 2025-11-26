@@ -1,7 +1,5 @@
 //! An ordered todo list that can be updated by the LLM as a tool.
 
-use std::sync::{Arc, Mutex, MutexGuard};
-
 use aither_core::llm::Tool;
 use anyhow::bail;
 use schemars::JsonSchema;
@@ -14,7 +12,8 @@ pub struct TodoList {
 }
 
 impl TodoList {
-    const TOOL_NAME: &'static str = "todo_list_updater";
+    /// Tool identifier exposed to the LLM.
+    pub const TOOL_NAME: &'static str = "todo_list_updater";
 
     /// Creates a new `TodoList` from a list of task descriptions.
     #[must_use]
@@ -158,79 +157,6 @@ impl Tool for TodoList {
                 self.update(tasks);
             }
         }
-        Ok("Todo list updated.".into())
-    }
-}
-
-/// Shared todo list that can be registered as a tool while remaining accessible.
-#[derive(Debug, Clone)]
-pub struct SharedTodoList {
-    inner: Arc<Mutex<TodoList>>,
-}
-
-impl SharedTodoList {
-    /// Creates a new shared todo list.
-    #[must_use]
-    pub fn new(list: TodoList) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(list)),
-        }
-    }
-
-    /// Returns a mutex guard for accessing the todo list.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the mutex is poisoned.
-    pub fn guard(&self) -> MutexGuard<'_, TodoList> {
-        self.inner.lock().expect("Shared todo list mutex poisoned")
-    }
-
-    /// Executes a function with a reference to the todo list.
-    pub fn with<R>(&self, f: impl FnOnce(&TodoList) -> R) -> R {
-        let guard = self.guard();
-        f(&guard)
-    }
-
-    /// Executes a function with a mutable reference to the todo list.
-    pub fn with_mut<R>(&self, f: impl FnOnce(&mut TodoList) -> R) -> R {
-        let mut guard = self.guard();
-        f(&mut guard)
-    }
-}
-
-impl Default for SharedTodoList {
-    fn default() -> Self {
-        Self::new(TodoList::new(Vec::new()))
-    }
-}
-
-impl Tool for SharedTodoList {
-    fn name(&self) -> std::borrow::Cow<'static, str> {
-        TodoList::TOOL_NAME.into()
-    }
-
-    fn description(&self) -> std::borrow::Cow<'static, str> {
-        "Updates the agent's todo list based on completed tasks.".into()
-    }
-
-    type Arguments = TodoListUpdate;
-
-    async fn call(&mut self, arguments: Self::Arguments) -> aither_core::Result {
-        let mut guard = self.guard();
-        match arguments {
-            TodoListUpdate::Tick { content } => {
-                if !guard.mark_completed(&content) {
-                    bail!(
-                        "Task with description '{content}' not found in todo list. Please check the task description and try again.",
-                    );
-                }
-            }
-            TodoListUpdate::Replace { tasks } => {
-                guard.update(tasks);
-            }
-        }
-        drop(guard);
         Ok("Todo list updated.".into())
     }
 }

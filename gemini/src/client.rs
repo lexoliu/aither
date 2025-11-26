@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use serde::Serialize;
 use zenwave::{Client, client, error::BoxHttpError, header};
 
@@ -12,24 +10,19 @@ use crate::{
 };
 
 pub async fn call_generate(
-    cfg: Arc<GeminiConfig>,
+    cfg: &GeminiConfig,
     model: &str,
     request: GenerateContentRequest,
 ) -> Result<GenerateContentResponse, GeminiError> {
-    post_json(
-        cfg.clone(),
-        cfg.model_endpoint(model, "generateContent"),
-        &request,
-    )
-    .await
+    post_json(cfg, cfg.model_endpoint(model, "generateContent"), &request).await
 }
 
 pub async fn embed_content(
-    cfg: Arc<GeminiConfig>,
+    cfg: &GeminiConfig,
     request: EmbedContentRequest,
 ) -> Result<EmbedContentResponse, GeminiError> {
     post_json(
-        cfg.clone(),
+        cfg,
         cfg.model_endpoint(&cfg.embedding_model, "embedContent"),
         &request,
     )
@@ -38,7 +31,7 @@ pub async fn embed_content(
 
 #[allow(clippy::future_not_send)]
 async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Serialize>(
-    cfg: Arc<GeminiConfig>,
+    cfg: &GeminiConfig,
     endpoint: String,
     body: &S,
 ) -> Result<T, GeminiError> {

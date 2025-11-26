@@ -6,7 +6,7 @@ use aither_core::{
         tool::ToolDefinition,
     },
 };
-use schemars::{JsonSchema, Schema};
+use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use tracing::debug;
@@ -115,8 +115,7 @@ impl LanguageModel for GeminiBackend {
 
                     debug!("Gemini request: {:?}", request);
 
-                    let response = match call_generate(cfg.clone(), &cfg.text_model, request).await
-                    {
+                    let response = match call_generate(&cfg, &cfg.text_model, request).await {
                         Ok(r) => r,
                         Err(e) => return Some((Err(e), State::Done)),
                     };

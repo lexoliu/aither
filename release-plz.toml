@@ -1,9 +1,20 @@
 [workspace]
 git_tag_name = "v{{ version }}"
+# Enable changelog updates in README and other markdown files
+changelog_update = true
 
 [[package]]
 name = "aither"
 path = "."
+# Update version references in README
+[[package.changelog_updates]]
+path = "README.md"
+search = "crates/v/aither\\.svg\\)](https://crates\\.io/crates/aither)"
+replace = "crates/v/{{version}}.svg)](https://crates.io/crates/aither)"
+[[package.changelog_updates]]
+path = "README.md"
+search = "docs\\.rs/aither/badge\\.svg\\)](https://docs\\.rs/aither)"
+replace = "docs.rs/aither/badge.svg)](https://docs.rs/aither/{{version}})"
 
 [[package]]
 name = "aither-core"
