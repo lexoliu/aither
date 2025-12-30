@@ -15,7 +15,22 @@ pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 // 1. GPT-5 FAMILY (Latest, reasoning-enhanced large models)
 // ============================================================
 
-/// Most capable general-purpose model (reasoning, coding, multimodal).
+/// Latest flagship GPT-5.2 model.
+pub const GPT5_2: &str = "gpt-5.2";
+
+/// Dynamic alias pointing to the latest GPT-5.2 chat model.
+pub const GPT5_2_CHAT_LATEST: &str = "gpt-5.2-chat-latest";
+
+/// Maximum-capability GPT-5.2 variant.
+pub const GPT5_2_PRO: &str = "gpt-5.2-pro";
+
+/// GPT-5.1 model (kept for compatibility).
+pub const GPT5_1: &str = "gpt-5.1";
+
+/// GPT-5.1 Codex Max model for specialized coding workflows.
+pub const GPT5_1_CODEX_MAX: &str = "gpt-5.1-codex-max";
+
+/// Original GPT-5 model identifier (kept for compatibility).
 pub const GPT5: &str = "gpt-5";
 
 /// Smaller, cheaper GPT-5 variant with excellent general performance.
@@ -25,7 +40,7 @@ pub const GPT5_MINI: &str = "gpt-5-mini";
 pub const GPT5_NANO: &str = "gpt-5-nano";
 
 /// Dynamic alias pointing to the latest GPT-5 chat model.
-pub const GPT5_CHAT_LATEST: &str = "gpt-5-chat-latest";
+pub const GPT5_CHAT_LATEST: &str = GPT5_2_CHAT_LATEST;
 
 // ============================================================
 // 2. GPT-4.1 FAMILY (High-quality non-reasoning models)
@@ -51,6 +66,8 @@ pub const GPT4O: &str = "gpt-4o";
 pub const GPT4O_MINI: &str = "gpt-4o-mini";
 
 /// Dynamic alias used by `ChatGPT` for “best available 4o”.
+///
+/// OpenAI recommends using non-ChatGPT model identifiers for API usage.
 pub const CHATGPT_4O_LATEST: &str = "chatgpt-4o-latest";
 
 // ============================================================
@@ -96,7 +113,10 @@ pub const EMBEDDING_ADA002: &str = "text-embedding-ada-002";
 // 7. IMAGE GENERATION MODELS
 // ============================================================
 
-/// Latest `OpenAI` image model (high quality).
+/// Latest `OpenAI` image model (highest quality).
+pub const IMAGE_GPT_1_5: &str = "gpt-image-1.5";
+
+/// Previous `OpenAI` image model (kept for compatibility).
 pub const IMAGE_GPT: &str = "gpt-image-1";
 
 /// Fast, smaller image model.
@@ -112,7 +132,10 @@ pub const DALLE3: &str = "dall-e-3";
 /// Recommended TTS model (fast, high quality).
 pub const TTS_GPT4O_MINI: &str = "gpt-4o-mini-tts";
 
-/// Larger TTS model with richer audio quality.
+/// Higher-fidelity TTS model.
+pub const TTS_1_HD: &str = "tts-1-hd";
+
+/// Legacy TTS model identifier kept for compatibility.
 pub const TTS_GPT4O: &str = "gpt-4o-tts";
 
 /// Legacy Whisper TTS model.

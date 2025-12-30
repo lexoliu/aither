@@ -12,7 +12,14 @@ keywords = ["ai", "llm", "claude", "anthropic"]
 categories = ["api-bindings"]
 
 [dependencies]
-aither-core = { workspace = true }
+aither-core.workspace = true
+futures-core = { version = "0.3", default-features = false }
+futures-lite = "2.6"
+schemars = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+zenwave.workspace = true
 
 [lints]
 workspace = true

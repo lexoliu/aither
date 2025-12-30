@@ -2,62 +2,67 @@
 //!
 //! Claude provider integration for aither.
 //!
-//! This crate provides the necessary components to interact with the Claude API through the aither
-//! framework. It includes a client for making requests, error handling, and data structures for
-//! Claude-specific API responses.
+//! This crate provides the necessary components to interact with the Anthropic Claude API
+//! through the aither framework. It includes a client for making requests, error handling,
+//! and full support for Claude's capabilities.
 //!
 //! ## Features
 //!
-//! - **Client**: A `Claude` struct to interact with the Claude API.
-//! - **Error Handling**: Custom error types for Claude API-specific issues.
+//! - **Streaming**: Full SSE streaming support for real-time responses
+//! - **Tool Use**: Function calling with automatic iteration loop
+//! - **Vision**: Image understanding via base64 or URL references
+//! - **Extended Thinking**: Support for Claude's reasoning/thinking mode
 //!
 //! ## Getting Started
 //!
-//! To use this crate, add `aither-claude` to your `Cargo.toml` dependencies.
+//! ```ignore
+//! use aither_claude::Claude;
+//! use aither_core::{LanguageModel, llm::oneshot};
 //!
-//! ```toml
-//! [dependencies]
-//! aither-claude = { version = "0.1", path = "../claude" }
+//! let client = Claude::new(std::env::var("ANTHROPIC_API_KEY")?);
+//!
+//! // Simple chat
+//! let response = client.respond(oneshot(
+//!     "You are a helpful assistant.",
+//!     "Explain Rust ownership in one paragraph."
+//! )).await?;
+//!
+//! println!("{response}");
 //! ```
 //!
-//! Then, you can create a `Claude` client and use it to make requests:
+//! ## Custom Configuration
 //!
 //! ```no_run
-//! use aither_claude::Claude;
+//! use aither_claude::{Claude, CLAUDE_OPUS_4_0};
 //!
-//! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
-//!     let client = Claude::new("YOUR_CLAUDE_API_KEY".to_string());
-//!     // Use the client to interact with the Claude API
-//!     Ok(())
-//! }
+//! let client = Claude::builder("your-api-key")
+//!     .model(CLAUDE_OPUS_4_0)
+//!     .max_tokens(8192)
+//!     .build();
 //! ```
-#![allow(unused)] // For early development
-#![no_std]
+//!
+//! ## Vision Support
+//!
+//! Claude can analyze images passed as attachments:
+//!
+//! ```ignore
+//! use aither_claude::Claude;
+//! use aither_core::{LanguageModel, llm::{LLMRequest, Message}};
+//!
+//! let client = Claude::new(std::env::var("ANTHROPIC_API_KEY")?);
+//!
+//! let message = Message::user("What's in this image?")
+//!     .with_attachment("https://example.com/image.jpg");
+//!
+//! let response = client.respond(LLMRequest::new([message])).await?;
+//! ```
 
-extern crate alloc;
+mod client;
+mod constant;
+mod error;
+mod request;
+mod response;
 
-use aither_core::Result;
-use alloc::string::String;
-
-/// A client for the Claude API.
-#[derive(Clone, Debug)]
-pub struct Claude {
-    api_key: String,
-}
-
-impl Claude {
-    /// Creates a new `Claude` client with the given API key.
-    pub fn new(api_key: String) -> Self {
-        Self { api_key }
-    }
-}
-
-/// Represents an error that can occur when interacting with the Claude API.
-#[derive(Debug)]
-pub enum ClaudeError {
-    // Placeholder for Claude-specific error types
-    #[allow(missing_docs)]
-    /// An unknown error occurred.
-    Unknown,
-}
+pub use client::{Builder, Claude};
+pub use constant::*;
+pub use error::ClaudeError;

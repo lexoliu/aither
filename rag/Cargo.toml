@@ -1,25 +1,41 @@
 [package]
 name = "aither-rag"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "High-performance Retrieval-Augmented Generation store backed by a parallel in-memory vector database"
-keywords = ["rag", "embedding", "vector-database", "search"]
+description = "Production-ready RAG with HNSW indexing, chunking, and persistence"
+keywords = ["rag", "embedding", "vector-database", "search", "hnsw"]
 categories = ["api-bindings", "database"]
 
 [dependencies]
 aither-core = { path = "../core" }
-anyhow = { version = "1.0", default-features = false, features = ["std"] }
-rayon = "1.10"
+thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", default-features = false, features = ["std"] }
 schemars = { version = "1.0", features = ["derive"] }
 futures-lite = { version = "2.6", features = ["std"] }
 futures-core = { version = "0.3", default-features = false, features = ["alloc"] }
 async-channel = "2.3"
+anyhow = "1.0"
+rayon = "1.10"
+serde_json = "1.0"
+
+# Chunking
+unicode-segmentation = "1.12"
+
+# HNSW Index
+instant-distance = "0.6"
+parking_lot = "0.12"
+ordered-float = "4.6"
+
+# Persistence
+rkyv = { version = "0.8", features = ["bytecheck"] }
+redb = "2.4"
+
+# Deduplication
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [features]
 default = []
@@ -27,3 +43,6 @@ default = []
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros"] }
 tempfile = "3.10"
+
+[lints]
+workspace = true

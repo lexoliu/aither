@@ -507,7 +507,8 @@ mod tests {
     fn profile_creation() {
         let profile = Profile::new("Test model", "test", "test-model", "A test model", 4096);
 
-        assert_eq!(profile.name, "test-model");
+        assert_eq!(profile.name, "Test model");
+        assert_eq!(profile.slug, "test-model");
         assert_eq!(profile.description, "A test model");
         assert_eq!(profile.context_length, 4096);
         assert!(profile.abilities.is_empty());
@@ -599,7 +600,8 @@ mod tests {
             .with_abilities([Ability::Audio, Ability::WebSearch])
             .with_pricing(pricing);
 
-        assert_eq!(profile.name, "full-model");
+        assert_eq!(profile.name, "Test");
+        assert_eq!(profile.slug, "full-model");
         assert_eq!(profile.description, "A full-featured model");
         assert_eq!(profile.context_length, 32768);
         assert_eq!(profile.abilities.len(), 4);

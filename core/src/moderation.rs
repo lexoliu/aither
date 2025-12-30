@@ -77,9 +77,19 @@ pub enum ModerationCategory {
         /// Confidence score indicating the severity/certainty of hate content detection (0.0-1.0).
         score: f32,
     },
+    /// Hate/threatening category with a confidence score.
+    HateThreatening {
+        /// Confidence score indicating the severity/certainty of threatening hate content detection (0.0-1.0).
+        score: f32,
+    },
     /// Harassment category with a confidence score.
     Harassment {
         /// Confidence score indicating the severity/certainty of harassment content detection (0.0-1.0).
+        score: f32,
+    },
+    /// Harassment/threatening category with a confidence score.
+    HarassmentThreatening {
+        /// Confidence score indicating the severity/certainty of threatening harassment content detection (0.0-1.0).
         score: f32,
     },
     /// Sexual category with a confidence score.
@@ -87,14 +97,44 @@ pub enum ModerationCategory {
         /// Confidence score indicating the severity/certainty of sexual content detection (0.0-1.0).
         score: f32,
     },
+    /// Sexual/minors category with a confidence score.
+    SexualMinors {
+        /// Confidence score indicating the severity/certainty of sexual content involving minors (0.0-1.0).
+        score: f32,
+    },
     /// Violence category with a confidence score.
     Violence {
         /// Confidence score indicating the severity/certainty of violence content detection (0.0-1.0).
         score: f32,
     },
+    /// Violence/graphic category with a confidence score.
+    ViolenceGraphic {
+        /// Confidence score indicating the severity/certainty of graphic violence content detection (0.0-1.0).
+        score: f32,
+    },
+    /// Illicit category with a confidence score.
+    Illicit {
+        /// Confidence score indicating the severity/certainty of illicit content detection (0.0-1.0).
+        score: f32,
+    },
+    /// Illicit/violent category with a confidence score.
+    IllicitViolent {
+        /// Confidence score indicating the severity/certainty of violent illicit content detection (0.0-1.0).
+        score: f32,
+    },
     /// Self-harm category with a confidence score.
     SelfHarm {
         /// Confidence score indicating the severity/certainty of self-harm content detection (0.0-1.0).
+        score: f32,
+    },
+    /// Self-harm/intent category with a confidence score.
+    SelfHarmIntent {
+        /// Confidence score indicating the severity/certainty of self-harm intent detection (0.0-1.0).
+        score: f32,
+    },
+    /// Self-harm/instructions category with a confidence score.
+    SelfHarmInstructions {
+        /// Confidence score indicating the severity/certainty of self-harm instructions detection (0.0-1.0).
         score: f32,
     },
 }
@@ -258,6 +298,7 @@ mod tests {
                     found_categories[4] = true;
                     assert!((score - 0.95).abs() < f32::EPSILON);
                 }
+                _ => {}
             }
         }
 

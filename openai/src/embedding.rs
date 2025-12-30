@@ -34,6 +34,7 @@ async fn embed_once(cfg: Arc<Config>, input: String) -> Result<Vec<f32>, OpenAIE
     let request = EmbeddingRequest {
         model: &cfg.embedding_model,
         input: &input,
+        dimensions: embedding_dimensions_for(&cfg.embedding_model, cfg.embedding_dimensions),
     };
     builder = builder.json_body(&request);
     let response: EmbeddingResponse = builder
@@ -52,6 +53,8 @@ async fn embed_once(cfg: Arc<Config>, input: String) -> Result<Vec<f32>, OpenAIE
 struct EmbeddingRequest<'a> {
     model: &'a str,
     input: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,4 +65,11 @@ struct EmbeddingResponse {
 #[derive(Debug, Deserialize)]
 struct EmbeddingItem {
     embedding: Vec<f32>,
+}
+
+fn embedding_dimensions_for(model: &str, dimensions: usize) -> Option<usize> {
+    match model {
+        "text-embedding-3-large" | "text-embedding-3-small" => Some(dimensions),
+        _ => None,
+    }
 }

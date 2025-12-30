@@ -80,33 +80,49 @@ fn collect_categories(payload: &ModerationPayload) -> Vec<ModerationCategory> {
     if let Some(score) = select_score(payload, "hate") {
         categories.push(ModerationCategory::Hate { score });
     }
+    if let Some(score) = select_score(payload, "hate/threatening") {
+        categories.push(ModerationCategory::HateThreatening { score });
+    }
     if let Some(score) = select_score(payload, "harassment") {
         categories.push(ModerationCategory::Harassment { score });
+    }
+    if let Some(score) = select_score(payload, "harassment/threatening") {
+        categories.push(ModerationCategory::HarassmentThreatening { score });
     }
     if let Some(score) = select_score(payload, "self-harm") {
         categories.push(ModerationCategory::SelfHarm { score });
     }
+    if let Some(score) = select_score(payload, "self-harm/intent") {
+        categories.push(ModerationCategory::SelfHarmIntent { score });
+    }
+    if let Some(score) = select_score(payload, "self-harm/instructions") {
+        categories.push(ModerationCategory::SelfHarmInstructions { score });
+    }
     if let Some(score) = select_score(payload, "sexual") {
         categories.push(ModerationCategory::Sexual { score });
+    }
+    if let Some(score) = select_score(payload, "sexual/minors") {
+        categories.push(ModerationCategory::SexualMinors { score });
     }
     if let Some(score) = select_score(payload, "violence") {
         categories.push(ModerationCategory::Violence { score });
     }
+    if let Some(score) = select_score(payload, "violence/graphic") {
+        categories.push(ModerationCategory::ViolenceGraphic { score });
+    }
+    if let Some(score) = select_score(payload, "illicit") {
+        categories.push(ModerationCategory::Illicit { score });
+    }
+    if let Some(score) = select_score(payload, "illicit/violent") {
+        categories.push(ModerationCategory::IllicitViolent { score });
+    }
     categories
 }
 
-fn select_score(payload: &ModerationPayload, prefix: &str) -> Option<f32> {
-    let flagged = payload
-        .categories
-        .iter()
-        .any(|(name, value)| *value && name.starts_with(prefix));
-    let mut best = None;
-    for (name, score) in &payload.category_scores {
-        if name.starts_with(prefix) {
-            best = Some(best.map_or(*score, |current: f32| current.max(*score)));
-        }
-    }
-    match (flagged, best) {
+fn select_score(payload: &ModerationPayload, name: &str) -> Option<f32> {
+    let flagged = payload.categories.get(name).copied().unwrap_or(false);
+    let score = payload.category_scores.get(name).copied();
+    match (flagged, score) {
         (true, Some(score)) => Some(score),
         (true, None) => Some(1.0),
         (false, Some(score)) if score > 0.0 => Some(score),

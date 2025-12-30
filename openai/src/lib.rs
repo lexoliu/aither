@@ -1,6 +1,10 @@
 //! `OpenAI` integration for the Aither framework built on top of the `zenwave`
 //! HTTP client and the shared `aither-core` abstractions.
 //!
+//! By default this client uses the Responses API. The legacy `chat.completions`
+//! endpoint is still available via [`OpenAI::builder`], but OpenAI has deprecated it.
+//! If you must keep using `max_tokens`, enable the legacy compatibility flag on the builder.
+//!
 //! ```no_run
 //! use aither_core::{LanguageModel, llm::{Message, Tools, model::Parameters}};
 //! use aither_openai::OpenAI;
@@ -35,20 +39,20 @@ mod provider;
 mod request;
 mod response;
 
-pub use client::{Builder, OpenAI};
+pub use client::{ApiKind, Builder, OpenAI};
 pub use error::OpenAIError;
 pub use provider::OpenAIProvider;
 
 mod constant;
 pub use constant::*;
 
-pub(crate) const DEFAULT_MODEL: &str = GPT5_CHAT_LATEST;
+pub(crate) const DEFAULT_MODEL: &str = GPT5_2;
 pub(crate) const DEFAULT_BASE_URL: &str = OPENAI_BASE_URL;
 pub(crate) const DEFAULT_EMBEDDING_MODEL: &str = EMBEDDING_SMALL;
 pub(crate) const DEFAULT_EMBEDDING_DIM: usize = 1536;
-pub(crate) const DEFAULT_IMAGE_MODEL: &str = IMAGE_GPT;
-pub(crate) const DEFAULT_AUDIO_MODEL: &str = TTS_GPT4O;
+pub(crate) const DEFAULT_IMAGE_MODEL: &str = IMAGE_GPT_1_5;
+pub(crate) const DEFAULT_AUDIO_MODEL: &str = TTS_GPT4O_MINI;
 pub(crate) const DEFAULT_AUDIO_VOICE: &str = "alloy";
 pub(crate) const DEFAULT_AUDIO_FORMAT: &str = "mp3";
-pub(crate) const DEFAULT_TRANSCRIPTION_MODEL: &str = "whisper-1";
+pub(crate) const DEFAULT_TRANSCRIPTION_MODEL: &str = STT_GPT4O;
 pub(crate) const DEFAULT_MODERATION_MODEL: &str = MODERATION_LATEST;
