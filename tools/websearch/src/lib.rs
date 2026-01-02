@@ -1,3 +1,43 @@
+//! Web search tool for aither agents.
+//!
+//! This crate provides a unified interface for web search providers that can be
+//! used with LLM agents to perform real-time internet searches.
+//!
+//! # Providers
+//!
+//! The following search providers are available:
+//!
+//! | Provider | API Key | Description |
+//! |----------|---------|-------------|
+//! | [`BraveSearch`] | Required | Privacy-first search with independent index |
+//! | [`DuckDuckGo`] | Not required | Free instant answers API |
+//! | [`Tavily`] | Required | AI-optimized search for RAG workflows |
+//! | [`SearXNG`] | Not required | Self-hosted metasearch engine |
+//! | [`GoogleSearch`] | Required (+CX ID) | Google Custom Search API |
+//! | [`Serper`] | Required | Fast Google SERP API |
+//!
+//! # Example
+//!
+//! ```no_run
+//! use aither_websearch::{BraveSearch, SearchProvider, WebSearchTool};
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! // Create a search provider
+//! let provider = BraveSearch::new("YOUR_API_KEY");
+//!
+//! // Use directly
+//! let results = provider.search("rust async programming", 5).await?;
+//!
+//! // Or wrap in a tool for LLM agents
+//! let tool = WebSearchTool::new(provider);
+//! # Ok(())
+//! # }
+//! ```
+
+mod providers;
+
+pub use providers::*;
+
 use std::borrow::Cow;
 
 use aither_core::llm::Tool;
@@ -79,45 +119,5 @@ where
         let limit = arguments.limit.clamp(1, 10);
         let results = self.provider.search(&arguments.query, limit).await?;
         Ok(json(&results))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct InMemorySearchProvider {
-    corpus: Vec<SearchResult>,
-}
-
-impl InMemorySearchProvider {
-    pub fn new(corpus: Vec<SearchResult>) -> Self {
-        Self { corpus }
-    }
-}
-
-impl Default for InMemorySearchProvider {
-    fn default() -> Self {
-        Self {
-            corpus: vec![SearchResult {
-                title: "Knowledge base is empty".into(),
-                url: "https://example.com".into(),
-                snippet: "Provide your own provider to enable real search.".into(),
-            }],
-        }
-    }
-}
-
-impl SearchProvider for InMemorySearchProvider {
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        let needle = query.to_lowercase();
-        let mut matches: Vec<_> = self
-            .corpus
-            .iter()
-            .filter(|entry| {
-                entry.title.to_lowercase().contains(&needle)
-                    || entry.snippet.to_lowercase().contains(&needle)
-            })
-            .cloned()
-            .collect();
-        matches.truncate(limit);
-        Ok(matches)
     }
 }
