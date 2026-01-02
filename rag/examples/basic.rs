@@ -1,4 +1,4 @@
-//! Basic RAG flow using the in-memory store and a toy embedder.
+//! Basic RAG flow using the HNSW index and a toy embedder.
 
 use aither_core::{EmbeddingModel, Result, llm::Tool};
 use aither_rag::{IndexStage, Rag, RagToolArgs};
@@ -19,47 +19,64 @@ impl EmbeddingModel for DemoEmbedder {
             let bucket = idx % self.dim();
             vector[bucket] += byte as f32;
         }
+        // Normalize
+        let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for v in &mut vector {
+                *v /= norm;
+            }
+        }
         Ok(vector)
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let rag = Rag::new(DemoEmbedder);
     let working_dir = prepare_source_tree()?;
-    let index_dir = working_dir.join("index");
-    rag.set_index_dir(&index_dir)?;
+    let index_path = working_dir.join("index.redb");
+
+    // Create RAG instance with custom configuration
+    let rag = Rag::builder(DemoEmbedder)
+        .index_path(&index_path)
+        .top_k(3)
+        .auto_save(true)
+        .build()
+        .expect("Failed to create RAG instance");
 
     println!("Indexing {}", working_dir.display());
     let mut job = rag.index_directory(working_dir.join("notes"))?;
+
     while let Some(progress) = job.next().await {
         match progress.stage {
-            IndexStage::Enumerating => println!("Scanning files..."),
-            IndexStage::Embedding | IndexStage::Embedded => {
-                if let Some(path) = progress.path.as_ref() {
+            IndexStage::Scanning => println!("Scanning files..."),
+            IndexStage::Embedding | IndexStage::Indexing => {
+                if let Some(path) = progress.current_file.as_ref() {
                     println!(
-                        "[{}/{}] Indexed {}",
+                        "[{}/{}] Indexing {}",
                         progress.processed,
                         progress.total,
                         path.display()
                     );
                 }
             }
-            IndexStage::Persisting => println!("Persisting snapshot..."),
-            IndexStage::Finished => println!("Done indexing!"),
+            IndexStage::Saving => println!("Saving index..."),
+            IndexStage::Done => println!("Done indexing!"),
             IndexStage::Skipped { ref reason } => {
-                if let Some(path) = progress.path.as_ref() {
+                if let Some(path) = progress.current_file.as_ref() {
                     eprintln!("Skipped {}: {}", path.display(), reason);
                 }
             }
+            _ => {}
         }
     }
+
     let indexed = job.await?;
     println!(
-        "Indexed {indexed} files. Snapshot stored at {}",
-        index_dir.display()
+        "Indexed {indexed} files. Index stored at {}",
+        index_path.display()
     );
 
+    // Use the RAG as a tool
     let mut tool_rag = rag.clone();
     let response = tool_rag
         .call(RagToolArgs {
@@ -67,7 +84,19 @@ async fn main() -> Result<()> {
             top_k: 2,
         })
         .await?;
-    println!("Tool response: {response}");
+    println!("\nTool response:\n{response}");
+
+    // Direct search
+    println!("\nDirect search results:");
+    let results = rag.search("rust safety").await?;
+    for result in results {
+        println!(
+            "  [{:.3}] {}: {}",
+            result.score,
+            result.chunk.id,
+            &result.chunk.text[..50.min(result.chunk.text.len())]
+        );
+    }
 
     Ok(())
 }
@@ -79,17 +108,19 @@ fn prepare_source_tree() -> Result<PathBuf> {
     }
     let notes_dir = base.join("notes");
     fs::create_dir_all(&notes_dir)?;
+
     fs::write(
         notes_dir.join("rag.txt"),
-        "Retrieval-Augmented Generation uses embeddings plus vector search.",
+        "Retrieval-Augmented Generation uses embeddings plus vector search to provide context to LLMs.",
     )?;
     fs::write(
         notes_dir.join("chunking.md"),
-        "Chunking splits large files into overlapping windows for indexing.",
+        "Chunking splits large files into overlapping windows for indexing. This helps with retrieval accuracy.",
     )?;
     fs::write(
         notes_dir.join("rust.md"),
-        "Rust focuses on performance and safety using ownership and borrowing.",
+        "Rust focuses on performance and safety using ownership and borrowing. It prevents memory bugs at compile time.",
     )?;
+
     Ok(base)
 }
