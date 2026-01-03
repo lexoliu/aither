@@ -2,17 +2,17 @@ use aither_core::{EmbeddingModel, Error as AitherError, Result as AitherResult};
 
 use crate::{
     client::embed_content,
-    config::GeminiBackend,
+    config::Gemini,
     types::{EmbedContentRequest, GeminiContent},
 };
 
-impl EmbeddingModel for GeminiBackend {
+impl EmbeddingModel for Gemini {
     fn dim(&self) -> usize {
         self.config().embedding_dimensions
     }
 
     fn embed(
-        &self,
+        &mut self,
         text: &str,
     ) -> impl core::future::Future<Output = AitherResult<Vec<f32>>> + Send {
         let cfg = self.config();

@@ -38,7 +38,7 @@
 //! ```rust
 //! use aither::EmbeddingModel;
 //!
-//! async fn example<T: EmbeddingModel>(model: &T) -> aither::Result<()> {
+//! async fn example<T: EmbeddingModel>(model: &mut T) -> aither::Result<()> {
 //!     // Get the embedding dimension
 //!     let dim = model.dim();
 //!     println!("Model produces {}-dimensional embeddings", dim);
@@ -89,14 +89,14 @@ pub type Embedding = Vec<f32>;
 ///         1536 // OpenAI text-embedding-ada-002 dimension
 ///     }
 ///     
-///     async fn embed(&self, text: &str) -> aither::Result<Vec<f32>> {
+///     async fn embed(&mut self, text: &str) -> aither::Result<Vec<f32>> {
 ///         // In a real implementation, this would call the embedding API
 ///         Ok(vec![0.0; self.dim()])
 ///     }
 /// }
 ///
 /// # tokio_test::block_on(async {
-/// let model = MyEmbedding { api_key: "sk-...".to_string() };
+/// let mut model = MyEmbedding { api_key: "sk-...".to_string() };
 /// let embedding = model.embed("The quick brown fox").await.unwrap();
 /// assert_eq!(embedding.len(), 1536);
 /// # });
@@ -128,7 +128,7 @@ pub trait EmbeddingModel: Send + Sized + Send + Sync {
     ///
     /// A [`Vec<f32>`] with length equal to [`Self::dim`](EmbeddingModel::dim).
     /// The vector represents the semantic meaning of the input text in high-dimensional space.
-    fn embed(&self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send;
+    fn embed(&mut self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send;
 }
 
 #[cfg(test)]
@@ -146,7 +146,7 @@ mod tests {
         }
 
         #[allow(clippy::cast_precision_loss)]
-        async fn embed(&self, text: &str) -> crate::Result<Vec<f32>> {
+        async fn embed(&mut self, text: &str) -> crate::Result<Vec<f32>> {
             // Create a simple mock embedding based on text length
             let mut embedding = vec![0.0; self.dimension];
             let text_len = text.len();
@@ -167,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn embedding_generation() {
-        let model = MockEmbeddingModel { dimension: 4 };
+        let mut model = MockEmbeddingModel { dimension: 4 };
         let embedding = model.embed("test").await.unwrap();
 
         assert_eq!(embedding.len(), 4);
@@ -180,7 +180,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::float_cmp)]
     async fn embedding_different_texts() {
-        let model = MockEmbeddingModel { dimension: 2 };
+        let mut model = MockEmbeddingModel { dimension: 2 };
 
         let embedding1 = model.embed("a").await.unwrap();
         let embedding2 = model.embed("ab").await.unwrap();
@@ -196,7 +196,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::float_cmp)]
     async fn embedding_empty_text() {
-        let model = MockEmbeddingModel { dimension: 3 };
+        let mut model = MockEmbeddingModel { dimension: 3 };
         let embedding = model.embed("").await.unwrap();
 
         assert_eq!(embedding.len(), 3);
@@ -207,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn embedding_large_dimension() {
-        let model = MockEmbeddingModel { dimension: 1536 }; // Common OpenAI dimension
+        let mut model = MockEmbeddingModel { dimension: 1536 }; // Common OpenAI dimension
         let embedding = model.embed("test text").await.unwrap();
 
         assert_eq!(embedding.len(), 1536);
