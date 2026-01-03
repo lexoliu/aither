@@ -10,7 +10,7 @@ use crate::chunking::{Chunker, FixedSizeChunker, SentenceChunker};
 use crate::config::{RagConfig, RagConfigBuilder};
 use crate::error::Result;
 use crate::index::VectorIndex;
-use crate::indexing::{IndexProgress, IndexStage, IndexingJob, collect_files};
+use crate::indexing::{IndexProgress, IndexStage};
 use crate::persistence::{Persistence, RedbPersistence};
 use crate::store::RagStore;
 use crate::types::{Document, Metadata, SearchResult};
@@ -28,11 +28,10 @@ use crate::types::{Document, Metadata, SearchResult};
 ///
 /// async fn example<E: EmbeddingModel + Send + Sync + 'static>(embedder: E) {
 ///     // Simple usage with defaults
-///     let rag = Rag::new(embedder);
+///     let mut rag = Rag::new(embedder);
 ///
 ///     // Index a directory
-///     let job = rag.index_directory("./docs").unwrap();
-///     let _count = job.await.unwrap();
+///     let count = rag.index_directory("./docs").await.unwrap();
 ///
 ///     // Search
 ///     let results = rag.search("query").await.unwrap();
@@ -42,16 +41,6 @@ pub struct Rag<M: EmbeddingModel> {
     store: RagStore<M>,
     persistence: Arc<dyn Persistence>,
     config: RagConfig,
-}
-
-impl<M: EmbeddingModel> Clone for Rag<M> {
-    fn clone(&self) -> Self {
-        Self {
-            store: self.store.clone(),
-            persistence: Arc::clone(&self.persistence),
-            config: self.config.clone(),
-        }
-    }
 }
 
 impl<M: EmbeddingModel> std::fmt::Debug for Rag<M> {
@@ -117,108 +106,105 @@ where
     /// 3. Chunks, embeds, and indexes the content
     /// 4. Saves the index (if auto-save is enabled)
     ///
-    /// Returns an [`IndexingJob`] that can be:
-    /// - Awaited for completion (returns total indexed files)
-    /// - Streamed for progress updates
-    pub fn index_directory<P: AsRef<Path>>(&self, dir: P) -> Result<IndexingJob> {
+    /// Returns the number of files indexed and a receiver for progress updates.
+    pub async fn index_directory<P: AsRef<Path>>(
+        &mut self,
+        dir: P,
+    ) -> Result<usize> {
+        self.index_directory_with_progress(dir, |_| {}).await
+    }
+
+    /// Indexes all files in a directory with progress callback.
+    ///
+    /// The callback is called for each progress update during indexing.
+    pub async fn index_directory_with_progress<P, F>(
+        &mut self,
+        dir: P,
+        mut on_progress: F,
+    ) -> Result<usize>
+    where
+        P: AsRef<Path>,
+        F: FnMut(IndexProgress),
+    {
+        use crate::indexing::collect_files;
+
         let dir_path = dir.as_ref().to_path_buf();
-        let store = self.store.clone();
-        let persistence = Arc::clone(&self.persistence);
-        let auto_save = self.config.auto_save;
 
-        let (progress_tx, progress_rx) = IndexingJob::channel();
+        // Collect files
+        on_progress(IndexProgress::new(0, 0, None, IndexStage::Scanning));
 
-        let job = async move {
-            // Collect files
-            let _ = progress_tx
-                .send(IndexProgress::new(0, 0, None, IndexStage::Scanning))
-                .await;
+        let files = collect_files(&dir_path)?;
+        let total = files.len();
 
-            let files = collect_files(&dir_path)?;
-            let total = files.len();
+        let mut indexed = 0usize;
 
-            let mut indexed = 0usize;
+        for (idx, path) in files.into_iter().enumerate() {
+            // Generate document ID from relative path
+            let relative_id = path
+                .strip_prefix(&dir_path)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
 
-            for (idx, path) in files.into_iter().enumerate() {
-                // Generate document ID from relative path
-                let relative_id = path
-                    .strip_prefix(&dir_path)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
-
-                // Read file content
-                let content = match fs::read_to_string(&path) {
-                    Ok(text) => text,
-                    Err(err) => {
-                        let _ = progress_tx
-                            .send(IndexProgress::new(
-                                idx,
-                                total,
-                                Some(path.clone()),
-                                IndexStage::Skipped {
-                                    reason: err.to_string(),
-                                },
-                            ))
-                            .await;
-                        continue;
-                    }
-                };
-
-                // Create document with metadata
-                let mut metadata = Metadata::new();
-                metadata.insert("path".into(), path.display().to_string());
-
-                let doc = Document::with_metadata(relative_id, content, metadata);
-
-                // Embed and index
-                let _ = progress_tx
-                    .send(IndexProgress::new(
+            // Read file content
+            let content = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(err) => {
+                    on_progress(IndexProgress::new(
                         idx,
                         total,
                         Some(path.clone()),
-                        IndexStage::Embedding,
-                    ))
-                    .await;
+                        IndexStage::Skipped {
+                            reason: err.to_string(),
+                        },
+                    ));
+                    continue;
+                }
+            };
 
-                store.insert(doc).await?;
-                indexed += 1;
+            // Create document with metadata
+            let mut metadata = Metadata::new();
+            metadata.insert("path".into(), path.display().to_string());
 
-                let _ = progress_tx
-                    .send(IndexProgress::new(
-                        idx + 1,
-                        total,
-                        Some(path),
-                        IndexStage::Indexing,
-                    ))
-                    .await;
-            }
+            let doc = Document::with_metadata(relative_id, content, metadata);
 
-            // Save if auto-save is enabled
-            if auto_save {
-                let _ = progress_tx
-                    .send(IndexProgress::new(indexed, total, None, IndexStage::Saving))
-                    .await;
+            // Embed and index
+            on_progress(IndexProgress::new(
+                idx,
+                total,
+                Some(path.clone()),
+                IndexStage::Embedding,
+            ));
 
-                let entries = store.index().entries();
-                persistence.save(&entries)?;
-            }
+            self.store.insert(doc).await?;
+            indexed += 1;
 
-            let _ = progress_tx
-                .send(IndexProgress::new(indexed, total, None, IndexStage::Done))
-                .await;
+            on_progress(IndexProgress::new(
+                idx + 1,
+                total,
+                Some(path),
+                IndexStage::Indexing,
+            ));
+        }
 
-            Ok(indexed)
-        };
+        // Save if auto-save is enabled
+        if self.config.auto_save {
+            on_progress(IndexProgress::new(indexed, total, None, IndexStage::Saving));
 
-        Ok(IndexingJob::new(job, progress_rx))
+            let entries = self.store.index().entries();
+            self.persistence.save(&entries)?;
+        }
+
+        on_progress(IndexProgress::new(indexed, total, None, IndexStage::Done));
+
+        Ok(indexed)
     }
 
     /// Inserts a single document.
     ///
     /// # Returns
     /// The number of chunks inserted.
-    pub async fn insert(&self, document: Document) -> Result<usize> {
+    pub async fn insert(&mut self, document: Document) -> Result<usize> {
         self.store.insert(document).await
     }
 
@@ -233,18 +219,23 @@ where
     /// Searches for similar content.
     ///
     /// Uses the configured default `top_k`.
-    pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
+    pub async fn search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
         self.store.search(query).await
     }
 
     /// Searches with a custom result count.
-    pub async fn search_with_k(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+    pub async fn search_with_k(&mut self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         self.store.search_with_k(query, top_k).await
     }
 
     /// Returns a reference to the underlying store.
     pub fn store(&self) -> &RagStore<M> {
         &self.store
+    }
+
+    /// Returns a mutable reference to the underlying store.
+    pub fn store_mut(&mut self) -> &mut RagStore<M> {
+        &mut self.store
     }
 
     /// Returns the number of indexed chunks.
@@ -393,11 +384,9 @@ impl Chunker for ChunkerWrapper {
 mod tests {
     use super::*;
     use aither_core::EmbeddingModel;
-    use futures_lite::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
-    #[derive(Clone)]
     struct MockEmbedder {
         dimension: usize,
         calls: Arc<AtomicUsize>,
@@ -417,7 +406,7 @@ mod tests {
             self.dimension
         }
 
-        async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
+        async fn embed(&mut self, text: &str) -> aither_core::Result<Vec<f32>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {
@@ -437,21 +426,22 @@ mod tests {
         fs::write(data_dir.path().join("file1.txt"), "Hello world").unwrap();
         fs::write(data_dir.path().join("file2.txt"), "Goodbye world").unwrap();
 
-        let rag = Rag::builder(embedder)
+        let mut rag = Rag::builder(embedder)
             .index_path(index_dir.path().join("index.redb"))
             .auto_save(false)
             .build()
             .unwrap();
 
         // Index directory
-        let mut job = rag.index_directory(data_dir.path()).unwrap();
         let mut saw_done = false;
-        while let Some(progress) = job.next().await {
-            if matches!(progress.stage, IndexStage::Done) {
-                saw_done = true;
-            }
-        }
-        let count = job.await.unwrap();
+        let count = rag
+            .index_directory_with_progress(data_dir.path(), |progress| {
+                if matches!(progress.stage, IndexStage::Done) {
+                    saw_done = true;
+                }
+            })
+            .await
+            .unwrap();
 
         assert!(saw_done);
         assert_eq!(count, 2);
@@ -469,7 +459,7 @@ mod tests {
         // Create and populate
         {
             let embedder = MockEmbedder::new(4);
-            let rag = Rag::builder(embedder)
+            let mut rag = Rag::builder(embedder)
                 .index_path(index_dir.path().join("index.redb"))
                 .build()
                 .unwrap();

@@ -2,7 +2,6 @@
 
 use aither_core::{EmbeddingModel, Result, llm::Tool};
 use aither_rag::{IndexStage, Rag, RagToolArgs};
-use futures_lite::StreamExt;
 use std::{env, fs, path::PathBuf};
 
 #[derive(Clone)]
@@ -13,7 +12,7 @@ impl EmbeddingModel for DemoEmbedder {
         4
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    async fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
         let mut vector = vec![0.0; self.dim()];
         for (idx, byte) in text.bytes().enumerate() {
             let bucket = idx % self.dim();
@@ -36,7 +35,7 @@ async fn main() -> Result<()> {
     let index_path = working_dir.join("index.redb");
 
     // Create RAG instance with custom configuration
-    let rag = Rag::builder(DemoEmbedder)
+    let mut rag = Rag::builder(DemoEmbedder)
         .index_path(&index_path)
         .top_k(3)
         .auto_save(true)
@@ -44,41 +43,39 @@ async fn main() -> Result<()> {
         .expect("Failed to create RAG instance");
 
     println!("Indexing {}", working_dir.display());
-    let mut job = rag.index_directory(working_dir.join("notes"))?;
-
-    while let Some(progress) = job.next().await {
-        match progress.stage {
-            IndexStage::Scanning => println!("Scanning files..."),
-            IndexStage::Embedding | IndexStage::Indexing => {
-                if let Some(path) = progress.current_file.as_ref() {
-                    println!(
-                        "[{}/{}] Indexing {}",
-                        progress.processed,
-                        progress.total,
-                        path.display()
-                    );
+    let indexed = rag
+        .index_directory_with_progress(working_dir.join("notes"), |progress| {
+            match progress.stage {
+                IndexStage::Scanning => println!("Scanning files..."),
+                IndexStage::Embedding | IndexStage::Indexing => {
+                    if let Some(path) = progress.current_file.as_ref() {
+                        println!(
+                            "[{}/{}] Indexing {}",
+                            progress.processed,
+                            progress.total,
+                            path.display()
+                        );
+                    }
                 }
-            }
-            IndexStage::Saving => println!("Saving index..."),
-            IndexStage::Done => println!("Done indexing!"),
-            IndexStage::Skipped { ref reason } => {
-                if let Some(path) = progress.current_file.as_ref() {
-                    eprintln!("Skipped {}: {}", path.display(), reason);
+                IndexStage::Saving => println!("Saving index..."),
+                IndexStage::Done => println!("Done indexing!"),
+                IndexStage::Skipped { ref reason } => {
+                    if let Some(path) = progress.current_file.as_ref() {
+                        eprintln!("Skipped {}: {}", path.display(), reason);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
-        }
-    }
+        })
+        .await?;
 
-    let indexed = job.await?;
     println!(
         "Indexed {indexed} files. Index stored at {}",
         index_path.display()
     );
 
     // Use the RAG as a tool
-    let mut tool_rag = rag.clone();
-    let response = tool_rag
+    let response = rag
         .call(RagToolArgs {
             query: "How do I prep documents for RAG?".into(),
             top_k: 2,

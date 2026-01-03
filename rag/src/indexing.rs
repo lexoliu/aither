@@ -1,11 +1,7 @@
 //! Directory indexing with progress tracking.
 
-use async_channel::{Receiver, Sender, unbounded};
-use futures_core::Stream;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 use crate::error::Result;
 
@@ -60,76 +56,6 @@ pub enum IndexStage {
         /// Reason the file was skipped.
         reason: String,
     },
-}
-
-/// A job that indexes a directory and reports progress.
-///
-/// This type implements both `Future` (for awaiting completion) and `Stream`
-/// (for receiving progress updates).
-pub struct IndexingJob {
-    /// Receiver for progress updates.
-    progress_rx: Pin<Box<Receiver<IndexProgress>>>,
-    /// The completion future.
-    completion: Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send>>,
-    /// Cached completion result.
-    completion_result: Option<Result<usize>>,
-}
-
-impl std::fmt::Debug for IndexingJob {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IndexingJob").finish_non_exhaustive()
-    }
-}
-
-impl IndexingJob {
-    /// Creates a new indexing job.
-    pub(crate) fn new<F>(future: F, progress_rx: Receiver<IndexProgress>) -> Self
-    where
-        F: std::future::Future<Output = Result<usize>> + Send + 'static,
-    {
-        Self {
-            progress_rx: Box::pin(progress_rx),
-            completion: Box::pin(future),
-            completion_result: None,
-        }
-    }
-
-    /// Creates a progress channel pair.
-    pub(crate) fn channel() -> (Sender<IndexProgress>, Receiver<IndexProgress>) {
-        unbounded()
-    }
-}
-
-impl std::future::Future for IndexingJob {
-    type Output = Result<usize>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-
-        if let Some(result) = this.completion_result.take() {
-            return Poll::Ready(result);
-        }
-
-        this.completion.as_mut().poll(cx)
-    }
-}
-
-impl Stream for IndexingJob {
-    type Item = IndexProgress;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = unsafe { self.get_unchecked_mut() };
-
-        // Drive the completion future to make progress
-        if this.completion_result.is_none() {
-            if let Poll::Ready(result) = this.completion.as_mut().poll(cx) {
-                this.completion_result = Some(result);
-            }
-        }
-
-        // Poll for progress updates
-        this.progress_rx.as_mut().poll_next(cx)
-    }
 }
 
 /// Collects all files from a directory tree.

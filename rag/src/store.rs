@@ -15,21 +15,10 @@ use crate::types::{Chunk, Document, SearchResult};
 /// `RagStore` combines an embedding model with a vector index to provide
 /// efficient semantic search over documents.
 pub struct RagStore<M: EmbeddingModel> {
-    embedder: Arc<M>,
+    embedder: M,
     index: Arc<HnswIndex>,
     chunker: Arc<dyn Chunker>,
     config: RagConfig,
-}
-
-impl<M: EmbeddingModel> Clone for RagStore<M> {
-    fn clone(&self) -> Self {
-        Self {
-            embedder: Arc::clone(&self.embedder),
-            index: Arc::clone(&self.index),
-            chunker: Arc::clone(&self.chunker),
-            config: self.config.clone(),
-        }
-    }
 }
 
 impl<M: EmbeddingModel> std::fmt::Debug for RagStore<M> {
@@ -53,7 +42,7 @@ where
     pub fn new(embedder: M) -> Self {
         let dimension = embedder.dim();
         Self {
-            embedder: Arc::new(embedder),
+            embedder,
             index: Arc::new(HnswIndex::new(dimension)),
             chunker: Arc::new(FixedSizeChunker::default()),
             config: RagConfig::default(),
@@ -65,7 +54,7 @@ where
     pub fn with_config(embedder: M, config: RagConfig) -> Self {
         let dimension = embedder.dim();
         Self {
-            embedder: Arc::new(embedder),
+            embedder,
             index: Arc::new(HnswIndex::new(dimension)),
             chunker: Arc::new(FixedSizeChunker::default()),
             config,
@@ -86,7 +75,7 @@ where
     /// # Returns
     /// The number of chunks actually inserted (may be less than total chunks
     /// if deduplication is enabled and duplicates are found).
-    pub async fn insert(&self, document: Document) -> Result<usize> {
+    pub async fn insert(&mut self, document: Document) -> Result<usize> {
         let chunks = self.chunker.chunk(&document)?;
         let mut inserted = 0;
 
@@ -113,7 +102,7 @@ where
     ///
     /// # Returns
     /// The total number of chunks inserted across all documents.
-    pub async fn insert_batch(&self, documents: Vec<Document>) -> Result<usize> {
+    pub async fn insert_batch(&mut self, documents: Vec<Document>) -> Result<usize> {
         let mut total_inserted = 0;
         for doc in documents {
             total_inserted += self.insert(doc).await?;
@@ -158,7 +147,7 @@ where
     ///
     /// # Returns
     /// Search results sorted by similarity score (highest first).
-    pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
+    pub async fn search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
         self.search_with_k(query, self.config.default_top_k).await
     }
 
@@ -170,7 +159,7 @@ where
     ///
     /// # Returns
     /// Search results sorted by similarity score (highest first).
-    pub async fn search_with_k(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+    pub async fn search_with_k(&mut self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         let embedding = self
             .embedder
             .embed(query)
@@ -208,6 +197,11 @@ where
         &self.embedder
     }
 
+    /// Returns a mutable reference to the embedder.
+    pub fn embedder_mut(&mut self) -> &mut M {
+        &mut self.embedder
+    }
+
     /// Returns the configuration.
     pub fn config(&self) -> &RagConfig {
         &self.config
@@ -240,7 +234,7 @@ mod tests {
             self.dimension
         }
 
-        async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
+        async fn embed(&mut self, text: &str) -> aither_core::Result<Vec<f32>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {
@@ -253,7 +247,7 @@ mod tests {
     #[tokio::test]
     async fn insert_and_search() {
         let embedder = MockEmbedder::new(4);
-        let store = RagStore::new(embedder);
+        let mut store = RagStore::new(embedder);
 
         let doc = Document::new("doc1", "Hello world");
         store.insert(doc).await.unwrap();
@@ -267,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn delete_document() {
         let embedder = MockEmbedder::new(4);
-        let store = RagStore::new(embedder);
+        let mut store = RagStore::new(embedder);
 
         let doc = Document::new("doc1", "Hello world");
         store.insert(doc).await.unwrap();
@@ -281,7 +275,7 @@ mod tests {
     async fn deduplication() {
         let embedder = MockEmbedder::new(4);
         let config = RagConfig::builder().deduplication(true).build();
-        let store = RagStore::with_config(embedder, config);
+        let mut store = RagStore::with_config(embedder, config);
 
         // Insert same content twice with different IDs
         let doc1 = Document::new("doc1", "Same content");
@@ -299,7 +293,7 @@ mod tests {
     async fn no_deduplication() {
         let embedder = MockEmbedder::new(4);
         let config = RagConfig::builder().deduplication(false).build();
-        let store = RagStore::with_config(embedder, config);
+        let mut store = RagStore::with_config(embedder, config);
 
         let doc1 = Document::new("doc1", "Same content");
         let doc2 = Document::new("doc2", "Same content");

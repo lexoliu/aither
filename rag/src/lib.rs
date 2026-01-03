@@ -15,11 +15,10 @@
 //!
 //! async fn example<E: EmbeddingModel + Send + Sync + 'static>(embedder: E) {
 //!     // Create RAG instance with defaults
-//!     let rag = Rag::new(embedder);
+//!     let mut rag = Rag::new(embedder);
 //!
 //!     // Index a directory
-//!     let job = rag.index_directory("./docs").unwrap();
-//!     let _count = job.await.unwrap();
+//!     let _count = rag.index_directory("./docs").await.unwrap();
 //!
 //!     // Search
 //!     let results = rag.search("query").await.unwrap();
@@ -79,7 +78,7 @@ pub use chunking::{Chunker, FixedSizeChunker, SentenceChunker};
 pub use config::{RagConfig, RagConfigBuilder};
 pub use error::{RagError, Result};
 pub use index::{HnswIndex, VectorIndex};
-pub use indexing::{IndexProgress, IndexStage, IndexingJob};
+pub use indexing::{IndexProgress, IndexStage};
 pub use persistence::{Persistence, RedbPersistence, RkyvPersistence};
 pub use rag::{Rag, RagBuilder};
 pub use store::RagStore;

@@ -50,28 +50,23 @@ where
 
     type Arguments = RagToolArgs;
 
-    fn call(
-        &mut self,
-        arguments: Self::Arguments,
-    ) -> impl std::future::Future<Output = aither_core::Result> + Send {
-        let store = self.store().clone();
-        async move {
-            let results = store
-                .search_with_k(&arguments.query, arguments.top_k)
-                .await?;
+    async fn call(&mut self, arguments: Self::Arguments) -> aither_core::Result {
+        let results = self
+            .store_mut()
+            .search_with_k(&arguments.query, arguments.top_k)
+            .await?;
 
-            let response: Vec<RagToolResponse> = results
-                .into_iter()
-                .map(|r| RagToolResponse {
-                    id: r.chunk.id,
-                    text: r.chunk.text,
-                    metadata: r.chunk.metadata,
-                    score: r.score,
-                })
-                .collect();
+        let response: Vec<RagToolResponse> = results
+            .into_iter()
+            .map(|r| RagToolResponse {
+                id: r.chunk.id,
+                text: r.chunk.text,
+                metadata: r.chunk.metadata,
+                score: r.score,
+            })
+            .collect();
 
-            Ok(serde_json::to_string(&response)?)
-        }
+        Ok(serde_json::to_string(&response)?)
     }
 }
 
@@ -104,7 +99,7 @@ mod tests {
             self.dimension
         }
 
-        async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
+        async fn embed(&mut self, text: &str) -> aither_core::Result<Vec<f32>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {
