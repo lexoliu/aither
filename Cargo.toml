@@ -43,8 +43,11 @@ tracing = "0.1.41"
 aither = { path = "."}
 aither-core = { path = "./core"}
 aither-derive = { path = "./derive", version = "0.1.0"}
+aither-ort = { path = "./ort" }
 zenwave = { git = "https://github.com/zen-rs/zenwave" }
+aither-skills = { path = "./skills" }
 aither-websearch = { path = "./tools/websearch" }
+aither-webfetch = { path = "./tools/webfetch" }
 aither-fs = { path = "./tools/fs" }
 aither-command = { path = "./tools/command" }
 
@@ -83,6 +86,7 @@ aither-command = { workspace = true, optional = true }
 aither-openai = { path = "./openai" }
 aither-gemini = { path = "./gemini" }
 aither-mem0 = { path = "./mem0" }
+aither-webfetch = { path = "./tools/webfetch" }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 aither-rag = { path = "./rag" }
 tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread"] }
