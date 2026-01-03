@@ -2,7 +2,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::{
     LanguageModel,
-    llm::{LLMRequest, Message, Tool, tool::Tools, try_collect},
+    llm::{LLMRequest, Message, Tool, collect_text, tool::Tools},
 };
 
 /// A struct representing an Assistant that interacts with a language model (LLM),
@@ -79,9 +79,9 @@ impl<LLM: LanguageModel> Assistant<LLM> {
     pub async fn send(&mut self, message: impl Into<String>) -> anyhow::Result<()> {
         self.messages.push(Message::user(message));
         let request = LLMRequest::new(self.messages.as_slice()).with_tools(&mut self.tools);
-        let stream = self.llm.respond(request);
+        let stream = self.llm.respond_with_tools(request);
 
-        let response = try_collect(stream).await?;
+        let response = collect_text(stream).await?;
         self.messages.push(Message::assistant(response));
         Ok(())
     }

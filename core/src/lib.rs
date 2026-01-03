@@ -24,7 +24,7 @@
 //!
 //! | Capability | Trait | Description |
 //! |------------|-------|-------------|
-//! | **Language Models** | [`LanguageModel`] / [`llm::LLMResponse`] | Streaming chat, reasoning summaries, structured output |
+//! | **Language Models** | [`LanguageModel`] | Streaming events (text, reasoning, tool calls) |
 //! | **Embeddings** | [`EmbeddingModel`] | Convert text to vectors for semantic search |
 //! | **Image Generation** | [`ImageGenerator`] | Create images with progressive quality improvement |
 //! | **Text-to-Speech** | [`AudioGenerator`] | Generate speech audio from text |
@@ -33,27 +33,28 @@
 //!
 //! ## Examples
 //!
-//! ### Streaming Responses with Reasoning
+//! ### Streaming Responses with Events
 //!
-//! ```rust
-//! use aither_core::llm::{LanguageModel, Message, Request, model::Parameters, LLMResponse};
-//! use futures_lite::{future::poll_fn, StreamExt};
-//! use core::pin::Pin;
+//! ```rust,ignore
+//! use aither_core::llm::{LanguageModel, Event, Message, LLMRequest, model::Parameters};
+//! use futures_lite::StreamExt;
 //!
-//! async fn reasoning_demo(model: impl LanguageModel) -> aither_core::Result {
-//!     let request = Request::new([
+//! async fn event_demo(model: impl LanguageModel) -> aither_core::Result {
+//!     let request = LLMRequest::new([
 //!         Message::user("Explain how rainbows form like I'm five."),
 //!     ])
 //!     .with_parameters(Parameters::default().include_reasoning(true));
 //!
-//!     let mut response = model.respond(request);
-//!     while let Some(step) = poll_fn(|cx| Pin::new(&mut response).poll_reasoning_next(cx)).await {
-//!         println!("thinking: {}", step?);
-//!     }
-//!
+//!     let mut stream = model.respond(request);
 //!     let mut answer = String::new();
-//!     while let Some(chunk) = response.next().await {
-//!         answer.push_str(&chunk?);
+//!
+//!     while let Some(event) = stream.next().await {
+//!         match event? {
+//!             Event::Text(text) => answer.push_str(&text),
+//!             Event::Reasoning(thought) => println!("thinking: {}", thought),
+//!             Event::ToolCall(call) => println!("tool requested: {}", call.name),
+//!             _ => {}
+//!         }
 //!     }
 //!     Ok(answer)
 //! }
