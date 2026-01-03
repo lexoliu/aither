@@ -40,7 +40,6 @@ clippy.multiple_crate_versions = { level = "allow", priority = 1}
 
 [workspace.dependencies]
 tracing = "0.1.41"
-aither = { path = "."}
 aither-core = { path = "./core"}
 aither-derive = { path = "./derive", version = "0.1.0"}
 aither-ort = { path = "./ort" }
