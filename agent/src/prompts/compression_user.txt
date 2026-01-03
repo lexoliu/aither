@@ -1,0 +1,19 @@
+Compress this conversation while preserving key information.
+
+MUST PRESERVE VERBATIM:
+- File paths: {file_paths}
+- Errors: {errors}
+- Commands: {commands}
+
+CONVERSATION TO COMPRESS:
+{dialogue}
+
+OUTPUT FORMAT:
+## Summary
+[2-3 sentence summary of what was accomplished]
+
+## Key Facts
+- [Bullet points of important decisions/findings]
+
+## Preserved Context
+[Any file paths, errors, commands that must be kept]

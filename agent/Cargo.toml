@@ -16,11 +16,17 @@ aither-core.workspace = true
 anyhow = "1.0.100"
 schemars = "1.1.0"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
 aither-websearch = { workspace = true, optional = true }
 aither-fs = { workspace = true, optional = true }
 aither-command = { workspace = true, optional = true }
 async-stream = "0.3.6"
 futures-core = "0.3.31"
+futures-lite = "2.6"
+regex = "1.11"
+[dev-dependencies]
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+
 [features]
 default = []
 websearch = ["dep:aither-websearch"]
