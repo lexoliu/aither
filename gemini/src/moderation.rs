@@ -2,7 +2,7 @@ use aither_core::moderation::{Moderation, ModerationCategory, ModerationResult};
 
 use crate::{
     client::call_generate,
-    config::GeminiBackend,
+    config::Gemini,
     error::GeminiError,
     types::{
         Candidate, GeminiContent, GenerateContentRequest, GenerationConfig, SafetyRating,
@@ -10,7 +10,7 @@ use crate::{
     },
 };
 
-impl Moderation for GeminiBackend {
+impl Moderation for Gemini {
     type Error = GeminiError;
 
     fn moderate(

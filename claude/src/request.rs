@@ -284,9 +284,9 @@ fn flatten_content(message: &Message) -> String {
 }
 
 /// Convert aither tool definitions to Claude format.
-pub fn convert_tools(definitions: Vec<ToolDefinition>) -> Vec<ToolPayload> {
+pub fn convert_tools(definitions: &[ToolDefinition]) -> Vec<ToolPayload> {
     definitions
-        .into_iter()
+        .iter()
         .map(|tool| ToolPayload {
             name: tool.name().to_string(),
             description: tool.description().to_string(),

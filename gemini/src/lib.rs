@@ -12,11 +12,11 @@
 //!     LanguageModel,
 //!     llm::{Message, tool::Tools, model::Parameters},
 //! };
-//! use aither_gemini::GeminiBackend;
+//! use aither_gemini::Gemini;
 //! use futures_lite::StreamExt;
 //!
 //! # async fn run() -> anyhow::Result<()> {
-//! let gemini = GeminiBackend::new(std::env::var("GEMINI_API_KEY")?);
+//! let gemini = Gemini::new(std::env::var("GEMINI_API_KEY")?);
 //! let messages = [
 //!     Message::system("You are a concise assistant."),
 //!     Message::user("Explain Tokio in two bullet points."),
@@ -43,24 +43,24 @@ mod moderation;
 mod provider;
 mod types;
 
-pub use config::{AuthMode, GEMINI_API_BASE_URL, GeminiBackend};
+pub use config::{AuthMode, GEMINI_API_BASE_URL, Gemini};
 pub use error::GeminiError;
 pub use provider::GeminiProvider;
 
 /// Create a Gemini backend configured to use the `gemini-2.5-pro` model.
 #[must_use]
-pub fn gemini_2_5_pro(key: impl Into<String>) -> GeminiBackend {
-    GeminiBackend::new(key).with_text_model("gemini-2.5-pro")
+pub fn gemini_2_5_pro(key: impl Into<String>) -> Gemini {
+    Gemini::new(key).with_text_model("gemini-2.5-pro")
 }
 
 /// Create a Gemini backend configured to use the `gemini-2.5-flash` model.
 #[must_use]
-pub fn gemini_2_5_flash(key: impl Into<String>) -> GeminiBackend {
-    GeminiBackend::new(key).with_text_model("gemini-2.5-flash")
+pub fn gemini_2_5_flash(key: impl Into<String>) -> Gemini {
+    Gemini::new(key).with_text_model("gemini-2.5-flash")
 }
 
 /// Create a Gemini backend configured to use the `gemini-2.5-flash-lite` model.
 #[must_use]
-pub fn gemini_2_5_flash_lite(key: impl Into<String>) -> GeminiBackend {
-    GeminiBackend::new(key).with_text_model("gemini-2.5-flash-lite")
+pub fn gemini_2_5_flash_lite(key: impl Into<String>) -> Gemini {
+    Gemini::new(key).with_text_model("gemini-2.5-flash-lite")
 }

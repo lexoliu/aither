@@ -1,4 +1,4 @@
-use crate::{GEMINI_API_BASE_URL, GeminiBackend, config::AuthMode, error::GeminiError};
+use crate::{GEMINI_API_BASE_URL, Gemini, config::AuthMode, error::GeminiError};
 use aither_core::llm::{
     LanguageModelProvider, model::Profile as ModelProfile, provider::Profile as ProviderProfile,
 };
@@ -40,7 +40,7 @@ impl GeminiProvider {
 }
 
 impl LanguageModelProvider for GeminiProvider {
-    type Model = GeminiBackend;
+    type Model = Gemini;
     type Error = GeminiError;
 
     fn list_models(&self) -> impl Future<Output = Result<Vec<ModelProfile>, Self::Error>> + Send {
@@ -93,7 +93,7 @@ impl LanguageModelProvider for GeminiProvider {
         let cfg = self.inner.clone();
         let name = name.to_string();
         async move {
-            let backend = GeminiBackend::new(cfg.api_key.clone())
+            let backend = Gemini::new(cfg.api_key.clone())
                 .with_base_url(cfg.base_url.clone())
                 .with_auth_mode(cfg.auth)
                 .with_text_model(name);

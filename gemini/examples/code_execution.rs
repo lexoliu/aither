@@ -8,7 +8,7 @@
 //! the native Code Execution tool, allowing Gemini to generate and run Python code.
 
 use aither_core::llm::{LanguageModel, Message, model::Parameters};
-use aither_gemini::GeminiBackend;
+use aither_gemini::Gemini;
 use std::env;
 use std::io::{self, Write}; // For StreamExt::next()
 
@@ -16,7 +16,7 @@ use std::io::{self, Write}; // For StreamExt::next()
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY environment variable not set");
 
-    let backend = GeminiBackend::new(api_key);
+    let backend = Gemini::new(api_key);
 
     println!("Welcome to the interactive Code Execution example!");
     println!("Type your computational questions, or 'quit'/'exit' to stop.");

@@ -4,12 +4,12 @@ use futures_lite::StreamExt;
 
 use crate::{
     client::call_generate,
-    config::GeminiBackend,
+    config::Gemini,
     error::GeminiError,
     types::{GeminiContent, GenerateContentRequest, GenerationConfig, ImageConfig, Part},
 };
 
-impl ImageGenerator for GeminiBackend {
+impl ImageGenerator for Gemini {
     type Error = GeminiError;
 
     fn create(

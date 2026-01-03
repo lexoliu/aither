@@ -3,9 +3,9 @@
 use aither_core::{
     AudioGenerator, AudioTranscriber, EmbeddingModel, ImageGenerator, LanguageModel,
     image::{Prompt, Size},
-    llm::{LanguageModelProvider, Message},
+    llm::{LanguageModelProvider, Message, collect_text},
 };
-use aither_gemini::{GeminiBackend, GeminiProvider};
+use aither_gemini::{Gemini, GeminiProvider};
 use futures_lite::{StreamExt, pin};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -32,14 +32,14 @@ async fn test_provider_list_models() {
 
 #[tokio::test]
 async fn test_chat_respond() {
-    let backend = GeminiBackend::new(api_key());
+    let backend = Gemini::new(api_key());
     let messages = vec![
         Message::system("You are a helpful assistant."),
         Message::user("What is 2+2? Answer with just the number."),
     ];
     let request = aither_core::llm::LLMRequest::new(messages);
-    let response = backend.respond(request);
-    let text = response.await.expect("Failed to collect response");
+    let stream = backend.respond(request);
+    let text = collect_text(stream).await.expect("Failed to collect response");
     assert!(text.contains("4"));
 }
 
@@ -51,7 +51,7 @@ struct MathResult {
 
 #[tokio::test]
 async fn test_structured_generate() {
-    let backend = GeminiBackend::new(api_key());
+    let backend = Gemini::new(api_key());
     let request = aither_core::llm::oneshot("You are a math tutor.", "What is 5 * 5?");
 
     let result: MathResult = LanguageModel::generate(&backend, request)
@@ -64,7 +64,7 @@ async fn test_structured_generate() {
 
 #[tokio::test]
 async fn test_embedding() {
-    let backend = GeminiBackend::new(api_key());
+    let mut backend = Gemini::new(api_key());
     let vec = backend.embed("Hello world").await.expect("Failed to embed");
     assert_eq!(vec.len(), backend.dim());
     assert!(!vec.is_empty());
@@ -74,7 +74,7 @@ async fn test_embedding() {
 #[ignore = "Audio generation not supported by available Gemini models/API access."]
 async fn test_audio_cycle() {
     // This test generates audio then transcribes it back
-    let backend = GeminiBackend::new(api_key());
+    let backend = Gemini::new(api_key());
 
     // 1. Generate Audio
     let text = "Hello, this is a test of the emergency broadcast system.";
@@ -108,7 +108,7 @@ async fn test_audio_cycle() {
 async fn test_image_generate() {
     // Verify image generation (might be slow or costly, maybe skip if not needed?)
     // Gemini flash image is usually cheap/free in some tiers.
-    let backend = GeminiBackend::new(api_key());
+    let backend = Gemini::new(api_key());
 
     let prompt = Prompt::new("A simple red circle on a white background");
     let size = Size::square(512);
@@ -129,7 +129,7 @@ async fn test_image_generate() {
 #[tokio::test]
 async fn test_moderation() {
     use aither_core::moderation::Moderation;
-    let backend = GeminiBackend::new(api_key());
+    let backend = Gemini::new(api_key());
     let result = backend
         .moderate("I love puppies")
         .await
@@ -140,15 +140,15 @@ async fn test_moderation() {
 #[tokio::test]
 async fn test_google_search() {
     use aither_core::llm::model::Parameters;
-    let backend = GeminiBackend::new(api_key());
+    let backend = Gemini::new(api_key());
     let messages = vec![aither_core::llm::Message::user(
         "Who won the men's Wimbledon singles title in 2023?",
     )];
     let request = aither_core::llm::LLMRequest::new(messages)
         .with_parameters(Parameters::default().websearch(true));
 
-    let response = backend.respond(request);
-    let text = response
+    let stream = backend.respond(request);
+    let text = collect_text(stream)
         .await
         .expect("Failed to collect response with Google Search");
 
@@ -163,15 +163,15 @@ async fn test_google_search() {
 #[tokio::test]
 async fn test_code_execution() {
     use aither_core::llm::model::Parameters;
-    let backend = GeminiBackend::new(api_key());
+    let backend = Gemini::new(api_key());
     let messages = vec![aither_core::llm::Message::user(
         "What is the sum of the first 50 prime numbers? Generate and run code for the calculation.",
     )];
     let request = aither_core::llm::LLMRequest::new(messages)
         .with_parameters(Parameters::default().code_execution(true));
 
-    let response = backend.respond(request);
-    let text = response
+    let stream = backend.respond(request);
+    let text = collect_text(stream)
         .await
         .expect("Failed to collect response with Code Execution");
 

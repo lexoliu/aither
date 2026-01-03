@@ -21,11 +21,11 @@ pub enum AuthMode {
 
 /// Native Gemini backend wired up to the `aither` traits.
 #[derive(Clone, Debug)]
-pub struct GeminiBackend {
+pub struct Gemini {
     inner: GeminiConfig,
 }
 
-impl GeminiBackend {
+impl Gemini {
     /// Create a backend using the default chat/embedding models.
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {

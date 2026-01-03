@@ -5,7 +5,7 @@ use std::sync::Arc;
 use aither_core::{
     LanguageModel,
     llm::{
-        LLMRequest, ReasoningStream, ResponseChunk,
+        Event, LLMRequest,
         model::{Ability, Profile as ModelProfile},
         oneshot,
     },
@@ -16,14 +16,9 @@ use tracing::debug;
 use zenwave::{Client, client, header};
 
 use crate::{
-    constant::{
-        ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, MAX_TOOL_ITERATIONS,
-    },
+    constant::{ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL},
     error::ClaudeError,
-    request::{
-        ContentBlock, ContentPayload, MessagePayload, MessagesRequest, ParameterSnapshot,
-        convert_tools, to_claude_messages,
-    },
+    request::{MessagesRequest, ParameterSnapshot, convert_tools, to_claude_messages},
     response::{StreamState, parse_event, should_skip_event},
 };
 
@@ -90,230 +85,104 @@ impl Claude {
 impl LanguageModel for Claude {
     type Error = ClaudeError;
 
-    #[allow(clippy::too_many_lines)]
-    fn respond(
-        &self,
-        request: LLMRequest,
-    ) -> impl aither_core::llm::LLMResponse<Error = Self::Error> {
-        enum State<'tools> {
-            Processing {
-                iterations: usize,
-                messages: Vec<MessagePayload>,
-                tools: Option<&'tools mut aither_core::llm::tool::Tools>,
-            },
-            Done,
-        }
-
+    fn respond(&self, request: LLMRequest) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         let cfg = self.config();
-        let (core_messages, parameters, tools) = request.into_parts();
+        let (core_messages, parameters, tool_definitions) = request.into_parts();
         let (system_prompt, claude_messages) = to_claude_messages(&core_messages);
-        let tool_defs = tools.as_ref().map(|t| t.definitions()).unwrap_or_default();
-        let claude_tools = if tool_defs.is_empty() {
+
+        let claude_tools = if tool_definitions.is_empty() {
             None
         } else {
-            Some(convert_tools(tool_defs))
+            Some(convert_tools(&tool_definitions))
         };
+
         let snapshot = ParameterSnapshot::from(&parameters);
         let max_tokens = snapshot.max_tokens.unwrap_or(cfg.default_max_tokens);
 
-        let stream = futures_lite::stream::unfold(
-            State::Processing {
-                iterations: 0,
+        async_stream::stream! {
+            // Build and send request
+            let request_body = MessagesRequest {
+                model: cfg.model.clone(),
+                max_tokens,
                 messages: claude_messages,
-                tools,
-            },
-            move |state| {
-                let cfg = cfg.clone();
-                let system_prompt = system_prompt.clone();
-                let claude_tools = claude_tools.clone();
-                let snapshot = snapshot.clone();
+                system: system_prompt,
+                stream: true,
+                temperature: snapshot.temperature,
+                top_p: snapshot.top_p,
+                top_k: snapshot.top_k,
+                stop_sequences: snapshot.stop_sequences.clone(),
+                tools: claude_tools,
+            };
 
-                async move {
-                    let (iterations, mut messages, mut tools) = match state {
-                        State::Processing {
-                            iterations,
-                            messages,
-                            tools,
-                        } => (iterations, messages, tools),
-                        State::Done => return None,
-                    };
+            debug!("Claude request: {:?}", request_body);
 
-                    let next_iteration = iterations + 1;
-                    if next_iteration > MAX_TOOL_ITERATIONS {
-                        return Some((
-                            Err(ClaudeError::Api(
-                                "exceeded Claude tool calling iteration limit".into(),
-                            )),
-                            State::Done,
-                        ));
-                    }
+            let endpoint = cfg.request_url("/v1/messages");
+            let mut backend = client();
+            let mut builder = backend.post(endpoint);
 
-                    // Build and send request
-                    let request_body = MessagesRequest {
-                        model: cfg.model.clone(),
-                        max_tokens,
-                        messages: messages.clone(),
-                        system: system_prompt.clone(),
-                        stream: true,
-                        temperature: snapshot.temperature,
-                        top_p: snapshot.top_p,
-                        top_k: snapshot.top_k,
-                        stop_sequences: snapshot.stop_sequences.clone(),
-                        tools: claude_tools.clone(),
-                    };
+            // Claude-specific headers
+            builder = builder.header("x-api-key", cfg.api_key.clone());
+            builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
+            builder = builder.header(header::CONTENT_TYPE.as_str(), "application/json");
+            builder = builder.header(header::ACCEPT.as_str(), "text/event-stream");
+            builder = builder.header(header::USER_AGENT.as_str(), "aither-claude/0.1");
 
-                    debug!("Claude request: {:?}", request_body);
-
-                    let endpoint = cfg.request_url("/v1/messages");
-                    let mut backend = client();
-                    let mut builder = backend.post(endpoint);
-
-                    // Claude-specific headers
-                    builder = builder.header("x-api-key", cfg.api_key.clone());
-                    builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
-                    builder = builder.header(header::CONTENT_TYPE.as_str(), "application/json");
-                    builder = builder.header(header::ACCEPT.as_str(), "text/event-stream");
-                    builder = builder.header(header::USER_AGENT.as_str(), "aither-claude/0.1");
-
-                    let sse_stream = match builder.json_body(&request_body).sse().await {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                            return Some((
-                                Err(ClaudeError::Api(format!("HTTP request failed: {e}"))),
-                                State::Done,
-                            ));
-                        }
-                    };
-
-                    // Collect all events and process
-                    let mut state = StreamState::new();
-                    let mut collected_text = String::new();
-                    let mut collected_reasoning = String::new();
-
-                    let events: Vec<_> = sse_stream
-                        .filter_map(|event| match event {
-                            Ok(e) if !should_skip_event(&e) => Some(Ok(e)),
-                            Ok(_) => None,
-                            Err(e) => Some(Err(e)),
-                        })
-                        .collect()
-                        .await;
-
-                    for event in events {
-                        match event {
-                            Ok(e) => {
-                                if let Err(e) = parse_event(&e, &mut state) {
-                                    return Some((Err(e), State::Done));
-                                }
-                            }
-                            Err(e) => return Some((Err(ClaudeError::from(e)), State::Done)),
-                        }
-                    }
-
-                    // Extract collected text/reasoning from stream state
-                    for block in &state.blocks {
-                        match block {
-                            crate::response::BlockState::Text(text) => {
-                                collected_text.push_str(text);
-                            }
-                            crate::response::BlockState::Thinking(thinking) => {
-                                collected_reasoning.push_str(thinking);
-                            }
-                            crate::response::BlockState::ToolUse { .. } => {
-                                // Tool use blocks don't contribute to text
-                            }
-                        }
-                    }
-
-                    debug!("Claude response state: {:?}", state);
-
-                    // Check if we need to handle tool calls
-                    if state.has_tool_calls() {
-                        // Build assistant message with tool_use blocks
-                        let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
-
-                        // Add any text content first
-                        if !collected_text.is_empty() {
-                            assistant_blocks.push(ContentBlock::Text {
-                                text: collected_text.clone(),
-                            });
-                        }
-
-                        // Add tool_use blocks
-                        for call in &state.tool_calls {
-                            assistant_blocks.push(ContentBlock::ToolUse {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                input: call.input.clone(),
-                            });
-                        }
-
-                        messages.push(MessagePayload {
-                            role: "assistant",
-                            content: ContentPayload::Blocks(assistant_blocks),
-                        });
-
-                        // Execute tools and build user message with results
-                        let mut result_blocks: Vec<ContentBlock> = Vec::new();
-
-                        for call in &state.tool_calls {
-                            let args_json = serde_json::to_string(&call.input)
-                                .unwrap_or_else(|_| "{}".to_string());
-
-                            let tool_output = if let Some(t) = &mut tools {
-                                match t.call(&call.name, &args_json).await {
-                                    Ok(output) => output,
-                                    Err(err) => {
-                                        return Some((
-                                            Err(ClaudeError::Api(err.to_string())),
-                                            State::Done,
-                                        ));
-                                    }
-                                }
-                            } else {
-                                return Some((
-                                    Err(ClaudeError::Api(
-                                        "Tool call requested but no tools available".into(),
-                                    )),
-                                    State::Done,
-                                ));
-                            };
-
-                            result_blocks.push(ContentBlock::ToolResult {
-                                tool_use_id: call.id.clone(),
-                                content: tool_output,
-                            });
-                        }
-
-                        messages.push(MessagePayload {
-                            role: "user",
-                            content: ContentPayload::Blocks(result_blocks),
-                        });
-
-                        // Continue iteration
-                        return Some((
-                            Ok(ResponseChunk::default()),
-                            State::Processing {
-                                iterations: next_iteration,
-                                messages,
-                                tools,
-                            },
-                        ));
-                    }
-
-                    // No tool calls - return the collected response
-                    let mut final_chunk = ResponseChunk::default();
-                    final_chunk.push_text(collected_text);
-                    final_chunk.push_reasoning(collected_reasoning);
-                    Some((Ok(final_chunk), State::Done))
+            let sse_stream = match builder.json_body(&request_body).sse().await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    yield Err(ClaudeError::Api(format!("HTTP request failed: {e}")));
+                    return;
                 }
-            },
-        );
+            };
 
-        ReasoningStream::new(stream)
+            // Process SSE events
+            let mut state = StreamState::new();
+
+            let events: Vec<_> = sse_stream
+                .filter_map(|event| match event {
+                    Ok(e) if !should_skip_event(&e) => Some(Ok(e)),
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                })
+                .collect()
+                .await;
+
+            for event in events {
+                match event {
+                    Ok(e) => {
+                        match parse_event(&e, &mut state) {
+                            Ok(llm_events) => {
+                                for llm_event in llm_events {
+                                    yield Ok(llm_event);
+                                }
+                            }
+                            Err(e) => {
+                                yield Err(e);
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(ClaudeError::from(e));
+                        return;
+                    }
+                }
+            }
+
+            // Yield tool call events (NOT executed - consumer handles execution)
+            for call in state.tool_calls {
+                yield Ok(Event::ToolCall(aither_core::llm::ToolCall {
+                    id: call.id,
+                    name: call.name,
+                    arguments: call.input,
+                }));
+            }
+
+            debug!("Claude response complete, stop_reason: {:?}", state.stop_reason);
+        }
     }
 
-    fn complete(&self, prefix: &str) -> impl Stream<Item = Result<String, Self::Error>> + Send {
+    fn complete(&self, prefix: &str) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         self.respond(oneshot(
             "Continue the user provided text without additional commentary.",
             prefix,

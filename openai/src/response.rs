@@ -1,47 +1,21 @@
-use aither_core::llm::ResponseChunk;
 use serde::Deserialize;
 use serde_json::Value;
 use zenwave::sse::Event;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionChunk {
-    choices: Vec<ChunkChoice>,
-}
-
-impl ChatCompletionChunk {
-    pub(crate) fn into_chunk(self) -> ResponseChunk {
-        self.into_chunk_filtered(true)
-    }
-
-    pub(crate) fn into_chunk_filtered(self, include_reasoning: bool) -> ResponseChunk {
-        let mut chunk = ResponseChunk::default();
-        for choice in self.choices {
-            if let Some(content) = choice.delta.content {
-                for text in content.into_segments() {
-                    chunk.push_text(text);
-                }
-            }
-            if include_reasoning {
-                if let Some(reasoning) = choice.delta.reasoning {
-                    for step in reasoning.into_segments() {
-                        chunk.push_reasoning(step);
-                    }
-                }
-            }
-        }
-        chunk
-    }
+    pub choices: Vec<ChunkChoice>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ChunkChoice {
-    delta: DeltaMessage,
+pub struct ChunkChoice {
+    pub delta: DeltaMessage,
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct DeltaMessage {
+pub struct DeltaMessage {
     #[serde(default)]
-    content: Option<MessageContent>,
+    pub content: Option<String>,
     #[serde(
         default,
         alias = "reasoning",
@@ -51,49 +25,22 @@ struct DeltaMessage {
         alias = "thinking_content",
         alias = "thinkingContent"
     )]
-    reasoning: Option<MessageContent>,
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<DeltaToolCall>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(untagged)]
-enum MessageContent {
-    Blocks(Vec<DeltaContent>),
-    Text(String),
-}
-
-impl MessageContent {
-    fn into_segments(self) -> Vec<String> {
-        match self {
-            Self::Blocks(parts) => parts.into_iter().map(DeltaContent::into_text).collect(),
-            Self::Text(text) => {
-                if text.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![text]
-                }
-            }
-        }
-    }
+pub struct DeltaToolCall {
+    pub index: Option<usize>,
+    pub id: Option<String>,
+    pub function: Option<DeltaToolFunction>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(untagged)]
-enum DeltaContent {
-    Text {
-        #[serde(rename = "type", default)]
-        #[allow(dead_code)]
-        _kind: Option<String>,
-        text: String,
-    },
-    Inline(String),
-}
-
-impl DeltaContent {
-    fn into_text(self) -> String {
-        match self {
-            Self::Text { text, .. } | Self::Inline(text) => text,
-        }
-    }
+pub struct DeltaToolFunction {
+    pub name: Option<String>,
+    pub arguments: Option<String>,
 }
 
 pub fn should_skip_event(event: &Event) -> bool {
@@ -150,10 +97,52 @@ impl ChatMessage {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum MessageContent {
+    Blocks(Vec<ContentPart>),
+    Text(String),
+}
+
+impl MessageContent {
+    fn into_segments(self) -> Vec<String> {
+        match self {
+            Self::Blocks(parts) => parts.into_iter().map(ContentPart::into_text).collect(),
+            Self::Text(text) => {
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![text]
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum ContentPart {
+    Text {
+        #[serde(rename = "type", default)]
+        #[allow(dead_code)]
+        _kind: Option<String>,
+        text: String,
+    },
+    Inline(String),
+}
+
+impl ContentPart {
+    fn into_text(self) -> String {
+        match self {
+            Self::Text { text, .. } | Self::Inline(text) => text,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct ChatToolCall {
     pub(crate) id: String,
     #[serde(rename = "type", default)]
-    pub(crate) kind: Option<String>,
+    _kind: Option<String>,
     pub(crate) function: ChatToolFunction,
 }
 

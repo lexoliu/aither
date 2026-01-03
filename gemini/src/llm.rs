@@ -1,19 +1,19 @@
 use aither_core::{
     Error, LanguageModel,
     llm::{
-        LLMRequest, Message, ReasoningStream, ResponseChunk, Role,
+        Event, LLMRequest, Message, Role,
         model::{Ability, Parameters, Profile, ReasoningEffort},
         tool::ToolDefinition,
     },
 };
+use futures_core::Stream;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Value};
 use tracing::debug;
 
 use crate::{
     client::call_generate,
-    config::GeminiBackend,
+    config::Gemini,
     error::GeminiError,
     types::{
         FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration, GeminiContent, GeminiTool,
@@ -23,198 +23,12 @@ use crate::{
 };
 use schemars::schema_for;
 
-const MAX_TOOL_ITERATIONS: usize = 8;
-
-impl LanguageModel for GeminiBackend {
+impl LanguageModel for Gemini {
     type Error = GeminiError;
 
-    #[allow(clippy::too_many_lines)]
-    fn respond(
-        &self,
-        request: LLMRequest,
-    ) -> impl aither_core::llm::LLMResponse<Error = Self::Error> {
-        enum State<'tools> {
-            Processing {
-                iterations: usize,
-                contents: Vec<GeminiContent>,
-                tools: Option<&'tools mut aither_core::llm::tool::Tools>,
-            },
-            Done,
-        }
-
+    fn respond(&self, request: LLMRequest) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         let cfg = self.config();
-        let (messages, parameters, tools) = request.into_parts();
-        let (system_instruction, contents) = messages_to_gemini(&messages);
-        let tool_defs = tools.as_ref().map(|t| t.definitions()).unwrap_or_default();
-        let tool_config = build_tool_config(&parameters, !tool_defs.is_empty());
-        let mut gemini_tools_payload: Vec<GeminiTool> = Vec::new();
-
-        // Add function declarations from aither-core Tools
-        if !tool_defs.is_empty() {
-            gemini_tools_payload.push(GeminiTool::FunctionTool {
-                function_declarations: convert_tool_definitions(tool_defs),
-            });
-        }
-
-        // Add native Google Search tool if enabled in parameters
-        if parameters.websearch {
-            gemini_tools_payload.push(GeminiTool::GoogleSearchTool {
-                google_search: GoogleSearch {},
-            });
-        }
-
-        // Add native Code Execution tool if enabled in parameters
-        if parameters.code_execution {
-            gemini_tools_payload.push(GeminiTool::CodeExecutionTool {
-                code_execution: crate::types::CodeExecution {},
-            });
-        }
-        let generation_config = build_generation_config(&parameters, None);
-
-        let stream = futures_lite::stream::unfold(
-            State::Processing {
-                iterations: 0,
-                contents,
-                tools,
-            },
-            move |state| {
-                let cfg = cfg.clone();
-                let system_instruction = system_instruction.clone();
-                let generation_config = generation_config.clone();
-                let gemini_tools_payload = gemini_tools_payload.clone();
-                let tool_config = tool_config.clone();
-
-                async move {
-                    let (iterations, mut contents, mut tools) = match state {
-                        State::Processing {
-                            iterations,
-                            contents,
-                            tools,
-                        } => (iterations, contents, tools),
-                        State::Done => return None,
-                    };
-
-                    let next_iteration = iterations + 1;
-                    if next_iteration > MAX_TOOL_ITERATIONS {
-                        return Some((
-                            Err(GeminiError::Api(
-                                "exceeded Gemini tool calling iteration limit".into(),
-                            )),
-                            State::Done,
-                        ));
-                    }
-
-                    let request = GenerateContentRequest {
-                        system_instruction: system_instruction.clone(),
-                        contents: contents.clone(),
-                        generation_config: generation_config.clone(),
-                        tools: gemini_tools_payload.clone(),
-                        tool_config: tool_config.clone(),
-                        safety_settings: Vec::new(),
-                    };
-
-                    debug!("Gemini request: {:?}", request);
-
-                    let response = match call_generate(&cfg, &cfg.text_model, request).await {
-                        Ok(r) => r,
-                        Err(e) => return Some((Err(e), State::Done)),
-                    };
-
-                    debug!("Gemini response: {:?}", response);
-
-                    let Some(candidate) = response.primary_candidate() else {
-                        let message = if let Some(feedback) = &response.prompt_feedback {
-                            format_prompt_feedback(feedback)
-                        } else {
-                            "Gemini response missing candidate".to_string()
-                        };
-                        return Some((Err(GeminiError::Api(message)), State::Done));
-                    };
-
-                    let Some(content) = &candidate.content else {
-                        return Some((
-                            Err(GeminiError::Api("Gemini response missing content".into())),
-                            State::Done,
-                        ));
-                    };
-
-                    if let Some(call) = content.first_function_call() {
-                        contents.push(content.clone());
-                        let args_json =
-                            serde_json::to_string(&call.args).unwrap_or_else(|_| "{}".to_string());
-                        let tool_output = if let Some(t) = &mut tools {
-                            match t.call(&call.name, &args_json).await {
-                                Ok(output) => output,
-                                Err(err) => {
-                                    return Some((
-                                        Err(GeminiError::Api(err.to_string())),
-                                        State::Done,
-                                    ));
-                                }
-                            }
-                        } else {
-                            return Some((
-                                Err(GeminiError::Api(
-                                    "Tool call requested but no tools available".into(),
-                                )),
-                                State::Done,
-                            ));
-                        };
-
-                        let response_value = match serde_json::from_str::<Value>(&tool_output) {
-                            Ok(Value::Object(map)) => Value::Object(map),
-                            Ok(other) => {
-                                let mut map = Map::new();
-                                map.insert("result".to_string(), other);
-                                Value::Object(map)
-                            }
-                            Err(_) => {
-                                let mut map = Map::new();
-                                map.insert("result".to_string(), Value::String(tool_output));
-                                Value::Object(map)
-                            }
-                        };
-                        contents.push(GeminiContent::function_response(call.name, response_value));
-
-                        return Some((
-                            Ok(ResponseChunk::default()),
-                            State::Processing {
-                                iterations: next_iteration,
-                                contents,
-                                tools,
-                            },
-                        ));
-                    }
-
-                    let mut chunk = ResponseChunk::default();
-                    for text in content.text_chunks() {
-                        chunk.push_text(text);
-                    }
-
-                    for part in &content.parts {
-                        if let Some(code) = &part.executable_code {
-                            let code_block = format!(
-                                "\n```{}\n{}\n```\n",
-                                code.language.to_lowercase(),
-                                code.code
-                            );
-                            chunk.push_text(code_block);
-                        }
-                        if let Some(result) = &part.code_execution_result {
-                            let output_block = format!("\n```output\n{}\n```\n", result.output);
-                            chunk.push_text(output_block);
-                        }
-                    }
-
-                    for reasoning in content.reasoning_chunks() {
-                        chunk.push_reasoning(reasoning);
-                    }
-                    Some((Ok(chunk), State::Done))
-                }
-            },
-        );
-
-        ReasoningStream::new(stream)
+        respond_stream(cfg.clone(), request)
     }
 
     fn generate<T: JsonSchema + DeserializeOwned + 'static>(
@@ -229,7 +43,7 @@ impl LanguageModel for GeminiBackend {
 
         let stream = self.respond(request);
         async move {
-            let text = stream.await?;
+            let text = aither_core::llm::collect_text(stream).await?;
             serde_json::from_str::<T>(&text)
                 .map_err(|err| Error::new(err).context("failed to parse structured output"))
         }
@@ -255,6 +69,139 @@ impl LanguageModel for GeminiBackend {
             profile
         }
     }
+}
+
+fn respond_stream(
+    cfg: crate::config::GeminiConfig,
+    request: LLMRequest,
+) -> impl Stream<Item = Result<Event, GeminiError>> + Send {
+    Box::pin(respond_stream_inner(cfg, request))
+}
+
+fn respond_stream_inner(
+    cfg: crate::config::GeminiConfig,
+    request: LLMRequest,
+) -> impl Stream<Item = Result<Event, GeminiError>> + Send {
+    async_stream::stream! {
+        let (messages, parameters, tool_defs) = request.into_parts();
+        let (system_instruction, contents) = messages_to_gemini(&messages);
+        let tool_config = build_tool_config(&parameters, !tool_defs.is_empty());
+        let mut gemini_tools_payload: Vec<GeminiTool> = Vec::new();
+
+        // Add function declarations from aither-core Tools
+        if !tool_defs.is_empty() {
+            gemini_tools_payload.push(GeminiTool::FunctionTool {
+                function_declarations: convert_tool_definitions(tool_defs),
+            });
+        }
+
+        // Add native Google Search tool if enabled in parameters
+        if parameters.websearch {
+            gemini_tools_payload.push(GeminiTool::GoogleSearchTool {
+                google_search: GoogleSearch {},
+            });
+        }
+
+        // Add native Code Execution tool if enabled in parameters
+        if parameters.code_execution {
+            gemini_tools_payload.push(GeminiTool::CodeExecutionTool {
+                code_execution: crate::types::CodeExecution {},
+            });
+        }
+
+        let generation_config = build_generation_config(&parameters, None);
+
+        let gemini_request = GenerateContentRequest {
+            system_instruction,
+            contents,
+            generation_config,
+            tools: gemini_tools_payload,
+            tool_config,
+            safety_settings: Vec::new(),
+        };
+
+        debug!("Gemini request: {:?}", gemini_request);
+
+        let response = match call_generate(&cfg, &cfg.text_model, gemini_request).await {
+            Ok(r) => r,
+            Err(e) => {
+                yield Err(e);
+                return;
+            }
+        };
+
+        debug!("Gemini response: {:?}", response);
+
+        let Some(candidate) = response.primary_candidate() else {
+            let message = if let Some(feedback) = &response.prompt_feedback {
+                format_prompt_feedback(feedback)
+            } else {
+                "Gemini response missing candidate".to_string()
+            };
+            yield Err(GeminiError::Api(message));
+            return;
+        };
+
+        let Some(content) = &candidate.content else {
+            yield Err(GeminiError::Api("Gemini response missing content".into()));
+            return;
+        };
+
+        // Emit reasoning events first
+        for reasoning in content.reasoning_chunks() {
+            yield Ok(Event::Reasoning(reasoning));
+        }
+
+        // Emit text events
+        for text in content.text_chunks() {
+            if !text.is_empty() {
+                yield Ok(Event::Text(text));
+            }
+        }
+
+        // Emit built-in tool results (code execution)
+        for part in &content.parts {
+            if let Some(code) = &part.executable_code {
+                let code_block = format!(
+                    "```{}\n{}\n```",
+                    code.language.to_lowercase(),
+                    code.code
+                );
+                yield Ok(Event::BuiltInToolResult {
+                    tool: "code_execution".to_string(),
+                    result: code_block,
+                });
+            }
+            if let Some(result) = &part.code_execution_result {
+                let output_block = format!("```output\n{}\n```", result.output);
+                yield Ok(Event::BuiltInToolResult {
+                    tool: "code_execution".to_string(),
+                    result: output_block,
+                });
+            }
+        }
+
+        // Emit tool call events (NOT executed - consumer handles execution)
+        if let Some(call) = content.first_function_call() {
+            // Generate a unique ID for this tool call
+            let call_id = format!("gemini_{}", uuid_v4());
+            yield Ok(Event::ToolCall(aither_core::llm::ToolCall {
+                id: call_id,
+                name: call.name.clone(),
+                arguments: call.args.clone(),
+            }));
+        }
+    }
+}
+
+/// Simple UUID v4 generator for tool call IDs.
+fn uuid_v4() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:032x}", timestamp)
 }
 
 fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<GeminiContent>) {

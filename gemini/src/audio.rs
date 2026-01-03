@@ -3,7 +3,7 @@ use futures_lite::StreamExt;
 
 use crate::{
     client::call_generate,
-    config::{GeminiBackend, GeminiConfig},
+    config::{Gemini, GeminiConfig},
     error::GeminiError,
     types::{
         GeminiContent, GenerateContentRequest, GenerationConfig, Part, PrebuiltVoiceConfig,
@@ -11,7 +11,7 @@ use crate::{
     },
 };
 
-impl AudioGenerator for GeminiBackend {
+impl AudioGenerator for Gemini {
     fn generate(&self, prompt: &str) -> impl futures_core::Stream<Item = AudioData> + Send {
         let cfg = self.config();
         let text = prompt.to_owned();
@@ -21,7 +21,7 @@ impl AudioGenerator for GeminiBackend {
     }
 }
 
-impl AudioTranscriber for GeminiBackend {
+impl AudioTranscriber for Gemini {
     fn transcribe(&self, audio: &[u8]) -> impl futures_core::Stream<Item = String> + Send {
         let cfg = self.config();
         let payload = audio.to_vec();

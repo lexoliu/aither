@@ -1,6 +1,6 @@
 //! SSE response parsing for the Claude API.
 
-use aither_core::llm::ResponseChunk;
+use aither_core::llm::Event as LLMEvent;
 use serde::Deserialize;
 use serde_json::Value;
 use zenwave::sse::Event;
@@ -192,15 +192,15 @@ impl StreamState {
     }
 }
 
-/// Parse a single SSE event into a response chunk.
+/// Parse a single SSE event into LLM events.
 ///
-/// Updates the stream state and returns a chunk with any new text/reasoning.
-pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<ResponseChunk, ClaudeError> {
+/// Updates the stream state and returns events to emit.
+pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEvent>, ClaudeError> {
     let event_name = event.event();
     let event_type = event_name.as_deref().unwrap_or("");
     let data = event.text_data();
 
-    let mut chunk = ResponseChunk::default();
+    let mut events = Vec::new();
 
     match event_type {
         "message_start" => {
@@ -215,13 +215,13 @@ pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<ResponseChu
                 ContentBlockType::Text { text } => {
                     state.blocks[ev.index] = BlockState::Text(text.clone());
                     if !text.is_empty() {
-                        chunk.push_text(text);
+                        events.push(LLMEvent::Text(text));
                     }
                 }
                 ContentBlockType::Thinking { thinking } => {
                     state.blocks[ev.index] = BlockState::Thinking(thinking.clone());
                     if !thinking.is_empty() {
-                        chunk.push_reasoning(thinking);
+                        events.push(LLMEvent::Reasoning(thinking));
                     }
                 }
                 ContentBlockType::ToolUse { id, name, .. } => {
@@ -240,14 +240,14 @@ pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<ResponseChu
                 match (&mut *block, ev.delta) {
                     (BlockState::Text(text), DeltaType::TextDelta { text: delta }) => {
                         text.push_str(&delta);
-                        chunk.push_text(delta);
+                        events.push(LLMEvent::Text(delta));
                     }
                     (
                         BlockState::Thinking(thinking),
                         DeltaType::ThinkingDelta { thinking: delta },
                     ) => {
                         thinking.push_str(&delta);
-                        chunk.push_reasoning(delta);
+                        events.push(LLMEvent::Reasoning(delta));
                     }
                     (
                         BlockState::ToolUse { input_json, .. },
@@ -313,7 +313,7 @@ pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<ResponseChu
         }
     }
 
-    Ok(chunk)
+    Ok(events)
 }
 
 /// Ensure the blocks vector has capacity for the given index.

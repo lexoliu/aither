@@ -4,31 +4,24 @@ use crate::{
     DEFAULT_MODEL, DEFAULT_MODERATION_MODEL, DEFAULT_TRANSCRIPTION_MODEL, OPENROUTER_BASE_URL,
     error::OpenAIError,
     request::{
-        ChatCompletionRequest, ChatMessagePayload, ChatToolCallPayload, ChatToolFunctionPayload,
-        ParameterSnapshot, ResponsesInputItem, ResponsesRequest, ResponsesTool,
-        convert_responses_tools, convert_tools, responses_tool_choice, to_chat_messages,
-        to_responses_input,
+        ChatCompletionRequest, ChatMessagePayload, ParameterSnapshot, ResponsesInputItem,
+        ResponsesRequest, ResponsesTool, ToolPayload, convert_responses_tools, convert_tools,
+        responses_tool_choice, to_chat_messages, to_responses_input,
     },
-    response::{ChatCompletionChunk, ChatCompletionResponse, ResponsesOutput, should_skip_event},
+    response::{ChatCompletionChunk, ResponsesOutput, should_skip_event},
 };
 use aither_core::{
     LanguageModel,
     llm::{
-        LLMRequest, LLMResponse, ReasoningStream, ResponseChunk,
+        Event, LLMRequest, ToolCall,
         model::{Ability, Profile as ModelProfile},
         oneshot,
-        tool::{ToolDefinition, Tools},
     },
 };
 use futures_core::Stream;
 use futures_lite::StreamExt;
 use std::{future::Future, pin::Pin, sync::Arc};
-use zenwave::{Client, client, error::BoxHttpError, header};
-
-const MAX_TOOL_ITERATIONS: usize = 8;
-
-type BoxedResponseStream<'a> =
-    Pin<Box<dyn Stream<Item = Result<ResponseChunk, OpenAIError>> + Send + 'a>>;
+use zenwave::{Client, client, header};
 
 /// `OpenAI` model backed by the Responses API by default, with legacy
 /// `chat.completions` support for compatibility.
@@ -179,52 +172,57 @@ impl OpenAI {
 impl LanguageModel for OpenAI {
     type Error = OpenAIError;
 
-    fn respond(&self, request: LLMRequest) -> impl LLMResponse<Error = Self::Error> {
+    fn respond(&self, request: LLMRequest) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         let cfg = self.inner.clone();
-        let (messages, parameters, tools) = request.into_parts();
+        let (messages, parameters, tool_defs) = request.into_parts();
         let mut snapshot = ParameterSnapshot::from(&parameters);
         snapshot.legacy_max_tokens = cfg.legacy_max_tokens;
 
         let payload_messages = to_chat_messages(&messages);
         let responses_input = to_responses_input(&messages);
 
-        let tool_defs = tools
-            .as_deref()
-            .map(|t| t.definitions())
-            .unwrap_or_default();
-        let tool_defs_responses = tool_defs.clone();
         let has_function_tools = !tool_defs.is_empty();
         if !has_function_tools {
             snapshot.tool_choice = None;
         }
 
-        let stream: BoxedResponseStream<'_> = match cfg.api_kind {
-            ApiKind::ChatCompletions => {
-                if has_function_tools {
-                    Box::pin(chat_completions_tool_loop(
+        async_stream::stream! {
+            match cfg.api_kind {
+                ApiKind::ChatCompletions => {
+                    let openai_tools = if tool_defs.is_empty() {
+                        None
+                    } else {
+                        Some(convert_tools(tool_defs))
+                    };
+
+                    let mut events = chat_completions_stream(
                         cfg,
                         payload_messages,
                         snapshot,
+                        openai_tools,
+                    );
+
+                    while let Some(event) = events.next().await {
+                        yield event;
+                    }
+                }
+                ApiKind::Responses => {
+                    let mut events = responses_stream(
+                        cfg,
+                        responses_input,
+                        snapshot,
                         tool_defs,
-                        tools,
-                    ))
-                } else {
-                    Box::pin(chat_completions_stream(cfg, payload_messages, snapshot))
+                    );
+
+                    while let Some(event) = events.next().await {
+                        yield event;
+                    }
                 }
             }
-            ApiKind::Responses => Box::pin(responses_tool_loop(
-                cfg,
-                responses_input,
-                snapshot,
-                tool_defs_responses,
-                tools,
-            )),
-        };
-
-        ReasoningStream::new(stream)
+        }
     }
 
-    fn complete(&self, prefix: &str) -> impl Stream<Item = Result<String, Self::Error>> + Send {
+    fn complete(&self, prefix: &str) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         self.respond(oneshot(
             "Continue the user provided text without additional commentary.",
             prefix,
@@ -256,9 +254,20 @@ fn chat_completions_stream(
     cfg: Arc<Config>,
     payload_messages: Vec<ChatMessagePayload>,
     snapshot: ParameterSnapshot,
-) -> impl Stream<Item = Result<ResponseChunk, OpenAIError>> + Send {
+    openai_tools: Option<Vec<ToolPayload>>,
+) -> impl Stream<Item = Result<Event, OpenAIError>> + Send + Unpin {
+    Box::pin(chat_completions_stream_inner(cfg, payload_messages, snapshot, openai_tools))
+}
+
+fn chat_completions_stream_inner(
+    cfg: Arc<Config>,
+    payload_messages: Vec<ChatMessagePayload>,
+    snapshot: ParameterSnapshot,
+    openai_tools: Option<Vec<ToolPayload>>,
+) -> impl Stream<Item = Result<Event, OpenAIError>> + Send {
     let include_reasoning = snapshot.include_reasoning;
-    let init_future = async move {
+
+    async_stream::stream! {
         let endpoint = cfg.request_url("/chat/completions");
         let mut backend = client();
         let mut builder = backend.post(endpoint);
@@ -273,334 +282,172 @@ fn chat_completions_stream(
             cfg.chat_model.clone(),
             payload_messages,
             &snapshot,
-            None,
+            openai_tools,
             true,
         );
 
-        builder.json_body(&request).sse().await
-    };
-
-    let events = futures_lite::stream::iter(vec![init_future])
-        .then(|fut| fut)
-        .filter_map(Result::ok)
-        .flatten();
-
-    events
-        .filter_map(|event| match &event {
-            Ok(e) if should_skip_event(e) => None,
-            Ok(e) if e.text_data() == "[DONE]" => None,
-            _ => Some(event),
-        })
-        .map(move |event| match event {
-            Ok(e) => serde_json::from_str::<ChatCompletionChunk>(e.text_data())
-                .map(|chunk| chunk.into_chunk_filtered(include_reasoning))
-                .map_err(OpenAIError::from),
-            Err(err) => Err(OpenAIError::from(err)),
-        })
-}
-
-fn chat_completions_tool_loop<'tools>(
-    cfg: Arc<Config>,
-    payload_messages: Vec<ChatMessagePayload>,
-    snapshot: ParameterSnapshot,
-    tool_defs: Vec<ToolDefinition>,
-    tools: Option<&'tools mut Tools>,
-) -> impl Stream<Item = Result<ResponseChunk, OpenAIError>> + Send + 'tools {
-    enum State<'tools> {
-        Processing {
-            iterations: usize,
-            messages: Vec<ChatMessagePayload>,
-            tools: Option<&'tools mut Tools>,
-        },
-        Done,
-    }
-
-    let openai_tools = if tool_defs.is_empty() {
-        None
-    } else {
-        Some(convert_tools(tool_defs))
-    };
-
-    futures_lite::stream::unfold(
-        State::Processing {
-            iterations: 0,
-            messages: payload_messages,
-            tools,
-        },
-        move |state| {
-            let cfg = cfg.clone();
-            let snapshot = snapshot.clone();
-            let openai_tools = openai_tools.clone();
-
-            async move {
-                let (iterations, mut messages, mut tools) = match state {
-                    State::Processing {
-                        iterations,
-                        messages,
-                        tools,
-                    } => (iterations, messages, tools),
-                    State::Done => return None,
-                };
-
-                let next_iteration = iterations + 1;
-                if next_iteration > MAX_TOOL_ITERATIONS {
-                    return Some((
-                        Err(OpenAIError::Api(
-                            "exceeded OpenAI tool calling iteration limit".into(),
-                        )),
-                        State::Done,
-                    ));
-                }
-
-                let endpoint = cfg.request_url("/chat/completions");
-                let mut backend = client();
-                let mut builder = backend.post(endpoint);
-                builder = builder.header(header::AUTHORIZATION.as_str(), cfg.request_auth());
-                builder = builder.header(header::USER_AGENT.as_str(), "aither-openai/0.1");
-                if let Some(org) = &cfg.organization {
-                    builder = builder.header("OpenAI-Organization", org.clone());
-                }
-
-                let request = ChatCompletionRequest::new(
-                    cfg.chat_model.clone(),
-                    messages.clone(),
-                    &snapshot,
-                    openai_tools.clone(),
-                    false,
-                );
-
-                let response: ChatCompletionResponse =
-                    match builder.json_body(&request).json().await {
-                        Ok(response) => response,
-                        Err(error) => {
-                            return Some((
-                                Err(OpenAIError::Http(BoxHttpError::from(Box::new(error)))),
-                                State::Done,
-                            ));
-                        }
-                    };
-
-                let Some(message) = response.into_primary() else {
-                    return Some((
-                        Err(OpenAIError::Api(
-                            "chat completion response missing message".into(),
-                        )),
-                        State::Done,
-                    ));
-                };
-
-                let (texts, reasoning, tool_calls) = message.into_parts();
-
-                if !tool_calls.is_empty() {
-                    let Some(tool_registry) = &mut tools else {
-                        return Some((
-                            Err(OpenAIError::Api(
-                                "tool call requested but no tools available".into(),
-                            )),
-                            State::Done,
-                        ));
-                    };
-
-                    let tool_payloads: Vec<ChatToolCallPayload> = tool_calls
-                        .iter()
-                        .map(|call| ChatToolCallPayload {
-                            id: call.id.clone(),
-                            kind: "function",
-                            function: ChatToolFunctionPayload {
-                                name: call.function.name.clone(),
-                                arguments: call.function.arguments.clone(),
-                            },
-                        })
-                        .collect();
-
-                    let content = texts.join("");
-                    messages.push(ChatMessagePayload::assistant_tool_calls(
-                        content,
-                        tool_payloads,
-                    ));
-
-                    for call in tool_calls {
-                        let output = match tool_registry
-                            .call(&call.function.name, &call.function.arguments)
-                            .await
-                        {
-                            Ok(output) => output,
-                            Err(err) => {
-                                return Some((Err(OpenAIError::Api(err.to_string())), State::Done));
-                            }
-                        };
-                        messages.push(ChatMessagePayload::tool_output(call.id, output));
-                    }
-
-                    return Some((
-                        Ok(ResponseChunk::default()),
-                        State::Processing {
-                            iterations: next_iteration,
-                            messages,
-                            tools,
-                        },
-                    ));
-                }
-
-                let mut chunk = ResponseChunk::default();
-                for text in texts {
-                    chunk.push_text(text);
-                }
-                if snapshot.include_reasoning {
-                    for step in reasoning {
-                        chunk.push_reasoning(step);
-                    }
-                }
-
-                Some((Ok(chunk), State::Done))
+        let sse_stream = match builder.json_body(&request).sse().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                yield Err(OpenAIError::Api(format!("HTTP request failed: {e}")));
+                return;
             }
-        },
-    )
+        };
+
+        let events: Vec<_> = sse_stream
+            .filter_map(|event| match event {
+                Ok(e) if !should_skip_event(&e) && e.text_data() != "[DONE]" => Some(Ok(e)),
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .collect()
+            .await;
+
+        for event in events {
+            match event {
+                Ok(e) => {
+                    match serde_json::from_str::<ChatCompletionChunk>(e.text_data()) {
+                        Ok(chunk) => {
+                            // Emit text events
+                            for choice in &chunk.choices {
+                                if let Some(content) = &choice.delta.content {
+                                    if !content.is_empty() {
+                                        yield Ok(Event::Text(content.clone()));
+                                    }
+                                }
+                                // Emit reasoning if enabled
+                                if include_reasoning {
+                                    if let Some(reasoning) = &choice.delta.reasoning_content {
+                                        if !reasoning.is_empty() {
+                                            yield Ok(Event::Reasoning(reasoning.clone()));
+                                        }
+                                    }
+                                }
+                                // Emit tool calls
+                                if let Some(tool_calls) = &choice.delta.tool_calls {
+                                    for call in tool_calls {
+                                        if let (Some(id), Some(function)) = (&call.id, &call.function) {
+                                            if let Some(name) = &function.name {
+                                                let args = function.arguments.as_deref().unwrap_or("{}");
+                                                let arguments = serde_json::from_str(args)
+                                                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                                                yield Ok(Event::ToolCall(ToolCall {
+                                                    id: id.clone(),
+                                                    name: name.clone(),
+                                                    arguments,
+                                                }));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            yield Err(OpenAIError::from(e));
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield Err(OpenAIError::from(e));
+                    return;
+                }
+            }
+        }
+    }
 }
 
-fn responses_tool_loop<'tools>(
+fn responses_stream(
     cfg: Arc<Config>,
     input: Vec<ResponsesInputItem>,
     snapshot: ParameterSnapshot,
-    tool_defs: Vec<ToolDefinition>,
-    tools: Option<&'tools mut Tools>,
-) -> impl Stream<Item = Result<ResponseChunk, OpenAIError>> + Send + 'tools {
-    enum State<'tools> {
-        Processing {
-            iterations: usize,
-            input: Vec<ResponsesInputItem>,
-            tools: Option<&'tools mut Tools>,
-        },
-        Done,
-    }
+    tool_defs: Vec<aither_core::llm::tool::ToolDefinition>,
+) -> impl Stream<Item = Result<Event, OpenAIError>> + Send + Unpin {
+    Box::pin(responses_stream_inner(cfg, input, snapshot, tool_defs))
+}
 
+fn responses_stream_inner(
+    cfg: Arc<Config>,
+    input: Vec<ResponsesInputItem>,
+    snapshot: ParameterSnapshot,
+    tool_defs: Vec<aither_core::llm::tool::ToolDefinition>,
+) -> impl Stream<Item = Result<Event, OpenAIError>> + Send {
+    let include_reasoning = snapshot.include_reasoning;
     let has_function_tools = !tool_defs.is_empty();
-    let mut response_tools = convert_responses_tools(tool_defs);
-    if snapshot.websearch {
-        response_tools.push(ResponsesTool::WebSearch);
-    }
-    if snapshot.code_execution {
-        response_tools.push(ResponsesTool::CodeInterpreter);
-    }
-    let response_tools = if response_tools.is_empty() {
-        None
-    } else {
-        Some(response_tools)
-    };
-    let tool_choice = if has_function_tools {
-        responses_tool_choice(&snapshot)
-    } else {
-        None
-    };
 
-    futures_lite::stream::unfold(
-        State::Processing {
-            iterations: 0,
+    async_stream::stream! {
+        let mut response_tools = convert_responses_tools(tool_defs);
+        if snapshot.websearch {
+            response_tools.push(ResponsesTool::WebSearch);
+        }
+        if snapshot.code_execution {
+            response_tools.push(ResponsesTool::CodeInterpreter);
+        }
+        let response_tools = if response_tools.is_empty() {
+            None
+        } else {
+            Some(response_tools)
+        };
+        let tool_choice = if has_function_tools {
+            responses_tool_choice(&snapshot)
+        } else {
+            None
+        };
+
+        let endpoint = cfg.request_url("/responses");
+        let mut backend = client();
+        let mut builder = backend.post(endpoint);
+        builder = builder.header(header::AUTHORIZATION.as_str(), cfg.request_auth());
+        builder = builder.header(header::USER_AGENT.as_str(), "aither-openai/0.1");
+        if let Some(org) = &cfg.organization {
+            builder = builder.header("OpenAI-Organization", org.clone());
+        }
+
+        let request = ResponsesRequest::new(
+            cfg.chat_model.clone(),
             input,
-            tools,
-        },
-        move |state| {
-            let cfg = cfg.clone();
-            let snapshot = snapshot.clone();
-            let response_tools = response_tools.clone();
-            let tool_choice = tool_choice.clone();
+            &snapshot,
+            response_tools,
+            tool_choice,
+        );
 
-            async move {
-                let (iterations, mut input, mut tools) = match state {
-                    State::Processing {
-                        iterations,
-                        input,
-                        tools,
-                    } => (iterations, input, tools),
-                    State::Done => return None,
-                };
-
-                let next_iteration = iterations + 1;
-                if next_iteration > MAX_TOOL_ITERATIONS {
-                    return Some((
-                        Err(OpenAIError::Api(
-                            "exceeded OpenAI tool calling iteration limit".into(),
-                        )),
-                        State::Done,
-                    ));
-                }
-
-                let endpoint = cfg.request_url("/responses");
-                let mut backend = client();
-                let mut builder = backend.post(endpoint);
-                builder = builder.header(header::AUTHORIZATION.as_str(), cfg.request_auth());
-                builder = builder.header(header::USER_AGENT.as_str(), "aither-openai/0.1");
-                if let Some(org) = &cfg.organization {
-                    builder = builder.header("OpenAI-Organization", org.clone());
-                }
-
-                let request = ResponsesRequest::new(
-                    cfg.chat_model.clone(),
-                    input.clone(),
-                    &snapshot,
-                    response_tools.clone(),
-                    tool_choice.clone(),
-                );
-
-                let response: ResponsesOutput = match builder.json_body(&request).json().await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        return Some((
-                            Err(OpenAIError::Http(BoxHttpError::from(Box::new(error)))),
-                            State::Done,
-                        ));
-                    }
-                };
-
-                let (texts, reasoning, tool_calls, _) = response.into_parts();
-
-                if !tool_calls.is_empty() {
-                    let Some(tool_registry) = &mut tools else {
-                        return Some((
-                            Err(OpenAIError::Api(
-                                "tool call requested but no tools available".into(),
-                            )),
-                            State::Done,
-                        ));
-                    };
-
-                    for call in tool_calls {
-                        let output = match tool_registry.call(&call.name, &call.arguments).await {
-                            Ok(output) => output,
-                            Err(err) => {
-                                return Some((Err(OpenAIError::Api(err.to_string())), State::Done));
-                            }
-                        };
-                        input.push(ResponsesInputItem::function_call_output(
-                            call.call_id,
-                            output,
-                        ));
-                    }
-
-                    return Some((
-                        Ok(ResponseChunk::default()),
-                        State::Processing {
-                            iterations: next_iteration,
-                            input,
-                            tools,
-                        },
-                    ));
-                }
-
-                let mut chunk = ResponseChunk::default();
-                for text in texts {
-                    chunk.push_text(text);
-                }
-                if snapshot.include_reasoning {
-                    for step in reasoning {
-                        chunk.push_reasoning(step);
-                    }
-                }
-
-                Some((Ok(chunk), State::Done))
+        let response: ResponsesOutput = match builder.json_body(&request).json().await {
+            Ok(response) => response,
+            Err(error) => {
+                yield Err(OpenAIError::Api(format!("HTTP request failed: {error}")));
+                return;
             }
-        },
-    )
+        };
+
+        let (texts, reasoning, tool_calls, _) = response.into_parts();
+
+        // Emit text events
+        for text in texts {
+            if !text.is_empty() {
+                yield Ok(Event::Text(text));
+            }
+        }
+
+        // Emit reasoning events
+        if include_reasoning {
+            for step in reasoning {
+                if !step.is_empty() {
+                    yield Ok(Event::Reasoning(step));
+                }
+            }
+        }
+
+        // Emit tool call events (NOT executed - consumer handles execution)
+        for call in tool_calls {
+            let arguments = serde_json::from_str(&call.arguments)
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            yield Ok(Event::ToolCall(ToolCall {
+                id: call.call_id,
+                name: call.name,
+                arguments,
+            }));
+        }
+    }
 }
 
 /// Builder for [`OpenAI`] clients.
