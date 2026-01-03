@@ -1,0 +1,22 @@
+[package]
+name = "aither-webfetch"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Web content fetching and HTML-to-Markdown conversion"
+readme = "../../README.md"
+keywords = ["web", "fetch", "markdown", "async", "scraping"]
+categories = ["web-programming"]
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+htmd = "0.1"
+readability = "0.3.0"
+url = "2.5.7"
+zenwave.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
