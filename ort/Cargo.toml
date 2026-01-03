@@ -1,0 +1,28 @@
+[package]
+name = "aither-ort"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Local ONNX Runtime embedding models for aither"
+
+[dependencies]
+aither-core.workspace = true
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "ndarray"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+ndarray = "0.16"
+thiserror = "2.0"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["macros", "rt"] }
+
+[features]
+default = ["cuda", "coreml", "download-binaries"]
+cuda = ["ort/cuda"]
+coreml = ["ort/coreml"]
+download-binaries = ["ort/download-binaries"]
+
+[lints]
+workspace = true
