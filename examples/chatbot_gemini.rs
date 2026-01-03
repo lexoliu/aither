@@ -6,7 +6,7 @@ use std::io::{self, Write};
 
 use aither::llm::LLMRequest;
 use aither_core::{LanguageModel, llm::Message};
-use aither_gemini::GeminiBackend;
+use aither_gemini::Gemini;
 use anyhow::{Context, Result};
 use futures_lite::{StreamExt, pin};
 
@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     let api_key =
         std::env::var("GEMINI_API_KEY").context("set GEMINI_API_KEY in your environment")?;
 
-    let model = GeminiBackend::new(api_key).with_text_model(MODEL);
+    let model = Gemini::new(api_key).with_text_model(MODEL);
     let mut messages = vec![Message::system(
         "You are a friendly assistant. Keep replies short unless asked otherwise.",
     )];

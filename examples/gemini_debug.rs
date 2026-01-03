@@ -8,7 +8,7 @@ use aither_core::{
     LanguageModel,
     llm::{LLMRequest, Message, Tool, model::Parameters, oneshot, tool::Tools},
 };
-use aither_gemini::GeminiBackend;
+use aither_gemini::Gemini;
 use anyhow::{Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ struct SimpleStruct {
 async fn main() -> Result<()> {
     let api_key =
         std::env::var("GEMINI_API_KEY").context("set GEMINI_API_KEY in your environment")?;
-    let gemini = GeminiBackend::new(api_key).with_text_model(MODEL);
+    let gemini = Gemini::new(api_key).with_text_model(MODEL);
 
     println!("== Structured output test ==");
     structured_output(&gemini).await?;
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn structured_output(gemini: &GeminiBackend) -> Result<()> {
+async fn structured_output(gemini: &Gemini) -> Result<()> {
     let mut params = Parameters::default();
     params.structured_outputs = true;
     params.response_format = Some(schemars::schema_for!(SimpleStruct));
@@ -85,7 +85,7 @@ impl Tool for EchoTool {
     }
 }
 
-async fn tool_call(gemini: &GeminiBackend) -> Result<()> {
+async fn tool_call(gemini: &Gemini) -> Result<()> {
     let mut tools = Tools::new();
     tools.register(EchoTool);
 

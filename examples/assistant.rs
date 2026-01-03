@@ -22,7 +22,7 @@ use aither_core::{
     LanguageModel,
     llm::{Message, model::Parameters},
 };
-use aither_gemini::GeminiBackend;
+use aither_gemini::Gemini;
 use aither_mem0::{Config as Mem0Config, InMemoryStore, Mem0, Memory, SearchResult};
 use aither_rag::{Document, Metadata, RagStore};
 use anyhow::{Context, Result, anyhow};
@@ -31,7 +31,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures_lite::{StreamExt, pin};
 use tracing_subscriber::EnvFilter;
 
-type Backend = GeminiBackend;
+type Backend = Gemini;
 type MemoryManager = Mem0<Backend, Backend, InMemoryStore>;
 type Store = RagStore<Backend>;
 
@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
     let api_key =
         std::env::var("GEMINI_API_KEY").context("set GEMINI_API_KEY in your environment")?;
 
-    let gemini = GeminiBackend::new(api_key).with_text_model(MODEL);
+    let gemini = Gemini::new(api_key).with_text_model(MODEL);
     let embedder = gemini.clone();
 
     let mem0 = Mem0::new(

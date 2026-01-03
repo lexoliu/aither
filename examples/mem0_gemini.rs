@@ -10,7 +10,7 @@
 //! - Invoke with `cargo run --example mem0_gemini`.
 
 use aither_core::llm::Message;
-use aither_gemini::GeminiBackend;
+use aither_gemini::Gemini;
 use aither_mem0::{Config, Mem0, store::InMemoryStore};
 use anyhow::{Context, Result};
 
@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     let api_key =
         std::env::var("GEMINI_API_KEY").context("set GEMINI_API_KEY in your environment")?;
 
-    let gemini = GeminiBackend::new(api_key).with_text_model(TEXT_MODEL);
+    let gemini = Gemini::new(api_key).with_text_model(TEXT_MODEL);
 
     let config = Config {
         retrieve_count: 3,
