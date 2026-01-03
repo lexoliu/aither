@@ -63,8 +63,8 @@ pub use aither_claude as claude;
 #[cfg(feature = "gemini")]
 pub use aither_gemini as gemini;
 
-#[cfg(feature = "llama")]
-pub use aither_llama as llama;
+#[cfg(feature = "ort")]
+pub use aither_ort as ort;
 
 // High-level features
 #[cfg(feature = "agent")]

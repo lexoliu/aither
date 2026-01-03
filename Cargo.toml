@@ -6,11 +6,13 @@ members = [
     "openai",
     "core",
     "gemini",
-    "llama",
+    "ort",
     "agent",
     "rag",
     "mem0",
+    "skills",
     "tools/websearch",
+    "tools/webfetch",
     "tools/fs",
     "tools/command",
 ]
@@ -62,15 +64,17 @@ url = { version = "2.5", default-features = false }
 aither-openai = { path = "./openai", optional = true }
 aither-claude = { path = "./claude", optional = true }
 aither-gemini = { path = "./gemini", optional = true }
-aither-llama = { path = "./llama", optional = true }
+aither-ort = { workspace = true, optional = true }
 
 # High-level features
 aither-agent = { path = "./agent", optional = true }
 aither-rag = { path = "./rag", optional = true }
 aither-mem0 = { path = "./mem0", optional = true }
+aither-skills = { workspace = true, optional = true }
 
 # Tools
 aither-websearch = { workspace = true, optional = true }
+aither-webfetch = { workspace = true, optional = true }
 aither-fs = { workspace = true, optional = true }
 aither-command = { workspace = true, optional = true }
 
@@ -123,26 +127,28 @@ derive = ["aither-derive"]
 openai = ["aither-openai"]
 claude = ["aither-claude"]
 gemini = ["aither-gemini"]
-llama = ["aither-llama"]
+ort = ["aither-ort"]
 
 # High-level features
 agent = ["aither-agent"]
 rag = ["aither-rag"]
 mem0 = ["aither-mem0"]
+skills = ["aither-skills"]
 
 # Tools
 websearch = ["aither-websearch"]
+webfetch = ["aither-webfetch"]
 fs = ["aither-fs"]
 command = ["aither-command"]
 
 # Convenience feature to enable all providers
-all-providers = ["openai", "claude", "gemini", "llama"]
+all-providers = ["openai", "claude", "gemini", "ort"]
 
 # Convenience feature to enable all tools
-all-tools = ["websearch", "fs", "command"]
+all-tools = ["websearch", "webfetch", "fs", "command"]
 
 # Convenience feature to enable everything
-full = ["all-providers", "all-tools", "agent", "rag", "mem0"]
+full = ["all-providers", "all-tools", "agent", "rag", "mem0", "skills"]
 
 [lints]
 workspace = true

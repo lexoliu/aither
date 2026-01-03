@@ -98,7 +98,7 @@ struct Mem0Inner<L, E, S> {
     new_facts: async_lock::RwLock<Vec<String>>, // Store new facts temporarily
     extraction_in_progress: async_lock::Mutex<()>, // If this is locked, fact extraction is in progress
     llm: L,
-    embedder: E,
+    embedder: async_lock::Mutex<E>,
     store: async_lock::RwLock<S>,
     config: Config,
 }
@@ -127,7 +127,7 @@ where
             inner: Arc::new(Mem0Inner {
                 new_facts: async_lock::RwLock::new(Vec::new()),
                 llm,
-                embedder,
+                embedder: async_lock::Mutex::new(embedder),
                 store: async_lock::RwLock::new(store),
                 config,
                 extraction_in_progress: async_lock::Mutex::new(()),
@@ -176,6 +176,8 @@ where
             let embedding = self
                 .inner
                 .embedder
+                .lock()
+                .await
                 .embed(&fact)
                 .await
                 .map_err(|e| Mem0Error::Embedding(e.into()))?;
@@ -222,6 +224,8 @@ where
                             let new_embedding = self
                                 .inner
                                 .embedder
+                                .lock()
+                                .await
                                 .embed(&content)
                                 .await
                                 .map_err(|e| Mem0Error::Llm(e.into()))?;
@@ -257,6 +261,8 @@ where
         let embedding = self
             .inner
             .embedder
+            .lock()
+            .await
             .embed(query)
             .await
             .map_err(|e| Mem0Error::Llm(e.into()))?;
