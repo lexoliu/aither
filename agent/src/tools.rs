@@ -13,6 +13,9 @@ use serde::Deserialize;
 use crate::config::{SearchStrategy, ToolSearchConfig};
 use crate::search::search_tools;
 
+#[cfg(feature = "mcp")]
+use aither_mcp::McpConnection;
+
 /// Enhanced tools registry with deferred loading support.
 ///
 /// Tools can be registered as either:
@@ -21,7 +24,6 @@ use crate::search::search_tools;
 ///
 /// When the total tool count exceeds a threshold, a search tool is
 /// automatically added to allow the LLM to discover deferred tools.
-#[derive(Debug, Default)]
 pub struct AgentTools {
     /// Always-loaded tools.
     eager: CoreTools,
@@ -34,6 +36,29 @@ pub struct AgentTools {
 
     /// Search configuration.
     config: ToolSearchConfig,
+
+    /// MCP connections (when mcp feature is enabled).
+    #[cfg(feature = "mcp")]
+    mcp: Vec<McpConnection>,
+}
+
+impl Default for AgentTools {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for AgentTools {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("AgentTools");
+        s.field("eager", &self.eager);
+        s.field("deferred", &self.deferred);
+        s.field("loaded_this_turn", &self.loaded_this_turn);
+        s.field("config", &self.config);
+        #[cfg(feature = "mcp")]
+        s.field("mcp", &self.mcp);
+        s.finish()
+    }
 }
 
 /// A deferred tool that's only loaded when searched.
@@ -46,15 +71,26 @@ impl AgentTools {
     /// Creates a new empty tools registry.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            eager: CoreTools::new(),
+            deferred: BTreeMap::new(),
+            loaded_this_turn: CoreTools::new(),
+            config: ToolSearchConfig::default(),
+            #[cfg(feature = "mcp")]
+            mcp: Vec::new(),
+        }
     }
 
     /// Creates a new tools registry with the given search config.
     #[must_use]
     pub fn with_config(config: ToolSearchConfig) -> Self {
         Self {
+            eager: CoreTools::new(),
+            deferred: BTreeMap::new(),
+            loaded_this_turn: CoreTools::new(),
             config,
-            ..Self::default()
+            #[cfg(feature = "mcp")]
+            mcp: Vec::new(),
         }
     }
 
@@ -118,11 +154,17 @@ impl AgentTools {
         self.loaded_this_turn.definitions()
     }
 
-    /// Returns all tool definitions (eager + loaded this turn).
+    /// Returns all tool definitions (eager + loaded this turn + MCP).
     #[must_use]
     pub fn active_definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = self.eager_definitions();
         defs.extend(self.loaded_definitions());
+
+        #[cfg(feature = "mcp")]
+        for conn in &self.mcp {
+            defs.extend(conn.definitions());
+        }
+
         defs
     }
 
@@ -169,7 +211,7 @@ impl AgentTools {
 
     /// Calls a tool by name with JSON arguments.
     ///
-    /// Searches both eager and loaded tools.
+    /// Searches eager, loaded, and MCP tools.
     ///
     /// # Errors
     ///
@@ -190,6 +232,37 @@ impl AgentTools {
             return self.loaded_this_turn.call(name, args).await;
         }
 
+        // Try MCP tools
+        #[cfg(feature = "mcp")]
+        for conn in &mut self.mcp {
+            if conn.has_tool(name) {
+                let args_value: serde_json::Value =
+                    serde_json::from_str(args).map_err(|e| anyhow::anyhow!("Invalid JSON: {e}"))?;
+
+                let result = conn
+                    .call(name, args_value)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MCP tool error: {e}"))?;
+
+                // Convert MCP result to string
+                let output = result
+                    .content
+                    .into_iter()
+                    .filter_map(|c| match c {
+                        aither_mcp::Content::Text(t) => Some(t.text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                return if result.is_error {
+                    Err(anyhow::anyhow!("{output}"))
+                } else {
+                    Ok(output)
+                };
+            }
+        }
+
         Err(anyhow::anyhow!("Tool '{name}' not found"))
     }
 
@@ -202,6 +275,28 @@ impl AgentTools {
     /// Returns a mutable reference to the underlying eager tools.
     pub fn eager_mut(&mut self) -> &mut CoreTools {
         &mut self.eager
+    }
+
+    /// Registers an MCP connection.
+    ///
+    /// All tools from the MCP server will be available for the agent to use.
+    #[cfg(feature = "mcp")]
+    pub fn register_mcp(&mut self, conn: McpConnection) {
+        self.mcp.push(conn);
+    }
+
+    /// Returns the number of registered MCP connections.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_count(&self) -> usize {
+        self.mcp.len()
+    }
+
+    /// Returns definitions from all MCP connections.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_definitions(&self) -> Vec<ToolDefinition> {
+        self.mcp.iter().flat_map(|c| c.definitions()).collect()
     }
 }
 

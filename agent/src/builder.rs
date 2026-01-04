@@ -14,6 +14,9 @@ use crate::{
     tools::AgentTools,
 };
 
+#[cfg(feature = "mcp")]
+use aither_mcp::McpConnection;
+
 /// Builder for constructing agents with custom configuration.
 ///
 /// # Example
@@ -137,6 +140,56 @@ where
     /// Sets the tool search configuration.
     pub fn tool_search_config(mut self, config: ToolSearchConfig) -> Self {
         self.config.tool_search = config;
+        self
+    }
+
+    /// Registers an MCP connection.
+    ///
+    /// All tools from the MCP server will be available for the agent to use.
+    /// You can call this method multiple times to register multiple MCP servers.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use aither_mcp::McpConnection;
+    ///
+    /// // Connect to an MCP server
+    /// let conn = McpConnection::spawn("npx", &["-y", "@modelcontextprotocol/server-filesystem", "/"]).await?;
+    ///
+    /// let agent = Agent::builder(llm)
+    ///     .mcp(conn)
+    ///     .build();
+    /// ```
+    ///
+    /// # Multiple Servers
+    ///
+    /// ```rust,ignore
+    /// let filesystem = McpConnection::spawn("npx", &["-y", "@modelcontextprotocol/server-filesystem", "/"]).await?;
+    /// let github = McpConnection::spawn("npx", &["-y", "@modelcontextprotocol/server-github"]).await?;
+    ///
+    /// let agent = Agent::builder(llm)
+    ///     .mcp(filesystem)
+    ///     .mcp(github)
+    ///     .build();
+    /// ```
+    ///
+    /// # Loading from Configuration
+    ///
+    /// ```rust,ignore
+    /// use aither_mcp::{McpConnection, McpServersConfig};
+    ///
+    /// let config: McpServersConfig = serde_json::from_str(&config_json)?;
+    /// let connections = McpConnection::from_configs(&config).await?;
+    ///
+    /// let mut builder = Agent::builder(llm);
+    /// for (_name, conn) in connections {
+    ///     builder = builder.mcp(conn);
+    /// }
+    /// let agent = builder.build();
+    /// ```
+    #[cfg(feature = "mcp")]
+    pub fn mcp(mut self, conn: McpConnection) -> Self {
+        self.tools.register_mcp(conn);
         self
     }
 

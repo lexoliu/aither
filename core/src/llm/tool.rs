@@ -334,6 +334,30 @@ impl ToolDefinition {
         }
     }
 
+    /// Creates a tool definition from raw parts.
+    ///
+    /// This is useful for creating definitions from external sources like MCP servers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schema value is not a valid JSON schema (must be object or bool).
+    #[must_use]
+    pub fn from_parts(
+        name: Cow<'static, str>,
+        description: Cow<'static, str>,
+        schema: Value,
+    ) -> Self {
+        let arguments: Schema = schema
+            .try_into()
+            .expect("Schema must be a JSON object or boolean");
+
+        Self {
+            name,
+            description,
+            arguments,
+        }
+    }
+
     /// Returns the tool's name.
     #[must_use]
     pub fn name(&self) -> &str {

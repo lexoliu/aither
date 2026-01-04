@@ -20,6 +20,7 @@ serde_json = "1.0"
 aither-websearch = { workspace = true, optional = true }
 aither-fs = { workspace = true, optional = true }
 aither-command = { workspace = true, optional = true }
+aither-mcp = { workspace = true, optional = true }
 async-stream = "0.3.6"
 futures-core = "0.3.31"
 futures-lite = "2.6"
@@ -32,6 +33,7 @@ default = []
 websearch = ["dep:aither-websearch"]
 filesystem = ["dep:aither-fs"]
 command = ["dep:aither-command"]
-full = ["websearch", "filesystem", "command"]
+mcp = ["dep:aither-mcp"]
+full = ["websearch", "filesystem", "command", "mcp"]
 [lints]
 workspace = true
