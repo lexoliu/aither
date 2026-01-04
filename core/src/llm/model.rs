@@ -120,10 +120,10 @@ pub struct Parameters {
     ///
     /// Generation stops when any of these strings are encountered.
     pub stop: Option<Vec<String>>,
-    /// Tool choices available to the model.
+    /// Tool choice policy for the model.
     ///
-    /// Specifies which tools the model is allowed to use.
-    pub tool_choice: Option<Vec<String>>,
+    /// Controls whether tools are allowed, required, or constrained to a specific tool.
+    pub tool_choice: ToolChoice,
 
     /// Preferred reasoning effort when supported.
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -215,6 +215,34 @@ impl Parameters {
     pub const fn code_execution(mut self, enabled: bool) -> Self {
         self.code_execution = enabled;
         self
+    }
+
+    /// Sets the tool choice policy.
+    #[must_use]
+    pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = choice;
+        self
+    }
+}
+
+/// Tool choice policy for tool calling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoice {
+    /// Let the model decide whether to call tools.
+    Auto,
+    /// Disallow tool calls.
+    None,
+    /// Require a tool call (any available tool).
+    Required,
+    /// Constrain the model to a specific tool.
+    Exact(String),
+}
+
+impl Default for ToolChoice {
+    fn default() -> Self {
+        Self::Auto
     }
 }
 

@@ -2,10 +2,11 @@ use aither_core::{
     Error, LanguageModel,
     llm::{
         Event, LLMRequest, Message, Role,
-        model::{Ability, Parameters, Profile, ReasoningEffort},
+        model::{Ability, Parameters, Profile, ReasoningEffort, ToolChoice},
         tool::ToolDefinition,
     },
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_core::Stream;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -17,7 +18,7 @@ use crate::{
     error::GeminiError,
     types::{
         FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration, GeminiContent, GeminiTool,
-        GenerateContentRequest, GenerationConfig, GoogleSearch, PromptFeedback, SafetyRating,
+        GenerateContentRequest, GenerationConfig, GoogleSearch, Part, PromptFeedback, SafetyRating,
         ThinkingConfig, ToolConfig,
     },
 };
@@ -26,7 +27,10 @@ use schemars::schema_for;
 impl LanguageModel for Gemini {
     type Error = GeminiError;
 
-    fn respond(&self, request: LLMRequest) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+    fn respond(
+        &self,
+        request: LLMRequest,
+    ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         let cfg = self.config();
         respond_stream(cfg.clone(), request)
     }
@@ -85,30 +89,39 @@ fn respond_stream_inner(
     async_stream::stream! {
         let (messages, parameters, tool_defs) = request.into_parts();
         let (system_instruction, contents) = messages_to_gemini(&messages);
-        let tool_config = build_tool_config(&parameters, !tool_defs.is_empty());
         let mut gemini_tools_payload: Vec<GeminiTool> = Vec::new();
+        let tool_defs = match &parameters.tool_choice {
+            ToolChoice::None => Vec::new(),
+            ToolChoice::Exact(name) => tool_defs
+                .into_iter()
+                .filter(|tool| tool.name() == name)
+                .collect(),
+            ToolChoice::Auto | ToolChoice::Required => tool_defs,
+        };
+        let has_function_tools = !tool_defs.is_empty();
 
         // Add function declarations from aither-core Tools
-        if !tool_defs.is_empty() {
+        if has_function_tools {
             gemini_tools_payload.push(GeminiTool::FunctionTool {
                 function_declarations: convert_tool_definitions(tool_defs),
             });
         }
 
         // Add native Google Search tool if enabled in parameters
-        if parameters.websearch {
+        if parameters.websearch && !matches!(parameters.tool_choice, ToolChoice::None | ToolChoice::Exact(_)) {
             gemini_tools_payload.push(GeminiTool::GoogleSearchTool {
                 google_search: GoogleSearch {},
             });
         }
 
         // Add native Code Execution tool if enabled in parameters
-        if parameters.code_execution {
+        if parameters.code_execution && !matches!(parameters.tool_choice, ToolChoice::None | ToolChoice::Exact(_)) {
             gemini_tools_payload.push(GeminiTool::CodeExecutionTool {
                 code_execution: crate::types::CodeExecution {},
             });
         }
 
+        let tool_config = build_tool_config(&parameters, has_function_tools);
         let generation_config = build_generation_config(&parameters, None);
 
         let gemini_request = GenerateContentRequest {
@@ -182,9 +195,8 @@ fn respond_stream_inner(
         }
 
         // Emit tool call events (NOT executed - consumer handles execution)
-        if let Some(call) = content.first_function_call() {
-            // Generate a unique ID for this tool call
-            let call_id = format!("gemini_{}", uuid_v4());
+        for (call, signature) in content.function_call_parts() {
+            let call_id = tool_call_id(signature.as_deref());
             yield Ok(Event::ToolCall(aither_core::llm::ToolCall {
                 id: call_id,
                 name: call.name.clone(),
@@ -204,19 +216,93 @@ fn uuid_v4() -> String {
     format!("{:032x}", timestamp)
 }
 
+const TOOL_SIGNATURE_SEPARATOR: &str = "|ts|";
+
+fn tool_call_id(signature: Option<&str>) -> String {
+    let base = format!("gemini_{}", uuid_v4());
+    match signature {
+        Some(value) => {
+            let encoded = URL_SAFE_NO_PAD.encode(value.as_bytes());
+            format!("{base}{TOOL_SIGNATURE_SEPARATOR}{encoded}")
+        }
+        None => base,
+    }
+}
+
+fn parse_tool_response(content: &str) -> Option<(String, serde_json::Value, Option<String>)> {
+    let content = content.trim_start();
+    if !content.starts_with('[') {
+        return None;
+    }
+    let end = content.find(']')?;
+    let header = &content[1..end];
+    let mut header_split = header.splitn(2, ':');
+    let id = header_split.next()?.trim();
+    let name = header_split.next()?.trim().to_string();
+    let output = content[end + 1..]
+        .strip_prefix(' ')
+        .unwrap_or(&content[end + 1..]);
+    let (_, signature) = parse_tool_signature(id);
+    let response_value = match serde_json::from_str::<serde_json::Value>(output) {
+        Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+        Ok(other) => {
+            let mut map = serde_json::Map::new();
+            map.insert("result".to_string(), other);
+            serde_json::Value::Object(map)
+        }
+        Err(_) => {
+            let mut map = serde_json::Map::new();
+            map.insert(
+                "result".to_string(),
+                serde_json::Value::String(output.to_string()),
+            );
+            serde_json::Value::Object(map)
+        }
+    };
+    Some((name, response_value, signature))
+}
+
+fn parse_tool_signature(id: &str) -> (String, Option<String>) {
+    if let Some((base, encoded)) = id.split_once(TOOL_SIGNATURE_SEPARATOR) {
+        if let Ok(bytes) = URL_SAFE_NO_PAD.decode(encoded) {
+            if let Ok(signature) = String::from_utf8(bytes) {
+                return (base.to_string(), Some(signature));
+            }
+        }
+    }
+    (id.to_string(), None)
+}
+
 fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<GeminiContent>) {
+    let mut system_parts = Vec::new();
     let mut contents = Vec::new();
     for message in messages {
         match message.role() {
-            Role::System => contents.push(GeminiContent::text("user", message.content())),
+            Role::System => system_parts.push(Part::text(message.content())),
             Role::User | Role::Tool => {
+                if message.role() == Role::Tool {
+                    if let Some((name, response, signature)) =
+                        parse_tool_response(message.content())
+                    {
+                        contents.push(GeminiContent::function_response_with_signature(
+                            name, response, signature,
+                        ));
+                        continue;
+                    }
+                }
                 contents.push(GeminiContent::text("user", message.content()));
             }
             Role::Assistant => contents.push(GeminiContent::text("model", message.content())),
         }
     }
 
-    (None, contents)
+    let system_instruction = if system_parts.is_empty() {
+        None
+    } else {
+        Some(GeminiContent::system(system_parts))
+    };
+
+    (system_instruction, contents)
 }
 
 fn format_prompt_feedback(feedback: &PromptFeedback) -> String {
@@ -282,17 +368,15 @@ fn build_tool_config(parameters: &Parameters, has_tools: bool) -> Option<ToolCon
     if !has_tools {
         return None;
     }
-    let allowed = parameters
-        .tool_choice
-        .clone()
-        .filter(|choices| !choices.is_empty());
+    let (mode, allowed) = match &parameters.tool_choice {
+        ToolChoice::None => return None,
+        ToolChoice::Auto => (FunctionCallingMode::Auto, None),
+        ToolChoice::Required => (FunctionCallingMode::Any, None),
+        ToolChoice::Exact(name) => (FunctionCallingMode::Auto, Some(vec![name.clone()])),
+    };
     Some(ToolConfig {
         function_calling_config: Some(FunctionCallingConfig {
-            mode: if allowed.is_some() {
-                FunctionCallingMode::Any
-            } else {
-                FunctionCallingMode::Auto
-            },
+            mode,
             allowed_function_names: allowed,
         }),
     })

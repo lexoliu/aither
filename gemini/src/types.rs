@@ -6,7 +6,11 @@ use crate::config::sanitize_model;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GenerateContentRequest {
-    #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "systemInstruction",
+        alias = "system_instruction",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) system_instruction: Option<GeminiContent>,
     pub(crate) contents: Vec<GeminiContent>,
     #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
@@ -38,6 +42,10 @@ impl GeminiContent {
         }
     }
 
+    pub(crate) fn system(parts: Vec<Part>) -> Self {
+        Self { role: None, parts }
+    }
+
     pub(crate) fn with_parts(role: impl Into<String>, parts: Vec<Part>) -> Self {
         Self {
             role: Some(role.into()),
@@ -45,29 +53,40 @@ impl GeminiContent {
         }
     }
 
-    pub(crate) fn function_response(name: impl Into<String>, response: Value) -> Self {
+    pub(crate) fn function_response_with_signature(
+        name: impl Into<String>,
+        response: Value,
+        thought_signature: Option<String>,
+    ) -> Self {
         Self {
             role: Some("user".into()),
-            parts: vec![Part::function_response(name.into(), response)],
+            parts: vec![Part::function_response_with_signature(
+                name.into(),
+                response,
+                thought_signature,
+            )],
         }
     }
 
     pub(crate) fn text_chunks(&self) -> Vec<String> {
-        self.parts
-            .iter()
-            .filter_map(|part| part.text.clone())
-            .collect()
+        self.parts.iter().filter_map(Part::text_chunk).collect()
     }
 
-    pub(crate) fn first_function_call(&self) -> Option<FunctionCall> {
+    pub(crate) fn function_call_parts(&self) -> Vec<(FunctionCall, Option<String>)> {
         self.parts
             .iter()
-            .find_map(|part| part.function_call.clone())
+            .filter_map(|part| {
+                part.function_call
+                    .clone()
+                    .map(|call| (call, part.thought_signature.clone()))
+            })
+            .collect()
     }
 
     pub(crate) fn reasoning_chunks(&self) -> Vec<String> {
         let mut chunks = Vec::new();
         for part in &self.parts {
+            part.collect_thoughts(&mut chunks);
             part.collect_reasoning(&mut chunks);
         }
         chunks
@@ -78,6 +97,10 @@ impl GeminiContent {
 pub struct Part {
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thought: Option<bool>,
+    #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+    pub(crate) thought_signature: Option<String>,
     #[serde(rename = "inlineData", skip_serializing_if = "Option::is_none")]
     pub(crate) inline_data: Option<InlineData>,
     #[serde(rename = "functionCall", skip_serializing_if = "Option::is_none")]
@@ -99,6 +122,8 @@ impl Part {
     pub(crate) fn text(text: impl Into<String>) -> Self {
         Self {
             text: Some(text.into()),
+            thought: None,
+            thought_signature: None,
             inline_data: None,
             function_call: None,
             function_response: None,
@@ -111,6 +136,8 @@ impl Part {
     pub(crate) fn inline_image(data: Vec<u8>) -> Self {
         Self {
             text: None,
+            thought: None,
+            thought_signature: None,
             inline_data: Some(InlineData::new("image/png", data)),
             function_call: None,
             function_response: None,
@@ -123,6 +150,8 @@ impl Part {
     pub(crate) fn inline_mask(data: Vec<u8>) -> Self {
         Self {
             text: None,
+            thought: None,
+            thought_signature: None,
             inline_data: Some(InlineData::new("application/octet-stream", data)),
             function_call: None,
             function_response: None,
@@ -135,6 +164,8 @@ impl Part {
     pub(crate) fn inline_audio(data: Vec<u8>) -> Self {
         Self {
             text: None,
+            thought: None,
+            thought_signature: None,
             inline_data: Some(InlineData::new("audio/wav", data)),
             function_call: None,
             function_response: None,
@@ -144,9 +175,15 @@ impl Part {
         }
     }
 
-    pub(crate) const fn function_response(name: String, response: Value) -> Self {
+    pub(crate) fn function_response_with_signature(
+        name: String,
+        response: Value,
+        thought_signature: Option<String>,
+    ) -> Self {
         Self {
             text: None,
+            thought: None,
+            thought_signature,
             inline_data: None,
             function_call: None,
             function_response: Some(FunctionResponse { name, response }),
@@ -156,10 +193,32 @@ impl Part {
         }
     }
 
+    fn text_chunk(&self) -> Option<String> {
+        if self.is_thought() {
+            None
+        } else {
+            self.text.clone()
+        }
+    }
+
+    fn collect_thoughts(&self, output: &mut Vec<String>) {
+        if self.is_thought() {
+            if let Some(text) = &self.text {
+                if !text.is_empty() {
+                    output.push(text.clone());
+                }
+            }
+        }
+    }
+
     fn collect_reasoning(&self, output: &mut Vec<String>) {
         if let Some(meta) = &self.metadata {
             collect_reasoning_values(meta, output, false);
         }
+    }
+
+    fn is_thought(&self) -> bool {
+        self.thought.unwrap_or(false)
     }
 }
 

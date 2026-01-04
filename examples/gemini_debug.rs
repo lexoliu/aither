@@ -6,7 +6,12 @@ use std::borrow::Cow;
 
 use aither_core::{
     LanguageModel,
-    llm::{LLMRequest, Message, Tool, model::Parameters, oneshot, tool::Tools},
+    llm::{
+        LLMRequest, Message, Tool,
+        model::{Parameters, ToolChoice},
+        oneshot,
+        tool::Tools,
+    },
 };
 use aither_gemini::Gemini;
 use anyhow::{Context, Result};
@@ -90,7 +95,7 @@ async fn tool_call(gemini: &Gemini) -> Result<()> {
     tools.register(EchoTool);
 
     let mut params = Parameters::default();
-    params.tool_choice = Some(vec!["echo_tool".to_string()]);
+    params.tool_choice = ToolChoice::Exact("echo_tool".into());
 
     let request = LLMRequest::new([
         Message::system("You are a tool tester."),

@@ -1,6 +1,6 @@
 use aither_core::llm::{
     Annotation, Message, Role,
-    model::{Parameters, ReasoningEffort},
+    model::{Parameters, ReasoningEffort, ToolChoice},
     tool::ToolDefinition,
 };
 use schemars::Schema;
@@ -18,7 +18,7 @@ pub struct ParameterSnapshot {
     pub(crate) stop: Option<Vec<String>>,
     pub(crate) logit_bias: Option<HashMap<String, f32>>,
     pub(crate) seed: Option<u32>,
-    pub(crate) tool_choice: Option<Vec<String>>,
+    pub(crate) tool_choice: ToolChoice,
     pub(crate) logprobs: Option<bool>,
     pub(crate) top_logprobs: Option<u8>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
@@ -104,6 +104,7 @@ impl ChatCompletionRequest {
         tools: Option<Vec<ToolPayload>>,
         stream: bool,
     ) -> Self {
+        let has_tools = tools.as_ref().map_or(false, |t| !t.is_empty());
         Self {
             model,
             messages,
@@ -124,7 +125,7 @@ impl ChatCompletionRequest {
             logprobs: params.logprobs,
             top_logprobs: params.top_logprobs,
             tools,
-            tool_choice: tool_choice(params),
+            tool_choice: tool_choice(params, has_tools),
             response_format: response_format(params),
             reasoning: reasoning(params),
         }
@@ -157,6 +158,7 @@ struct ToolFunction {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum ToolChoicePayload {
+    Mode(&'static str),
     Function {
         #[serde(rename = "type")]
         kind: &'static str,
@@ -260,13 +262,16 @@ fn schema_to_value(schema: &Schema) -> Value {
     serde_json::to_value(schema).unwrap_or_else(|_| Value::Object(Map::new()))
 }
 
-fn tool_choice(params: &ParameterSnapshot) -> Option<ToolChoicePayload> {
-    params.tool_choice.as_ref().and_then(|choices| {
-        choices.first().map(|name| ToolChoicePayload::Function {
-            kind: "function",
-            function: ToolChoiceFunction { name: name.clone() },
-        })
-    })
+fn tool_choice(params: &ParameterSnapshot, has_tools: bool) -> Option<ToolChoicePayload> {
+    if !has_tools {
+        return None;
+    }
+    match &params.tool_choice {
+        ToolChoice::Auto => None,
+        ToolChoice::None => Some(ToolChoicePayload::Mode("none")),
+        ToolChoice::Required => Some(ToolChoicePayload::Mode("required")),
+        ToolChoice::Exact(_) => None,
+    }
 }
 
 fn response_format(params: &ParameterSnapshot) -> Option<ResponseFormatPayload> {
@@ -458,6 +463,7 @@ pub enum ResponsesTool {
 #[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
 pub(crate) enum ResponsesToolChoice {
+    Mode(&'static str),
     Function {
         #[serde(rename = "type")]
         kind: &'static str,
@@ -491,13 +497,19 @@ pub fn convert_responses_tools(definitions: Vec<ToolDefinition>) -> Vec<Response
         .collect()
 }
 
-pub(crate) fn responses_tool_choice(params: &ParameterSnapshot) -> Option<ResponsesToolChoice> {
-    params.tool_choice.as_ref().and_then(|choices| {
-        choices.first().map(|name| ResponsesToolChoice::Function {
-            kind: "function",
-            function: ToolChoiceFunction { name: name.clone() },
-        })
-    })
+pub(crate) fn responses_tool_choice(
+    params: &ParameterSnapshot,
+    has_tools: bool,
+) -> Option<ResponsesToolChoice> {
+    if !has_tools {
+        return None;
+    }
+    match &params.tool_choice {
+        ToolChoice::Auto => None,
+        ToolChoice::None => Some(ResponsesToolChoice::Mode("none")),
+        ToolChoice::Required => Some(ResponsesToolChoice::Mode("required")),
+        ToolChoice::Exact(_) => None,
+    }
 }
 
 fn responses_text(params: &ParameterSnapshot) -> Option<ResponseTextConfig> {
@@ -566,7 +578,7 @@ mod tests {
             vec![ResponsesInputItem::message("user", "hi".to_string())],
             &snapshot,
             None,
-            responses_tool_choice(&snapshot),
+            responses_tool_choice(&snapshot, false),
         );
         let value = serde_json::to_value(&req).expect("serialize responses request");
         assert_eq!(value["text"]["format"]["type"], "json_object");

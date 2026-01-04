@@ -14,7 +14,7 @@ use aither_core::{
     LanguageModel,
     llm::{
         Event, LLMRequest, ToolCall,
-        model::{Ability, Profile as ModelProfile},
+        model::{Ability, Profile as ModelProfile, ToolChoice},
         oneshot,
     },
 };
@@ -172,19 +172,18 @@ impl OpenAI {
 impl LanguageModel for OpenAI {
     type Error = OpenAIError;
 
-    fn respond(&self, request: LLMRequest) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+    fn respond(
+        &self,
+        request: LLMRequest,
+    ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         let cfg = self.inner.clone();
         let (messages, parameters, tool_defs) = request.into_parts();
+        let tool_defs = filter_tool_definitions(tool_defs, &parameters.tool_choice);
         let mut snapshot = ParameterSnapshot::from(&parameters);
         snapshot.legacy_max_tokens = cfg.legacy_max_tokens;
 
         let payload_messages = to_chat_messages(&messages);
         let responses_input = to_responses_input(&messages);
-
-        let has_function_tools = !tool_defs.is_empty();
-        if !has_function_tools {
-            snapshot.tool_choice = None;
-        }
 
         async_stream::stream! {
             match cfg.api_kind {
@@ -256,7 +255,12 @@ fn chat_completions_stream(
     snapshot: ParameterSnapshot,
     openai_tools: Option<Vec<ToolPayload>>,
 ) -> impl Stream<Item = Result<Event, OpenAIError>> + Send + Unpin {
-    Box::pin(chat_completions_stream_inner(cfg, payload_messages, snapshot, openai_tools))
+    Box::pin(chat_completions_stream_inner(
+        cfg,
+        payload_messages,
+        snapshot,
+        openai_tools,
+    ))
 }
 
 fn chat_completions_stream_inner(
@@ -373,26 +377,25 @@ fn responses_stream_inner(
     tool_defs: Vec<aither_core::llm::tool::ToolDefinition>,
 ) -> impl Stream<Item = Result<Event, OpenAIError>> + Send {
     let include_reasoning = snapshot.include_reasoning;
-    let has_function_tools = !tool_defs.is_empty();
 
     async_stream::stream! {
         let mut response_tools = convert_responses_tools(tool_defs);
-        if snapshot.websearch {
-            response_tools.push(ResponsesTool::WebSearch);
-        }
-        if snapshot.code_execution {
-            response_tools.push(ResponsesTool::CodeInterpreter);
+        let allow_builtins = matches!(snapshot.tool_choice, ToolChoice::Auto | ToolChoice::Required);
+        if allow_builtins {
+            if snapshot.websearch {
+                response_tools.push(ResponsesTool::WebSearch);
+            }
+            if snapshot.code_execution {
+                response_tools.push(ResponsesTool::CodeInterpreter);
+            }
         }
         let response_tools = if response_tools.is_empty() {
             None
         } else {
             Some(response_tools)
         };
-        let tool_choice = if has_function_tools {
-            responses_tool_choice(&snapshot)
-        } else {
-            None
-        };
+        let has_tools = response_tools.is_some();
+        let tool_choice = responses_tool_choice(&snapshot, has_tools);
 
         let endpoint = cfg.request_url("/responses");
         let mut backend = client();
@@ -447,6 +450,20 @@ fn responses_stream_inner(
                 arguments,
             }));
         }
+    }
+}
+
+fn filter_tool_definitions(
+    defs: Vec<aither_core::llm::tool::ToolDefinition>,
+    choice: &ToolChoice,
+) -> Vec<aither_core::llm::tool::ToolDefinition> {
+    match choice {
+        ToolChoice::None => Vec::new(),
+        ToolChoice::Exact(name) => defs
+            .into_iter()
+            .filter(|tool| tool.name() == name)
+            .collect(),
+        ToolChoice::Auto | ToolChoice::Required => defs,
     }
 }
 
