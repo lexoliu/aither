@@ -71,7 +71,10 @@ impl Transport for HttpTransport {
         let mut builder = backend.post(&self.base_url);
 
         builder = builder.header(header::CONTENT_TYPE.as_str(), "application/json");
-        builder = builder.header(header::ACCEPT.as_str(), "application/json");
+        builder = builder.header(
+            header::ACCEPT.as_str(),
+            "application/json, text/event-stream",
+        );
         builder = builder.header(header::USER_AGENT.as_str(), "aither-mcp/0.1");
 
         if let Some(auth) = &self.auth {
@@ -101,18 +104,21 @@ impl Transport for HttpTransport {
         let mut builder = backend.post(&self.base_url);
 
         builder = builder.header(header::CONTENT_TYPE.as_str(), "application/json");
-        builder = builder.header(header::ACCEPT.as_str(), "application/json");
+        builder = builder.header(
+            header::ACCEPT.as_str(),
+            "application/json, text/event-stream",
+        );
         builder = builder.header(header::USER_AGENT.as_str(), "aither-mcp/0.1");
 
         if let Some(auth) = &self.auth {
             builder = builder.header(header::AUTHORIZATION.as_str(), auth.clone());
         }
 
-        let _: serde_json::Value = builder
+        // Notifications may return empty body, so we ignore parse errors
+        let _ = builder
             .json_body(&notif)
-            .json()
-            .await
-            .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?;
+            .json::<serde_json::Value>()
+            .await;
 
         Ok(())
     }
