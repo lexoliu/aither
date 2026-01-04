@@ -39,7 +39,9 @@ async fn test_chat_respond() {
     ];
     let request = aither_core::llm::LLMRequest::new(messages);
     let stream = backend.respond(request);
-    let text = collect_text(stream).await.expect("Failed to collect response");
+    let text = collect_text(stream)
+        .await
+        .expect("Failed to collect response");
     assert!(text.contains("4"));
 }
 

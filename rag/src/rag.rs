@@ -107,10 +107,7 @@ where
     /// 4. Saves the index (if auto-save is enabled)
     ///
     /// Returns the number of files indexed and a receiver for progress updates.
-    pub async fn index_directory<P: AsRef<Path>>(
-        &mut self,
-        dir: P,
-    ) -> Result<usize> {
+    pub async fn index_directory<P: AsRef<Path>>(&mut self, dir: P) -> Result<usize> {
         self.index_directory_with_progress(dir, |_| {}).await
     }
 

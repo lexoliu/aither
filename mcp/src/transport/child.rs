@@ -59,13 +59,15 @@ impl ChildProcessTransport {
             .stderr(Stdio::inherit())
             .spawn()?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            McpError::Transport("Failed to capture child stdin".to_string())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| McpError::Transport("Failed to capture child stdin".to_string()))?;
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            McpError::Transport("Failed to capture child stdout".to_string())
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| McpError::Transport("Failed to capture child stdout".to_string()))?;
 
         Ok(Self {
             child,
@@ -86,13 +88,15 @@ impl ChildProcessTransport {
     ///
     /// Returns an error if stdin/stdout are not available.
     pub fn from_child(mut child: Child) -> Result<Self> {
-        let stdin = child.stdin.take().ok_or_else(|| {
-            McpError::Transport("Child process stdin not available".to_string())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| McpError::Transport("Child process stdin not available".to_string()))?;
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            McpError::Transport("Child process stdout not available".to_string())
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| McpError::Transport("Child process stdout not available".to_string()))?;
 
         Ok(Self {
             child,

@@ -44,28 +44,26 @@ async fn main() -> Result<()> {
 
     println!("Indexing {}", working_dir.display());
     let indexed = rag
-        .index_directory_with_progress(working_dir.join("notes"), |progress| {
-            match progress.stage {
-                IndexStage::Scanning => println!("Scanning files..."),
-                IndexStage::Embedding | IndexStage::Indexing => {
-                    if let Some(path) = progress.current_file.as_ref() {
-                        println!(
-                            "[{}/{}] Indexing {}",
-                            progress.processed,
-                            progress.total,
-                            path.display()
-                        );
-                    }
+        .index_directory_with_progress(working_dir.join("notes"), |progress| match progress.stage {
+            IndexStage::Scanning => println!("Scanning files..."),
+            IndexStage::Embedding | IndexStage::Indexing => {
+                if let Some(path) = progress.current_file.as_ref() {
+                    println!(
+                        "[{}/{}] Indexing {}",
+                        progress.processed,
+                        progress.total,
+                        path.display()
+                    );
                 }
-                IndexStage::Saving => println!("Saving index..."),
-                IndexStage::Done => println!("Done indexing!"),
-                IndexStage::Skipped { ref reason } => {
-                    if let Some(path) = progress.current_file.as_ref() {
-                        eprintln!("Skipped {}: {}", path.display(), reason);
-                    }
-                }
-                _ => {}
             }
+            IndexStage::Saving => println!("Saving index..."),
+            IndexStage::Done => println!("Done indexing!"),
+            IndexStage::Skipped { ref reason } => {
+                if let Some(path) = progress.current_file.as_ref() {
+                    eprintln!("Skipped {}: {}", path.display(), reason);
+                }
+            }
+            _ => {}
         })
         .await?;
 

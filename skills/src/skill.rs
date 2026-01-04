@@ -118,9 +118,15 @@ When reviewing code, follow these steps:
 
         let skill = Skill::parse(content).unwrap();
         assert_eq!(skill.name, "code-review");
-        assert_eq!(skill.description, "Reviews code for security and best practices");
+        assert_eq!(
+            skill.description,
+            "Reviews code for security and best practices"
+        );
         assert_eq!(skill.triggers, vec!["review", "security audit"]);
-        assert_eq!(skill.allowed_tools, Some(vec!["Read".to_string(), "Grep".to_string()]));
+        assert_eq!(
+            skill.allowed_tools,
+            Some(vec!["Read".to_string(), "Grep".to_string()])
+        );
         assert!(skill.instructions.contains("Code Review Skill"));
         assert!(skill.instructions.contains("security vulnerabilities"));
     }

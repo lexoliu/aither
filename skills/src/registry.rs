@@ -158,7 +158,10 @@ mod tests {
         registry.register(make_skill("test", &[]));
 
         assert!(registry.contains("test"));
-        assert_eq!(registry.get("test").map(|s| &s.name), Some(&"test".to_string()));
+        assert_eq!(
+            registry.get("test").map(|s| &s.name),
+            Some(&"test".to_string())
+        );
         assert!(registry.get("nonexistent").is_none());
     }
 

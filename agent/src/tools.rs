@@ -145,7 +145,10 @@ impl AgentTools {
     /// Returns definitions of all deferred tools.
     #[must_use]
     pub fn deferred_definitions(&self) -> Vec<ToolDefinition> {
-        self.deferred.values().map(|d| d.definition.clone()).collect()
+        self.deferred
+            .values()
+            .map(|d| d.definition.clone())
+            .collect()
     }
 
     /// Returns definitions of tools loaded this turn via search.

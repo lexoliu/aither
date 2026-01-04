@@ -84,4 +84,3 @@ pub use rag::{Rag, RagBuilder};
 pub use store::RagStore;
 pub use tool::{RagToolArgs, RagToolResponse};
 pub use types::{Chunk, Document, IndexEntry, Metadata, SearchResult};
-

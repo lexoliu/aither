@@ -256,8 +256,7 @@ mod tests {
 
     impl Hook for CountingHook {
         async fn pre_tool_use(&self, _ctx: &ToolUseContext<'_>) -> HookAction {
-            self.count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             HookAction::Continue
         }
     }

@@ -6,7 +6,7 @@ use tracing::debug;
 use crate::protocol::{
     CallToolParams, CallToolResult, InitializeParams, InitializeResult, JsonRpcError,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListToolsResult, McpError, McpToolDefinition,
-    ServerCapabilities, ServerInfo, TextContent, ToolsCapability, PROTOCOL_VERSION,
+    PROTOCOL_VERSION, ServerCapabilities, ServerInfo, TextContent, ToolsCapability,
 };
 use crate::transport::{BidirectionalTransport, StdioTransport};
 
@@ -168,10 +168,7 @@ impl<T: BidirectionalTransport> McpServer<T> {
         let _params: InitializeParams = match req.params.map(serde_json::from_value).transpose() {
             Ok(p) => p.unwrap_or_default(),
             Err(e) => {
-                return JsonRpcResponse::error(
-                    req.id,
-                    JsonRpcError::invalid_params(e.to_string()),
-                );
+                return JsonRpcResponse::error(req.id, JsonRpcError::invalid_params(e.to_string()));
             }
         };
 
@@ -222,10 +219,7 @@ impl<T: BidirectionalTransport> McpServer<T> {
                 );
             }
             Err(e) => {
-                return JsonRpcResponse::error(
-                    req.id,
-                    JsonRpcError::invalid_params(e.to_string()),
-                );
+                return JsonRpcResponse::error(req.id, JsonRpcError::invalid_params(e.to_string()));
             }
         };
 

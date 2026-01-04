@@ -64,7 +64,9 @@ pub use config::{AgentConfig, SearchStrategy, ToolSearchConfig};
 pub use context::{ConversationMemory, MemoryCheckpoint};
 pub use error::AgentError;
 pub use event::AgentEvent;
-pub use hook::{HCons, Hook, HookAction, StopContext, StopReason, ToolResultContext, ToolUseContext};
+pub use hook::{
+    HCons, Hook, HookAction, StopContext, StopReason, ToolResultContext, ToolUseContext,
+};
 pub use stream::AgentStream;
 pub use tools::AgentTools;
 

@@ -79,9 +79,7 @@ impl PoolingStrategy {
             }
             Self::Cls => {
                 // First token (index 0)
-                (0..hidden_dim)
-                    .map(|d| hidden_states[[0, 0, d]])
-                    .collect()
+                (0..hidden_dim).map(|d| hidden_states[[0, 0, d]]).collect()
             }
         }
     }

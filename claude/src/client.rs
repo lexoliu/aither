@@ -85,7 +85,10 @@ impl Claude {
 impl LanguageModel for Claude {
     type Error = ClaudeError;
 
-    fn respond(&self, request: LLMRequest) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+    fn respond(
+        &self,
+        request: LLMRequest,
+    ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         let cfg = self.config();
         let (core_messages, parameters, tool_definitions) = request.into_parts();
         let (system_prompt, claude_messages) = to_claude_messages(&core_messages);

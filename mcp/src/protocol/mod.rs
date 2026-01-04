@@ -10,7 +10,6 @@ pub use message::{
 };
 pub use types::{
     CallToolParams, CallToolResult, ClientCapabilities, Content, ImageContent, InitializeParams,
-    InitializeResult, ListToolsResult, McpToolDefinition, PromptMessage, Resource,
-    ResourceContents, ServerCapabilities, ServerInfo, TextContent, ToolsCapability,
-    PROTOCOL_VERSION,
+    InitializeResult, ListToolsResult, McpToolDefinition, PROTOCOL_VERSION, PromptMessage,
+    Resource, ResourceContents, ServerCapabilities, ServerInfo, TextContent, ToolsCapability,
 };

@@ -127,7 +127,11 @@ impl<T: Transport> McpClient<T> {
         let result: CallToolResult =
             serde_json::from_value(response.into_result().map_err(McpError::JsonRpc)?)?;
 
-        debug!("Tool {} returned {} content items", name, result.content.len());
+        debug!(
+            "Tool {} returned {} content items",
+            name,
+            result.content.len()
+        );
         Ok(result)
     }
 

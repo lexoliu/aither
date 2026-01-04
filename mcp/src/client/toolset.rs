@@ -93,17 +93,23 @@ pub enum McpConnection {
 impl std::fmt::Debug for McpConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Process { server_name, tools, .. } => f
+            Self::Process {
+                server_name, tools, ..
+            } => f
                 .debug_struct("McpConnection::Process")
                 .field("server_name", server_name)
                 .field("tool_count", &tools.len())
                 .finish(),
-            Self::Http { server_name, tools, .. } => f
+            Self::Http {
+                server_name, tools, ..
+            } => f
                 .debug_struct("McpConnection::Http")
                 .field("server_name", server_name)
                 .field("tool_count", &tools.len())
                 .finish(),
-            Self::Stdio { server_name, tools, .. } => f
+            Self::Stdio {
+                server_name, tools, ..
+            } => f
                 .debug_struct("McpConnection::Stdio")
                 .field("server_name", server_name)
                 .field("tool_count", &tools.len())
@@ -277,9 +283,9 @@ impl McpConnection {
     #[must_use]
     pub fn mcp_definitions(&self) -> &[McpToolDefinition] {
         match self {
-            Self::Process { tools, .. }
-            | Self::Http { tools, .. }
-            | Self::Stdio { tools, .. } => tools,
+            Self::Process { tools, .. } | Self::Http { tools, .. } | Self::Stdio { tools, .. } => {
+                tools
+            }
         }
     }
 

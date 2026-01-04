@@ -140,11 +140,7 @@ impl SkillLoader {
     }
 
     /// Load all files from a directory into the skill's resources.
-    fn load_dir_contents(
-        dir: &Path,
-        prefix: &str,
-        skill: &mut Skill,
-    ) -> Result<(), SkillError> {
+    fn load_dir_contents(dir: &Path, prefix: &str, skill: &mut Skill) -> Result<(), SkillError> {
         let entries = fs::read_dir(dir).map_err(|source| SkillError::ReadFile {
             path: dir.to_path_buf(),
             source,
@@ -257,6 +253,9 @@ Content.
         let loader = SkillLoader::new().add_path(dir.path());
         let skill = loader.load("with-resources").unwrap();
 
-        assert_eq!(skill.resources.get("templates/review.md"), Some(&"# Review Template".to_string()));
+        assert_eq!(
+            skill.resources.get("templates/review.md"),
+            Some(&"# Review Template".to_string())
+        );
     }
 }

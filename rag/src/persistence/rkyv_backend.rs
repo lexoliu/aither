@@ -38,7 +38,12 @@ impl From<&IndexEntry> for EntryData {
             chunk_source_id: entry.chunk.source_id.clone(),
             chunk_index: entry.chunk.index as u32,
             chunk_content_hash: entry.chunk.content_hash,
-            chunk_metadata: entry.chunk.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            chunk_metadata: entry
+                .chunk
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             embedding: entry.embedding.clone(),
         }
     }
@@ -102,8 +107,8 @@ impl Persistence for RkyvPersistence {
             entries: entries.iter().map(EntryData::from).collect(),
         };
 
-        let bytes = to_bytes::<RkyvError>(&wrapper)
-            .map_err(|e| RagError::Serialization(e.to_string()))?;
+        let bytes =
+            to_bytes::<RkyvError>(&wrapper).map_err(|e| RagError::Serialization(e.to_string()))?;
 
         fs::write(&self.path, &bytes).map_err(|e| RagError::Persistence {
             path: self.path.clone(),

@@ -45,11 +45,8 @@ fn bm25_search(query: &str, tools: &[ToolDefinition], top_k: usize) -> Vec<usize
     const B: f64 = 0.75;
 
     // Calculate average document length
-    let avg_doc_len: f64 = tools
-        .iter()
-        .map(|t| doc_length(t) as f64)
-        .sum::<f64>()
-        / tools.len() as f64;
+    let avg_doc_len: f64 =
+        tools.iter().map(|t| doc_length(t) as f64).sum::<f64>() / tools.len() as f64;
 
     // Score each tool
     let mut scores: Vec<(usize, f64)> = tools
@@ -122,7 +119,11 @@ fn regex_search(query: &str, tools: &[ToolDefinition], top_k: usize) -> Vec<usiz
     // Sort by match count descending
     matches.sort_by(|a, b| b.1.cmp(&a.1));
 
-    matches.into_iter().take(top_k).map(|(idx, _)| idx).collect()
+    matches
+        .into_iter()
+        .take(top_k)
+        .map(|(idx, _)| idx)
+        .collect()
 }
 
 /// Simple literal substring search (fallback).
@@ -145,7 +146,11 @@ fn literal_search(query: &str, tools: &[ToolDefinition], top_k: usize) -> Vec<us
 
     matches.sort_by(|a, b| b.1.cmp(&a.1));
 
-    matches.into_iter().take(top_k).map(|(idx, _)| idx).collect()
+    matches
+        .into_iter()
+        .take(top_k)
+        .map(|(idx, _)| idx)
+        .collect()
 }
 
 /// Tokenize text into lowercase words.

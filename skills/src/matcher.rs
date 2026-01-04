@@ -55,7 +55,11 @@ impl SkillMatcher {
             .collect();
 
         // Sort by confidence descending
-        matches.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        matches.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         matches
     }
@@ -193,15 +197,19 @@ mod tests {
 
         // High threshold - short trigger won't match long prompt
         let matcher = SkillMatcher::new().with_threshold(0.9);
-        let matches =
-            matcher.match_prompt("this is a very long prompt that mentions test somewhere", &skills);
+        let matches = matcher.match_prompt(
+            "this is a very long prompt that mentions test somewhere",
+            &skills,
+        );
 
         assert!(matches.is_empty());
 
         // Low threshold - will match
         let matcher = SkillMatcher::new().with_threshold(0.3);
-        let matches =
-            matcher.match_prompt("this is a very long prompt that mentions test somewhere", &skills);
+        let matches = matcher.match_prompt(
+            "this is a very long prompt that mentions test somewhere",
+            &skills,
+        );
 
         assert_eq!(matches.len(), 1);
     }

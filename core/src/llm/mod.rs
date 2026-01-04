@@ -100,9 +100,9 @@ use alloc::{
 };
 use anyhow::{Context, anyhow};
 use core::{any::TypeId, future::Future};
+pub use event::{Event, ToolCall};
 use futures_core::Stream;
 use futures_lite::{StreamExt, pin};
-pub use event::{Event, ToolCall};
 pub use message::{Annotation, Message, Role, UrlAnnotation};
 pub use provider::LanguageModelProvider;
 pub use researcher::{
@@ -260,7 +260,8 @@ pub trait LanguageModel: Sized + Send + Sync {
     /// - `Event::Reasoning` - Internal reasoning (for reasoning models)
     /// - `Event::ToolCall` - Requests to execute tools (NOT auto-executed)
     /// - `Event::BuiltInToolResult` - Results from provider's built-in tools
-    fn respond(&self, request: LLMRequest) -> impl Stream<Item = Result<Event, Self::Error>> + Send;
+    fn respond(&self, request: LLMRequest)
+    -> impl Stream<Item = Result<Event, Self::Error>> + Send;
 
     /// Generates a streaming response with a mutable tool registry.
     ///
@@ -378,7 +379,10 @@ macro_rules! impl_language_model {
 impl<T: LanguageModel> LanguageModel for &T {
     type Error = T::Error;
 
-    fn respond(&self, request: LLMRequest) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+    fn respond(
+        &self,
+        request: LLMRequest,
+    ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         T::respond(self, request)
     }
 

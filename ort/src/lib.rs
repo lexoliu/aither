@@ -151,16 +151,21 @@ impl EmbeddingModel for OrtEmbedding {
         let seq_len = input_ids.len();
 
         // Create tensors [batch=1, seq_len]
-        let input_ids_tensor = ort::value::Tensor::from_array(([1, seq_len], input_ids.into_boxed_slice()))
-            .map_err(OrtError::from)?;
-        let attention_mask_tensor = ort::value::Tensor::from_array(([1, seq_len], attention_mask.into_boxed_slice()))
-            .map_err(OrtError::from)?;
+        let input_ids_tensor =
+            ort::value::Tensor::from_array(([1, seq_len], input_ids.into_boxed_slice()))
+                .map_err(OrtError::from)?;
+        let attention_mask_tensor =
+            ort::value::Tensor::from_array(([1, seq_len], attention_mask.into_boxed_slice()))
+                .map_err(OrtError::from)?;
 
         // Run inference
-        let outputs = self.session.run(ort::inputs![
-            "input_ids" => input_ids_tensor,
-            "attention_mask" => attention_mask_tensor,
-        ]).map_err(OrtError::from)?;
+        let outputs = self
+            .session
+            .run(ort::inputs![
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+            ])
+            .map_err(OrtError::from)?;
 
         // Extract hidden states - try common output names
         let hidden_states = outputs
@@ -169,7 +174,9 @@ impl EmbeddingModel for OrtEmbedding {
             .or_else(|| outputs.get("output"))
             .ok_or_else(|| OrtError::InvalidOutputShape(0))?;
 
-        let view = hidden_states.try_extract_array::<f32>().map_err(OrtError::from)?;
+        let view = hidden_states
+            .try_extract_array::<f32>()
+            .map_err(OrtError::from)?;
 
         // Ensure 3D shape [batch, seq_len, hidden_dim]
         let shape = view.shape();
@@ -182,11 +189,7 @@ impl EmbeddingModel for OrtEmbedding {
             .map_err(|e: ndarray::ShapeError| OrtError::Shape(e.to_string()))?;
 
         // Apply pooling
-        let attention_mask_u32: Vec<u32> = encoding
-            .get_attention_mask()
-            .iter()
-            .copied()
-            .collect();
+        let attention_mask_u32: Vec<u32> = encoding.get_attention_mask().iter().copied().collect();
         let mut embedding = self.pooling.apply(&view_3d, &attention_mask_u32);
 
         // Normalize if enabled
@@ -285,7 +288,9 @@ impl OrtEmbeddingBuilder {
 
 impl Default for OrtEmbedding {
     fn default() -> Self {
-        panic!("OrtEmbedding requires a model path; use OrtEmbedding::from_directory() or OrtEmbedding::builder()")
+        panic!(
+            "OrtEmbedding requires a model path; use OrtEmbedding::from_directory() or OrtEmbedding::builder()"
+        )
     }
 }
 

@@ -141,4 +141,3 @@ pub enum McpError {
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 }
-
