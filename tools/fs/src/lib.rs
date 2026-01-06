@@ -47,12 +47,17 @@ pub trait FileSystem: Send + Sync + 'static {
     fn remove_dir<'a>(&'a self, dir: &'a Path) -> impl Future<Output = io::Result<()>> + Send + 'a;
 }
 
+/// Filesystem operation. Set "operation" to one of: read, write, append, list.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum FsOperation {
+    /// Read a file's content.
     Read { path: String },
-    Write { path: String, contents: String },
-    Append { path: String, contents: String },
+    /// Write content to a file (creates or overwrites).
+    Write { path: String, content: String },
+    /// Append content to a file.
+    Append { path: String, content: String },
+    /// List directory contents.
     List { path: Option<String> },
 }
 
@@ -148,18 +153,18 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                 .read_file(Path::new(&path))
                 .await
                 .map_err(anyhow::Error::new)?,
-            FsOperation::Write { path, contents } => {
+            FsOperation::Write { path, content } => {
                 self.ensure_writable()?;
                 self.filesystem
-                    .write_file(Path::new(&path), contents)
+                    .write_file(Path::new(&path), content)
                     .await
                     .map_err(anyhow::Error::new)?;
                 format!("Wrote {path}")
             }
-            FsOperation::Append { path, contents } => {
+            FsOperation::Append { path, content } => {
                 self.ensure_writable()?;
                 self.filesystem
-                    .append_file(Path::new(&path), contents)
+                    .append_file(Path::new(&path), content)
                     .await
                     .map_err(anyhow::Error::new)?;
                 format!("Appended {path}")

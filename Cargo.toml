@@ -16,6 +16,7 @@ members = [
     "tools/fs",
     "tools/command",
     "mcp",
+    "cli",
 ]
 
 [workspace.package]
@@ -51,6 +52,8 @@ aither-webfetch = { path = "./tools/webfetch" }
 aither-fs = { path = "./tools/fs" }
 aither-command = { path = "./tools/command" }
 aither-mcp = { path = "./mcp" }
+aither-agent = { path = "./agent" }
+aither-gemini = { path = "./gemini" }
 
 [dependencies]
 aither-core.workspace = true

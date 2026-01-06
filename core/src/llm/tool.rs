@@ -249,6 +249,9 @@ fn is_object<T: JsonSchema>() -> bool {
 
     matches!(value.get("type").and_then(Value::as_str), Some("object"))
         || value.get("properties").is_some()
+        || value.get("oneOf").is_some()
+        || value.get("anyOf").is_some()
+        || value.get("$defs").is_some()
 }
 
 impl<T: Tool + 'static> ToolImpl for T {
@@ -388,24 +391,84 @@ struct ToolArgument<T> {
 }
 
 fn clean_schema(value: &mut Value) {
+    // First pass: extract $defs for reference resolution
+    let defs = extract_defs(value);
+
+    // Second pass: resolve refs and clean
+    resolve_and_clean(value, &defs);
+}
+
+/// Extracts `$defs` or `definitions` from the root schema.
+fn extract_defs(value: &Value) -> serde_json::Map<String, Value> {
+    if let Value::Object(map) = value {
+        if let Some(Value::Object(defs)) = map.get("$defs").or_else(|| map.get("definitions")) {
+            return defs.clone();
+        }
+    }
+    serde_json::Map::new()
+}
+
+/// Resolves `$ref` and cleans the schema recursively.
+fn resolve_and_clean(value: &mut Value, defs: &serde_json::Map<String, Value>) {
     match value {
         Value::Object(map) => {
+            // Handle $ref - inline the referenced definition
+            if let Some(Value::String(ref_path)) = map.get("$ref").cloned() {
+                if let Some(resolved) = resolve_ref(&ref_path, defs) {
+                    *value = resolved;
+                    // Recursively clean the inlined value
+                    resolve_and_clean(value, defs);
+                    return;
+                }
+            }
+
+            // Remove schema metadata
             map.remove("$schema");
             map.remove("$id");
             map.remove("title");
             map.remove("definitions");
+            map.remove("$defs");
+            map.remove("$ref");
 
+            // Handle "type" arrays like ["string", "null"] - Gemini doesn't support this
+            if let Some(Value::Array(types)) = map.get("type") {
+                // Filter out "null" and take the first non-null type
+                let non_null: Vec<&Value> = types
+                    .iter()
+                    .filter(|t| !matches!(t, Value::String(s) if s == "null"))
+                    .collect();
+                if non_null.len() == 1 {
+                    map.insert("type".to_string(), non_null[0].clone());
+                }
+            }
+
+            // Convert "const" to "enum" with single value - Gemini doesn't support const
+            if let Some(const_val) = map.remove("const") {
+                map.insert("enum".to_string(), Value::Array(alloc::vec![const_val]));
+            }
+
+            // Recursively clean all values
             for v in map.values_mut() {
-                clean_schema(v);
+                resolve_and_clean(v, defs);
             }
         }
         Value::Array(arr) => {
             for v in arr {
-                clean_schema(v);
+                resolve_and_clean(v, defs);
             }
         }
         _ => {}
     }
+}
+
+/// Resolves a `$ref` path like `#/$defs/FsOperation` to its definition.
+fn resolve_ref(ref_path: &str, defs: &serde_json::Map<String, Value>) -> Option<Value> {
+    // Handle common patterns: #/$defs/Name or #/definitions/Name
+    let name = ref_path
+        .strip_prefix("#/$defs/")
+        .or_else(|| ref_path.strip_prefix("#/definitions/"))?;
+
+    defs.get(name).cloned()
 }
 
 impl Default for Tools {

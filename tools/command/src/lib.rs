@@ -8,9 +8,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CommandArgs {
+    /// Executable name only (e.g., "ls", "cat"). No arguments here.
     pub program: String,
+    /// Arguments array (e.g., ["-l", "-a"] for "ls -la").
     #[serde(default)]
     pub args: Vec<String>,
+    /// Working directory (optional).
     pub cwd: Option<PathBuf>,
 }
 
