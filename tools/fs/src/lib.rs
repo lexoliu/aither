@@ -47,7 +47,7 @@ pub trait FileSystem: Send + Sync + 'static {
     fn remove_dir<'a>(&'a self, dir: &'a Path) -> impl Future<Output = io::Result<()>> + Send + 'a;
 }
 
-/// Filesystem operation. Set "operation" to one of: read, write, append, list.
+/// Filesystem operation. Set "operation" to one of: read, write, append, delete, list.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum FsOperation {
@@ -57,6 +57,8 @@ pub enum FsOperation {
     Write { path: String, content: String },
     /// Append content to a file.
     Append { path: String, content: String },
+    /// Delete a file.
+    Delete { path: String },
     /// List directory contents.
     List { path: Option<String> },
 }
@@ -155,19 +157,29 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                 .map_err(anyhow::Error::new)?,
             FsOperation::Write { path, content } => {
                 self.ensure_writable()?;
+                let bytes = content.len();
                 self.filesystem
                     .write_file(Path::new(&path), content)
                     .await
                     .map_err(anyhow::Error::new)?;
-                format!("Wrote {path}")
+                format!("Successfully wrote {bytes} bytes to {path}")
             }
             FsOperation::Append { path, content } => {
                 self.ensure_writable()?;
+                let bytes = content.len();
                 self.filesystem
                     .append_file(Path::new(&path), content)
                     .await
                     .map_err(anyhow::Error::new)?;
-                format!("Appended {path}")
+                format!("Successfully appended {bytes} bytes to {path}")
+            }
+            FsOperation::Delete { path } => {
+                self.ensure_writable()?;
+                self.filesystem
+                    .remove_file(Path::new(&path))
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                format!("Deleted {path}")
             }
             FsOperation::List { path } => {
                 let listing = self

@@ -95,7 +95,7 @@ async fn run_repl(gemini: Gemini, args: &Args) -> Result<()> {
 
     // Add filesystem tool
     if !args.no_fs {
-        builder = builder.tool(aither_agent::filesystem::FileSystemTool::read_only("."));
+        builder = builder.tool(aither_agent::filesystem::FileSystemTool::new("."));
     }
 
     // Add command tool
