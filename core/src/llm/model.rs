@@ -521,10 +521,55 @@ pub enum Ability {
     Vision,
     /// The model can process and understand audio.
     Audio,
+    /// The model can process and understand video.
+    Video,
     /// The model can perform web searches natively.
     WebSearch,
     /// The model can directly read and reason over PDF or document attachments.
     Pdf,
+    /// The model can execute code.
+    CodeExecution,
+    /// The model supports extended thinking/reasoning.
+    Reasoning,
+    /// The model can generate images.
+    ImageGeneration,
+}
+
+/// Model performance/cost tier classification.
+///
+/// Used to categorize models by their general performance characteristics
+/// and typical cost levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ModelTier {
+    /// Flagship models - highest capability, highest cost (e.g., GPT-4, Claude Opus)
+    Flagship,
+    /// Balanced models - good capability/cost ratio (e.g., GPT-4o, Claude Sonnet)
+    Balanced,
+    /// Fast models - optimized for speed and cost (e.g., GPT-4o-mini, Claude Haiku)
+    Fast,
+}
+
+/// Static metadata about a known model.
+///
+/// This struct contains pre-defined information about popular models,
+/// used as fallback when provider APIs don't expose model metadata.
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    /// Canonical model ID (e.g., "gpt-4o", "claude-3-5-sonnet")
+    pub id: &'static str,
+    /// Human-readable name (e.g., "GPT-4o", "Claude 3.5 Sonnet")
+    pub name: &'static str,
+    /// Provider name (e.g., "openai", "anthropic", "google")
+    pub provider: &'static str,
+    /// Context window size in tokens
+    pub context_window: u32,
+    /// Maximum output tokens (if known)
+    pub max_output_tokens: Option<u32>,
+    /// Model tier classification
+    pub tier: ModelTier,
+    /// Model capabilities
+    pub abilities: &'static [Ability],
 }
 
 #[cfg(test)]

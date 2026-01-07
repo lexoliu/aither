@@ -25,6 +25,16 @@ use crate::{
     tools::AgentTools,
 };
 
+/// Result of a compaction operation.
+#[derive(Debug, Clone)]
+pub struct CompactResult {
+    /// Number of messages that were compacted.
+    pub messages_compacted: usize,
+    /// Number of messages remaining (preserved).
+    pub messages_remaining: usize,
+    /// The generated summary.
+    pub summary: String,
+}
 
 /// An autonomous agent that processes tasks using a language model.
 ///
@@ -170,6 +180,47 @@ where
         self.memory.clear();
     }
 
+    /// Compacts the conversation by summarizing all messages and starting fresh.
+    ///
+    /// This generates a summary of the entire conversation, clears history,
+    /// and starts a new session with only the summary as context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if summary generation fails.
+    pub async fn compact(&mut self) -> Result<Option<CompactResult>, AgentError> {
+        self.ensure_initialized().await;
+
+        let messages = self.memory.all();
+        if messages.is_empty() {
+            return Ok(None);
+        }
+
+        // Get compression config or use defaults
+        let config = match &self.config.context {
+            ContextStrategy::Smart(config) => config.clone(),
+            ContextStrategy::Unlimited => crate::compression::SmartCompressionConfig::default(),
+        };
+
+        let preserved = config.extract_preserved(&messages);
+        let messages_compacted = messages.len();
+
+        let summary = config
+            .generate_summary(&self.llm, &messages, &preserved)
+            .await
+            .map_err(|e| AgentError::Llm(e.to_string()))?;
+
+        // Clear everything and start fresh with just the summary
+        self.memory.clear();
+        self.memory.push_summary(Message::system(summary.clone()));
+
+        Ok(Some(CompactResult {
+            messages_compacted,
+            messages_remaining: 0,
+            summary,
+        }))
+    }
+
     /// Returns the current conversation history.
     #[must_use]
     pub fn history(&self) -> Vec<Message> {
@@ -250,6 +301,9 @@ where
                     Ok(Event::BuiltInToolResult { tool, result }) => {
                         // Built-in tool results are treated as text
                         text_chunks.push(format!("[{tool}] {result}"));
+                    }
+                    Ok(Event::Usage(_usage)) => {
+                        // TODO: Track usage for budget management
                     }
                     Err(e) => {
                         let error_msg = e.to_string();
@@ -391,10 +445,6 @@ where
 
         match &self.config.context {
             ContextStrategy::Unlimited => Ok(()),
-            ContextStrategy::SlidingWindow { max_messages } => {
-                self.memory.drain_oldest(*max_messages);
-                Ok(())
-            }
             ContextStrategy::Smart(config) => {
                 if usage >= config.trigger_threshold {
                     let preserved = config.extract_preserved(&self.memory.all());

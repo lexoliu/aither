@@ -54,15 +54,34 @@ impl LanguageModel for Gemini {
     }
 
     fn profile(&self) -> impl core::future::Future<Output = Profile> + Send {
-        let cfg = self.config();
+        let cfg = self.config().clone();
         async move {
-            let display = cfg.text_model.trim_start_matches("models/").to_string();
+            let model_name = cfg.text_model.trim_start_matches("models/").to_string();
+
+            // Fetch actual context window from API, fallback to models database
+            let context_length = match crate::client::get_model_info(&cfg, &cfg.text_model).await {
+                Ok(info) => info.input_token_limit,
+                Err(e) => {
+                    tracing::debug!("API did not return context_length: {e}");
+                    // Fallback to models database
+                    aither_models::lookup(&model_name)
+                        .map(|info| info.context_window)
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                "Model '{}' not found in database, using default 1M",
+                                model_name
+                            );
+                            1_000_000
+                        })
+                }
+            };
+
             let mut profile = Profile::new(
-                display.clone(),
+                model_name.clone(),
                 "google",
-                display,
+                model_name,
                 "Gemini Developer API model",
-                1_000_000,
+                context_length,
             )
             .with_abilities([Ability::ToolUse, Ability::Vision, Ability::Audio]);
             for ability in &cfg.native_abilities {

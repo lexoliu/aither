@@ -39,6 +39,7 @@ mod context;
 mod error;
 mod event;
 mod hook;
+mod model_group;
 mod search;
 mod stream;
 mod todo;
@@ -56,7 +57,7 @@ pub use aither_fs as filesystem;
 pub use aither_websearch as websearch;
 
 // Public API
-pub use agent::Agent;
+pub use agent::{Agent, CompactResult};
 pub use builder::AgentBuilder;
 pub use compression::{
     CompressionLevel, ContextStrategy, PreserveConfig, PreservedContent, SmartCompressionConfig,
@@ -72,6 +73,9 @@ pub use hook::{
 pub use stream::AgentStream;
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoTool, TodoWriteArgs};
 pub use tools::AgentTools;
+
+// Model groups for budget tracking and fallback
+pub use model_group::{Budget, BudgetedModel, ModelGroup, ModelGroupError, ModelTier, TieredModels};
 
 // Re-export core tool trait for convenience
 pub use aither_core::llm::Tool;

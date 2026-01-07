@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
         println!("Provider: {}", cloud.provider());
         println!("Model: {model}");
         if args.prompt.is_none() {
-            println!("Commands: /quit, /clear, /history");
+            println!("Commands: /quit, /clear, /history, /compact");
         }
         println!();
     }
@@ -277,9 +277,26 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
                     print_history(&agent);
                     continue;
                 }
+                "/compact" => {
+                    match agent.compact().await {
+                        Ok(Some(result)) => {
+                            println!(
+                                "\x1b[2mCompacted {} messages into summary, starting fresh session\x1b[22m",
+                                result.messages_compacted
+                            );
+                        }
+                        Ok(None) => {
+                            println!("Nothing to compact (no conversation history).");
+                        }
+                        Err(e) => {
+                            println!("\x1b[31mCompaction failed: {e}\x1b[0m");
+                        }
+                    }
+                    continue;
+                }
                 cmd => {
                     println!("Unknown command: {cmd}");
-                    println!("Available: /quit, /clear, /history");
+                    println!("Available: /quit, /clear, /history, /compact");
                     continue;
                 }
             }

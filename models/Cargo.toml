@@ -1,0 +1,17 @@
+[package]
+name = "aither-models"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "Model registry with capabilities, context windows, and metadata for popular LLMs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/phaedrus-ai/aither"
+keywords = ["llm", "ai", "models", "registry"]
+categories = ["data-structures"]
+
+[dependencies]
+aither-core.workspace = true
+
+[build-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"

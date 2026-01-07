@@ -100,7 +100,7 @@ use alloc::{
 };
 use anyhow::{Context, anyhow};
 use core::{any::TypeId, future::Future};
-pub use event::{Event, ToolCall};
+pub use event::{Event, ToolCall, Usage};
 use futures_core::Stream;
 use futures_lite::{StreamExt, pin};
 pub use message::{Message, Role};

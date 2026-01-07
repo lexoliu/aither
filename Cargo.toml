@@ -11,6 +11,7 @@ members = [
     "rag",
     "mem0",
     "skills",
+    "models",
     "tools/websearch",
     "tools/webfetch",
     "tools/fs",
@@ -56,6 +57,7 @@ aither-agent = { path = "./agent" }
 aither-openai = { path = "./openai" }
 aither-claude = { path = "./claude" }
 aither-gemini = { path = "./gemini" }
+aither-models = { path = "./models" }
 
 [dependencies]
 aither-core.workspace = true

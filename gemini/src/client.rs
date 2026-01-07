@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use zenwave::{Client, client, error::BoxHttpError, header};
 
 use crate::{
@@ -9,12 +9,32 @@ use crate::{
     },
 };
 
+/// Response from GET /models/{model} endpoint.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    /// Model name (e.g., "models/gemini-2.0-flash")
+    #[allow(dead_code)]
+    pub name: String,
+    /// Maximum input tokens the model can accept.
+    pub input_token_limit: u32,
+    /// Maximum output tokens the model can generate.
+    #[allow(dead_code)]
+    pub output_token_limit: u32,
+}
+
 pub async fn call_generate(
     cfg: &GeminiConfig,
     model: &str,
     request: GenerateContentRequest,
 ) -> Result<GenerateContentResponse, GeminiError> {
     post_json(cfg, cfg.model_endpoint(model, "generateContent"), &request).await
+}
+
+/// Fetch model info including context window size.
+pub async fn get_model_info(cfg: &GeminiConfig, model: &str) -> Result<ModelInfo, GeminiError> {
+    let model = crate::config::sanitize_model(model);
+    get_json(cfg, cfg.endpoint(&model)).await
 }
 
 pub async fn embed_content(
@@ -27,6 +47,20 @@ pub async fn embed_content(
         &request,
     )
     .await
+}
+
+#[allow(clippy::future_not_send)]
+async fn get_json<T: for<'de> serde::Deserialize<'de>>(
+    cfg: &GeminiConfig,
+    endpoint: String,
+) -> Result<T, GeminiError> {
+    let mut backend = client();
+    let mut builder = backend.get(endpoint);
+    builder = builder.header(header::USER_AGENT.as_str(), USER_AGENT);
+    if cfg.auth == AuthMode::Header {
+        builder = builder.header("x-goog-api-key", cfg.api_key.clone());
+    }
+    builder.json().await.map_err(|e| GeminiError::Http(BoxHttpError::from(Box::new(e))))
 }
 
 #[allow(clippy::future_not_send)]

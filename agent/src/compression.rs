@@ -9,22 +9,16 @@ use crate::context::ConversationMemory;
 /// Strategy for managing conversation context.
 #[derive(Debug, Clone)]
 pub enum ContextStrategy {
-    /// No compression - keep all messages.
+    /// No compression - keep all messages until context is full, then stop.
     Unlimited,
 
-    /// Simple sliding window - keep only the most recent N messages.
-    SlidingWindow {
-        /// Maximum number of messages to retain.
-        max_messages: usize,
-    },
-
-    /// Smart compression with selective preservation.
+    /// Smart compression with selective preservation (default).
     Smart(SmartCompressionConfig),
 }
 
 impl Default for ContextStrategy {
     fn default() -> Self {
-        Self::SlidingWindow { max_messages: 32 }
+        Self::Smart(SmartCompressionConfig::default())
     }
 }
 

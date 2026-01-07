@@ -1,8 +1,7 @@
-Execute shell commands with program and arguments separated.
+Execute shell commands. The `args` field MUST be a JSON array like ["arg1"], not a string like "[\"arg1\"]".
 
-<examples>
-- List files: `{"program": "ls", "args": ["-la"]}`
-- Search text: `{"program": "grep", "args": ["-r", "TODO", "src/"]}`
-- Show file: `{"program": "cat", "args": ["README.md"]}`
-- Check git: `{"program": "git", "args": ["status"]}`
-</examples>
+Examples:
+- `{"program": "ls", "args": ["-la"]}`
+- `{"program": "grep", "args": ["-r", "TODO", "src/"]}`
+- `{"program": "git", "args": ["status"]}`
+- `{"program": "pwd", "args": []}`

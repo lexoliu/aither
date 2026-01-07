@@ -10,6 +10,7 @@
 //! - [`Event::Reasoning`] - Internal reasoning/thinking (for reasoning models)
 //! - [`Event::ToolCall`] - Request to execute a tool (NOT auto-executed)
 //! - [`Event::BuiltInToolResult`] - Result from provider's built-in tool (e.g., Google Search)
+//! - [`Event::Usage`] - Token usage and cost information
 //!
 //! # Design
 //!
@@ -22,6 +23,92 @@
 
 use alloc::string::{String, ToString};
 use serde_json::Value;
+
+/// Token usage information from a model response.
+///
+/// Providers should emit this at the end of each response stream.
+/// Token counts and costs are optional since not all providers report them.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Usage {
+    /// Number of tokens in the prompt/input.
+    pub prompt_tokens: Option<u32>,
+    /// Number of tokens in the completion/output.
+    pub completion_tokens: Option<u32>,
+    /// Total tokens (prompt + completion).
+    pub total_tokens: Option<u32>,
+    /// Tokens used for reasoning/thinking (for reasoning models).
+    pub reasoning_tokens: Option<u32>,
+    /// Tokens read from cache (for providers with prompt caching).
+    pub cache_read_tokens: Option<u32>,
+    /// Tokens written to cache.
+    pub cache_write_tokens: Option<u32>,
+    /// Estimated cost in USD for this request.
+    pub cost_usd: Option<f64>,
+}
+
+impl Usage {
+    /// Creates a new usage with basic token counts.
+    #[must_use]
+    pub const fn new(prompt_tokens: u32, completion_tokens: u32) -> Self {
+        Self {
+            prompt_tokens: Some(prompt_tokens),
+            completion_tokens: Some(completion_tokens),
+            total_tokens: Some(prompt_tokens + completion_tokens),
+            reasoning_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: None,
+        }
+    }
+
+    /// Adds reasoning token count.
+    #[must_use]
+    pub const fn with_reasoning_tokens(mut self, tokens: u32) -> Self {
+        self.reasoning_tokens = Some(tokens);
+        self
+    }
+
+    /// Adds cache token counts.
+    #[must_use]
+    pub const fn with_cache_tokens(mut self, read: u32, write: u32) -> Self {
+        self.cache_read_tokens = Some(read);
+        self.cache_write_tokens = Some(write);
+        self
+    }
+
+    /// Adds estimated cost.
+    #[must_use]
+    pub const fn with_cost(mut self, cost_usd: f64) -> Self {
+        self.cost_usd = Some(cost_usd);
+        self
+    }
+
+    /// Accumulates usage from another instance.
+    pub fn accumulate(&mut self, other: &Self) {
+        if let Some(v) = other.prompt_tokens {
+            *self.prompt_tokens.get_or_insert(0) += v;
+        }
+        if let Some(v) = other.completion_tokens {
+            *self.completion_tokens.get_or_insert(0) += v;
+        }
+        if let Some(v) = other.total_tokens {
+            *self.total_tokens.get_or_insert(0) += v;
+        }
+        if let Some(v) = other.reasoning_tokens {
+            *self.reasoning_tokens.get_or_insert(0) += v;
+        }
+        if let Some(v) = other.cache_read_tokens {
+            *self.cache_read_tokens.get_or_insert(0) += v;
+        }
+        if let Some(v) = other.cache_write_tokens {
+            *self.cache_write_tokens.get_or_insert(0) += v;
+        }
+        if let Some(v) = other.cost_usd {
+            *self.cost_usd.get_or_insert(0.0) += v;
+        }
+    }
+}
 
 /// Events emitted by a language model during response generation.
 ///
@@ -45,6 +132,9 @@ use serde_json::Value;
 ///         }
 ///         Event::BuiltInToolResult { tool, result } => {
 ///             println!("[{}] {}", tool, result);
+///         }
+///         Event::Usage(usage) => {
+///             println!("Tokens used: {:?}", usage.total_tokens);
 ///         }
 ///     }
 /// }
@@ -87,6 +177,12 @@ pub enum Event {
         /// Result from the tool execution.
         result: String,
     },
+
+    /// Token usage and cost information.
+    ///
+    /// Emitted at the end of a response stream with usage statistics.
+    /// Use this to track token consumption and costs across requests.
+    Usage(Usage),
 }
 
 impl Event {
@@ -119,6 +215,12 @@ impl Event {
             tool: tool.into(),
             result: result.into(),
         }
+    }
+
+    /// Creates a usage event.
+    #[must_use]
+    pub const fn usage(usage: Usage) -> Self {
+        Self::Usage(usage)
     }
 
     /// Returns the text content if this is a Text event.
@@ -158,6 +260,21 @@ impl Event {
     #[must_use]
     pub const fn is_tool_call(&self) -> bool {
         matches!(self, Self::ToolCall(_))
+    }
+
+    /// Returns the usage info if this is a Usage event.
+    #[must_use]
+    pub const fn as_usage(&self) -> Option<&Usage> {
+        match self {
+            Self::Usage(u) => Some(u),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this is a usage event.
+    #[must_use]
+    pub const fn is_usage(&self) -> bool {
+        matches!(self, Self::Usage(_))
     }
 }
 

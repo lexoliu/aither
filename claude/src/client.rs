@@ -195,12 +195,31 @@ impl LanguageModel for Claude {
     fn profile(&self) -> impl core::future::Future<Output = ModelProfile> + Send {
         let cfg = self.inner.clone();
         async move {
+            // Try to fetch context window from proxy API (e.g., OpenRouter)
+            // Native Anthropic API doesn't expose this
+            let context_length = match fetch_model_context_length(&cfg).await {
+                Ok(len) => len,
+                Err(e) => {
+                    tracing::debug!("API did not return context_length: {e}");
+                    // Fallback to models database
+                    aither_models::lookup(&cfg.model)
+                        .map(|info| info.context_window)
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                "Model '{}' not found in database, using default 200k",
+                                cfg.model
+                            );
+                            200_000
+                        })
+                }
+            };
+
             let mut profile = ModelProfile::new(
                 cfg.model.clone(),
                 "Anthropic",
                 cfg.model.clone(),
                 "Claude model by Anthropic",
-                200_000, // Claude supports 200K context
+                context_length,
             )
             .with_abilities([Ability::ToolUse, Ability::Vision]);
 
@@ -212,6 +231,52 @@ impl LanguageModel for Claude {
             profile
         }
     }
+}
+
+/// Try to fetch context length from the models endpoint.
+async fn fetch_model_context_length(cfg: &Config) -> Result<u32, ClaudeError> {
+    #[derive(serde::Deserialize)]
+    struct ModelsResponse {
+        data: Vec<ModelInfo>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ModelInfo {
+        id: String,
+        /// Anthropic uses max_tokens, OpenRouter uses context_length
+        #[serde(default, alias = "max_tokens")]
+        context_length: Option<u32>,
+    }
+
+    let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+    let mut backend = client();
+    let mut req = backend.get(&url);
+
+    // Anthropic uses x-api-key header, proxies use Bearer token
+    if cfg.base_url.contains("anthropic.com") {
+        req = req
+            .header("x-api-key", cfg.api_key.clone())
+            .header("anthropic-version", ANTHROPIC_VERSION);
+    } else {
+        req = req.header(header::AUTHORIZATION.as_str(), format!("Bearer {}", cfg.api_key));
+    }
+
+    let response: ModelsResponse = req
+        .json()
+        .await
+        .map_err(|e| ClaudeError::Api(e.to_string()))?;
+
+    for model in response.data {
+        if model.id == cfg.model {
+            if let Some(ctx) = model.context_length {
+                return Ok(ctx);
+            }
+        }
+    }
+
+    Err(ClaudeError::Api(format!(
+        "Model '{}' not found or missing context_length",
+        cfg.model
+    )))
 }
 
 /// Builder for Claude clients.

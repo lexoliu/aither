@@ -180,26 +180,18 @@ impl<LLM: Clone> TaskTool<LLM> {
     }
 
     fn build_description(types: &[(&str, &str)]) -> String {
+        const TEMPLATE: &str = include_str!("../prompts/task.md");
+
         if types.is_empty() {
-            return "Launch a specialized subagent to handle complex tasks.\n\n\
-                No subagent types registered."
-                .to_string();
+            return TEMPLATE.replace("{{types}}", "No subagent types registered.");
         }
 
-        let mut desc = String::from(
-            "Launch a specialized subagent to handle complex tasks autonomously.\n\n\
-            Available subagent types:\n",
-        );
-
+        let mut types_list = String::new();
         for (name, type_desc) in types {
-            desc.push_str(&format!("- {name}: {type_desc}\n"));
+            types_list.push_str(&format!("- {name}: {type_desc}\n"));
         }
 
-        desc.push_str(
-            "\nThe subagent will work independently using its specialized tools \
-            and return a final result.",
-        );
-        desc
+        TEMPLATE.replace("{{types}}", &types_list)
     }
 }
 

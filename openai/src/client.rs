@@ -233,12 +233,30 @@ impl LanguageModel for OpenAI {
     fn profile(&self) -> impl Future<Output = ModelProfile> + Send {
         let cfg = self.inner.clone();
         async move {
+            // Try to fetch context window from API, fallback to models database
+            let context_length = match fetch_model_context_length(&cfg).await {
+                Ok(len) => len,
+                Err(e) => {
+                    tracing::debug!("API did not return context_length: {e}");
+                    // Fallback to models database
+                    aither_models::lookup(&cfg.chat_model)
+                        .map(|info| info.context_window)
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                "Model '{}' not found in database, using default 128k",
+                                cfg.chat_model
+                            );
+                            128_000
+                        })
+                }
+            };
+
             let mut profile = ModelProfile::new(
                 cfg.chat_model.clone(),
                 "OpenAI",
                 cfg.chat_model.clone(),
                 "OpenAI GPT family model",
-                128_000,
+                context_length,
             )
             .with_ability(Ability::ToolUse);
             for ability in &cfg.native_abilities {
@@ -248,6 +266,45 @@ impl LanguageModel for OpenAI {
             }
             profile
         }
+    }
+}
+
+/// Fetch context window size from the models API.
+async fn fetch_model_context_length(cfg: &Config) -> Result<u32, OpenAIError> {
+    use crate::response::ModelsListResponse;
+
+    let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+    let mut backend = client();
+    let response: ModelsListResponse = backend
+        .get(&url)
+        .header(header::AUTHORIZATION.as_str(), format!("Bearer {}", cfg.api_key))
+        .json()
+        .await
+        .map_err(|e| OpenAIError::Http(zenwave::error::BoxHttpError::from(Box::new(e))))?;
+
+    // Find matching model
+    let mut model_found = false;
+    for model in response.data {
+        if model.id == cfg.chat_model {
+            model_found = true;
+            if let Some(ctx) = model.context_length.or(model.max_tokens) {
+                tracing::debug!("Fetched context_length={} for model '{}'", ctx, cfg.chat_model);
+                return Ok(ctx);
+            }
+        }
+    }
+
+    // More specific error message
+    if model_found {
+        Err(OpenAIError::Api(format!(
+            "Model '{}' found but missing context_length field (proxy may not support it)",
+            cfg.chat_model
+        )))
+    } else {
+        Err(OpenAIError::Api(format!(
+            "Model '{}' not found in /models response",
+            cfg.chat_model
+        )))
     }
 }
 

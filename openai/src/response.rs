@@ -467,3 +467,26 @@ fn extract_reasoning(value: Option<Value>) -> Vec<String> {
         _ => Vec::new(),
     }
 }
+
+// ============================================================================
+// Model Info (for fetching context window)
+// ============================================================================
+
+/// Response from GET /v1/models endpoint (OpenRouter format).
+#[derive(Debug, Deserialize)]
+pub struct ModelsListResponse {
+    pub data: Vec<ModelInfo>,
+}
+
+/// Individual model info from /v1/models.
+#[derive(Debug, Deserialize)]
+pub struct ModelInfo {
+    /// Model ID
+    pub id: String,
+    /// Context window size (OpenRouter returns this)
+    #[serde(default)]
+    pub context_length: Option<u32>,
+    /// Some providers use max_tokens instead
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
