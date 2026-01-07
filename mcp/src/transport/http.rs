@@ -1,24 +1,32 @@
-//! HTTP transport for MCP.
+//! HTTP transport for MCP (Streamable HTTP).
 //!
-//! This transport uses HTTP POST for sending requests to the server.
+//! This transport uses HTTP POST for sending requests to the server,
+//! with support for MCP session management via `Mcp-Session-Id` header.
 
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::RwLock;
 
 use tracing::debug;
-use zenwave::{Client, client, header};
+use zenwave::{Client, ResponseExt, client, header};
 
 use super::traits::{Result, Transport};
 use crate::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError, RequestId};
 
-/// HTTP transport for MCP communication.
+/// MCP session ID header name.
+const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
+
+/// HTTP transport for MCP communication (Streamable HTTP).
 ///
-/// This transport sends requests via HTTP POST.
+/// This transport sends requests via HTTP POST and handles session management
+/// via the `Mcp-Session-Id` header as per MCP specification 2025-03-26.
 #[derive(Debug)]
 pub struct HttpTransport {
     /// Base URL of the MCP server.
     base_url: String,
     /// Optional authorization header value.
     auth: Option<String>,
+    /// Session ID returned by server during initialization.
+    session_id: RwLock<Option<String>>,
     /// Next request ID.
     next_id: AtomicI64,
     /// Whether the transport is closed.
@@ -36,6 +44,7 @@ impl HttpTransport {
         Self {
             base_url: base_url.into(),
             auth: None,
+            session_id: RwLock::new(None),
             next_id: AtomicI64::new(1),
             closed: false,
         }
@@ -81,15 +90,34 @@ impl Transport for HttpTransport {
             builder = builder.header(header::AUTHORIZATION.as_str(), auth.clone());
         }
 
-        let response: JsonRpcResponse = builder
+        // Include session ID if we have one
+        if let Some(session_id) = self.session_id.read().unwrap().as_ref() {
+            builder = builder.header(MCP_SESSION_ID_HEADER, session_id.clone());
+        }
+
+        // Send request and get response with headers
+        let response = builder
             .json_body(&req)
-            .json()
             .await
             .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?;
 
-        debug!("MCP HTTP RX: {:?}", response);
+        // Extract session ID from response headers
+        if let Some(session_id) = response.headers().get(MCP_SESSION_ID_HEADER) {
+            if let Ok(session_str) = session_id.to_str() {
+                debug!("MCP HTTP session ID: {}", session_str);
+                *self.session_id.write().unwrap() = Some(session_str.to_string());
+            }
+        }
 
-        Ok(response)
+        // Parse response body as JSON
+        let result: JsonRpcResponse = response
+            .into_json()
+            .await
+            .map_err(|e| McpError::Transport(format!("Response parse failed: {e}")))?;
+
+        debug!("MCP HTTP RX: {:?}", result);
+
+        Ok(result)
     }
 
     async fn notify(&mut self, notif: JsonRpcNotification) -> Result<()> {
@@ -114,11 +142,13 @@ impl Transport for HttpTransport {
             builder = builder.header(header::AUTHORIZATION.as_str(), auth.clone());
         }
 
+        // Include session ID if we have one
+        if let Some(session_id) = self.session_id.read().unwrap().as_ref() {
+            builder = builder.header(MCP_SESSION_ID_HEADER, session_id.clone());
+        }
+
         // Notifications may return empty body, so we ignore parse errors
-        let _ = builder
-            .json_body(&notif)
-            .json::<serde_json::Value>()
-            .await;
+        let _ = builder.json_body(&notif).await;
 
         Ok(())
     }

@@ -17,11 +17,12 @@ anyhow = "1.0.100"
 schemars = "1.1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
+tracing = "0.1"
 aither-websearch = { workspace = true, optional = true }
 aither-fs = { workspace = true, optional = true }
 aither-command = { workspace = true, optional = true }
 aither-mcp = { workspace = true, optional = true }
-tokio = { version = "1.0", features = ["sync"], optional = true }
+parking_lot = { version = "0.12", features = ["send_guard"], optional = true }
 async-stream = "0.3.6"
 futures = "0.3"
 futures-core = "0.3.31"
@@ -35,7 +36,7 @@ default = []
 websearch = ["dep:aither-websearch"]
 filesystem = ["dep:aither-fs"]
 command = ["dep:aither-command"]
-mcp = ["dep:aither-mcp", "dep:tokio"]
+mcp = ["dep:aither-mcp", "dep:parking_lot"]
 full = ["websearch", "filesystem", "command", "mcp"]
 [lints]
 workspace = true

@@ -44,6 +44,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use aither_agent::specialized::{SubagentType, TaskTool};
 use aither_agent::{Agent, Hook};
 use aither_core::LanguageModel;
 use aither_core::llm::Role;
@@ -141,6 +142,9 @@ async fn main() -> Result<()> {
 }
 
 async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudProvider, aither_agent::HCons<DebugHook, ()>>> {
+    // Clone cloud for task tool before moving into builder
+    let cloud_for_tasks = cloud.clone();
+
     // Build the agent
     let mut builder = Agent::builder(cloud).hook(DebugHook);
 
@@ -148,12 +152,7 @@ async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudPro
     if let Some(ref system) = args.system {
         builder = builder.system_prompt(system);
     } else {
-        builder = builder.system_prompt(
-            "You are a helpful AI assistant with access to tools. \
-             When the user asks to explore, analyze, or work with code, proactively use the filesystem tool. \
-             For complex tasks, use the todo tool to track progress. \
-             Always take action using tools when helpful.",
-        );
+        builder = builder.system_prompt(include_str!("prompts/system.md"));
     }
 
     // Add filesystem tool
@@ -169,9 +168,37 @@ async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudPro
     // Add todo tool
     builder = builder.tool(aither_agent::TodoTool::new());
 
+    // Add task tool with explore subagent
+    // Note: SubagentType builders return AgentBuilder (not built Agent)
+    // so that TaskTool can add display hooks for real-time feedback
+    let mut task_tool = TaskTool::new(cloud_for_tasks);
+    task_tool.register(
+        "explore",
+        SubagentType::new(
+            "Fast codebase explorer for finding files, searching code, and analyzing structure",
+            |llm| {
+                Agent::builder(llm)
+                    .system_prompt(include_str!("prompts/explore.md"))
+                    .tool(aither_agent::filesystem::FileSystemTool::new("."))
+            },
+        ),
+    );
+    task_tool.register(
+        "plan",
+        SubagentType::new(
+            "Software architect for designing implementation plans",
+            |llm| {
+                Agent::builder(llm)
+                    .system_prompt(include_str!("prompts/plan.md"))
+                    .tool(aither_agent::filesystem::FileSystemTool::new("."))
+            },
+        ),
+    );
+    builder = builder.tool(task_tool);
+
     // Add Context7 MCP server by default (documentation lookup)
     if !args.no_context7 {
-        match McpConnection::http("https://context7.liam.sh/mcp").await {
+        match McpConnection::http("https://mcp.context7.com/mcp").await {
             Ok(conn) => {
                 if !args.quiet {
                     println!("Connected to Context7 MCP server");

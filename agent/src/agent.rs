@@ -234,23 +234,39 @@ where
 
             let mut text_chunks = Vec::new();
             let mut tool_calls = Vec::new();
+            let mut malformed_function_call = false;
 
             while let Some(event) = stream.next().await {
-                match event.map_err(|e| AgentError::Llm(e.to_string()))? {
-                    Event::Text(text) => {
+                match event {
+                    Ok(Event::Text(text)) => {
                         text_chunks.push(text);
                     }
-                    Event::Reasoning(_) => {
+                    Ok(Event::Reasoning(_)) => {
                         // Reasoning is for observability, not part of response
                     }
-                    Event::ToolCall(call) => {
+                    Ok(Event::ToolCall(call)) => {
                         tool_calls.push(call);
                     }
-                    Event::BuiltInToolResult { tool, result } => {
+                    Ok(Event::BuiltInToolResult { tool, result }) => {
                         // Built-in tool results are treated as text
                         text_chunks.push(format!("[{tool}] {result}"));
                     }
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        // Check if this is a malformed function call error - retry silently
+                        if error_msg.contains("malformed function call") {
+                            tracing::warn!("Model generated malformed function call, retrying...");
+                            malformed_function_call = true;
+                            break;
+                        }
+                        return Err(AgentError::Llm(error_msg));
+                    }
                 }
+            }
+
+            // If malformed function call, retry this iteration
+            if malformed_function_call {
+                continue;
             }
 
             let response_text = text_chunks.join("");

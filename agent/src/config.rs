@@ -21,7 +21,9 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 32,
+            // Very high default - should effectively never hit this limit
+            // Individual use cases can set lower limits if needed
+            max_iterations: 10_000,
             context: ContextStrategy::default(),
             system_prompt: None,
             tool_search: ToolSearchConfig::default(),

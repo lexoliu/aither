@@ -88,6 +88,7 @@ impl std::str::FromStr for Provider {
 }
 
 /// Unified cloud provider wrapping OpenAI, Claude, and Gemini.
+#[derive(Clone)]
 pub enum CloudProvider {
     /// OpenAI GPT models.
     OpenAI(OpenAI),
@@ -114,13 +115,15 @@ impl CloudProvider {
 
         Ok(match provider {
             Provider::OpenAI => {
-                // Always use Chat Completions API - Responses API is stateful
-                // and doesn't fit the stateless LanguageModel abstraction
-                let mut client = OpenAI::new(api_key)
-                    .with_model(model)
-                    .with_chat_completions_api();
+                // Use Responses API by default for better caching and reasoning
+                // preservation. Fall back to Chat Completions for proxies.
+                let mut client = OpenAI::new(api_key).with_model(model);
                 if let Some(url) = base_url {
                     client = client.with_base_url(url);
+                    // Use Chat Completions for non-OpenAI endpoints (proxies)
+                    if !url.contains("api.openai.com") {
+                        client = client.with_chat_completions_api();
+                    }
                 }
                 Self::OpenAI(client)
             }

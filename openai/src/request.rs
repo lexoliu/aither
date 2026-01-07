@@ -385,6 +385,8 @@ impl ResponsesInputItem {
 pub struct ResponsesRequest {
     model: String,
     input: Vec<ResponsesInputItem>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -421,10 +423,12 @@ impl ResponsesRequest {
         params: &ParameterSnapshot,
         tools: Option<Vec<ResponsesTool>>,
         tool_choice: Option<ResponsesToolChoice>,
+        stream: bool,
     ) -> Self {
         Self {
             model,
             input,
+            stream,
             temperature: params.temperature,
             top_p: params.top_p,
             max_output_tokens: params.max_tokens,
@@ -591,6 +595,7 @@ mod tests {
             &snapshot,
             None,
             responses_tool_choice(&snapshot, false),
+            false,
         );
         let value = serde_json::to_value(&req).expect("serialize responses request");
         assert_eq!(value["text"]["format"]["type"], "json_object");

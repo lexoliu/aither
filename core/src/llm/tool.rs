@@ -402,6 +402,13 @@ fn clean_schema(value: &mut Value) {
 
     // Second pass: resolve refs and clean
     resolve_and_clean(value, &defs);
+
+    // Ensure root has type: object (required by OpenAI function calling)
+    if let Value::Object(map) = value {
+        if map.contains_key("properties") && !map.contains_key("type") {
+            map.insert("type".to_string(), Value::String("object".to_string()));
+        }
+    }
 }
 
 /// Extracts `$defs` or `definitions` from the root schema.
@@ -416,27 +423,165 @@ fn extract_defs(value: &Value) -> serde_json::Map<String, Value> {
 
 /// Resolves `$ref` and cleans the schema recursively.
 fn resolve_and_clean(value: &mut Value, defs: &serde_json::Map<String, Value>) {
+    resolve_and_clean_inner(value, defs, false);
+}
+
+/// Inner recursive function with flag to track if we're inside a properties object.
+fn resolve_and_clean_inner(
+    value: &mut Value,
+    defs: &serde_json::Map<String, Value>,
+    inside_properties: bool,
+) {
     match value {
         Value::Object(map) => {
-            // Handle $ref - inline the referenced definition
-            if let Some(Value::String(ref_path)) = map.get("$ref").cloned() {
-                if let Some(resolved) = resolve_ref(&ref_path, defs) {
-                    *value = resolved;
-                    // Recursively clean the inlined value
-                    resolve_and_clean(value, defs);
-                    return;
+            // Handle $ref - inline the referenced definition, preserving sibling properties
+            if let Some(Value::String(ref_path)) = map.remove("$ref") {
+                if let Some(Value::Object(resolved_map)) = resolve_ref(&ref_path, defs) {
+                    // Merge resolved definition with any existing properties (like description)
+                    // Resolved definition takes precedence for conflicts except description
+                    let existing_description = map.remove("description");
+                    for (k, v) in resolved_map {
+                        map.entry(k).or_insert(v);
+                    }
+                    // Preserve the field-level description if it exists
+                    if let Some(desc) = existing_description {
+                        map.insert("description".to_string(), desc);
+                    }
                 }
             }
 
-            // Remove schema metadata
-            map.remove("$schema");
-            map.remove("$id");
-            map.remove("title");
-            map.remove("definitions");
-            map.remove("$defs");
-            map.remove("$ref");
+            // Convert "const" to "enum" with single value (before filtering)
+            if let Some(const_val) = map.remove("const") {
+                map.insert("enum".to_string(), Value::Array(alloc::vec![const_val]));
+            }
 
-            // Handle "type" arrays like ["string", "null"] - Gemini doesn't support this
+            // Flatten oneOf/anyOf variants (before filtering, since oneOf is not in allowed list)
+            if let Some(Value::Array(variants)) = map.remove("oneOf").or_else(|| map.remove("anyOf"))
+            {
+                // Check if this is a simple string enum (variants have const/type but no properties)
+                let is_simple_enum = variants.iter().all(|v| {
+                    if let Value::Object(vm) = v {
+                        (vm.contains_key("const") || vm.contains_key("enum"))
+                            && !vm.contains_key("properties")
+                    } else {
+                        false
+                    }
+                });
+
+                if is_simple_enum {
+                    // Collect all const/enum values into a single enum array
+                    let mut enum_values: alloc::vec::Vec<Value> = alloc::vec::Vec::new();
+                    let mut variant_type: Option<String> = None;
+
+                    for variant in &variants {
+                        if let Value::Object(vm) = variant {
+                            if let Some(const_val) = vm.get("const") {
+                                if !enum_values.contains(const_val) {
+                                    enum_values.push(const_val.clone());
+                                }
+                            }
+                            if let Some(Value::Array(arr)) = vm.get("enum") {
+                                for val in arr {
+                                    if !enum_values.contains(val) {
+                                        enum_values.push(val.clone());
+                                    }
+                                }
+                            }
+                            if variant_type.is_none() {
+                                if let Some(Value::String(t)) = vm.get("type") {
+                                    variant_type = Some(t.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    if !enum_values.is_empty() {
+                        map.insert("enum".to_string(), Value::Array(enum_values));
+                        if let Some(t) = variant_type {
+                            map.insert("type".to_string(), Value::String(t));
+                        }
+                    }
+                } else {
+                    // Complex variants with properties - merge them
+                    let mut all_properties = serde_json::Map::new();
+
+                    for variant in variants {
+                        if let Value::Object(variant_map) = variant {
+                            if let Some(Value::Object(props)) = variant_map.get("properties") {
+                                for (key, val) in props {
+                                    // Extract enum value - handle both "enum" and "const"
+                                    let new_values: Option<alloc::vec::Vec<Value>> =
+                                        if let Value::Object(val_obj) = val {
+                                            if let Some(Value::Array(arr)) = val_obj.get("enum") {
+                                                Some(arr.clone())
+                                            } else if let Some(const_val) = val_obj.get("const") {
+                                                Some(alloc::vec![const_val.clone()])
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        };
+
+                                    if all_properties.contains_key(key) {
+                                        // Merge enum/const values into existing
+                                        if let Some(values) = new_values {
+                                            if let Some(Value::Object(existing_obj)) =
+                                                all_properties.get_mut(key)
+                                            {
+                                                if let Some(Value::Array(existing_enum)) =
+                                                    existing_obj.get_mut("enum")
+                                                {
+                                                    for e in values {
+                                                        if !existing_enum.contains(&e) {
+                                                            existing_enum.push(e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // First time seeing this property - convert const to enum
+                                        let mut val_clone = val.clone();
+                                        if let Value::Object(obj) = &mut val_clone {
+                                            if let Some(const_val) = obj.remove("const") {
+                                                obj.insert(
+                                                    "enum".to_string(),
+                                                    Value::Array(alloc::vec![const_val]),
+                                                );
+                                            }
+                                        }
+                                        all_properties.insert(key.clone(), val_clone);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Set type as object if we have properties
+                    if !all_properties.is_empty() {
+                        map.insert("type".to_string(), Value::String("object".to_string()));
+                        map.insert("properties".to_string(), Value::Object(all_properties));
+                    }
+                }
+            }
+
+            // Only filter schema keywords, not property names inside "properties"
+            // OpenAPI schema subset supported by most LLM providers
+            if !inside_properties {
+                let allowed = [
+                    "type",
+                    "description",
+                    "properties",
+                    "required",
+                    "items",
+                    "enum",
+                    "nullable",
+                ];
+                map.retain(|k, _| allowed.contains(&k.as_str()));
+            }
+
+            // Simplify "type" arrays like ["string", "null"] to single type
             if let Some(Value::Array(types)) = map.get("type") {
                 // Filter out "null" and take the first non-null type
                 let non_null: Vec<&Value> = types
@@ -448,85 +593,16 @@ fn resolve_and_clean(value: &mut Value, defs: &serde_json::Map<String, Value>) {
                 }
             }
 
-            // Convert "const" to "enum" with single value - Gemini doesn't support const
-            if let Some(const_val) = map.remove("const") {
-                map.insert("enum".to_string(), Value::Array(alloc::vec![const_val]));
-            }
-
-            // Handle oneOf/anyOf - flatten variants into single object with all properties
-            // Gemini doesn't handle oneOf well for tool schemas
-            if let Some(Value::Array(variants)) = map.remove("oneOf").or_else(|| map.remove("anyOf"))
-            {
-                let mut all_properties = serde_json::Map::new();
-
-                for variant in variants {
-                    if let Value::Object(variant_map) = variant {
-                        if let Some(Value::Object(props)) = variant_map.get("properties") {
-                            for (key, val) in props {
-                                // Extract enum value - handle both "enum" and "const"
-                                let new_values: Option<alloc::vec::Vec<Value>> =
-                                    if let Value::Object(val_obj) = val {
-                                        if let Some(Value::Array(arr)) = val_obj.get("enum") {
-                                            Some(arr.clone())
-                                        } else if let Some(const_val) = val_obj.get("const") {
-                                            Some(alloc::vec![const_val.clone()])
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    };
-
-                                if all_properties.contains_key(key) {
-                                    // Merge enum/const values into existing
-                                    if let Some(values) = new_values {
-                                        if let Some(Value::Object(existing_obj)) =
-                                            all_properties.get_mut(key)
-                                        {
-                                            if let Some(Value::Array(existing_enum)) =
-                                                existing_obj.get_mut("enum")
-                                            {
-                                                for e in values {
-                                                    if !existing_enum.contains(&e) {
-                                                        existing_enum.push(e);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // First time seeing this property - convert const to enum
-                                    let mut val_clone = val.clone();
-                                    if let Value::Object(obj) = &mut val_clone {
-                                        if let Some(const_val) = obj.remove("const") {
-                                            obj.insert(
-                                                "enum".to_string(),
-                                                Value::Array(alloc::vec![const_val]),
-                                            );
-                                        }
-                                    }
-                                    all_properties.insert(key.clone(), val_clone);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Set type as object if we have properties
-                if !all_properties.is_empty() {
-                    map.insert("type".to_string(), Value::String("object".to_string()));
-                    map.insert("properties".to_string(), Value::Object(all_properties));
-                }
-            }
-
             // Recursively clean all values
-            for v in map.values_mut() {
-                resolve_and_clean(v, defs);
+            for (key, v) in map.iter_mut() {
+                // When entering "properties", its children are property definitions
+                let child_inside_props = key == "properties";
+                resolve_and_clean_inner(v, defs, child_inside_props);
             }
         }
         Value::Array(arr) => {
             for v in arr {
-                resolve_and_clean(v, defs);
+                resolve_and_clean_inner(v, defs, false);
             }
         }
         _ => {}
@@ -908,5 +984,138 @@ mod tests {
 
         assert_eq!(original.name, cloned.name);
         assert_eq!(original.description, cloned.description);
+    }
+
+    #[test]
+    fn schema_preserves_enum() {
+        #[derive(JsonSchema, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Status {
+            Pending,
+            InProgress,
+            Completed,
+        }
+
+        #[derive(JsonSchema, Deserialize)]
+        struct Item {
+            status: Status,
+        }
+
+        #[derive(JsonSchema, Deserialize)]
+        struct Args {
+            items: Vec<Item>,
+        }
+
+        struct TestTool;
+
+        impl Tool for TestTool {
+            fn name(&self) -> Cow<'static, str> {
+                "test".into()
+            }
+            fn description(&self) -> Cow<'static, str> {
+                "Test tool".into()
+            }
+            type Arguments = Args;
+
+            async fn call(&self, _args: Self::Arguments) -> Result {
+                Ok("ok".to_string())
+            }
+        }
+
+        let tool = TestTool;
+        let def = ToolDefinition::new(&tool);
+        let schema = def.arguments_openai_schema();
+
+        // Check that status has enum values
+        let schema_obj = schema.as_object().expect("schema should be object");
+        let properties = schema_obj.get("properties").expect("should have properties").as_object().unwrap();
+        let items = properties.get("items").expect("should have items").as_object().unwrap();
+        let item_props = items.get("items").expect("items should have items schema").as_object().unwrap();
+        let item_properties = item_props.get("properties").expect("item should have properties").as_object().unwrap();
+        let status = item_properties.get("status").expect("should have status").as_object().unwrap();
+
+        // Status should have enum
+        assert!(
+            status.contains_key("enum"),
+            "Status should have enum field. Full schema: {}",
+            serde_json::to_string_pretty(&schema).unwrap()
+        );
+    }
+
+    #[test]
+    fn schema_ref_resolution() {
+        // Test that $ref schemas get resolved and enum values preserved
+        let raw_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "status": {
+                    "$ref": "#/$defs/Status"
+                }
+            },
+            "$defs": {
+                "Status": {
+                    "type": "string",
+                    "enum": ["pending", "in_progress", "completed"]
+                }
+            }
+        });
+
+        let mut schema = raw_schema.clone();
+        clean_schema(&mut schema);
+
+        let props = schema.get("properties").unwrap().as_object().unwrap();
+        let status = props.get("status").unwrap().as_object().unwrap();
+
+        assert!(
+            status.contains_key("enum"),
+            "Status should have enum after ref resolution. Got: {}",
+            serde_json::to_string_pretty(&schema).unwrap()
+        );
+    }
+
+    #[test]
+    fn schema_nested_ref_in_array() {
+        // Test nested $ref inside array items (like TodoWriteArgs)
+        let raw_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/TodoItem"
+                    }
+                }
+            },
+            "$defs": {
+                "TodoItem": {
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string" },
+                        "status": { "$ref": "#/$defs/TodoStatus" }
+                    },
+                    "required": ["content", "status"]
+                },
+                "TodoStatus": {
+                    "type": "string",
+                    "enum": ["pending", "in_progress", "completed"]
+                }
+            }
+        });
+
+        let mut schema = raw_schema.clone();
+        clean_schema(&mut schema);
+
+        // Navigate to status
+        let props = schema.get("properties").unwrap().as_object().unwrap();
+        let todos = props.get("todos").unwrap().as_object().unwrap();
+        let items = todos.get("items").unwrap().as_object().unwrap();
+        let item_props = items.get("properties").unwrap().as_object().unwrap();
+        let status = item_props.get("status").unwrap().as_object().unwrap();
+
+        assert!(
+            status.contains_key("enum"),
+            "Nested status should have enum. Full schema: {}",
+            serde_json::to_string_pretty(&schema).unwrap()
+        );
     }
 }

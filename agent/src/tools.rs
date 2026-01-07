@@ -40,7 +40,7 @@ pub struct AgentTools {
     /// MCP connections (when mcp feature is enabled).
     /// Wrapped in Mutex to allow parallel tool calls.
     #[cfg(feature = "mcp")]
-    mcp: Vec<tokio::sync::Mutex<McpConnection>>,
+    mcp: Vec<parking_lot::Mutex<McpConnection>>,
 }
 
 impl Default for AgentTools {
@@ -166,8 +166,7 @@ impl AgentTools {
 
         #[cfg(feature = "mcp")]
         for conn in &self.mcp {
-            // Use blocking_lock for sync context - definitions are cached so this is fast
-            defs.extend(conn.blocking_lock().definitions());
+            defs.extend(conn.lock().definitions());
         }
 
         defs
@@ -240,14 +239,13 @@ impl AgentTools {
         // Try MCP tools
         #[cfg(feature = "mcp")]
         for conn in &self.mcp {
-            let has_tool = conn.blocking_lock().has_tool(name);
+            let has_tool = conn.lock().has_tool(name);
             if has_tool {
                 let args_value: serde_json::Value =
                     serde_json::from_str(args).map_err(|e| anyhow::anyhow!("Invalid JSON: {e}"))?;
 
                 let result = conn
                     .lock()
-                    .await
                     .call(name, args_value)
                     .await
                     .map_err(|e| anyhow::anyhow!("MCP tool error: {e}"))?;
@@ -290,7 +288,7 @@ impl AgentTools {
     /// All tools from the MCP server will be available for the agent to use.
     #[cfg(feature = "mcp")]
     pub fn register_mcp(&mut self, conn: McpConnection) {
-        self.mcp.push(tokio::sync::Mutex::new(conn));
+        self.mcp.push(parking_lot::Mutex::new(conn));
     }
 
     /// Returns the number of registered MCP connections.
@@ -306,8 +304,24 @@ impl AgentTools {
     pub fn mcp_definitions(&self) -> Vec<ToolDefinition> {
         self.mcp
             .iter()
-            .flat_map(|c| c.blocking_lock().definitions())
+            .flat_map(|c| c.lock().definitions())
             .collect()
+    }
+
+    /// Merge another AgentTools into this one.
+    ///
+    /// Note: MCP connections are not cloned (they would require ownership transfer).
+    pub fn merge(&mut self, other: Self) {
+        // Merge eager tools - we can only merge definitions since CoreTools doesn't support iteration
+        // For now, we'll skip this as we can't easily extract and re-register tools
+        // Users should register tools directly on the subagent config
+
+        // Merge deferred tools
+        for (name, tool) in other.deferred {
+            self.deferred.entry(name).or_insert(tool);
+        }
+
+        // Merge config (keep self's config)
     }
 }
 

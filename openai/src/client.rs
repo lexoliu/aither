@@ -8,7 +8,9 @@ use crate::{
         ResponsesRequest, ResponsesTool, ToolPayload, convert_responses_tools, convert_tools,
         responses_tool_choice, to_chat_messages, to_responses_input,
     },
-    response::{ChatCompletionChunk, ResponsesOutput, should_skip_event},
+    response::{
+        ChatCompletionChunk, ResponsesOutputItem, ResponsesStreamEvent, should_skip_event,
+    },
 };
 use aither_core::{
     LanguageModel,
@@ -298,6 +300,8 @@ fn chat_completions_stream_inner(
             true,
         );
 
+        tracing::debug!(request = %serde_json::to_string_pretty(&request).unwrap_or_default(), "Sending chat completion request");
+
         let sse_stream = match builder.json_body(&request).sse().await {
             Ok(stream) => stream,
             Err(e) => {
@@ -315,18 +319,46 @@ fn chat_completions_stream_inner(
             .collect()
             .await;
 
+        tracing::debug!(event_count = events.len(), "Collected SSE events");
+
+        if events.is_empty() {
+            tracing::warn!("No SSE events received from API");
+        }
+
         // Accumulate tool calls by index - streaming sends id/name first, then arguments incrementally
         let mut tool_calls: std::collections::HashMap<usize, ToolCallAccumulator> =
             std::collections::HashMap::new();
+        let mut text_yielded = false;
 
         for event in events {
             match event {
                 Ok(e) => {
-                    tracing::debug!(sse_event = %e.text_data(), "Received SSE event");
-                    match serde_json::from_str::<ChatCompletionChunk>(e.text_data()) {
+                    let data = e.text_data();
+                    tracing::debug!(sse_event = %data, "Received SSE event");
+
+                    // Check for API error response
+                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(error) = error_obj.get("error") {
+                            let msg = error.get("message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("Unknown API error");
+                            yield Err(OpenAIError::Api(msg.to_string()));
+                            return;
+                        }
+                    }
+
+                    match serde_json::from_str::<ChatCompletionChunk>(data) {
                         Ok(chunk) => {
                             // Emit text events
                             for choice in &chunk.choices {
+                                // Check for malformed function call
+                                if let Some(ref reason) = choice.finish_reason {
+                                    if reason.contains("malformed_function_call") {
+                                        yield Err(OpenAIError::Api("malformed function call".to_string()));
+                                        return;
+                                    }
+                                }
+
                                 if let Some(content) = &choice.delta.content {
                                     if !content.is_empty() {
                                         yield Ok(Event::Text(content.clone()));
@@ -403,6 +435,14 @@ fn responses_stream(
     Box::pin(responses_stream_inner(cfg, input, snapshot, tool_defs))
 }
 
+/// Accumulated function call state for Responses API streaming.
+#[derive(Debug, Default)]
+struct FunctionCallAccumulator {
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
 fn responses_stream_inner(
     cfg: Arc<Config>,
     input: Vec<ResponsesInputItem>,
@@ -435,6 +475,7 @@ fn responses_stream_inner(
         let mut builder = backend.post(endpoint);
         builder = builder.header(header::AUTHORIZATION.as_str(), cfg.request_auth());
         builder = builder.header(header::USER_AGENT.as_str(), "aither-openai/0.1");
+        builder = builder.header(header::ACCEPT.as_str(), "text/event-stream");
         if let Some(org) = &cfg.organization {
             builder = builder.header("OpenAI-Organization", org.clone());
         }
@@ -445,43 +486,137 @@ fn responses_stream_inner(
             &snapshot,
             response_tools,
             tool_choice,
+            true, // stream: true
         );
 
-        let response: ResponsesOutput = match builder.json_body(&request).json().await {
-            Ok(response) => response,
-            Err(error) => {
-                yield Err(OpenAIError::Api(format!("HTTP request failed: {error}")));
+        tracing::debug!(request = %serde_json::to_string_pretty(&request).unwrap_or_default(), "Sending responses request");
+
+        let sse_stream = match builder.json_body(&request).sse().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                yield Err(OpenAIError::Api(format!("HTTP request failed: {e}")));
                 return;
             }
         };
 
-        let (texts, reasoning, tool_calls, _) = response.into_parts();
+        // Collect and filter SSE events
+        let events: Vec<_> = sse_stream
+            .filter_map(|event| match event {
+                Ok(e) if !should_skip_event(&e) && e.text_data() != "[DONE]" => Some(Ok(e)),
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .collect()
+            .await;
 
-        // Emit text events
-        for text in texts {
-            if !text.is_empty() {
-                yield Ok(Event::Text(text));
-            }
-        }
+        tracing::debug!(event_count = events.len(), "Collected Responses API SSE events");
 
-        // Emit reasoning events
-        if include_reasoning {
-            for step in reasoning {
-                if !step.is_empty() {
-                    yield Ok(Event::Reasoning(step));
+        // Accumulate function calls by item_id
+        let mut function_calls: std::collections::HashMap<String, FunctionCallAccumulator> =
+            std::collections::HashMap::new();
+
+        for event in events {
+            match event {
+                Ok(e) => {
+                    let data = e.text_data();
+                    tracing::trace!(sse_event = %data, "Received Responses API SSE event");
+
+                    // Check for API error response
+                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(error) = error_obj.get("error") {
+                            let msg = error.get("message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("Unknown API error");
+                            yield Err(OpenAIError::Api(msg.to_string()));
+                            return;
+                        }
+                    }
+
+                    match serde_json::from_str::<ResponsesStreamEvent>(data) {
+                        Ok(stream_event) => {
+                            match stream_event {
+                                ResponsesStreamEvent::OutputTextDelta { delta, .. } => {
+                                    if !delta.is_empty() {
+                                        yield Ok(Event::Text(delta));
+                                    }
+                                }
+                                ResponsesStreamEvent::ReasoningTextDelta { delta, .. } |
+                                ResponsesStreamEvent::ReasoningSummaryTextDelta { delta, .. } => {
+                                    if include_reasoning && !delta.is_empty() {
+                                        yield Ok(Event::Reasoning(delta));
+                                    }
+                                }
+                                ResponsesStreamEvent::OutputItemAdded { item, .. } => {
+                                    // When a function_call item is added, capture id and name
+                                    if let ResponsesOutputItem::FunctionCall { id, call_id, name, .. } = item {
+                                        let acc = function_calls.entry(id.clone()).or_default();
+                                        acc.call_id = call_id.or(Some(id));
+                                        acc.name = Some(name);
+                                    }
+                                }
+                                ResponsesStreamEvent::FunctionCallArgumentsDelta { delta, item_id, .. } => {
+                                    let acc = function_calls.entry(item_id).or_default();
+                                    acc.arguments.push_str(&delta);
+                                }
+                                ResponsesStreamEvent::FunctionCallArgumentsDone { arguments, item_id, .. } => {
+                                    let acc = function_calls.entry(item_id).or_default();
+                                    acc.arguments = arguments;
+                                }
+                                ResponsesStreamEvent::OutputItemDone { item, .. } => {
+                                    // Emit function call when item is done
+                                    if let ResponsesOutputItem::FunctionCall { id, call_id, name, arguments } = item {
+                                        let call_id = call_id.unwrap_or(id);
+                                        let args = serde_json::from_str(&arguments)
+                                            .unwrap_or(serde_json::Value::Object(Default::default()));
+                                        yield Ok(Event::ToolCall(ToolCall {
+                                            id: call_id,
+                                            name,
+                                            arguments: args,
+                                        }));
+                                    }
+                                }
+                                ResponsesStreamEvent::ResponseFailed { error } => {
+                                    let msg = error
+                                        .and_then(|e| e.message)
+                                        .unwrap_or_else(|| "Response failed".to_string());
+                                    yield Err(OpenAIError::Api(msg));
+                                    return;
+                                }
+                                ResponsesStreamEvent::Error { message, .. } => {
+                                    let msg = message.unwrap_or_else(|| "Unknown error".to_string());
+                                    yield Err(OpenAIError::Api(msg));
+                                    return;
+                                }
+                                // Ignore other events
+                                _ => {}
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, data = %data, "Failed to parse Responses API event");
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield Err(OpenAIError::from(e));
+                    return;
                 }
             }
         }
 
-        // Emit tool call events (NOT executed - consumer handles execution)
-        for call in tool_calls {
-            let arguments = serde_json::from_str(&call.arguments)
-                .unwrap_or(serde_json::Value::Object(Default::default()));
-            yield Ok(Event::ToolCall(ToolCall {
-                id: call.call_id,
-                name: call.name,
-                arguments,
-            }));
+        // Emit any remaining accumulated function calls (fallback if OutputItemDone wasn't received)
+        for (item_id, acc) in function_calls {
+            if let (Some(call_id), Some(name)) = (acc.call_id, acc.name) {
+                // Skip if already emitted via OutputItemDone
+                if !acc.arguments.is_empty() {
+                    let args = serde_json::from_str(&acc.arguments)
+                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    yield Ok(Event::ToolCall(ToolCall {
+                        id: call_id,
+                        name,
+                        arguments: args,
+                    }));
+                }
+            }
         }
     }
 }

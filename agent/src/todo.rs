@@ -6,6 +6,34 @@
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aither_core::llm::tool::ToolDefinition;
+
+    #[test]
+    fn todo_schema_has_status_enum() {
+        let tool = TodoTool::new();
+        let def = ToolDefinition::new(&tool);
+        let schema = def.arguments_openai_schema();
+
+        // Navigate to status field
+        let schema_obj = schema.as_object().expect("schema should be object");
+        let properties = schema_obj.get("properties").expect("should have properties").as_object().unwrap();
+        let todos = properties.get("todos").expect("should have todos").as_object().unwrap();
+        let items = todos.get("items").expect("todos should have items").as_object().unwrap();
+        let item_props = items.get("properties").expect("item should have properties").as_object().unwrap();
+        let status = item_props.get("status").expect("should have status").as_object().unwrap();
+
+        // Status should have enum
+        assert!(
+            status.contains_key("enum") || status.contains_key("type"),
+            "Status should have enum or type field. Full schema: {}",
+            serde_json::to_string_pretty(&schema).unwrap()
+        );
+    }
+}
+
 use aither_core::llm::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

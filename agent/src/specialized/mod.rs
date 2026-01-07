@@ -4,6 +4,8 @@
 
 mod coder;
 mod subagent;
+pub mod task;
 
 pub use coder::{Coder, CoderBuilder};
 pub use subagent::{SubAgentQuery, SubAgentTool};
+pub use task::{SubagentType, TaskArgs, TaskTool};
