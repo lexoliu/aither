@@ -90,6 +90,9 @@ pub struct ChatCompletionRequest {
     tools: Option<Vec<ToolPayload>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoicePayload>,
+    /// Enable parallel tool calls (default: true when tools provided)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormatPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,6 +129,7 @@ impl ChatCompletionRequest {
             top_logprobs: params.top_logprobs,
             tools,
             tool_choice: tool_choice(params, has_tools),
+            parallel_tool_calls: if has_tools { Some(true) } else { None },
             response_format: response_format(params),
             reasoning: reasoning(params),
         }
