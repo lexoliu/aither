@@ -22,7 +22,7 @@ use aither_core::{
 };
 use futures_core::Stream;
 use futures_lite::StreamExt;
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, sync::Arc};
 use zenwave::{Client, client, header};
 
 /// `OpenAI` model backed by the Responses API by default, with legacy
@@ -328,7 +328,7 @@ fn chat_completions_stream_inner(
         // Accumulate tool calls by index - streaming sends id/name first, then arguments incrementally
         let mut tool_calls: std::collections::HashMap<usize, ToolCallAccumulator> =
             std::collections::HashMap::new();
-        let mut text_yielded = false;
+        let mut _text_yielded = false;
 
         for event in events {
             match event {
@@ -604,7 +604,7 @@ fn responses_stream_inner(
         }
 
         // Emit any remaining accumulated function calls (fallback if OutputItemDone wasn't received)
-        for (item_id, acc) in function_calls {
+        for (_item_id, acc) in function_calls {
             if let (Some(call_id), Some(name)) = (acc.call_id, acc.name) {
                 // Skip if already emitted via OutputItemDone
                 if !acc.arguments.is_empty() {

@@ -30,22 +30,38 @@ impl SubagentDisplayHook {
 
 impl Hook for SubagentDisplayHook {
     async fn pre_tool_use(&self, ctx: &ToolUseContext<'_>) -> PreToolAction {
-        // Show tool being called
-        eprintln!("{} \x1b[36m{}\x1b[0m", self.prefix, ctx.tool_name);
+        // Show tool being called with arguments preview
+        let args_preview: String = ctx.arguments.chars().take(60).collect();
+        let args_display = if ctx.arguments.len() > 60 {
+            format!("{}...", args_preview)
+        } else {
+            args_preview
+        };
+        eprintln!(
+            "{} \x1b[36m{}\x1b[0m \x1b[90m{}\x1b[0m",
+            self.prefix, ctx.tool_name, args_display
+        );
         PreToolAction::Allow
     }
 
     async fn post_tool_use(&self, ctx: &ToolResultContext<'_>) -> PostToolAction {
-        // Show result status
-        let status = if ctx.result.is_ok() {
-            "\x1b[32m✓\x1b[0m"
-        } else {
-            "\x1b[31m✗\x1b[0m"
-        };
-        eprintln!(
-            "{} {} {} \x1b[90m({:?})\x1b[0m",
-            self.prefix, status, ctx.tool_name, ctx.duration
-        );
+        // Show result status with error details if failed
+        match ctx.result {
+            Ok(_) => {
+                eprintln!(
+                    "{} \x1b[32m✓\x1b[0m {} \x1b[90m({:?})\x1b[0m",
+                    self.prefix, ctx.tool_name, ctx.duration
+                );
+            }
+            Err(err) => {
+                // Show error message for failures
+                let err_preview: String = err.chars().take(80).collect();
+                eprintln!(
+                    "{} \x1b[31m✗\x1b[0m {} \x1b[31m{}\x1b[0m",
+                    self.prefix, ctx.tool_name, err_preview
+                );
+            }
+        }
         PostToolAction::Keep
     }
 }

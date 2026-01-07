@@ -330,6 +330,7 @@ pub struct ChatToolFunctionPayload {
     pub(crate) arguments: String,
 }
 
+#[allow(dead_code)]
 impl ChatMessagePayload {
     pub(crate) fn tool_output(call_id: String, output: String) -> Self {
         Self {
@@ -353,6 +354,7 @@ impl ChatMessagePayload {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
 pub enum ResponsesInputItem {
@@ -368,6 +370,7 @@ pub enum ResponsesInputItem {
     },
 }
 
+#[allow(dead_code)]
 impl ResponsesInputItem {
     pub(crate) fn message(role: impl Into<String>, content: String) -> Self {
         Self::Message {
@@ -480,6 +483,7 @@ pub enum ResponsesTool {
     CodeInterpreter,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
 pub(crate) enum ResponsesToolChoice {
