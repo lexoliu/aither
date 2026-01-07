@@ -9,19 +9,27 @@
 //! # Example
 //!
 //! ```no_run
-//! use aither_webfetch::{fetch, FetchResult};
+//! use aither_webfetch::{fetch, FetchResult, WebFetchTool};
 //!
 //! # async fn example() -> anyhow::Result<()> {
+//! // Direct fetch
 //! let result = fetch("https://example.com").await?;
 //! println!("Title: {:?}", result.title);
 //! println!("Content: {}", result.content);
+//!
+//! // Or use as an LLM tool
+//! let tool = WebFetchTool::new();
 //! # Ok(())
 //! # }
 //! ```
 
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::io::Cursor;
+
+use aither_core::llm::Tool;
+use anyhow::{Result, anyhow};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 /// Result of fetching web content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +80,92 @@ async fn fetch_html(url: &str) -> Result<String> {
         .map_err(|e| anyhow!("Failed to read response body: {e}"))?;
 
     Ok(html.to_string())
+}
+
+/// Arguments for the web fetch tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WebFetchArgs {
+    /// The URL to fetch content from. Must be a valid HTTP or HTTPS URL.
+    pub url: String,
+}
+
+/// Web content fetching tool for LLM agents.
+///
+/// Fetches web pages, extracts main content using readability, and converts
+/// to clean markdown format suitable for LLM consumption.
+///
+/// # Example
+///
+/// ```no_run
+/// use aither_webfetch::WebFetchTool;
+/// use aither_core::llm::Tool;
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// let tool = WebFetchTool::new();
+/// // Use with agent...
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct WebFetchTool {
+    name: String,
+    description: String,
+}
+
+impl Default for WebFetchTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WebFetchTool {
+    /// Create a new web fetch tool with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            name: "web_fetch".into(),
+            description: include_str!("prompt.md").into(),
+        }
+    }
+
+    /// Create a web fetch tool with custom name.
+    #[must_use]
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Create a web fetch tool with custom description.
+    #[must_use]
+    pub fn described(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+}
+
+impl Tool for WebFetchTool {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Owned(self.name.clone())
+    }
+
+    fn description(&self) -> Cow<'static, str> {
+        Cow::Owned(self.description.clone())
+    }
+
+    type Arguments = WebFetchArgs;
+
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
+        let result = fetch(&arguments.url).await?;
+
+        let mut output = String::new();
+        if let Some(title) = &result.title {
+            output.push_str(&format!("# {title}\n\n"));
+        }
+        output.push_str(&format!("Source: {}\n\n", result.url));
+        output.push_str(&result.content);
+
+        Ok(output)
+    }
 }
 
 #[cfg(test)]

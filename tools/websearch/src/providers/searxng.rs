@@ -1,8 +1,7 @@
 //! SearXNG metasearch engine provider.
 //!
 //! [SearXNG](https://docs.searxng.org/) is a free, open-source metasearch engine
-//! that aggregates results from multiple search engines. It can be self-hosted
-//! for privacy-focused applications.
+//! that aggregates results from multiple search engines. No API key required.
 //!
 //! # Example
 //!
@@ -10,12 +9,12 @@
 //! use aither_websearch::{SearXNG, SearchProvider};
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! // Connect to a self-hosted SearXNG instance
-//! let provider = SearXNG::new("http://localhost:8080");
-//! let results = provider.search("privacy search engines", 5).await?;
-//! for result in results {
-//!     println!("{}: {}", result.title, result.url);
-//! }
+//! // Use the default public endpoint
+//! let provider = SearXNG::default();
+//! let results = provider.search("rust programming", 5).await?;
+//!
+//! // Or use a custom instance
+//! let custom = SearXNG::new("http://localhost:8080");
 //! # Ok(())
 //! # }
 //! ```
@@ -25,18 +24,27 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use zenwave::{Client, client, header};
 
+/// Default public SearXNG endpoint.
+pub const DEFAULT_SEARXNG_URL: &str = "https://serxng-deployment-production.up.railway.app";
+
 /// SearXNG metasearch engine provider.
 ///
-/// Connects to a self-hosted [SearXNG](https://github.com/searxng/searxng) instance.
-/// Requires the instance to have JSON format enabled in settings.
+/// A free, open-source metasearch engine that requires no API key.
+/// Uses a public instance by default, or can be configured with a custom URL.
 #[derive(Debug, Clone)]
 pub struct SearXNG {
     base_url: String,
     engines: Option<String>,
 }
 
+impl Default for SearXNG {
+    fn default() -> Self {
+        Self::new(DEFAULT_SEARXNG_URL)
+    }
+}
+
 impl SearXNG {
-    /// Create a new SearXNG provider with the given instance URL.
+    /// Create a new SearXNG provider with a custom instance URL.
     ///
     /// # Arguments
     ///
@@ -56,7 +64,7 @@ impl SearXNG {
     /// ```
     /// use aither_websearch::SearXNG;
     ///
-    /// let provider = SearXNG::new("http://localhost:8080")
+    /// let provider = SearXNG::default()
     ///     .with_engines("google,duckduckgo,bing");
     /// ```
     #[must_use]

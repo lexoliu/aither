@@ -34,6 +34,8 @@
 //! The CLI includes the following tools by default:
 //! - **FileSystem**: Read/write/search files in the current directory
 //! - **Command**: Execute shell commands
+//! - **WebSearch**: Search the web (via SearXNG)
+//! - **WebFetch**: Fetch and read web pages
 //! - **Todo**: Track tasks
 //! - **Context7**: Look up library documentation (via MCP)
 
@@ -89,6 +91,14 @@ struct Args {
     /// Disable command execution tool.
     #[arg(long)]
     no_command: bool,
+
+    /// Disable web search tool.
+    #[arg(long)]
+    no_websearch: bool,
+
+    /// Disable web fetch tool.
+    #[arg(long)]
+    no_webfetch: bool,
 
     /// Disable Context7 MCP server (documentation lookup).
     #[arg(long)]
@@ -163,6 +173,16 @@ async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudPro
     // Add command tool
     if !args.no_command {
         builder = builder.tool(aither_agent::command::CommandTool::new("."));
+    }
+
+    // Add web search tool (uses SearXNG - free, no API key)
+    if !args.no_websearch {
+        builder = builder.tool(aither_agent::websearch::WebSearchTool::default());
+    }
+
+    // Add web fetch tool
+    if !args.no_webfetch {
+        builder = builder.tool(aither_agent::webfetch::WebFetchTool::new());
     }
 
     // Add todo tool

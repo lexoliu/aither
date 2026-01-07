@@ -195,6 +195,20 @@ impl Part {
         }
     }
 
+    pub(crate) fn function_call(name: String, args: Value) -> Self {
+        Self {
+            text: None,
+            thought: None,
+            thought_signature: None,
+            inline_data: None,
+            function_call: Some(FunctionCall { name, args }),
+            function_response: None,
+            executable_code: None,
+            code_execution_result: None,
+            metadata: None,
+        }
+    }
+
     fn text_chunk(&self) -> Option<String> {
         if self.is_thought() {
             None

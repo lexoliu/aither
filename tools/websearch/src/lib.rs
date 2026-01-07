@@ -3,35 +3,35 @@
 //! This crate provides a unified interface for web search providers that can be
 //! used with LLM agents to perform real-time internet searches.
 //!
-//! # Providers
+//! # Default Provider
 //!
-//! The following search providers are available:
+//! By default, uses [SearXNG](https://docs.searxng.org/) - a free, open-source
+//! metasearch engine that requires no API key.
+//!
+//! ```no_run
+//! use aither_websearch::WebSearchTool;
+//!
+//! // Uses SearXNG - no API key needed
+//! let tool = WebSearchTool::default();
+//! ```
+//!
+//! # All Providers
 //!
 //! | Provider | API Key | Description |
 //! |----------|---------|-------------|
+//! | [`SearXNG`] | Not required | **Default** - Free metasearch engine |
+//! | [`DuckDuckGo`] | Not required | Instant answers only (not full web search) |
 //! | [`BraveSearch`] | Required | Privacy-first search with independent index |
-//! | [`DuckDuckGo`] | Not required | Free instant answers API |
 //! | [`Tavily`] | Required | AI-optimized search for RAG workflows |
-//! | [`SearXNG`] | Not required | Self-hosted metasearch engine |
 //! | [`GoogleSearch`] | Required (+CX ID) | Google Custom Search API |
 //! | [`Serper`] | Required | Fast Google SERP API |
 //!
-//! # Example
+//! # Custom Provider
 //!
 //! ```no_run
-//! use aither_websearch::{BraveSearch, SearchProvider, WebSearchTool};
+//! use aither_websearch::{Tavily, WebSearchTool};
 //!
-//! # async fn example() -> anyhow::Result<()> {
-//! // Create a search provider
-//! let provider = BraveSearch::new("YOUR_API_KEY");
-//!
-//! // Use directly
-//! let results = provider.search("rust async programming", 5).await?;
-//!
-//! // Or wrap in a tool for LLM agents
-//! let tool = WebSearchTool::new(provider);
-//! # Ok(())
-//! # }
+//! let tool = WebSearchTool::new(Tavily::new("YOUR_API_KEY"));
 //! ```
 
 mod providers;
@@ -79,15 +79,23 @@ pub struct WebSearchTool<P> {
     description: String,
 }
 
+impl Default for WebSearchTool<SearXNG> {
+    fn default() -> Self {
+        Self::new(SearXNG::default())
+    }
+}
+
 impl<P> WebSearchTool<P> {
+    /// Create a web search tool with a custom provider.
     pub fn new(provider: P) -> Self {
         Self {
             provider,
             name: "web_search".into(),
-            description: "Searches the web and returns relevant documents.".into(),
+            description: include_str!("prompt.md").into(),
         }
     }
 
+    /// Create a web search tool with custom name and description.
     pub fn with_metadata(
         provider: P,
         name: impl Into<String>,

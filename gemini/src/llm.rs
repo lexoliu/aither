@@ -293,25 +293,88 @@ fn parse_tool_signature(id: &str) -> (String, Option<String>) {
 }
 
 fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<GeminiContent>) {
+    use std::collections::HashMap;
+
     let mut system_parts = Vec::new();
     let mut contents = Vec::new();
+
+    // Build a map from tool_call_id to function name for resolving Tool messages
+    let mut tool_call_names: HashMap<&str, &str> = HashMap::new();
+    for message in messages {
+        for tc in message.tool_calls() {
+            tool_call_names.insert(&tc.id, &tc.name);
+        }
+    }
+
     for message in messages {
         match message.role() {
             Role::System => system_parts.push(Part::text(message.content())),
-            Role::User | Role::Tool => {
-                if message.role() == Role::Tool {
-                    if let Some((name, response, signature)) =
-                        parse_tool_response(message.content())
-                    {
-                        contents.push(GeminiContent::function_response_with_signature(
-                            name, response, signature,
-                        ));
-                        continue;
-                    }
-                }
+            Role::User => {
                 contents.push(GeminiContent::text("user", message.content()));
             }
-            Role::Assistant => contents.push(GeminiContent::text("model", message.content())),
+            Role::Tool => {
+                // Get the function name from the tool_call_id
+                let tool_call_id = message.tool_call_id().unwrap_or("");
+                let (base_id, signature) = parse_tool_signature(tool_call_id);
+
+                if let Some(&function_name) = tool_call_names.get(tool_call_id) {
+                    // Parse the content as JSON, or wrap it as a string result
+                    let response_value = match serde_json::from_str::<serde_json::Value>(message.content()) {
+                        Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+                        Ok(other) => {
+                            let mut map = serde_json::Map::new();
+                            map.insert("result".to_string(), other);
+                            serde_json::Value::Object(map)
+                        }
+                        Err(_) => {
+                            let mut map = serde_json::Map::new();
+                            map.insert(
+                                "result".to_string(),
+                                serde_json::Value::String(message.content().to_string()),
+                            );
+                            serde_json::Value::Object(map)
+                        }
+                    };
+                    contents.push(GeminiContent::function_response_with_signature(
+                        function_name.to_string(),
+                        response_value,
+                        signature,
+                    ));
+                } else {
+                    // Fallback: try legacy format or send as user message
+                    if let Some((name, response, sig)) = parse_tool_response(message.content()) {
+                        contents.push(GeminiContent::function_response_with_signature(
+                            name, response, sig,
+                        ));
+                    } else {
+                        // Last resort - wrap as text
+                        debug!("Tool message without matching tool_call_id: {}", base_id);
+                        contents.push(GeminiContent::text("user", message.content()));
+                    }
+                }
+            }
+            Role::Assistant => {
+                let tool_calls = message.tool_calls();
+                if tool_calls.is_empty() {
+                    // Regular text response
+                    contents.push(GeminiContent::text("model", message.content()));
+                } else {
+                    // Assistant message with function calls
+                    let mut parts = Vec::new();
+
+                    // Add text content if present
+                    if !message.content().is_empty() {
+                        parts.push(Part::text(message.content()));
+                    }
+
+                    // Add function call parts
+                    for tc in tool_calls {
+                        parts.push(Part::function_call(tc.name.clone(), tc.arguments.clone()));
+                    }
+
+                    contents.push(GeminiContent::with_parts("model", parts));
+                }
+            }
         }
     }
 

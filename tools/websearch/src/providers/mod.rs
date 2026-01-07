@@ -13,6 +13,6 @@ mod tavily;
 pub use brave::BraveSearch;
 pub use duckduckgo::DuckDuckGo;
 pub use google::GoogleSearch;
-pub use searxng::SearXNG;
+pub use searxng::{DEFAULT_SEARXNG_URL, SearXNG};
 pub use serper::Serper;
 pub use tavily::Tavily;

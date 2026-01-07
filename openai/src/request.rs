@@ -354,13 +354,19 @@ impl ChatMessagePayload {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
 pub enum ResponsesInputItem {
     Message {
         role: String,
         content: String,
+    },
+    FunctionCall {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        call_id: String,
+        name: String,
+        arguments: String,
     },
     FunctionCallOutput {
         #[serde(rename = "type")]
@@ -496,18 +502,54 @@ pub(crate) enum ResponsesToolChoice {
 }
 
 pub fn to_responses_input(messages: &[Message]) -> Vec<ResponsesInputItem> {
-    messages
-        .iter()
-        .map(|message| {
-            let role = match message.role() {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "developer",
-                Role::Tool => "tool",
-            };
-            ResponsesInputItem::message(role, flatten_content(message))
-        })
-        .collect()
+    let mut items = Vec::new();
+
+    for message in messages {
+        match message.role() {
+            Role::User => {
+                items.push(ResponsesInputItem::message("user", flatten_content(message)));
+            }
+            Role::System => {
+                items.push(ResponsesInputItem::message("developer", flatten_content(message)));
+            }
+            Role::Assistant => {
+                let tool_calls = message.tool_calls();
+                if tool_calls.is_empty() {
+                    // Regular text response
+                    items.push(ResponsesInputItem::message("assistant", flatten_content(message)));
+                } else {
+                    // Assistant message with function calls
+                    // First add text content if present
+                    if !message.content().is_empty() {
+                        items.push(ResponsesInputItem::message("assistant", message.content().to_string()));
+                    }
+                    // Add function call items
+                    for tc in tool_calls {
+                        items.push(ResponsesInputItem::FunctionCall {
+                            kind: "function_call",
+                            call_id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            arguments: tc.arguments.to_string(),
+                        });
+                    }
+                }
+            }
+            Role::Tool => {
+                // Tool results must be sent as FunctionCallOutput
+                if let Some(call_id) = message.tool_call_id() {
+                    items.push(ResponsesInputItem::function_call_output(
+                        call_id,
+                        message.content().to_string(),
+                    ));
+                } else {
+                    // Fallback if no call_id (shouldn't happen)
+                    items.push(ResponsesInputItem::message("user", flatten_content(message)));
+                }
+            }
+        }
+    }
+
+    items
 }
 
 pub fn convert_responses_tools(definitions: Vec<ToolDefinition>) -> Vec<ResponsesTool> {

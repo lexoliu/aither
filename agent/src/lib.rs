@@ -53,6 +53,8 @@ pub mod specialized;
 pub use aither_command as command;
 #[cfg(feature = "filesystem")]
 pub use aither_fs as filesystem;
+#[cfg(feature = "webfetch")]
+pub use aither_webfetch as webfetch;
 #[cfg(feature = "websearch")]
 pub use aither_websearch as websearch;
 

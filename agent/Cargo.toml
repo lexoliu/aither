@@ -19,6 +19,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
 aither-websearch = { workspace = true, optional = true }
+aither-webfetch = { workspace = true, optional = true }
 aither-fs = { workspace = true, optional = true }
 aither-command = { workspace = true, optional = true }
 aither-mcp = { workspace = true, optional = true }
@@ -28,15 +29,17 @@ futures = "0.3"
 futures-core = "0.3.31"
 futures-lite = "2.6"
 regex = "1.11"
+
 [dev-dependencies]
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = []
 websearch = ["dep:aither-websearch"]
+webfetch = ["dep:aither-webfetch"]
 filesystem = ["dep:aither-fs"]
 command = ["dep:aither-command"]
 mcp = ["dep:aither-mcp", "dep:parking_lot"]
-full = ["websearch", "filesystem", "command", "mcp"]
+full = ["websearch", "webfetch", "filesystem", "command", "mcp"]
 [lints]
 workspace = true
