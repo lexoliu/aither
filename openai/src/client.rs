@@ -263,6 +263,14 @@ fn chat_completions_stream(
     ))
 }
 
+/// Accumulated tool call state for streaming.
+#[derive(Debug, Default)]
+struct ToolCallAccumulator {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
 fn chat_completions_stream_inner(
     cfg: Arc<Config>,
     payload_messages: Vec<ChatMessagePayload>,
@@ -307,9 +315,14 @@ fn chat_completions_stream_inner(
             .collect()
             .await;
 
+        // Accumulate tool calls by index - streaming sends id/name first, then arguments incrementally
+        let mut tool_calls: std::collections::HashMap<usize, ToolCallAccumulator> =
+            std::collections::HashMap::new();
+
         for event in events {
             match event {
                 Ok(e) => {
+                    tracing::debug!(sse_event = %e.text_data(), "Received SSE event");
                     match serde_json::from_str::<ChatCompletionChunk>(e.text_data()) {
                         Ok(chunk) => {
                             // Emit text events
@@ -327,19 +340,20 @@ fn chat_completions_stream_inner(
                                         }
                                     }
                                 }
-                                // Emit tool calls
-                                if let Some(tool_calls) = &choice.delta.tool_calls {
-                                    for call in tool_calls {
-                                        if let (Some(id), Some(function)) = (&call.id, &call.function) {
+                                // Accumulate tool calls
+                                if let Some(calls) = &choice.delta.tool_calls {
+                                    for call in calls {
+                                        let index = call.index.unwrap_or(0);
+                                        let acc = tool_calls.entry(index).or_default();
+                                        if let Some(id) = &call.id {
+                                            acc.id = Some(id.clone());
+                                        }
+                                        if let Some(function) = &call.function {
                                             if let Some(name) = &function.name {
-                                                let args = function.arguments.as_deref().unwrap_or("{}");
-                                                let arguments = serde_json::from_str(args)
-                                                    .unwrap_or(serde_json::Value::Object(Default::default()));
-                                                yield Ok(Event::ToolCall(ToolCall {
-                                                    id: id.clone(),
-                                                    name: name.clone(),
-                                                    arguments,
-                                                }));
+                                                acc.name = Some(name.clone());
+                                            }
+                                            if let Some(args) = &function.arguments {
+                                                acc.arguments.push_str(args);
                                             }
                                         }
                                     }
@@ -356,6 +370,25 @@ fn chat_completions_stream_inner(
                     yield Err(OpenAIError::from(e));
                     return;
                 }
+            }
+        }
+
+        // Emit accumulated tool calls at the end
+        let mut sorted_calls: Vec<_> = tool_calls.into_iter().collect();
+        sorted_calls.sort_by_key(|(index, _)| *index);
+        for (_, acc) in sorted_calls {
+            if let (Some(id), Some(name)) = (acc.id, acc.name) {
+                let arguments = if acc.arguments.is_empty() {
+                    serde_json::Value::Object(Default::default())
+                } else {
+                    serde_json::from_str(&acc.arguments)
+                        .unwrap_or(serde_json::Value::Object(Default::default()))
+                };
+                yield Ok(Event::ToolCall(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                }));
             }
         }
     }

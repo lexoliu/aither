@@ -6,14 +6,15 @@ use async_process::Command;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Arguments for executing a shell command.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CommandArgs {
-    /// Executable name only (e.g., "ls", "cat"). No arguments here.
+    /// Program name to execute (e.g., "ls", "grep", "git", "cargo").
     pub program: String,
-    /// Arguments array (e.g., ["-l", "-a"] for "ls -la").
+    /// Command-line arguments as separate strings (e.g., ["-la"] for ls, ["-r", "TODO", "src/"] for grep).
     #[serde(default)]
     pub args: Vec<String>,
-    /// Working directory (optional).
+    /// Working directory for command execution. Omit to use default.
     pub cwd: Option<PathBuf>,
 }
 
@@ -41,8 +42,8 @@ impl CommandTool {
             allowed: None,
             default_cwd,
             max_output: 16 * 1024,
-            name: "command_runner".into(),
-            description: "Executes shell commands inside a sandboxed environment.".into(),
+            name: "command".into(),
+            description: include_str!("prompt.md").into(),
         }
     }
 
@@ -101,7 +102,7 @@ impl Tool for CommandTool {
 
     type Arguments = CommandArgs;
 
-    async fn call(&mut self, arguments: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
         self.ensure_allowed(&arguments.program)?;
 
         let working_dir = arguments.cwd.unwrap_or_else(|| self.default_cwd.clone());

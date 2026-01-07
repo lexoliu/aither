@@ -13,7 +13,7 @@ impl EmbeddingModel for OpenAI {
     }
 
     fn embed(
-        &mut self,
+        &self,
         text: &str,
     ) -> impl core::future::Future<Output = CoreResult<Vec<f32>>> + Send {
         let cfg = self.config();

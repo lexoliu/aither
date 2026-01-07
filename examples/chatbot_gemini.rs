@@ -4,7 +4,7 @@
 
 use std::io::{self, Write};
 
-use aither::llm::LLMRequest;
+use aither::llm::{Event, LLMRequest};
 use aither_core::{LanguageModel, llm::Message};
 use aither_gemini::Gemini;
 use anyhow::{Context, Result};
@@ -48,10 +48,12 @@ async fn main() -> Result<()> {
             pin!(stream);
             let mut response = String::new();
             while let Some(chunk) = stream.next().await {
-                let text = chunk?;
-                print!("{text}");
-                io::stdout().flush().ok();
-                response.push_str(&text);
+                let event = chunk?;
+                if let Event::Text(text) = event {
+                    print!("{text}");
+                    io::stdout().flush().ok();
+                    response.push_str(&text);
+                }
             }
             println!();
             response

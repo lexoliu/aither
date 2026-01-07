@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use aither_core::{
     LanguageModel,
     llm::{
-        LLMRequest, Message, Tool,
+        Event, LLMRequest, Message, Tool,
         model::{Parameters, ToolChoice},
         oneshot,
         tool::Tools,
@@ -15,6 +15,7 @@ use aither_core::{
 };
 use aither_gemini::Gemini;
 use anyhow::{Context, Result};
+use futures_lite::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -52,7 +53,13 @@ async fn structured_output(gemini: &Gemini) -> Result<()> {
     )
     .with_parameters(params);
 
-    let raw = gemini.respond(req).into_future().await?;
+    let mut stream = gemini.respond(req);
+    let mut raw = String::new();
+    while let Some(event) = stream.next().await {
+        if let Event::Text(text) = event? {
+            raw.push_str(&text);
+        }
+    }
     println!("Raw structured response:\n{raw}\n");
 
     match serde_json::from_str::<SimpleStruct>(&raw) {
@@ -82,7 +89,7 @@ impl Tool for EchoTool {
     type Arguments = EchoArgs;
 
     fn call(
-        &mut self,
+        &self,
         arguments: Self::Arguments,
     ) -> impl core::future::Future<Output = aither_core::Result<String>> + Send {
         let text = arguments.text;
@@ -104,9 +111,19 @@ async fn tool_call(gemini: &Gemini) -> Result<()> {
         ),
     ])
     .with_parameters(params)
-    .with_tools(&mut tools);
+    .with_tool_definitions(tools.definitions());
 
-    let final_text = gemini.respond(request).into_future().await?;
+    let mut stream = gemini.respond(request);
+    let mut final_text = String::new();
+    while let Some(event) = stream.next().await {
+        match event? {
+            Event::Text(text) => final_text.push_str(&text),
+            Event::ToolCall(call) => {
+                println!("Tool call received: {} with args {}", call.name, call.arguments);
+            }
+            _ => {}
+        }
+    }
     println!("Tool call response:\n{final_text}");
     Ok(())
 }

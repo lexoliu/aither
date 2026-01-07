@@ -1,6 +1,6 @@
 //! Request building and message conversion for the Claude API.
 
-use aither_core::llm::{Annotation, Message, Role, model::Parameters, tool::ToolDefinition};
+use aither_core::llm::{Message, Role, model::Parameters, tool::ToolDefinition};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -256,31 +256,9 @@ fn is_image_url(url: &str) -> bool {
         || lower.contains("/image")
 }
 
-/// Flatten message content including annotations.
+/// Flatten message content.
 fn flatten_content(message: &Message) -> String {
-    let mut content = message.content().to_owned();
-
-    if !message.annotations().is_empty() {
-        content.push_str("\n\nReferences:\n");
-        for annotation in message.annotations() {
-            match annotation {
-                Annotation::Url(url) => {
-                    content.push_str("- ");
-                    content.push_str(&url.title);
-                    content.push_str(": ");
-                    content.push_str(url.url.as_str());
-                    if !url.content.is_empty() {
-                        content.push_str(" (");
-                        content.push_str(&url.content);
-                        content.push(')');
-                    }
-                    content.push('\n');
-                }
-            }
-        }
-    }
-
-    content
+    message.content().to_owned()
 }
 
 /// Convert aither tool definitions to Claude format.

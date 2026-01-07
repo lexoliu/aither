@@ -276,7 +276,7 @@ mod tests {
 
         type Arguments = MockArgs;
 
-        async fn call(&mut self, _args: Self::Arguments) -> aither_core::Result {
+        async fn call(&self, _args: Self::Arguments) -> aither_core::Result {
             Ok("ok".to_string())
         }
     }

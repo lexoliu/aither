@@ -1,5 +1,5 @@
 use aither_core::llm::{
-    Annotation, Message, Role,
+    Message, Role,
     model::{Parameters, ReasoningEffort, ToolChoice},
     tool::ToolDefinition,
 };
@@ -195,16 +195,43 @@ struct ReasoningPayload {
 pub fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
     messages
         .iter()
-        .map(|message| ChatMessagePayload {
-            role: match message.role() {
+        .map(|message| {
+            let role = match message.role() {
                 Role::User => "user",
                 Role::Assistant => "assistant",
                 Role::System => "system",
                 Role::Tool => "tool",
-            },
-            content: flatten_content(message),
-            tool_calls: None,
-            tool_call_id: None,
+            };
+
+            // Handle tool_call_id for Tool messages
+            let tool_call_id = message.tool_call_id().map(String::from);
+
+            // Handle tool_calls for Assistant messages
+            let tool_calls = if !message.tool_calls().is_empty() {
+                Some(
+                    message
+                        .tool_calls()
+                        .iter()
+                        .map(|tc| ChatToolCallPayload {
+                            id: tc.id.clone(),
+                            kind: "function",
+                            function: ChatToolFunctionPayload {
+                                name: tc.name.clone(),
+                                arguments: tc.arguments.to_string(),
+                            },
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
+
+            ChatMessagePayload {
+                role,
+                content: flatten_content(message),
+                tool_calls,
+                tool_call_id,
+            }
         })
         .collect()
 }
@@ -218,26 +245,6 @@ fn flatten_content(message: &Message) -> String {
             content.push_str("- ");
             content.push_str(attachment.as_str());
             content.push('\n');
-        }
-    }
-
-    if !message.annotations().is_empty() {
-        content.push_str("\n\nReferences:\n");
-        for annotation in message.annotations() {
-            match annotation {
-                Annotation::Url(url) => {
-                    content.push_str("- ");
-                    content.push_str(&url.title);
-                    content.push_str(": ");
-                    content.push_str(url.url.as_str());
-                    if !url.content.is_empty() {
-                        content.push_str(" (");
-                        content.push_str(&url.content);
-                        content.push(')');
-                    }
-                    content.push('\n');
-                }
-            }
         }
     }
 
@@ -267,10 +274,15 @@ fn tool_choice(params: &ParameterSnapshot, has_tools: bool) -> Option<ToolChoice
         return None;
     }
     match &params.tool_choice {
-        ToolChoice::Auto => None,
+        ToolChoice::Auto => Some(ToolChoicePayload::Mode("auto")),
         ToolChoice::None => Some(ToolChoicePayload::Mode("none")),
         ToolChoice::Required => Some(ToolChoicePayload::Mode("required")),
-        ToolChoice::Exact(_) => None,
+        ToolChoice::Exact(name) => Some(ToolChoicePayload::Function {
+            kind: "function",
+            function: ToolChoiceFunction {
+                name: name.clone(),
+            },
+        }),
     }
 }
 

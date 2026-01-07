@@ -128,7 +128,9 @@ pub trait EmbeddingModel: Send + Sized + Send + Sync {
     ///
     /// A [`Vec<f32>`] with length equal to [`Self::dim`](EmbeddingModel::dim).
     /// The vector represents the semantic meaning of the input text in high-dimensional space.
-    fn embed(&mut self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send;
+    ///
+    /// Implementations that need mutable state should use interior mutability.
+    fn embed(&self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send;
 }
 
 #[cfg(test)]
@@ -146,7 +148,7 @@ mod tests {
         }
 
         #[allow(clippy::cast_precision_loss)]
-        async fn embed(&mut self, text: &str) -> crate::Result<Vec<f32>> {
+        async fn embed(&self, text: &str) -> crate::Result<Vec<f32>> {
             // Create a simple mock embedding based on text length
             let mut embedding = vec![0.0; self.dimension];
             let text_len = text.len();

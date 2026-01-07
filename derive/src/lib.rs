@@ -303,7 +303,7 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
             }
             type Arguments = #args_type;
 
-            async fn call(&mut self, args: Self::Arguments) -> ::aither::Result {
+            async fn call(&self, args: Self::Arguments) -> ::aither::Result {
                 #extractor
                 let result: ::aither::Result<_> = #call_expr;
                 let result: ::aither::Result<String> = result.map(|value|{

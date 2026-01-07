@@ -208,7 +208,9 @@ pub trait Tool: Send + Sync {
     /// Executes the tool with the provided arguments.
     ///
     /// Returns a [`crate::Result`] containing the tool's output.
-    fn call(&mut self, arguments: Self::Arguments) -> impl Future<Output = Result> + Send;
+    ///
+    /// Tools that need mutable state should use interior mutability (e.g., `Mutex`).
+    fn call(&self, arguments: Self::Arguments) -> impl Future<Output = Result> + Send;
 }
 
 /// Utility to convert a serializable value to a pretty-printed JSON string.
@@ -239,7 +241,7 @@ pub fn json<T: Serialize>(value: &T) -> String {
 }
 
 trait ToolImpl: Send + Sync + Any {
-    fn call(&mut self, args: &str) -> Pin<Box<dyn Future<Output = Result> + Send + '_>>;
+    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result> + Send + '_>>;
     fn definition(&self) -> ToolDefinition;
 }
 
@@ -255,7 +257,7 @@ fn is_object<T: JsonSchema>() -> bool {
 }
 
 impl<T: Tool + 'static> ToolImpl for T {
-    fn call(&mut self, args: &str) -> Pin<Box<dyn Future<Output = Result> + Send + '_>> {
+    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result> + Send + '_>> {
         let is_object = is_object::<T::Arguments>();
 
         let result = if is_object {
@@ -265,10 +267,14 @@ impl<T: Tool + 'static> ToolImpl for T {
         };
 
         let Ok(arguments) = result else {
+            let name = self.name();
+            let mut schema = schema_for!(T::Arguments).to_value();
+            clean_schema(&mut schema);
+            let schema_str =
+                serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".to_string());
             return Box::pin(async move {
                 Err(anyhow::Error::msg(format!(
-                    "Failed to parse arguments for tool '{}'",
-                    self.name()
+                    "Invalid arguments for tool '{name}'. Expected schema:\n{schema_str}"
                 )))
             });
         };
@@ -447,6 +453,72 @@ fn resolve_and_clean(value: &mut Value, defs: &serde_json::Map<String, Value>) {
                 map.insert("enum".to_string(), Value::Array(alloc::vec![const_val]));
             }
 
+            // Handle oneOf/anyOf - flatten variants into single object with all properties
+            // Gemini doesn't handle oneOf well for tool schemas
+            if let Some(Value::Array(variants)) = map.remove("oneOf").or_else(|| map.remove("anyOf"))
+            {
+                let mut all_properties = serde_json::Map::new();
+
+                for variant in variants {
+                    if let Value::Object(variant_map) = variant {
+                        if let Some(Value::Object(props)) = variant_map.get("properties") {
+                            for (key, val) in props {
+                                // Extract enum value - handle both "enum" and "const"
+                                let new_values: Option<alloc::vec::Vec<Value>> =
+                                    if let Value::Object(val_obj) = val {
+                                        if let Some(Value::Array(arr)) = val_obj.get("enum") {
+                                            Some(arr.clone())
+                                        } else if let Some(const_val) = val_obj.get("const") {
+                                            Some(alloc::vec![const_val.clone()])
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                if all_properties.contains_key(key) {
+                                    // Merge enum/const values into existing
+                                    if let Some(values) = new_values {
+                                        if let Some(Value::Object(existing_obj)) =
+                                            all_properties.get_mut(key)
+                                        {
+                                            if let Some(Value::Array(existing_enum)) =
+                                                existing_obj.get_mut("enum")
+                                            {
+                                                for e in values {
+                                                    if !existing_enum.contains(&e) {
+                                                        existing_enum.push(e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // First time seeing this property - convert const to enum
+                                    let mut val_clone = val.clone();
+                                    if let Value::Object(obj) = &mut val_clone {
+                                        if let Some(const_val) = obj.remove("const") {
+                                            obj.insert(
+                                                "enum".to_string(),
+                                                Value::Array(alloc::vec![const_val]),
+                                            );
+                                        }
+                                    }
+                                    all_properties.insert(key.clone(), val_clone);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Set type as object if we have properties
+                if !all_properties.is_empty() {
+                    map.insert("type".to_string(), Value::String("object".to_string()));
+                    map.insert("properties".to_string(), Value::Object(all_properties));
+                }
+            }
+
             // Recursively clean all values
             for v in map.values_mut() {
                 resolve_and_clean(v, defs);
@@ -544,8 +616,8 @@ impl Tools {
     ///
     /// Returns an error if the tool is not found, arguments cannot be parsed,
     /// or tool execution fails.
-    pub async fn call(&mut self, name: &str, args: &str) -> Result {
-        if let Some(tool) = self.tools.get_mut(name) {
+    pub async fn call(&self, name: &str, args: &str) -> Result {
+        if let Some(tool) = self.tools.get(name) {
             tool.call(args).await
         } else {
             Err(anyhow::Error::msg(format!("Tool '{name}' not found")))
@@ -578,7 +650,7 @@ mod tests {
         }
         type Arguments = CalculatorArgs;
 
-        async fn call(&mut self, args: Self::Arguments) -> Result {
+        async fn call(&self, args: Self::Arguments) -> Result {
             match args.operation.as_str() {
                 "add" => Ok((args.a + args.b).to_string()),
                 "subtract" => Ok((args.a - args.b).to_string()),
@@ -614,7 +686,7 @@ mod tests {
         }
         type Arguments = GreetArgs;
 
-        async fn call(&mut self, args: Self::Arguments) -> Result {
+        async fn call(&self, args: Self::Arguments) -> Result {
             Ok(format!("Hello, {}!", args.name))
         }
     }

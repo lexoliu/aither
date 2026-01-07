@@ -12,7 +12,7 @@ impl EmbeddingModel for DemoEmbedder {
         4
     }
 
-    async fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let mut vector = vec![0.0; self.dim()];
         for (idx, byte) in text.bytes().enumerate() {
             let bucket = idx % self.dim();

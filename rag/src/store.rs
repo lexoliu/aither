@@ -75,7 +75,7 @@ where
     /// # Returns
     /// The number of chunks actually inserted (may be less than total chunks
     /// if deduplication is enabled and duplicates are found).
-    pub async fn insert(&mut self, document: Document) -> Result<usize> {
+    pub async fn insert(&self, document: Document) -> Result<usize> {
         let chunks = self.chunker.chunk(&document)?;
         let mut inserted = 0;
 
@@ -102,7 +102,7 @@ where
     ///
     /// # Returns
     /// The total number of chunks inserted across all documents.
-    pub async fn insert_batch(&mut self, documents: Vec<Document>) -> Result<usize> {
+    pub async fn insert_batch(&self, documents: Vec<Document>) -> Result<usize> {
         let mut total_inserted = 0;
         for doc in documents {
             total_inserted += self.insert(doc).await?;
@@ -147,7 +147,7 @@ where
     ///
     /// # Returns
     /// Search results sorted by similarity score (highest first).
-    pub async fn search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
+    pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
         self.search_with_k(query, self.config.default_top_k).await
     }
 
@@ -159,7 +159,7 @@ where
     ///
     /// # Returns
     /// Search results sorted by similarity score (highest first).
-    pub async fn search_with_k(&mut self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+    pub async fn search_with_k(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         let embedding = self
             .embedder
             .embed(query)
@@ -197,11 +197,6 @@ where
         &self.embedder
     }
 
-    /// Returns a mutable reference to the embedder.
-    pub fn embedder_mut(&mut self) -> &mut M {
-        &mut self.embedder
-    }
-
     /// Returns the configuration.
     pub fn config(&self) -> &RagConfig {
         &self.config
@@ -234,7 +229,7 @@ mod tests {
             self.dimension
         }
 
-        async fn embed(&mut self, text: &str) -> aither_core::Result<Vec<f32>> {
+        async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {

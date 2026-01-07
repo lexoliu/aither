@@ -34,6 +34,7 @@ pub use error::OrtError;
 pub use pooling::PoolingStrategy;
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use aither_core::EmbeddingModel;
 use ndarray::Ix3;
@@ -62,7 +63,7 @@ use tokenizers::Tokenizer;
 /// # Ok::<(), aither_ort::OrtError>(())
 /// ```
 pub struct OrtEmbedding {
-    session: Session,
+    session: Mutex<Session>,
     tokenizer: Tokenizer,
     dimension: usize,
     pooling: PoolingStrategy,
@@ -135,7 +136,7 @@ impl EmbeddingModel for OrtEmbedding {
         self.dimension
     }
 
-    async fn embed(&mut self, text: &str) -> aither_core::Result<Vec<f32>> {
+    async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
         // Tokenize
         let encoding = self
             .tokenizer
@@ -158,39 +159,44 @@ impl EmbeddingModel for OrtEmbedding {
             ort::value::Tensor::from_array(([1, seq_len], attention_mask.into_boxed_slice()))
                 .map_err(OrtError::from)?;
 
-        // Run inference
-        let outputs = self
-            .session
-            .run(ort::inputs![
-                "input_ids" => input_ids_tensor,
-                "attention_mask" => attention_mask_tensor,
-            ])
-            .map_err(OrtError::from)?;
+        // Run inference and extract to owned array (before releasing session lock)
+        let hidden_states_owned = {
+            let mut session = self.session.lock().expect("session lock poisoned");
+            let outputs = session
+                .run(ort::inputs![
+                    "input_ids" => input_ids_tensor,
+                    "attention_mask" => attention_mask_tensor,
+                ])
+                .map_err(OrtError::from)?;
 
-        // Extract hidden states - try common output names
-        let hidden_states = outputs
-            .get("last_hidden_state")
-            .or_else(|| outputs.get("hidden_states"))
-            .or_else(|| outputs.get("output"))
-            .ok_or_else(|| OrtError::InvalidOutputShape(0))?;
+            // Extract hidden states - try common output names
+            let hidden_states = outputs
+                .get("last_hidden_state")
+                .or_else(|| outputs.get("hidden_states"))
+                .or_else(|| outputs.get("output"))
+                .ok_or_else(|| OrtError::InvalidOutputShape(0))?;
 
-        let view = hidden_states
-            .try_extract_array::<f32>()
-            .map_err(OrtError::from)?;
+            let view = hidden_states
+                .try_extract_array::<f32>()
+                .map_err(OrtError::from)?;
+
+            // Convert to owned array before releasing lock
+            view.to_owned()
+        };
 
         // Ensure 3D shape [batch, seq_len, hidden_dim]
-        let shape = view.shape();
+        let shape = hidden_states_owned.shape();
         if shape.len() != 3 {
             return Err(OrtError::InvalidOutputShape(shape.len()).into());
         }
 
-        let view_3d = view
+        let view_3d = hidden_states_owned
             .into_dimensionality::<Ix3>()
             .map_err(|e: ndarray::ShapeError| OrtError::Shape(e.to_string()))?;
 
         // Apply pooling
         let attention_mask_u32: Vec<u32> = encoding.get_attention_mask().iter().copied().collect();
-        let mut embedding = self.pooling.apply(&view_3d, &attention_mask_u32);
+        let mut embedding = self.pooling.apply(&view_3d.view(), &attention_mask_u32);
 
         // Normalize if enabled
         if self.normalize {
@@ -277,7 +283,7 @@ impl OrtEmbeddingBuilder {
         let dimension = detect_embedding_dimension(&session)?;
 
         Ok(OrtEmbedding {
-            session,
+            session: Mutex::new(session),
             tokenizer,
             dimension,
             pooling: self.pooling,

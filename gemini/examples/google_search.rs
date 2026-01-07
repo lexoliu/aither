@@ -7,10 +7,11 @@
 //! This example demonstrates how to answer a question that requires up-to-date
 //! information by enabling the native Google Search tool.
 
-use aither_core::llm::{LanguageModel, Message, model::Parameters};
+use aither_core::llm::{Event, LanguageModel, Message, model::Parameters};
 use aither_gemini::Gemini;
+use futures_lite::StreamExt;
 use std::env;
-use std::io::{self, Write}; // For StreamExt::next()
+use std::io::{self, Write};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,9 +41,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_parameters(Parameters::default().websearch(true));
 
         println!("Gemini (searching): ");
-        let full_response = backend.respond(request).await?;
-
-        println!("{}", full_response);
+        let mut stream = backend.respond(request);
+        let mut full_response = String::new();
+        while let Some(event) = stream.next().await {
+            if let Event::Text(text) = event? {
+                print!("{text}");
+                io::stdout().flush()?;
+                full_response.push_str(&text);
+            }
+        }
+        println!();
     }
 
     Ok(())

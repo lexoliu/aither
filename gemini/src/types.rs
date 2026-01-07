@@ -31,6 +31,8 @@ pub struct GenerateContentRequest {
 pub struct GeminiContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) role: Option<String>,
+    /// Parts of the content. Defaults to empty if not present in response.
+    #[serde(default)]
     pub(crate) parts: Vec<Part>,
 }
 

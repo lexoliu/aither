@@ -17,16 +17,16 @@ use std::{
     time::Duration,
 };
 
-use aither::llm::{LLMRequest, model::ReasoningEffort, tool::Tools};
+use aither::llm::{Event as LlmEvent, LLMRequest, model::ReasoningEffort, tool::Tools};
 use aither_core::{
     LanguageModel,
     llm::{Message, model::Parameters},
 };
 use aither_gemini::Gemini;
-use aither_mem0::{Config as Mem0Config, InMemoryStore, Mem0, Memory, SearchResult};
-use aither_rag::{Document, Metadata, RagStore};
+use aither_mem0::{Config as Mem0Config, InMemoryStore, Mem0, Memory, SearchResult as Mem0SearchResult};
+use aither_rag::{Document, Metadata, RagStore, SearchResult as RagSearchResult};
 use anyhow::{Context, Result, anyhow};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures_lite::{StreamExt, pin};
 use tracing_subscriber::EnvFilter;
@@ -92,7 +92,7 @@ async fn run_loop(gemini: Backend, mem0: MemoryManager, rag: Store) -> Result<()
             continue;
         }
 
-        let rag_hits = match rag.query(user, RAG_TOP_K).await {
+        let rag_hits = match rag.search_with_k(user, RAG_TOP_K).await {
             Ok(hits) => hits,
             Err(err) => {
                 eprintln!("RAG lookup failed: {err}");
@@ -114,17 +114,19 @@ async fn run_loop(gemini: Backend, mem0: MemoryManager, rag: Store) -> Result<()
         tools.register(mem0.search_tool());
         let request = LLMRequest::new(request_messages)
             .with_parameters(params)
-            .with_tools(&mut tools);
+            .with_tool_definitions(tools.definitions());
 
         println!("Gemini>");
         let mut response = String::new();
         let stream = gemini.respond(request);
         pin!(stream);
         while let Some(chunk) = stream.next().await {
-            let text = chunk?;
-            print!("{text}");
-            io::stdout().flush().ok();
-            response.push_str(&text);
+            let event = chunk?;
+            if let LlmEvent::Text(text) = event {
+                print!("{text}");
+                io::stdout().flush().ok();
+                response.push_str(&text);
+            }
         }
         println!();
 
@@ -169,7 +171,7 @@ fn truncate(text: &str, limit: usize) -> String {
     truncated
 }
 
-fn format_memories(hits: &[SearchResult]) -> Option<String> {
+fn format_memories(hits: &[Mem0SearchResult]) -> Option<String> {
     if hits.is_empty() {
         return None;
     }
@@ -183,7 +185,7 @@ fn format_memories(hits: &[SearchResult]) -> Option<String> {
     Some(format!("Relevant memories:\n{}", rows.join("\n")))
 }
 
-fn format_rag_hits(hits: &[aither_rag::RetrievedDocument]) -> Option<String> {
+fn format_rag_hits(hits: &[RagSearchResult]) -> Option<String> {
     if hits.is_empty() {
         return None;
     }
@@ -192,17 +194,17 @@ fn format_rag_hits(hits: &[aither_rag::RetrievedDocument]) -> Option<String> {
         .enumerate()
         .map(|(idx, hit)| {
             let origin = hit
-                .document
+                .chunk
                 .metadata
                 .get("path")
                 .cloned()
-                .unwrap_or_else(|| hit.document.id.clone());
+                .unwrap_or_else(|| hit.chunk.id.clone());
             format!(
                 "{}. [{}] {} :: {}",
                 idx + 1,
                 format!("{:.2}", hit.score),
                 origin,
-                truncate(&hit.document.text, 240)
+                truncate(&hit.chunk.text, 240)
             )
         })
         .collect();
@@ -277,7 +279,7 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
     loop {
         if event::poll(Duration::from_millis(250))? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                TermEvent::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Esc => {
                         print!("\r\n");
                         io::stdout().flush().ok();

@@ -1,6 +1,7 @@
-//! SubAgent - Wrap an agent as a callable tool.
+//! SubAgent - Wrap an agent configuration as a callable tool.
 //!
 //! Allows composing agents by delegating tasks to specialized sub-agents.
+//! Each call spawns a fresh agent instance.
 
 use std::borrow::Cow;
 
@@ -8,9 +9,9 @@ use aither_core::{LanguageModel, llm::Tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::{Agent, AgentError, hook::Hook};
+use crate::Agent;
 
-/// A sub-agent that can be used as a tool by a parent agent.
+/// A sub-agent tool that spawns a fresh agent for each call.
 ///
 /// This allows building hierarchies of agents, where a main agent
 /// can delegate specific tasks to specialized sub-agents.
@@ -18,15 +19,10 @@ use crate::{Agent, AgentError, hook::Hook};
 /// # Example
 ///
 /// ```rust,ignore
-/// let reviewer = Agent::builder(claude)
-///     .system_prompt("You are a code reviewer...")
-///     .build();
-///
-/// let reviewer_tool = SubAgentTool::new(
-///     reviewer,
-///     "code-reviewer",
-///     "Reviews code for security and quality issues"
-/// );
+/// let reviewer_tool = SubAgentTool::new(claude.clone())
+///     .name("code-reviewer")
+///     .description("Reviews code for security and quality issues")
+///     .system_prompt("You are a code reviewer...");
 ///
 /// let main_agent = Agent::builder(claude)
 ///     .tool(reviewer_tool)
@@ -35,45 +31,43 @@ use crate::{Agent, AgentError, hook::Hook};
 /// // Main agent can now delegate review tasks
 /// main_agent.query("Write and review a new function").await?;
 /// ```
-pub struct SubAgentTool<LLM, H = ()> {
-    agent: Agent<LLM, H>,
+pub struct SubAgentTool<LLM> {
+    llm: LLM,
     name: String,
     description: String,
+    system_prompt: Option<String>,
 }
 
-impl<LLM, H> SubAgentTool<LLM, H>
-where
-    LLM: LanguageModel,
-    H: Hook,
-{
-    /// Creates a new sub-agent tool.
-    pub fn new(
-        agent: Agent<LLM, H>,
-        name: impl Into<String>,
-        description: impl Into<String>,
-    ) -> Self {
+impl<LLM: Clone> SubAgentTool<LLM> {
+    /// Creates a new sub-agent tool with the given LLM.
+    pub fn new(llm: LLM) -> Self {
         Self {
-            agent,
-            name: name.into(),
-            description: description.into(),
+            llm,
+            name: "subagent".to_string(),
+            description: "A sub-agent that can handle delegated tasks".to_string(),
+            system_prompt: None,
         }
     }
 
-    /// Returns the sub-agent's name.
+    /// Sets the tool name.
     #[must_use]
-    pub fn agent_name(&self) -> &str {
-        &self.name
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
-    /// Returns a reference to the underlying agent.
+    /// Sets the tool description.
     #[must_use]
-    pub const fn agent(&self) -> &Agent<LLM, H> {
-        &self.agent
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
     }
 
-    /// Returns a mutable reference to the underlying agent.
-    pub fn agent_mut(&mut self) -> &mut Agent<LLM, H> {
-        &mut self.agent
+    /// Sets the system prompt for the sub-agent.
+    #[must_use]
+    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
+        self
     }
 }
 
@@ -85,10 +79,9 @@ pub struct SubAgentQuery {
     pub task: String,
 }
 
-impl<LLM, H> Tool for SubAgentTool<LLM, H>
+impl<LLM> Tool for SubAgentTool<LLM>
 where
-    LLM: LanguageModel + 'static,
-    H: Hook + 'static,
+    LLM: LanguageModel + Clone + 'static,
 {
     fn name(&self) -> Cow<'static, str> {
         Cow::Owned(self.name.clone())
@@ -100,42 +93,29 @@ where
 
     type Arguments = SubAgentQuery;
 
-    async fn call(&mut self, args: Self::Arguments) -> aither_core::Result {
-        self.agent
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result {
+        // Create a fresh agent for this call
+        let mut builder = Agent::builder(self.llm.clone());
+
+        if let Some(ref prompt) = self.system_prompt {
+            builder = builder.system_prompt(prompt);
+        }
+
+        let mut agent = builder.build();
+
+        agent
             .query(&args.task)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 
-/// Extension trait for converting an agent into a sub-agent tool.
-pub trait IntoSubAgent {
-    /// The language model type.
-    type LLM: LanguageModel;
-    /// The hook type.
-    type Hooks: Hook;
-
-    /// Converts this agent into a sub-agent tool.
-    fn into_subagent(
-        self,
-        name: impl Into<String>,
-        description: impl Into<String>,
-    ) -> SubAgentTool<Self::LLM, Self::Hooks>;
-}
-
-impl<LLM, H> IntoSubAgent for Agent<LLM, H>
-where
-    LLM: LanguageModel,
-    H: Hook,
-{
-    type LLM = LLM;
-    type Hooks = H;
-
-    fn into_subagent(
-        self,
-        name: impl Into<String>,
-        description: impl Into<String>,
-    ) -> SubAgentTool<LLM, H> {
-        SubAgentTool::new(self, name, description)
+/// Extension trait for creating sub-agent tools from an LLM.
+pub trait IntoSubAgent: LanguageModel + Clone + Sized {
+    /// Creates a sub-agent tool from this LLM.
+    fn into_subagent(self) -> SubAgentTool<Self> {
+        SubAgentTool::new(self)
     }
 }
+
+impl<LLM: LanguageModel + Clone> IntoSubAgent for LLM {}

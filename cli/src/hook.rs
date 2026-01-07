@@ -4,14 +4,14 @@
 
 use std::io::{self, Write};
 
-use aither_agent::{Hook, HookAction, StopContext, ToolResultContext, ToolUseContext};
+use aither_agent::{Hook, PostToolAction, PreToolAction, StopContext, ToolResultContext, ToolUseContext};
 
 /// A debug hook that logs tool calls and asks permission for sensitive operations.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DebugHook;
 
 impl Hook for DebugHook {
-    async fn pre_tool_use(&self, ctx: &ToolUseContext<'_>) -> HookAction {
+    async fn pre_tool_use(&self, ctx: &ToolUseContext<'_>) -> PreToolAction {
         println!(
             "\x1b[36m[tool]\x1b[0m {} \x1b[90m(turn {})\x1b[0m",
             ctx.tool_name, ctx.turn
@@ -29,15 +29,15 @@ impl Hook for DebugHook {
         // Check if this is a sensitive operation
         if is_sensitive(ctx.tool_name, ctx.arguments) {
             if !ask_permission() {
-                println!("\x1b[33m[skipped]\x1b[0m User denied permission");
-                return HookAction::Skip;
+                println!("\x1b[33m[denied]\x1b[0m User denied permission");
+                return PreToolAction::Deny("User denied permission".to_string());
             }
         }
 
-        HookAction::Continue
+        PreToolAction::Allow
     }
 
-    async fn post_tool_use(&self, ctx: &ToolResultContext<'_>) -> HookAction {
+    async fn post_tool_use(&self, ctx: &ToolResultContext<'_>) -> PostToolAction {
         let duration_ms = ctx.duration.as_millis();
 
         match ctx.result {
@@ -66,22 +66,22 @@ impl Hook for DebugHook {
             }
         }
 
-        HookAction::Continue
+        PostToolAction::Keep
     }
 
-    async fn on_stop(&self, ctx: &StopContext<'_>) -> HookAction {
+    async fn on_stop(&self, ctx: &StopContext<'_>) -> Option<String> {
         println!(
             "\n\x1b[90m[completed in {} turn(s), reason: {:?}]\x1b[0m",
             ctx.turns, ctx.reason
         );
-        HookAction::Continue
+        None
     }
 }
 
 /// Check if an operation is sensitive and requires user permission.
 fn is_sensitive(tool_name: &str, arguments: &str) -> bool {
     match tool_name {
-        "command_runner" => true,
+        "command" => true,
         "filesystem" => {
             // Parse to check operation type
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(arguments) {

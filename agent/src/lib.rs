@@ -41,6 +41,7 @@ mod event;
 mod hook;
 mod search;
 mod stream;
+mod todo;
 mod tools;
 
 // Specialized agents
@@ -65,9 +66,11 @@ pub use context::{ConversationMemory, MemoryCheckpoint};
 pub use error::AgentError;
 pub use event::AgentEvent;
 pub use hook::{
-    HCons, Hook, HookAction, StopContext, StopReason, ToolResultContext, ToolUseContext,
+    HCons, Hook, PostToolAction, PreToolAction, StopContext, StopReason, ToolResultContext,
+    ToolUseContext,
 };
 pub use stream::AgentStream;
+pub use todo::{TodoItem, TodoList, TodoStatus, TodoTool, TodoWriteArgs};
 pub use tools::AgentTools;
 
 // Re-export core tool trait for convenience

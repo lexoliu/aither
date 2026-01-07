@@ -45,22 +45,54 @@ pub trait FileSystem: Send + Sync + 'static {
     ) -> impl Future<Output = io::Result<Vec<DirEntry>>> + Send + 'a;
     fn create_dir<'a>(&'a self, dir: &'a Path) -> impl Future<Output = io::Result<()>> + Send + 'a;
     fn remove_dir<'a>(&'a self, dir: &'a Path) -> impl Future<Output = io::Result<()>> + Send + 'a;
+
+    /// Find files matching a glob pattern. Returns relative paths.
+    fn glob(&self, pattern: &str) -> io::Result<Vec<String>> {
+        // Default implementation returns empty - override for real filesystems
+        let _ = pattern;
+        Ok(Vec::new())
+    }
 }
 
-/// Filesystem operation. Set "operation" to one of: read, write, append, delete, list.
+/// Filesystem operation to perform.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum FsOperation {
-    /// Read a file's content.
-    Read { path: String },
-    /// Write content to a file (creates or overwrites).
-    Write { path: String, content: String },
-    /// Append content to a file.
-    Append { path: String, content: String },
+    /// Read entire file contents.
+    Read {
+        /// Relative path to the file (e.g., "src/main.rs", "data/config.json").
+        path: String,
+    },
+    /// Write content to a file, creating it if needed, overwriting if exists.
+    Write {
+        /// Relative path to the file.
+        path: String,
+        /// Text content to write.
+        content: String,
+    },
+    /// Append content to the end of an existing file.
+    Append {
+        /// Relative path to the file.
+        path: String,
+        /// Text content to append.
+        content: String,
+    },
     /// Delete a file.
-    Delete { path: String },
+    Delete {
+        /// Relative path to the file to delete.
+        path: String,
+    },
     /// List directory contents.
-    List { path: Option<String> },
+    List {
+        /// Relative path to directory. Omit or use empty string for current directory.
+        path: Option<String>,
+    },
+    /// Find files matching a glob pattern recursively.
+    /// Examples: "**/*.rs" finds all Rust files, "src/**/*.json" finds JSON in src.
+    Glob {
+        /// Glob pattern to match (e.g., "**/*.rs", "src/**/*.ts", "*.md").
+        pattern: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -109,7 +141,7 @@ impl<FS: FileSystem> FileSystemTool<FS> {
             filesystem: fs,
             allow_writes: true,
             name: "filesystem".into(),
-            description: "Reads and writes files relative to the mounted workspace.".into(),
+            description: include_str!("prompt.md").into(),
         }
     }
 
@@ -148,7 +180,7 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
 
     type Arguments = FsOperation;
 
-    async fn call(&mut self, arguments: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
         let response = match arguments {
             FsOperation::Read { path } => self
                 .filesystem
@@ -188,6 +220,10 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .await
                     .map_err(anyhow::Error::new)?;
                 json(&listing)
+            }
+            FsOperation::Glob { pattern } => {
+                let matches = self.filesystem.glob(&pattern)?;
+                json(&matches)
             }
         };
 
@@ -322,6 +358,24 @@ impl FileSystem for LocalFileSystem {
         self.ensure_writable()?;
         let target = self.resolve(dir, false).await?;
         remove_dir(&target).await
+    }
+
+    fn glob(&self, pattern: &str) -> io::Result<Vec<String>> {
+        let full_pattern = self.root.join(pattern);
+        let pattern_str = full_pattern.to_string_lossy();
+
+        let entries = glob::glob(&pattern_str)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.msg))?;
+
+        let mut results = Vec::new();
+        for entry in entries.flatten() {
+            // Convert to relative path
+            if let Ok(relative) = entry.strip_prefix(&self.root) {
+                results.push(relative.to_string_lossy().into_owned());
+            }
+        }
+        results.sort();
+        Ok(results)
     }
 }
 

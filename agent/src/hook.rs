@@ -11,9 +11,9 @@
 //! struct LoggingHook;
 //!
 //! impl Hook for LoggingHook {
-//!     async fn pre_tool_use(&self, ctx: &ToolUseContext<'_>) -> HookAction {
+//!     async fn pre_tool_use(&self, ctx: &ToolUseContext<'_>) -> PreToolAction {
 //!         println!("Calling: {}", ctx.tool_name);
-//!         HookAction::Continue
+//!         PreToolAction::Allow
 //!     }
 //! }
 //!
@@ -74,57 +74,31 @@ pub enum StopReason {
     EndTurn,
 }
 
-/// Result of a hook invocation.
+/// Action to take before a tool is executed.
 #[derive(Debug, Clone)]
-pub enum HookAction {
-    /// Continue with the operation normally.
-    Continue,
-
-    /// Skip this tool call (only valid for `pre_tool_use`).
-    Skip,
-
-    /// Abort the agent run with an error.
+pub enum PreToolAction {
+    /// Allow the tool to execute.
+    Allow,
+    /// Deny the tool execution. The reason is sent to the LLM as an error.
+    Deny(String),
+    /// Abort the agent run entirely with an error.
     Abort(String),
-
-    /// Replace the tool result with a custom value (only valid for `post_tool_use`).
-    Replace(String),
 }
 
-impl HookAction {
-    /// Returns `true` if this action indicates the operation should be skipped.
-    #[must_use]
-    pub fn should_skip(&self) -> bool {
-        matches!(self, Self::Skip)
-    }
-
-    /// Returns `true` if this action indicates the agent should abort.
-    #[must_use]
-    pub fn should_abort(&self) -> bool {
-        matches!(self, Self::Abort(_))
-    }
-
-    /// Returns the abort reason if this is an abort action.
-    #[must_use]
-    pub fn abort_reason(&self) -> Option<&str> {
-        match self {
-            Self::Abort(reason) => Some(reason),
-            _ => None,
-        }
-    }
-
-    /// Returns the replacement value if this is a replace action.
-    #[must_use]
-    pub fn replacement(&self) -> Option<&str> {
-        match self {
-            Self::Replace(value) => Some(value),
-            _ => None,
-        }
-    }
+/// Action to take after a tool is executed.
+#[derive(Debug, Clone)]
+pub enum PostToolAction {
+    /// Keep the original tool result.
+    Keep,
+    /// Replace the tool result with a custom value.
+    Replace(String),
+    /// Abort the agent run entirely with an error.
+    Abort(String),
 }
 
 /// Trait for intercepting agent operations.
 ///
-/// All methods have default no-op implementations that return `HookAction::Continue`.
+/// All methods have default no-op implementations.
 /// Implement only the methods you need.
 ///
 /// Hooks are composed using the [`HCons`] type, allowing multiple hooks to be
@@ -132,39 +106,39 @@ impl HookAction {
 pub trait Hook: Send + Sync {
     /// Called before a tool is executed.
     ///
-    /// Return `HookAction::Skip` to skip the tool call, or `HookAction::Abort`
-    /// to stop the agent entirely.
+    /// Return `PreToolAction::Deny` to reject the tool call (reason sent to LLM),
+    /// or `PreToolAction::Abort` to stop the agent entirely.
     fn pre_tool_use(
         &self,
         _ctx: &ToolUseContext<'_>,
-    ) -> impl std::future::Future<Output = HookAction> + Send {
-        async { HookAction::Continue }
+    ) -> impl std::future::Future<Output = PreToolAction> + Send {
+        async { PreToolAction::Allow }
     }
 
     /// Called after a tool is executed.
     ///
-    /// Return `HookAction::Replace` to override the tool result, or
-    /// `HookAction::Abort` to stop the agent.
+    /// Return `PostToolAction::Replace` to override the tool result, or
+    /// `PostToolAction::Abort` to stop the agent.
     fn post_tool_use(
         &self,
         _ctx: &ToolResultContext<'_>,
-    ) -> impl std::future::Future<Output = HookAction> + Send {
-        async { HookAction::Continue }
+    ) -> impl std::future::Future<Output = PostToolAction> + Send {
+        async { PostToolAction::Keep }
     }
 
     /// Called when the agent is about to stop.
     ///
-    /// Return `HookAction::Abort` to convert a successful stop into an error.
+    /// Return `Some(error)` to convert a successful stop into an error.
     fn on_stop(
         &self,
         _ctx: &StopContext<'_>,
-    ) -> impl std::future::Future<Output = HookAction> + Send {
-        async { HookAction::Continue }
+    ) -> impl std::future::Future<Output = Option<String>> + Send {
+        async { None }
     }
 
     /// Called when text is streamed from the LLM.
     ///
-    /// This is for observation only; the return value is ignored.
+    /// This is for observation only.
     fn on_text(&self, _text: &str) -> impl std::future::Future<Output = ()> + Send {
         async {}
     }
@@ -207,25 +181,25 @@ where
     Head: Hook,
     Tail: Hook,
 {
-    async fn pre_tool_use(&self, ctx: &ToolUseContext<'_>) -> HookAction {
+    async fn pre_tool_use(&self, ctx: &ToolUseContext<'_>) -> PreToolAction {
         match self.head.pre_tool_use(ctx).await {
-            HookAction::Continue => self.tail.pre_tool_use(ctx).await,
+            PreToolAction::Allow => self.tail.pre_tool_use(ctx).await,
             other => other,
         }
     }
 
-    async fn post_tool_use(&self, ctx: &ToolResultContext<'_>) -> HookAction {
+    async fn post_tool_use(&self, ctx: &ToolResultContext<'_>) -> PostToolAction {
         match self.head.post_tool_use(ctx).await {
-            HookAction::Continue => self.tail.post_tool_use(ctx).await,
+            PostToolAction::Keep => self.tail.post_tool_use(ctx).await,
             other => other,
         }
     }
 
-    async fn on_stop(&self, ctx: &StopContext<'_>) -> HookAction {
-        match self.head.on_stop(ctx).await {
-            HookAction::Continue => self.tail.on_stop(ctx).await,
-            other => other,
+    async fn on_stop(&self, ctx: &StopContext<'_>) -> Option<String> {
+        if let Some(err) = self.head.on_stop(ctx).await {
+            return Some(err);
         }
+        self.tail.on_stop(ctx).await
     }
 
     async fn on_text(&self, text: &str) {
@@ -248,16 +222,12 @@ mod tests {
                 count: std::sync::atomic::AtomicUsize::new(0),
             }
         }
-
-        fn count(&self) -> usize {
-            self.count.load(std::sync::atomic::Ordering::SeqCst)
-        }
     }
 
     impl Hook for CountingHook {
-        async fn pre_tool_use(&self, _ctx: &ToolUseContext<'_>) -> HookAction {
+        async fn pre_tool_use(&self, _ctx: &ToolUseContext<'_>) -> PreToolAction {
             self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            HookAction::Continue
+            PreToolAction::Allow
         }
     }
 
@@ -271,7 +241,7 @@ mod tests {
             message_count: 1,
         };
         let action = hook.pre_tool_use(&ctx).await;
-        assert!(matches!(action, HookAction::Continue));
+        assert!(matches!(action, PreToolAction::Allow));
     }
 
     #[tokio::test]
@@ -286,29 +256,6 @@ mod tests {
         };
 
         let action = chain.pre_tool_use(&ctx).await;
-        assert!(matches!(action, HookAction::Continue));
-        // Both hooks should have been called (count would be 1 each, but we can't check
-        // individual counts without keeping references - just verify it didn't panic)
-    }
-
-    #[test]
-    fn test_hook_action_helpers() {
-        assert!(HookAction::Skip.should_skip());
-        assert!(!HookAction::Continue.should_skip());
-
-        assert!(HookAction::Abort("reason".to_string()).should_abort());
-        assert!(!HookAction::Continue.should_abort());
-
-        assert_eq!(
-            HookAction::Abort("reason".to_string()).abort_reason(),
-            Some("reason")
-        );
-        assert_eq!(HookAction::Continue.abort_reason(), None);
-
-        assert_eq!(
-            HookAction::Replace("new".to_string()).replacement(),
-            Some("new")
-        );
-        assert_eq!(HookAction::Continue.replacement(), None);
+        assert!(matches!(action, PreToolAction::Allow));
     }
 }

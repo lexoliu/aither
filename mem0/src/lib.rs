@@ -35,7 +35,7 @@ where
         "Search for relevant memories based on a query string.".into()
     }
 
-    async fn call(&mut self, arguments: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
         Ok(self
             .inner
             .retrieve_formatted(&arguments, 50)
@@ -63,7 +63,7 @@ where
         "Add a new fact to memory.".into()
     }
 
-    async fn call(&mut self, arguments: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
         self.inner
             .add_fact(arguments)
             .await

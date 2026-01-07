@@ -38,8 +38,9 @@ pub struct AgentTools {
     config: ToolSearchConfig,
 
     /// MCP connections (when mcp feature is enabled).
+    /// Wrapped in Mutex to allow parallel tool calls.
     #[cfg(feature = "mcp")]
-    mcp: Vec<McpConnection>,
+    mcp: Vec<tokio::sync::Mutex<McpConnection>>,
 }
 
 impl Default for AgentTools {
@@ -165,7 +166,8 @@ impl AgentTools {
 
         #[cfg(feature = "mcp")]
         for conn in &self.mcp {
-            defs.extend(conn.definitions());
+            // Use blocking_lock for sync context - definitions are cached so this is fast
+            defs.extend(conn.blocking_lock().definitions());
         }
 
         defs
@@ -219,7 +221,7 @@ impl AgentTools {
     /// # Errors
     ///
     /// Returns an error if the tool is not found or execution fails.
-    pub async fn call(&mut self, name: &str, args: &str) -> aither_core::Result {
+    pub async fn call(&self, name: &str, args: &str) -> aither_core::Result {
         // Try eager tools first
         if self.eager.definitions().iter().any(|d| d.name() == name) {
             return self.eager.call(name, args).await;
@@ -237,12 +239,15 @@ impl AgentTools {
 
         // Try MCP tools
         #[cfg(feature = "mcp")]
-        for conn in &mut self.mcp {
-            if conn.has_tool(name) {
+        for conn in &self.mcp {
+            let has_tool = conn.blocking_lock().has_tool(name);
+            if has_tool {
                 let args_value: serde_json::Value =
                     serde_json::from_str(args).map_err(|e| anyhow::anyhow!("Invalid JSON: {e}"))?;
 
                 let result = conn
+                    .lock()
+                    .await
                     .call(name, args_value)
                     .await
                     .map_err(|e| anyhow::anyhow!("MCP tool error: {e}"))?;
@@ -285,7 +290,7 @@ impl AgentTools {
     /// All tools from the MCP server will be available for the agent to use.
     #[cfg(feature = "mcp")]
     pub fn register_mcp(&mut self, conn: McpConnection) {
-        self.mcp.push(conn);
+        self.mcp.push(tokio::sync::Mutex::new(conn));
     }
 
     /// Returns the number of registered MCP connections.
@@ -299,7 +304,10 @@ impl AgentTools {
     #[cfg(feature = "mcp")]
     #[must_use]
     pub fn mcp_definitions(&self) -> Vec<ToolDefinition> {
-        self.mcp.iter().flat_map(|c| c.definitions()).collect()
+        self.mcp
+            .iter()
+            .flat_map(|c| c.blocking_lock().definitions())
+            .collect()
     }
 }
 
@@ -347,7 +355,7 @@ impl Tool for ToolSearchTool {
 
     type Arguments = ToolSearchArgs;
 
-    async fn call(&mut self, args: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result {
         // Safety: We ensure the pointer is valid during agent execution
         let tools = unsafe { &mut *self.tools_ptr };
         Ok(tools.search_and_load(&args.query))
@@ -376,7 +384,7 @@ mod tests {
 
         type Arguments = DummyArgs;
 
-        async fn call(&mut self, _args: Self::Arguments) -> aither_core::Result {
+        async fn call(&self, _args: Self::Arguments) -> aither_core::Result {
             Ok("ok".to_string())
         }
     }

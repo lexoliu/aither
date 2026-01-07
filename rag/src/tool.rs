@@ -50,9 +50,9 @@ where
 
     type Arguments = RagToolArgs;
 
-    async fn call(&mut self, arguments: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
         let results = self
-            .store_mut()
+            .store()
             .search_with_k(&arguments.query, arguments.top_k)
             .await?;
 
@@ -99,7 +99,7 @@ mod tests {
             self.dimension
         }
 
-        async fn embed(&mut self, text: &str) -> aither_core::Result<Vec<f32>> {
+        async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {

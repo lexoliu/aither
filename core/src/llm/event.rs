@@ -169,7 +169,8 @@ impl Event {
 /// 2. Parsing and validating arguments
 /// 3. Executing the tool
 /// 4. Returning results to the model
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ToolCall {
     /// Unique identifier for this tool call.
     ///

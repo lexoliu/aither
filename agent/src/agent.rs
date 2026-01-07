@@ -4,7 +4,7 @@
 //! It manages conversation memory, applies context compression, and
 //! handles tool execution in an agent-controlled loop.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aither_core::{
     LanguageModel,
@@ -17,13 +17,14 @@ use crate::{
     config::AgentConfig,
     context::ConversationMemory,
     error::AgentError,
-    hook::{Hook, HookAction, StopContext, StopReason, ToolResultContext, ToolUseContext},
+    hook::{
+        Hook, PostToolAction, PreToolAction, StopContext, StopReason, ToolResultContext,
+        ToolUseContext,
+    },
     stream::AgentStream,
     tools::AgentTools,
 };
 
-/// Maximum number of tool call iterations per query.
-const MAX_TOOL_ITERATIONS: usize = 16;
 
 /// An autonomous agent that processes tasks using a language model.
 ///
@@ -206,9 +207,9 @@ where
 
         loop {
             iteration += 1;
-            if iteration > MAX_TOOL_ITERATIONS {
+            if iteration > self.config.max_iterations {
                 return Err(AgentError::MaxIterations {
-                    limit: MAX_TOOL_ITERATIONS,
+                    limit: self.config.max_iterations,
                 });
             }
 
@@ -267,71 +268,79 @@ where
             }
 
             // Store assistant response with tool calls in memory
-            if !response_text.is_empty() {
-                self.memory.push(Message::assistant(&response_text));
-            }
+            self.memory
+                .push(Message::assistant_with_tool_calls(&response_text, tool_calls.clone()));
 
-            // Execute tool calls
-            for call in tool_calls {
+            // Execute tool calls in parallel
+            let hooks = &self.hooks;
+            let tools = &self.tools;
+            let tool_futures = tool_calls.iter().map(|call| {
                 let args_json = call.arguments.to_string();
                 let message_count = self.memory.len();
 
-                // Pre-tool hook
-                let tool_ctx = ToolUseContext {
-                    tool_name: &call.name,
-                    arguments: &args_json,
-                    turn: iteration,
-                    message_count,
-                };
+                async move {
+                    // Pre-tool hook
+                    let tool_ctx = ToolUseContext {
+                        tool_name: &call.name,
+                        arguments: &args_json,
+                        turn: iteration,
+                        message_count,
+                    };
 
-                match self.hooks.pre_tool_use(&tool_ctx).await {
-                    HookAction::Abort(reason) => {
-                        return Err(AgentError::HookRejected {
-                            hook: "pre_tool_use",
-                            reason,
-                        });
-                    }
-                    HookAction::Skip => continue,
-                    HookAction::Continue | HookAction::Replace(_) => {}
+                    let (result, duration) = match hooks.pre_tool_use(&tool_ctx).await {
+                        PreToolAction::Abort(reason) => {
+                            return Err(AgentError::HookRejected {
+                                hook: "pre_tool_use",
+                                reason,
+                            });
+                        }
+                        PreToolAction::Deny(reason) => (Err(anyhow::anyhow!(reason)), Duration::ZERO),
+                        PreToolAction::Allow => {
+                            let start = Instant::now();
+                            let result = tools.call(&call.name, &args_json).await;
+                            (result, start.elapsed())
+                        }
+                    };
+
+                    // Post-tool hook
+                    let result_str = match &result {
+                        Ok(s) => s.clone(),
+                        Err(e) => format!("Error: {e}"),
+                    };
+                    let result_ref = result
+                        .as_ref()
+                        .map(|s| s.as_str())
+                        .map_err(|e| e.to_string());
+                    let result_ctx = ToolResultContext {
+                        tool_name: &call.name,
+                        arguments: &args_json,
+                        result: result_ref.as_ref().map(|s| *s).map_err(|s| s.as_str()),
+                        duration,
+                    };
+
+                    let tool_content = match hooks.post_tool_use(&result_ctx).await {
+                        PostToolAction::Abort(reason) => {
+                            return Err(AgentError::HookRejected {
+                                hook: "post_tool_use",
+                                reason,
+                            });
+                        }
+                        PostToolAction::Replace(replacement) => replacement,
+                        PostToolAction::Keep => result_str,
+                    };
+
+                    Ok((call.id.clone(), tool_content))
                 }
+            });
 
-                // Execute the tool
-                let start = Instant::now();
-                let result = self.tools.call(&call.name, &args_json).await;
-                let duration = start.elapsed();
+            // Wait for all tool calls to complete
+            let results: Vec<Result<(String, String), AgentError>> =
+                futures::future::join_all(tool_futures).await;
 
-                // Post-tool hook
-                let result_ref = result
-                    .as_ref()
-                    .map(|s| s.as_str())
-                    .map_err(|e| e.to_string());
-                let result_ctx = ToolResultContext {
-                    tool_name: &call.name,
-                    arguments: &args_json,
-                    result: result_ref.as_ref().map(|s| *s).map_err(|s| s.as_str()),
-                    duration,
-                };
-
-                match self.hooks.post_tool_use(&result_ctx).await {
-                    HookAction::Abort(reason) => {
-                        return Err(AgentError::HookRejected {
-                            hook: "post_tool_use",
-                            reason,
-                        });
-                    }
-                    _ => {}
-                }
-
-                // Handle the result
-                let output = result.map_err(|e| AgentError::ToolExecution {
-                    name: call.name.clone(),
-                    error: e.to_string(),
-                })?;
-
-                // Add tool result to memory as a formatted message
-                // Format: [tool_call_id:tool_name] result
-                let tool_content = format!("[{}:{}] {}", call.id, call.name, output);
-                self.memory.push(Message::tool(tool_content));
+            // Add results to memory in order
+            for result in results {
+                let (call_id, content) = result?;
+                self.memory.push(Message::tool(&call_id, content));
             }
 
             // Continue the loop to get the next response
@@ -344,14 +353,11 @@ where
             reason: StopReason::Complete,
         };
 
-        match self.hooks.on_stop(&stop_ctx).await {
-            HookAction::Abort(reason) => {
-                return Err(AgentError::HookRejected {
-                    hook: "on_stop",
-                    reason,
-                });
-            }
-            _ => {}
+        if let Some(reason) = self.hooks.on_stop(&stop_ctx).await {
+            return Err(AgentError::HookRejected {
+                hook: "on_stop",
+                reason,
+            });
         }
 
         Ok(final_text)

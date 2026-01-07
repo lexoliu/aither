@@ -53,6 +53,8 @@ aither-fs = { path = "./tools/fs" }
 aither-command = { path = "./tools/command" }
 aither-mcp = { path = "./mcp" }
 aither-agent = { path = "./agent" }
+aither-openai = { path = "./openai" }
+aither-claude = { path = "./claude" }
 aither-gemini = { path = "./gemini" }
 
 [dependencies]

@@ -21,7 +21,9 @@ aither-websearch = { workspace = true, optional = true }
 aither-fs = { workspace = true, optional = true }
 aither-command = { workspace = true, optional = true }
 aither-mcp = { workspace = true, optional = true }
+tokio = { version = "1.0", features = ["sync"], optional = true }
 async-stream = "0.3.6"
+futures = "0.3"
 futures-core = "0.3.31"
 futures-lite = "2.6"
 regex = "1.11"
@@ -33,7 +35,7 @@ default = []
 websearch = ["dep:aither-websearch"]
 filesystem = ["dep:aither-fs"]
 command = ["dep:aither-command"]
-mcp = ["dep:aither-mcp"]
+mcp = ["dep:aither-mcp", "dep:tokio"]
 full = ["websearch", "filesystem", "command", "mcp"]
 [lints]
 workspace = true

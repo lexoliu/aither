@@ -115,7 +115,7 @@ where
 
     type Arguments = WebSearchArgs;
 
-    async fn call(&mut self, arguments: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
         let limit = arguments.limit.clamp(1, 10);
         let results = self.provider.search(&arguments.query, limit).await?;
         Ok(json(&results))

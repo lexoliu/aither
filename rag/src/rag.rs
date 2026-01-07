@@ -107,7 +107,7 @@ where
     /// 4. Saves the index (if auto-save is enabled)
     ///
     /// Returns the number of files indexed and a receiver for progress updates.
-    pub async fn index_directory<P: AsRef<Path>>(&mut self, dir: P) -> Result<usize> {
+    pub async fn index_directory<P: AsRef<Path>>(&self, dir: P) -> Result<usize> {
         self.index_directory_with_progress(dir, |_| {}).await
     }
 
@@ -115,7 +115,7 @@ where
     ///
     /// The callback is called for each progress update during indexing.
     pub async fn index_directory_with_progress<P, F>(
-        &mut self,
+        &self,
         dir: P,
         mut on_progress: F,
     ) -> Result<usize>
@@ -201,7 +201,7 @@ where
     ///
     /// # Returns
     /// The number of chunks inserted.
-    pub async fn insert(&mut self, document: Document) -> Result<usize> {
+    pub async fn insert(&self, document: Document) -> Result<usize> {
         self.store.insert(document).await
     }
 
@@ -216,23 +216,18 @@ where
     /// Searches for similar content.
     ///
     /// Uses the configured default `top_k`.
-    pub async fn search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
+    pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
         self.store.search(query).await
     }
 
     /// Searches with a custom result count.
-    pub async fn search_with_k(&mut self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+    pub async fn search_with_k(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         self.store.search_with_k(query, top_k).await
     }
 
     /// Returns a reference to the underlying store.
     pub fn store(&self) -> &RagStore<M> {
         &self.store
-    }
-
-    /// Returns a mutable reference to the underlying store.
-    pub fn store_mut(&mut self) -> &mut RagStore<M> {
-        &mut self.store
     }
 
     /// Returns the number of indexed chunks.
@@ -403,7 +398,7 @@ mod tests {
             self.dimension
         }
 
-        async fn embed(&mut self, text: &str) -> aither_core::Result<Vec<f32>> {
+        async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {
