@@ -14,7 +14,9 @@ categories = ["api-bindings"]
 [dependencies]
 aither-core.workspace = true
 aither-models.workspace = true
+async-io = "2"
 async-stream = "0.3"
+http = "1"
 futures-core = { version = "0.3", default-features = false }
 futures-lite = "2.6"
 base64 = "0.21"

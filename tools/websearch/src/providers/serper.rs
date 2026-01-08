@@ -97,15 +97,19 @@ impl SearchProvider for Serper {
         };
 
         let mut backend = client();
-        let builder = backend
+        let response: SerperResponse = backend
             .post(SERPER_API_URL)
+            .map_err(|e| anyhow!("{e}"))?
             .header("X-API-KEY", &self.api_key)
+            .map_err(|e| anyhow!("{e}"))?
             .header(header::CONTENT_TYPE.as_str(), "application/json")
+            .map_err(|e| anyhow!("{e}"))?
             .header(header::ACCEPT.as_str(), "application/json")
-            .header(header::USER_AGENT.as_str(), "aither-websearch/0.1");
-
-        let response: SerperResponse = builder
+            .map_err(|e| anyhow!("{e}"))?
+            .header(header::USER_AGENT.as_str(), "aither-websearch/0.1")
+            .map_err(|e| anyhow!("{e}"))?
             .json_body(&request)
+            .map_err(|e| anyhow!("{e}"))?
             .json()
             .await
             .map_err(|e| anyhow!("{e}"))?;

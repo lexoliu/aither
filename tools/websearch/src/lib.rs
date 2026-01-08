@@ -40,7 +40,7 @@ pub use providers::*;
 
 use std::borrow::Cow;
 
-use aither_core::llm::Tool;
+use aither_core::llm::{Tool, ToolOutput};
 use aither_core::llm::tool::json;
 use anyhow::Result;
 use schemars::JsonSchema;
@@ -90,7 +90,7 @@ impl<P> WebSearchTool<P> {
     pub fn new(provider: P) -> Self {
         Self {
             provider,
-            name: "web_search".into(),
+            name: "websearch".into(),
             description: include_str!("prompt.md").into(),
         }
     }
@@ -109,6 +109,17 @@ impl<P> WebSearchTool<P> {
     }
 }
 
+/// Maximum retry attempts when search returns empty results.
+const MAX_RETRIES: u32 = 3;
+
+/// Delay between retry attempts in milliseconds.
+const RETRY_DELAY_MS: u64 = 500;
+
+/// Check if an error is non-retryable (e.g., CAPTCHA).
+fn is_non_retryable(e: &anyhow::Error) -> bool {
+    e.to_string().contains("CAPTCHA")
+}
+
 impl<P> Tool for WebSearchTool<P>
 where
     P: SearchProvider + 'static,
@@ -123,9 +134,38 @@ where
 
     type Arguments = WebSearchArgs;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
         let limit = arguments.limit.clamp(1, 10);
-        let results = self.provider.search(&arguments.query, limit).await?;
-        Ok(json(&results))
+
+        // Retry on empty results (search engines may temporarily fail)
+        for attempt in 0..MAX_RETRIES {
+            match self.provider.search(&arguments.query, limit).await {
+                Ok(results) if !results.is_empty() => {
+                    return Ok(ToolOutput::text(json(&results)));
+                }
+                Ok(_empty) if attempt < MAX_RETRIES - 1 => {
+                    // Empty results, retry after delay
+                    async_io::Timer::after(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                }
+                Ok(empty) => {
+                    // Final attempt still empty, return empty results
+                    return Ok(ToolOutput::text(json(&empty)));
+                }
+                Err(e) if is_non_retryable(&e) => {
+                    // Non-retryable error (e.g., CAPTCHA), fail immediately
+                    return Err(e.into());
+                }
+                Err(e) if attempt < MAX_RETRIES - 1 => {
+                    // Retryable error, retry after delay
+                    async_io::Timer::after(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                    tracing::warn!(attempt, error = %e, "websearch failed, retrying");
+                }
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
+        }
+
+        unreachable!()
     }
 }

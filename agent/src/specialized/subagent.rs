@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 
-use aither_core::{LanguageModel, llm::Tool};
+use aither_core::{LanguageModel, llm::{Tool, ToolOutput}};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -15,6 +15,8 @@ use crate::Agent;
 ///
 /// This allows building hierarchies of agents, where a main agent
 /// can delegate specific tasks to specialized sub-agents.
+///
+/// The subagent uses a single model for all tiers (advanced/balanced/fast).
 ///
 /// # Example
 ///
@@ -93,7 +95,7 @@ where
 
     type Arguments = SubAgentQuery;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
         // Create a fresh agent for this call
         let mut builder = Agent::builder(self.llm.clone());
 
@@ -103,10 +105,11 @@ where
 
         let mut agent = builder.build();
 
-        agent
+        let result = agent
             .query(&args.task)
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(ToolOutput::text(result))
     }
 }
 

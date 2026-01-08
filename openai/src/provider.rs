@@ -6,7 +6,7 @@ use aither_core::llm::{
 };
 use serde::Deserialize;
 use std::{future::Future, sync::Arc};
-use zenwave::{Client, client, error::BoxHttpError, header};
+use zenwave::{Client, client, header};
 
 /// Provider capable of listing and instantiating `OpenAI` models.
 #[derive(Clone, Debug)]
@@ -72,18 +72,20 @@ impl LanguageModelProvider for OpenAIProvider {
         async move {
             let endpoint = format!("{}/models", cfg.base_url.trim_end_matches('/'));
             let mut backend = client();
-            let mut builder = backend.get(endpoint);
-            builder = builder.header(
-                header::AUTHORIZATION.as_str(),
-                format!("Bearer {}", cfg.api_key),
-            );
+            let mut builder = backend
+                .get(endpoint)
+                .map_err(|e| OpenAIError::Http(e))?
+                .header(header::AUTHORIZATION.as_str(), format!("Bearer {}", cfg.api_key))
+                .map_err(|e| OpenAIError::Http(e))?;
             if let Some(org) = &cfg.organization {
-                builder = builder.header("OpenAI-Organization", org.clone());
+                builder = builder
+                    .header("OpenAI-Organization", org.clone())
+                    .map_err(|e| OpenAIError::Http(e))?;
             }
             let response: ModelListResponse = builder
                 .json()
                 .await
-                .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
+                .map_err(|e| OpenAIError::Http(e))?;
             Ok(response
                 .data
                 .into_iter()

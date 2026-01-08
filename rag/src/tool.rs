@@ -1,7 +1,7 @@
 //! Tool trait implementation for RAG.
 
 use aither_core::embedding::EmbeddingModel;
-use aither_core::llm::tool::Tool;
+use aither_core::llm::tool::{Tool, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -50,7 +50,7 @@ where
 
     type Arguments = RagToolArgs;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
         let results = self
             .store()
             .search_with_k(&arguments.query, arguments.top_k)
@@ -66,7 +66,7 @@ where
             })
             .collect();
 
-        Ok(serde_json::to_string(&response)?)
+        ToolOutput::json(&response)
     }
 }
 
@@ -131,6 +131,6 @@ mod tests {
         };
 
         let result = rag.call(args).await.unwrap();
-        assert!(result.contains("Rust"));
+        assert!(result.as_str().unwrap().contains("Rust"));
     }
 }

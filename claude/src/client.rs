@@ -121,19 +121,28 @@ impl LanguageModel for Claude {
 
             let endpoint = cfg.request_url("/v1/messages");
             let mut backend = client();
-            let mut builder = backend.post(endpoint);
 
             // Claude-specific headers
-            builder = builder.header("x-api-key", cfg.api_key.clone());
-            builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
-            builder = builder.header(header::CONTENT_TYPE.as_str(), "application/json");
-            builder = builder.header(header::ACCEPT.as_str(), "text/event-stream");
-            builder = builder.header(header::USER_AGENT.as_str(), "aither-claude/0.1");
+            let builder = match backend
+                .post(endpoint)
+                .and_then(|b| b.header("x-api-key", cfg.api_key.clone()))
+                .and_then(|b| b.header("anthropic-version", ANTHROPIC_VERSION))
+                .and_then(|b| b.header(header::CONTENT_TYPE.as_str(), "application/json"))
+                .and_then(|b| b.header(header::ACCEPT.as_str(), "text/event-stream"))
+                .and_then(|b| b.header(header::USER_AGENT.as_str(), "aither-claude/0.1"))
+                .and_then(|b| b.json_body(&request_body))
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    yield Err(ClaudeError::Http(e));
+                    return;
+                }
+            };
 
-            let sse_stream = match builder.json_body(&request_body).sse().await {
+            let sse_stream = match builder.sse().await {
                 Ok(stream) => stream,
                 Err(e) => {
-                    yield Err(ClaudeError::Api(format!("HTTP request failed: {e}")));
+                    yield Err(ClaudeError::Http(e));
                     return;
                 }
             };
@@ -249,21 +258,25 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, ClaudeError> {
 
     let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
     let mut backend = client();
-    let mut req = backend.get(&url);
+    let mut req = backend.get(&url).map_err(|e| ClaudeError::Http(e))?;
 
     // Anthropic uses x-api-key header, proxies use Bearer token
     if cfg.base_url.contains("anthropic.com") {
         req = req
             .header("x-api-key", cfg.api_key.clone())
-            .header("anthropic-version", ANTHROPIC_VERSION);
+            .map_err(|e| ClaudeError::Http(e))?
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .map_err(|e| ClaudeError::Http(e))?;
     } else {
-        req = req.header(header::AUTHORIZATION.as_str(), format!("Bearer {}", cfg.api_key));
+        req = req
+            .header(header::AUTHORIZATION.as_str(), format!("Bearer {}", cfg.api_key))
+            .map_err(|e| ClaudeError::Http(e))?;
     }
 
     let response: ModelsResponse = req
         .json()
         .await
-        .map_err(|e| ClaudeError::Api(e.to_string()))?;
+        .map_err(|e| ClaudeError::Http(e))?;
 
     for model in response.data {
         if model.id == cfg.model {

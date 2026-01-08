@@ -1,13 +1,13 @@
 use std::fmt;
 
 use base64::DecodeError;
-use zenwave::{BodyError, error::BoxHttpError};
+use zenwave::{BodyError, Error as ZenwaveError};
 
 /// Errors raised by the Gemini backend.
 #[derive(Debug)]
 pub enum GeminiError {
     /// HTTP transport errors.
-    Http(BoxHttpError),
+    Http(ZenwaveError),
     /// Request/response body encoding failures.
     Body(BodyError),
     /// JSON serialization/deserialization problems.

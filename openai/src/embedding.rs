@@ -5,7 +5,7 @@ use crate::{
 use aither_core::{EmbeddingModel, Result as CoreResult};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use zenwave::{Client, client, error::BoxHttpError, header};
+use zenwave::{Client, client, header};
 
 impl EmbeddingModel for OpenAI {
     fn dim(&self) -> usize {
@@ -28,22 +28,29 @@ impl EmbeddingModel for OpenAI {
 async fn embed_once(cfg: Arc<Config>, input: String) -> Result<Vec<f32>, OpenAIError> {
     let endpoint = cfg.request_url("/embeddings");
     let mut backend = client();
-    let mut builder = backend.post(endpoint);
-    builder = builder.header(header::AUTHORIZATION.as_str(), cfg.request_auth());
-    builder = builder.header(header::USER_AGENT.as_str(), "aither-openai/0.1");
+    let mut builder = backend
+        .post(endpoint)
+        .map_err(|e| OpenAIError::Http(e))?
+        .header(header::AUTHORIZATION.as_str(), cfg.request_auth())
+        .map_err(|e| OpenAIError::Http(e))?
+        .header(header::USER_AGENT.as_str(), "aither-openai/0.1")
+        .map_err(|e| OpenAIError::Http(e))?;
     if let Some(org) = &cfg.organization {
-        builder = builder.header("OpenAI-Organization", org.clone());
+        builder = builder
+            .header("OpenAI-Organization", org.clone())
+            .map_err(|e| OpenAIError::Http(e))?;
     }
     let request = EmbeddingRequest {
         model: &cfg.embedding_model,
         input: &input,
         dimensions: embedding_dimensions_for(&cfg.embedding_model, cfg.embedding_dimensions),
     };
-    builder = builder.json_body(&request);
     let response: EmbeddingResponse = builder
+        .json_body(&request)
+        .map_err(|e| OpenAIError::Http(e))?
         .json()
         .await
-        .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
+        .map_err(|e| OpenAIError::Http(e))?;
     response
         .data
         .into_iter()

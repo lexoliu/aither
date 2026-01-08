@@ -38,7 +38,7 @@
 //!     const DESCRIPTION: &str = "Performs basic math operations";
 //!     type Arguments = MathArgs;
 //!
-//!     async fn call(&mut self, args: Self::Arguments) -> aither::Result {
+//!     async fn call(&self, args: Self::Arguments) -> aither::Result<ToolOutput> {
 //!         let result = match args.operation.as_str() {
 //!             "add" => args.a + args.b,
 //!             "subtract" => args.a - args.b,
@@ -47,7 +47,7 @@
 //!             "divide" => return Err(anyhow::Error::msg("Division by zero")),
 //!             _ => return Err(anyhow::Error::msg("Unknown operation")),
 //!         };
-//!         Ok(result.to_string())
+//!         Ok(ToolOutput::text(result.to_string()))
 //!     }
 //! }
 //! ```
@@ -153,15 +153,132 @@ use alloc::{boxed::Box, collections::BTreeMap};
 use core::any::Any;
 use core::fmt::Debug;
 use core::{future::Future, pin::Pin};
+pub use mime::Mime;
 use schemars::{JsonSchema, Schema, schema_for};
 use serde::{Serialize, de::DeserializeOwned};
+
+/// Output from a tool execution.
+///
+/// Tools return either:
+/// - `Done` - operation completed with no output (e.g., "file deleted")
+/// - `Output` - operation produced content with a MIME type
+///
+/// # Example
+///
+/// ```rust
+/// use aither::llm::tool::ToolOutput;
+///
+/// // Tool that produces text
+/// fn search_tool() -> ToolOutput {
+///     ToolOutput::text("Found 3 results...")
+/// }
+///
+/// // Tool that completes without output
+/// fn delete_tool() -> ToolOutput {
+///     ToolOutput::Done
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub enum ToolOutput {
+    /// Tool completed with no output to return.
+    /// No file will be created, nothing to save.
+    Done,
+
+    /// Tool produced output with content and MIME type.
+    Output {
+        /// MIME type of the content (e.g., `text/plain`, `image/png`)
+        mime: Mime,
+        /// Raw content bytes
+        content: Vec<u8>,
+    },
+}
+
+impl ToolOutput {
+    /// Creates a text output (UTF-8 string).
+    #[must_use]
+    pub fn text(s: impl Into<String>) -> Self {
+        let s = s.into();
+        Self::Output {
+            mime: mime::TEXT_PLAIN_UTF_8,
+            content: s.into_bytes(),
+        }
+    }
+
+    /// Creates a JSON output from a serializable value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
+    pub fn json<T: Serialize>(value: &T) -> Result<Self> {
+        let bytes = serde_json::to_vec(value)?;
+        Ok(Self::Output {
+            mime: mime::APPLICATION_JSON,
+            content: bytes,
+        })
+    }
+
+    /// Creates an image output.
+    #[must_use]
+    pub fn image(data: Vec<u8>, media_type: &str) -> Self {
+        Self::Output {
+            mime: media_type.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM),
+            content: data,
+        }
+    }
+
+    /// Creates a binary output.
+    #[must_use]
+    pub fn binary(data: Vec<u8>) -> Self {
+        Self::Output {
+            mime: mime::APPLICATION_OCTET_STREAM,
+            content: data,
+        }
+    }
+
+    /// Returns `true` if this is a `Done` variant.
+    #[must_use]
+    pub const fn is_done(&self) -> bool {
+        matches!(self, Self::Done)
+    }
+
+    /// Returns the content if this is an `Output` variant.
+    #[must_use]
+    pub fn content(&self) -> Option<&[u8]> {
+        match self {
+            Self::Done => None,
+            Self::Output { content, .. } => Some(content),
+        }
+    }
+
+    /// Returns the MIME type if this is an `Output` variant.
+    #[must_use]
+    pub fn mime(&self) -> Option<&Mime> {
+        match self {
+            Self::Done => None,
+            Self::Output { mime, .. } => Some(mime),
+        }
+    }
+
+    /// Converts the output to a string if it's text content.
+    ///
+    /// Returns `None` if:
+    /// - This is a `Done` variant
+    /// - The content is not valid UTF-8
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Done => None,
+            Self::Output { content, .. } => core::str::from_utf8(content).ok(),
+        }
+    }
+}
 
 /// Tools that can be called by language models.
 ///
 /// # Example
 ///
 /// ```rust
-/// use aither::llm::Tool;
+/// use aither::llm::{Tool, ToolOutput};
 /// use schemars::JsonSchema;
 /// use serde::Deserialize;
 ///
@@ -178,15 +295,15 @@ use serde::{Serialize, de::DeserializeOwned};
 ///     const NAME: &str = "calculator";
 ///     const DESCRIPTION: &str = "Performs basic mathematical operations";
 ///     type Arguments = CalculatorArgs;
-///     
-///     async fn call(&mut self, args: Self::Arguments) -> aither::Result {
+///
+///     async fn call(&mut self, args: Self::Arguments) -> aither::Result<ToolOutput> {
 ///         match args.operation.as_str() {
-///             "add" => Ok((args.a + args.b).to_string()),
-///             "subtract" => Ok((args.a - args.b).to_string()),
-///             "multiply" => Ok((args.a * args.b).to_string()),
+///             "add" => Ok(ToolOutput::text((args.a + args.b).to_string())),
+///             "subtract" => Ok(ToolOutput::text((args.a - args.b).to_string())),
+///             "multiply" => Ok(ToolOutput::text((args.a * args.b).to_string())),
 ///             "divide" => {
 ///                 if args.b != 0.0 {
-///                     Ok((args.a / args.b).to_string())
+///                     Ok(ToolOutput::text((args.a / args.b).to_string()))
 ///                 } else {
 ///                     Err(anyhow::Error::msg("Division by zero"))
 ///                 }
@@ -207,10 +324,10 @@ pub trait Tool: Send + Sync {
 
     /// Executes the tool with the provided arguments.
     ///
-    /// Returns a [`crate::Result`] containing the tool's output.
+    /// Returns a [`ToolOutput`] containing the tool's output or [`ToolOutput::Done`] for no output.
     ///
     /// Tools that need mutable state should use interior mutability (e.g., `Mutex`).
-    fn call(&self, arguments: Self::Arguments) -> impl Future<Output = Result> + Send;
+    fn call(&self, arguments: Self::Arguments) -> impl Future<Output = Result<ToolOutput>> + Send;
 }
 
 /// Utility to convert a serializable value to a pretty-printed JSON string.
@@ -241,8 +358,30 @@ pub fn json<T: Serialize>(value: &T) -> String {
 }
 
 trait ToolImpl: Send + Sync + Any {
-    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result> + Send + '_>>;
+    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + '_>>;
     fn definition(&self) -> ToolDefinition;
+}
+
+/// Dynamic tool implementation for type-erased tools.
+struct DynToolImpl<F>
+where
+    F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send>> + Send + Sync,
+{
+    definition: ToolDefinition,
+    handler: F,
+}
+
+impl<F> ToolImpl for DynToolImpl<F>
+where
+    F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send>> + Send + Sync + 'static,
+{
+    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + '_>> {
+        (self.handler)(args)
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        self.definition.clone()
+    }
 }
 
 fn is_object<T: JsonSchema>() -> bool {
@@ -257,7 +396,7 @@ fn is_object<T: JsonSchema>() -> bool {
 }
 
 impl<T: Tool + 'static> ToolImpl for T {
-    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result> + Send + '_>> {
+    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + '_>> {
         let is_object = is_object::<T::Arguments>();
 
         let result = if is_object {
@@ -279,7 +418,7 @@ impl<T: Tool + 'static> ToolImpl for T {
             });
         };
 
-        Box::pin(async move { self.call(arguments).await })
+        Box::pin(async move { Tool::call(self, arguments).await })
     }
 
     fn definition(&self) -> ToolDefinition {
@@ -681,6 +820,24 @@ impl Tools {
         self.tools.insert(name, Box::new(tool) as Box<dyn ToolImpl>);
     }
 
+    /// Registers a dynamic tool with a pre-made definition and handler.
+    ///
+    /// This is useful for type-erased tools (e.g., child bash tools for subagents)
+    /// where the concrete type isn't known at compile time.
+    pub fn register_dyn<F>(&mut self, definition: ToolDefinition, handler: F)
+    where
+        F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send>> + Send + Sync + 'static,
+    {
+        let name = definition.name.clone();
+        assert!(
+            !self.tools.contains_key(&name),
+            "Tool with name '{}' is already registered",
+            name
+        );
+
+        self.tools.insert(name, Box::new(DynToolImpl { definition, handler }));
+    }
+
     /// Removes a tool from the registry.
     pub fn unregister(&mut self, name: &str) {
         self.tools.remove(name);
@@ -692,7 +849,7 @@ impl Tools {
     ///
     /// Returns an error if the tool is not found, arguments cannot be parsed,
     /// or tool execution fails.
-    pub async fn call(&self, name: &str, args: &str) -> Result {
+    pub async fn call(&self, name: &str, args: &str) -> Result<ToolOutput> {
         if let Some(tool) = self.tools.get(name) {
             tool.call(args).await
         } else {
@@ -726,16 +883,16 @@ mod tests {
         }
         type Arguments = CalculatorArgs;
 
-        async fn call(&self, args: Self::Arguments) -> Result {
+        async fn call(&self, args: Self::Arguments) -> Result<ToolOutput> {
             match args.operation.as_str() {
-                "add" => Ok((args.a + args.b).to_string()),
-                "subtract" => Ok((args.a - args.b).to_string()),
-                "multiply" => Ok((args.a * args.b).to_string()),
+                "add" => Ok(ToolOutput::text((args.a + args.b).to_string())),
+                "subtract" => Ok(ToolOutput::text((args.a - args.b).to_string())),
+                "multiply" => Ok(ToolOutput::text((args.a * args.b).to_string())),
                 "divide" => {
                     if args.b == 0.0 {
                         Err(anyhow::Error::msg("Division by zero"))
                     } else {
-                        Ok((args.a / args.b).to_string())
+                        Ok(ToolOutput::text((args.a / args.b).to_string()))
                     }
                 }
                 _ => Err(anyhow::Error::msg(format!(
@@ -762,8 +919,8 @@ mod tests {
         }
         type Arguments = GreetArgs;
 
-        async fn call(&self, args: Self::Arguments) -> Result {
-            Ok(format!("Hello, {}!", args.name))
+        async fn call(&self, args: Self::Arguments) -> Result<ToolOutput> {
+            Ok(ToolOutput::text(format!("Hello, {}!", args.name)))
         }
     }
 
@@ -818,7 +975,7 @@ mod tests {
             .call("calculator", r#"{"operation": "add", "a": 5, "b": 3}"#)
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "8");
+        assert_eq!(result.unwrap().as_str(), Some("8"));
     }
 
     #[tokio::test]
@@ -830,7 +987,7 @@ mod tests {
         let result = tools
             .call("calculator", r#"{"operation": "add", "a": 10, "b": 5}"#)
             .await;
-        assert_eq!(result.unwrap(), "15");
+        assert_eq!(result.unwrap().as_str(), Some("15"));
 
         // Test subtraction
         let result = tools
@@ -839,19 +996,19 @@ mod tests {
                 r#"{"operation": "subtract", "a": 10, "b": 3}"#,
             )
             .await;
-        assert_eq!(result.unwrap(), "7");
+        assert_eq!(result.unwrap().as_str(), Some("7"));
 
         // Test multiplication
         let result = tools
             .call("calculator", r#"{"operation": "multiply", "a": 4, "b": 3}"#)
             .await;
-        assert_eq!(result.unwrap(), "12");
+        assert_eq!(result.unwrap().as_str(), Some("12"));
 
         // Test division
         let result = tools
             .call("calculator", r#"{"operation": "divide", "a": 15, "b": 3}"#)
             .await;
-        assert_eq!(result.unwrap(), "5");
+        assert_eq!(result.unwrap().as_str(), Some("5"));
     }
 
     #[tokio::test]
@@ -906,10 +1063,10 @@ mod tests {
         let calc_result = tools
             .call("calculator", r#"{"operation": "add", "a": 2, "b": 3}"#)
             .await;
-        assert_eq!(calc_result.unwrap(), "5");
+        assert_eq!(calc_result.unwrap().as_str(), Some("5"));
 
         let greet_result = tools.call("greeter", r#"{"name": "Alice"}"#).await;
-        assert_eq!(greet_result.unwrap(), "Hello, Alice!");
+        assert_eq!(greet_result.unwrap().as_str(), Some("Hello, Alice!"));
     }
 
     #[tokio::test]
@@ -1017,8 +1174,8 @@ mod tests {
             }
             type Arguments = Args;
 
-            async fn call(&self, _args: Self::Arguments) -> Result {
-                Ok("ok".to_string())
+            async fn call(&self, _args: Self::Arguments) -> Result<ToolOutput> {
+                Ok(ToolOutput::text("ok"))
             }
         }
 

@@ -4,8 +4,6 @@ use std::collections::{HashMap, HashSet};
 
 use aither_core::{LanguageModel, llm::Message};
 
-use crate::context::ConversationMemory;
-
 /// Strategy for managing conversation context.
 #[derive(Debug, Clone)]
 pub enum ContextStrategy {
@@ -119,8 +117,39 @@ pub fn estimate_context_usage(messages: &[Message], context_window: usize) -> f3
 // Prompt templates loaded from files
 const COMPRESSION_SYSTEM_PROMPT: &str = include_str!("prompts/compression_system.txt");
 const COMPRESSION_USER_TEMPLATE: &str = include_str!("prompts/compression_user.txt");
+const COMPRESSION_URLS_TEMPLATE: &str = include_str!("prompts/compression_urls.txt");
+
+/// Result of a compaction operation with URL tracking.
+#[derive(Debug, Clone)]
+pub struct CompactionResult {
+    /// The generated summary text.
+    pub summary: String,
+    /// URLs that were referenced in the summary (should be written to disk).
+    pub referenced_urls: HashSet<String>,
+}
+
+/// A pending URL allocation for content that hasn't been written to disk.
+#[derive(Debug, Clone)]
+pub struct ContentWithUrl {
+    /// The content in text form.
+    pub content: String,
+    /// The allocated URL for this content.
+    pub url: String,
+}
 
 impl SmartCompressionConfig {
+    /// Reserve 20% of context for the compaction process itself.
+    pub const COMPACTION_RESERVE: f32 = 0.2;
+
+    /// Returns the effective trigger threshold accounting for compaction reserve.
+    ///
+    /// The actual trigger is lower than `trigger_threshold` to leave room
+    /// for the fast LLM to see both URLs and original content during compaction.
+    #[must_use]
+    pub fn effective_trigger(&self) -> f32 {
+        self.trigger_threshold - Self::COMPACTION_RESERVE
+    }
+
     /// Extract content that should be preserved from messages.
     #[must_use]
     pub fn extract_preserved(&self, messages: &[Message]) -> PreservedContent {
@@ -199,15 +228,65 @@ impl SmartCompressionConfig {
         llm: &LLM,
         messages: &[Message],
         preserved: &PreservedContent,
-    ) -> aither_core::Result<String> {
+    ) -> Result<String, LLM::Error> {
         let prompt = COMPRESSION_USER_TEMPLATE
             .replace("{file_paths}", &preserved.file_paths.join(", "))
             .replace("{errors}", &preserved.errors.join("\n"))
             .replace("{commands}", &preserved.commands.join("\n"))
             .replace("{dialogue}", &format_messages(messages));
 
-        llm.generate(aither_core::llm::oneshot(COMPRESSION_SYSTEM_PROMPT, prompt))
-            .await
+        let request = aither_core::llm::oneshot(COMPRESSION_SYSTEM_PROMPT, prompt);
+        let stream = llm.respond(request);
+        aither_core::llm::collect_text(stream).await
+    }
+
+    /// Generate a compressed summary with URL tracking for tool outputs.
+    ///
+    /// This method:
+    /// 1. Takes messages and their associated pending URLs
+    /// 2. Generates a summary that may reference those URLs
+    /// 3. Scans the summary to find which URLs were actually referenced
+    /// 4. Returns both the summary and the set of referenced URLs
+    ///
+    /// The caller should only write files for URLs that appear in `referenced_urls`.
+    ///
+    /// # Arguments
+    ///
+    /// * `llm` - The fast LLM to use for summary generation
+    /// * `messages` - Messages to compress
+    /// * `preserved` - Content to preserve verbatim
+    /// * `pending_urls` - Map of message content to allocated URLs
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LLM fails to generate a summary.
+    pub async fn generate_summary_with_urls<LLM: LanguageModel>(
+        &self,
+        llm: &LLM,
+        messages: &[Message],
+        preserved: &PreservedContent,
+        pending_urls: &[ContentWithUrl],
+    ) -> Result<CompactionResult, LLM::Error> {
+        // Build content with URLs section
+        let content_with_urls = format_content_with_urls(messages, pending_urls);
+
+        let prompt = COMPRESSION_URLS_TEMPLATE
+            .replace("{content_with_urls}", &content_with_urls)
+            .replace("{file_paths}", &preserved.file_paths.join(", "))
+            .replace("{errors}", &preserved.errors.join("\n"))
+            .replace("{commands}", &preserved.commands.join("\n"));
+
+        let request = aither_core::llm::oneshot(COMPRESSION_SYSTEM_PROMPT, prompt);
+        let stream = llm.respond(request);
+        let summary = aither_core::llm::collect_text(stream).await?;
+
+        // Extract which URLs were actually referenced
+        let referenced_urls = extract_referenced_urls(&summary);
+
+        Ok(CompactionResult {
+            summary,
+            referenced_urls,
+        })
     }
 }
 
@@ -317,6 +396,99 @@ fn format_messages(messages: &[Message]) -> String {
         .join("\n")
 }
 
+/// Format messages with their associated URLs for compression.
+///
+/// Each message is formatted with its URL header (if it has one).
+fn format_content_with_urls(messages: &[Message], pending_urls: &[ContentWithUrl]) -> String {
+    let mut output = String::new();
+
+    for msg in messages {
+        let content = msg.content();
+
+        // Check if this message content has a pending URL
+        let url = pending_urls.iter().find(|p| p.content == content);
+
+        if let Some(url_info) = url {
+            // Format with URL header
+            output.push_str(&format!(
+                "### [URL: {}]\n{}\n\n",
+                url_info.url, content
+            ));
+        } else {
+            // Format without URL (inline content)
+            output.push_str(&format!(
+                "### [Inline - {:?}]\n{}\n\n",
+                msg.role(),
+                content
+            ));
+        }
+    }
+
+    output
+}
+
+/// Extract output URLs referenced in a summary.
+///
+/// Scans the summary for URL patterns like "outputs/word-word-word-word.ext"
+/// and returns the set of all found URLs.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use aither_agent::compression::extract_referenced_urls;
+///
+/// let summary = "The agent read config from outputs/amber-oak-swift-river.txt and saved data.";
+/// let urls = extract_referenced_urls(summary);
+/// assert!(urls.contains("outputs/amber-oak-swift-river.txt"));
+/// ```
+#[must_use]
+pub fn extract_referenced_urls(summary: &str) -> HashSet<String> {
+    let mut urls = HashSet::new();
+
+    // Match pattern: outputs/word-word-word-word.extension
+    // Words are lowercase letters only, separated by hyphens
+    for word in summary.split_whitespace() {
+        // Clean up surrounding punctuation
+        let word = word.trim_matches(|c: char| {
+            c == '"' || c == '\'' || c == '`' || c == ',' || c == '.' || c == ')' || c == ']'
+        });
+
+        if word.starts_with("outputs/") {
+            // Validate the pattern: outputs/word-word-word-word.ext
+            let filename = word.strip_prefix("outputs/").unwrap_or("");
+            if is_valid_output_filename(filename) {
+                urls.insert(word.to_string());
+            }
+        }
+    }
+
+    urls
+}
+
+/// Check if a filename matches the word-word-word-word.ext pattern.
+fn is_valid_output_filename(filename: &str) -> bool {
+    // Split by extension
+    let Some((name, ext)) = filename.rsplit_once('.') else {
+        return false;
+    };
+
+    // Extension should be alphanumeric
+    if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+
+    // Name should be word-word-word-word (4 lowercase words separated by hyphens)
+    let parts: Vec<&str> = name.split('-').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+
+    // Each part should be non-empty lowercase letters
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +516,40 @@ mod tests {
         let tokens = estimate_tokens(content);
         assert!(tokens > 0);
         assert!(tokens < content.len());
+    }
+
+    #[test]
+    fn test_extract_referenced_urls() {
+        let summary = "The agent read config from outputs/amber-oak-swift-river.txt and saved data to outputs/bold-creek-calm-dawn.json.";
+        let urls = extract_referenced_urls(summary);
+        assert_eq!(urls.len(), 2);
+        assert!(urls.contains("outputs/amber-oak-swift-river.txt"));
+        assert!(urls.contains("outputs/bold-creek-calm-dawn.json"));
+    }
+
+    #[test]
+    fn test_extract_urls_with_punctuation() {
+        // URLs at end of sentence or in quotes
+        let summary = r#"See "outputs/jade-mist-clear-pool.txt" for details."#;
+        let urls = extract_referenced_urls(summary);
+        assert!(urls.contains("outputs/jade-mist-clear-pool.txt"));
+    }
+
+    #[test]
+    fn test_invalid_url_patterns() {
+        // These should NOT be extracted
+        let summary = "Not valid: outputs/single.txt outputs/two-words.txt outputs/ outputs/one-two-three.txt";
+        let urls = extract_referenced_urls(summary);
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn test_valid_output_filename() {
+        assert!(is_valid_output_filename("amber-oak-swift-river.txt"));
+        assert!(is_valid_output_filename("bold-creek-calm-dawn.json"));
+        assert!(!is_valid_output_filename("single.txt"));
+        assert!(!is_valid_output_filename("two-words.txt"));
+        assert!(!is_valid_output_filename("no-extension"));
+        assert!(!is_valid_output_filename("Upper-Case-Words.txt"));
     }
 }

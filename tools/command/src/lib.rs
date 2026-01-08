@@ -1,6 +1,6 @@
 use std::{borrow::Cow, path::PathBuf};
 
-use aither_core::llm::{Tool, tool::json};
+use aither_core::llm::{Tool, ToolOutput, tool::json};
 use anyhow::{Context, Result, bail};
 use async_process::Command;
 use schemars::JsonSchema;
@@ -102,7 +102,7 @@ impl Tool for CommandTool {
 
     type Arguments = CommandArgs;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
         self.ensure_allowed(&arguments.program)?;
 
         let working_dir = arguments.cwd.unwrap_or_else(|| self.default_cwd.clone());
@@ -126,6 +126,6 @@ impl Tool for CommandTool {
             stderr: self.truncate(String::from_utf8_lossy(&output.stderr).to_string()),
         };
 
-        Ok(json(&response))
+        Ok(ToolOutput::text(json(&response)))
     }
 }

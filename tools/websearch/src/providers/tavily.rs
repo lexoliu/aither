@@ -87,14 +87,17 @@ impl SearchProvider for Tavily {
         };
 
         let mut backend = client();
-        let builder = backend
+        let response: TavilyResponse = backend
             .post(TAVILY_API_URL)
+            .map_err(|e| anyhow!("{e}"))?
             .header(header::CONTENT_TYPE.as_str(), "application/json")
+            .map_err(|e| anyhow!("{e}"))?
             .header(header::ACCEPT.as_str(), "application/json")
-            .header(header::USER_AGENT.as_str(), "aither-websearch/0.1");
-
-        let response: TavilyResponse = builder
+            .map_err(|e| anyhow!("{e}"))?
+            .header(header::USER_AGENT.as_str(), "aither-websearch/0.1")
+            .map_err(|e| anyhow!("{e}"))?
             .json_body(&request)
+            .map_err(|e| anyhow!("{e}"))?
             .json()
             .await
             .map_err(|e| anyhow!("{e}"))?;

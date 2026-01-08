@@ -367,9 +367,14 @@ fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<Gemin
                         parts.push(Part::text(message.content()));
                     }
 
-                    // Add function call parts
+                    // Add function call parts with thought signatures extracted from IDs
                     for tc in tool_calls {
-                        parts.push(Part::function_call(tc.name.clone(), tc.arguments.clone()));
+                        let (_, signature) = parse_tool_signature(&tc.id);
+                        parts.push(Part::function_call_with_signature(
+                            tc.name.clone(),
+                            tc.arguments.clone(),
+                            signature,
+                        ));
                     }
 
                     contents.push(GeminiContent::with_parts("model", parts));

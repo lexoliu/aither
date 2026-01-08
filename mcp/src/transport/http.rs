@@ -77,27 +77,36 @@ impl Transport for HttpTransport {
 
         // Build and send HTTP request
         let mut backend = client();
-        let mut builder = backend.post(&self.base_url);
-
-        builder = builder.header(header::CONTENT_TYPE.as_str(), "application/json");
-        builder = builder.header(
-            header::ACCEPT.as_str(),
-            "application/json, text/event-stream",
-        );
-        builder = builder.header(header::USER_AGENT.as_str(), "aither-mcp/0.1");
+        let mut builder = backend
+            .post(&self.base_url)
+            .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?
+            .header(header::CONTENT_TYPE.as_str(), "application/json")
+            .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?
+            .header(
+                header::ACCEPT.as_str(),
+                "application/json, text/event-stream",
+            )
+            .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?
+            .header(header::USER_AGENT.as_str(), "aither-mcp/0.1")
+            .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?;
 
         if let Some(auth) = &self.auth {
-            builder = builder.header(header::AUTHORIZATION.as_str(), auth.clone());
+            builder = builder
+                .header(header::AUTHORIZATION.as_str(), auth.clone())
+                .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?;
         }
 
         // Include session ID if we have one
         if let Some(session_id) = self.session_id.read().unwrap().as_ref() {
-            builder = builder.header(MCP_SESSION_ID_HEADER, session_id.clone());
+            builder = builder
+                .header(MCP_SESSION_ID_HEADER, session_id.clone())
+                .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?;
         }
 
         // Send request and get response with headers
         let response = builder
             .json_body(&req)
+            .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?
             .await
             .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?;
 
@@ -129,26 +138,36 @@ impl Transport for HttpTransport {
 
         // Build and send HTTP request (fire and forget)
         let mut backend = client();
-        let mut builder = backend.post(&self.base_url);
-
-        builder = builder.header(header::CONTENT_TYPE.as_str(), "application/json");
-        builder = builder.header(
-            header::ACCEPT.as_str(),
-            "application/json, text/event-stream",
-        );
-        builder = builder.header(header::USER_AGENT.as_str(), "aither-mcp/0.1");
+        let mut builder = backend
+            .post(&self.base_url)
+            .map_err(|e| McpError::Transport(format!("HTTP notify failed: {e}")))?
+            .header(header::CONTENT_TYPE.as_str(), "application/json")
+            .map_err(|e| McpError::Transport(format!("HTTP notify failed: {e}")))?
+            .header(
+                header::ACCEPT.as_str(),
+                "application/json, text/event-stream",
+            )
+            .map_err(|e| McpError::Transport(format!("HTTP notify failed: {e}")))?
+            .header(header::USER_AGENT.as_str(), "aither-mcp/0.1")
+            .map_err(|e| McpError::Transport(format!("HTTP notify failed: {e}")))?;
 
         if let Some(auth) = &self.auth {
-            builder = builder.header(header::AUTHORIZATION.as_str(), auth.clone());
+            builder = builder
+                .header(header::AUTHORIZATION.as_str(), auth.clone())
+                .map_err(|e| McpError::Transport(format!("HTTP notify failed: {e}")))?;
         }
 
         // Include session ID if we have one
         if let Some(session_id) = self.session_id.read().unwrap().as_ref() {
-            builder = builder.header(MCP_SESSION_ID_HEADER, session_id.clone());
+            builder = builder
+                .header(MCP_SESSION_ID_HEADER, session_id.clone())
+                .map_err(|e| McpError::Transport(format!("HTTP notify failed: {e}")))?;
         }
 
         // Notifications may return empty body, so we ignore parse errors
-        let _ = builder.json_body(&notif).await;
+        let _ = builder
+            .json_body(&notif)
+            .map(|b| async { b.await });
 
         Ok(())
     }

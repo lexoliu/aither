@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use aither_core::llm::tool::{Tool, ToolDefinition, Tools as CoreTools};
+use aither_core::llm::tool::{Tool, ToolDefinition, ToolOutput, Tools as CoreTools};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -98,6 +98,26 @@ impl AgentTools {
     /// Registers an eager (always-loaded) tool.
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
         self.eager.register(tool);
+    }
+
+    /// Registers a dynamic bash tool (type-erased).
+    ///
+    /// This is used for child bash tools in subagents where the concrete type
+    /// is not known at compile time.
+    pub fn register_dyn_bash(&mut self, dyn_tool: aither_sandbox::DynBashTool) {
+        use aither_core::llm::ToolOutput;
+        use std::pin::Pin;
+        use futures_core::Future;
+
+        let handler = dyn_tool.handler;
+        self.eager.register_dyn(dyn_tool.definition, move |args: &str| -> Pin<Box<dyn Future<Output = aither_core::Result<ToolOutput>> + Send>> {
+            let handler = handler.clone();
+            let args = args.to_string();
+            Box::pin(async move {
+                let result = handler(&args).await;
+                Ok(ToolOutput::text(result))
+            })
+        });
     }
 
     /// Registers a deferred (searchable) tool.
@@ -220,7 +240,7 @@ impl AgentTools {
     /// # Errors
     ///
     /// Returns an error if the tool is not found or execution fails.
-    pub async fn call(&self, name: &str, args: &str) -> aither_core::Result {
+    pub async fn call(&self, name: &str, args: &str) -> aither_core::Result<ToolOutput> {
         // Try eager tools first
         if self.eager.definitions().iter().any(|d| d.name() == name) {
             return self.eager.call(name, args).await;
@@ -264,7 +284,7 @@ impl AgentTools {
                 return if result.is_error {
                     Err(anyhow::anyhow!("{output}"))
                 } else {
-                    Ok(output)
+                    Ok(ToolOutput::text(output))
                 };
             }
         }
@@ -369,10 +389,10 @@ impl Tool for ToolSearchTool {
 
     type Arguments = ToolSearchArgs;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
         // Safety: We ensure the pointer is valid during agent execution
         let tools = unsafe { &mut *self.tools_ptr };
-        Ok(tools.search_and_load(&args.query))
+        Ok(ToolOutput::text(tools.search_and_load(&args.query)))
     }
 }
 
@@ -398,8 +418,8 @@ mod tests {
 
         type Arguments = DummyArgs;
 
-        async fn call(&self, _args: Self::Arguments) -> aither_core::Result {
-            Ok("ok".to_string())
+        async fn call(&self, _args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+            Ok(ToolOutput::text("ok"))
         }
     }
 

@@ -4,7 +4,7 @@ use aither_core::llm::{
 };
 use serde::Deserialize;
 use std::{future::Future, sync::Arc};
-use zenwave::{Client, client, error::BoxHttpError};
+use zenwave::{Client, client};
 
 /// Provider capable of listing and instantiating `Gemini` models.
 #[derive(Clone, Debug)]
@@ -55,16 +55,18 @@ impl LanguageModelProvider for GeminiProvider {
             }
 
             let mut backend = client();
-            let mut builder = backend.get(endpoint);
+            let mut builder = backend.get(endpoint).map_err(|e| GeminiError::Http(e))?;
 
             if cfg.auth == AuthMode::Header {
-                builder = builder.header("x-goog-api-key", cfg.api_key.clone());
+                builder = builder
+                    .header("x-goog-api-key", cfg.api_key.clone())
+                    .map_err(|e| GeminiError::Http(e))?;
             }
 
             let response: ModelListResponse = builder
                 .json()
                 .await
-                .map_err(|error| GeminiError::Http(BoxHttpError::from(Box::new(error))))?;
+                .map_err(|e| GeminiError::Http(e))?;
 
             Ok(response
                 .models

@@ -87,12 +87,33 @@ impl SearchProvider for SearXNG {
         }
 
         let mut backend = client();
-        let builder = backend
+        let response: SearxngResponse = backend
             .get(&url)
+            .map_err(|e| anyhow!("{e}"))?
             .header(header::ACCEPT.as_str(), "application/json")
-            .header(header::USER_AGENT.as_str(), "aither-websearch/0.1");
+            .map_err(|e| anyhow!("{e}"))?
+            .header(header::USER_AGENT.as_str(), "aither-websearch/0.1")
+            .map_err(|e| anyhow!("{e}"))?
+            .json()
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
 
-        let response: SearxngResponse = builder.json().await.map_err(|e| anyhow!("{e}"))?;
+        // Check for CAPTCHA errors when no results
+        if response.results.is_empty() {
+            let captcha_engines: Vec<_> = response
+                .unresponsive_engines
+                .iter()
+                .filter(|(_, reason)| reason.contains("CAPTCHA"))
+                .map(|(engine, _)| engine.as_str())
+                .collect();
+
+            if !captcha_engines.is_empty() {
+                return Err(anyhow!(
+                    "CAPTCHA detected for engines: {}. Try a different SearXNG instance.",
+                    captcha_engines.join(", ")
+                ));
+            }
+        }
 
         Ok(response
             .results
@@ -110,6 +131,8 @@ impl SearchProvider for SearXNG {
 #[derive(Debug, Deserialize)]
 struct SearxngResponse {
     results: Vec<SearxngResult>,
+    #[serde(default)]
+    unresponsive_engines: Vec<(String, String)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,4 +144,37 @@ struct SearxngResult {
 
 fn urlencoded(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn search_returns_results() {
+        let provider = SearXNG::default();
+        let results = provider.search("rust programming language", 5).await;
+        match results {
+            Ok(r) if !r.is_empty() => {} // Success
+            Ok(_) => eprintln!("Warning: SearXNG returned no results - endpoint may be degraded"),
+            Err(e) if e.to_string().contains("CAPTCHA") => {
+                eprintln!("Warning: SearXNG CAPTCHA detected - skipping test");
+            }
+            Err(e) => panic!("SearXNG search failed: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_unicode_query() {
+        let provider = SearXNG::default();
+        // Test with unicode characters (Japanese: "weather forecast")
+        let results = provider.search("天気予報", 5).await;
+        match results {
+            Ok(_) => {} // Success (empty is ok for unicode)
+            Err(e) if e.to_string().contains("CAPTCHA") => {
+                eprintln!("Warning: SearXNG CAPTCHA detected - skipping test");
+            }
+            Err(e) => panic!("SearXNG unicode search failed: {e}"),
+        }
+    }
 }

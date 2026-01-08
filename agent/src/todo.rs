@@ -34,7 +34,7 @@ mod tests {
     }
 }
 
-use aither_core::llm::Tool;
+use aither_core::llm::{Tool, ToolOutput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -185,7 +185,7 @@ impl Tool for TodoTool {
 
     type Arguments = TodoWriteArgs;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
         // Validate: at most one task should be in_progress
         let in_progress_count = arguments
             .todos
@@ -201,27 +201,7 @@ impl Tool for TodoTool {
 
         self.list.write(arguments.todos);
 
-        let items = self.list.items();
-        if items.is_empty() {
-            Ok("Todo list cleared".to_string())
-        } else {
-            let completed = items.iter().filter(|i| i.status == TodoStatus::Completed).count();
-            let in_progress = items.iter().filter(|i| i.status == TodoStatus::InProgress).count();
-            let pending = items.iter().filter(|i| i.status == TodoStatus::Pending).count();
-
-            let mut response = format!(
-                "Todo list updated: {} total ({} completed, {} in progress, {} pending)",
-                items.len(),
-                completed,
-                in_progress,
-                pending
-            );
-
-            if let Some(current) = items.iter().find(|i| i.status == TodoStatus::InProgress) {
-                response.push_str(&format!("\nCurrently: {}", current.active_form));
-            }
-
-            Ok(response)
-        }
+        // TodoWrite succeeds with no output - the UI shows the todo list separately
+        Ok(ToolOutput::Done)
     }
 }

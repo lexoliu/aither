@@ -33,8 +33,8 @@ use crate::hook::Hook;
 ///     }
 /// }
 /// ```
-pub struct AgentStream<'a, LLM, H> {
-    agent: &'a mut Agent<LLM, H>,
+pub struct AgentStream<'a, Advanced, Balanced, Fast, H> {
+    agent: &'a mut Agent<Advanced, Balanced, Fast, H>,
     prompt: String,
     state: StreamState,
 }
@@ -50,13 +50,15 @@ enum StreamState {
     Done,
 }
 
-impl<'a, LLM, H> AgentStream<'a, LLM, H>
+impl<'a, Advanced, Balanced, Fast, H> AgentStream<'a, Advanced, Balanced, Fast, H>
 where
-    LLM: LanguageModel,
+    Advanced: LanguageModel,
+    Balanced: LanguageModel,
+    Fast: LanguageModel,
     H: Hook,
 {
     /// Creates a new agent stream.
-    pub(crate) fn new(agent: &'a mut Agent<LLM, H>, prompt: String) -> Self {
+    pub(crate) fn new(agent: &'a mut Agent<Advanced, Balanced, Fast, H>, prompt: String) -> Self {
         Self {
             agent,
             prompt,
@@ -77,9 +79,11 @@ where
     }
 }
 
-impl<LLM, H> Stream for AgentStream<'_, LLM, H>
+impl<Advanced, Balanced, Fast, H> Stream for AgentStream<'_, Advanced, Balanced, Fast, H>
 where
-    LLM: LanguageModel + Unpin,
+    Advanced: LanguageModel + Unpin,
+    Balanced: LanguageModel + Unpin,
+    Fast: LanguageModel + Unpin,
     H: Hook + Unpin,
 {
     type Item = Result<AgentEvent, AgentError>;
@@ -108,20 +112,22 @@ where
 ///
 /// This runs the agent to completion and yields events.
 #[cfg(test)]
-pub struct BlockingStream<'a, LLM, H> {
-    agent: &'a mut Agent<LLM, H>,
+pub struct BlockingStream<'a, Advanced, Balanced, Fast, H> {
+    agent: &'a mut Agent<Advanced, Balanced, Fast, H>,
     prompt: String,
     completed: bool,
     result: Option<Result<String, AgentError>>,
 }
 
 #[cfg(test)]
-impl<'a, LLM, H> BlockingStream<'a, LLM, H>
+impl<'a, Advanced, Balanced, Fast, H> BlockingStream<'a, Advanced, Balanced, Fast, H>
 where
-    LLM: LanguageModel,
+    Advanced: LanguageModel,
+    Balanced: LanguageModel,
+    Fast: LanguageModel,
     H: Hook,
 {
-    pub fn new(agent: &'a mut Agent<LLM, H>, prompt: String) -> Self {
+    pub fn new(agent: &'a mut Agent<Advanced, Balanced, Fast, H>, prompt: String) -> Self {
         Self {
             agent,
             prompt,

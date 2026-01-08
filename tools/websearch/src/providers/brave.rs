@@ -50,13 +50,18 @@ impl SearchProvider for BraveSearch {
         let url = format!("{}?q={}&count={}", BRAVE_API_URL, urlencoded(query), limit);
 
         let mut backend = client();
-        let builder = backend
+        let response: BraveResponse = backend
             .get(&url)
+            .map_err(|e| anyhow!("{e}"))?
             .header("X-Subscription-Token", &self.api_key)
+            .map_err(|e| anyhow!("{e}"))?
             .header(header::ACCEPT.as_str(), "application/json")
-            .header(header::USER_AGENT.as_str(), "aither-websearch/0.1");
-
-        let response: BraveResponse = builder.json().await.map_err(|e| anyhow!("{e}"))?;
+            .map_err(|e| anyhow!("{e}"))?
+            .header(header::USER_AGENT.as_str(), "aither-websearch/0.1")
+            .map_err(|e| anyhow!("{e}"))?
+            .json()
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
 
         Ok(response
             .web

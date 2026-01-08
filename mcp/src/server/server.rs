@@ -227,9 +227,10 @@ impl<T: BidirectionalTransport> McpServer<T> {
 
         match self.tools.call(&params.name, &args_str).await {
             Ok(output) => {
+                let text = output.as_str().unwrap_or("").to_string();
                 let result = CallToolResult {
                     content: vec![crate::protocol::Content::Text(TextContent {
-                        text: output,
+                        text,
                         annotations: None,
                     })],
                     is_error: false,

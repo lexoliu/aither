@@ -22,8 +22,136 @@ use aither_core::{
 };
 use futures_core::Stream;
 use futures_lite::StreamExt;
-use std::{future::Future, sync::Arc};
+use std::{future::Future, sync::Arc, time::Duration};
 use zenwave::{Client, client, header};
+
+/// Configuration for request retry behavior.
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts (0 = no retries).
+    pub max_retries: u32,
+    /// Initial delay before first retry.
+    pub initial_delay: Duration,
+    /// Maximum delay between retries.
+    pub max_delay: Duration,
+    /// Multiplier for exponential backoff.
+    pub backoff_multiplier: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(30),
+            backoff_multiplier: 2.0,
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Create a config with no retries.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            max_retries: 0,
+            ..Default::default()
+        }
+    }
+
+    /// Calculate delay for a given attempt number (0-indexed).
+    fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        let delay_ms = self.initial_delay.as_millis() as f64
+            * self.backoff_multiplier.powi(attempt as i32);
+        let delay = Duration::from_millis(delay_ms as u64);
+        delay.min(self.max_delay)
+    }
+}
+
+/// Check if an error is retryable.
+fn is_retryable_error(err: &OpenAIError) -> bool {
+    match err {
+        // Network/transport errors are retryable
+        OpenAIError::Http(_) => true,
+        // Body errors (connection issues) may be retryable
+        OpenAIError::Body(_) => true,
+        // SSE stream errors may be retryable
+        OpenAIError::Stream(_) => true,
+        // Rate limit and server errors are retryable
+        OpenAIError::RateLimit { .. } => true,
+        OpenAIError::ServerError { .. } => true,
+        // Timeout is retryable
+        OpenAIError::Timeout => true,
+        // API errors are generally not retryable (bad request, auth, etc.)
+        OpenAIError::Api(_) => false,
+        // Parse errors are not retryable
+        OpenAIError::Json(_) => false,
+        // Decode errors are not retryable
+        OpenAIError::Decode(_) => false,
+    }
+}
+
+/// Get retry delay for an error, respecting Retry-After header for rate limits.
+fn get_retry_delay(err: &OpenAIError, attempt: u32, config: &RetryConfig) -> Duration {
+    if let OpenAIError::RateLimit { retry_after: Some(delay), .. } = err {
+        // Respect Retry-After header, but cap at max_delay
+        return (*delay).min(config.max_delay);
+    }
+    config.delay_for_attempt(attempt)
+}
+
+/// Sleep for the given duration (runtime-agnostic).
+async fn sleep(duration: Duration) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        async_io::Timer::after(duration).await;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        gloo_timers::future::TimeoutFuture::new(duration.as_millis() as u32).await;
+    }
+}
+
+/// Result of attempting to establish an SSE stream.
+type SseStreamResult = Result<Vec<Result<zenwave::sse::Event, zenwave::sse::ParseError>>, OpenAIError>;
+
+/// Attempt to make an SSE request with retry logic.
+///
+/// Returns the collected SSE events on success, or the last error on failure.
+async fn sse_request_with_retry<F, Fut>(
+    cfg: &Config,
+    make_request: F,
+) -> SseStreamResult
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = SseStreamResult>,
+{
+    let retry_config = &cfg.retry;
+    let mut attempt = 0;
+
+    loop {
+        match make_request().await {
+            Ok(events) => return Ok(events),
+            Err(err) => {
+                // Check if we should retry
+                if attempt < retry_config.max_retries && is_retryable_error(&err) {
+                    let delay = get_retry_delay(&err, attempt, retry_config);
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_retries = retry_config.max_retries,
+                        delay_ms = delay.as_millis(),
+                        error = %err,
+                        "Request failed, retrying"
+                    );
+                    sleep(delay).await;
+                    attempt += 1;
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
 
 /// `OpenAI` model backed by the Responses API by default, with legacy
 /// `chat.completions` support for compatibility.
@@ -277,10 +405,12 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, OpenAIError> {
     let mut backend = client();
     let response: ModelsListResponse = backend
         .get(&url)
+        .map_err(|e| OpenAIError::Http(e))?
         .header(header::AUTHORIZATION.as_str(), format!("Bearer {}", cfg.api_key))
+        .map_err(|e| OpenAIError::Http(e))?
         .json()
         .await
-        .map_err(|e| OpenAIError::Http(zenwave::error::BoxHttpError::from(Box::new(e))))?;
+        .map_err(|e| OpenAIError::Http(e))?;
 
     // Find matching model
     let mut model_found = false;
@@ -330,6 +460,49 @@ struct ToolCallAccumulator {
     arguments: String,
 }
 
+/// Make a chat completions SSE request (single attempt).
+async fn chat_completions_request(
+    cfg: &Config,
+    request: &ChatCompletionRequest,
+) -> SseStreamResult {
+    let endpoint = cfg.request_url("/chat/completions");
+    let mut backend = client();
+
+    let build_result = backend
+        .post(endpoint)
+        .and_then(|b| b.header(header::AUTHORIZATION.as_str(), cfg.request_auth()))
+        .and_then(|b| b.header(header::USER_AGENT.as_str(), "aither-openai/0.1"))
+        .and_then(|b| b.header(header::ACCEPT.as_str(), "text/event-stream"));
+
+    let mut builder = build_result.map_err(OpenAIError::Http)?;
+
+    if let Some(org) = &cfg.organization {
+        builder = builder.header("OpenAI-Organization", org.clone()).map_err(OpenAIError::Http)?;
+    }
+
+    let sse_stream = match builder
+        .json_body(request)
+        .map_err(OpenAIError::Http)?
+        .sse()
+        .await
+    {
+        Ok(stream) => stream,
+        Err(zenwave::Error::Timeout) => return Err(OpenAIError::Timeout),
+        Err(e) => return Err(OpenAIError::Http(e)),
+    };
+
+    let events: Vec<_> = sse_stream
+        .filter_map(|event| match event {
+            Ok(e) if !should_skip_event(&e) && e.text_data() != "[DONE]" => Some(Ok(e)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect()
+        .await;
+
+    Ok(events)
+}
+
 fn chat_completions_stream_inner(
     cfg: Arc<Config>,
     payload_messages: Vec<ChatMessagePayload>,
@@ -339,16 +512,6 @@ fn chat_completions_stream_inner(
     let include_reasoning = snapshot.include_reasoning;
 
     async_stream::stream! {
-        let endpoint = cfg.request_url("/chat/completions");
-        let mut backend = client();
-        let mut builder = backend.post(endpoint);
-        builder = builder.header(header::AUTHORIZATION.as_str(), cfg.request_auth());
-        builder = builder.header(header::USER_AGENT.as_str(), "aither-openai/0.1");
-        if let Some(org) = &cfg.organization {
-            builder = builder.header("OpenAI-Organization", org.clone());
-        }
-        builder = builder.header(header::ACCEPT.as_str(), "text/event-stream");
-
         let request = ChatCompletionRequest::new(
             cfg.chat_model.clone(),
             payload_messages,
@@ -359,22 +522,14 @@ fn chat_completions_stream_inner(
 
         tracing::debug!(request = %serde_json::to_string_pretty(&request).unwrap_or_default(), "Sending chat completion request");
 
-        let sse_stream = match builder.json_body(&request).sse().await {
-            Ok(stream) => stream,
+        // Make request with retry
+        let events = match sse_request_with_retry(&cfg, || chat_completions_request(&cfg, &request)).await {
+            Ok(events) => events,
             Err(e) => {
-                yield Err(OpenAIError::Api(format!("HTTP request failed: {e}")));
+                yield Err(e);
                 return;
             }
         };
-
-        let events: Vec<_> = sse_stream
-            .filter_map(|event| match event {
-                Ok(e) if !should_skip_event(&e) && e.text_data() != "[DONE]" => Some(Ok(e)),
-                Ok(_) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .collect()
-            .await;
 
         tracing::debug!(event_count = events.len(), "Collected SSE events");
 
@@ -500,6 +655,49 @@ struct FunctionCallAccumulator {
     arguments: String,
 }
 
+/// Make a responses API SSE request (single attempt).
+async fn responses_request(
+    cfg: &Config,
+    request: &ResponsesRequest,
+) -> SseStreamResult {
+    let endpoint = cfg.request_url("/responses");
+    let mut backend = client();
+
+    let build_result = backend
+        .post(endpoint)
+        .and_then(|b| b.header(header::AUTHORIZATION.as_str(), cfg.request_auth()))
+        .and_then(|b| b.header(header::USER_AGENT.as_str(), "aither-openai/0.1"))
+        .and_then(|b| b.header(header::ACCEPT.as_str(), "text/event-stream"));
+
+    let mut builder = build_result.map_err(OpenAIError::Http)?;
+
+    if let Some(org) = &cfg.organization {
+        builder = builder.header("OpenAI-Organization", org.clone()).map_err(OpenAIError::Http)?;
+    }
+
+    let sse_stream = match builder
+        .json_body(request)
+        .map_err(OpenAIError::Http)?
+        .sse()
+        .await
+    {
+        Ok(stream) => stream,
+        Err(zenwave::Error::Timeout) => return Err(OpenAIError::Timeout),
+        Err(e) => return Err(OpenAIError::Http(e)),
+    };
+
+    let events: Vec<_> = sse_stream
+        .filter_map(|event| match event {
+            Ok(e) if !should_skip_event(&e) && e.text_data() != "[DONE]" => Some(Ok(e)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect()
+        .await;
+
+    Ok(events)
+}
+
 fn responses_stream_inner(
     cfg: Arc<Config>,
     input: Vec<ResponsesInputItem>,
@@ -527,16 +725,6 @@ fn responses_stream_inner(
         let has_tools = response_tools.is_some();
         let tool_choice = responses_tool_choice(&snapshot, has_tools);
 
-        let endpoint = cfg.request_url("/responses");
-        let mut backend = client();
-        let mut builder = backend.post(endpoint);
-        builder = builder.header(header::AUTHORIZATION.as_str(), cfg.request_auth());
-        builder = builder.header(header::USER_AGENT.as_str(), "aither-openai/0.1");
-        builder = builder.header(header::ACCEPT.as_str(), "text/event-stream");
-        if let Some(org) = &cfg.organization {
-            builder = builder.header("OpenAI-Organization", org.clone());
-        }
-
         let request = ResponsesRequest::new(
             cfg.chat_model.clone(),
             input,
@@ -548,23 +736,14 @@ fn responses_stream_inner(
 
         tracing::debug!(request = %serde_json::to_string_pretty(&request).unwrap_or_default(), "Sending responses request");
 
-        let sse_stream = match builder.json_body(&request).sse().await {
-            Ok(stream) => stream,
+        // Make request with retry
+        let events = match sse_request_with_retry(&cfg, || responses_request(&cfg, &request)).await {
+            Ok(events) => events,
             Err(e) => {
-                yield Err(OpenAIError::Api(format!("HTTP request failed: {e}")));
+                yield Err(e);
                 return;
             }
         };
-
-        // Collect and filter SSE events
-        let events: Vec<_> = sse_stream
-            .filter_map(|event| match event {
-                Ok(e) if !should_skip_event(&e) && e.text_data() != "[DONE]" => Some(Ok(e)),
-                Ok(_) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .collect()
-            .await;
 
         tracing::debug!(event_count = events.len(), "Collected Responses API SSE events");
 
@@ -710,7 +889,12 @@ pub struct Builder {
     legacy_max_tokens: bool,
     organization: Option<String>,
     native_abilities: Vec<Ability>,
+    retry: RetryConfig,
+    request_timeout: Duration,
 }
+
+/// Default request timeout (5 minutes - generous for long completions).
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 impl Builder {
     fn new(api_key: impl Into<String>) -> Self {
@@ -730,6 +914,8 @@ impl Builder {
             legacy_max_tokens: false,
             organization: None,
             native_abilities: Vec::new(),
+            retry: RetryConfig::default(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 
@@ -860,6 +1046,40 @@ impl Builder {
         self.native_capabilities([Ability::Pdf])
     }
 
+    /// Configure retry behavior for failed requests.
+    ///
+    /// By default, requests are retried up to 3 times with exponential backoff.
+    /// Retries happen on network errors and certain HTTP status codes (429, 500, 502, 503, 504).
+    #[must_use]
+    pub fn retry(mut self, config: RetryConfig) -> Self {
+        self.retry = config;
+        self
+    }
+
+    /// Set maximum number of retry attempts.
+    #[must_use]
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        self.retry.max_retries = max_retries;
+        self
+    }
+
+    /// Disable retries entirely.
+    #[must_use]
+    pub fn no_retry(mut self) -> Self {
+        self.retry = RetryConfig::none();
+        self
+    }
+
+    /// Set the request timeout.
+    ///
+    /// Default is 5 minutes, which is generous for long completions.
+    /// The timeout applies to the entire request, including connection and response streaming.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
     /// Consume the builder and create an [`OpenAI`] client.
     #[must_use]
     pub fn build(self) -> OpenAI {
@@ -880,6 +1100,8 @@ impl Builder {
                 legacy_max_tokens: self.legacy_max_tokens,
                 organization: self.organization,
                 native_abilities: self.native_abilities,
+                retry: self.retry,
+                request_timeout: self.request_timeout,
             }),
         }
     }
@@ -902,6 +1124,8 @@ pub struct Config {
     pub(crate) legacy_max_tokens: bool,
     pub(crate) organization: Option<String>,
     pub(crate) native_abilities: Vec<Ability>,
+    pub(crate) retry: RetryConfig,
+    pub(crate) request_timeout: Duration,
 }
 
 impl Config {

@@ -32,6 +32,7 @@
 
 // Core modules
 mod agent;
+mod bash_agent;
 mod builder;
 mod compression;
 mod config;
@@ -42,11 +43,15 @@ mod hook;
 mod model_group;
 mod search;
 mod stream;
+mod subagent_file;
 mod todo;
 mod tools;
 
 // Specialized agents
 pub mod specialized;
+
+// File-based subagent definitions
+pub use subagent_file::{builtin_subagents, SubagentDefinition};
 
 // Re-export tool crates
 #[cfg(feature = "command")]
@@ -58,8 +63,12 @@ pub use aither_webfetch as webfetch;
 #[cfg(feature = "websearch")]
 pub use aither_websearch as websearch;
 
+// Sandbox is always available (bash-first design)
+pub use aither_sandbox as sandbox;
+
 // Public API
 pub use agent::{Agent, CompactResult};
+pub use bash_agent::BashAgentBuilder;
 pub use builder::AgentBuilder;
 pub use compression::{
     CompressionLevel, ContextStrategy, PreserveConfig, PreservedContent, SmartCompressionConfig,
@@ -81,3 +90,20 @@ pub use model_group::{Budget, BudgetedModel, ModelGroup, ModelGroupError, ModelT
 
 // Re-export core tool trait for convenience
 pub use aither_core::llm::Tool;
+
+/// Default system prompt for bash-centric agents.
+///
+/// This prompt teaches the LLM to use bash as the primary tool interface,
+/// with all capabilities exposed as CLI commands that can be piped and composed.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use aither_agent::{Agent, BASH_SYSTEM_PROMPT};
+///
+/// let agent = Agent::builder(llm)
+///     .system_prompt(BASH_SYSTEM_PROMPT)
+///     .bash(permission_handler, config, output_store)
+///     .build();
+/// ```
+pub const BASH_SYSTEM_PROMPT: &str = include_str!("prompts/system.md");

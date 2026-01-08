@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aither_core::embedding::EmbeddingModel;
-use aither_core::llm::{LLMRequest, LanguageModel, Message, Tool};
+use aither_core::llm::{LLMRequest, LanguageModel, Message, Tool, ToolOutput};
 use anyhow::Context;
 use llm::{Action, ExtractedFacts, MemoryDecision};
 use store::{MemoryStore, SearchFilters};
@@ -35,12 +35,13 @@ where
         "Search for relevant memories based on a query string.".into()
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
-        Ok(self
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+        let result = self
             .inner
             .retrieve_formatted(&arguments, 50)
             .await
-            .context("Fail to retrive memory")?)
+            .context("Fail to retrive memory")?;
+        Ok(ToolOutput::text(result))
     }
 }
 
@@ -63,12 +64,12 @@ where
         "Add a new fact to memory.".into()
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
         self.inner
             .add_fact(arguments)
             .await
             .context("Fail to add fact")?;
-        Ok("Fact(s) added successfully.".into())
+        Ok(ToolOutput::Done)
     }
 }
 

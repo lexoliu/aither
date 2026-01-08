@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use zenwave::{Client, client, error::BoxHttpError, header};
+use zenwave::{Client, client, header};
 
 use crate::{
     config::{AuthMode, GeminiConfig, USER_AGENT},
@@ -55,12 +55,17 @@ async fn get_json<T: for<'de> serde::Deserialize<'de>>(
     endpoint: String,
 ) -> Result<T, GeminiError> {
     let mut backend = client();
-    let mut builder = backend.get(endpoint);
-    builder = builder.header(header::USER_AGENT.as_str(), USER_AGENT);
+    let mut builder = backend
+        .get(endpoint)
+        .map_err(|e| GeminiError::Http(e))?
+        .header(header::USER_AGENT.as_str(), USER_AGENT)
+        .map_err(|e| GeminiError::Http(e))?;
     if cfg.auth == AuthMode::Header {
-        builder = builder.header("x-goog-api-key", cfg.api_key.clone());
+        builder = builder
+            .header("x-goog-api-key", cfg.api_key.clone())
+            .map_err(|e| GeminiError::Http(e))?;
     }
-    builder.json().await.map_err(|e| GeminiError::Http(BoxHttpError::from(Box::new(e))))
+    builder.json().await.map_err(|e| GeminiError::Http(e))
 }
 
 #[allow(clippy::future_not_send)]
@@ -83,12 +88,17 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
     loop {
         attempt += 1;
         let mut backend = client();
-        let mut builder = backend.post(endpoint.clone());
-        builder = builder.header(header::USER_AGENT.as_str(), USER_AGENT);
+        let mut builder = backend
+            .post(endpoint.clone())
+            .map_err(|e| GeminiError::Http(e))?
+            .header(header::USER_AGENT.as_str(), USER_AGENT)
+            .map_err(|e| GeminiError::Http(e))?;
         if cfg.auth == AuthMode::Header {
-            builder = builder.header("x-goog-api-key", cfg.api_key.clone());
+            builder = builder
+                .header("x-goog-api-key", cfg.api_key.clone())
+                .map_err(|e| GeminiError::Http(e))?;
         }
-        builder = builder.json_body(body);
+        let builder = builder.json_body(body).map_err(|e| GeminiError::Http(e))?;
 
         match builder.json().await {
             Ok(res) => {
@@ -104,7 +114,7 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
                 let is_connect = msg.to_ascii_lowercase().contains("connect");
                 let should_retry = is_connect && attempt < 3;
                 if !should_retry {
-                    return Err(GeminiError::Http(BoxHttpError::from(Box::new(error))));
+                    return Err(GeminiError::Http(error));
                 }
                 if debug {
                     eprintln!("Gemini connect error, retrying attempt {attempt}: {msg}");

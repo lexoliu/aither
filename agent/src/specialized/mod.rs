@@ -1,11 +1,10 @@
-//! Specialized agent implementations.
+//! Specialized subagent implementations.
 //!
-//! These are pre-configured agents for common use cases.
+//! These are subagent types that can be spawned by the main agent
+//! for specific tasks like exploration or deep research.
 
-mod coder;
 mod subagent;
 pub mod task;
 
-pub use coder::{Coder, CoderBuilder};
-pub use subagent::{SubAgentQuery, SubAgentTool};
-pub use task::{SubagentType, TaskArgs, TaskTool};
+pub use subagent::{IntoSubAgent, SubAgentQuery, SubAgentTool};
+pub use task::{SubagentDisplayHook, SubagentType, TaskArgs, TaskTool};

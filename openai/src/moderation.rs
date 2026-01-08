@@ -5,7 +5,7 @@ use crate::{
 use aither_core::moderation::{Moderation, ModerationCategory, ModerationResult};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, future::Future, sync::Arc};
-use zenwave::{Client, client, error::BoxHttpError, header};
+use zenwave::{Client, client, header};
 
 impl Moderation for OpenAI {
     type Error = OpenAIError;
@@ -23,22 +23,29 @@ impl Moderation for OpenAI {
 async fn moderate_once(cfg: Arc<Config>, content: String) -> Result<ModerationResult, OpenAIError> {
     let endpoint = cfg.request_url("/moderations");
     let mut backend = client();
-    let mut builder = backend.post(endpoint);
-    builder = builder.header(header::AUTHORIZATION.as_str(), cfg.request_auth());
-    builder = builder.header(header::USER_AGENT.as_str(), "aither-openai/0.1");
+    let mut builder = backend
+        .post(endpoint)
+        .map_err(|e| OpenAIError::Http(e))?
+        .header(header::AUTHORIZATION.as_str(), cfg.request_auth())
+        .map_err(|e| OpenAIError::Http(e))?
+        .header(header::USER_AGENT.as_str(), "aither-openai/0.1")
+        .map_err(|e| OpenAIError::Http(e))?;
     if let Some(org) = &cfg.organization {
-        builder = builder.header("OpenAI-Organization", org.clone());
+        builder = builder
+            .header("OpenAI-Organization", org.clone())
+            .map_err(|e| OpenAIError::Http(e))?;
     }
 
     let request = ModerationRequest {
         model: &cfg.moderation_model,
         input: &content,
     };
-    builder = builder.json_body(&request);
     let response: ModerationResponse = builder
+        .json_body(&request)
+        .map_err(|e| OpenAIError::Http(e))?
         .json()
         .await
-        .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
+        .map_err(|e| OpenAIError::Http(e))?;
 
     response.into_result()
 }

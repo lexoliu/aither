@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
             top_k: 2,
         })
         .await?;
-    println!("\nTool response:\n{response}");
+    println!("\nTool response:\n{}", response.as_str().unwrap_or(""));
 
     // Direct search
     println!("\nDirect search results:");

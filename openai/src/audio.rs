@@ -7,9 +7,7 @@ use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use zenwave::{
-    Client, client,
-    error::BoxHttpError,
-    header,
+    Client, client, header,
     multipart::{MultipartPart, encode as encode_multipart},
 };
 
@@ -36,11 +34,17 @@ impl AudioTranscriber for OpenAI {
 async fn synthesize(cfg: Arc<Config>, text: String) -> Result<Vec<u8>, OpenAIError> {
     let endpoint = cfg.request_url("/audio/speech");
     let mut backend = client();
-    let mut builder = backend.post(endpoint);
-    builder = builder.header(header::AUTHORIZATION.as_str(), cfg.request_auth());
-    builder = builder.header(header::USER_AGENT.as_str(), "aither-openai/0.1");
+    let mut builder = backend
+        .post(endpoint)
+        .map_err(|e| OpenAIError::Http(e))?
+        .header(header::AUTHORIZATION.as_str(), cfg.request_auth())
+        .map_err(|e| OpenAIError::Http(e))?
+        .header(header::USER_AGENT.as_str(), "aither-openai/0.1")
+        .map_err(|e| OpenAIError::Http(e))?;
     if let Some(org) = &cfg.organization {
-        builder = builder.header("OpenAI-Organization", org.clone());
+        builder = builder
+            .header("OpenAI-Organization", org.clone())
+            .map_err(|e| OpenAIError::Http(e))?;
     }
 
     let request = SpeechRequest {
@@ -49,11 +53,12 @@ async fn synthesize(cfg: Arc<Config>, text: String) -> Result<Vec<u8>, OpenAIErr
         voice: &cfg.audio_voice,
         format: &cfg.audio_format,
     };
-    builder = builder.json_body(&request);
     let bytes = builder
+        .json_body(&request)
+        .map_err(|e| OpenAIError::Http(e))?
         .bytes()
         .await
-        .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
+        .map_err(|e| OpenAIError::Http(e))?;
 
     Ok(bytes.to_vec())
 }
@@ -61,11 +66,17 @@ async fn synthesize(cfg: Arc<Config>, text: String) -> Result<Vec<u8>, OpenAIErr
 async fn transcribe_once(cfg: Arc<Config>, audio: Vec<u8>) -> Result<String, OpenAIError> {
     let endpoint = cfg.request_url("/audio/transcriptions");
     let mut backend = client();
-    let mut builder = backend.post(endpoint);
-    builder = builder.header(header::AUTHORIZATION.as_str(), cfg.request_auth());
-    builder = builder.header(header::USER_AGENT.as_str(), "aither-openai/0.1");
+    let mut builder = backend
+        .post(endpoint)
+        .map_err(|e| OpenAIError::Http(e))?
+        .header(header::AUTHORIZATION.as_str(), cfg.request_auth())
+        .map_err(|e| OpenAIError::Http(e))?
+        .header(header::USER_AGENT.as_str(), "aither-openai/0.1")
+        .map_err(|e| OpenAIError::Http(e))?;
     if let Some(org) = &cfg.organization {
-        builder = builder.header("OpenAI-Organization", org.clone());
+        builder = builder
+            .header("OpenAI-Organization", org.clone())
+            .map_err(|e| OpenAIError::Http(e))?;
     }
 
     let parts = vec![
@@ -75,16 +86,16 @@ async fn transcribe_once(cfg: Arc<Config>, audio: Vec<u8>) -> Result<String, Ope
     ];
 
     let (boundary, body) = encode_multipart(parts);
-    builder = builder.header(
-        header::CONTENT_TYPE.as_str(),
-        format!("multipart/form-data; boundary={boundary}"),
-    );
-    builder = builder.bytes_body(body);
-
     let response: TranscriptionResponse = builder
+        .header(
+            header::CONTENT_TYPE.as_str(),
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .map_err(|e| OpenAIError::Http(e))?
+        .bytes_body(body)
         .json()
         .await
-        .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
+        .map_err(|e| OpenAIError::Http(e))?;
 
     Ok(response.text)
 }

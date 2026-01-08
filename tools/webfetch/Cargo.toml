@@ -19,6 +19,26 @@ schemars = "1.1"
 serde = { version = "1.0", features = ["derive"] }
 url = "2.5.7"
 zenwave.workspace = true
+tracing.workspace = true
+regex = "1.11"
+html-escape = "0.2"
+
+# Image processing for format conversion
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+
+# Headless browser support (optional) - tokio comes via chromiumoxide
+chromiumoxide = { version = "0.7", optional = true, default-features = false, features = ["tokio-runtime"] }
+futures-lite = { version = "2.6", optional = true }
+tokio = { version = "1.0", optional = true, features = ["rt", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+headless = ["dep:chromiumoxide", "dep:futures-lite", "dep:tokio"]
+
+[[example]]
+name = "headless"
+required-features = ["headless"]

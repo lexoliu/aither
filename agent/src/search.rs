@@ -228,8 +228,8 @@ mod tests {
 
         type Arguments = EmptyArgs;
 
-        async fn call(&self, _args: Self::Arguments) -> aither_core::Result {
-            Ok("ok".into())
+        async fn call(&self, _args: Self::Arguments) -> aither_core::Result<aither_core::llm::ToolOutput> {
+            Ok(aither_core::llm::ToolOutput::text("ok"))
         }
     }
 

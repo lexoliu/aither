@@ -18,6 +18,7 @@ members = [
     "tools/command",
     "mcp",
     "cli",
+    "sandbox",
 ]
 
 [workspace.package]
@@ -46,13 +47,14 @@ tracing = "0.1.41"
 aither-core = { path = "./core"}
 aither-derive = { path = "./derive", version = "0.1.0"}
 aither-ort = { path = "./ort" }
-zenwave = { git = "https://github.com/zen-rs/zenwave" }
+zenwave = { path = "../zenwave" }
 aither-skills = { path = "./skills" }
 aither-websearch = { path = "./tools/websearch" }
 aither-webfetch = { path = "./tools/webfetch" }
 aither-fs = { path = "./tools/fs" }
 aither-command = { path = "./tools/command" }
 aither-mcp = { path = "./mcp" }
+aither-sandbox = { path = "./sandbox" }
 aither-agent = { path = "./agent" }
 aither-openai = { path = "./openai" }
 aither-claude = { path = "./claude" }

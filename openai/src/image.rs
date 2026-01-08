@@ -9,9 +9,7 @@ use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use zenwave::{
-    Client, client,
-    error::BoxHttpError,
-    header,
+    Client, client, header,
     multipart::{MultipartPart, encode as encode_multipart},
 };
 
@@ -70,11 +68,17 @@ async fn generate_images(
 ) -> Result<Vec<Data>, OpenAIError> {
     let endpoint = cfg.request_url("/images/generations");
     let mut backend = client();
-    let mut builder = backend.post(endpoint);
-    builder = builder.header(header::AUTHORIZATION.as_str(), cfg.request_auth());
-    builder = builder.header(header::USER_AGENT.as_str(), "aither-openai/0.1");
+    let mut builder = backend
+        .post(endpoint)
+        .map_err(|e| OpenAIError::Http(e))?
+        .header(header::AUTHORIZATION.as_str(), cfg.request_auth())
+        .map_err(|e| OpenAIError::Http(e))?
+        .header(header::USER_AGENT.as_str(), "aither-openai/0.1")
+        .map_err(|e| OpenAIError::Http(e))?;
     if let Some(org) = &cfg.organization {
-        builder = builder.header("OpenAI-Organization", org.clone());
+        builder = builder
+            .header("OpenAI-Organization", org.clone())
+            .map_err(|e| OpenAIError::Http(e))?;
     }
     let request = ImageGenerationRequest {
         model: &cfg.image_model,
@@ -83,11 +87,12 @@ async fn generate_images(
         response_format: "b64_json",
         n: 1,
     };
-    builder = builder.json_body(&request);
     let response: ImageResponse = builder
+        .json_body(&request)
+        .map_err(|e| OpenAIError::Http(e))?
         .json()
         .await
-        .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
+        .map_err(|e| OpenAIError::Http(e))?;
     response.into_images()
 }
 
@@ -100,11 +105,17 @@ async fn edit_image(
 ) -> Result<Vec<Data>, OpenAIError> {
     let endpoint = cfg.request_url("/images/edits");
     let mut backend = client();
-    let mut builder = backend.post(endpoint);
-    builder = builder.header(header::AUTHORIZATION.as_str(), cfg.request_auth());
-    builder = builder.header(header::USER_AGENT.as_str(), "aither-openai/0.1");
+    let mut builder = backend
+        .post(endpoint)
+        .map_err(|e| OpenAIError::Http(e))?
+        .header(header::AUTHORIZATION.as_str(), cfg.request_auth())
+        .map_err(|e| OpenAIError::Http(e))?
+        .header(header::USER_AGENT.as_str(), "aither-openai/0.1")
+        .map_err(|e| OpenAIError::Http(e))?;
     if let Some(org) = &cfg.organization {
-        builder = builder.header("OpenAI-Organization", org.clone());
+        builder = builder
+            .header("OpenAI-Organization", org.clone())
+            .map_err(|e| OpenAIError::Http(e))?;
     }
     let mut parts = vec![
         MultipartPart::text("model", cfg.image_model.clone()),
@@ -122,15 +133,16 @@ async fn edit_image(
         ));
     }
     let (boundary, body) = encode_multipart(parts);
-    builder = builder.header(
-        header::CONTENT_TYPE.as_str(),
-        format!("multipart/form-data; boundary={boundary}"),
-    );
-    builder = builder.bytes_body(body);
     let response: ImageResponse = builder
+        .header(
+            header::CONTENT_TYPE.as_str(),
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .map_err(|e| OpenAIError::Http(e))?
+        .bytes_body(body)
         .json()
         .await
-        .map_err(|error| OpenAIError::Http(BoxHttpError::from(Box::new(error))))?;
+        .map_err(|e| OpenAIError::Http(e))?;
     response.into_images()
 }
 

@@ -1,13 +1,13 @@
 //! Error types for the Claude API client.
 
 use core::fmt;
-use zenwave::{BodyError, error::BoxHttpError, sse::ParseError as SseParseError};
+use zenwave::{BodyError, Error as ZenwaveError, sse::ParseError as SseParseError};
 
 /// Errors that can arise when calling the Claude API.
 #[derive(Debug)]
 pub enum ClaudeError {
     /// HTTP layer errors.
-    Http(BoxHttpError),
+    Http(ZenwaveError),
     /// Response body parsing failures.
     Body(BodyError),
     /// SSE parsing failures.
@@ -32,8 +32,8 @@ impl fmt::Display for ClaudeError {
 
 impl std::error::Error for ClaudeError {}
 
-impl From<BoxHttpError> for ClaudeError {
-    fn from(value: BoxHttpError) -> Self {
+impl From<ZenwaveError> for ClaudeError {
+    fn from(value: ZenwaveError) -> Self {
         Self::Http(value)
     }
 }

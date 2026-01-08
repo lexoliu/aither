@@ -1,0 +1,31 @@
+Compress this conversation context. Some content has URLs for later reference.
+
+## Rules
+1. Preserve ALL critical information (file paths, errors, commands, decisions)
+2. When referencing tool outputs that should be accessible later, include their URL
+3. Only reference URLs for content valuable enough to persist
+4. Tiny status messages don't need URLs - summarize them inline
+
+## Content to Compact
+
+{content_with_urls}
+
+## MUST PRESERVE VERBATIM
+- File paths: {file_paths}
+- Errors: {errors}
+- Commands: {commands}
+
+## OUTPUT FORMAT
+
+Produce a concise summary. Reference URLs like `outputs/word-word-word-word.ext`
+for any content that should remain accessible later.
+
+## Summary
+[2-3 sentence summary of what was accomplished]
+
+## Key Facts
+- [Bullet points of important decisions/findings]
+- [Reference URLs for detailed outputs worth preserving]
+
+## Preserved Context
+[File paths, errors, commands, and URL references]
