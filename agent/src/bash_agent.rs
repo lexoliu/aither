@@ -158,6 +158,20 @@ where
         self
     }
 
+    /// Registers the `ask` command with a fast LLM for processing piped content.
+    ///
+    /// The ask command allows LLM to query a fast model about large outputs:
+    /// ```bash
+    /// cat large_output.txt | ask "summarize the key points"
+    /// ```
+    pub fn with_ask<FastLLM>(self, fast_llm: FastLLM) -> Self
+    where
+        FastLLM: LanguageModel + Send + Sync + 'static,
+    {
+        let ask_cmd = aither_sandbox::builtin::AskCommand::new(fast_llm);
+        self.ipc_tool_with_desc(ask_cmd, "Query fast LLM about piped content")
+    }
+
     /// Sets a custom system prompt (raw string, no template processing).
     pub fn system_prompt_raw(mut self, prompt: impl Into<String>) -> Self {
         self.inner = self.inner.system_prompt(prompt.into());

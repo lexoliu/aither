@@ -80,8 +80,6 @@ pub enum OutputEntry {
         url: String,
         /// Preview content (if large text)
         content: Option<Content>,
-        /// Summary for large outputs
-        summary: Option<String>,
     },
 }
 
@@ -105,21 +103,12 @@ impl Serialize for OutputEntry {
                 map.serialize_entry("content", content)?;
                 map.end()
             }
-            OutputEntry::Stored { url, content, summary } => {
-                let mut count = 1; // url is always present
-                if content.is_some() {
-                    count += 1;
-                }
-                if summary.is_some() {
-                    count += 1;
-                }
+            OutputEntry::Stored { url, content } => {
+                let count = if content.is_some() { 2 } else { 1 };
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("url", url)?;
                 if let Some(c) = content {
                     map.serialize_entry("content", c)?;
-                }
-                if let Some(s) = summary {
-                    map.serialize_entry("summary", s)?;
                 }
                 map.end()
             }
@@ -136,13 +125,12 @@ impl<'de> Deserialize<'de> for OutputEntry {
         struct Helper {
             url: Option<String>,
             content: Option<Content>,
-            summary: Option<String>,
         }
 
         let h = Helper::deserialize(deserializer)?;
 
         Ok(match (h.url, h.content) {
-            (Some(url), content) => OutputEntry::Stored { url, content, summary: h.summary },
+            (Some(url), content) => OutputEntry::Stored { url, content },
             (None, Some(content)) => OutputEntry::Inline { content },
             (None, None) => OutputEntry::Empty,
         })
@@ -167,21 +155,19 @@ impl std::fmt::Display for OutputEntry {
                     }
                 }
             }
-            OutputEntry::Stored { url, content, summary } => {
+            OutputEntry::Stored { url, content } => {
                 if let Some(content) = content {
                     match content {
                         Content::Text { text, truncated } => {
                             write!(f, "{text}")?;
                             if *truncated {
-                                write!(f, "\n[truncated, full content at {url}]")?;
+                                write!(f, "\n[full content at {url}]")?;
                             }
                         }
                         Content::Image { media_type, .. } => {
                             write!(f, "[Image: {media_type}] at {url}")?;
                         }
                     }
-                } else if let Some(summary) = summary {
-                    write!(f, "{summary}\n[full content at {url}]")?;
                 } else {
                     write!(f, "[content at {url}]")?;
                 }
@@ -331,15 +317,9 @@ impl OutputStore {
             OutputFormat::Video | OutputFormat::Binary => {
                 // Binary/video are always Stored immediately
                 let (url, _) = create_file(dir, data, format).await?;
-                let summary = format!(
-                    "{} data ({} bytes)",
-                    if format == OutputFormat::Video { "Video" } else { "Binary" },
-                    data.len()
-                );
                 Ok(OutputEntry::Stored {
                     url,
                     content: None,
-                    summary: Some(summary),
                 })
             }
         }
@@ -357,7 +337,6 @@ impl OutputStore {
                 Ok(OutputEntry::Stored {
                     url,
                     content: Some(content.clone()),
-                    summary: None,
                 })
             }
             // Already stored or inline/empty - return as-is
@@ -512,16 +491,14 @@ async fn save_text_output(
         let preview: String = lines[..PREVIEW_LINES].join("\n");
         let content = Content::Text {
             text: format!(
-                "{preview}\n\n... truncated ({} more lines). Use `ask` or read the file to see more.",
+                "{preview}\n\n... ({} more lines at {url})",
                 line_count - PREVIEW_LINES
             ),
             truncated: true,
         };
-        let summary = format!("Text output with {line_count} lines ({} bytes)", data.len());
         Ok(OutputEntry::Stored {
             url,
             content: Some(content),
-            summary: Some(summary),
         })
     }
 }
@@ -718,12 +695,10 @@ mod tests {
                 text: "preview".to_string(),
                 truncated: true,
             }),
-            summary: Some("100 lines".to_string()),
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"url\""));
         assert!(json.contains("\"content\""));
-        assert!(json.contains("\"summary\""));
     }
 
     #[test]

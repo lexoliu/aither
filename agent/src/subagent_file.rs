@@ -1,20 +1,21 @@
 //! File-based subagent definitions.
 //!
-//! Subagents can be defined in markdown files with the format:
+//! Subagents can be defined in markdown files with YAML frontmatter:
 //!
 //! ```markdown
-//! # subagent-id
-//!
-//! One sentence description.
-//!
 //! ---
+//! name: subagent-id
+//! description: One sentence description of when to use this subagent.
+//! ---
+//!
+//! # Subagent Title
 //!
 //! System prompt content here...
 //! ```
 //!
-//! The first line after `#` is the subagent ID.
-//! The line before `---` is the description.
-//! Everything after `---` is the system prompt.
+//! The `name` field is the subagent ID used for tool registration.
+//! The `description` field is shown in tool listings.
+//! Everything after the frontmatter is the system prompt.
 
 use std::path::Path;
 
@@ -32,49 +33,48 @@ pub struct SubagentDefinition {
 }
 
 impl SubagentDefinition {
-    /// Parse a subagent definition from markdown content.
+    /// Parse a subagent definition from markdown content with YAML frontmatter.
     ///
     /// Format:
     /// ```markdown
-    /// # id
-    ///
-    /// Description sentence.
-    ///
+    /// ---
+    /// name: subagent-id
+    /// description: Description of when to use this subagent.
     /// ---
     ///
-    /// System prompt...
+    /// System prompt content...
     /// ```
     pub fn parse(content: &str) -> Option<Self> {
         let content = content.trim();
 
-        // Find the ID (first # heading)
-        let id = content
-            .lines()
-            .find(|l| l.starts_with("# "))?
-            .trim_start_matches("# ")
-            .trim()
-            .to_string();
-
-        // Split by ---
-        let parts: Vec<&str> = content.splitn(2, "\n---").collect();
-        if parts.len() != 2 {
+        // Must start with ---
+        if !content.starts_with("---") {
             return None;
         }
 
-        let header = parts[0];
-        let system_prompt = parts[1].trim().to_string();
+        // Find the closing ---
+        let after_open = &content[3..].trim_start_matches(['\r', '\n']);
+        let close_idx = after_open.find("\n---")?;
 
-        // Extract description (non-empty line after the # heading, before ---)
-        let description = header
-            .lines()
-            .skip_while(|l| l.starts_with('#') || l.is_empty())
-            .find(|l| !l.is_empty())?
-            .trim()
-            .to_string();
+        let frontmatter = &after_open[..close_idx];
+        let system_prompt = after_open[close_idx + 4..].trim().to_string();
+
+        // Parse frontmatter (simple key: value parsing)
+        let mut id = None;
+        let mut description = None;
+
+        for line in frontmatter.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("name:") {
+                id = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("description:") {
+                description = Some(rest.trim().to_string());
+            }
+        }
 
         Some(Self {
-            id,
-            description,
+            id: id?,
+            description: description?,
             system_prompt,
             max_iterations: 20,
         })
@@ -121,6 +121,9 @@ pub fn builtin_subagents() -> Vec<SubagentDefinition> {
     if let Some(def) = SubagentDefinition::parse(include_str!("prompts/subagents/plan.md")) {
         defs.push(def);
     }
+    if let Some(def) = SubagentDefinition::parse(include_str!("prompts/subagents/research.md")) {
+        defs.push(def);
+    }
 
     defs
 }
@@ -131,18 +134,22 @@ mod tests {
 
     #[test]
     fn parse_subagent_definition() {
-        let content = r#"# test-agent
-
-This is a test agent.
-
+        let content = r#"---
+name: test-agent
+description: This is a test agent for exploring and testing.
 ---
+
+# Test Agent
 
 You are a test agent. Do test things.
 "#;
 
         let def = SubagentDefinition::parse(content).unwrap();
         assert_eq!(def.id, "test-agent");
-        assert_eq!(def.description, "This is a test agent.");
+        assert_eq!(
+            def.description,
+            "This is a test agent for exploring and testing."
+        );
         assert!(def.system_prompt.contains("You are a test agent"));
     }
 

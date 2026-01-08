@@ -461,7 +461,8 @@ async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudPro
     let mut builder = BashAgentBuilder::new(cloud.clone(), bash_tool)
         // Built-in IPC tools
         .ipc_tool(aither_agent::websearch::WebSearchTool::default())
-        .ipc_tool(aither_agent::webfetch::WebFetchTool::new());
+        .ipc_tool(aither_agent::webfetch::WebFetchTool::new())
+        .with_ask(cloud.clone()); // Fast LLM for processing piped content
 
     // Register todo with simple CLI syntax (not JSON)
     register_simple_todo();

@@ -32,14 +32,25 @@ Ask briefly:
 
 ### 1.2 Research Topic
 
-Use web search to research the topic if needed. Gather:
-- Key points to cover
-- Relevant statistics or quotes
-- Visual inspiration
+Delegate topic research to a subagent:
 
-### 1.3 Create Outline Document
+```
+task references/subagent_topic_research.md "Research the topic: {TOPIC}"
+```
 
-Create an outline with:
+The subagent will return key points, statistics, quotes, and suggested structure.
+
+### 1.3 Art Direction
+
+Delegate visual design to a subagent:
+
+```
+task references/subagent_art_direction.md "Design art direction for: {TOPIC}, audience: {AUDIENCE}, style: {STYLE}"
+```
+
+### 1.4 Create Outline Document
+
+Combine research and art direction into an outline with:
 - Slide-by-slide breakdown (title + key points for each)
 - Art direction (theme, color scheme, visual style)
 - Content types per slide (text, code, table, image, quote)
@@ -69,7 +80,7 @@ Example format:
 ...
 ```
 
-### 1.4 Discuss with User
+### 1.5 Discuss with User
 
 Present the outline to the user. Ask for feedback:
 - "Does this structure cover what you need?"
@@ -102,13 +113,16 @@ npx @slidev/cli slides.md &
 For each slide in the outline:
 
 1. **Append** the slide content to `slides.md`
-2. **Launch browser subagent** with system prompt from [references/subagent_visual_verification.md](references/subagent_visual_verification.md)
-3. Pass the slide number to verify
+2. **Delegate verification** to a subagent:
+   ```
+   task references/subagent_visual_verification.md "Verify slide {N} at http://localhost:3030/{N}"
+   ```
+3. Review the subagent's status report
 
 If subagent reports ERROR:
 1. Check terminal output for error details
 2. Fix the slide content
-3. Re-run subagent verification
+3. Re-run verification task
 
 Only proceed to next slide after current one passes.
 
@@ -121,16 +135,6 @@ for i in {1..N}; do echo "Slide $i: $(curl -s http://localhost:3030/$i | grep -o
 ```
 
 Confirm all slides pass. Present final result to user.
-
-## Subagent System Prompts
-
-Use these system prompts when launching subagents:
-
-| Subagent | System Prompt File | When to Use |
-|----------|-------------------|-------------|
-| Topic Research | [subagent_topic_research.md](references/subagent_topic_research.md) | Phase 1: Researching unfamiliar topics |
-| Art Direction | [subagent_art_direction.md](references/subagent_art_direction.md) | Phase 1: Designing visual style |
-| Visual Verification | [subagent_visual_verification.md](references/subagent_visual_verification.md) | Phase 2: After each slide is created |
 
 ## Syntax Quick Reference
 
