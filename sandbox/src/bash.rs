@@ -221,6 +221,8 @@ pub struct BashTool<P, E> {
     completed_rx: Receiver<CompletedTask>,
     /// Channel for sending completed background tasks (cloned for each background task).
     completed_tx: Sender<CompletedTask>,
+    /// Job registry for tracking background tasks.
+    job_registry: crate::job_registry::JobRegistry,
 }
 
 // Manual Clone impl because P doesn't need to be Clone (we use Arc<P>)
@@ -233,6 +235,7 @@ impl<P, E: Clone> Clone for BashTool<P, E> {
             output_store: self.output_store.clone(),
             completed_rx: self.completed_rx.clone(),
             completed_tx: self.completed_tx.clone(),
+            job_registry: self.job_registry.clone(),
         }
     }
 }
@@ -269,6 +272,9 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
         // Create channel for background task completion (unbounded to not block spawned tasks)
         let (completed_tx, completed_rx) = async_channel::unbounded();
 
+        // Create job registry for tracking background tasks
+        let job_registry = crate::job_registry::JobRegistry::new();
+
         Ok(Self {
             working_dir: working_dir_path,
             permission_handler: Arc::new(permission_handler),
@@ -276,6 +282,7 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
             output_store,
             completed_rx,
             completed_tx,
+            job_registry,
         })
     }
 
@@ -285,16 +292,18 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
     /// Use this to create bash tools for subagents that:
     /// - Share the same working directory and output store
     /// - Share the same permission handler (security policies enforced consistently)
+    /// - Share the same job registry (parent can see all jobs)
     /// - Have independent completion channels (no message mixup)
     pub fn child(&self) -> Self {
         let (completed_tx, completed_rx) = async_channel::unbounded();
         Self {
             working_dir: self.working_dir.clone(),
-            permission_handler: self.permission_handler.clone(), // Arc clone - shares handler
+            permission_handler: self.permission_handler.clone(),
             executor: self.executor.clone(),
             output_store: self.output_store.clone(),
             completed_rx,
             completed_tx,
+            job_registry: self.job_registry.clone(),
         }
     }
 
@@ -306,6 +315,11 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
     /// Returns the output store.
     pub fn output_store(&self) -> &Arc<RwLock<OutputStore>> {
         &self.output_store
+    }
+
+    /// Returns the job registry for tracking background tasks.
+    pub fn job_registry(&self) -> &crate::job_registry::JobRegistry {
+        &self.job_registry
     }
 
     /// Returns a receiver for completed background tasks.

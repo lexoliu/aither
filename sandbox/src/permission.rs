@@ -2,11 +2,14 @@
 //!
 //! Different bash modes have different permission requirements:
 //! - `Sandboxed`: No approval needed (read-only, no network)
-//! - `Network`: First-use approval only
+//! - `Network`: Trusted domains auto-allowed, others require approval
 //! - `Unsafe`: Per-script approval required
 
+use std::collections::HashSet;
 use std::future::Future;
+use std::sync::RwLock;
 
+use leash::DomainRequest;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +70,75 @@ pub trait PermissionHandler: Send + Sync {
         mode: BashMode,
         script: &str,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send;
+
+    /// Checks if a network domain access is allowed.
+    ///
+    /// Called for each outbound network connection in network mode.
+    /// Default implementation allows all (for backwards compatibility).
+    fn check_domain(
+        &self,
+        request: &DomainRequest,
+    ) -> impl Future<Output = bool> + Send {
+        let _ = request;
+        async { true }
+    }
+}
+
+/// Default trusted domains for common package registries and services.
+pub const TRUSTED_DOMAINS: &[&str] = &[
+    // Package registries
+    "*.npmjs.org",
+    "*.npmjs.com",
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "*.pypi.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "*.crates.io",
+    "crates.io",
+    "static.crates.io",
+    "*.rubygems.org",
+    // Code hosting
+    "*.github.com",
+    "github.com",
+    "*.githubusercontent.com",
+    "*.gitlab.com",
+    "gitlab.com",
+    "*.bitbucket.org",
+    // CDNs commonly used by package managers
+    "*.cloudflare.com",
+    "*.fastly.net",
+    "*.akamaized.net",
+    // Language-specific
+    "*.golang.org",
+    "proxy.golang.org",
+    "*.rust-lang.org",
+    "*.docs.rs",
+    // Common development tools
+    "*.docker.io",
+    "*.docker.com",
+    "auth.docker.io",
+    "registry-1.docker.io",
+];
+
+/// Check if a domain matches a pattern (exact or wildcard).
+fn domain_matches(domain: &str, pattern: &str) -> bool {
+    if domain == pattern {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        if domain.ends_with(suffix) && domain.len() > suffix.len() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a domain is in the trusted list.
+pub fn is_trusted_domain(domain: &str) -> bool {
+    TRUSTED_DOMAINS
+        .iter()
+        .any(|pattern| domain_matches(domain, pattern))
 }
 
 /// Error type for permission operations.
@@ -114,19 +186,44 @@ impl PermissionHandler for AllowAll {
     }
 }
 
-/// A permission handler that tracks network approval state.
-#[derive(Debug, Default)]
+/// A permission handler that tracks approval state for network mode and domains.
+///
+/// - Network mode: requires first-use approval
+/// - Trusted domains: auto-allowed without prompting
+/// - Unknown domains: prompts user, caches approval
 pub struct StatefulPermissionHandler<Inner> {
     inner: Inner,
     network_approved: std::sync::atomic::AtomicBool,
+    /// Domains that have been approved by the user (not in trusted list)
+    approved_domains: RwLock<HashSet<String>>,
+}
+
+impl<Inner: std::fmt::Debug> std::fmt::Debug for StatefulPermissionHandler<Inner> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatefulPermissionHandler")
+            .field("inner", &self.inner)
+            .field("network_approved", &self.network_approved)
+            .field(
+                "approved_domains",
+                &self.approved_domains.read().unwrap().len(),
+            )
+            .finish()
+    }
+}
+
+impl<Inner: Default> Default for StatefulPermissionHandler<Inner> {
+    fn default() -> Self {
+        Self::new(Inner::default())
+    }
 }
 
 impl<Inner> StatefulPermissionHandler<Inner> {
     /// Creates a new stateful handler wrapping the given inner handler.
-    pub const fn new(inner: Inner) -> Self {
+    pub fn new(inner: Inner) -> Self {
         Self {
             inner,
             network_approved: std::sync::atomic::AtomicBool::new(false),
+            approved_domains: RwLock::new(HashSet::new()),
         }
     }
 
@@ -140,6 +237,27 @@ impl<Inner> StatefulPermissionHandler<Inner> {
     pub fn approve_network(&self) {
         self.network_approved
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Check if a domain has been approved (either trusted or user-approved).
+    fn is_domain_approved(&self, domain: &str) -> bool {
+        // Check trusted list first
+        if is_trusted_domain(domain) {
+            return true;
+        }
+        // Check user-approved domains
+        self.approved_domains
+            .read()
+            .unwrap()
+            .contains(domain)
+    }
+
+    /// Mark a domain as approved.
+    fn approve_domain(&self, domain: &str) {
+        self.approved_domains
+            .write()
+            .unwrap()
+            .insert(domain.to_string());
     }
 }
 
@@ -164,6 +282,27 @@ impl<Inner: PermissionHandler> PermissionHandler for StatefulPermissionHandler<I
                 self.inner.check(mode, script).await
             }
         }
+    }
+
+    async fn check_domain(&self, request: &DomainRequest) -> bool {
+        let domain = request.target().to_string();
+
+        // Check if already approved (trusted or user-approved)
+        if self.is_domain_approved(&domain) {
+            tracing::debug!(domain = %domain, "domain auto-allowed (trusted or cached)");
+            return true;
+        }
+
+        // Ask inner handler for unknown domain
+        tracing::info!(domain = %domain, "unknown domain, prompting user");
+        let approved = self.inner.check_domain(request).await;
+        if approved {
+            self.approve_domain(&domain);
+            tracing::info!(domain = %domain, "domain approved by user");
+        } else {
+            tracing::warn!(domain = %domain, "domain denied by user");
+        }
+        approved
     }
 }
 

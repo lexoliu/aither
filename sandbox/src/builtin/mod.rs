@@ -1,16 +1,14 @@
-//! Built-in commands for the bash sandbox.
+//! Built-in tools for the bash sandbox.
 //!
-//! These commands are always available and provide special functionality:
+//! These tools are always available and provide special functionality:
 //! - `ask`: Query a fast LLM about piped content
+//! - `tasks`: List background tasks (running, completed, failed, killed)
+//! - `kill`: Terminate a background task by PID
 
 mod ask;
+mod kill_tool;
+mod tasks;
 
 pub use ask::AskCommand;
-
-use leash::IpcRouter;
-
-/// Creates an IPC router with built-in commands (excluding ask, which needs LLM).
-#[must_use]
-pub fn builtin_router() -> IpcRouter {
-    IpcRouter::new()
-}
+pub use kill_tool::{KillArgs, KillTool};
+pub use tasks::{TasksArgs, TasksTool};

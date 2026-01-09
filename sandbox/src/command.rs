@@ -447,14 +447,6 @@ impl IpcCommand for ToolCallCommand {
         self.tool_name.clone()
     }
 
-    fn primary_arg(&self) -> Option<Cow<'static, str>> {
-        get_tool_primary_arg(&self.tool_name).map(Cow::Owned)
-    }
-
-    fn stdin_arg(&self) -> Option<Cow<'static, str>> {
-        get_tool_stdin_arg(&self.tool_name).map(Cow::Owned)
-    }
-
     fn set_method_name(&mut self, name: &str) {
         self.tool_name = name.to_string();
     }

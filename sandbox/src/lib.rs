@@ -51,8 +51,14 @@ mod bash;
 mod command;
 mod output;
 
-/// Built-in IPC commands (ask, reload).
+/// Built-in IPC commands (ask, jobs, kill).
 pub mod builtin;
+
+/// Background job registry for tracking and managing background tasks.
+pub mod job_registry;
+
+/// Network access policy with trusted domain whitelist.
+pub mod network;
 
 /// Permission handling for bash modes.
 pub mod permission;
@@ -64,5 +70,6 @@ pub use command::{
     registered_tool_names, set_bash_tool_factory, DynBashTool, DynToolHandler, ToolCallCommand,
     ToolCommand,
 };
+pub use job_registry::{JobInfo, JobRegistry, JobStatus};
 pub use output::{Content, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{BashMode, PermissionHandler};
