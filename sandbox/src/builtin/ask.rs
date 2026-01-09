@@ -17,7 +17,14 @@ use futures_lite::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Arguments for the ask command.
+/// Query a fast LLM about piped content.
+///
+/// Reads content from stdin and processes it with a fast language model.
+/// Only the model's response is returned to your context - the input content
+/// is not included in the response, saving context space for large inputs.
+///
+/// This is useful when you need to analyze, summarize, or extract information
+/// from data without loading the full content into your context window.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AskArgs {
     /// The question or instruction about the input content.
@@ -29,6 +36,7 @@ pub struct AskArgs {
 }
 
 /// The ask command tool.
+#[derive(Debug)]
 pub struct AskCommand<LLM> {
     llm: LLM,
 }
@@ -43,19 +51,6 @@ impl<LLM> AskCommand<LLM> {
 impl<LLM: LanguageModel> Tool for AskCommand<LLM> {
     fn name(&self) -> Cow<'static, str> {
         "ask".into()
-    }
-
-    fn description(&self) -> Cow<'static, str> {
-        r#"Query a fast LLM about piped content.
-
-Usage: <content> | ask "<question>"
-
-Examples:
-  cat large_output.txt | ask "summarize the key points"
-  websearch "rust async" | ask "extract the main patterns"
-  grep -r "error" . | ask "categorize these errors"
-"#
-        .into()
     }
 
     type Arguments = AskArgs;

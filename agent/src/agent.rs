@@ -26,7 +26,7 @@ use crate::{
     tools::AgentTools,
 };
 
-use aither_sandbox::{BackgroundTaskReceiver, OutputStore, builtin::ReloadResponse};
+use aither_sandbox::{BackgroundTaskReceiver, OutputStore};
 use std::sync::{Arc, RwLock};
 
 /// Result of a compaction operation.
@@ -888,42 +888,11 @@ where
         Ok(result.summary)
     }
 
-    /// Processes a tool result to handle reload markers.
+    /// Processes a tool result (currently passthrough).
     ///
-    /// If the result contains a reload marker, attempts to read the file
-    /// and return its content. Otherwise returns the original result.
+    /// Previously handled reload markers, now just returns the content as-is.
     fn process_reload_marker(&self, result: &str) -> String {
-        // Check if the result is a reload response
-        if let Some(url) = ReloadResponse::parse_reload_url(result) {
-            // Resolve the URL relative to the working directory
-            let path = if url.starts_with("outputs/") {
-                std::path::PathBuf::from(&url)
-            } else {
-                std::path::PathBuf::from("outputs").join(&url)
-            };
-
-            // Try to read the file
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    // Check if content is small enough to inline
-                    let line_count = content.lines().count();
-                    if line_count < 500 {
-                        format!("[Loaded from {url}]\n{content}")
-                    } else {
-                        // Too large, provide summary
-                        let preview: String = content.lines().take(50).collect::<Vec<_>>().join("\n");
-                        format!(
-                            "[Loaded from {url} - {line_count} lines, showing first 50]\n{preview}\n..."
-                        )
-                    }
-                }
-                Err(e) => {
-                    format!("[Failed to load {url}: {e}]")
-                }
-            }
-        } else {
-            result.to_string()
-        }
+        result.to_string()
     }
 
     /// Formats the todo list as a system reminder.

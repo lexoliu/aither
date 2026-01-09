@@ -69,6 +69,7 @@ async fn structured_output(gemini: &Gemini) -> Result<()> {
     Ok(())
 }
 
+/// Echo back the provided text.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct EchoArgs {
     text: String,
@@ -80,10 +81,6 @@ struct EchoTool;
 impl Tool for EchoTool {
     fn name(&self) -> Cow<'static, str> {
         "echo_tool".into()
-    }
-
-    fn description(&self) -> Cow<'static, str> {
-        "Echo back the provided text".into()
     }
 
     type Arguments = EchoArgs;

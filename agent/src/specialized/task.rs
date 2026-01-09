@@ -14,61 +14,7 @@ use aither_core::{LanguageModel, llm::{Tool, ToolOutput}};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::hook::{Hook, PostToolAction, PreToolAction, ToolResultContext, ToolUseContext};
 use crate::subagent_file::SubagentDefinition;
-
-/// Hook that displays subagent activity to stderr.
-pub struct SubagentDisplayHook {
-    prefix: String,
-}
-
-impl SubagentDisplayHook {
-    /// Create a new display hook with a prefix for output.
-    pub fn new(subagent_type: &str) -> Self {
-        Self {
-            prefix: format!("  \x1b[90m[{}]\x1b[0m", subagent_type),
-        }
-    }
-}
-
-impl Hook for SubagentDisplayHook {
-    async fn pre_tool_use(&self, ctx: &ToolUseContext<'_>) -> PreToolAction {
-        // Show tool being called with arguments preview
-        let args_preview: String = ctx.arguments.chars().take(60).collect();
-        let args_display = if ctx.arguments.len() > 60 {
-            format!("{}...", args_preview)
-        } else {
-            args_preview
-        };
-        eprintln!(
-            "{} \x1b[36m{}\x1b[0m \x1b[90m{}\x1b[0m",
-            self.prefix, ctx.tool_name, args_display
-        );
-        PreToolAction::Allow
-    }
-
-    async fn post_tool_use(&self, ctx: &ToolResultContext<'_>) -> PostToolAction {
-        // Show result status with error details if failed
-        match ctx.result {
-            Ok(_) => {
-                eprintln!(
-                    "{} \x1b[32m✓\x1b[0m {} \x1b[90m({:?})\x1b[0m",
-                    self.prefix, ctx.tool_name, ctx.duration
-                );
-            }
-            Err(err) => {
-                // Show error message for failures
-                let err_preview: String = err.chars().take(80).collect();
-                eprintln!(
-                    "{} \x1b[31m✗\x1b[0m {} \x1b[31m{}\x1b[0m",
-                    self.prefix, ctx.tool_name, err_preview
-                );
-            }
-        }
-        PostToolAction::Keep
-    }
-}
-
 use crate::AgentBuilder;
 
 /// Builder function type for configuring a subagent.
@@ -105,21 +51,28 @@ impl<LLM: Clone> SubagentType<LLM> {
     }
 }
 
-/// Arguments for the Task tool.
+/// Launch a specialized subagent for complex tasks.
+///
+/// Subagents are autonomous agents that run in their own context window.
+/// Their work does not consume your context, and they return only their
+/// final results. This enables:
+///
+/// - Context isolation for research-heavy tasks
+/// - Parallel execution of independent investigations
+/// - Specialized capabilities per subagent type
+///
+/// Each subagent type has focused tools and prompts optimized for its purpose.
+/// Choose the subagent type that best matches the task requirements.
+///
+/// You can also load custom subagents from `.md` files by specifying a path
+/// (e.g., `./custom-agent.md` or `.subagents/researcher.md`).
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
 pub struct TaskArgs {
-    /// Short description of the task (3-5 words).
-    pub description: String,
+    /// Subagent type name (e.g., "explore", "plan") or path to a subagent file.
+    /// If the value contains '/' or ends with '.md', it's treated as a file path.
+    pub subagent: String,
     /// The detailed task prompt for the subagent.
     pub prompt: String,
-    /// The type of specialized subagent to use (e.g., "explore", "plan").
-    /// Either `subagent_type` or `subagent_file` must be provided.
-    #[serde(default)]
-    pub subagent_type: Option<String>,
-    /// Path to a subagent definition file (markdown format).
-    /// Use this to launch a custom subagent not in the registry.
-    #[serde(default)]
-    pub subagent_file: Option<String>,
 }
 
 /// A tool that spawns specialized subagents to handle complex tasks.
@@ -152,7 +105,6 @@ pub struct TaskArgs {
 pub struct TaskTool<LLM> {
     llm: LLM,
     types: HashMap<String, SubagentType<LLM>>,
-    description: String,
 }
 
 impl<LLM: Clone> TaskTool<LLM> {
@@ -161,7 +113,6 @@ impl<LLM: Clone> TaskTool<LLM> {
         Self {
             llm,
             types: HashMap::new(),
-            description: Self::build_description(&[]),
         }
     }
 
@@ -169,7 +120,6 @@ impl<LLM: Clone> TaskTool<LLM> {
     pub fn register(&mut self, name: impl Into<String>, subagent: SubagentType<LLM>) {
         let name = name.into();
         self.types.insert(name, subagent);
-        self.update_description();
     }
 
     /// Register a subagent type (builder pattern).
@@ -188,30 +138,6 @@ impl<LLM: Clone> TaskTool<LLM> {
             .iter()
             .map(|(name, t)| (name.as_str(), t.description.as_str()))
             .collect()
-    }
-
-    fn update_description(&mut self) {
-        let type_info: Vec<(&str, &str)> = self
-            .types
-            .iter()
-            .map(|(name, t)| (name.as_str(), t.description.as_str()))
-            .collect();
-        self.description = Self::build_description(&type_info);
-    }
-
-    fn build_description(types: &[(&str, &str)]) -> String {
-        const TEMPLATE: &str = include_str!("../prompts/task.md");
-
-        if types.is_empty() {
-            return TEMPLATE.replace("{{types}}", "No subagent types registered.");
-        }
-
-        let mut types_list = String::new();
-        for (name, type_desc) in types {
-            types_list.push_str(&format!("- {name}: {type_desc}\n"));
-        }
-
-        TEMPLATE.replace("{{types}}", &types_list)
     }
 }
 
@@ -250,67 +176,59 @@ where
         Cow::Borrowed("task")
     }
 
-    fn description(&self) -> Cow<'static, str> {
-        Cow::Owned(self.description.clone())
-    }
-
     type Arguments = TaskArgs;
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        // Determine how to create the subagent: from registered type or file
-        let (subagent_id, agent_builder) = match (&args.subagent_type, &args.subagent_file) {
-            (Some(type_name), None) => {
-                // Use registered subagent type
-                let subagent_type = self.types.get(type_name).ok_or_else(|| {
-                    let available: Vec<&str> = self.types.keys().map(|s| s.as_str()).collect();
-                    anyhow::anyhow!(
-                        "Unknown subagent type '{}'. Available: {}",
-                        type_name,
-                        available.join(", ")
-                    )
-                })?;
-                (type_name.clone(), subagent_type.builder(self.llm.clone()))
-            }
-            (None, Some(file_path)) => {
-                // Load subagent from file
-                let path = Path::new(file_path);
-                let def = SubagentDefinition::from_file(path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read subagent file '{}': {e}", file_path))?
-                    .ok_or_else(|| anyhow::anyhow!("Invalid subagent definition in '{}'", file_path))?;
+        // Determine if subagent is a file path or a registered type name
+        // File paths contain '/' or end with '.md'
+        let is_file_path = args.subagent.contains('/') || args.subagent.ends_with(".md");
 
-                let builder = crate::AgentBuilder::new(self.llm.clone())
-                    .system_prompt(&def.system_prompt)
-                    .max_iterations(def.max_iterations);
+        let (subagent_id, agent_builder) = if is_file_path {
+            // Load subagent from file
+            // Try paths in order: as-is, then under .subagents/, then under .skills/
+            let file_path = &args.subagent;
+            let path = Path::new(file_path);
+            let resolved_path = if path.exists() {
+                path.to_path_buf()
+            } else {
+                let subagents_path = Path::new(".subagents").join(file_path);
+                if subagents_path.exists() {
+                    subagents_path
+                } else {
+                    let skills_path = Path::new(".skills").join(file_path);
+                    if skills_path.exists() {
+                        skills_path
+                    } else {
+                        // Return original path for error message
+                        path.to_path_buf()
+                    }
+                }
+            };
 
-                (def.id, builder)
-            }
-            (Some(_), Some(_)) => {
-                return Err(anyhow::anyhow!(
-                    "Cannot specify both 'subagent_type' and 'subagent_file'. Choose one."
-                ).into());
-            }
-            (None, None) => {
+            let def = SubagentDefinition::from_file(&resolved_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read subagent file '{}': {e}", resolved_path.display()))?
+                .ok_or_else(|| anyhow::anyhow!("Invalid subagent definition in '{}'", resolved_path.display()))?;
+
+            let builder = crate::AgentBuilder::new(self.llm.clone())
+                .system_prompt(&def.system_prompt)
+                .max_iterations(def.max_iterations);
+
+            (def.id, builder)
+        } else {
+            // Use registered subagent type
+            let type_name = &args.subagent;
+            let subagent_type = self.types.get(type_name).ok_or_else(|| {
                 let available: Vec<&str> = self.types.keys().map(|s| s.as_str()).collect();
-                return Err(anyhow::anyhow!(
-                    "Must specify either 'subagent_type' or 'subagent_file'. Available types: {}",
+                anyhow::anyhow!(
+                    "Unknown subagent type '{}'. Available: {}",
+                    type_name,
                     available.join(", ")
-                ).into());
-            }
+                )
+            })?;
+            (type_name.clone(), subagent_type.builder(self.llm.clone()))
         };
 
-        // Log subagent start with user-visible feedback
-        tracing::info!(
-            subagent = %subagent_id,
-            description = %args.description,
-            "Starting subagent"
-        );
-        eprintln!(
-            "\x1b[90m[subagent:{}] {}\x1b[0m",
-            subagent_id, args.description
-        );
-
-        // Build the subagent with display hook for real-time feedback
-        let display_hook = SubagentDisplayHook::new(&subagent_id);
+        tracing::info!(subagent = %subagent_id, "Starting subagent");
 
         // Add child bash tool if factory is configured
         let agent_builder = if let Some(dyn_bash) = aither_sandbox::create_child_bash_tool() {
@@ -319,7 +237,7 @@ where
             agent_builder
         };
 
-        let mut agent = agent_builder.hook(display_hook).build();
+        let mut agent = agent_builder.build();
 
         // Run the subagent with the prompt
         let result = agent
@@ -327,18 +245,11 @@ where
             .await
             .map_err(|e| anyhow::anyhow!("Subagent '{}' error: {e}", subagent_id))?;
 
-        tracing::info!(
-            subagent = %subagent_id,
-            "Subagent completed"
-        );
-        eprintln!(
-            "\x1b[32m[subagent:{}] done\x1b[0m",
-            subagent_id
-        );
+        tracing::info!(subagent = %subagent_id, "Subagent completed");
 
         Ok(ToolOutput::text(format!(
-            "[Subagent '{}' completed: {}]\n\n{}",
-            subagent_id, args.description, result
+            "[Subagent '{}' completed]\n\n{}",
+            subagent_id, result
         )))
     }
 }
@@ -351,9 +262,13 @@ mod tests {
     fn task_args_schema() {
         let schema = schemars::schema_for!(TaskArgs);
         let value = schema.to_value();
+        println!("Schema: {}", serde_json::to_string_pretty(&value).unwrap());
         let props = value.get("properties").expect("should have properties");
-        assert!(props.get("description").is_some());
+        assert!(props.get("subagent").is_some());
         assert!(props.get("prompt").is_some());
-        assert!(props.get("subagent_type").is_some());
+
+        // Check required order
+        let required = value.get("required").expect("should have required");
+        println!("Required: {:?}", required);
     }
 }

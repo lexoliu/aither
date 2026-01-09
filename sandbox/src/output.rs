@@ -62,11 +62,15 @@ pub enum OutputEntry {
 
     /// Super tiny content - always in context, NEVER gets URL.
     /// Examples: "done", "3 files deleted", short status messages.
-    Inline { content: Content },
+    Inline {
+        /// The content to display inline.
+        content: Content,
+    },
 
     /// Content is loaded in context, no file yet.
     /// URL will be generated when offloaded.
     Loaded {
+        /// The content to display.
         content: Content,
         /// Raw bytes for potential later file creation
         raw: Vec<u8>,
@@ -188,14 +192,10 @@ pub struct OutputRef {
     pub size: usize,
 }
 
-/// Maximum lines for tiny text (never gets URL).
-const MAX_INLINE_LINES: usize = 5;
-
-/// Maximum lines for small text (lazy URL on offload).
-const MAX_LOADED_LINES: usize = 500;
-
-/// Preview lines for truncated large text.
-const PREVIEW_LINES: usize = 50;
+/// Maximum output size to show inline (roughly what fits in a terminal without scrolling).
+/// Outputs exceeding this are saved to file, and only the file path is returned.
+/// This is the single source of truth for output size limits.
+pub const INLINE_OUTPUT_LIMIT: usize = 4000;
 
 /// A pending URL allocation that hasn't been written to disk yet.
 ///
@@ -271,13 +271,12 @@ impl OutputStore {
         Ok(entry)
     }
 
-    /// Saves output data to a directory without tracking.
+    /// Saves output data to a directory.
     ///
-    /// Determines the appropriate `OutputEntry` variant based on content:
+    /// Uses the system-wide INLINE_OUTPUT_LIMIT constant:
     /// - Empty data → `Empty`
-    /// - Super tiny text (< 5 lines) → `Inline`
-    /// - Small text (< 500 lines) or images → `Loaded`
-    /// - Large text, binary, video → `Stored` (file created immediately)
+    /// - Below limit → `Inline` (shown directly)
+    /// - Above limit → `Stored` (file created, path returned)
     ///
     /// # Errors
     ///
@@ -286,6 +285,23 @@ impl OutputStore {
         dir: &Path,
         data: &[u8],
         format: OutputFormat,
+    ) -> std::io::Result<OutputEntry> {
+        Self::save_to_dir_with_limit(dir, data, format, Some(INLINE_OUTPUT_LIMIT)).await
+    }
+
+    /// Saves output data with an explicit size limit.
+    ///
+    /// When output exceeds the limit, it's saved to file and only a reference is returned.
+    /// The LLM must use head/tail/grep to read the file content like a human.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file creation fails.
+    pub async fn save_to_dir_with_limit(
+        dir: &Path,
+        data: &[u8],
+        format: OutputFormat,
+        limit: Option<usize>,
     ) -> std::io::Result<OutputEntry> {
         if data.is_empty() {
             return Ok(OutputEntry::Empty);
@@ -297,30 +313,33 @@ impl OutputStore {
             format
         };
 
+        // Check if we exceed limit - if so, always store as file
+        if let Some(max) = limit {
+            if data.len() > max {
+                return save_large_output(dir, data, format).await;
+            }
+        }
+
         match format {
             OutputFormat::Text | OutputFormat::Auto => {
                 save_text_output(dir, data, format).await
             }
             OutputFormat::Image => {
-                // Images are always Loaded (lazy URL)
-                let media_type = detect_image_media_type(data);
-                let content = Content::Image {
-                    data: base64_encode(data),
-                    media_type,
-                };
-                Ok(OutputEntry::Loaded {
-                    content,
-                    raw: data.to_vec(),
-                    format,
-                })
+                // Small images inline as base64
+                if data.len() <= limit.unwrap_or(INLINE_OUTPUT_LIMIT) {
+                    let media_type = detect_image_media_type(data);
+                    let content = Content::Image {
+                        data: base64_encode(data),
+                        media_type,
+                    };
+                    Ok(OutputEntry::Inline { content })
+                } else {
+                    save_large_output(dir, data, format).await
+                }
             }
             OutputFormat::Video | OutputFormat::Binary => {
-                // Binary/video are always Stored immediately
-                let (url, _) = create_file(dir, data, format).await?;
-                Ok(OutputEntry::Stored {
-                    url,
-                    content: None,
-                })
+                // Binary/video are always Stored
+                save_large_output(dir, data, format).await
             }
         }
     }
@@ -457,43 +476,30 @@ impl OutputStore {
     }
 }
 
-/// Saves text output with appropriate classification.
+/// Saves text output with simple size-based classification.
+///
+/// - Below INLINE_OUTPUT_LIMIT → show inline
+/// - Above INLINE_OUTPUT_LIMIT → save to file, return only file reference
 async fn save_text_output(
     dir: &Path,
     data: &[u8],
     format: OutputFormat,
 ) -> std::io::Result<OutputEntry> {
     let text = String::from_utf8_lossy(data);
-    let lines: Vec<&str> = text.lines().collect();
-    let line_count = lines.len();
 
-    if line_count <= MAX_INLINE_LINES {
-        // Super tiny - Inline, never gets URL
+    if data.len() <= INLINE_OUTPUT_LIMIT {
+        // Small enough to show inline
         let content = Content::Text {
             text: text.into_owned(),
             truncated: false,
         };
         Ok(OutputEntry::Inline { content })
-    } else if line_count <= MAX_LOADED_LINES {
-        // Small - Loaded, lazy URL on offload
-        let content = Content::Text {
-            text: text.into_owned(),
-            truncated: false,
-        };
-        Ok(OutputEntry::Loaded {
-            content,
-            raw: data.to_vec(),
-            format,
-        })
     } else {
-        // Large - Stored immediately with preview
+        // Large - save to file, return only reference
         let (url, _) = create_file(dir, data, format).await?;
-        let preview: String = lines[..PREVIEW_LINES].join("\n");
+        let line_count = text.lines().count();
         let content = Content::Text {
-            text: format!(
-                "{preview}\n\n... ({} more lines at {url})",
-                line_count - PREVIEW_LINES
-            ),
+            text: format!("Output saved to {} ({} lines, {} bytes)", url, line_count, data.len()),
             truncated: true,
         };
         Ok(OutputEntry::Stored {
@@ -501,6 +507,31 @@ async fn save_text_output(
             content: Some(content),
         })
     }
+}
+
+/// Saves output that exceeds limit - stores full content, returns only file reference.
+async fn save_large_output(
+    dir: &Path,
+    data: &[u8],
+    format: OutputFormat,
+) -> std::io::Result<OutputEntry> {
+    // Store full content to file
+    let (url, _) = create_file(dir, data, format).await?;
+
+    // Return just the file reference (no preview - LLM must read file like a human)
+    let content = match format {
+        OutputFormat::Text | OutputFormat::Auto => {
+            let text = String::from_utf8_lossy(data);
+            let line_count = text.lines().count();
+            Some(Content::Text {
+                text: format!("Output saved to {} ({} lines, {} bytes)", url, line_count, data.len()),
+                truncated: true,
+            })
+        }
+        _ => None, // Binary/video/image just get file path
+    };
+
+    Ok(OutputEntry::Stored { url, content })
 }
 
 /// Creates a file with a four-random-words name.

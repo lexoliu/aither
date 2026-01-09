@@ -7,33 +7,33 @@
 //!
 //! ## Quick Start
 //!
-//! Transform any async function into an AI tool by adding the `#[tool]` attribute:
+//! Transform any async function into an AI tool by adding the `#[tool]` attribute.
+//! Tool description comes from rustdoc on the Args struct:
 //!
 //! ```rust
 //! use aither::Result;
 //! use aither_derive::tool;
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
 //!
-//! #[tool(description = "Get the current UTC time")]
-//! pub async fn get_time() -> Result<&'static str> {
+//! /// Get the current UTC time.
+//! #[derive(JsonSchema, Deserialize)]
+//! pub struct GetTimeArgs;
+//!
+//! #[tool]
+//! pub async fn get_time(_args: GetTimeArgs) -> Result<&'static str> {
 //!     Ok("2023-10-01T12:00:00Z")
 //! }
 //! ```
 //!
 //! ## Function Patterns
 //!
-//! ### No Parameters
-//!
-//! ```rust
-//! #[tool(description = "Check service health status")]
-//! pub async fn health_check() -> Result<String> {
-//!     Ok("Service is healthy".to_string())
-//! }
-//! ```
-//!
 //! ### Simple Parameters
 //!
 //! ```rust
 //! use serde::Serialize;
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
 //!
 //! #[derive(Debug, Serialize)]
 //! pub struct SearchResult {
@@ -41,9 +41,15 @@
 //!     url: String,
 //! }
 //!
-//! #[tool(description = "Search the web for content")]
-//! pub async fn search(keywords: Vec<String>, limit: u32) -> Result<Vec<SearchResult>> {
-//!     // Your search implementation here
+//! /// Search the web for content.
+//! #[derive(JsonSchema, Deserialize)]
+//! pub struct SearchArgs {
+//!     pub keywords: Vec<String>,
+//!     pub limit: u32,
+//! }
+//!
+//! #[tool]
+//! pub async fn search(args: SearchArgs) -> Result<Vec<SearchResult>> {
 //!     Ok(vec![])
 //! }
 //! ```
@@ -54,6 +60,7 @@
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //!
+//! /// Generate an image from a text prompt.
 //! #[derive(Debug, JsonSchema, Deserialize)]
 //! pub struct ImageArgs {
 //!     /// The text prompt for image generation
@@ -61,7 +68,7 @@
 //!     /// Image width in pixels
 //!     #[serde(default = "default_width")]
 //!     pub width: u32,
-//!     /// Image height in pixels  
+//!     /// Image height in pixels
 //!     #[serde(default = "default_height")]
 //!     pub height: u32,
 //! }
@@ -69,9 +76,8 @@
 //! fn default_width() -> u32 { 512 }
 //! fn default_height() -> u32 { 512 }
 //!
-//! #[tool(description = "Generate an image from a text prompt")]
+//! #[tool]
 //! pub async fn generate_image(args: ImageArgs) -> Result<String> {
-//!     // Your image generation logic here
 //!     Ok(format!("Generated image: {}", args.prompt))
 //! }
 //! ```
@@ -95,7 +101,6 @@ use syn::{
 
 /// Arguments for the `#[tool]` attribute macro
 struct ToolArgs {
-    description: String,
     rename: Option<String>,
 }
 
@@ -103,10 +108,8 @@ impl Parse for ToolArgs {
     /// Parse the arguments from the `#[tool(...)]` attribute.
     ///
     /// Supports:
-    /// - `description = "..."` (required): Tool description for the AI model
     /// - `rename = "..."` (optional): Custom name for the tool (defaults to function name)
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut description = None;
         let mut rename = None;
 
         while !input.is_empty() {
@@ -115,12 +118,11 @@ impl Parse for ToolArgs {
             let value: LitStr = input.parse()?;
 
             match ident.to_string().as_str() {
-                "description" => description = Some(value.value()),
                 "rename" => rename = Some(value.value()),
                 _ => {
                     return Err(syn::Error::new_spanned(
                         ident,
-                        "unknown attribute. Supported: description, rename",
+                        "unknown attribute. Supported: rename",
                     ));
                 }
             }
@@ -130,13 +132,7 @@ impl Parse for ToolArgs {
             }
         }
 
-        let description = description
-            .ok_or_else(|| syn::Error::new(input.span(), "description attribute is required"))?;
-
-        Ok(Self {
-            description,
-            rename,
-        })
+        Ok(Self { rename })
     }
 }
 
@@ -145,41 +141,39 @@ impl Parse for ToolArgs {
 /// This procedural macro generates the necessary boilerplate code to make your function
 /// callable through the `aither::llm::Tool` trait.
 ///
+/// Tool description is extracted from rustdoc on the Args struct via `schemars::JsonSchema`.
+///
 /// # Arguments
 ///
-/// - `description` (required): A clear description of what the tool does. This helps the AI model
-///   decide when to use this tool.
 /// - `rename` (optional): A custom name for the tool. If not provided, uses the function name.
 ///
 /// # Examples
 ///
-/// ## Basic Usage (No Parameters)
+/// ## Basic Usage
 ///
 /// ```rust
 /// use aither::Result;
 /// use aither_derive::tool;
+/// use schemars::JsonSchema;
+/// use serde::Deserialize;
 ///
-/// #[tool(description = "Get the current system time")]
-/// pub async fn current_time() -> Result<String> {
+/// /// Get the current system time.
+/// #[derive(JsonSchema, Deserialize)]
+/// pub struct CurrentTimeArgs;
+///
+/// #[tool]
+/// pub async fn current_time(_args: CurrentTimeArgs) -> Result<String> {
 ///     Ok(chrono::Utc::now().to_rfc3339())
 /// }
 /// ```
 ///
-/// ## With Simple Parameters
-///
-/// ```rust
-/// #[tool(description = "Calculate the sum of two numbers")]
-/// pub async fn add(a: f64, b: f64) -> Result<f64> {
-///     Ok(a + b)
-/// }
-/// ```
-///
-/// ## With Complex Parameters
+/// ## With Parameters
 ///
 /// ```rust
 /// use schemars::JsonSchema;
 /// use serde::Deserialize;
 ///
+/// /// Send an email to a recipient.
 /// #[derive(JsonSchema, Deserialize)]
 /// pub struct EmailRequest {
 ///     /// Recipient email address
@@ -190,9 +184,8 @@ impl Parse for ToolArgs {
 ///     pub body: String,
 /// }
 ///
-/// #[tool(description = "Send an email to a recipient")]
+/// #[tool]
 /// pub async fn send_email(request: EmailRequest) -> Result<String> {
-///     // Your email sending logic here
 ///     Ok(format!("Email sent to {}", request.to))
 /// }
 /// ```
@@ -200,12 +193,14 @@ impl Parse for ToolArgs {
 /// ## With Custom Name
 ///
 /// ```rust
-/// #[tool(
-///     description = "Perform complex mathematical calculations",
-///     rename = "calculator"
-/// )]
-/// pub async fn complex_math_function(expression: String) -> Result<f64> {
-///     // Your calculation logic here
+/// /// Perform complex mathematical calculations.
+/// #[derive(JsonSchema, Deserialize)]
+/// pub struct CalcArgs {
+///     pub expression: String,
+/// }
+///
+/// #[tool(rename = "calculator")]
+/// pub async fn complex_math_function(args: CalcArgs) -> Result<f64> {
 ///     Ok(42.0)
 /// }
 /// ```
@@ -251,7 +246,6 @@ pub fn tool(args: TokenStream, input: TokenStream) -> TokenStream {
 fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let fn_name = &input_fn.sig.ident;
     let tool_name = args.rename.unwrap_or_else(|| fn_name.to_string());
-    let description = args.description;
     let fn_vis = &input_fn.vis;
 
     let tool_struct_name = format_ident!("{}", fn_name.to_string().to_case(Case::Pascal));
@@ -297,9 +291,6 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
         impl ::aither::llm::Tool for #tool_struct_name {
             fn name(&self) -> ::aither::__hidden::CowStr {
                 #tool_name.into()
-            }
-            fn description(&self) -> ::aither::__hidden::CowStr {
-                #description.into()
             }
             type Arguments = #args_type;
 

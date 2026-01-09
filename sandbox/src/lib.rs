@@ -60,8 +60,9 @@ pub mod permission;
 pub use bash::{BackgroundTaskReceiver, BashArgs, BashError, BashResult, BashTool, CompletedTask};
 pub use command::{
     configure_raw_handler, configure_tool, create_child_bash_tool, get_tool_help,
-    get_tool_primary_arg, is_tool_configured, register_tool_command, registered_tool_names,
-    set_bash_tool_factory, DynBashTool, DynToolHandler, ToolCallCommand, ToolCommand,
+    get_tool_primary_arg, get_tool_stdin_arg, is_tool_configured, register_tool_command,
+    registered_tool_names, set_bash_tool_factory, DynBashTool, DynToolHandler, ToolCallCommand,
+    ToolCommand,
 };
 pub use output::{Content, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{BashMode, PermissionHandler};

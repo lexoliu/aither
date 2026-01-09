@@ -316,10 +316,9 @@ impl ToolOutput {
 pub trait Tool: Send + Sync {
     /// Tool name. Must be unique.
     fn name(&self) -> Cow<'static, str>;
-    /// Tool description for the language model.
-    fn description(&self) -> Cow<'static, str>;
 
     /// Tool arguments type. Must implement [`schemars::JsonSchema`] and [`serde::de::DeserializeOwned`].
+    /// Description is extracted from the rustdoc on this type via JsonSchema.
     type Arguments: Send + JsonSchema + DeserializeOwned;
 
     /// Executes the tool with the provided arguments.
@@ -467,6 +466,10 @@ pub struct ToolDefinition {
 
 impl ToolDefinition {
     /// Creates a tool definition for a given tool type.
+    ///
+    /// The description is extracted from the Arguments struct's rustdoc comment
+    /// (via schemars::JsonSchema). Falls back to `Tool::description()` if no
+    /// rustdoc is present on the Args struct.
     #[must_use]
     pub fn new<T: Tool>(tool: &T) -> Self {
         let mut arguments = schema_for!(T::Arguments);
@@ -475,9 +478,18 @@ impl ToolDefinition {
             arguments = schema_for!(ToolArgument<T::Arguments>);
         }
 
+        // Extract description from schema (rustdoc on Args struct)
+        let description = arguments
+            .clone()
+            .to_value()
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| Cow::Owned(s.to_string()))
+            .unwrap_or_default();
+
         Self {
             name: tool.name(),
-            description: tool.description(),
+            description,
             arguments,
         }
     }
@@ -865,6 +877,7 @@ mod tests {
     use schemars::JsonSchema;
     use serde::Deserialize;
 
+    /// Performs basic mathematical operations.
     #[derive(JsonSchema, Deserialize, Debug, PartialEq)]
     struct CalculatorArgs {
         operation: String,
@@ -877,9 +890,6 @@ mod tests {
     impl Tool for Calculator {
         fn name(&self) -> Cow<'static, str> {
             "calculator".into()
-        }
-        fn description(&self) -> Cow<'static, str> {
-            "Performs basic mathematical operations".into()
         }
         type Arguments = CalculatorArgs;
 
@@ -903,6 +913,7 @@ mod tests {
         }
     }
 
+    /// Greets a person by name.
     #[derive(JsonSchema, Deserialize)]
     struct GreetArgs {
         name: String,
@@ -913,9 +924,6 @@ mod tests {
     impl Tool for Greeter {
         fn name(&self) -> Cow<'static, str> {
             "greeter".into()
-        }
-        fn description(&self) -> Cow<'static, str> {
-            "Greets a person by name".into()
         }
         type Arguments = GreetArgs;
 
@@ -1168,9 +1176,6 @@ mod tests {
         impl Tool for TestTool {
             fn name(&self) -> Cow<'static, str> {
                 "test".into()
-            }
-            fn description(&self) -> Cow<'static, str> {
-                "Test tool".into()
             }
             type Arguments = Args;
 

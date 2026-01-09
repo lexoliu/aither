@@ -44,10 +44,6 @@ where
         "rag_search".into()
     }
 
-    fn description(&self) -> Cow<'static, str> {
-        "Search the knowledge base for relevant information".into()
-    }
-
     type Arguments = RagToolArgs;
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {

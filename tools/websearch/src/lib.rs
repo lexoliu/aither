@@ -46,9 +46,22 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Search the web and return relevant results.
+///
+/// This tool performs real-time internet searches and returns structured results
+/// including page titles, URLs, and text snippets. Results are ordered by relevance.
+///
+/// The output is compact - just metadata about pages, not full content.
+/// To read a specific page's content, use `webfetch` with the URL.
+///
+/// Search queries work best when specific and targeted. Vague queries may return
+/// less relevant results.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebSearchArgs {
+    /// The search query string.
     pub query: String,
+
+    /// Maximum number of results to return (1-10).
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -76,7 +89,6 @@ pub trait SearchProvider: Send + Sync {
 pub struct WebSearchTool<P> {
     provider: P,
     name: String,
-    description: String,
 }
 
 impl Default for WebSearchTool<SearXNG> {
@@ -91,22 +103,17 @@ impl<P> WebSearchTool<P> {
         Self {
             provider,
             name: "websearch".into(),
-            description: include_str!("prompt.md").into(),
         }
     }
 
-    /// Create a web search tool with custom name and description.
-    pub fn with_metadata(
-        provider: P,
-        name: impl Into<String>,
-        description: impl Into<String>,
-    ) -> Self {
+    /// Create a web search tool with custom name.
+    pub fn with_name(provider: P, name: impl Into<String>) -> Self {
         Self {
             provider,
             name: name.into(),
-            description: description.into(),
         }
     }
+
 }
 
 /// Maximum retry attempts when search returns empty results.
@@ -126,10 +133,6 @@ where
 {
     fn name(&self) -> Cow<'static, str> {
         Cow::Owned(self.name.clone())
-    }
-
-    fn description(&self) -> Cow<'static, str> {
-        Cow::Owned(self.description.clone())
     }
 
     type Arguments = WebSearchArgs;

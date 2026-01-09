@@ -453,10 +453,6 @@ mod tests {
             "mock_tool".into()
         }
 
-        fn description(&self) -> Cow<'static, str> {
-            "A mock tool".into()
-        }
-
         type Arguments = MockArgs;
 
         async fn call(&self, _args: Self::Arguments) -> aither_core::Result<aither_core::llm::ToolOutput> {

@@ -28,6 +28,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -51,6 +52,7 @@ struct ToolEntry {
     handler: ToolHandlerFn,
     help: String,
     primary_arg: Option<String>,
+    stdin_arg: Option<String>,
 }
 
 /// Global registry of tools.
@@ -58,6 +60,42 @@ static TOOL_REGISTRY: OnceLock<RwLock<HashMap<String, ToolEntry>>> = OnceLock::n
 
 fn get_registry() -> &'static RwLock<HashMap<String, ToolEntry>> {
     TOOL_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+// ============================================================================
+// Output Size Handling (system-level offload for large outputs)
+// ============================================================================
+
+use crate::output::INLINE_OUTPUT_LIMIT;
+
+/// Counter for generating unique output filenames.
+static OUTPUT_COUNTER: AtomicU32 = AtomicU32::new(1);
+
+/// Handles large outputs by saving to file if needed.
+/// Returns the output as-is if small enough, or a file reference message if saved.
+fn handle_large_output(output: String) -> String {
+    if output.len() <= INLINE_OUTPUT_LIMIT {
+        return output;
+    }
+
+    // Large output - save to file
+    let count = OUTPUT_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let filename = format!("outputs/{:03}.txt", count);
+
+    // Count lines for the message
+    let line_count = output.lines().count();
+
+    // Try to save - if it fails, fall back to truncated inline output
+    match std::fs::write(&filename, &output) {
+        Ok(()) => {
+            format!("Output saved to {} ({} lines, {} bytes)", filename, line_count, output.len())
+        }
+        Err(e) => {
+            // Fallback: show truncated output with error note
+            let truncated: String = output.chars().take(INLINE_OUTPUT_LIMIT).collect();
+            format!("{}\n\n[truncated - failed to save full output: {}]", truncated, e)
+        }
+    }
 }
 
 // ============================================================================
@@ -148,6 +186,8 @@ where
 
     // Auto-detect primary_arg from schema: first required field
     let primary_arg = detect_primary_arg(&schema);
+    // Auto-detect stdin_arg from schema: optional "input" field
+    let stdin_arg = detect_stdin_arg(&schema);
 
     let tool = Arc::new(tool);
     let tool_name = tool.name().to_string();
@@ -161,11 +201,11 @@ where
                 Ok(json_args) => match serde_json::from_value(json_args) {
                     Ok(parsed) => match tool.call(parsed).await {
                         Ok(output) => output.as_str().unwrap_or("").to_string(),
-                        Err(e) => format!("{{\"error\": \"{}\"}}", e),
+                        Err(e) => format!("Error: {}", e),
                     },
-                    Err(e) => format!("{{\"error\": \"Parse error: {}\"}}", e),
+                    Err(e) => format!("Error: failed to parse arguments: {}", e),
                 },
-                Err(e) => format!("{{\"error\": \"Argument error: {}\"}}", e),
+                Err(e) => format!("Error: {}", e),
             }
         })
     });
@@ -179,6 +219,7 @@ where
                 handler,
                 help: help_text,
                 primary_arg,
+                stdin_arg,
             },
         );
 }
@@ -197,7 +238,34 @@ fn detect_primary_arg(schema: &Value) -> Option<String> {
     Some(first_required.to_string())
 }
 
+/// Detects the stdin argument from a JSON schema.
+///
+/// Returns "input" if the schema has an "input" property that is not required.
+/// This allows stdin piping: `cat file | command "prompt"` passes stdin as --input.
+fn detect_stdin_arg(schema: &Value) -> Option<String> {
+    // Check if "input" property exists
+    let properties = schema.get("properties")?.as_object()?;
+    if !properties.contains_key("input") {
+        return None;
+    }
+
+    // Check that "input" is NOT required (has a default)
+    let required = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    if required.contains(&"input") {
+        return None;
+    }
+
+    Some("input".to_string())
+}
+
 /// Queries a tool handler by name.
+///
+/// Large outputs (> 4000 chars) are automatically saved to file.
 async fn query_tool_handler(tool_name: &str, args: &[String]) -> String {
     // Get the handler future while holding the lock, then release before awaiting
     let future = {
@@ -209,8 +277,12 @@ async fn query_tool_handler(tool_name: &str, args: &[String]) -> String {
     };
 
     match future {
-        Some(fut) => fut.await,
-        None => format!("{{\"error\": \"Unknown tool: {}\"}}", tool_name),
+        Some(fut) => {
+            let output = fut.await;
+            // Handle large outputs by saving to file
+            handle_large_output(output)
+        }
+        None => format!("Error: unknown command '{}'. Run 'help' to see available commands.", tool_name),
     }
 }
 
@@ -241,6 +313,16 @@ pub fn get_tool_primary_arg(tool_name: &str) -> Option<String> {
         .expect("tool registry poisoned")
         .get(tool_name)
         .and_then(|e| e.primary_arg.clone())
+}
+
+/// Returns the stdin argument for a tool.
+#[must_use]
+pub fn get_tool_stdin_arg(tool_name: &str) -> Option<String> {
+    get_registry()
+        .read()
+        .expect("tool registry poisoned")
+        .get(tool_name)
+        .and_then(|e| e.stdin_arg.clone())
 }
 
 /// Returns list of registered tool names.
@@ -292,6 +374,7 @@ where
                 handler: Box::new(handler),
                 help: help.into(),
                 primary_arg,
+                stdin_arg: None,
             },
         );
 }
@@ -366,6 +449,10 @@ impl IpcCommand for ToolCallCommand {
 
     fn primary_arg(&self) -> Option<Cow<'static, str>> {
         get_tool_primary_arg(&self.tool_name).map(Cow::Owned)
+    }
+
+    fn stdin_arg(&self) -> Option<Cow<'static, str>> {
+        get_tool_stdin_arg(&self.tool_name).map(Cow::Owned)
     }
 
     fn set_method_name(&mut self, name: &str) {
@@ -577,6 +664,16 @@ fn get_variant_name(schema: &Value, tag: &str) -> Option<String> {
     schema.get("title").and_then(Value::as_str).map(String::from)
 }
 
+/// Finds the most similar option name for typo suggestions.
+fn find_similar_option<'a>(input: &str, options: impl Iterator<Item = &'a str>) -> Option<String> {
+    let input_lower = input.to_lowercase().replace('-', "_");
+    options
+        .map(|opt| (opt, strsim::levenshtein(&input_lower, &opt.to_lowercase())))
+        .filter(|(_, dist)| *dist <= 2) // Only suggest if edit distance <= 2
+        .min_by_key(|(_, dist)| *dist)
+        .map(|(opt, _)| opt.replace('_', "-"))
+}
+
 /// Parses an object schema from CLI arguments.
 fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
     let mut result: HashMap<String, Value> = HashMap::new();
@@ -589,18 +686,14 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
         .cloned()
         .unwrap_or_default();
 
-    let required: std::collections::HashSet<String> = schema
+    let required: Vec<String> = schema
         .get("required")
         .and_then(Value::as_array)
         .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
         .unwrap_or_default();
 
-    // Collect positional field names (required fields without defaults)
-    let positional_fields: Vec<_> = properties
-        .iter()
-        .filter(|(name, _)| required.contains(*name))
-        .map(|(name, _)| name.clone())
-        .collect();
+    // Positional fields are the required fields in schema order
+    let positional_fields = required.clone();
 
     let mut i = 0;
     while i < args.len() {
@@ -637,7 +730,12 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
 
                 result.insert(field_name, parsed_value);
             } else {
-                anyhow::bail!("unknown option: --{}", name);
+                let suggestion = find_similar_option(&name, properties.keys().map(String::as_str));
+                if let Some(similar) = suggestion {
+                    anyhow::bail!("unknown option: --{}. Did you mean --{}?", name, similar);
+                } else {
+                    anyhow::bail!("unknown option: --{}", name);
+                }
             }
         } else {
             // Positional argument
@@ -773,16 +871,24 @@ pub fn schema_to_help(schema: &Value) -> String {
 
     // Simple object
     if let Some(props) = schema.get("properties").and_then(Value::as_object) {
-        let required: std::collections::HashSet<&str> = schema
+        let required: Vec<&str> = schema
             .get("required")
             .and_then(Value::as_array)
             .map(|arr| arr.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
 
-        help.push_str("  [options]\n\nOptions:\n");
+        // Show positional usage for required args
+        if !required.is_empty() {
+            let positional: Vec<_> = required.iter().map(|n| format!("<{}>", n.replace('_', "-"))).collect();
+            help.push_str(&format!("  {} [options]\n", positional.join(" ")));
+        } else {
+            help.push_str("  [options]\n");
+        }
+
+        help.push_str("\nArguments:\n");
 
         for (name, prop) in props {
-            let is_required = required.contains(name.as_str());
+            let is_required = required.contains(&name.as_str());
             let flag = name.replace('_', "-");
 
             help.push_str(&format!("  --{flag}"));
@@ -842,12 +948,47 @@ mod tests {
         assert_eq!(result["count"], 10);
     }
 
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct TwoPositionalArgs {
+        /// First required arg
+        first: String,
+        /// Second required arg
+        second: String,
+    }
+
+    #[test]
+    fn test_multiple_positional_args() {
+        let schema = schemars::schema_for!(TwoPositionalArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        // Both as positional
+        let result = cli_to_json(&schema, &["hello".to_string(), "world".to_string()]).unwrap();
+        assert_eq!(result["first"], "hello");
+        assert_eq!(result["second"], "world");
+
+        // Mix positional and named
+        let result = cli_to_json(&schema, &["hello".to_string(), "--second".to_string(), "world".to_string()]).unwrap();
+        assert_eq!(result["first"], "hello");
+        assert_eq!(result["second"], "world");
+    }
+
+    #[test]
+    fn test_typo_suggestion() {
+        let schema = schemars::schema_for!(SimpleArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        // Typo in flag name
+        let err = cli_to_json(&schema, &["--paht".to_string(), "foo.txt".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("Did you mean --path?"));
+    }
+
     #[test]
     fn test_schema_to_help() {
         let schema = schemars::schema_for!(SimpleArgs);
         let schema = serde_json::to_value(schema).unwrap();
         let help = schema_to_help(&schema);
 
+        assert!(help.contains("<path>")); // Shows positional usage
         assert!(help.contains("--path"));
         assert!(help.contains("--count"));
     }

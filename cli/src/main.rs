@@ -95,6 +95,16 @@ impl PermissionHandler for InteractivePermissionHandler {
     }
 }
 
+/// Expand ~ to home directory in a path.
+fn expand_tilde(path: &std::path::Path) -> PathBuf {
+    if let Ok(stripped) = path.strip_prefix("~") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(stripped);
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Truncate script for display, showing first N chars (UTF-8 safe).
 fn truncate_script(s: &str, max_chars: usize) -> String {
     let s = s.replace('\n', " ").replace('\r', "");
@@ -406,6 +416,14 @@ struct Args {
     /// Quiet mode. Only output the response (useful with --prompt for scripting).
     #[arg(short, long)]
     quiet: bool,
+
+    /// Path to skills directory. Skills are loaded from SKILL.md files in subdirectories.
+    #[arg(long)]
+    skills: Option<PathBuf>,
+
+    /// Path to subagents directory. Subagents are markdown files invoked via `task <path> <prompt>`.
+    #[arg(long)]
+    subagents: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -468,8 +486,32 @@ async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudPro
     register_simple_todo();
     builder = builder.tool_description("todo", "Manage task list (add/start/done/list/clear)");
 
-    // Built-in reload command
-    builder = builder.tool_description("reload", "Load file content back into context");
+    // Load skills if path provided
+    if let Some(ref skills_path) = args.skills {
+        // Expand ~ to home directory
+        let expanded = expand_tilde(skills_path);
+        if expanded.exists() {
+            builder = builder.with_skills(&expanded);
+            if !args.quiet {
+                println!("Loaded skills from: {}", expanded.display());
+            }
+        } else if !args.quiet {
+            eprintln!("Warning: Skills directory not found: {}", expanded.display());
+        }
+    }
+
+    // Set up subagents directory if path provided
+    if let Some(ref subagents_path) = args.subagents {
+        let expanded = expand_tilde(subagents_path);
+        if expanded.exists() {
+            builder = builder.with_subagents(&expanded);
+            if !args.quiet {
+                println!("Subagents directory: {}", expanded.display());
+            }
+        } else if !args.quiet {
+            eprintln!("Warning: Subagents directory not found: {}", expanded.display());
+        }
+    }
 
     // Add Context7 MCP server by default (documentation lookup)
     if !args.no_context7 {

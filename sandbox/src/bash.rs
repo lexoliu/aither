@@ -16,6 +16,7 @@ use std::{
 use rand::seq::IndexedRandom;
 
 use aither_core::llm::{Tool, ToolOutput};
+use crate::output::INLINE_OUTPUT_LIMIT;
 use async_channel::{Receiver, Sender};
 use executor_core::{Executor, Task};
 use leash::{AllowAll, DenyAll, IpcRouter, Sandbox, SandboxConfig, SecurityConfig, WorkingDir};
@@ -51,7 +52,32 @@ fn random_task_id() -> String {
     words.join("-")
 }
 
-/// Arguments for the bash tool.
+/// Execute bash scripts in a sandboxed environment.
+///
+/// The primary interface to all system capabilities. Scripts run in a sandbox
+/// with full read access to the host filesystem but writes contained to a
+/// dedicated working directory.
+///
+/// ## Output Handling
+///
+/// Large outputs are automatically saved to file to manage context. When this
+/// happens, you receive the file path and can process it using standard Unix
+/// tools (head, tail, grep, less) or pipe through `ask` for summarization.
+///
+/// ## Built-in Commands
+///
+/// The sandbox provides these commands without network access:
+/// - `websearch "query"` - search the web, returns titles/URLs/snippets
+/// - `webfetch "url"` - fetch URL content as markdown
+/// - `ask "prompt"` - query a fast LLM about piped content (saves context)
+/// - `task <subagent> "prompt"` - launch specialized subagents
+/// - `todo` - manage task list
+///
+/// ## Permission Modes
+///
+/// - `sandboxed` (default): Read-only host access, writes to sandbox only
+/// - `network`: Sandbox + network access (for curl, wget, ssh, git)
+/// - `unsafe`: No sandbox, full system access (requires approval with reason)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BashArgs {
     /// The bash script to execute.
@@ -325,12 +351,17 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
         use aither_core::llm::tool::ToolDefinition;
         use serde_json::Value;
 
-        // Create the definition
+        // Create the definition - description comes from BashArgs rustdoc
         let schema = schemars::schema_for!(BashArgs);
         let schema_value: Value = schema.to_value();
+        let description = schema_value
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let definition = ToolDefinition::from_parts(
             "bash".into(),
-            include_str!("bash_prompt.md").into(),
+            description.into(),
             schema_value,
         );
 
@@ -378,13 +409,14 @@ impl<P: PermissionHandler, E: Executor + Clone + 'static> BashTool<P, E> {
             let store = self.output_store.read().map_err(|_| BashError::StoreLock)?;
             store.dir().to_path_buf()
         };
-        let stdout = OutputStore::save_to_dir(&store_dir, &output.stdout, args.expect).await?;
+        let limit = Some(INLINE_OUTPUT_LIMIT);
+        let stdout = OutputStore::save_to_dir_with_limit(&store_dir, &output.stdout, args.expect, limit).await?;
 
         // Save stderr if non-empty
         let stderr = if output.stderr.is_empty() {
             None
         } else {
-            Some(OutputStore::save_to_dir(&store_dir, &output.stderr, OutputFormat::Text).await?)
+            Some(OutputStore::save_to_dir_with_limit(&store_dir, &output.stderr, OutputFormat::Text, limit).await?)
         };
 
         let exit_code = output.status.code().unwrap_or(-1);
@@ -462,10 +494,6 @@ impl<P: PermissionHandler, E: Executor + Clone + 'static> BashTool<P, E> {
 impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool for BashTool<P, E> {
     fn name(&self) -> Cow<'static, str> {
         "bash".into()
-    }
-
-    fn description(&self) -> Cow<'static, str> {
-        include_str!("bash_prompt.md").into()
     }
 
     type Arguments = BashArgs;
@@ -615,14 +643,15 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
         }
     };
 
-    // Save stdout
-    let stdout = OutputStore::save_to_dir(store_dir, &output.stdout, expect).await?;
+    // Save stdout with system-level size limit
+    let limit = Some(INLINE_OUTPUT_LIMIT);
+    let stdout = OutputStore::save_to_dir_with_limit(store_dir, &output.stdout, expect, limit).await?;
 
     // Save stderr if non-empty
     let stderr = if output.stderr.is_empty() {
         None
     } else {
-        Some(OutputStore::save_to_dir(store_dir, &output.stderr, OutputFormat::Text).await?)
+        Some(OutputStore::save_to_dir_with_limit(store_dir, &output.stderr, OutputFormat::Text, limit).await?)
     };
 
     let exit_code = output.status.code().unwrap_or(-1);
@@ -703,8 +732,10 @@ mod tests {
         let result = BashResult {
             stdout: OutputEntry::Stored {
                 url: "outputs/bold-oak-calm-river.txt".to_string(),
-                content: None,
-                summary: Some("test output".to_string()),
+                content: Some(Content::Text {
+                    text: "preview text".to_string(),
+                    truncated: true,
+                }),
             },
             stderr: None,
             exit_code: 0,

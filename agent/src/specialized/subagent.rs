@@ -36,7 +36,6 @@ use crate::Agent;
 pub struct SubAgentTool<LLM> {
     llm: LLM,
     name: String,
-    description: String,
     system_prompt: Option<String>,
 }
 
@@ -46,7 +45,6 @@ impl<LLM: Clone> SubAgentTool<LLM> {
         Self {
             llm,
             name: "subagent".to_string(),
-            description: "A sub-agent that can handle delegated tasks".to_string(),
             system_prompt: None,
         }
     }
@@ -58,13 +56,6 @@ impl<LLM: Clone> SubAgentTool<LLM> {
         self
     }
 
-    /// Sets the tool description.
-    #[must_use]
-    pub fn description(mut self, description: impl Into<String>) -> Self {
-        self.description = description.into();
-        self
-    }
-
     /// Sets the system prompt for the sub-agent.
     #[must_use]
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -73,7 +64,10 @@ impl<LLM: Clone> SubAgentTool<LLM> {
     }
 }
 
-/// Arguments for calling a sub-agent.
+/// Delegate a task to a sub-agent.
+///
+/// Sub-agents run autonomously in their own context and return results.
+/// Use for delegating complex or specialized tasks.
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
 pub struct SubAgentQuery {
     /// The task to delegate to this sub-agent.
@@ -87,10 +81,6 @@ where
 {
     fn name(&self) -> Cow<'static, str> {
         Cow::Owned(self.name.clone())
-    }
-
-    fn description(&self) -> Cow<'static, str> {
-        Cow::Owned(self.description.clone())
     }
 
     type Arguments = SubAgentQuery;

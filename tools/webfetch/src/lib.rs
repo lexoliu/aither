@@ -424,7 +424,16 @@ fn is_image_url(url: &str) -> bool {
     false
 }
 
-/// Arguments for the web fetch tool.
+/// Fetch content from a URL and convert to clean markdown.
+///
+/// Retrieves web pages and extracts the main content, removing navigation,
+/// ads, and boilerplate. Returns clean markdown suitable for analysis.
+///
+/// Web page sizes vary widely. Large pages may be automatically saved to file
+/// to manage context. When this happens, you receive the file path and can
+/// read it in parts using standard Unix tools.
+///
+/// Some sites may block automated requests or require authentication.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebFetchArgs {
     /// The URL to fetch content from. Can be a webpage or an image URL.
@@ -443,7 +452,6 @@ pub struct WebFetchArgs {
 #[derive(Debug, Clone, Default)]
 pub struct WebFetchTool {
     name: String,
-    description: String,
     /// URLs must match at least one pattern to be allowed (if non-empty).
     whitelist: Vec<Regex>,
     /// URLs matching any pattern will be blocked.
@@ -456,7 +464,6 @@ impl WebFetchTool {
     pub fn new() -> Self {
         Self {
             name: "webfetch".into(),
-            description: include_str!("prompt.md").into(),
             whitelist: Vec::new(),
             blacklist: Vec::new(),
         }
@@ -466,13 +473,6 @@ impl WebFetchTool {
     #[must_use]
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
-        self
-    }
-
-    /// Create a web fetch tool with custom description.
-    #[must_use]
-    pub fn described(mut self, description: impl Into<String>) -> Self {
-        self.description = description.into();
         self
     }
 
@@ -516,10 +516,6 @@ impl WebFetchTool {
 impl Tool for WebFetchTool {
     fn name(&self) -> Cow<'static, str> {
         Cow::Owned(self.name.clone())
-    }
-
-    fn description(&self) -> Cow<'static, str> {
-        Cow::Owned(self.description.clone())
     }
 
     type Arguments = WebFetchArgs;

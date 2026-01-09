@@ -214,16 +214,11 @@ mod tests {
 
     struct MockTool {
         name: &'static str,
-        description: &'static str,
     }
 
     impl Tool for MockTool {
         fn name(&self) -> Cow<'static, str> {
             self.name.into()
-        }
-
-        fn description(&self) -> Cow<'static, str> {
-            self.description.into()
         }
 
         type Arguments = EmptyArgs;
@@ -233,8 +228,8 @@ mod tests {
         }
     }
 
-    fn make_tool(name: &'static str, description: &'static str) -> ToolDefinition {
-        ToolDefinition::new(&MockTool { name, description })
+    fn make_tool(name: &'static str, _description: &'static str) -> ToolDefinition {
+        ToolDefinition::new(&MockTool { name })
     }
 
     #[test]

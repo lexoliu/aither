@@ -31,10 +31,6 @@ where
         "search_memories".into()
     }
 
-    fn description(&self) -> std::borrow::Cow<'static, str> {
-        "Search for relevant memories based on a query string.".into()
-    }
-
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
         let result = self
             .inner
@@ -58,10 +54,6 @@ where
     type Arguments = Vec<String>;
     fn name(&self) -> std::borrow::Cow<'static, str> {
         "add_fact".into()
-    }
-
-    fn description(&self) -> std::borrow::Cow<'static, str> {
-        "Add a new fact to memory.".into()
     }
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {

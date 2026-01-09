@@ -34,6 +34,7 @@
 use std::borrow::Cow;
 
 use aither_core::llm::Tool;
+use aither_core::llm::tool::ToolDefinition;
 use aither_core::LanguageModel;
 use askama::Template;
 use executor_core::Executor;
@@ -54,7 +55,31 @@ struct SystemPrompt {
     user_cwd: String,
     sandbox_dir: String,
     tools: String,
+    skills: String,
+    has_skills: bool,
+    subagents: String,
+    has_subagents: bool,
     is_macos: bool,
+}
+
+/// Loaded skill metadata for system prompt.
+#[derive(Debug, Clone)]
+pub struct SkillInfo {
+    /// Name of the skill.
+    pub name: String,
+    /// Short description.
+    pub description: String,
+}
+
+/// Loaded subagent metadata for system prompt.
+#[derive(Debug, Clone)]
+pub struct SubagentInfo {
+    /// Name/ID of the subagent.
+    pub name: String,
+    /// Short description.
+    pub description: String,
+    /// Relative path within .subagents folder.
+    pub path: String,
 }
 
 /// Builder for creating bash-centric agents.
@@ -70,6 +95,8 @@ where
     inner: AgentBuilder<LLM, LLM, LLM, H>,
     bash_tool: BashTool<P, E>,
     tool_descriptions: Vec<(String, String)>,
+    skills: Vec<SkillInfo>,
+    subagents: Vec<SubagentInfo>,
 }
 
 impl<LLM, P, E> BashAgentBuilder<LLM, P, E, ()>
@@ -95,6 +122,8 @@ where
             inner: AgentBuilder::new(llm),
             bash_tool,
             tool_descriptions: Vec::new(),
+            skills: Vec::new(),
+            subagents: Vec::new(),
         }
     }
 }
@@ -123,12 +152,14 @@ where
         T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
     {
         let name = tool.name().to_string();
-        let description = tool.description();
+        // Extract description from schema (rustdoc on Args struct)
+        let def = ToolDefinition::new(&tool);
+        let description = def.description();
         // Truncate description to first sentence
         let short_desc = description
             .split('.')
             .next()
-            .unwrap_or(&description)
+            .unwrap_or(description)
             .trim()
             .to_string();
 
@@ -189,6 +220,22 @@ where
             .collect::<Vec<_>>()
             .join("\n");
 
+        // Build skills description
+        let has_skills = !self.skills.is_empty();
+        let skills = self.skills
+            .iter()
+            .map(|s| format!("- {}: {}", s.name, s.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Build subagents description
+        let has_subagents = !self.subagents.is_empty();
+        let subagents = self.subagents
+            .iter()
+            .map(|s| format!("- {} ({}): {}", s.name, s.path, s.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+
         // Get directory paths
         let sandbox_dir = self.bash_tool.working_dir().display().to_string();
         let user_cwd = std::env::current_dir()
@@ -207,6 +254,10 @@ where
             user_cwd,
             sandbox_dir,
             tools,
+            skills,
+            has_skills,
+            subagents,
+            has_subagents,
             is_macos,
         };
 
@@ -221,7 +272,110 @@ where
             inner: self.inner.hook(hook),
             bash_tool: self.bash_tool,
             tool_descriptions: self.tool_descriptions,
+            skills: self.skills,
+            subagents: self.subagents,
         }
+    }
+
+    /// Loads skills from a filesystem path and creates a symlink in the sandbox.
+    ///
+    /// Skills are loaded from SKILL.md files in subdirectories of the provided path.
+    /// A symlink `.skills` is created in the sandbox working directory pointing to
+    /// the skills directory, allowing the agent to read skill contents.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// builder.with_skills("/path/to/skills")
+    /// ```
+    #[cfg(feature = "skills")]
+    pub fn with_skills(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        use aither_skills::SkillLoader;
+
+        let path = path.as_ref();
+        if !path.exists() {
+            return self;
+        }
+
+        // Load all skills from the path
+        tracing::debug!(path = %path.display(), "Loading skills from path");
+        let loader = SkillLoader::new().add_path(path);
+        match loader.load_all() {
+            Ok(skills) => {
+                tracing::info!(count = skills.len(), path = %path.display(), "Loaded skills");
+                for skill in skills {
+                    tracing::debug!(name = %skill.name, "Loaded skill");
+                    self.skills.push(SkillInfo {
+                        name: skill.name,
+                        description: skill.description,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "Failed to load skills");
+            }
+        }
+
+        // Create symlink to .skills in sandbox working directory
+        // Canonicalize path to ensure symlink works from sandbox directory
+        let symlink_path = self.bash_tool.working_dir().join(".skills");
+        if let Ok(abs_path) = path.canonicalize() {
+            let _ = std::os::unix::fs::symlink(&abs_path, &symlink_path);
+        }
+
+        self
+    }
+
+    /// Adds a skill manually without loading from filesystem.
+    pub fn skill(mut self, name: impl Into<String>, description: impl Into<String>) -> Self {
+        self.skills.push(SkillInfo {
+            name: name.into(),
+            description: description.into(),
+        });
+        self
+    }
+
+    /// Sets up the subagents directory and creates a symlink in the sandbox.
+    ///
+    /// Subagents are markdown files with YAML frontmatter (name, description).
+    /// They can be invoked via: `task --subagent_file <path> --prompt "..."`
+    ///
+    /// A symlink `.subagents` is created in the sandbox working directory.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// builder.with_subagents("/path/to/subagents")
+    /// ```
+    pub fn with_subagents(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        use crate::subagent_file::SubagentDefinition;
+
+        let path = path.as_ref();
+        if !path.exists() {
+            return self;
+        }
+
+        // Load all subagent definitions from the directory
+        if let Ok(defs) = SubagentDefinition::load_from_dir(path) {
+            for def in defs {
+                // Get relative path for the subagent file
+                let filename = format!("{}.md", def.id);
+                self.subagents.push(SubagentInfo {
+                    name: def.id,
+                    description: def.description,
+                    path: filename,
+                });
+            }
+        }
+
+        // Create symlink to .subagents in sandbox working directory
+        // Canonicalize path to ensure symlink works from sandbox directory
+        let symlink_path = self.bash_tool.working_dir().join(".subagents");
+        if let Ok(abs_path) = path.canonicalize() {
+            let _ = std::os::unix::fs::symlink(&abs_path, &symlink_path);
+        }
+
+        self
     }
 
     /// Sets the maximum number of iterations.

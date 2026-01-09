@@ -54,7 +54,14 @@ pub trait FileSystem: Send + Sync + 'static {
     }
 }
 
-/// Filesystem operation to perform.
+/// File system operations: read, write, append, delete, list.
+///
+/// Provides direct filesystem access within the sandbox. All operations
+/// respect the sandbox permission model - writes go to the sandbox directory
+/// unless running in unsafe mode.
+///
+/// Large file reads may be automatically truncated or saved to a separate
+/// file. Use standard Unix tools to process large files in parts.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum FsOperation {
@@ -106,7 +113,6 @@ pub struct FileSystemTool<FS> {
     filesystem: FS,
     allow_writes: bool,
     name: String,
-    description: String,
 }
 
 impl FileSystemTool<LocalFileSystem> {
@@ -141,7 +147,6 @@ impl<FS: FileSystem> FileSystemTool<FS> {
             filesystem: fs,
             allow_writes: true,
             name: "filesystem".into(),
-            description: include_str!("prompt.md").into(),
         }
     }
 
@@ -152,11 +157,6 @@ impl<FS: FileSystem> FileSystemTool<FS> {
 
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
-        self
-    }
-
-    pub fn described(mut self, description: impl Into<String>) -> Self {
-        self.description = description.into();
         self
     }
 
@@ -172,10 +172,6 @@ impl<FS: FileSystem> FileSystemTool<FS> {
 impl<FS: FileSystem> Tool for FileSystemTool<FS> {
     fn name(&self) -> Cow<'static, str> {
         Cow::Owned(self.name.clone())
-    }
-
-    fn description(&self) -> Cow<'static, str> {
-        Cow::Owned(self.description.clone())
     }
 
     type Arguments = FsOperation;

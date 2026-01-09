@@ -381,12 +381,6 @@ impl Tool for ToolSearchTool {
         "_search_tools".into()
     }
 
-    fn description(&self) -> Cow<'static, str> {
-        "Search for available tools by describing what you need. \
-         Use this when you need a capability that isn't in your current tool set."
-            .into()
-    }
-
     type Arguments = ToolSearchArgs;
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
@@ -410,10 +404,6 @@ mod tests {
     impl Tool for DummyTool {
         fn name(&self) -> Cow<'static, str> {
             Cow::Owned(self.name.clone())
-        }
-
-        fn description(&self) -> Cow<'static, str> {
-            "A dummy tool for testing".into()
         }
 
         type Arguments = DummyArgs;

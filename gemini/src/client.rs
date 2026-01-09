@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use async_io::Timer;
 use serde::{Deserialize, Serialize};
 use zenwave::{Client, client, header};
 
@@ -119,7 +122,7 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
                 if debug {
                     eprintln!("Gemini connect error, retrying attempt {attempt}: {msg}");
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200 * attempt as u64));
+                Timer::after(Duration::from_millis(200 * attempt as u64)).await;
             }
         }
     }

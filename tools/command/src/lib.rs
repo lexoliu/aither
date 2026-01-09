@@ -6,7 +6,13 @@ use async_process::Command;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Arguments for executing a shell command.
+/// Execute a shell command with arguments.
+///
+/// Runs a program with the specified arguments and returns stdout, stderr,
+/// and exit code. Use this for executing system commands when you need
+/// fine-grained control over arguments.
+///
+/// For complex scripts with pipelines, use `bash` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CommandArgs {
     /// Program name to execute (e.g., "ls", "grep", "git", "cargo").
@@ -32,7 +38,6 @@ pub struct CommandTool {
     default_cwd: PathBuf,
     max_output: usize,
     name: String,
-    description: String,
 }
 
 impl CommandTool {
@@ -43,7 +48,6 @@ impl CommandTool {
             default_cwd,
             max_output: 16 * 1024,
             name: "command".into(),
-            description: include_str!("prompt.md").into(),
         }
     }
 
@@ -59,11 +63,6 @@ impl CommandTool {
 
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
-        self
-    }
-
-    pub fn described(mut self, description: impl Into<String>) -> Self {
-        self.description = description.into();
         self
     }
 
@@ -94,10 +93,6 @@ impl CommandTool {
 impl Tool for CommandTool {
     fn name(&self) -> Cow<'static, str> {
         Cow::Owned(self.name.clone())
-    }
-
-    fn description(&self) -> Cow<'static, str> {
-        Cow::Owned(self.description.clone())
     }
 
     type Arguments = CommandArgs;

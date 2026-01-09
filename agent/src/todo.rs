@@ -130,7 +130,14 @@ impl TodoList {
     }
 }
 
-/// Arguments for the todo tool - replaces entire list.
+/// Manage a structured task list for tracking progress on complex work.
+///
+/// Use proactively when tasks require 3+ steps, involve multiple files,
+/// or need careful organization. Updates replace the entire list.
+///
+/// Task states: pending, in_progress, completed.
+/// Keep exactly one task in_progress at a time.
+/// Mark tasks complete immediately when done.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TodoWriteArgs {
     /// The complete updated todo list. This replaces any existing todos.
@@ -177,10 +184,6 @@ impl Default for TodoTool {
 impl Tool for TodoTool {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("todo")
-    }
-
-    fn description(&self) -> Cow<'static, str> {
-        Cow::Borrowed(include_str!("prompts/todo.md"))
     }
 
     type Arguments = TodoWriteArgs;
