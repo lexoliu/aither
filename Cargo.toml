@@ -17,7 +17,6 @@ members = [
     "tools/fs",
     "tools/command",
     "mcp",
-    "cli",
     "sandbox",
 ]
 

@@ -3,7 +3,7 @@
 //! The builder pattern allows fluent configuration of agents with
 //! tools, hooks, and various settings.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use aither_core::{LanguageModel, llm::Tool};
 use aither_sandbox::{BackgroundTaskReceiver, OutputStore};
@@ -11,7 +11,7 @@ use aither_sandbox::{BackgroundTaskReceiver, OutputStore};
 use crate::{
     agent::{Agent, ModelTier},
     compression::ContextStrategy,
-    config::{AgentConfig, ToolSearchConfig},
+    config::AgentConfig,
     context::ConversationMemory,
     hook::{HCons, Hook},
     todo::{TodoList, TodoTool},
@@ -52,8 +52,18 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     hooks: H,
     config: AgentConfig,
     todo_list: Option<TodoList>,
-    output_store: Option<Arc<RwLock<OutputStore>>>,
+    output_store: Option<Arc<OutputStore>>,
     background_receiver: Option<BackgroundTaskReceiver>,
+}
+
+impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Balanced, Fast, H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentBuilder")
+            .field("tier", &self.tier)
+            .field("config", &self.config)
+            .field("todo_enabled", &self.todo_list.is_some())
+            .finish()
+    }
 }
 
 impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
@@ -109,7 +119,10 @@ where
     ///
     /// This model is used for tasks where speed and cost matter more
     /// than capability, such as context compression.
-    pub fn fast_model<F2: LanguageModel>(self, model: F2) -> AgentBuilder<Advanced, Balanced, F2, H> {
+    pub fn fast_model<F2: LanguageModel>(
+        self,
+        model: F2,
+    ) -> AgentBuilder<Advanced, Balanced, F2, H> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: self.balanced,
@@ -163,15 +176,6 @@ where
         self
     }
 
-    /// Registers a deferred (searchable) tool.
-    ///
-    /// Deferred tools are only loaded when the agent searches for them,
-    /// reducing context usage when many tools are available.
-    pub fn deferred_tool<T: Tool + 'static>(mut self, tool: T) -> Self {
-        self.tools.register_deferred(tool);
-        self
-    }
-
     /// Adds a hook to intercept agent operations.
     ///
     /// Hooks are composed using the HCons pattern, allowing multiple
@@ -186,10 +190,7 @@ where
     ///     .build();
     /// // Type: Agent<LLM, HCons<ConfirmationHook, HCons<LoggingHook, ()>>>
     /// ```
-    pub fn hook<NH: Hook>(
-        self,
-        hook: NH,
-    ) -> AgentBuilder<Advanced, Balanced, Fast, HCons<NH, H>> {
+    pub fn hook<NH: Hook>(self, hook: NH) -> AgentBuilder<Advanced, Balanced, Fast, HCons<NH, H>> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: self.balanced,
@@ -224,31 +225,6 @@ where
     /// Sets the context compression strategy.
     pub fn context_strategy(mut self, strategy: ContextStrategy) -> Self {
         self.config.context = strategy;
-        self
-    }
-
-    /// Enables or disables tool search explicitly.
-    ///
-    /// When enabled, the agent can search for deferred tools dynamically.
-    /// By default, tool search is auto-enabled when the tool count
-    /// exceeds the threshold.
-    pub fn tool_search(mut self, enabled: bool) -> Self {
-        self.config.tool_search.enabled = Some(enabled);
-        self
-    }
-
-    /// Sets the threshold for auto-enabling tool search.
-    ///
-    /// When the total number of tools exceeds this threshold,
-    /// tool search is automatically enabled.
-    pub fn tool_search_threshold(mut self, count: usize) -> Self {
-        self.config.tool_search.auto_threshold = Some(count);
-        self
-    }
-
-    /// Sets the tool search configuration.
-    pub fn tool_search_config(mut self, config: ToolSearchConfig) -> Self {
-        self.config.tool_search = config;
         self
     }
 
@@ -314,19 +290,24 @@ where
     /// # Example
     ///
     /// ```rust,ignore
-    /// use aither_sandbox::{BashTool, permission::DenyUnsafe};
+    /// use aither_sandbox::{BashTool, ToolRegistryBuilder, permission::DenyUnsafe};
+    /// use std::sync::Arc;
     ///
     /// // Create bash tool (creates random working dir like amber-forest-thunder-pearl/)
     /// let bash_tool = BashTool::new_in(parent, DenyUnsafe, executor).await?;
+    /// let registry = Arc::new(ToolRegistryBuilder::new().build(bash_tool.outputs_dir()));
+    /// let bash_tool = bash_tool.with_registry(registry);
     ///
     /// let agent = Agent::builder(llm)
     ///     .bash(bash_tool)
     ///     .build();
     /// ```
-    pub fn bash<P, E>(mut self, bash_tool: aither_sandbox::BashTool<P, E>) -> Self
+    pub fn bash<P, E, State>(mut self, bash_tool: aither_sandbox::BashTool<P, E, State>) -> Self
     where
         P: aither_sandbox::PermissionHandler + 'static,
         E: executor_core::Executor + Clone + 'static,
+        State: Clone + 'static,
+        aither_sandbox::BashTool<P, E, State>: Tool + 'static,
     {
         let output_store = bash_tool.output_store().clone();
         let background_receiver = bash_tool.background_receiver();
@@ -455,7 +436,10 @@ mod tests {
 
         type Arguments = MockArgs;
 
-        async fn call(&self, _args: Self::Arguments) -> aither_core::Result<aither_core::llm::ToolOutput> {
+        async fn call(
+            &self,
+            _args: Self::Arguments,
+        ) -> aither_core::Result<aither_core::llm::ToolOutput> {
             Ok(aither_core::llm::ToolOutput::text("ok"))
         }
     }
@@ -468,13 +452,13 @@ mod tests {
     #[test]
     fn test_builder_basic() {
         let agent = AgentBuilder::new(MockLlm).build();
-        assert!(agent.tools.eager_definitions().is_empty());
+        assert!(agent.tools.definitions().is_empty());
     }
 
     #[test]
     fn test_builder_with_tool() {
         let agent = AgentBuilder::new(MockLlm).tool(MockTool).build();
-        assert_eq!(agent.tools.eager_definitions().len(), 1);
+        assert_eq!(agent.tools.definitions().len(), 1);
     }
 
     #[test]
@@ -510,8 +494,11 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_tool_search() {
-        let agent = AgentBuilder::new(MockLlm).tool_search(true).build();
-        assert_eq!(agent.config.tool_search.enabled, Some(true));
+    fn test_builder_default_config() {
+        let agent = AgentBuilder::new(MockLlm).build();
+        assert_eq!(
+            agent.config.max_iterations,
+            AgentConfig::default().max_iterations
+        );
     }
 }

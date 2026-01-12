@@ -4,8 +4,12 @@
 //! - `ask`: Query a fast LLM about piped content
 
 mod ask;
+mod stop;
+mod tasks;
 
 pub use ask::AskCommand;
+pub use stop::StopTool;
+pub use tasks::TasksTool;
 
 use leash::IpcRouter;
 

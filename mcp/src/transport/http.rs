@@ -4,7 +4,6 @@
 //! with support for MCP session management via `Mcp-Session-Id` header.
 
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::RwLock;
 
 use tracing::debug;
 use zenwave::{Client, ResponseExt, client, header};
@@ -26,7 +25,7 @@ pub struct HttpTransport {
     /// Optional authorization header value.
     auth: Option<String>,
     /// Session ID returned by server during initialization.
-    session_id: RwLock<Option<String>>,
+    session_id: Option<String>,
     /// Next request ID.
     next_id: AtomicI64,
     /// Whether the transport is closed.
@@ -44,7 +43,7 @@ impl HttpTransport {
         Self {
             base_url: base_url.into(),
             auth: None,
-            session_id: RwLock::new(None),
+            session_id: None,
             next_id: AtomicI64::new(1),
             closed: false,
         }
@@ -97,7 +96,7 @@ impl Transport for HttpTransport {
         }
 
         // Include session ID if we have one
-        if let Some(session_id) = self.session_id.read().unwrap().as_ref() {
+        if let Some(session_id) = self.session_id.as_ref() {
             builder = builder
                 .header(MCP_SESSION_ID_HEADER, session_id.clone())
                 .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?;
@@ -114,7 +113,7 @@ impl Transport for HttpTransport {
         if let Some(session_id) = response.headers().get(MCP_SESSION_ID_HEADER) {
             if let Ok(session_str) = session_id.to_str() {
                 debug!("MCP HTTP session ID: {}", session_str);
-                *self.session_id.write().unwrap() = Some(session_str.to_string());
+                self.session_id = Some(session_str.to_string());
             }
         }
 
@@ -158,7 +157,7 @@ impl Transport for HttpTransport {
         }
 
         // Include session ID if we have one
-        if let Some(session_id) = self.session_id.read().unwrap().as_ref() {
+        if let Some(session_id) = self.session_id.as_ref() {
             builder = builder
                 .header(MCP_SESSION_ID_HEADER, session_id.clone())
                 .map_err(|e| McpError::Transport(format!("HTTP notify failed: {e}")))?;

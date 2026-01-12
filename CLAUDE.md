@@ -15,7 +15,6 @@ Run examples:
 ```bash
 OPENAI_API_KEY=sk-... cargo run --example tool_macro -p aither-openai
 GEMINI_API_KEY=... cargo run --example chatbot_gemini -p aither-gemini
-cargo run -p aither-cli                                      # Interactive CLI
 ```
 
 Run a single test:
@@ -59,9 +58,6 @@ Standalone tool crates that integrate with the agent:
 
 ### MCP (`mcp/`)
 Model Context Protocol client/server implementation for tool discovery and execution.
-
-### CLI (`cli/`)
-Interactive terminal interface for testing agents. Binary name: `aither`.
 
 ### Other Crates
 - `derive/` – proc-macros (`#[tool]`)

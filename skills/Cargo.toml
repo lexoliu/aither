@@ -15,6 +15,8 @@ categories = ["api-bindings"]
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2.0"
+async-fs = "2"
+futures-lite = "2"
 
 [dev-dependencies]
 tempfile = "3.17"

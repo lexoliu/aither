@@ -7,4 +7,4 @@ mod client;
 mod toolset;
 
 pub(crate) use client::McpClient;
-pub use toolset::{McpConnection, McpServerConfig, McpServersConfig};
+pub use toolset::{McpConnection, McpServerConfig, McpServersConfig, McpToolService};

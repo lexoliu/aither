@@ -10,46 +10,32 @@
 use std::{
     borrow::Cow,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
-
-use rand::seq::IndexedRandom;
 
 use aither_core::llm::{Tool, ToolOutput};
 use crate::output::INLINE_OUTPUT_LIMIT;
 use async_channel::{Receiver, Sender};
 use executor_core::{Executor, Task};
-use leash::{AllowAll, DenyAll, IpcRouter, Sandbox, SandboxConfig, SecurityConfig, WorkingDir};
+use leash::{
+    AllowAll, DenyAll, IpcRouter, NetworkPolicy, Sandbox, SandboxConfig, SecurityConfig,
+    StdioConfig, WorkingDir,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::{
     builtin::builtin_router,
+    command::ToolRegistry,
     output::{OutputEntry, OutputFormat, OutputStore},
     permission::{BashMode, PermissionError, PermissionHandler},
+    job_registry::{JobRegistry, job_registry_channel},
 };
-
-/// Word list for generating random task IDs (four words like "amber-forest-thunder-pearl").
-const WORDS: &[&str] = &[
-    "apple", "banana", "cherry", "dragon", "eagle", "falcon", "garden", "harbor", "island",
-    "jungle", "kitten", "lemon", "mango", "night", "ocean", "planet", "queen", "river", "silver",
-    "tiger", "umbrella", "violet", "winter", "yellow", "zebra", "anchor", "bridge", "castle",
-    "desert", "ember", "forest", "glacier", "horizon", "ivory", "jasmine", "kingdom", "lantern",
-    "meadow", "nebula", "orchid", "phoenix", "quartz", "rainbow", "shadow", "thunder", "urban",
-    "velvet", "whisper", "crystal", "dolphin", "eclipse", "firefly", "granite", "hollow",
-    "indigo", "journey", "karma", "lotus", "marble", "nomad", "oasis", "prism", "quest", "ripple",
-    "sphinx", "temple", "unity", "vortex", "willow", "xenon", "yonder", "zenith", "amber",
-    "blazer", "copper", "dusk", "ether", "flame", "golden", "haze", "iron", "jade", "kindle",
-    "lunar", "mystic", "nova", "onyx", "pearl", "radiant", "storm", "tidal", "ultra", "vivid",
-    "wave", "azure", "breeze",
-];
 
 /// Generate a random four-word ID (e.g., "amber-forest-thunder-pearl").
 fn random_task_id() -> String {
-    let mut rng = rand::rng();
-    let words: Vec<&str> = WORDS.choose_multiple(&mut rng, 4).copied().collect();
-    words.join("-")
+    crate::naming::random_word_slug(4)
 }
 
 /// Execute bash scripts in a sandboxed environment.
@@ -171,6 +157,14 @@ impl BackgroundTaskReceiver {
         !self.rx.is_empty()
     }
 
+    /// Checks if there are any background tasks still running.
+    ///
+    /// This works by checking the sender count - BashTool holds one sender,
+    /// and each running background task holds a cloned sender.
+    pub fn has_running(&self) -> bool {
+        self.rx.sender_count() > 1
+    }
+
     /// Waits for the next completed task.
     ///
     /// Returns `None` if the channel is closed (all senders dropped).
@@ -202,6 +196,68 @@ impl std::fmt::Debug for BackgroundTaskReceiver {
     }
 }
 
+/// Factory for creating child bash tools asynchronously.
+#[derive(Clone)]
+pub struct BashToolFactory {
+    tx: Sender<Sender<crate::command::DynBashTool>>,
+}
+
+/// Receiver that serves bash tool creation requests.
+pub struct BashToolFactoryReceiver {
+    rx: Receiver<Sender<crate::command::DynBashTool>>,
+}
+
+/// Errors that can occur when requesting a child bash tool.
+#[derive(Debug, thiserror::Error)]
+pub enum BashToolFactoryError {
+    /// The factory service is not running.
+    #[error("bash tool factory is not available")]
+    Unavailable,
+    /// The factory failed to return a tool.
+    #[error("bash tool factory failed to return a tool")]
+    NoResponse,
+}
+
+/// Creates a factory channel pair for spawning child bash tools.
+#[must_use]
+pub fn bash_tool_factory_channel() -> (BashToolFactory, BashToolFactoryReceiver) {
+    let (tx, rx) = async_channel::unbounded();
+    (
+        BashToolFactory { tx },
+        BashToolFactoryReceiver { rx },
+    )
+}
+
+impl BashToolFactory {
+    /// Requests a new child bash tool from the factory service.
+    pub async fn create(&self) -> Result<crate::command::DynBashTool, BashToolFactoryError> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.tx
+            .send(reply_tx)
+            .await
+            .map_err(|_| BashToolFactoryError::Unavailable)?;
+        reply_rx
+            .recv()
+            .await
+            .map_err(|_| BashToolFactoryError::NoResponse)
+    }
+}
+
+impl BashToolFactoryReceiver {
+    async fn serve<P, E>(self, bash_tool: BashTool<P, E, Configured>)
+    where
+        P: PermissionHandler + 'static,
+        E: Executor + Clone + 'static,
+    {
+        while let Ok(reply_tx) = self.rx.recv().await {
+            let tool = bash_tool.child().to_dyn();
+            if reply_tx.send(tool).await.is_err() {
+                warn!("bash tool factory response channel dropped");
+            }
+        }
+    }
+}
+
 /// The bash tool for executing scripts in a sandbox.
 ///
 /// Creates a shared working directory with four random words that persists
@@ -210,34 +266,53 @@ impl std::fmt::Debug for BackgroundTaskReceiver {
 ///
 /// The executor type `E` determines how async tasks are spawned for the IPC server.
 /// Use `TokioExecutor` when running in a tokio runtime.
-pub struct BashTool<P, E> {
+/// Marker type for a bash tool without a configured registry.
+#[derive(Clone, Debug)]
+pub struct Unconfigured;
+
+/// Marker type for a bash tool with a configured registry.
+#[derive(Clone)]
+pub struct Configured {
+    registry: Arc<ToolRegistry>,
+}
+
+/// The bash tool for executing scripts in a sandbox.
+pub struct BashTool<P, E, State = Unconfigured> {
     /// Shared working directory (four random words, e.g., `amber-forest-thunder-pearl/`)
     working_dir: PathBuf,
     /// Permission handler wrapped in Arc for sharing between parent and child tools.
     permission_handler: Arc<P>,
     executor: E,
-    output_store: Arc<RwLock<OutputStore>>,
+    output_store: Arc<OutputStore>,
+    job_registry: JobRegistry,
     /// Channel for receiving completed background tasks.
     completed_rx: Receiver<CompletedTask>,
     /// Channel for sending completed background tasks (cloned for each background task).
     completed_tx: Sender<CompletedTask>,
+    /// Additional paths that should be writable in the sandbox.
+    writable_paths: Vec<PathBuf>,
+    /// Tool registry state.
+    registry: State,
 }
 
 // Manual Clone impl because P doesn't need to be Clone (we use Arc<P>)
-impl<P, E: Clone> Clone for BashTool<P, E> {
+impl<P, E: Clone, State: Clone> Clone for BashTool<P, E, State> {
     fn clone(&self) -> Self {
         Self {
             working_dir: self.working_dir.clone(),
             permission_handler: self.permission_handler.clone(),
             executor: self.executor.clone(),
             output_store: self.output_store.clone(),
+            job_registry: self.job_registry.clone(),
             completed_rx: self.completed_rx.clone(),
             completed_tx: self.completed_tx.clone(),
+            writable_paths: self.writable_paths.clone(),
+            registry: self.registry.clone(),
         }
     }
 }
 
-impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
+impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
     /// Creates a new bash tool with permission handler and executor.
     ///
     /// Creates a random four-word working directory under the specified parent directory.
@@ -264,7 +339,13 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
         async_fs::create_dir_all(&outputs_dir).await?;
 
         // Create output store
-        let output_store = Arc::new(RwLock::new(OutputStore::new(&outputs_dir).await?));
+        let output_store = Arc::new(OutputStore::new(&outputs_dir).await?);
+
+        // Start job registry service
+        let (job_registry, job_registry_service) = job_registry_channel();
+        executor
+            .spawn(async move { job_registry_service.serve().await })
+            .detach();
 
         // Create channel for background task completion (unbounded to not block spawned tasks)
         let (completed_tx, completed_rx) = async_channel::unbounded();
@@ -274,9 +355,91 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
             permission_handler: Arc::new(permission_handler),
             executor,
             output_store,
+            job_registry,
             completed_rx,
             completed_tx,
+            writable_paths: Vec::new(),
+            registry: Unconfigured,
         })
+    }
+
+    /// Creates a new bash tool with permission handler and executor,
+    /// using the provided directory directly as the working directory.
+    ///
+    /// Unlike `new_in` which creates a random subdirectory, this method
+    /// uses the exact path provided. Use this when you want explicit control
+    /// over the working directory location.
+    pub async fn new_exact(
+        working_dir: impl AsRef<std::path::Path>,
+        permission_handler: P,
+        executor: E,
+    ) -> Result<Self, BashError> {
+        let working_dir_path = working_dir.as_ref().to_path_buf();
+
+        // Ensure working directory exists
+        async_fs::create_dir_all(&working_dir_path).await?;
+
+        // Create outputs directory inside working dir
+        let outputs_dir = working_dir_path.join("outputs");
+        async_fs::create_dir_all(&outputs_dir).await?;
+
+        // Create output store
+        let output_store = Arc::new(OutputStore::new(&outputs_dir).await?);
+
+        // Start job registry service
+        let (job_registry, job_registry_service) = job_registry_channel();
+        executor
+            .spawn(async move { job_registry_service.serve().await })
+            .detach();
+
+        // Create channel for background task completion (unbounded to not block spawned tasks)
+        let (completed_tx, completed_rx) = async_channel::unbounded();
+
+        Ok(Self {
+            working_dir: working_dir_path,
+            permission_handler: Arc::new(permission_handler),
+            executor,
+            output_store,
+            job_registry,
+            completed_rx,
+            completed_tx,
+            writable_paths: Vec::new(),
+            registry: Unconfigured,
+        })
+    }
+
+    /// Attaches a tool registry to this bash tool, enabling IPC command dispatch.
+    #[must_use]
+    pub fn with_registry(self, registry: Arc<ToolRegistry>) -> BashTool<P, E, Configured> {
+        BashTool {
+            working_dir: self.working_dir,
+            permission_handler: self.permission_handler,
+            executor: self.executor,
+            output_store: self.output_store,
+            job_registry: self.job_registry,
+            completed_rx: self.completed_rx,
+            completed_tx: self.completed_tx,
+            writable_paths: self.writable_paths,
+            registry: Configured { registry },
+        }
+    }
+
+}
+
+impl<P, E, State> BashTool<P, E, State>
+where
+    E: Executor + Clone + 'static,
+    State: Clone,
+{
+    /// Adds additional writable paths to the sandbox configuration.
+    ///
+    /// These paths will be writable in sandboxed and network modes.
+    pub fn with_writable_paths(
+        mut self,
+        paths: impl IntoIterator<Item = impl Into<PathBuf>>,
+    ) -> Self {
+        self.writable_paths.extend(paths.into_iter().map(Into::into));
+        self
     }
 
     /// Creates a child BashTool that shares the same sandbox and permission handler
@@ -293,8 +456,11 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
             permission_handler: self.permission_handler.clone(), // Arc clone - shares handler
             executor: self.executor.clone(),
             output_store: self.output_store.clone(),
+            job_registry: self.job_registry.clone(),
             completed_rx,
             completed_tx,
+            writable_paths: self.writable_paths.clone(),
+            registry: self.registry.clone(),
         }
     }
 
@@ -303,9 +469,19 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
         &self.working_dir
     }
 
+    /// Returns the outputs directory path.
+    pub fn outputs_dir(&self) -> PathBuf {
+        self.working_dir.join("outputs")
+    }
+
     /// Returns the output store.
-    pub fn output_store(&self) -> &Arc<RwLock<OutputStore>> {
+    pub fn output_store(&self) -> &Arc<OutputStore> {
         &self.output_store
+    }
+
+    /// Returns the job registry handle.
+    pub fn job_registry(&self) -> JobRegistry {
+        self.job_registry.clone()
     }
 
     /// Returns a receiver for completed background tasks.
@@ -337,15 +513,30 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
         // But since we clone the sender for each task, we check if channel is empty
         !self.completed_rx.is_empty() || self.completed_tx.sender_count() > 1
     }
+}
+
+impl<P, E> BashTool<P, E, Configured>
+where
+    P: PermissionHandler + 'static,
+    E: Executor + Clone + 'static,
+{
+    fn registry(&self) -> &Arc<ToolRegistry> {
+        &self.registry.registry
+    }
+
+    /// Starts a background service that produces child bash tools on demand.
+    pub fn start_factory_service(&self, receiver: BashToolFactoryReceiver) {
+        let tool = self.clone();
+        self.executor
+            .spawn(async move { receiver.serve(tool).await })
+            .detach();
+    }
 
     /// Converts this BashTool into a type-erased DynBashTool.
     ///
     /// This is useful for creating child bash tools for subagents where
     /// the concrete type cannot be known at compile time.
-    pub fn to_dyn(self) -> crate::command::DynBashTool
-    where
-        P: PermissionHandler + 'static,
-    {
+    pub fn to_dyn(self) -> crate::command::DynBashTool {
         use std::sync::Arc;
         use crate::command::{DynBashTool, DynToolHandler};
         use aither_core::llm::tool::ToolDefinition;
@@ -359,11 +550,7 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let definition = ToolDefinition::from_parts(
-            "bash".into(),
-            description.into(),
-            schema_value,
-        );
+        let definition = ToolDefinition::from_parts("bash".into(), description.into(), schema_value);
 
         // Create the handler
         let tool = Arc::new(self);
@@ -385,7 +572,7 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E> {
     }
 }
 
-impl<P: PermissionHandler, E: Executor + Clone + 'static> BashTool<P, E> {
+impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> BashTool<P, E, Configured> {
     /// Executes a bash script with the given arguments.
     #[instrument(skip(self), fields(mode = ?args.mode, expect = ?args.expect))]
     async fn execute(&self, args: BashArgs) -> Result<BashResult, BashError> {
@@ -405,10 +592,7 @@ impl<P: PermissionHandler, E: Executor + Clone + 'static> BashTool<P, E> {
         };
 
         // Save stdout - get store dir first, then save async
-        let store_dir = {
-            let store = self.output_store.read().map_err(|_| BashError::StoreLock)?;
-            store.dir().to_path_buf()
-        };
+        let store_dir = self.output_store.dir().to_path_buf();
         let limit = Some(INLINE_OUTPUT_LIMIT);
         let stdout = OutputStore::save_to_dir_with_limit(&store_dir, &output.stdout, args.expect, limit).await?;
 
@@ -433,10 +617,11 @@ impl<P: PermissionHandler, E: Executor + Clone + 'static> BashTool<P, E> {
 
     /// Executes in sandboxed mode (read-only, no network).
     async fn execute_sandboxed(&self, script: &str) -> Result<std::process::Output, BashError> {
-        let router = create_ipc_router();
+        let router = create_ipc_router(self.registry().clone());
         let config = SandboxConfig::builder()
             .network(DenyAll)
             .working_dir(&self.working_dir)
+            .writable_paths(&self.writable_paths)
             .security(SecurityConfig::interactive())
             .ipc(router)
             .build()
@@ -457,10 +642,11 @@ impl<P: PermissionHandler, E: Executor + Clone + 'static> BashTool<P, E> {
 
     /// Executes with network access enabled.
     async fn execute_network(&self, script: &str) -> Result<std::process::Output, BashError> {
-        let router = create_ipc_router();
+        let router = create_ipc_router(self.registry().clone());
         let config = SandboxConfig::builder()
             .network(AllowAll)
             .working_dir(&self.working_dir)
+            .writable_paths(&self.writable_paths)
             .security(SecurityConfig::interactive())
             .ipc(router)
             .build()
@@ -491,7 +677,9 @@ impl<P: PermissionHandler, E: Executor + Clone + 'static> BashTool<P, E> {
     }
 }
 
-impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool for BashTool<P, E> {
+impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
+    for BashTool<P, E, Configured>
+{
     fn name(&self) -> Cow<'static, str> {
         "bash".into()
     }
@@ -520,12 +708,12 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool for Bas
             let mode = arguments.mode;
             let expect = arguments.expect;
             let working_dir = self.working_dir.clone();
+            let writable_paths = self.writable_paths.clone();
             let executor = self.executor.clone();
-            let store_dir = {
-                let store = self.output_store.read().map_err(|_| anyhow::anyhow!(BashError::StoreLock))?;
-                store.dir().to_path_buf()
-            };
+            let registry = self.registry().clone();
+            let store_dir = self.output_store.dir().to_path_buf();
             let completed_tx = self.completed_tx.clone();
+            let job_registry = self.job_registry.clone();
 
             info!(task_id = %task_id, script_len = script.len(), "spawning background bash task");
 
@@ -536,7 +724,10 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool for Bas
             self.executor.spawn(async move {
                 let result = execute_script_standalone(
                     &working_dir,
+                    &writable_paths,
                     executor,
+                    registry,
+                    job_registry,
                     &script,
                     mode,
                     expect,
@@ -577,7 +768,10 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool for Bas
 /// Standalone script execution that can be spawned in a background task.
 async fn execute_script_standalone<E: Executor + Clone + 'static>(
     working_dir: &PathBuf,
+    writable_paths: &[PathBuf],
     executor: E,
+    registry: Arc<ToolRegistry>,
+    job_registry: JobRegistry,
     script: &str,
     mode: BashMode,
     expect: OutputFormat,
@@ -586,76 +780,81 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
     info!(script_len = script.len(), ?mode, "executing background bash script");
     debug!(script = %script, "script content");
 
-    // Execute based on mode
-    let output = match mode {
+    let (pid, output) = match mode {
         BashMode::Sandboxed => {
-            let router = create_ipc_router();
-            let config = SandboxConfig::builder()
-                .network(DenyAll)
-                .working_dir(working_dir)
-                .security(SecurityConfig::interactive())
-                .ipc(router)
-                .build()
-                .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
-
-            let sandbox = Sandbox::with_config_and_executor(config, executor)
-                .await
-                .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
-
-            sandbox
-                .command("bash")
-                .arg("-c")
-                .arg(script)
-                .output()
-                .await
-                .map_err(|e| BashError::Execution(e.to_string()))?
+            execute_sandboxed_background(
+                working_dir,
+                writable_paths,
+                executor.clone(),
+                registry.clone(),
+                script,
+                mode,
+                DenyAll,
+                &job_registry,
+            )
+            .await?
         }
         BashMode::Network => {
-            let router = create_ipc_router();
-            let config = SandboxConfig::builder()
-                .network(AllowAll)
-                .working_dir(working_dir)
-                .security(SecurityConfig::interactive())
-                .ipc(router)
-                .build()
-                .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
-
-            let sandbox = Sandbox::with_config_and_executor(config, executor)
-                .await
-                .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
-
-            sandbox
-                .command("bash")
-                .arg("-c")
-                .arg(script)
-                .output()
-                .await
-                .map_err(|e| BashError::Execution(e.to_string()))?
+            execute_sandboxed_background(
+                working_dir,
+                writable_paths,
+                executor,
+                registry,
+                script,
+                mode,
+                AllowAll,
+                &job_registry,
+            )
+            .await?
         }
         BashMode::Unsafe => {
-            async_process::Command::new("bash")
-                .arg("-c")
-                .arg(script)
-                .current_dir(working_dir)
-                .output()
-                .await
-                .map_err(|e| BashError::Execution(e.to_string()))?
+            execute_unsafe_background(working_dir, script, mode, &job_registry).await?
         }
     };
 
     // Save stdout with system-level size limit
     let limit = Some(INLINE_OUTPUT_LIMIT);
-    let stdout = OutputStore::save_to_dir_with_limit(store_dir, &output.stdout, expect, limit).await?;
+    let stdout = match OutputStore::save_to_dir_with_limit(store_dir, &output.stdout, expect, limit)
+        .await
+    {
+        Ok(entry) => entry,
+        Err(err) => {
+            job_registry
+                .fail(pid, &err.to_string(), None)
+                .await;
+            return Err(BashError::Io(err));
+        }
+    };
 
     // Save stderr if non-empty
     let stderr = if output.stderr.is_empty() {
         None
     } else {
-        Some(OutputStore::save_to_dir_with_limit(store_dir, &output.stderr, OutputFormat::Text, limit).await?)
+        match OutputStore::save_to_dir_with_limit(
+            store_dir,
+            &output.stderr,
+            OutputFormat::Text,
+            limit,
+        )
+        .await
+        {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                job_registry
+                    .fail(pid, &err.to_string(), None)
+                    .await;
+                return Err(BashError::Io(err));
+            }
+        }
     };
 
     let exit_code = output.status.code().unwrap_or(-1);
     debug!(exit_code, "background script completed");
+
+    let output_path = stdout.stored_path(store_dir);
+    job_registry
+        .complete(pid, exit_code, output_path)
+        .await;
 
     Ok(BashResult {
         stdout,
@@ -666,13 +865,118 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
     })
 }
 
+async fn execute_sandboxed_background<E, N>(
+    working_dir: &PathBuf,
+    writable_paths: &[PathBuf],
+    executor: E,
+    registry: Arc<ToolRegistry>,
+    script: &str,
+    mode: BashMode,
+    policy: N,
+    job_registry: &JobRegistry,
+) -> Result<(u32, std::process::Output), BashError>
+where
+    E: Executor + Clone + 'static,
+    N: NetworkPolicy + 'static,
+{
+    let router = create_ipc_router(registry);
+    let config = SandboxConfig::builder()
+        .network(policy)
+        .working_dir(working_dir)
+        .writable_paths(writable_paths)
+        .security(SecurityConfig::interactive())
+        .ipc(router)
+        .build()
+        .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
+
+    let sandbox = Sandbox::with_config_and_executor(config, executor)
+        .await
+        .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
+
+    let mut child = sandbox
+        .command("bash")
+        .arg("-c")
+        .arg(script)
+        .stdin(StdioConfig::Null)
+        .stdout(StdioConfig::Piped)
+        .stderr(StdioConfig::Piped)
+        .spawn()
+        .await
+        .map_err(|e| BashError::Execution(e.to_string()))?;
+
+    let pid = child.id();
+    job_registry
+        .register(pid, script, mode, None)
+        .await;
+
+    let output_result =
+        run_blocking(move || futures_lite::future::block_on(child.wait_with_output())).await;
+    let output = match output_result {
+        Ok(output) => output,
+        Err(err) => {
+            job_registry
+                .fail(pid, &err.to_string(), None)
+                .await;
+            return Err(BashError::Execution(err.to_string()));
+        }
+    };
+
+    Ok((pid, output))
+}
+
+async fn execute_unsafe_background(
+    working_dir: &PathBuf,
+    script: &str,
+    mode: BashMode,
+    job_registry: &JobRegistry,
+) -> Result<(u32, std::process::Output), BashError> {
+    let mut child = async_process::Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .current_dir(working_dir)
+        .stdin(async_process::Stdio::null())
+        .stdout(async_process::Stdio::piped())
+        .stderr(async_process::Stdio::piped())
+        .spawn()
+        .map_err(|e| BashError::Execution(e.to_string()))?;
+
+    let pid = child.id();
+    job_registry
+        .register(pid, script, mode, None)
+        .await;
+
+    match child.output().await {
+        Ok(output) => Ok((pid, output)),
+        Err(err) => {
+            job_registry
+                .fail(pid, &err.to_string(), None)
+                .await;
+            Err(BashError::Execution(err.to_string()))
+        }
+    }
+}
+
+async fn run_blocking<T, F>(task: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(task());
+    });
+    rx.recv()
+        .await
+        .expect("blocking task channel dropped")
+}
+
 /// Creates the IPC router with built-in and tool commands (standalone version).
-fn create_ipc_router() -> IpcRouter {
+fn create_ipc_router(registry: Arc<ToolRegistry>) -> IpcRouter {
     let mut router = builtin_router();
 
     // Register all configured tools as IPC commands
-    for name in crate::registered_tool_names() {
-        router = crate::register_tool_command(router, &name);
+    for name in registry.registered_tool_names() {
+        router = crate::register_tool_command(router, registry.clone(), &name);
     }
 
     router
@@ -697,22 +1001,78 @@ pub enum BashError {
     #[error("execution failed: {0}")]
     Execution(String),
 
-    /// Output store lock poisoned.
-    #[error("output store lock poisoned")]
-    StoreLock,
-
     /// IO error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
 
-impl<P, E> std::fmt::Debug for BashTool<P, E> {
+impl<P, E, State> std::fmt::Debug for BashTool<P, E, State> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BashTool")
             .field("working_dir", &self.working_dir)
             .finish_non_exhaustive()
     }
 }
+
+    /// Returns (os_name, os_version) for the current system.
+    pub fn get_os_info() -> (String, String) {
+        #[cfg(target_os = "macos")]
+        {
+            let version = std::process::Command::new("sw_vers")
+                .arg("-productVersion")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            ("macOS".to_string(), version)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            // Try to get pretty name from os-release
+            let version = std::fs::read_to_string("/etc/os-release")
+                .ok()
+                .and_then(|content| {
+                    content
+                        .lines()
+                        .find(|line| line.starts_with("PRETTY_NAME="))
+                        .map(|line| {
+                            line.trim_start_matches("PRETTY_NAME=")
+                                .trim_matches('"')
+                                .to_string()
+                        })
+                })
+                .unwrap_or_else(|| {
+                    // Fallback to uname -r
+                    std::process::Command::new("uname")
+                        .arg("-r")
+                        .output()
+                        .ok()
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                });
+            ("Linux".to_string(), version)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let version = std::process::Command::new("cmd")
+                .args(["/C", "ver"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            ("Windows".to_string(), version)
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            (std::env::consts::OS.to_string(), "unknown".to_string())
+        }
+    }
 
 #[cfg(test)]
 mod tests {

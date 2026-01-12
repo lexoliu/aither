@@ -27,6 +27,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1.0"
 
+# Process control (for killing background tasks)
+libc = "0.2"
+
 # Utilities
 url = "2"
 uuid = { version = "1", features = ["v4"] }
@@ -36,8 +39,8 @@ thiserror = "2"
 base64 = "0.22"
 futures-lite = "2.6"
 async-channel = "2"
-rand = "0.9"
 strsim = "0.11.1"
+human-hash = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

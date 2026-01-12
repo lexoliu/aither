@@ -25,17 +25,18 @@
 //! use aither_agent::bash_agent::BashAgentBuilder;
 //!
 //! let agent = BashAgentBuilder::new(llm, bash_tool)
-//!     .ipc_tool(WebSearchTool::default())  // Becomes `websearch` bash command
-//!     .ipc_tool(WebFetchTool::new())       // Becomes `webfetch` bash command
-//!     .ipc_tool(TaskTool::new(llm))        // Becomes `task` bash command
+//!     .tool(WebSearchTool::default())  // Becomes `websearch` bash command
+//!     .tool(WebFetchTool::new())       // Becomes `webfetch` bash command
+//!     .tool(TaskTool::new(llm))        // Becomes `task` bash command
 //!     .build();
 //! ```
 
 use std::borrow::Cow;
 
+use aither_core::LanguageModel;
 use aither_core::llm::Tool;
 use aither_core::llm::tool::ToolDefinition;
-use aither_core::LanguageModel;
+use async_fs as fs;
 use askama::Template;
 use executor_core::Executor;
 use schemars::JsonSchema;
@@ -43,7 +44,11 @@ use serde::de::DeserializeOwned;
 
 use crate::hook::Hook;
 use crate::{Agent, AgentBuilder};
-use aither_sandbox::{configure_tool, BashTool, PermissionHandler};
+use aither_sandbox::{
+    BashTool, BashToolFactory, BashToolFactoryReceiver, PermissionHandler, ToolRegistryBuilder,
+    Unconfigured, bash_tool_factory_channel,
+};
+use aither_sandbox::builtin::{StopTool, TasksTool};
 
 /// System prompt template for bash-centric agents.
 #[derive(Template)]
@@ -93,10 +98,28 @@ where
     E: Executor + Clone + 'static,
 {
     inner: AgentBuilder<LLM, LLM, LLM, H>,
-    bash_tool: BashTool<P, E>,
+    bash_tool: BashTool<P, E, Unconfigured>,
+    registry_builder: ToolRegistryBuilder,
+    bash_tool_factory: BashToolFactory,
+    bash_tool_factory_receiver: Option<BashToolFactoryReceiver>,
     tool_descriptions: Vec<(String, String)>,
     skills: Vec<SkillInfo>,
     subagents: Vec<SubagentInfo>,
+}
+
+impl<LLM, P, E, H> std::fmt::Debug for BashAgentBuilder<LLM, P, E, H>
+where
+    LLM: LanguageModel + Clone,
+    P: PermissionHandler + 'static,
+    E: Executor + Clone + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BashAgentBuilder")
+            .field("tool_count", &self.tool_descriptions.len())
+            .field("skill_count", &self.skills.len())
+            .field("subagent_count", &self.subagents.len())
+            .finish()
+    }
 }
 
 impl<LLM, P, E> BashAgentBuilder<LLM, P, E, ()>
@@ -108,20 +131,37 @@ where
     /// Creates a new bash-centric agent builder.
     ///
     /// The bash tool is the only direct tool available to the LLM.
-    /// Use `.ipc_tool()` to register tools as bash commands.
-    pub fn new(llm: LLM, bash_tool: BashTool<P, E>) -> Self {
-        // Set up bash tool factory for subagents
-        {
-            let bash_for_factory = bash_tool.clone();
-            aither_sandbox::set_bash_tool_factory(move || {
-                bash_for_factory.child().to_dyn()
-            });
-        }
+    /// Use `.tool()` to register tools as bash commands.
+    pub fn new(llm: LLM, bash_tool: BashTool<P, E, Unconfigured>) -> Self {
+        let (bash_tool_factory, bash_tool_factory_receiver) = bash_tool_factory_channel();
+        let mut registry_builder = ToolRegistryBuilder::new();
+        let mut tool_descriptions = Vec::new();
+
+        let job_registry = bash_tool.job_registry();
+        let tasks_tool = TasksTool::new(job_registry.clone());
+        let stop_tool = StopTool::new(job_registry);
+
+        let tasks_def = ToolDefinition::new(&tasks_tool);
+        tool_descriptions.push((
+            tasks_def.name().to_string(),
+            short_description(tasks_def.description()),
+        ));
+        registry_builder.configure_tool(tasks_tool);
+
+        let stop_def = ToolDefinition::new(&stop_tool);
+        tool_descriptions.push((
+            stop_def.name().to_string(),
+            short_description(stop_def.description()),
+        ));
+        registry_builder.configure_tool(stop_tool);
 
         Self {
             inner: AgentBuilder::new(llm),
             bash_tool,
-            tool_descriptions: Vec::new(),
+            registry_builder,
+            bash_tool_factory,
+            bash_tool_factory_receiver: Some(bash_tool_factory_receiver),
+            tool_descriptions,
             skills: Vec::new(),
             subagents: Vec::new(),
         }
@@ -143,10 +183,10 @@ where
     /// # Example
     ///
     /// ```rust,ignore
-    /// builder.ipc_tool(WebSearchTool::default())
+    /// builder.tool(WebSearchTool::default())
     /// // LLM can now call: bash -c 'websearch "rust async"'
     /// ```
-    pub fn ipc_tool<T>(mut self, tool: T) -> Self
+    pub fn tool<T>(mut self, tool: T) -> Self
     where
         T: Tool + Send + Sync + 'static,
         T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
@@ -155,52 +195,35 @@ where
         // Extract description from schema (rustdoc on Args struct)
         let def = ToolDefinition::new(&tool);
         let description = def.description();
-        // Truncate description to first sentence
-        let short_desc = description
-            .split('.')
-            .next()
-            .unwrap_or(description)
-            .trim()
-            .to_string();
-
-        self.tool_descriptions.push((name, short_desc));
-        configure_tool(tool);
+        self.tool_descriptions
+            .push((name, short_description(description)));
+        self.registry_builder.configure_tool(tool);
         self
     }
 
     /// Registers a tool with a custom description.
-    pub fn ipc_tool_with_desc<T>(mut self, tool: T, description: impl Into<String>) -> Self
+    pub fn tool_with_desc<T>(mut self, tool: T, description: impl Into<String>) -> Self
     where
         T: Tool + Send + Sync + 'static,
         T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
     {
         let name = tool.name().to_string();
         self.tool_descriptions.push((name, description.into()));
-        configure_tool(tool);
+        self.registry_builder.configure_tool(tool);
         self
     }
 
     /// Adds a pre-configured tool description (for tools registered elsewhere).
     ///
-    /// Use this when the tool was already registered via `configure_tool()`
-    /// or `configure_raw_handler()`.
-    pub fn tool_description(mut self, name: impl Into<String>, description: impl Into<String>) -> Self {
-        self.tool_descriptions.push((name.into(), description.into()));
+    /// Use this when the tool was already registered on the registry builder.
+    pub fn tool_description(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        self.tool_descriptions
+            .push((name.into(), description.into()));
         self
-    }
-
-    /// Registers the `ask` command with a fast LLM for processing piped content.
-    ///
-    /// The ask command allows LLM to query a fast model about large outputs:
-    /// ```bash
-    /// cat large_output.txt | ask "summarize the key points"
-    /// ```
-    pub fn with_ask<FastLLM>(self, fast_llm: FastLLM) -> Self
-    where
-        FastLLM: LanguageModel + Send + Sync + 'static,
-    {
-        let ask_cmd = aither_sandbox::builtin::AskCommand::new(fast_llm);
-        self.ipc_tool_with_desc(ask_cmd, "Query fast LLM about piped content")
     }
 
     /// Sets a custom system prompt (raw string, no template processing).
@@ -214,7 +237,8 @@ where
     /// This should be called after all tools are registered.
     pub fn with_default_prompt(mut self) -> Self {
         // Build tools description
-        let tools = self.tool_descriptions
+        let tools = self
+            .tool_descriptions
             .iter()
             .map(|(name, desc)| format!("- {name}: {desc}"))
             .collect::<Vec<_>>()
@@ -222,7 +246,8 @@ where
 
         // Build skills description
         let has_skills = !self.skills.is_empty();
-        let skills = self.skills
+        let skills = self
+            .skills
             .iter()
             .map(|s| format!("- {}: {}", s.name, s.description))
             .collect::<Vec<_>>()
@@ -230,7 +255,8 @@ where
 
         // Build subagents description
         let has_subagents = !self.subagents.is_empty();
-        let subagents = self.subagents
+        let subagents = self
+            .subagents
             .iter()
             .map(|s| format!("- {} ({}): {}", s.name, s.path, s.description))
             .collect::<Vec<_>>()
@@ -261,7 +287,9 @@ where
             is_macos,
         };
 
-        let prompt = template.render().expect("failed to render system prompt template");
+        let prompt = template
+            .render()
+            .expect("failed to render system prompt template");
         self.inner = self.inner.system_prompt(prompt);
         self
     }
@@ -271,6 +299,9 @@ where
         BashAgentBuilder {
             inner: self.inner.hook(hook),
             bash_tool: self.bash_tool,
+            registry_builder: self.registry_builder,
+            bash_tool_factory: self.bash_tool_factory,
+            bash_tool_factory_receiver: self.bash_tool_factory_receiver,
             tool_descriptions: self.tool_descriptions,
             skills: self.skills,
             subagents: self.subagents,
@@ -321,6 +352,48 @@ where
         let symlink_path = self.bash_tool.working_dir().join(".skills");
         if let Ok(abs_path) = path.canonicalize() {
             let _ = std::os::unix::fs::symlink(&abs_path, &symlink_path);
+        }
+
+        self
+    }
+
+    /// Loads skills from a filesystem path asynchronously.
+    #[cfg(feature = "skills")]
+    pub async fn with_skills_async(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        use aither_skills::SkillLoader;
+
+        let path = path.as_ref().to_path_buf();
+        if !path_exists(&path).await {
+            return self;
+        }
+
+        let loader = SkillLoader::new().add_path(&path);
+        match loader.load_all_async().await {
+            Ok(skills) => {
+                tracing::info!(count = skills.len(), path = %path.display(), "Loaded skills");
+                for skill in skills {
+                    tracing::debug!(name = %skill.name, "Loaded skill");
+                    self.skills.push(SkillInfo {
+                        name: skill.name,
+                        description: skill.description,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "Failed to load skills");
+            }
+        }
+
+        let symlink_path = self.bash_tool.working_dir().join(".skills");
+        if let Ok(abs_path) = fs::canonicalize(&path).await {
+            #[cfg(unix)]
+            {
+                let _ = fs::unix::symlink(&abs_path, &symlink_path).await;
+            }
+            #[cfg(windows)]
+            {
+                let _ = fs::windows::symlink_dir(&abs_path, &symlink_path).await;
+            }
         }
 
         self
@@ -378,6 +451,41 @@ where
         self
     }
 
+    /// Sets up the subagents directory and creates a symlink in the sandbox asynchronously.
+    pub async fn with_subagents_async(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        use crate::subagent_file::SubagentDefinition;
+
+        let path = path.as_ref();
+        if !path_exists(path).await {
+            return self;
+        }
+
+        if let Ok(defs) = SubagentDefinition::load_from_dir_async(path).await {
+            for def in defs {
+                let filename = format!("{}.md", def.id);
+                self.subagents.push(SubagentInfo {
+                    name: def.id,
+                    description: def.description,
+                    path: filename,
+                });
+            }
+        }
+
+        let symlink_path = self.bash_tool.working_dir().join(".subagents");
+        if let Ok(abs_path) = fs::canonicalize(path).await {
+            #[cfg(unix)]
+            {
+                let _ = fs::unix::symlink(&abs_path, &symlink_path).await;
+            }
+            #[cfg(windows)]
+            {
+                let _ = fs::windows::symlink_dir(&abs_path, &symlink_path).await;
+            }
+        }
+
+        self
+    }
+
     /// Sets the maximum number of iterations.
     pub fn max_iterations(mut self, limit: usize) -> Self {
         self.inner = self.inner.max_iterations(limit);
@@ -391,6 +499,17 @@ where
         &self.tool_descriptions
     }
 
+    /// Returns a factory for spawning child bash tools (for subagents).
+    #[must_use]
+    pub fn bash_tool_factory(&self) -> BashToolFactory {
+        self.bash_tool_factory.clone()
+    }
+
+    /// Returns a mutable reference to the tool registry builder.
+    pub fn tool_registry_mut(&mut self) -> &mut ToolRegistryBuilder {
+        &mut self.registry_builder
+    }
+
     /// Returns the sandbox working directory path.
     pub fn sandbox_dir(&self) -> Cow<'_, str> {
         self.bash_tool.working_dir().to_string_lossy()
@@ -401,7 +520,41 @@ where
     /// The returned agent only has the `bash` tool.
     /// All registered IPC tools are accessible as bash commands.
     pub fn build(self) -> Agent<LLM, LLM, LLM, H> {
-        self.inner.bash(self.bash_tool).build()
+        // Build registry
+        let registry = std::sync::Arc::new(self.registry_builder.build(self.bash_tool.outputs_dir()));
+
+        // Configure bash tool
+        let bash_tool = self.bash_tool.with_registry(registry);
+
+        // Start factory service for subagents if requested
+        if let Some(receiver) = self.bash_tool_factory_receiver {
+            bash_tool.start_factory_service(receiver);
+        }
+
+        self.inner.bash(bash_tool).build()
+    }
+}
+
+fn short_description(description: &str) -> String {
+    description
+        .split('.')
+        .next()
+        .unwrap_or(description)
+        .trim()
+        .to_string()
+}
+
+async fn path_exists(path: &std::path::Path) -> bool {
+    match fs::metadata(path).await {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            panic!(
+                "failed to access path {}: {}",
+                path.display(),
+                err
+            );
+        }
     }
 }
 

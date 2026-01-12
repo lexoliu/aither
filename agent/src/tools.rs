@@ -14,7 +14,7 @@ use crate::config::{SearchStrategy, ToolSearchConfig};
 use crate::search::search_tools;
 
 #[cfg(feature = "mcp")]
-use aither_mcp::McpConnection;
+use aither_mcp::{McpConnection, McpToolService};
 
 /// Enhanced tools registry with deferred loading support.
 ///
@@ -38,9 +38,8 @@ pub struct AgentTools {
     config: ToolSearchConfig,
 
     /// MCP connections (when mcp feature is enabled).
-    /// Wrapped in Mutex to allow parallel tool calls.
     #[cfg(feature = "mcp")]
-    mcp: Vec<parking_lot::Mutex<McpConnection>>,
+    mcp: Vec<McpToolService>,
 }
 
 impl Default for AgentTools {
@@ -186,7 +185,7 @@ impl AgentTools {
 
         #[cfg(feature = "mcp")]
         for conn in &self.mcp {
-            defs.extend(conn.lock().definitions());
+            defs.extend(conn.definitions());
         }
 
         defs
@@ -259,13 +258,11 @@ impl AgentTools {
         // Try MCP tools
         #[cfg(feature = "mcp")]
         for conn in &self.mcp {
-            let has_tool = conn.lock().has_tool(name);
-            if has_tool {
+            if conn.has_tool(name) {
                 let args_value: serde_json::Value =
                     serde_json::from_str(args).map_err(|e| anyhow::anyhow!("Invalid JSON: {e}"))?;
 
                 let result = conn
-                    .lock()
                     .call(name, args_value)
                     .await
                     .map_err(|e| anyhow::anyhow!("MCP tool error: {e}"))?;
@@ -308,7 +305,7 @@ impl AgentTools {
     /// All tools from the MCP server will be available for the agent to use.
     #[cfg(feature = "mcp")]
     pub fn register_mcp(&mut self, conn: McpConnection) {
-        self.mcp.push(parking_lot::Mutex::new(conn));
+        self.mcp.push(McpToolService::new(conn));
     }
 
     /// Returns the number of registered MCP connections.
@@ -324,7 +321,7 @@ impl AgentTools {
     pub fn mcp_definitions(&self) -> Vec<ToolDefinition> {
         self.mcp
             .iter()
-            .flat_map(|c| c.lock().definitions())
+            .flat_map(|c| c.definitions())
             .collect()
     }
 

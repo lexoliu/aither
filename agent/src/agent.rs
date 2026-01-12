@@ -6,6 +6,7 @@
 
 use std::time::{Duration, Instant};
 
+use async_fs as fs;
 use aither_core::{
     LanguageModel,
     llm::{Event, LLMRequest, Message, model::Profile as ModelProfile},
@@ -27,7 +28,7 @@ use crate::{
 };
 
 use aither_sandbox::{BackgroundTaskReceiver, OutputStore};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
@@ -139,7 +140,7 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     pub(crate) todo_list: Option<TodoList>,
 
     /// Output store for lazy URL allocation during compression.
-    pub(crate) output_store: Option<Arc<RwLock<OutputStore>>>,
+    pub(crate) output_store: Option<Arc<OutputStore>>,
 
     /// Receiver for completed background bash tasks.
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
@@ -833,21 +834,17 @@ where
         let mut content_to_url: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
-        {
-            let store = output_store.read().map_err(|_| AgentError::Llm("output store lock poisoned".to_string()))?;
-
-            for msg in to_compress {
-                // Only allocate URLs for large tool results
-                if msg.role() == aither_core::llm::Role::Tool
-                    && msg.content().len() >= Self::MIN_CONTENT_FOR_URL
-                {
-                    let content = msg.content().to_string();
-                    // Avoid duplicate allocations for same content
-                    if !content_to_url.contains_key(&content) {
-                        let url = store.allocate_text_url();
-                        content_to_url.insert(content.clone(), url.clone());
-                        pending_urls.push(ContentWithUrl { content, url });
-                    }
+        for msg in to_compress {
+            // Only allocate URLs for large tool results
+            if msg.role() == aither_core::llm::Role::Tool
+                && msg.content().len() >= Self::MIN_CONTENT_FOR_URL
+            {
+                let content = msg.content().to_string();
+                // Avoid duplicate allocations for same content
+                if !content_to_url.contains_key(&content) {
+                    let url = output_store.allocate_text_url();
+                    content_to_url.insert(content.clone(), url.clone());
+                    pending_urls.push(ContentWithUrl { content, url });
                 }
             }
         }
@@ -868,16 +865,13 @@ where
 
         if !files_to_write.is_empty() {
             // Get the output directory while holding the lock briefly
-            let output_dir = {
-                let store = output_store.read().map_err(|_| AgentError::Llm("output store lock poisoned".to_string()))?;
-                store.dir().to_path_buf()
-            };
+            let output_dir = output_store.dir().to_path_buf();
 
             // Write files without holding the lock
             for (url, content) in files_to_write {
                 let filename = url.strip_prefix("outputs/").unwrap_or(&url);
                 let filepath = output_dir.join(filename);
-                if let Err(e) = tokio::fs::write(&filepath, content.as_bytes()).await {
+                if let Err(e) = fs::write(&filepath, content.as_bytes()).await {
                     tracing::warn!(url = %url, error = %e, "failed to write referenced URL");
                 } else {
                     tracing::debug!(url = %url, "wrote referenced URL");
