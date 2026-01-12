@@ -45,6 +45,9 @@ mod stream;
 mod subagent_file;
 mod todo;
 mod tools;
+pub mod ask_user;
+pub mod tool_request;
+pub mod workspace_request;
 
 // Specialized agents
 pub mod specialized;

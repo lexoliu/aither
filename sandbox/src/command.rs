@@ -861,6 +861,11 @@ fn get_variant_name(schema: &Value, tag: &str) -> Option<String> {
 
 /// Returns true if args contain -h/--help before "--".
 fn has_help_flag(args: &[String]) -> bool {
+    let args = if args.first().map(|s| s.as_str()) == Some("--") {
+        &args[1..]
+    } else {
+        args
+    };
     let mut end_of_options = false;
     for arg in args {
         if end_of_options {
@@ -927,6 +932,11 @@ fn find_similar_option<'a>(input: &str, options: impl Iterator<Item = &'a str>) 
 
 /// Parses an object schema from CLI arguments.
 fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
+    let args = if args.first().map(|s| s.as_str()) == Some("--") {
+        &args[1..]
+    } else {
+        args
+    };
     let mut result: HashMap<String, Value> = HashMap::new();
     let mut positional_idx = 0;
 
