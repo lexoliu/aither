@@ -269,14 +269,14 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, ClaudeError> {
             .map_err(|e| ClaudeError::Http(e))?;
     } else {
         req = req
-            .header(header::AUTHORIZATION.as_str(), format!("Bearer {}", cfg.api_key))
+            .header(
+                header::AUTHORIZATION.as_str(),
+                format!("Bearer {}", cfg.api_key),
+            )
             .map_err(|e| ClaudeError::Http(e))?;
     }
 
-    let response: ModelsResponse = req
-        .json()
-        .await
-        .map_err(|e| ClaudeError::Http(e))?;
+    let response: ModelsResponse = req.json().await.map_err(|e| ClaudeError::Http(e))?;
 
     for model in response.data {
         if model.id == cfg.model {

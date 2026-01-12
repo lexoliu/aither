@@ -3,8 +3,8 @@
 //! This transport uses HTTP POST for sending requests to the server,
 //! with support for MCP session management via `Mcp-Session-Id` header.
 
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use tracing::debug;
 use zenwave::{Client, ResponseExt, client, header};
@@ -165,9 +165,7 @@ impl Transport for HttpTransport {
         }
 
         // Notifications may return empty body, so we ignore parse errors
-        let _ = builder
-            .json_body(&notif)
-            .map(|b| async { b.await });
+        let _ = builder.json_body(&notif).map(|b| async { b.await });
 
         Ok(())
     }

@@ -19,11 +19,31 @@ mod tests {
 
         // Navigate to status field
         let schema_obj = schema.as_object().expect("schema should be object");
-        let properties = schema_obj.get("properties").expect("should have properties").as_object().unwrap();
-        let todos = properties.get("todos").expect("should have todos").as_object().unwrap();
-        let items = todos.get("items").expect("todos should have items").as_object().unwrap();
-        let item_props = items.get("properties").expect("item should have properties").as_object().unwrap();
-        let status = item_props.get("status").expect("should have status").as_object().unwrap();
+        let properties = schema_obj
+            .get("properties")
+            .expect("should have properties")
+            .as_object()
+            .unwrap();
+        let todos = properties
+            .get("todos")
+            .expect("should have todos")
+            .as_object()
+            .unwrap();
+        let items = todos
+            .get("items")
+            .expect("todos should have items")
+            .as_object()
+            .unwrap();
+        let item_props = items
+            .get("properties")
+            .expect("item should have properties")
+            .as_object()
+            .unwrap();
+        let status = item_props
+            .get("status")
+            .expect("should have status")
+            .as_object()
+            .unwrap();
 
         // Status should have enum
         assert!(
@@ -112,9 +132,18 @@ impl TodoList {
             return String::new();
         }
 
-        let completed = items.iter().filter(|i| i.status == TodoStatus::Completed).count();
-        let in_progress = items.iter().filter(|i| i.status == TodoStatus::InProgress).count();
-        let pending = items.iter().filter(|i| i.status == TodoStatus::Pending).count();
+        let completed = items
+            .iter()
+            .filter(|i| i.status == TodoStatus::Completed)
+            .count();
+        let in_progress = items
+            .iter()
+            .filter(|i| i.status == TodoStatus::InProgress)
+            .count();
+        let pending = items
+            .iter()
+            .filter(|i| i.status == TodoStatus::Pending)
+            .count();
         let total = items.len();
 
         let mut summary = format!("Progress: {completed}/{total} completed");

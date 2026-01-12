@@ -8,9 +8,7 @@ use crate::{
         ResponsesRequest, ResponsesTool, ToolPayload, convert_responses_tools, convert_tools,
         responses_tool_choice, to_chat_messages, to_responses_input,
     },
-    response::{
-        ChatCompletionChunk, ResponsesOutputItem, ResponsesStreamEvent, should_skip_event,
-    },
+    response::{ChatCompletionChunk, ResponsesOutputItem, ResponsesStreamEvent, should_skip_event},
 };
 use aither_core::{
     LanguageModel,
@@ -61,8 +59,8 @@ impl RetryConfig {
 
     /// Calculate delay for a given attempt number (0-indexed).
     fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let delay_ms = self.initial_delay.as_millis() as f64
-            * self.backoff_multiplier.powi(attempt as i32);
+        let delay_ms =
+            self.initial_delay.as_millis() as f64 * self.backoff_multiplier.powi(attempt as i32);
         let delay = Duration::from_millis(delay_ms as u64);
         delay.min(self.max_delay)
     }
@@ -93,7 +91,11 @@ fn is_retryable_error(err: &OpenAIError) -> bool {
 
 /// Get retry delay for an error, respecting Retry-After header for rate limits.
 fn get_retry_delay(err: &OpenAIError, attempt: u32, config: &RetryConfig) -> Duration {
-    if let OpenAIError::RateLimit { retry_after: Some(delay), .. } = err {
+    if let OpenAIError::RateLimit {
+        retry_after: Some(delay),
+        ..
+    } = err
+    {
         // Respect Retry-After header, but cap at max_delay
         return (*delay).min(config.max_delay);
     }
@@ -113,15 +115,13 @@ async fn sleep(duration: Duration) {
 }
 
 /// Result of attempting to establish an SSE stream.
-type SseStreamResult = Result<Vec<Result<zenwave::sse::Event, zenwave::sse::ParseError>>, OpenAIError>;
+type SseStreamResult =
+    Result<Vec<Result<zenwave::sse::Event, zenwave::sse::ParseError>>, OpenAIError>;
 
 /// Attempt to make an SSE request with retry logic.
 ///
 /// Returns the collected SSE events on success, or the last error on failure.
-async fn sse_request_with_retry<F, Fut>(
-    cfg: &Config,
-    make_request: F,
-) -> SseStreamResult
+async fn sse_request_with_retry<F, Fut>(cfg: &Config, make_request: F) -> SseStreamResult
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = SseStreamResult>,
@@ -406,7 +406,10 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, OpenAIError> {
     let response: ModelsListResponse = backend
         .get(&url)
         .map_err(|e| OpenAIError::Http(e))?
-        .header(header::AUTHORIZATION.as_str(), format!("Bearer {}", cfg.api_key))
+        .header(
+            header::AUTHORIZATION.as_str(),
+            format!("Bearer {}", cfg.api_key),
+        )
         .map_err(|e| OpenAIError::Http(e))?
         .json()
         .await
@@ -418,7 +421,11 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, OpenAIError> {
         if model.id == cfg.chat_model {
             model_found = true;
             if let Some(ctx) = model.context_length.or(model.max_tokens) {
-                tracing::debug!("Fetched context_length={} for model '{}'", ctx, cfg.chat_model);
+                tracing::debug!(
+                    "Fetched context_length={} for model '{}'",
+                    ctx,
+                    cfg.chat_model
+                );
                 return Ok(ctx);
             }
         }
@@ -477,7 +484,9 @@ async fn chat_completions_request(
     let mut builder = build_result.map_err(OpenAIError::Http)?;
 
     if let Some(org) = &cfg.organization {
-        builder = builder.header("OpenAI-Organization", org.clone()).map_err(OpenAIError::Http)?;
+        builder = builder
+            .header("OpenAI-Organization", org.clone())
+            .map_err(OpenAIError::Http)?;
     }
 
     let sse_stream = match builder
@@ -656,10 +665,7 @@ struct FunctionCallAccumulator {
 }
 
 /// Make a responses API SSE request (single attempt).
-async fn responses_request(
-    cfg: &Config,
-    request: &ResponsesRequest,
-) -> SseStreamResult {
+async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStreamResult {
     let endpoint = cfg.request_url("/responses");
     let mut backend = client();
 
@@ -672,7 +678,9 @@ async fn responses_request(
     let mut builder = build_result.map_err(OpenAIError::Http)?;
 
     if let Some(org) = &cfg.organization {
-        builder = builder.header("OpenAI-Organization", org.clone()).map_err(OpenAIError::Http)?;
+        builder = builder
+            .header("OpenAI-Organization", org.clone())
+            .map_err(OpenAIError::Http)?;
     }
 
     let sse_stream = match builder

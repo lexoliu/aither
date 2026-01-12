@@ -10,9 +10,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use async_fs as fs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
-use async_fs as fs;
 use tracing::debug;
 
 /// Expected output format for bash execution.
@@ -260,7 +260,11 @@ impl OutputStore {
         let id = format!("output_{}", self.next_id);
         self.next_id += 1;
 
-        let format = if format == OutputFormat::Auto { detect_format(data) } else { format };
+        let format = if format == OutputFormat::Auto {
+            detect_format(data)
+        } else {
+            format
+        };
         let output_ref = OutputRef {
             entry: entry.clone(),
             format,
@@ -321,9 +325,7 @@ impl OutputStore {
         }
 
         match format {
-            OutputFormat::Text | OutputFormat::Auto => {
-                save_text_output(dir, data, format).await
-            }
+            OutputFormat::Text | OutputFormat::Auto => save_text_output(dir, data, format).await,
             OutputFormat::Image => {
                 // Small images inline as base64
                 if data.len() <= limit.unwrap_or(INLINE_OUTPUT_LIMIT) {
@@ -351,7 +353,11 @@ impl OutputStore {
     /// Returns an error if file creation fails.
     pub async fn offload(&mut self, entry: &OutputEntry) -> std::io::Result<OutputEntry> {
         match entry {
-            OutputEntry::Loaded { content, raw, format } => {
+            OutputEntry::Loaded {
+                content,
+                raw,
+                format,
+            } => {
                 let (url, _) = create_file(&self.dir, raw, *format).await?;
                 Ok(OutputEntry::Stored {
                     url,
@@ -436,10 +442,7 @@ impl OutputStore {
     ///
     /// Returns an error if the file cannot be written.
     pub async fn write_pending(&self, pending: &PendingUrl) -> std::io::Result<PathBuf> {
-        let filename = pending
-            .url
-            .strip_prefix("outputs/")
-            .unwrap_or(&pending.url);
+        let filename = pending.url.strip_prefix("outputs/").unwrap_or(&pending.url);
         let filepath = self.dir.join(filename);
         fs::write(&filepath, &pending.raw).await?;
         debug!(url = %pending.url, size = pending.raw.len(), "wrote pending output");
@@ -499,7 +502,12 @@ async fn save_text_output(
         let (url, _) = create_file(dir, data, format).await?;
         let line_count = text.lines().count();
         let content = Content::Text {
-            text: format!("Output saved to {} ({} lines, {} bytes)", url, line_count, data.len()),
+            text: format!(
+                "Output saved to {} ({} lines, {} bytes)",
+                url,
+                line_count,
+                data.len()
+            ),
             truncated: true,
         };
         Ok(OutputEntry::Stored {
@@ -524,7 +532,12 @@ async fn save_large_output(
             let text = String::from_utf8_lossy(data);
             let line_count = text.lines().count();
             Some(Content::Text {
-                text: format!("Output saved to {} ({} lines, {} bytes)", url, line_count, data.len()),
+                text: format!(
+                    "Output saved to {} ({} lines, {} bytes)",
+                    url,
+                    line_count,
+                    data.len()
+                ),
                 truncated: true,
             })
         }
@@ -535,7 +548,11 @@ async fn save_large_output(
 }
 
 /// Creates a file with a four-random-words name.
-async fn create_file(dir: &Path, data: &[u8], format: OutputFormat) -> std::io::Result<(String, PathBuf)> {
+async fn create_file(
+    dir: &Path,
+    data: &[u8],
+    format: OutputFormat,
+) -> std::io::Result<(String, PathBuf)> {
     let ext = format_extension(format);
     let name = generate_word_filename();
     let filename = format!("{name}.{ext}");
@@ -549,73 +566,8 @@ async fn create_file(dir: &Path, data: &[u8], format: OutputFormat) -> std::io::
 }
 
 /// Generates a filename using four random words.
-fn generate_word_filename() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Simple word list - common adjectives and nouns
-    const ADJECTIVES: &[&str] = &[
-        "amber", "azure", "bold", "brave", "bright", "calm", "clear", "cool",
-        "coral", "crisp", "dark", "deep", "dry", "dusk", "fair", "fast",
-        "fine", "firm", "free", "fresh", "frost", "glad", "gold", "good",
-        "gray", "green", "happy", "hard", "high", "jade", "keen", "kind",
-        "late", "lean", "light", "live", "long", "loud", "mild", "neat",
-        "new", "next", "nice", "old", "open", "pale", "pink", "plain",
-        "proud", "pure", "quick", "quiet", "rare", "red", "rich", "ripe",
-        "rough", "ruby", "safe", "sage", "sharp", "short", "shy", "silk",
-        "slim", "slow", "small", "smart", "smooth", "snow", "soft", "solid",
-        "stark", "still", "stone", "strong", "sweet", "swift", "tall", "teal",
-        "thick", "thin", "tight", "warm", "west", "white", "wide", "wild",
-        "wise", "young", "zero",
-    ];
-
-    const NOUNS: &[&str] = &[
-        "acorn", "arch", "aria", "ash", "aurora", "bay", "beam", "bear",
-        "bell", "bird", "blade", "bloom", "bolt", "book", "bowl", "breeze",
-        "brook", "bud", "cape", "cave", "chill", "cliff", "cloud", "coast",
-        "comet", "coral", "cove", "crane", "creek", "crest", "crow", "dawn",
-        "deer", "delta", "dew", "dove", "dream", "drift", "dune", "dust",
-        "eagle", "earth", "echo", "edge", "elm", "ember", "fawn", "fern",
-        "field", "finch", "fire", "flame", "flash", "flight", "flint", "flood",
-        "flow", "foam", "fog", "forge", "frost", "gate", "gaze", "glade",
-        "gleam", "glen", "glow", "gorge", "grain", "grass", "grove", "gust",
-        "hail", "harbor", "hawk", "haze", "heath", "helm", "hill", "hollow",
-        "hope", "horn", "hush", "ice", "inlet", "isle", "ivy", "jade",
-        "jay", "jet", "lake", "lark", "leaf", "light", "lily", "lion",
-        "marsh", "mead", "mist", "moon", "moss", "moth", "mount", "muse",
-        "nest", "night", "north", "oak", "oasis", "ocean", "orchid", "owl",
-        "palm", "pass", "path", "peak", "pearl", "petal", "pine", "plain",
-        "plum", "pond", "pool", "rain", "rapids", "raven", "ray", "reef",
-        "ridge", "ring", "rise", "river", "road", "rock", "root", "rose",
-        "sage", "sand", "sea", "seed", "shade", "shadow", "shell", "shore",
-        "silk", "sky", "slate", "slope", "snow", "song", "south", "spark",
-        "spire", "spray", "spring", "spruce", "star", "steam", "steel", "stem",
-        "stone", "storm", "strait", "stream", "sun", "surf", "swan", "swift",
-        "thorn", "thyme", "tide", "trail", "tree", "vale", "valley", "vapor",
-        "vine", "vista", "void", "wave", "well", "wheat", "willow", "wind",
-        "wing", "winter", "wolf", "wood", "wren", "yarn", "yew", "zen",
-    ];
-
-    // Use time-based seed + counter for randomness without external deps
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0) as u64;
-
-    // Simple xorshift for pseudo-random selection
-    let mut rng = seed;
-    let mut next = || {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        rng
-    };
-
-    let w1 = ADJECTIVES[(next() as usize) % ADJECTIVES.len()];
-    let w2 = NOUNS[(next() as usize) % NOUNS.len()];
-    let w3 = ADJECTIVES[(next() as usize) % ADJECTIVES.len()];
-    let w4 = NOUNS[(next() as usize) % NOUNS.len()];
-
-    format!("{w1}-{w2}-{w3}-{w4}")
+pub fn generate_word_filename() -> String {
+    crate::naming::random_word_slug(4)
 }
 
 /// Detects the output format from content.
@@ -644,9 +596,9 @@ fn detect_format(data: &[u8]) -> OutputFormat {
 
     // Check if it's printable UTF-8 text (no null bytes or control chars except newline/tab)
     if let Ok(text) = std::str::from_utf8(data) {
-        let is_text = text.chars().all(|c| {
-            c == '\n' || c == '\r' || c == '\t' || (c >= ' ' && c != '\x7f')
-        });
+        let is_text = text
+            .chars()
+            .all(|c| c == '\n' || c == '\r' || c == '\t' || (c >= ' ' && c != '\x7f'));
         if is_text {
             return OutputFormat::Text;
         }
@@ -702,7 +654,10 @@ mod tests {
         assert_eq!(detect_format(b"Hello, world!"), OutputFormat::Text);
 
         // Binary with null bytes
-        assert_eq!(detect_format(&[0x00, 0x01, 0x02, 0x03]), OutputFormat::Binary);
+        assert_eq!(
+            detect_format(&[0x00, 0x01, 0x02, 0x03]),
+            OutputFormat::Binary
+        );
     }
 
     #[test]

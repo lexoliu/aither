@@ -88,7 +88,8 @@ impl Tool for EchoTool {
     fn call(
         &self,
         arguments: Self::Arguments,
-    ) -> impl core::future::Future<Output = aither_core::Result<aither_core::llm::ToolOutput>> + Send {
+    ) -> impl core::future::Future<Output = aither_core::Result<aither_core::llm::ToolOutput>> + Send
+    {
         let text = arguments.text;
         async move { Ok(aither_core::llm::ToolOutput::text(format!("echo: {text}"))) }
     }
@@ -116,7 +117,10 @@ async fn tool_call(gemini: &Gemini) -> Result<()> {
         match event? {
             Event::Text(text) => final_text.push_str(&text),
             Event::ToolCall(call) => {
-                println!("Tool call received: {} with args {}", call.name, call.arguments);
+                println!(
+                    "Tool call received: {} with args {}",
+                    call.name, call.arguments
+                );
             }
             _ => {}
         }

@@ -70,7 +70,8 @@ impl<M> BudgetedModel<M> {
     /// Records usage from a response.
     pub fn record_usage(&self, usage: &Usage) {
         if let Some(tokens) = usage.total_tokens {
-            self.tokens_used.fetch_add(u64::from(tokens), Ordering::Relaxed);
+            self.tokens_used
+                .fetch_add(u64::from(tokens), Ordering::Relaxed);
         }
         if let Some(cost) = usage.cost_usd {
             // Convert to microdollars

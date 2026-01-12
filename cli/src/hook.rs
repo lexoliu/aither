@@ -2,7 +2,9 @@
 //!
 //! Provides logging and human-friendly bash output display.
 
-use aither_agent::{Hook, PostToolAction, PreToolAction, StopContext, ToolResultContext, ToolUseContext};
+use aither_agent::{
+    Hook, PostToolAction, PreToolAction, StopContext, ToolResultContext, ToolUseContext,
+};
 
 /// A debug hook that logs tool calls with human-friendly bash output.
 #[derive(Debug, Clone, Copy, Default)]
@@ -18,8 +20,9 @@ impl Hook for DebugHook {
                     Some("network") => "\x1b[33m⚡\x1b[0m ",
                     _ => "",
                 };
-                // Show command with $ prefix like a terminal
-                println!("\x1b[32m{mode_indicator}$\x1b[0m {}", truncate_command(&script, 120));
+                // Show command with $ prefix like a terminal (no truncation)
+                let display_script = script.trim().replace('\n', "; ");
+                println!("\x1b[32m{mode_indicator}$\x1b[0m {display_script}");
             }
         } else {
             // Non-bash tools (shouldn't happen in bash-first architecture)
@@ -108,7 +111,10 @@ impl Hook for DebugHook {
 fn parse_bash_args(arguments: &str) -> Option<(String, Option<String>)> {
     let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
     let script = parsed.get("script")?.as_str()?.to_string();
-    let mode = parsed.get("mode").and_then(|v| v.as_str()).map(String::from);
+    let mode = parsed
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     Some((script, mode))
 }
 
@@ -143,9 +149,18 @@ fn parse_bash_result(result: &str) -> Option<BashOutput> {
         _ => None,
     };
 
-    let exit_code = parsed.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let task_id = parsed.get("task_id").and_then(|v| v.as_str()).map(String::from);
-    let status = parsed.get("status").and_then(|v| v.as_str()).map(String::from);
+    let exit_code = parsed
+        .get("exit_code")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let task_id = parsed
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let status = parsed
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     Some(BashOutput {
         stdout,
@@ -186,7 +201,10 @@ fn print_bash_output(output: &BashOutput, duration_ms: u128) {
             println!("  {line}");
         }
         if lines.len() > max_lines {
-            println!("  \x1b[90m... ({} more lines)\x1b[0m", lines.len() - max_lines);
+            println!(
+                "  \x1b[90m... ({} more lines)\x1b[0m",
+                lines.len() - max_lines
+            );
         }
     }
 
@@ -197,18 +215,6 @@ fn print_bash_output(output: &BashOutput, duration_ms: u128) {
         for line in truncated.lines().take(5) {
             println!("  \x1b[31m{line}\x1b[0m");
         }
-    }
-}
-
-/// Truncate command for display (UTF-8 safe).
-fn truncate_command(cmd: &str, max_chars: usize) -> String {
-    // Replace newlines with semicolons for single-line display
-    let single_line = cmd.trim().replace('\n', "; ");
-
-    // Find byte index at char boundary using nth
-    match single_line.char_indices().nth(max_chars) {
-        Some((byte_idx, _)) => format!("{}...", &single_line[..byte_idx]),
-        None => single_line, // String is shorter than max_chars
     }
 }
 

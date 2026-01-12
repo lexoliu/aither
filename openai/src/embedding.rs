@@ -12,10 +12,7 @@ impl EmbeddingModel for OpenAI {
         self.config().embedding_dimensions
     }
 
-    fn embed(
-        &self,
-        text: &str,
-    ) -> impl core::future::Future<Output = CoreResult<Vec<f32>>> + Send {
+    fn embed(&self, text: &str) -> impl core::future::Future<Output = CoreResult<Vec<f32>>> + Send {
         let cfg = self.config();
         let input = text.to_owned();
         async move {

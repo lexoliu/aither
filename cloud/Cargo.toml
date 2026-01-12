@@ -1,0 +1,27 @@
+[package]
+name = "aither-cloud"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Unified cloud provider supporting OpenAI, Anthropic Claude, and Google Gemini"
+readme = "README.md"
+keywords = ["ai", "llm", "openai", "claude", "gemini"]
+categories = ["api-bindings"]
+
+[dependencies]
+aither-core.workspace = true
+aither-claude.workspace = true
+aither-copilot.workspace = true
+aither-gemini.workspace = true
+aither-openai.workspace = true
+anyhow = "1.0"
+async-stream = "0.3"
+futures-core = "0.3"
+futures-lite = "2.6"
+thiserror = "2"
+
+[lints]
+workspace = true

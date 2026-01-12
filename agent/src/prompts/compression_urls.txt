@@ -14,6 +14,7 @@ Compress this conversation context. Some content has URLs for later reference.
 - File paths: {file_paths}
 - Errors: {errors}
 - Commands: {commands}
+{running_jobs}
 
 ## OUTPUT FORMAT
 

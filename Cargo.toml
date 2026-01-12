@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "claude",
+    "cloud",
+    "copilot",
     "derive",
     "openai",
     "core",
@@ -17,6 +19,7 @@ members = [
     "tools/fs",
     "tools/command",
     "mcp",
+    "acp",
     "cli",
     "sandbox",
 ]
@@ -54,11 +57,14 @@ aither-webfetch = { path = "./tools/webfetch" }
 aither-fs = { path = "./tools/fs" }
 aither-command = { path = "./tools/command" }
 aither-mcp = { path = "./mcp" }
+aither-acp = { path = "./acp" }
 aither-sandbox = { path = "./sandbox" }
 aither-agent = { path = "./agent" }
 aither-openai = { path = "./openai" }
 aither-claude = { path = "./claude" }
+aither-cloud = { path = "./cloud" }
 aither-gemini = { path = "./gemini" }
+aither-copilot = { path = "./copilot" }
 aither-models = { path = "./models" }
 
 [dependencies]

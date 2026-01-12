@@ -8,12 +8,13 @@ use aither_core::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_core::Stream;
+use futures_lite::StreamExt;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use tracing::debug;
 
 use crate::{
-    client::call_generate,
+    client::stream_generate,
     config::Gemini,
     error::GeminiError,
     types::{
@@ -154,73 +155,83 @@ fn respond_stream_inner(
 
         debug!("Gemini request: {:?}", gemini_request);
 
-        let response = match call_generate(&cfg, &cfg.text_model, gemini_request).await {
-            Ok(r) => r,
+        // Use streaming endpoint for true streaming output
+        let stream = match stream_generate(&cfg, &cfg.text_model, gemini_request).await {
+            Ok(s) => s,
             Err(e) => {
                 yield Err(e);
                 return;
             }
         };
+        futures_lite::pin!(stream);
 
-        debug!("Gemini response: {:?}", response);
-
-        let Some(candidate) = response.primary_candidate() else {
-            let message = if let Some(feedback) = &response.prompt_feedback {
-                format_prompt_feedback(feedback)
-            } else {
-                "Gemini response missing candidate".to_string()
+        while let Some(result) = stream.next().await {
+            let response = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    yield Err(e);
+                    continue;
+                }
             };
-            yield Err(GeminiError::Api(message));
-            return;
-        };
 
-        let Some(content) = &candidate.content else {
-            yield Err(GeminiError::Api("Gemini response missing content".into()));
-            return;
-        };
+            debug!("Gemini stream chunk: {:?}", response);
 
-        // Emit reasoning events first
-        for reasoning in content.reasoning_chunks() {
-            yield Ok(Event::Reasoning(reasoning));
-        }
+            let Some(candidate) = response.primary_candidate() else {
+                // Skip chunks without candidates (might be metadata)
+                if let Some(feedback) = &response.prompt_feedback {
+                    let message = format_prompt_feedback(feedback);
+                    yield Err(GeminiError::Api(message));
+                }
+                continue;
+            };
 
-        // Emit text events
-        for text in content.text_chunks() {
-            if !text.is_empty() {
-                yield Ok(Event::Text(text));
+            let Some(content) = &candidate.content else {
+                continue;
+            };
+
+            // Emit reasoning events
+            for reasoning in content.reasoning_chunks() {
+                yield Ok(Event::Reasoning(reasoning));
             }
-        }
 
-        // Emit built-in tool results (code execution)
-        for part in &content.parts {
-            if let Some(code) = &part.executable_code {
-                let code_block = format!(
-                    "```{}\n{}\n```",
-                    code.language.to_lowercase(),
-                    code.code
-                );
-                yield Ok(Event::BuiltInToolResult {
-                    tool: "code_execution".to_string(),
-                    result: code_block,
-                });
+            // Emit text events
+            for text in content.text_chunks() {
+                if !text.is_empty() {
+                    yield Ok(Event::Text(text));
+                }
             }
-            if let Some(result) = &part.code_execution_result {
-                let output_block = format!("```output\n{}\n```", result.output);
-                yield Ok(Event::BuiltInToolResult {
-                    tool: "code_execution".to_string(),
-                    result: output_block,
-                });
-            }
-        }
 
-        // Emit tool call events (NOT executed - consumer handles execution)
-        for (call, signature) in content.function_call_parts() {
-            let call_id = tool_call_id(signature.as_deref());
-            yield Ok(Event::ToolCall(aither_core::llm::ToolCall {
-                id: call_id,
-                name: call.name.clone(),
-                arguments: call.args.clone(),
-            }));
+            // Emit built-in tool results (code execution)
+            for part in &content.parts {
+                if let Some(code) = &part.executable_code {
+                    let code_block = format!(
+                        "```{}\n{}\n```",
+                        code.language.to_lowercase(),
+                        code.code
+                    );
+                    yield Ok(Event::BuiltInToolResult {
+                        tool: "code_execution".to_string(),
+                        result: code_block,
+                    });
+                }
+                if let Some(result) = &part.code_execution_result {
+                    let output_block = format!("```output\n{}\n```", result.output);
+                    yield Ok(Event::BuiltInToolResult {
+                        tool: "code_execution".to_string(),
+                        result: output_block,
+                    });
+                }
+            }
+
+            // Emit tool call events (NOT executed - consumer handles execution)
+            for (call, signature) in content.function_call_parts() {
+                let call_id = tool_call_id(signature.as_deref());
+                yield Ok(Event::ToolCall(aither_core::llm::ToolCall {
+                    id: call_id,
+                    name: call.name.clone(),
+                    arguments: call.args.clone(),
+                }));
+            }
         }
     }
 }
@@ -319,22 +330,23 @@ fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<Gemin
 
                 if let Some(&function_name) = tool_call_names.get(tool_call_id) {
                     // Parse the content as JSON, or wrap it as a string result
-                    let response_value = match serde_json::from_str::<serde_json::Value>(message.content()) {
-                        Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
-                        Ok(other) => {
-                            let mut map = serde_json::Map::new();
-                            map.insert("result".to_string(), other);
-                            serde_json::Value::Object(map)
-                        }
-                        Err(_) => {
-                            let mut map = serde_json::Map::new();
-                            map.insert(
-                                "result".to_string(),
-                                serde_json::Value::String(message.content().to_string()),
-                            );
-                            serde_json::Value::Object(map)
-                        }
-                    };
+                    let response_value =
+                        match serde_json::from_str::<serde_json::Value>(message.content()) {
+                            Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+                            Ok(other) => {
+                                let mut map = serde_json::Map::new();
+                                map.insert("result".to_string(), other);
+                                serde_json::Value::Object(map)
+                            }
+                            Err(_) => {
+                                let mut map = serde_json::Map::new();
+                                map.insert(
+                                    "result".to_string(),
+                                    serde_json::Value::String(message.content().to_string()),
+                                );
+                                serde_json::Value::Object(map)
+                            }
+                        };
                     contents.push(GeminiContent::function_response_with_signature(
                         function_name.to_string(),
                         response_value,

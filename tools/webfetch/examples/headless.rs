@@ -9,7 +9,8 @@ use aither_webfetch::{fetch_html_raw, fetch_with_browser};
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let raw_mode = args.iter().any(|a| a == "--raw");
-    let url = args.iter()
+    let url = args
+        .iter()
         .skip(1)
         .find(|a| !a.starts_with("--"))
         .map(|s| s.as_str())

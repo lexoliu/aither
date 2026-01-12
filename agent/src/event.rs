@@ -47,6 +47,9 @@ pub enum AgentEvent {
         turns: usize,
     },
 
+    /// Token usage information from LLM.
+    Usage(aither_core::llm::Usage),
+
     /// Error occurred during execution.
     Error(AgentError),
 }

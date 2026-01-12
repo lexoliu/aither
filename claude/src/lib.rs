@@ -60,9 +60,11 @@
 mod client;
 mod constant;
 mod error;
+mod provider;
 mod request;
 mod response;
 
 pub use client::{Builder, Claude};
 pub use constant::*;
 pub use error::ClaudeError;
+pub use provider::ClaudeProvider;

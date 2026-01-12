@@ -173,14 +173,19 @@ fn convert_to_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, String)> {
 
 /// Extract og:description from HTML for sites where readability fails.
 fn extract_og_description(html: &str) -> Option<String> {
-    let og_re = Regex::new(r#"<meta[^>]+(?:property|name)="og:description"[^>]+content="([^"]+)""#).ok()?;
+    let og_re =
+        Regex::new(r#"<meta[^>]+(?:property|name)="og:description"[^>]+content="([^"]+)""#).ok()?;
     if let Some(cap) = og_re.captures(html) {
-        return cap.get(1).map(|m| html_escape::decode_html_entities(m.as_str()).to_string());
+        return cap
+            .get(1)
+            .map(|m| html_escape::decode_html_entities(m.as_str()).to_string());
     }
     // Try reversed attribute order
-    let og_re2 = Regex::new(r#"<meta[^>]+content="([^"]+)"[^>]+(?:property|name)="og:description""#).ok()?;
+    let og_re2 =
+        Regex::new(r#"<meta[^>]+content="([^"]+)"[^>]+(?:property|name)="og:description""#).ok()?;
     og_re2.captures(html).and_then(|cap| {
-        cap.get(1).map(|m| html_escape::decode_html_entities(m.as_str()).to_string())
+        cap.get(1)
+            .map(|m| html_escape::decode_html_entities(m.as_str()).to_string())
     })
 }
 
@@ -218,7 +223,9 @@ fn html_to_result(url: &str, html: &str) -> Result<FetchResult> {
 /// Extract body content from HTML, stripping scripts and styles.
 fn extract_body_content(html: &str) -> String {
     // Find body content
-    let body_start = html.find("<body").and_then(|i| html[i..].find('>').map(|j| i + j + 1));
+    let body_start = html
+        .find("<body")
+        .and_then(|i| html[i..].find('>').map(|j| i + j + 1));
     let body_end = html.rfind("</body>");
 
     let body = match (body_start, body_end) {
@@ -248,8 +255,10 @@ const USER_AGENTS: &[&str] = &[
 
 /// Get a User-Agent string based on URL hash.
 fn get_user_agent(url: &str) -> &'static str {
-    let ua_index =
-        url.bytes().fold(0usize, |acc, b| acc.wrapping_add(b as usize)) % USER_AGENTS.len();
+    let ua_index = url
+        .bytes()
+        .fold(0usize, |acc, b| acc.wrapping_add(b as usize))
+        % USER_AGENTS.len();
     USER_AGENTS[ua_index]
 }
 
@@ -263,7 +272,10 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
         .header(header::USER_AGENT.as_str(), user_agent)?
         .header(header::ACCEPT.as_str(), "*/*")?
         .header(header::ACCEPT_LANGUAGE.as_str(), "en-US,en;q=0.9")?
-        .header("Sec-CH-UA", "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\"")?
+        .header(
+            "Sec-CH-UA",
+            "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\"",
+        )?
         .header("Sec-CH-UA-Mobile", "?0")?
         .header("Sec-CH-UA-Platform", "\"macOS\"")?
         .header("Sec-Fetch-Dest", "image")?
@@ -351,9 +363,7 @@ async fn fetch_html_headless(url: &str) -> Result<String> {
         .map_err(|e| anyhow!("Failed to launch browser: {e}"))?;
 
     // Spawn handler task
-    let handle = tokio::spawn(async move {
-        while handler.next().await.is_some() {}
-    });
+    let handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     // Create blank page first
     let page = browser
@@ -376,7 +386,9 @@ async fn fetch_html_headless(url: &str) -> Result<String> {
         .ok();
 
     // Now navigate to the actual URL
-    page.goto(url).await.map_err(|e| anyhow!("Failed to navigate: {e}"))?;
+    page.goto(url)
+        .await
+        .map_err(|e| anyhow!("Failed to navigate: {e}"))?;
 
     // Wait for page to load
     tokio::time::sleep(Duration::from_millis(5000)).await;
@@ -400,7 +412,9 @@ fn is_image_url(url: &str) -> bool {
     let lower = url.to_lowercase();
 
     // Check common image extensions
-    let extensions = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".ico"];
+    let extensions = [
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".ico",
+    ];
     for ext in extensions {
         if lower.contains(ext) {
             return true;
@@ -482,7 +496,8 @@ impl WebFetchTool {
     /// Panics if the pattern is not a valid regex.
     #[must_use]
     pub fn allow(mut self, pattern: &str) -> Self {
-        self.whitelist.push(Regex::new(pattern).expect("invalid whitelist regex"));
+        self.whitelist
+            .push(Regex::new(pattern).expect("invalid whitelist regex"));
         self
     }
 
@@ -492,7 +507,8 @@ impl WebFetchTool {
     /// Panics if the pattern is not a valid regex.
     #[must_use]
     pub fn block(mut self, pattern: &str) -> Self {
-        self.blacklist.push(Regex::new(pattern).expect("invalid blacklist regex"));
+        self.blacklist
+            .push(Regex::new(pattern).expect("invalid blacklist regex"));
         self
     }
 
@@ -600,9 +616,7 @@ mod tests {
 
     #[test]
     fn url_filtering_blacklist() {
-        let tool = WebFetchTool::new()
-            .block(r"\.evil\.com")
-            .block(r"/admin/");
+        let tool = WebFetchTool::new().block(r"\.evil\.com").block(r"/admin/");
 
         assert!(tool.is_url_allowed("https://example.com/page"));
         assert!(!tool.is_url_allowed("https://www.evil.com/malware"));

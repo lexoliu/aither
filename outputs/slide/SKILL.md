@@ -1,102 +1,125 @@
 ---
 name: slide
-description: "Create Markdown-based presentation slides using Slidev framework. Use when users ask to create slides, presentations, or slide decks."
+description: "Create Markdown-based presentation slides using Slidev. Use when users ask to create slides, presentations, or slide decks."
 ---
 
 # Slide Skill (Slidev)
 
-## Pre-flight
+## Pre-flight Check
 
-Before proceeding, ask:
+Ask: **"Will you edit this in Keynote/PowerPoint later?"**
+- YES: Stop. Recommend using those apps directly.
+- NO: Continue.
 
-**"Are you planning to edit this presentation in Keynote or PowerPoint afterwards?"**
+## Workflow
 
-- If YES → Stop. Explain: "Slidev creates browser-based presentations from Markdown. For Keynote/PowerPoint output, use those apps directly or a different tool."
-- If NO → Continue.
+### Phase 1: Research (Optional)
 
-## Phase 1: Research & Outline
+If the topic needs research, use the builtin research subagent:
 
-### 1.1 Gather Requirements
-
-Ask briefly:
-- Topic
-- Audience (technical/non-technical)
-- Approximate slide count (default: 5-10)
-- Style preference (minimal, corporate, playful, dark)
-- Special content needs (code demos, diagrams, equations)
-
-### 1.2 Research Topic
-
-Use `websearch` to research the topic. Focus on:
-- Core concepts and key points
-- Recent statistics or data with sources
-- Notable quotes from experts
-- Visual/diagram opportunities
-
-### 1.3 Create Outline
-
-Based on research, create an outline with:
-- Slide-by-slide breakdown (title + key points for each)
-- Theme choice (seriph, apple-basic, default)
-- Content types per slide (text, code, table, diagram)
-
-Present outline to user for approval before proceeding.
-
-## Phase 2: Create Slides
-
-### 2.1 Initialize Project
-
-Create `slides.md` with frontmatter:
-
-```markdown
----
-theme: seriph
-title: [Title]
-transition: slide-left
----
+```bash
+task research --prompt "Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights."
 ```
 
-### 2.2 Create Each Slide
+Use explicit flags to avoid positional argument ambiguity:
 
-Add slides one at a time using `---` separator. After each slide, verify syntax is correct.
-
-## Syntax Quick Reference
-
-**Slide separator:** `---`
-
-**Layouts:** `default`, `center`, `cover`, `two-cols`, `image-right`, `quote`, `section`, `fact`, `end`
-
-**Two columns:**
-```markdown
----
-layout: two-cols
----
-
-Left content
-
-::right::
-
-Right content
+```bash
+task --subagent research --prompt "Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights."
 ```
 
-**Code with highlighting:**
-````markdown
-```python {2,3}
-line 1
-line 2  # highlighted
-line 3
+### Phase 2: Requirements (Main Agent)
+
+Gather from user:
+- Topic and key message
+- Audience: technical / general / executive
+- Slide count (default: 5-8)
+- Style: dark / light / minimal / corporate / playful
+
+### Phase 3: Art Direction (Subagent)
+
+Launch art direction subagent to create design guide and outline:
+
+```bash
+task --subagent .skills/slide/subagents/art_direction.md --prompt "Create design guide for: [TOPIC]. Audience: [AUDIENCE]. Style: [STYLE]. Slide count: [N]."
 ```
-````
 
-**Tables:** Use standard Markdown tables
+The subagent returns a YAML design guide containing:
+- Theme selection
+- Color palette
+- Typography guidance
+- Slide-by-slide outline with layouts and content
 
-**LaTeX:** Inline `$E=mc^2$`, block `$$\int_0^1 x dx$$`
+### Phase 4: User Approval
 
-**Presenter notes:** `<!-- Speaker notes here -->`
+Present the outline to the user:
+- Show slide titles and structure
+- Confirm design direction
+- **Get approval before proceeding**
+
+### Phase 5: Parallel Slide Creation (Subagents)
+
+Launch one slide_creator subagent per slide **in parallel**:
+
+```bash
+task --subagent .skills/slide/subagents/slide_creator.md --prompt "Slide 1: [SPEC]. Design: [DESIGN_GUIDE]"
+task --subagent .skills/slide/subagents/slide_creator.md --prompt "Slide 2: [SPEC]. Design: [DESIGN_GUIDE]"
+task --subagent .skills/slide/subagents/slide_creator.md --prompt "Slide 3: [SPEC]. Design: [DESIGN_GUIDE]"
+# ... one per slide
+```
+
+Each subagent:
+1. Creates standalone temp file with slide content
+2. Renders to PNG for visual verification
+3. Views the image to ensure quality
+4. Iterates until the slide looks correct
+5. Returns verified slide markdown
+
+### Phase 6: Assembly & Preview (Main Agent)
+
+Collect all slide outputs and assemble into final presentation:
+
+```bash
+mkdir -p artifacts
+cat > artifacts/slides.md << 'EOF'
+---
+theme: [from design guide]
+title: [presentation title]
+transition: [from design guide]
+---
+
+[Slide 1 content]
+
+---
+
+[Slide 2 content]
+
+---
+
+[... all slides ...]
+EOF
+```
+
+Clean up temp files and start preview server:
+
+```bash
+rm -rf artifacts/temp
+cd artifacts && npx slidev slides.md --port 3030 &
+```
+
+Tell user: **"Preview at http://localhost:3030"**
+
+### Phase 7: Export (Optional)
+
+If user wants PDF:
+
+```bash
+cd artifacts && npx slidev export slides.md --output slides.pdf
+```
 
 ## Reference Files
 
-For detailed syntax, read:
-- `.skills/slide/references/syntax.md` - Full syntax guide
-- `.skills/slide/references/layouts.md` - All layout options
-- `.skills/slide/references/themes.md` - Theme gallery
+Read these from the skill directory:
+
+- `.skills/slide/references/syntax.md` - Full Slidev syntax guide
+- `.skills/slide/references/layouts.md` - Layout options and usage
+- `.skills/slide/references/themes.md` - Theme gallery and recommendations

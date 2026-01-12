@@ -16,12 +16,11 @@ name = "aither"
 path = "src/main.rs"
 
 [dependencies]
+aither-acp.workspace = true
 aither-agent = { workspace = true, features = ["full"] }
+aither-cloud.workspace = true
 aither-core.workspace = true
-aither-claude = { workspace = true }
-aither-gemini = { workspace = true }
-aither-mcp = { workspace = true }
-aither-openai = { workspace = true }
+aither-mcp.workspace = true
 anyhow = "1.0"
 async-lock = "3"
 async-stream = "0.3"

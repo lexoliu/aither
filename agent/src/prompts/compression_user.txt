@@ -4,6 +4,7 @@ MUST PRESERVE VERBATIM:
 - File paths: {file_paths}
 - Errors: {errors}
 - Commands: {commands}
+{running_jobs}
 
 CONVERSATION TO COMPRESS:
 {dialogue}
@@ -16,4 +17,4 @@ OUTPUT FORMAT:
 - [Bullet points of important decisions/findings]
 
 ## Preserved Context
-[Any file paths, errors, commands that must be kept]
+[Any file paths, errors, commands, running jobs that must be kept]

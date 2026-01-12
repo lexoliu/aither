@@ -67,6 +67,17 @@ pub trait PermissionHandler: Send + Sync {
         mode: BashMode,
         script: &str,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send;
+
+    /// Checks if a network domain is allowed.
+    ///
+    /// Called for each network connection attempt in `Network` mode.
+    /// The implementation may prompt the user, check against a whitelist, etc.
+    ///
+    /// Default implementation denies all domains (fail-safe).
+    fn check_domain(&self, domain: &str, port: u16) -> impl Future<Output = bool> + Send {
+        let _ = (domain, port);
+        async { false }
+    }
 }
 
 /// Error type for permission operations.
@@ -94,12 +105,10 @@ impl PermissionHandler for DenyUnsafe {
     async fn check(&self, mode: BashMode, _script: &str) -> Result<bool, PermissionError> {
         match mode {
             BashMode::Sandboxed => Ok(true),
-            BashMode::Network | BashMode::Unsafe => {
-                Err(PermissionError::Denied(format!(
-                    "{} mode requires approval but no interactive handler is configured",
-                    mode.description()
-                )))
-            }
+            BashMode::Network | BashMode::Unsafe => Err(PermissionError::Denied(format!(
+                "{} mode requires approval but no interactive handler is configured",
+                mode.description()
+            ))),
         }
     }
 }
@@ -111,6 +120,10 @@ pub struct AllowAll;
 impl PermissionHandler for AllowAll {
     async fn check(&self, _mode: BashMode, _script: &str) -> Result<bool, PermissionError> {
         Ok(true)
+    }
+
+    async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
+        true
     }
 }
 
@@ -165,6 +178,10 @@ impl<Inner: PermissionHandler> PermissionHandler for StatefulPermissionHandler<I
             }
         }
     }
+
+    async fn check_domain(&self, domain: &str, port: u16) -> bool {
+        self.inner.check_domain(domain, port).await
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +224,31 @@ mod tests {
 
         // Subsequent checks use cached approval
         assert!(handler.check(BashMode::Network, "wget").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_deny_unsafe_check_domain() {
+        let handler = DenyUnsafe;
+
+        // Default implementation denies all domains
+        assert!(!handler.check_domain("example.com", 443).await);
+        assert!(!handler.check_domain("api.github.com", 80).await);
+    }
+
+    #[tokio::test]
+    async fn test_allow_all_check_domain() {
+        let handler = AllowAll;
+
+        // AllowAll allows all domains
+        assert!(handler.check_domain("example.com", 443).await);
+        assert!(handler.check_domain("malicious.com", 80).await);
+    }
+
+    #[tokio::test]
+    async fn test_stateful_handler_check_domain() {
+        let handler = StatefulPermissionHandler::new(AllowAll);
+
+        // Delegates to inner handler
+        assert!(handler.check_domain("example.com", 443).await);
     }
 }

@@ -139,7 +139,7 @@
 mod client;
 pub mod protocol;
 mod server;
-pub(crate) mod transport;
+pub mod transport;
 
 // Re-export main types
 pub use client::{McpConnection, McpServerConfig, McpServersConfig};

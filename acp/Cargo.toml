@@ -1,0 +1,32 @@
+[package]
+name = "aither-acp"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ACP (Agent Client Protocol) server for aither"
+readme = "../README.md"
+keywords = ["ai", "agent", "acp", "editor-integration"]
+categories = ["api-bindings"]
+
+[dependencies]
+aither-core = { path = "../core" }
+aither-agent = { path = "../agent" }
+aither-mcp = { path = "../mcp" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-lite = "2"
+futures-core = "0.3"
+thiserror = "2"
+async-io = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

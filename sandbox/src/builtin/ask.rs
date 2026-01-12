@@ -11,8 +11,8 @@
 
 use std::borrow::Cow;
 
-use aither_core::llm::{Event, LLMRequest, Message, Tool, ToolOutput};
 use aither_core::LanguageModel;
+use aither_core::llm::{Event, LLMRequest, Message, Tool, ToolOutput};
 use futures_lite::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -61,10 +61,7 @@ impl<LLM: LanguageModel> Tool for AskCommand<LLM> {
         }
 
         // Build the prompt with context
-        let user_content = format!(
-            "<context>\n{}\n</context>\n\n{}",
-            args.input, args.prompt
-        );
+        let user_content = format!("<context>\n{}\n</context>\n\n{}", args.input, args.prompt);
 
         let request = LLMRequest::new(vec![Message::user(user_content)]);
         let response = self.llm.respond(request);

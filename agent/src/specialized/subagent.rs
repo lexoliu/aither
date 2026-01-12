@@ -5,7 +5,10 @@
 
 use std::borrow::Cow;
 
-use aither_core::{LanguageModel, llm::{Tool, ToolOutput}};
+use aither_core::{
+    LanguageModel,
+    llm::{Tool, ToolOutput},
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -37,6 +40,15 @@ pub struct SubAgentTool<LLM> {
     llm: LLM,
     name: String,
     system_prompt: Option<String>,
+}
+
+impl<LLM> std::fmt::Debug for SubAgentTool<LLM> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubAgentTool")
+            .field("name", &self.name)
+            .field("has_system_prompt", &self.system_prompt.is_some())
+            .finish()
+    }
 }
 
 impl<LLM: Clone> SubAgentTool<LLM> {

@@ -24,8 +24,9 @@
 //! GEMINI_API_KEY=xxx cargo run -p aither-cli -- --provider gemini
 //! ```
 
-mod cloud;
 mod hook;
+mod provider;
 
-pub use cloud::{CloudError, CloudProvider, Provider};
+pub use aither_cloud::{CloudError, CloudProvider};
 pub use hook::DebugHook;
+pub use provider::{Provider, auto_detect};

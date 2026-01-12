@@ -1,12 +1,19 @@
-use aither_skills::{SkillLoader, Skill};
+use aither_skills::{Skill, SkillLoader};
 
 fn main() {
     // Test parsing the skill file directly
     let content = std::fs::read_to_string("./outputs/slide/SKILL.md").unwrap();
-    println!("File content first 200 chars:\n{}\n---", &content[..200.min(content.len())]);
+    println!(
+        "File content first 200 chars:\n{}\n---",
+        &content[..200.min(content.len())]
+    );
 
     match Skill::parse(&content) {
-        Ok(skill) => println!("Parsed skill: {} - {}", skill.name, &skill.description[..50.min(skill.description.len())]),
+        Ok(skill) => println!(
+            "Parsed skill: {} - {}",
+            skill.name,
+            &skill.description[..50.min(skill.description.len())]
+        ),
         Err(e) => println!("Parse error: {:?}", e),
     }
 
@@ -17,7 +24,11 @@ fn main() {
         Ok(skills) => {
             println!("Loaded {} skills", skills.len());
             for skill in skills {
-                println!("  - {}: {}", skill.name, &skill.description[..50.min(skill.description.len())]);
+                println!(
+                    "  - {}: {}",
+                    skill.name,
+                    &skill.description[..50.min(skill.description.len())]
+                );
             }
         }
         Err(e) => println!("Loader error: {:?}", e),

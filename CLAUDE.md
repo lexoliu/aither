@@ -84,6 +84,49 @@ Interactive terminal interface for testing agents. Binary name: `aither`.
 
 Requires Rust 1.87+ (edition 2024).
 
+## Agent development guide
+- Appending is cheap, since it utilizes input cache of LLM.
+- When testing agents, simulate a realistic scenario
+- Inspire model's creativity by providing open-ended prompts
+- Use XML labels to structure tool calls responses and your prompts
+- Utilize subagent to parallelize complex tasks and save context window
+
+## Tool development guide
+- You are not allowed to be special in architecture. You must implement `Tool` trait.
+- Your tool will be converted into bash-based automatically. You should never write workaround to expose CLI commands.
+
+## Bash-based agent
+Our agent only have a single tool: `bash`. All capabilities are exposed via CLI commands,
+including web search, web fetch, task management, and LLM queries.
+
+Technically, these command is a wrapper script that calls `aither-ipc <command> "$@"`.
+Through from the agent's perspective, it is just calling a bash tool,
+you are stilled require to develop a tool using `Tool` trait. We convert these tools 
+to CLI commands under the hood.
+
+For each tool, please write one sentence description in rustdoc, and then detailed prompt engineering.
+The detailed prompt engineering would be provided to the agent when it run the command with `--help` flag.
+
+## When subagent?
+
+Subagent is useful when:
+- The task can be decomposed into smaller subtasks performed independently
+- You want to isolate context for better focus
+- The task doesn't require interactive user input or feedback. For instance, research a topic or explore a codebase.
+
+## Bad Smells
+
+Avoid the following bad smells in code:
+- Static variables that hold state across invocations
+- Long monolithic functions that do multiple things
+- Any patch or workaround that hides a problem instead of fixing it
+- Duplicated code instead of shared functions or modules
+- Legacy code left for fallback instead of removal
+- Type erasure instead of using structs, traits, and generics
+- Manual implementation of functionality that can be achieved with third-party crates
+
+If you found yourself writing patch, stub or workaround, you are doing something wrong. Stop and rethink your design.
+
 ## Linting
 
 Workspace-wide pedantic clippy is enforced. All public APIs require `///` documentation.

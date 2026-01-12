@@ -44,7 +44,10 @@ impl fmt::Display for OpenAIError {
             Self::Json(err) => write!(f, "JSON error: {err}"),
             Self::Decode(err) => write!(f, "Base64 decode error: {err}"),
             Self::Api(message) => write!(f, "{message}"),
-            Self::RateLimit { message, retry_after } => {
+            Self::RateLimit {
+                message,
+                retry_after,
+            } => {
                 write!(f, "Rate limit exceeded: {message}")?;
                 if let Some(delay) = retry_after {
                     write!(f, " (retry after {}s)", delay.as_secs())?;

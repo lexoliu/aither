@@ -40,8 +40,8 @@ pub use providers::*;
 
 use std::borrow::Cow;
 
-use aither_core::llm::{Tool, ToolOutput};
 use aither_core::llm::tool::json;
+use aither_core::llm::{Tool, ToolOutput};
 use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -113,7 +113,6 @@ impl<P> WebSearchTool<P> {
             name: name.into(),
         }
     }
-
 }
 
 /// Maximum retry attempts when search returns empty results.

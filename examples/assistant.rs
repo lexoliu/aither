@@ -23,7 +23,9 @@ use aither_core::{
     llm::{Message, model::Parameters},
 };
 use aither_gemini::Gemini;
-use aither_mem0::{Config as Mem0Config, InMemoryStore, Mem0, Memory, SearchResult as Mem0SearchResult};
+use aither_mem0::{
+    Config as Mem0Config, InMemoryStore, Mem0, Memory, SearchResult as Mem0SearchResult,
+};
 use aither_rag::{Document, Metadata, RagStore, SearchResult as RagSearchResult};
 use anyhow::{Context, Result, anyhow};
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind};

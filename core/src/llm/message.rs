@@ -39,7 +39,10 @@ pub enum Message {
         /// Text content of the message.
         content: String,
         /// Attachment URLs (images, documents, etc.)
-        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
         attachments: Vec<Url>,
     },
     /// Assistant message with content and optional tool calls.
@@ -47,7 +50,10 @@ pub enum Message {
         /// Text content of the message.
         content: String,
         /// Tool calls made by the assistant.
-        #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
         tool_calls: Vec<ToolCall>,
     },
     /// System message with instructions/context.
@@ -131,7 +137,10 @@ impl Message {
     }
 
     /// Creates an assistant message with tool calls.
-    pub fn assistant_with_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
         Self::Assistant {
             content: content.into(),
             tool_calls,

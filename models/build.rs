@@ -21,9 +21,16 @@ struct TomlModel {
     context_window: u32,
     #[serde(default)]
     max_output_tokens: Option<u32>,
-    tier: String,
+    /// Single tier (legacy, optional)
+    #[serde(default)]
+    tier: Option<String>,
+    /// Multiple tiers (preferred)
+    #[serde(default)]
+    tiers: Vec<String>,
     #[serde(default)]
     capabilities: Vec<String>,
+    #[serde(default)]
+    outdated: bool,
 }
 
 fn main() {
@@ -43,8 +50,23 @@ fn main() {
     // Generate MODELS array using core types
     code.push_str("const MODELS: &[aither_core::llm::model::ModelInfo] = &[\n");
     for model in &data.models {
+        // Collect tiers - prefer `tiers` array, fall back to single `tier`
+        let tiers: Vec<&str> = if !model.tiers.is_empty() {
+            model.tiers.iter().map(|s| s.as_str()).collect()
+        } else if let Some(ref t) = model.tier {
+            vec![t.as_str()]
+        } else {
+            panic!("Model {} has no tier or tiers defined", model.id);
+        };
+
+        let tiers_code = tiers
+            .iter()
+            .map(|t| tier_variant(t))
+            .collect::<Vec<_>>()
+            .join(", ");
+
         code.push_str(&format!(
-            "    aither_core::llm::model::ModelInfo {{\n        id: {:?},\n        name: {:?},\n        provider: {:?},\n        context_window: {},\n        max_output_tokens: {},\n        tier: {},\n        abilities: &[{}],\n    }},\n",
+            "    aither_core::llm::model::ModelInfo {{\n        id: {:?},\n        name: {:?},\n        provider: {:?},\n        context_window: {},\n        max_output_tokens: {},\n        tiers: &[{}],\n        abilities: &[{}],\n        outdated: {},\n    }},\n",
             model.id,
             model.name,
             model.provider,
@@ -53,8 +75,9 @@ fn main() {
                 Some(v) => format!("Some({v})"),
                 None => "None".to_string(),
             },
-            tier_variant(&model.tier),
+            tiers_code,
             model.capabilities.iter().map(|c| ability_variant(c)).collect::<Vec<_>>().join(", "),
+            model.outdated,
         ));
     }
     code.push_str("];\n\n");

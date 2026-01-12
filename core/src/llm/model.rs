@@ -566,10 +566,26 @@ pub struct ModelInfo {
     pub context_window: u32,
     /// Maximum output tokens (if known)
     pub max_output_tokens: Option<u32>,
-    /// Model tier classification
-    pub tier: ModelTier,
+    /// Model tier classifications (a model can belong to multiple tiers)
+    pub tiers: &'static [ModelTier],
     /// Model capabilities
     pub abilities: &'static [Ability],
+    /// Whether this model is outdated (superseded by a newer version)
+    pub outdated: bool,
+}
+
+impl ModelInfo {
+    /// Check if this model belongs to a specific tier.
+    #[must_use]
+    pub fn has_tier(&self, tier: ModelTier) -> bool {
+        self.tiers.contains(&tier)
+    }
+
+    /// Get the primary (first) tier for this model.
+    #[must_use]
+    pub fn primary_tier(&self) -> Option<ModelTier> {
+        self.tiers.first().copied()
+    }
 }
 
 #[cfg(test)]

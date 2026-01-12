@@ -283,9 +283,7 @@ fn tool_choice(params: &ParameterSnapshot, has_tools: bool) -> Option<ToolChoice
         ToolChoice::Required => Some(ToolChoicePayload::Mode("required")),
         ToolChoice::Exact(name) => Some(ToolChoicePayload::Function {
             kind: "function",
-            function: ToolChoiceFunction {
-                name: name.clone(),
-            },
+            function: ToolChoiceFunction { name: name.clone() },
         }),
     }
 }
@@ -507,21 +505,33 @@ pub fn to_responses_input(messages: &[Message]) -> Vec<ResponsesInputItem> {
     for message in messages {
         match message.role() {
             Role::User => {
-                items.push(ResponsesInputItem::message("user", flatten_content(message)));
+                items.push(ResponsesInputItem::message(
+                    "user",
+                    flatten_content(message),
+                ));
             }
             Role::System => {
-                items.push(ResponsesInputItem::message("developer", flatten_content(message)));
+                items.push(ResponsesInputItem::message(
+                    "developer",
+                    flatten_content(message),
+                ));
             }
             Role::Assistant => {
                 let tool_calls = message.tool_calls();
                 if tool_calls.is_empty() {
                     // Regular text response
-                    items.push(ResponsesInputItem::message("assistant", flatten_content(message)));
+                    items.push(ResponsesInputItem::message(
+                        "assistant",
+                        flatten_content(message),
+                    ));
                 } else {
                     // Assistant message with function calls
                     // First add text content if present
                     if !message.content().is_empty() {
-                        items.push(ResponsesInputItem::message("assistant", message.content().to_string()));
+                        items.push(ResponsesInputItem::message(
+                            "assistant",
+                            message.content().to_string(),
+                        ));
                     }
                     // Add function call items
                     for tc in tool_calls {
@@ -543,7 +553,10 @@ pub fn to_responses_input(messages: &[Message]) -> Vec<ResponsesInputItem> {
                     ));
                 } else {
                     // Fallback if no call_id (shouldn't happen)
-                    items.push(ResponsesInputItem::message("user", flatten_content(message)));
+                    items.push(ResponsesInputItem::message(
+                        "user",
+                        flatten_content(message),
+                    ));
                 }
             }
         }

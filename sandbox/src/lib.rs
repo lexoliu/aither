@@ -9,14 +9,17 @@
 //! # Setting Up the Bash Tool
 //!
 //! ```rust,ignore
-//! use aither_sandbox::{BashTool, permission::AllowAll};
+//! use aither_sandbox::{BashTool, ToolRegistryBuilder, permission::AllowAll};
+//! use std::sync::Arc;
 //!
 //! // Creates a random four-word working directory (e.g., amber-forest-thunder-pearl/)
 //! // with outputs/ subdirectory and IPC command wrapper scripts
-//! let tool = BashTool::new(AllowAll).await?;
+//! let tool = BashTool::new_in(std::env::temp_dir(), AllowAll, executor).await?;
+//! let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+//! let tool = tool.with_registry(registry);
 //!
 //! // Access the working directory path
-//! println!("Working dir: {}", tool.working_dir().display());
+//! tracing::info!("Working dir: {}", tool.working_dir().display());
 //! ```
 //!
 //! # Registering Tools as IPC Commands
@@ -24,19 +27,21 @@
 //! Tools can be made available to bash scripts running in the sandbox:
 //!
 //! ```rust,ignore
-//! use aither_sandbox::{configure_tool, register_tool_command};
+//! use aither_sandbox::{ToolRegistryBuilder, register_tool_command};
 //! use aither_sandbox::builtin::builtin_router;
 //!
-//! // 1. Configure tools (stores handlers in global registry)
-//! configure_tool(websearch_tool);
-//! configure_tool(webfetch_tool);
+//! // 1. Configure tools
+//! let mut registry = ToolRegistryBuilder::new();
+//! registry.configure_tool(websearch_tool);
+//! registry.configure_tool(webfetch_tool);
+//! let registry = std::sync::Arc::new(registry.build("./outputs"));
 //!
 //! // 2. Create router with built-in commands (reload)
 //! let router = builtin_router();
 //!
 //! // 3. Register tool commands with the router
-//! let router = register_tool_command(router, "websearch");
-//! let router = register_tool_command(router, "webfetch");
+//! let router = register_tool_command(router, registry.clone(), "websearch");
+//! let router = register_tool_command(router, registry.clone(), "webfetch");
 //! ```
 //!
 //! # Built-in Commands
@@ -49,20 +54,28 @@
 
 mod bash;
 mod command;
+mod naming;
 mod output;
 
 /// Built-in IPC commands (ask, reload).
 pub mod builtin;
 
+/// Background job registry for tracking tasks.
+pub mod job_registry;
+
 /// Permission handling for bash modes.
 pub mod permission;
 
-pub use bash::{BackgroundTaskReceiver, BashArgs, BashError, BashResult, BashTool, CompletedTask};
-pub use command::{
-    configure_raw_handler, configure_tool, create_child_bash_tool, get_tool_help,
-    get_tool_primary_arg, get_tool_stdin_arg, is_tool_configured, register_tool_command,
-    registered_tool_names, set_bash_tool_factory, DynBashTool, DynToolHandler, ToolCallCommand,
-    ToolCommand,
+pub use bash::{
+    BackgroundTaskReceiver, BashArgs, BashError, BashResult, BashTool, BashToolFactory,
+    BashToolFactoryError, BashToolFactoryReceiver, CompletedTask, Configured, Unconfigured,
+    bash_tool_factory_channel,
 };
+pub use command::{
+    DynBashTool, DynToolHandler, IpcToolCommand, ToolCallCommand, ToolCommand, ToolRegistry,
+    ToolRegistryBuilder, cli_to_json, register_tool_command, register_tool_direct,
+    schema_to_help,
+};
+pub use job_registry::{JobInfo, JobRegistry, JobStatus};
 pub use output::{Content, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{BashMode, PermissionHandler};

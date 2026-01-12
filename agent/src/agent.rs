@@ -10,6 +10,7 @@ use aither_core::{
     LanguageModel,
     llm::{Event, LLMRequest, Message, model::Profile as ModelProfile},
 };
+use futures_core::Stream;
 use futures_lite::StreamExt;
 
 use crate::{
@@ -17,11 +18,11 @@ use crate::{
     config::AgentConfig,
     context::ConversationMemory,
     error::AgentError,
+    event::AgentEvent,
     hook::{
         Hook, PostToolAction, PreToolAction, StopContext, StopReason, ToolResultContext,
         ToolUseContext,
     },
-    stream::AgentStream,
     todo::{TodoItem, TodoList, TodoStatus},
     tools::AgentTools,
 };
@@ -114,7 +115,7 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Which model tier to use for main reasoning.
     pub(crate) tier: ModelTier,
 
-    /// Registered tools (eager and deferred).
+    /// Registered tools.
     pub(crate) tools: AgentTools,
 
     /// Composed hooks.
@@ -164,7 +165,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             balanced: llm.clone(),
             fast: llm,
             tier: ModelTier::default(),
-            tools: AgentTools::with_config(config.tool_search.clone()),
+            tools: AgentTools::new(),
             hooks: (),
             config,
             memory: ConversationMemory::default(),
@@ -205,14 +206,29 @@ where
     /// - A hook aborts the operation
     /// - Tool execution fails
     pub async fn query(&mut self, prompt: &str) -> Result<String, AgentError> {
-        self.ensure_initialized().await;
-        self.run_query(prompt).await
+        use futures_lite::StreamExt;
+
+        let stream = self.run(prompt);
+        futures_lite::pin!(stream);
+
+        let mut final_text = String::new();
+        while let Some(event) = stream.next().await {
+            match event? {
+                AgentEvent::Text(chunk) => final_text.push_str(&chunk),
+                AgentEvent::Complete { final_text: text, .. } => {
+                    return Ok(text);
+                }
+                _ => {}
+            }
+        }
+        Ok(final_text)
     }
 
     /// Runs the agent with streaming events.
     ///
     /// Returns a stream of `AgentEvent`s that can be consumed to observe
-    /// the agent's progress in real-time.
+    /// the agent's progress in real-time. Text chunks are yielded as they
+    /// arrive from the LLM for true streaming display.
     ///
     /// # Example
     ///
@@ -229,8 +245,416 @@ where
     /// }
     /// ```
     #[must_use]
-    pub fn run(&mut self, prompt: &str) -> AgentStream<'_, Advanced, Balanced, Fast, H> {
-        AgentStream::new(self, prompt.to_string())
+    pub fn run(
+        &mut self,
+        prompt: &str,
+    ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
+        let prompt = prompt.to_string();
+        self.run_streaming(prompt)
+    }
+
+    /// Internal streaming implementation.
+    fn run_streaming(
+        &mut self,
+        prompt: String,
+    ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
+        async_stream::try_stream! {
+            self.ensure_initialized().await;
+
+            // Apply context compression if needed
+            self.maybe_compress().await?;
+
+            // Add user message
+            self.memory.push(Message::user(&prompt));
+
+            // Run the tool loop
+            let mut iteration = 0;
+            let mut all_text_chunks: Vec<String> = Vec::new();
+
+            let final_text = loop {
+                iteration += 1;
+                if iteration > self.config.max_iterations {
+                    Err(AgentError::MaxIterations {
+                        limit: self.config.max_iterations,
+                    })?;
+                }
+
+                // Build messages
+                let messages = self.build_request_messages();
+
+                // Create request with tool definitions
+                let tool_defs = self.tools.active_definitions();
+                let request = LLMRequest::new(messages).with_tool_definitions(tool_defs);
+
+                // Stream the response and yield text events as they arrive
+                let mut text_chunks: Vec<String> = Vec::new();
+                let mut tool_calls = Vec::new();
+                let mut malformed_function_call = false;
+                let mut error: Option<String> = None;
+
+                // Process stream based on tier
+                match self.tier {
+                    ModelTier::Advanced => {
+                        let stream = self.advanced.respond(request);
+                        futures_lite::pin!(stream);
+
+                        while let Some(event) = stream.next().await {
+                            match event {
+                                Ok(Event::Text(text)) => {
+                                    self.hooks.on_text(&text).await;
+                                    // Yield text event for streaming display
+                                    yield AgentEvent::Text(text.clone());
+                                    text_chunks.push(text);
+                                }
+                                Ok(Event::Reasoning(r)) => {
+                                    yield AgentEvent::Reasoning(r);
+                                }
+                                Ok(Event::ToolCall(call)) => tool_calls.push(call),
+                                Ok(Event::BuiltInToolResult { tool, result }) => {
+                                    let formatted = format!("[{tool}] {result}");
+                                    yield AgentEvent::Text(formatted.clone());
+                                    text_chunks.push(formatted);
+                                }
+                                Ok(Event::Usage(u)) => {
+                                    yield AgentEvent::Usage(u);
+                                }
+                                Err(e) => {
+                                    let error_msg = e.to_string();
+                                    if error_msg.contains("malformed function call") {
+                                        tracing::warn!("Model generated malformed function call, retrying...");
+                                        malformed_function_call = true;
+                                        break;
+                                    }
+                                    error = Some(error_msg);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    ModelTier::Balanced => {
+                        let stream = self.balanced.respond(request);
+                        futures_lite::pin!(stream);
+
+                        while let Some(event) = stream.next().await {
+                            match event {
+                                Ok(Event::Text(text)) => {
+                                    self.hooks.on_text(&text).await;
+                                    yield AgentEvent::Text(text.clone());
+                                    text_chunks.push(text);
+                                }
+                                Ok(Event::Reasoning(r)) => {
+                                    yield AgentEvent::Reasoning(r);
+                                }
+                                Ok(Event::ToolCall(call)) => tool_calls.push(call),
+                                Ok(Event::BuiltInToolResult { tool, result }) => {
+                                    let formatted = format!("[{tool}] {result}");
+                                    yield AgentEvent::Text(formatted.clone());
+                                    text_chunks.push(formatted);
+                                }
+                                Ok(Event::Usage(u)) => {
+                                    yield AgentEvent::Usage(u);
+                                }
+                                Err(e) => {
+                                    let error_msg = e.to_string();
+                                    if error_msg.contains("malformed function call") {
+                                        tracing::warn!("Model generated malformed function call, retrying...");
+                                        malformed_function_call = true;
+                                        break;
+                                    }
+                                    error = Some(error_msg);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    ModelTier::Fast => {
+                        let stream = self.fast.respond(request);
+                        futures_lite::pin!(stream);
+
+                        while let Some(event) = stream.next().await {
+                            match event {
+                                Ok(Event::Text(text)) => {
+                                    self.hooks.on_text(&text).await;
+                                    yield AgentEvent::Text(text.clone());
+                                    text_chunks.push(text);
+                                }
+                                Ok(Event::Reasoning(r)) => {
+                                    yield AgentEvent::Reasoning(r);
+                                }
+                                Ok(Event::ToolCall(call)) => tool_calls.push(call),
+                                Ok(Event::BuiltInToolResult { tool, result }) => {
+                                    let formatted = format!("[{tool}] {result}");
+                                    yield AgentEvent::Text(formatted.clone());
+                                    text_chunks.push(formatted);
+                                }
+                                Ok(Event::Usage(u)) => {
+                                    yield AgentEvent::Usage(u);
+                                }
+                                Err(e) => {
+                                    let error_msg = e.to_string();
+                                    if error_msg.contains("malformed function call") {
+                                        tracing::warn!("Model generated malformed function call, retrying...");
+                                        malformed_function_call = true;
+                                        break;
+                                    }
+                                    error = Some(error_msg);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(e) = error {
+                    Err(AgentError::Llm(e))?;
+                }
+
+                // If malformed function call, retry this iteration
+                if malformed_function_call {
+                    continue;
+                }
+
+                let response_text = text_chunks.join("");
+                all_text_chunks.extend(text_chunks);
+
+                // If no tool calls, we're done
+                if tool_calls.is_empty() {
+                    if !response_text.is_empty() {
+                        self.memory.push(Message::assistant(&response_text));
+                    }
+                    break response_text;
+                }
+
+                // Store assistant response with tool calls in memory
+                self.memory.push(Message::assistant_with_tool_calls(
+                    &response_text,
+                    tool_calls.clone(),
+                ));
+
+                // Snapshot todo state BEFORE executing tool calls
+                let old_todo_items: Vec<TodoItem> = self
+                    .todo_list
+                    .as_ref()
+                    .map(|l| l.items())
+                    .unwrap_or_default();
+
+                // Track tool names for later todo detection
+                let tool_names: Vec<_> = tool_calls.iter().map(|c| c.name.clone()).collect();
+
+                // Yield tool call start events
+                for call in &tool_calls {
+                    yield AgentEvent::ToolCallStart {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.to_string(),
+                    };
+                }
+
+                // Execute tool calls in parallel
+                let tools = &self.tools;
+                let hooks = &self.hooks;
+                let tool_futures = tool_calls.iter().map(|call| {
+                    let args_json = call.arguments.to_string();
+                    let message_count = self.memory.len();
+
+                    async move {
+                        let tool_ctx = ToolUseContext {
+                            tool_name: &call.name,
+                            arguments: &args_json,
+                            turn: iteration,
+                            message_count,
+                        };
+
+                        let (result, duration) = match hooks.pre_tool_use(&tool_ctx).await {
+                            PreToolAction::Abort(reason) => {
+                                return Err(AgentError::HookRejected {
+                                    hook: "pre_tool_use",
+                                    reason,
+                                });
+                            }
+                            PreToolAction::Deny(reason) => {
+                                (Err(anyhow::anyhow!(reason)), Duration::ZERO)
+                            }
+                            PreToolAction::Allow => {
+                                let start = Instant::now();
+                                let result = tools.call(&call.name, &args_json).await;
+                                let result = result.map(|output| output.as_str().unwrap_or("").to_string());
+                                (result, start.elapsed())
+                            }
+                        };
+
+                        let result_str = match &result {
+                            Ok(s) => s.clone(),
+                            Err(e) => format!("Error: {e}"),
+                        };
+                        let result_ref = result
+                            .as_ref()
+                            .map(|s| s.as_str())
+                            .map_err(|e| e.to_string());
+                        let result_ctx = ToolResultContext {
+                            tool_name: &call.name,
+                            arguments: &args_json,
+                            result: result_ref.as_ref().map(|s| *s).map_err(|s| s.as_str()),
+                            duration,
+                        };
+
+                        let tool_content = match hooks.post_tool_use(&result_ctx).await {
+                            PostToolAction::Abort(reason) => {
+                                return Err(AgentError::HookRejected {
+                                    hook: "post_tool_use",
+                                    reason,
+                                });
+                            }
+                            PostToolAction::Replace(replacement) => replacement,
+                            PostToolAction::Keep => result_str,
+                        };
+
+                        Ok((call.id.clone(), call.name.clone(), tool_content))
+                    }
+                });
+
+                // Wait for all tool calls to complete
+                let results: Vec<Result<(String, String, String), AgentError>> =
+                    futures::future::join_all(tool_futures).await;
+
+                // Check if todo tool was called
+                let todo_tool_called = tool_names.iter().any(|name| name == "todo");
+
+                // Add results to memory and yield tool end events
+                let mut has_tool_error = false;
+                for result in results {
+                    let (call_id, call_name, content) = result?;
+
+                    // Yield tool call end event
+                    yield AgentEvent::ToolCallEnd {
+                        id: call_id.clone(),
+                        name: call_name,
+                        result: Ok(content.clone()),
+                    };
+
+                    if content.contains("not found") || content.contains("Invalid arguments") {
+                        has_tool_error = true;
+                    }
+                    let processed_content = self.process_reload_marker(&content);
+                    self.memory.push(Message::tool(&call_id, processed_content));
+                }
+
+                // If there was a tool error, inject a reminder
+                if has_tool_error {
+                    let reminder = concat!(
+                        "<system-reminder>\n",
+                        "IMPORTANT: You have exactly ONE tool: `bash`. ",
+                        "All other capabilities (websearch, webfetch, task, etc.) are bash commands, not separate tools.\n\n",
+                        "Correct usage:\n",
+                        "- websearch: bash with script `websearch \"query\"`\n",
+                        "- webfetch: bash with script `webfetch \"url\"`\n",
+                        "- Network commands (websearch, webfetch) work in sandboxed mode - they handle network internally.\n",
+                        "- Only use mode=\"network\" when YOUR bash script needs direct network access (curl, wget, etc.).\n",
+                        "</system-reminder>"
+                    );
+                    self.memory.push(Message::system(reminder));
+                }
+
+                // If todo tool was called, inject updated todo list
+                if todo_tool_called {
+                    let new_items = self
+                        .todo_list
+                        .as_ref()
+                        .map(|l| l.items())
+                        .unwrap_or_default();
+
+                    let newly_completed: Vec<_> = new_items
+                        .iter()
+                        .filter(|new_item| {
+                            new_item.status == TodoStatus::Completed
+                                && old_todo_items.iter().any(|old| {
+                                    old.content == new_item.content
+                                        && old.status != TodoStatus::Completed
+                                })
+                        })
+                        .collect();
+
+                    if let Some(completed) = newly_completed.first() {
+                        if let Some(reminder) = self.format_next_task_reminder(&completed.content) {
+                            self.memory.push(Message::system(&reminder));
+                        }
+                    } else if let Some(reminder) = self.format_todo_reminder() {
+                        self.memory.push(Message::system(&reminder));
+                    }
+                }
+
+                // Poll for completed background tasks
+                if let Some(ref receiver) = self.background_receiver {
+                    let completed_tasks = receiver.take_completed();
+                    for task in completed_tasks {
+                        tracing::info!(task_id = %task.task_id, "background task completed");
+                        let result_msg = self.format_background_task_result(&task);
+                        self.memory.push(Message::system(&result_msg));
+                    }
+                }
+            };
+
+            // Handle background tasks before completing
+            if let Some(ref receiver) = self.background_receiver {
+                let completed_tasks = receiver.take_completed();
+                let mut had_completed = !completed_tasks.is_empty();
+                for task in completed_tasks {
+                    tracing::info!(task_id = %task.task_id, "background task completed (final check)");
+                    let result_msg = self.format_background_task_result(&task);
+                    self.memory.push(Message::system(&result_msg));
+                }
+
+                const MAX_WAIT: Duration = Duration::from_secs(300);
+                const POLL_INTERVAL: Duration = Duration::from_millis(100);
+                let start = Instant::now();
+
+                while start.elapsed() < MAX_WAIT {
+                    if let Some(task) = receiver.recv_timeout(POLL_INTERVAL).await {
+                        tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
+                        let result_msg = self.format_background_task_result(&task);
+                        self.memory.push(Message::system(&result_msg));
+                        had_completed = true;
+                    } else {
+                        let has_running = self
+                            .background_receiver
+                            .as_ref()
+                            .is_some_and(|receiver| receiver.has_running());
+                        if !has_running {
+                            break;
+                        }
+                    }
+                }
+
+                if had_completed {
+                    // Continue processing with background results
+                    let continuation = self.continue_after_background_streaming().await;
+                    for event in continuation {
+                        yield event?;
+                    }
+                    return;
+                }
+            }
+
+            // Notify hooks
+            let stop_ctx = StopContext {
+                final_text: &final_text,
+                turns: iteration,
+                reason: StopReason::Complete,
+            };
+
+            if let Some(reason) = self.hooks.on_stop(&stop_ctx).await {
+                Err(AgentError::HookRejected {
+                    hook: "on_stop",
+                    reason,
+                })?;
+            }
+
+            // Yield completion event
+            yield AgentEvent::Complete {
+                final_text,
+                turns: iteration,
+            };
+        }
     }
 
     /// Registers a tool for the agent to use.
@@ -238,11 +662,7 @@ where
         self.tools.register(tool);
     }
 
-    /// Registers a deferred tool (loaded via search).
-    pub fn register_deferred_tool<T: aither_core::llm::Tool + 'static>(&mut self, tool: T) {
-        self.tools.register_deferred(tool);
-    }
-
+    /// Registers a tool (alias for register_tool).
     /// Adds a message to the conversation history.
     pub fn push_message(&mut self, message: Message) {
         self.memory.push(message);
@@ -326,397 +746,138 @@ where
         self.initialized = true;
     }
 
-    /// Runs a single query turn with tool loop handling.
-    async fn run_query(&mut self, prompt: &str) -> Result<String, AgentError> {
-        // Apply context compression if needed
-        self.maybe_compress().await?;
+    /// Builds the message list for an LLM request (system prompt + todo context + memory).
+    fn build_request_messages(&self) -> Vec<Message> {
+        let mut messages = Vec::new();
 
-        // Add user message
-        self.memory.push(Message::user(prompt));
-
-        // Run the tool loop
-        let mut iteration = 0;
-        let mut final_text = String::new();
-
-        loop {
-            iteration += 1;
-            if iteration > self.config.max_iterations {
-                return Err(AgentError::MaxIterations {
-                    limit: self.config.max_iterations,
-                });
-            }
-
-            // Build messages
-            let mut messages = Vec::new();
-
-            // System prompt (static for caching)
-            if let Some(ref system_prompt) = self.config.system_prompt {
-                messages.push(Message::system(system_prompt));
-            }
-
-            // Previous conversation
-            messages.extend(self.memory.all());
-
-            // Create request with tool definitions
-            let tool_defs = self.tools.active_definitions();
-            let request = LLMRequest::new(messages).with_tool_definitions(tool_defs);
-
-            // Stream and collect the response using the selected tier model
-            // Macro to process stream from any model type (handles different error types)
-            macro_rules! process_stream {
-                ($model:expr, $request:expr) => {{
-                    let stream = $model.respond($request);
-                    futures_lite::pin!(stream);
-
-                    let mut text_chunks = Vec::new();
-                    let mut tool_calls = Vec::new();
-                    let mut malformed_function_call = false;
-                    let mut error: Option<String> = None;
-
-                    while let Some(event) = stream.next().await {
-                        match event {
-                            Ok(Event::Text(text)) => text_chunks.push(text),
-                            Ok(Event::Reasoning(_)) => {} // Observability only
-                            Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                            Ok(Event::BuiltInToolResult { tool, result }) => {
-                                text_chunks.push(format!("[{tool}] {result}"));
-                            }
-                            Ok(Event::Usage(_)) => {} // TODO: Track usage
-                            Err(e) => {
-                                let error_msg = e.to_string();
-                                if error_msg.contains("malformed function call") {
-                                    tracing::warn!("Model generated malformed function call, retrying...");
-                                    malformed_function_call = true;
-                                    break;
-                                }
-                                error = Some(error_msg);
-                                break;
-                            }
-                        }
-                    }
-
-                    (text_chunks, tool_calls, malformed_function_call, error)
-                }};
-            }
-
-            let (text_chunks, tool_calls, malformed_function_call, error) = match self.tier {
-                ModelTier::Advanced => process_stream!(self.advanced, request.clone()),
-                ModelTier::Balanced => process_stream!(self.balanced, request.clone()),
-                ModelTier::Fast => process_stream!(self.fast, request),
-            };
-
-            if let Some(e) = error {
-                return Err(AgentError::Llm(e));
-            }
-
-            // If malformed function call, retry this iteration
-            if malformed_function_call {
-                continue;
-            }
-
-            let response_text = text_chunks.join("");
-
-            // If no tool calls, we're done
-            if tool_calls.is_empty() {
-                final_text = response_text.clone();
-
-                // Store assistant response in memory
-                if !response_text.is_empty() {
-                    self.memory.push(Message::assistant(&response_text));
-                }
-
-                break;
-            }
-
-            // Store assistant response with tool calls in memory
-            self.memory
-                .push(Message::assistant_with_tool_calls(&response_text, tool_calls.clone()));
-
-            // Snapshot todo state BEFORE executing tool calls
-            let old_todo_items: Vec<TodoItem> = self
-                .todo_list
-                .as_ref()
-                .map(|l| l.items())
-                .unwrap_or_default();
-
-            // Track tool names for later todo detection
-            let tool_names: Vec<_> = tool_calls.iter().map(|c| c.name.clone()).collect();
-
-            // Execute tool calls in parallel
-            let hooks = &self.hooks;
-            let tools = &self.tools;
-            let tool_futures = tool_calls.iter().map(|call| {
-                let args_json = call.arguments.to_string();
-                let message_count = self.memory.len();
-
-                async move {
-                    // Pre-tool hook
-                    let tool_ctx = ToolUseContext {
-                        tool_name: &call.name,
-                        arguments: &args_json,
-                        turn: iteration,
-                        message_count,
-                    };
-
-                    let (result, duration) = match hooks.pre_tool_use(&tool_ctx).await {
-                        PreToolAction::Abort(reason) => {
-                            return Err(AgentError::HookRejected {
-                                hook: "pre_tool_use",
-                                reason,
-                            });
-                        }
-                        PreToolAction::Deny(reason) => (Err(anyhow::anyhow!(reason)), Duration::ZERO),
-                        PreToolAction::Allow => {
-                            let start = Instant::now();
-                            let result = tools.call(&call.name, &args_json).await;
-                            // Convert ToolOutput to String for hook and message passing
-                            let result = result.map(|output| {
-                                output.as_str().unwrap_or("").to_string()
-                            });
-                            (result, start.elapsed())
-                        }
-                    };
-
-                    // Post-tool hook
-                    let result_str = match &result {
-                        Ok(s) => s.clone(),
-                        Err(e) => format!("Error: {e}"),
-                    };
-                    let result_ref = result
-                        .as_ref()
-                        .map(|s| s.as_str())
-                        .map_err(|e| e.to_string());
-                    let result_ctx = ToolResultContext {
-                        tool_name: &call.name,
-                        arguments: &args_json,
-                        result: result_ref.as_ref().map(|s| *s).map_err(|s| s.as_str()),
-                        duration,
-                    };
-
-                    let tool_content = match hooks.post_tool_use(&result_ctx).await {
-                        PostToolAction::Abort(reason) => {
-                            return Err(AgentError::HookRejected {
-                                hook: "post_tool_use",
-                                reason,
-                            });
-                        }
-                        PostToolAction::Replace(replacement) => replacement,
-                        PostToolAction::Keep => result_str,
-                    };
-
-                    Ok((call.id.clone(), tool_content))
-                }
-            });
-
-            // Wait for all tool calls to complete
-            let results: Vec<Result<(String, String), AgentError>> =
-                futures::future::join_all(tool_futures).await;
-
-            // Check if todo tool was called
-            let todo_tool_called = tool_names.iter().any(|name| name == "todo");
-
-            // Add results to memory in order
-            for result in results {
-                let (call_id, content) = result?;
-                // Process reload markers to inject file content
-                let processed_content = self.process_reload_marker(&content);
-                self.memory.push(Message::tool(&call_id, processed_content));
-            }
-
-            // If todo tool was called, inject the updated todo list as a system reminder
-            if todo_tool_called {
-                // Get newly completed tasks by comparing old vs new state
-                let new_items = self
-                    .todo_list
-                    .as_ref()
-                    .map(|l| l.items())
-                    .unwrap_or_default();
-
-                // Find tasks that were just marked completed
-                let newly_completed: Vec<_> = new_items
-                    .iter()
-                    .filter(|new_item| {
-                        new_item.status == TodoStatus::Completed
-                            && old_todo_items.iter().any(|old| {
-                                old.content == new_item.content
-                                    && old.status != TodoStatus::Completed
-                            })
-                    })
-                    .collect();
-
-                // Generate appropriate reminder
-                if let Some(completed) = newly_completed.first() {
-                    // A task was just completed - show next task reminder
-                    if let Some(reminder) = self.format_next_task_reminder(&completed.content) {
-                        self.memory.push(Message::system(&reminder));
-                    }
-                } else if let Some(reminder) = self.format_todo_reminder() {
-                    // Todo list changed but no task completed - show full list
-                    self.memory.push(Message::system(&reminder));
-                }
-            }
-
-            // Poll for completed background tasks and inject results
-            if let Some(ref receiver) = self.background_receiver {
-                let completed_tasks = receiver.take_completed();
-                for task in completed_tasks {
-                    tracing::info!(task_id = task.task_id, "background task completed");
-                    let result_msg = self.format_background_task_result(&task);
-                    self.memory.push(Message::system(&result_msg));
-                }
-            }
-
-            // Continue the loop to get the next response
+        if let Some(ref system_prompt) = self.config.system_prompt {
+            messages.push(Message::system(system_prompt));
         }
 
-        // Before returning, check for pending background tasks
-        // If the agent finished but there are pending tasks, wait for them
-        if let Some(ref receiver) = self.background_receiver {
-            // First, inject any already completed tasks
-            let completed_tasks = receiver.take_completed();
-            let mut had_completed = !completed_tasks.is_empty();
-            for task in completed_tasks {
-                tracing::info!(task_id = task.task_id, "background task completed (final check)");
-                let result_msg = self.format_background_task_result(&task);
-                self.memory.push(Message::system(&result_msg));
-            }
-
-            // Wait for any pending tasks with a reasonable timeout
-            // This uses a loop with short timeouts to check for new completions
-            const MAX_WAIT: Duration = Duration::from_secs(300); // 5 minute max wait
-            const POLL_INTERVAL: Duration = Duration::from_millis(100);
-            let start = Instant::now();
-
-            while start.elapsed() < MAX_WAIT {
-                if let Some(task) = receiver.recv_timeout(POLL_INTERVAL).await {
-                    tracing::info!(task_id = task.task_id, "background task completed (waiting)");
-                    let result_msg = self.format_background_task_result(&task);
-                    self.memory.push(Message::system(&result_msg));
-                    had_completed = true;
-                } else {
-                    // No task completed within timeout - check if we should keep waiting
-                    // If no more tasks are pending, we can stop
-                    if !receiver.has_completed() {
-                        break;
-                    }
-                }
-            }
-
-            // If any background tasks completed, continue the agent loop to let it react
-            if had_completed {
-                // Recursively continue processing
-                return self.continue_after_background().await;
-            }
+        if let Some(todo_ctx) = self.format_todo_context() {
+            messages.push(Message::system(todo_ctx));
         }
 
-        // Notify hooks
-        let stop_ctx = StopContext {
-            final_text: &final_text,
-            turns: iteration,
-            reason: StopReason::Complete,
-        };
-
-        if let Some(reason) = self.hooks.on_stop(&stop_ctx).await {
-            return Err(AgentError::HookRejected {
-                hook: "on_stop",
-                reason,
-            });
-        }
-
-        Ok(final_text)
+        messages.extend(self.memory.all());
+        messages
     }
 
-    /// Continues agent processing after background tasks complete.
-    ///
-    /// This runs a continuation turn where the agent can react to the
-    /// injected background task results.
-    async fn continue_after_background(&mut self) -> Result<String, AgentError> {
-        // Run a continuation turn - the agent sees the injected background results
-        // and can choose to respond or take further action
+    /// Continues agent processing after background tasks complete (streaming version).
+    async fn continue_after_background_streaming(&mut self) -> Vec<Result<AgentEvent, AgentError>> {
+        let mut events = Vec::new();
         let mut iteration = 0;
-        let mut final_text = String::new();
 
         loop {
             iteration += 1;
             if iteration > self.config.max_iterations {
-                return Err(AgentError::MaxIterations {
+                events.push(Err(AgentError::MaxIterations {
                     limit: self.config.max_iterations,
-                });
+                }));
+                return events;
             }
 
-            // Build messages
-            let mut messages = Vec::new();
-
-            // System prompt (static for caching)
-            if let Some(ref system_prompt) = self.config.system_prompt {
-                messages.push(Message::system(system_prompt));
-            }
-
-            // Previous conversation (includes injected background results)
-            messages.extend(self.memory.all());
-
-            // Create request with tool definitions
+            let messages = self.build_request_messages();
             let tool_defs = self.tools.active_definitions();
             let request = LLMRequest::new(messages).with_tool_definitions(tool_defs);
 
-            // Process response using the appropriate tier
-            macro_rules! process_stream {
-                ($model:expr, $request:expr) => {{
-                    let stream = $model.respond($request);
+            let mut text_chunks = Vec::new();
+            let mut tool_calls = Vec::new();
+            let mut error: Option<String> = None;
+
+            // Process stream based on tier
+            match self.tier {
+                ModelTier::Advanced => {
+                    let stream = self.advanced.respond(request);
                     futures_lite::pin!(stream);
-
-                    let mut text_chunks = Vec::new();
-                    let mut tool_calls = Vec::new();
-                    let mut error: Option<String> = None;
-
                     while let Some(event) = stream.next().await {
                         match event {
-                            Ok(Event::Text(text)) => text_chunks.push(text),
-                            Ok(Event::Reasoning(_)) => {}
+                            Ok(Event::Text(text)) => {
+                                self.hooks.on_text(&text).await;
+                                events.push(Ok(AgentEvent::Text(text.clone())));
+                                text_chunks.push(text);
+                            }
+                            Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
                             Ok(Event::ToolCall(call)) => tool_calls.push(call),
                             Ok(Event::BuiltInToolResult { tool, result }) => {
-                                text_chunks.push(format!("[{tool}] {result}"));
+                                let formatted = format!("[{tool}] {result}");
+                                events.push(Ok(AgentEvent::Text(formatted.clone())));
+                                text_chunks.push(formatted);
                             }
-                            Ok(Event::Usage(_)) => {}
-                            Err(e) => {
-                                error = Some(e.to_string());
-                                break;
-                            }
+                            Ok(Event::Usage(u)) => events.push(Ok(AgentEvent::Usage(u))),
+                            Err(e) => { error = Some(e.to_string()); break; }
                         }
                     }
-
-                    (text_chunks, tool_calls, error)
-                }};
+                }
+                ModelTier::Balanced => {
+                    let stream = self.balanced.respond(request);
+                    futures_lite::pin!(stream);
+                    while let Some(event) = stream.next().await {
+                        match event {
+                            Ok(Event::Text(text)) => {
+                                self.hooks.on_text(&text).await;
+                                events.push(Ok(AgentEvent::Text(text.clone())));
+                                text_chunks.push(text);
+                            }
+                            Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
+                            Ok(Event::ToolCall(call)) => tool_calls.push(call),
+                            Ok(Event::BuiltInToolResult { tool, result }) => {
+                                let formatted = format!("[{tool}] {result}");
+                                events.push(Ok(AgentEvent::Text(formatted.clone())));
+                                text_chunks.push(formatted);
+                            }
+                            Ok(Event::Usage(u)) => events.push(Ok(AgentEvent::Usage(u))),
+                            Err(e) => { error = Some(e.to_string()); break; }
+                        }
+                    }
+                }
+                ModelTier::Fast => {
+                    let stream = self.fast.respond(request);
+                    futures_lite::pin!(stream);
+                    while let Some(event) = stream.next().await {
+                        match event {
+                            Ok(Event::Text(text)) => {
+                                self.hooks.on_text(&text).await;
+                                events.push(Ok(AgentEvent::Text(text.clone())));
+                                text_chunks.push(text);
+                            }
+                            Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
+                            Ok(Event::ToolCall(call)) => tool_calls.push(call),
+                            Ok(Event::BuiltInToolResult { tool, result }) => {
+                                let formatted = format!("[{tool}] {result}");
+                                events.push(Ok(AgentEvent::Text(formatted.clone())));
+                                text_chunks.push(formatted);
+                            }
+                            Ok(Event::Usage(u)) => events.push(Ok(AgentEvent::Usage(u))),
+                            Err(e) => { error = Some(e.to_string()); break; }
+                        }
+                    }
+                }
             }
 
-            let (text_chunks, tool_calls, error) = match self.tier {
-                ModelTier::Advanced => process_stream!(self.advanced, request.clone()),
-                ModelTier::Balanced => process_stream!(self.balanced, request.clone()),
-                ModelTier::Fast => process_stream!(self.fast, request),
-            };
-
             if let Some(e) = error {
-                return Err(AgentError::Llm(e));
+                events.push(Err(AgentError::Llm(e)));
+                return events;
             }
 
             let response_text = text_chunks.join("");
 
-            // If no tool calls, we're done
             if tool_calls.is_empty() {
-                final_text = response_text.clone();
-
                 if !response_text.is_empty() {
                     self.memory.push(Message::assistant(&response_text));
                 }
-
-                break;
+                events.push(Ok(AgentEvent::Complete {
+                    final_text: response_text,
+                    turns: iteration,
+                }));
+                return events;
             }
 
-            // Store assistant response with tool calls
-            self.memory
-                .push(Message::assistant_with_tool_calls(&response_text, tool_calls.clone()));
+            self.memory.push(Message::assistant_with_tool_calls(
+                &response_text,
+                tool_calls.clone(),
+            ));
 
-            // Execute tool calls (simplified - no hooks in continuation)
+            // Execute tool calls
             let tools = &self.tools;
             let tool_futures = tool_calls.iter().map(|call| {
                 let args_json = call.arguments.to_string();
@@ -726,18 +887,22 @@ where
                         Ok(output) => output.as_str().unwrap_or("").to_string(),
                         Err(e) => format!("Error: {e}"),
                     };
-                    (call.id.clone(), result_str)
+                    (call.id.clone(), call.name.clone(), result_str)
                 }
             });
 
-            let results: Vec<(String, String)> = futures::future::join_all(tool_futures).await;
+            let results: Vec<(String, String, String)> = futures::future::join_all(tool_futures).await;
 
-            for (call_id, content) in results {
+            for (call_id, call_name, content) in results {
+                events.push(Ok(AgentEvent::ToolCallEnd {
+                    id: call_id.clone(),
+                    name: call_name,
+                    result: Ok(content.clone()),
+                }));
                 let processed_content = self.process_reload_marker(&content);
                 self.memory.push(Message::tool(&call_id, processed_content));
             }
 
-            // Poll for more completed background tasks
             if let Some(ref receiver) = self.background_receiver {
                 let completed_tasks = receiver.take_completed();
                 for task in completed_tasks {
@@ -746,8 +911,6 @@ where
                 }
             }
         }
-
-        Ok(final_text)
     }
 
     /// Minimum content length to consider for URL allocation during compression.
@@ -834,7 +997,9 @@ where
             std::collections::HashMap::new();
 
         {
-            let store = output_store.read().map_err(|_| AgentError::Llm("output store lock poisoned".to_string()))?;
+            let store = output_store
+                .read()
+                .map_err(|_| AgentError::Llm("output store lock poisoned".to_string()))?;
 
             for msg in to_compress {
                 // Only allocate URLs for large tool results
@@ -869,7 +1034,9 @@ where
         if !files_to_write.is_empty() {
             // Get the output directory while holding the lock briefly
             let output_dir = {
-                let store = output_store.read().map_err(|_| AgentError::Llm("output store lock poisoned".to_string()))?;
+                let store = output_store
+                    .read()
+                    .map_err(|_| AgentError::Llm("output store lock poisoned".to_string()))?;
                 store.dir().to_path_buf()
             };
 
@@ -904,27 +1071,24 @@ where
         if items.is_empty() {
             return None;
         }
+        let items_json = format_todo_items_json(&items);
+        Some(format!(
+            "<system-reminder>\nYour todo list has changed. DO NOT mention this explicitly to the user. Here are the latest contents of your todo list:\n\n{items_json}. Continue on with the tasks at hand if applicable.\n</system-reminder>"
+        ))
+    }
 
-        let mut reminder = String::from("<system-reminder>\nYour todo list has changed. DO NOT mention this explicitly to the user. Here are the latest contents of your todo list:\n\n[");
-
-        for (i, item) in items.iter().enumerate() {
-            if i > 0 {
-                reminder.push_str(", ");
-            }
-            let status = match item.status {
-                TodoStatus::Pending => "pending",
-                TodoStatus::InProgress => "in_progress",
-                TodoStatus::Completed => "completed",
-            };
-            reminder.push_str(&format!(
-                "{{\"content\":\"{}\",\"status\":\"{}\",\"activeForm\":\"{}\"}}",
-                item.content, status, item.active_form
-            ));
+    /// Formats the current todo list for context injection before each request.
+    fn format_todo_context(&self) -> Option<String> {
+        let list = self.todo_list.as_ref()?;
+        let items = list.items();
+        if items.is_empty() {
+            return None;
         }
 
-        reminder.push_str("]. Continue on with the tasks at hand if applicable.\n</system-reminder>");
-
-        Some(reminder)
+        let items_json = format_todo_items_json(&items);
+        Some(format!(
+            "<system-reminder>\nCurrent todo list (do not mention this explicitly to the user):\n\n{items_json}\n</system-reminder>"
+        ))
     }
 
     /// Formats a completed background task result as a system message.
@@ -974,16 +1138,14 @@ where
         let items = list.items();
 
         // Find the next pending or in_progress task
-        let next_task = items.iter().find(|item| {
-            matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress)
-        });
+        let next_task = items
+            .iter()
+            .find(|item| matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress));
 
         if let Some(task) = next_task {
             Some(format!(
                 "<system-reminder>\nTask \"{}\" completed. Next task: {} ({})\n</system-reminder>",
-                completed_task,
-                task.content,
-                task.active_form
+                completed_task, task.content, task.active_form
             ))
         } else if items.iter().all(|i| i.status == TodoStatus::Completed) {
             Some(format!(
@@ -994,6 +1156,11 @@ where
             None
         }
     }
+}
+
+/// Formats todo items into the JSON-ish list used in system reminders.
+fn format_todo_items_json(items: &[TodoItem]) -> String {
+    serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Truncates a script for display in messages.

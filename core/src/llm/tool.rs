@@ -554,8 +554,13 @@ fn clean_schema(value: &mut Value) {
     // Second pass: resolve refs and clean
     resolve_and_clean(value, &defs);
 
-    // Ensure root has type: object (required by OpenAI function calling)
+    // Clean up root-level schema
     if let Value::Object(map) = value {
+        // Remove root-level description - it's already used as tool description
+        // Keeping it duplicates the description in the API request
+        map.remove("description");
+
+        // Ensure root has type: object (required by OpenAI function calling)
         if map.contains_key("properties") && !map.contains_key("type") {
             map.insert("type".to_string(), Value::String("object".to_string()));
         }
@@ -607,7 +612,8 @@ fn resolve_and_clean_inner(
             }
 
             // Flatten oneOf/anyOf variants (before filtering, since oneOf is not in allowed list)
-            if let Some(Value::Array(variants)) = map.remove("oneOf").or_else(|| map.remove("anyOf"))
+            if let Some(Value::Array(variants)) =
+                map.remove("oneOf").or_else(|| map.remove("anyOf"))
             {
                 // Check if this is a simple string enum (variants have const/type but no properties)
                 let is_simple_enum = variants.iter().all(|v| {
@@ -838,7 +844,10 @@ impl Tools {
     /// where the concrete type isn't known at compile time.
     pub fn register_dyn<F>(&mut self, definition: ToolDefinition, handler: F)
     where
-        F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send>> + Send + Sync + 'static,
+        F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
         let name = definition.name.clone();
         assert!(
@@ -847,7 +856,13 @@ impl Tools {
             name
         );
 
-        self.tools.insert(name, Box::new(DynToolImpl { definition, handler }));
+        self.tools.insert(
+            name,
+            Box::new(DynToolImpl {
+                definition,
+                handler,
+            }),
+        );
     }
 
     /// Removes a tool from the registry.
@@ -1190,11 +1205,31 @@ mod tests {
 
         // Check that status has enum values
         let schema_obj = schema.as_object().expect("schema should be object");
-        let properties = schema_obj.get("properties").expect("should have properties").as_object().unwrap();
-        let items = properties.get("items").expect("should have items").as_object().unwrap();
-        let item_props = items.get("items").expect("items should have items schema").as_object().unwrap();
-        let item_properties = item_props.get("properties").expect("item should have properties").as_object().unwrap();
-        let status = item_properties.get("status").expect("should have status").as_object().unwrap();
+        let properties = schema_obj
+            .get("properties")
+            .expect("should have properties")
+            .as_object()
+            .unwrap();
+        let items = properties
+            .get("items")
+            .expect("should have items")
+            .as_object()
+            .unwrap();
+        let item_props = items
+            .get("items")
+            .expect("items should have items schema")
+            .as_object()
+            .unwrap();
+        let item_properties = item_props
+            .get("properties")
+            .expect("item should have properties")
+            .as_object()
+            .unwrap();
+        let status = item_properties
+            .get("status")
+            .expect("should have status")
+            .as_object()
+            .unwrap();
 
         // Status should have enum
         assert!(

@@ -10,12 +10,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use aither_core::{LanguageModel, llm::{Tool, ToolOutput}};
+use aither_sandbox::BashToolFactory;
+use aither_core::{
+    LanguageModel,
+    llm::{Tool, ToolOutput},
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::subagent_file::SubagentDefinition;
 use crate::AgentBuilder;
+use crate::subagent_file::SubagentDefinition;
 
 /// Builder function type for configuring a subagent.
 /// Returns an AgentBuilder so we can add hooks before building.
@@ -28,6 +32,14 @@ pub struct SubagentType<LLM> {
     pub description: String,
     /// Builder function that creates the configured agent builder.
     builder: SubagentBuilder<LLM>,
+}
+
+impl<LLM> std::fmt::Debug for SubagentType<LLM> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubagentType")
+            .field("description", &self.description)
+            .finish()
+    }
 }
 
 impl<LLM: Clone> SubagentType<LLM> {
@@ -105,6 +117,20 @@ pub struct TaskArgs {
 pub struct TaskTool<LLM> {
     llm: LLM,
     types: HashMap<String, SubagentType<LLM>>,
+    /// Base directory for resolving relative paths (e.g., sandbox directory).
+    base_dir: Option<std::path::PathBuf>,
+    /// Factory for creating child bash tools for subagents.
+    bash_tool_factory: Option<BashToolFactory>,
+}
+
+impl<LLM> std::fmt::Debug for TaskTool<LLM> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let type_names: Vec<_> = self.types.keys().cloned().collect();
+        f.debug_struct("TaskTool")
+            .field("type_names", &type_names)
+            .field("base_dir", &self.base_dir)
+            .finish()
+    }
 }
 
 impl<LLM: Clone> TaskTool<LLM> {
@@ -113,7 +139,26 @@ impl<LLM: Clone> TaskTool<LLM> {
         Self {
             llm,
             types: HashMap::new(),
+            base_dir: None,
+            bash_tool_factory: None,
         }
+    }
+
+    /// Sets the base directory for resolving relative paths.
+    ///
+    /// Paths like `.subagents/...` and `.skills/...` will be resolved
+    /// relative to this directory.
+    #[must_use]
+    pub fn with_base_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.base_dir = Some(dir.into());
+        self
+    }
+
+    /// Sets the bash tool factory used for subagents.
+    #[must_use]
+    pub fn with_bash_tool_factory(mut self, factory: BashToolFactory) -> Self {
+        self.bash_tool_factory = Some(factory);
+        self
     }
 
     /// Register a subagent type.
@@ -185,29 +230,45 @@ where
 
         let (subagent_id, agent_builder) = if is_file_path {
             // Load subagent from file
-            // Try paths in order: as-is, then under .subagents/, then under .skills/
+            // Resolve paths relative to base_dir if set (e.g., sandbox directory)
             let file_path = &args.subagent;
-            let path = Path::new(file_path);
+            let base = self.base_dir.as_deref().unwrap_or(Path::new("."));
+
+            // Try paths in order:
+            // 1. As-is relative to base_dir
+            // 2. Under .subagents/ relative to base_dir
+            // 3. Under .skills/ relative to base_dir
+            let path = base.join(file_path);
             let resolved_path = if path.exists() {
-                path.to_path_buf()
+                path
             } else {
-                let subagents_path = Path::new(".subagents").join(file_path);
+                let subagents_path = base.join(".subagents").join(file_path);
                 if subagents_path.exists() {
                     subagents_path
                 } else {
-                    let skills_path = Path::new(".skills").join(file_path);
+                    let skills_path = base.join(".skills").join(file_path);
                     if skills_path.exists() {
                         skills_path
                     } else {
                         // Return original path for error message
-                        path.to_path_buf()
+                        path
                     }
                 }
             };
 
             let def = SubagentDefinition::from_file(&resolved_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read subagent file '{}': {e}", resolved_path.display()))?
-                .ok_or_else(|| anyhow::anyhow!("Invalid subagent definition in '{}'", resolved_path.display()))?;
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to read subagent file '{}': {e}",
+                        resolved_path.display()
+                    )
+                })?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Invalid subagent definition in '{}'",
+                        resolved_path.display()
+                    )
+                })?;
 
             let builder = crate::AgentBuilder::new(self.llm.clone())
                 .system_prompt(&def.system_prompt)
@@ -231,7 +292,11 @@ where
         tracing::info!(subagent = %subagent_id, "Starting subagent");
 
         // Add child bash tool if factory is configured
-        let agent_builder = if let Some(dyn_bash) = aither_sandbox::create_child_bash_tool() {
+        let agent_builder = if let Some(factory) = &self.bash_tool_factory {
+            let dyn_bash = factory
+                .create()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to create subagent bash tool: {e}"))?;
             agent_builder.dyn_bash(dyn_bash)
         } else {
             agent_builder
@@ -262,13 +327,12 @@ mod tests {
     fn task_args_schema() {
         let schema = schemars::schema_for!(TaskArgs);
         let value = schema.to_value();
-        println!("Schema: {}", serde_json::to_string_pretty(&value).unwrap());
         let props = value.get("properties").expect("should have properties");
         assert!(props.get("subagent").is_some());
         assert!(props.get("prompt").is_some());
 
         // Check required order
         let required = value.get("required").expect("should have required");
-        println!("Required: {:?}", required);
+        assert!(required.is_array());
     }
 }

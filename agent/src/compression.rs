@@ -99,6 +99,9 @@ pub struct PreservedContent {
     pub errors: Vec<String>,
     /// Shell commands found.
     pub commands: Vec<String>,
+    /// Running background jobs (formatted text).
+    /// Only running jobs are preserved - completed jobs are ephemeral.
+    pub running_jobs: Option<String>,
 }
 
 /// Estimate tokens in a string (rough approximation: ~4 chars per token).
@@ -229,10 +232,18 @@ impl SmartCompressionConfig {
         messages: &[Message],
         preserved: &PreservedContent,
     ) -> Result<String, LLM::Error> {
+        let running_jobs = preserved
+            .running_jobs
+            .as_ref()
+            .map_or(String::new(), |jobs| {
+                format!("- Running background jobs:\n{jobs}")
+            });
+
         let prompt = COMPRESSION_USER_TEMPLATE
             .replace("{file_paths}", &preserved.file_paths.join(", "))
             .replace("{errors}", &preserved.errors.join("\n"))
             .replace("{commands}", &preserved.commands.join("\n"))
+            .replace("{running_jobs}", &running_jobs)
             .replace("{dialogue}", &format_messages(messages));
 
         let request = aither_core::llm::oneshot(COMPRESSION_SYSTEM_PROMPT, prompt);
@@ -270,11 +281,19 @@ impl SmartCompressionConfig {
         // Build content with URLs section
         let content_with_urls = format_content_with_urls(messages, pending_urls);
 
+        let running_jobs = preserved
+            .running_jobs
+            .as_ref()
+            .map_or(String::new(), |jobs| {
+                format!("- Running background jobs:\n{jobs}")
+            });
+
         let prompt = COMPRESSION_URLS_TEMPLATE
             .replace("{content_with_urls}", &content_with_urls)
             .replace("{file_paths}", &preserved.file_paths.join(", "))
             .replace("{errors}", &preserved.errors.join("\n"))
-            .replace("{commands}", &preserved.commands.join("\n"));
+            .replace("{commands}", &preserved.commands.join("\n"))
+            .replace("{running_jobs}", &running_jobs);
 
         let request = aither_core::llm::oneshot(COMPRESSION_SYSTEM_PROMPT, prompt);
         let stream = llm.respond(request);
@@ -410,17 +429,10 @@ fn format_content_with_urls(messages: &[Message], pending_urls: &[ContentWithUrl
 
         if let Some(url_info) = url {
             // Format with URL header
-            output.push_str(&format!(
-                "### [URL: {}]\n{}\n\n",
-                url_info.url, content
-            ));
+            output.push_str(&format!("### [URL: {}]\n{}\n\n", url_info.url, content));
         } else {
             // Format without URL (inline content)
-            output.push_str(&format!(
-                "### [Inline - {:?}]\n{}\n\n",
-                msg.role(),
-                content
-            ));
+            output.push_str(&format!("### [Inline - {:?}]\n{}\n\n", msg.role(), content));
         }
     }
 

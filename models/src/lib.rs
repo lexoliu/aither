@@ -12,7 +12,8 @@
 //! // Lookup by canonical ID
 //! if let Some(info) = lookup("gpt-4o") {
 //!     println!("Context window: {}", info.context_window);
-//!     println!("Tier: {:?}", info.tier);
+//!     println!("Tiers: {:?}", info.tiers);
+//!     println!("Is fast tier: {}", info.has_tier(ModelTier::Fast));
 //!     println!("Has vision: {}", info.abilities.contains(&Ability::Vision));
 //! }
 //!
@@ -39,7 +40,10 @@ pub fn lookup(model_id: &str) -> Option<&'static ModelInfo> {
     let model_lower = model_id.to_lowercase();
 
     // 1. Exact match on canonical ID
-    if let Some(info) = MODELS.iter().find(|m| m.id.eq_ignore_ascii_case(&model_lower)) {
+    if let Some(info) = MODELS
+        .iter()
+        .find(|m| m.id.eq_ignore_ascii_case(&model_lower))
+    {
         return Some(info);
     }
 
@@ -70,13 +74,15 @@ pub fn models_for_provider(provider: &str) -> impl Iterator<Item = &'static Mode
 /// Get all models with a specific ability.
 #[must_use]
 pub fn models_with_ability(ability: Ability) -> impl Iterator<Item = &'static ModelInfo> {
-    MODELS.iter().filter(move |m| m.abilities.contains(&ability))
+    MODELS
+        .iter()
+        .filter(move |m| m.abilities.contains(&ability))
 }
 
 /// Get all models of a specific tier.
 #[must_use]
 pub fn models_by_tier(tier: ModelTier) -> impl Iterator<Item = &'static ModelInfo> {
-    MODELS.iter().filter(move |m| m.tier == tier)
+    MODELS.iter().filter(move |m| m.has_tier(tier))
 }
 
 /// Get all known models.
@@ -94,7 +100,7 @@ mod tests {
         let info = lookup("gpt-4o").unwrap();
         assert_eq!(info.id, "gpt-4o");
         assert_eq!(info.context_window, 128_000);
-        assert_eq!(info.tier, ModelTier::Balanced);
+        assert!(info.has_tier(ModelTier::Fast));
     }
 
     #[test]
@@ -147,16 +153,18 @@ mod tests {
     fn test_models_with_ability() {
         let vision_models: Vec<_> = models_with_ability(Ability::Vision).collect();
         assert!(!vision_models.is_empty());
-        assert!(vision_models
-            .iter()
-            .all(|m| m.abilities.contains(&Ability::Vision)));
+        assert!(
+            vision_models
+                .iter()
+                .all(|m| m.abilities.contains(&Ability::Vision))
+        );
     }
 
     #[test]
     fn test_models_by_tier() {
         let flagship: Vec<_> = models_by_tier(ModelTier::Flagship).collect();
         assert!(!flagship.is_empty());
-        assert!(flagship.iter().all(|m| m.tier == ModelTier::Flagship));
+        assert!(flagship.iter().all(|m| m.has_tier(ModelTier::Flagship)));
     }
 
     #[test]

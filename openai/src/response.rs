@@ -22,9 +22,7 @@ pub enum ResponsesStreamEvent {
     ResponseInProgress,
     /// Response completed
     #[serde(rename = "response.completed")]
-    ResponseCompleted {
-        response: ResponsesStreamResponse,
-    },
+    ResponseCompleted { response: ResponsesStreamResponse },
     /// Response failed
     #[serde(rename = "response.failed")]
     ResponseFailed {
@@ -80,9 +78,7 @@ pub enum ResponsesStreamEvent {
     ReasoningTextDone,
     /// Reasoning summary text delta
     #[serde(rename = "response.reasoning_summary_text.delta")]
-    ReasoningSummaryTextDelta {
-        delta: String,
-    },
+    ReasoningSummaryTextDelta { delta: String },
     /// Reasoning summary done
     #[serde(rename = "response.reasoning_summary_text.done")]
     ReasoningSummaryTextDone,

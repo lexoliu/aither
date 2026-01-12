@@ -63,10 +63,8 @@ impl LanguageModelProvider for GeminiProvider {
                     .map_err(|e| GeminiError::Http(e))?;
             }
 
-            let response: ModelListResponse = builder
-                .json()
-                .await
-                .map_err(|e| GeminiError::Http(e))?;
+            let response: ModelListResponse =
+                builder.json().await.map_err(|e| GeminiError::Http(e))?;
 
             Ok(response
                 .models

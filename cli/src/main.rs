@@ -35,38 +35,82 @@
 //! cargo run -p aither-cli -- --no-context7
 //! ```
 
-mod cloud;
 mod hook;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use aither_agent::sandbox::{configure_raw_handler, permission::{BashMode, PermissionHandler, PermissionError, StatefulPermissionHandler}};
+use aither_agent::sandbox::{
+    ToolRegistryBuilder, cli_to_json,
+    permission::{BashMode, PermissionError, PermissionHandler, StatefulPermissionHandler},
+    schema_to_help,
+};
 use aither_agent::specialized::TaskTool;
 use aither_agent::{Agent, BashAgentBuilder, Hook};
-use std::sync::Arc;
-use async_lock::Mutex as AsyncMutex;
-use executor_core::tokio::TokioGlobal;
 use aither_core::LanguageModel;
 use aither_core::llm::Role;
 use aither_mcp::{McpConnection, McpServersConfig};
 use anyhow::{Context, Result};
+use async_lock::Mutex as AsyncMutex;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use executor_core::tokio::TokioGlobal;
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-use crate::cloud::{CloudProvider, Provider};
+mod provider;
+
 use crate::hook::DebugHook;
+use crate::provider::Provider;
+use aither_cloud::CloudProvider;
+
+/// Default whitelist of common domains that don't need explicit approval.
+const DEFAULT_DOMAIN_WHITELIST: &[&str] = &[
+    // Package registries
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "crates.io",
+    "static.crates.io",
+    "rubygems.org",
+    // CDNs
+    "cdn.jsdelivr.net",
+    "unpkg.com",
+    "cdnjs.cloudflare.com",
+    "esm.sh",
+    // Git hosts
+    "github.com",
+    "raw.githubusercontent.com",
+    "gitlab.com",
+    "bitbucket.org",
+    // Common APIs
+    "api.github.com",
+];
 
 /// Interactive permission handler that prompts the user.
 ///
 /// - Sandboxed: always allow (no prompt)
-/// - Network: ask once, remember approval
+/// - Network: ask once, then auto-approve all domains
 /// - Unsafe: always ask for each script
 #[derive(Debug, Default)]
-struct InteractivePermissionHandler;
+struct InteractivePermissionHandler {
+    /// Whether network mode has been approved (auto-approves all domains).
+    network_approved: std::sync::atomic::AtomicBool,
+    /// Cache of approved domains for cases where network mode isn't blanket approved.
+    approved_domains: std::sync::RwLock<std::collections::HashSet<String>>,
+}
+
+impl InteractivePermissionHandler {
+    fn new() -> Self {
+        Self {
+            network_approved: std::sync::atomic::AtomicBool::new(false),
+            approved_domains: std::sync::RwLock::new(std::collections::HashSet::new()),
+        }
+    }
+}
 
 impl PermissionHandler for InteractivePermissionHandler {
     async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
@@ -74,10 +118,11 @@ impl PermissionHandler for InteractivePermissionHandler {
         match mode {
             BashMode::Sandboxed => Ok(true), // Always allow
             BashMode::Network | BashMode::Unsafe => {
-                // Display script and ask for permission
+                // Display script and ask for permission (show full script, no truncation)
                 let mode_desc = mode.description();
+                let display_script = script.trim().replace('\n', "; ");
                 eprintln!("\n\x1b[33m⚠ Permission request: {mode_desc}\x1b[0m");
-                eprintln!("\x1b[2mScript:\x1b[22m {}", truncate_script(script, 200));
+                eprintln!("\x1b[2mScript:\x1b[22m {display_script}");
                 eprint!("\x1b[33mAllow? [y/N]: \x1b[0m");
                 io::stderr().flush().ok();
 
@@ -86,11 +131,56 @@ impl PermissionHandler for InteractivePermissionHandler {
                 eprintln!();
 
                 if approved {
+                    // Mark network as approved to skip domain prompts
+                    if mode == BashMode::Network {
+                        self.network_approved
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
                     Ok(true)
                 } else {
                     Err(PermissionError::Denied("user declined".to_string()))
                 }
             }
+        }
+    }
+
+    async fn check_domain(&self, domain: &str, _port: u16) -> bool {
+        // If network mode was approved, allow all domains
+        if self
+            .network_approved
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return true;
+        }
+
+        // Check default whitelist
+        if DEFAULT_DOMAIN_WHITELIST.iter().any(|d| *d == domain) {
+            return true;
+        }
+
+        // Check if already approved
+        {
+            let approved = self.approved_domains.read().expect("domain cache lock");
+            if approved.contains(domain) {
+                return true;
+            }
+        }
+
+        // Prompt user for new domain
+        eprintln!("\n\x1b[33m⚠ Network access: {domain}\x1b[0m");
+        eprint!("\x1b[33mAllow? [y/N]: \x1b[0m");
+        io::stderr().flush().ok();
+
+        let approved = read_yes_no().unwrap_or(false);
+        eprintln!();
+
+        if approved {
+            // Cache approval for this domain
+            let mut cache = self.approved_domains.write().expect("domain cache lock");
+            cache.insert(domain.to_string());
+            true
+        } else {
+            false
         }
     }
 }
@@ -103,22 +193,6 @@ fn expand_tilde(path: &std::path::Path) -> PathBuf {
         }
     }
     path.to_path_buf()
-}
-
-/// Truncate script for display, showing first N chars (UTF-8 safe).
-fn truncate_script(s: &str, max_chars: usize) -> String {
-    let s = s.replace('\n', " ").replace('\r', "");
-    // Find byte index at char boundary
-    let end = s
-        .char_indices()
-        .nth(max_chars)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    if end >= s.len() {
-        s
-    } else {
-        format!("{}...", &s[..end])
-    }
 }
 
 /// Read y/n response from stdin.
@@ -154,7 +228,7 @@ fn read_yes_no() -> Result<bool> {
 ///
 /// This makes MCP tools available as bash commands (e.g., `resolve-library-id "tokio"`)
 /// instead of direct LLM tool calls.
-fn register_mcp_tools(conn: McpConnection) {
+fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
     let conn = Arc::new(AsyncMutex::new(conn));
 
     // Get tool definitions before moving conn into closures
@@ -179,206 +253,65 @@ fn register_mcp_tools(conn: McpConnection) {
         let tool_name = name.clone();
 
         // Build help text from schema
-        let help = format!("{}\n\nUsage: {} <args>", description, name);
+        let help = if description.is_empty() {
+            schema_to_help(&schema)
+        } else {
+            format!("{description}\n\n{}", schema_to_help(&schema))
+        };
 
-        // Detect primary arg from schema
-        let primary_arg = schema
+        // Detect positional args from schema (all required fields in order)
+        let positional_args = schema
             .get("required")
             .and_then(|r| r.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|v| v.as_str())
-            .map(String::from);
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        configure_raw_handler(
-            name,
-            help,
-            primary_arg,
-            move |args| {
-                let conn = conn.clone();
-                let tool_name = tool_name.clone();
-                Box::pin(async move {
-                    // Parse CLI args into JSON object
-                    let arguments = parse_cli_args_to_json(&args);
+        registry.configure_raw_handler(name, help, positional_args, move |args| {
+            let conn = conn.clone();
+            let tool_name = tool_name.clone();
+            let schema = schema.clone();
+            Box::pin(async move {
+                // Parse CLI args into JSON object
+                let arguments = match parse_cli_args_to_json(&schema, &args) {
+                    Ok(value) => value,
+                    Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
+                };
 
-                    // Call the MCP tool
-                    let mut conn = conn.lock().await;
-                    match conn.call(&tool_name, arguments).await {
-                        Ok(result) => {
-                            // Extract text content from result
-                            result
-                                .content
-                                .into_iter()
-                                .filter_map(|c| {
-                                    if let aither_mcp::Content::Text(text_content) = c {
-                                        Some(text_content.text)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        }
-                        Err(e) => format!("{{\"error\": \"{}\"}}", e),
+                // Call the MCP tool
+                let mut conn = conn.lock().await;
+                match conn.call(&tool_name, arguments).await {
+                    Ok(result) => {
+                        // Extract text content from result
+                        result
+                            .content
+                            .into_iter()
+                            .filter_map(|c| {
+                                if let aither_mcp::Content::Text(text_content) = c {
+                                    Some(text_content.text)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
                     }
-                })
-            },
-        );
+                    Err(e) => format!("{{\"error\": \"{}\"}}", e),
+                }
+            })
+        });
     }
 }
 
-/// Parse CLI-style arguments into a JSON object.
-///
-/// Handles:
-/// - `--key value` pairs
-/// - `--json '{...}'` for direct JSON input
-/// - Positional arguments (mapped to "query", "arg1", etc.)
-fn parse_cli_args_to_json(args: &[String]) -> serde_json::Value {
-    // Check for --json flag with direct JSON input
-    if args.len() >= 2 && args[0] == "--json" {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args[1]) {
-            return parsed;
-        }
-    }
-
-    let mut map = serde_json::Map::new();
-    let mut i = 0;
-    let mut positional_idx = 0;
-
-    while i < args.len() {
-        if args[i].starts_with("--") {
-            let key = args[i].trim_start_matches("--");
-            if i + 1 < args.len() && !args[i + 1].starts_with("--") {
-                map.insert(key.to_string(), serde_json::Value::String(args[i + 1].clone()));
-                i += 2;
-            } else {
-                map.insert(key.to_string(), serde_json::Value::Bool(true));
-                i += 1;
-            }
-        } else {
-            // Positional argument - use as "query" or "arg0", "arg1", etc.
-            let key = if positional_idx == 0 {
-                "query".to_string()
-            } else {
-                format!("arg{}", positional_idx)
-            };
-            map.insert(key, serde_json::Value::String(args[i].clone()));
-            positional_idx += 1;
-            i += 1;
-        }
-    }
-
-    serde_json::Value::Object(map)
-}
-
-/// Simple todo list state for CLI.
-static TODO_LIST: std::sync::OnceLock<std::sync::RwLock<Vec<(String, String)>>> = std::sync::OnceLock::new();
-
-fn get_todo_list() -> &'static std::sync::RwLock<Vec<(String, String)>> {
-    TODO_LIST.get_or_init(|| std::sync::RwLock::new(Vec::new()))
-}
-
-/// Register a simple todo command with natural CLI syntax.
-///
-/// Usage:
-/// - `todo add "Task 1" "Task 2"` - add tasks (pending)
-/// - `todo start 1` - mark task 1 as in_progress
-/// - `todo done 1` - mark task 1 as completed
-/// - `todo list` - show current todos
-/// - `todo clear` - clear all todos
-fn register_simple_todo() {
-    let help = r#"Manage task list for tracking progress.
-
-Usage:
-  todo add "Task 1" "Task 2" ...  Add new tasks (pending)
-  todo start <n>                  Mark task n as in_progress
-  todo done <n>                   Mark task n as completed
-  todo list                       Show current todos
-  todo clear                      Clear all todos
-
-Examples:
-  todo add "Implement feature" "Write tests" "Update docs"
-  todo start 1
-  todo done 1
-  todo list"#;
-
-    configure_raw_handler("todo", help, None::<String>, move |args| {
-        Box::pin(async move {
-            if args.is_empty() {
-                return "Usage: todo <add|start|done|list|clear> [args...]".to_string();
-            }
-
-            let cmd = args[0].as_str();
-            let list = get_todo_list();
-
-            match cmd {
-                "add" => {
-                    let mut todos = list.write().unwrap();
-                    for task in &args[1..] {
-                        todos.push((task.clone(), "pending".to_string()));
-                    }
-                    format!("Added {} task(s). Total: {}", args.len() - 1, todos.len())
-                }
-                "start" => {
-                    if args.len() < 2 {
-                        return "Usage: todo start <task_number>".to_string();
-                    }
-                    let n: usize = match args[1].parse() {
-                        Ok(n) => n,
-                        Err(_) => return "Invalid task number".to_string(),
-                    };
-                    let mut todos = list.write().unwrap();
-                    if n == 0 || n > todos.len() {
-                        return format!("Task {} not found (have {} tasks)", n, todos.len());
-                    }
-                    // Set all others to pending/completed, this one to in_progress
-                    for (i, (_, status)) in todos.iter_mut().enumerate() {
-                        if i == n - 1 {
-                            *status = "in_progress".to_string();
-                        } else if status == "in_progress" {
-                            *status = "pending".to_string();
-                        }
-                    }
-                    format!("Started task {}: {}", n, todos[n - 1].0)
-                }
-                "done" => {
-                    if args.len() < 2 {
-                        return "Usage: todo done <task_number>".to_string();
-                    }
-                    let n: usize = match args[1].parse() {
-                        Ok(n) => n,
-                        Err(_) => return "Invalid task number".to_string(),
-                    };
-                    let mut todos = list.write().unwrap();
-                    if n == 0 || n > todos.len() {
-                        return format!("Task {} not found (have {} tasks)", n, todos.len());
-                    }
-                    todos[n - 1].1 = "completed".to_string();
-                    format!("Completed task {}: {}", n, todos[n - 1].0)
-                }
-                "list" => {
-                    let todos = list.read().unwrap();
-                    if todos.is_empty() {
-                        return "No tasks.".to_string();
-                    }
-                    let mut out = String::new();
-                    for (i, (task, status)) in todos.iter().enumerate() {
-                        let marker = match status.as_str() {
-                            "completed" => "[x]",
-                            "in_progress" => "[>]",
-                            _ => "[ ]",
-                        };
-                        out.push_str(&format!("{} {}. {}\n", marker, i + 1, task));
-                    }
-                    out
-                }
-                "clear" => {
-                    list.write().unwrap().clear();
-                    "Cleared all tasks.".to_string()
-                }
-                _ => format!("Unknown command: {}. Use add/start/done/list/clear", cmd),
-            }
-        })
-    });
+/// Parse CLI-style arguments into a JSON object using the MCP schema.
+fn parse_cli_args_to_json(
+    schema: &serde_json::Value,
+    args: &[String],
+) -> anyhow::Result<serde_json::Value> {
+    cli_to_json(schema, args)
 }
 
 /// Interactive CLI for testing aither agents.
@@ -424,6 +357,10 @@ struct Args {
     /// Path to subagents directory. Subagents are markdown files invoked via `task <path> <prompt>`.
     #[arg(long)]
     subagents: Option<PathBuf>,
+
+    /// Run as ACP server (for integration with Zed and other editors).
+    #[arg(long)]
+    acp: bool,
 }
 
 #[tokio::main]
@@ -434,21 +371,33 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // ACP server mode
+    if args.acp {
+        return run_acp_server().await;
+    }
+
     // Create cloud provider
     let base_url = args.base_url.as_deref();
-    let (cloud, model) = if let Some(provider) = args.provider {
+    let (cloud, model, provider_name) = if let Some(provider) = args.provider {
         let model = args.model.as_deref().unwrap_or(provider.default_model());
         (
-            CloudProvider::with_base_url(provider, model, base_url)?,
+            provider.create(model, base_url)?,
             model.to_string(),
+            provider.to_string(),
         )
     } else {
-        CloudProvider::auto(args.model.as_deref(), base_url)?
+        let (cloud, model) = provider::auto_detect(args.model.as_deref(), base_url)?;
+        let provider_name = match &cloud {
+            CloudProvider::OpenAI(_) => "OpenAI",
+            CloudProvider::Claude(_) => "Claude",
+            CloudProvider::Gemini(_) => "Gemini",
+        };
+        (cloud, model, provider_name.to_string())
     };
 
     if !args.quiet {
         println!("Aither Agent CLI");
-        println!("Provider: {}", cloud.provider());
+        println!("Provider: {provider_name}");
         println!("Model: {model}");
         if args.prompt.is_none() {
             println!("Commands: /quit, /clear, /history, /compact");
@@ -464,27 +413,40 @@ async fn main() -> Result<()> {
     run_repl(cloud, &args).await
 }
 
-async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudProvider, CloudProvider, CloudProvider, aither_agent::HCons<DebugHook, ()>>> {
+/// Run as ACP server for editor integration.
+async fn run_acp_server() -> Result<()> {
+    use aither_acp::AcpServer;
+
+    let mut server = AcpServer::stdio("aither", env!("CARGO_PKG_VERSION"))?;
+    server.run().await?;
+    Ok(())
+}
+
+async fn build_agent(
+    cloud: CloudProvider,
+    args: &Args,
+) -> Result<Agent<CloudProvider, CloudProvider, CloudProvider, aither_agent::HCons<DebugHook, ()>>>
+{
     // Create bash tool (creates random four-word working dir under system temp)
     // Uses interactive permission handler:
     // - Sandboxed: always allow (no prompt)
     // - Network: ask once, then remember
     // - Unsafe: always ask for each script
     let workdir_parent = std::env::temp_dir().join("aither");
-    let permission_handler = StatefulPermissionHandler::new(InteractivePermissionHandler);
-    let bash_tool = aither_agent::sandbox::BashTool::new_in(&workdir_parent, permission_handler, TokioGlobal).await?;
+    let permission_handler = StatefulPermissionHandler::new(InteractivePermissionHandler::new());
+    let bash_tool =
+        aither_agent::sandbox::BashTool::new_in(&workdir_parent, permission_handler, TokioGlobal)
+            .await?;
 
     // Create bash-centric agent builder
     // All tools become IPC commands accessible via bash
     let mut builder = BashAgentBuilder::new(cloud.clone(), bash_tool)
-        // Built-in IPC tools
-        .ipc_tool(aither_agent::websearch::WebSearchTool::default())
-        .ipc_tool(aither_agent::webfetch::WebFetchTool::new())
-        .with_ask(cloud.clone()); // Fast LLM for processing piped content
-
-    // Register todo with simple CLI syntax (not JSON)
-    register_simple_todo();
-    builder = builder.tool_description("todo", "Manage task list (add/start/done/list/clear)");
+        .tool(aither_agent::websearch::WebSearchTool::default())
+        .tool(aither_agent::webfetch::WebFetchTool::new())
+        .tool(aither_agent::TodoTool::new())
+        .tool(aither_agent::sandbox::builtin::AskCommand::new(
+            cloud.clone(),
+        ));
 
     // Load skills if path provided
     if let Some(ref skills_path) = args.skills {
@@ -496,7 +458,10 @@ async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudPro
                 println!("Loaded skills from: {}", expanded.display());
             }
         } else if !args.quiet {
-            eprintln!("Warning: Skills directory not found: {}", expanded.display());
+            eprintln!(
+                "Warning: Skills directory not found: {}",
+                expanded.display()
+            );
         }
     }
 
@@ -509,7 +474,10 @@ async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudPro
                 println!("Subagents directory: {}", expanded.display());
             }
         } else if !args.quiet {
-            eprintln!("Warning: Subagents directory not found: {}", expanded.display());
+            eprintln!(
+                "Warning: Subagents directory not found: {}",
+                expanded.display()
+            );
         }
     }
 
@@ -526,7 +494,7 @@ async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudPro
                     let desc = desc.split('.').next().unwrap_or(&desc).trim().to_string();
                     builder = builder.tool_description(def.name.clone(), desc);
                 }
-                register_mcp_tools(conn);
+                register_mcp_tools(conn, builder.tool_registry_mut());
             }
             Err(e) => {
                 if !args.quiet {
@@ -540,8 +508,8 @@ async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudPro
     if let Some(ref mcp_path) = args.mcp {
         let config_str = std::fs::read_to_string(mcp_path)
             .with_context(|| format!("failed to read MCP config from {}", mcp_path.display()))?;
-        let config: McpServersConfig = serde_json::from_str(&config_str)
-            .with_context(|| "failed to parse MCP config")?;
+        let config: McpServersConfig =
+            serde_json::from_str(&config_str).with_context(|| "failed to parse MCP config")?;
 
         let connections = McpConnection::from_configs(&config).await?;
         for (name, conn) in connections {
@@ -553,17 +521,25 @@ async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudPro
                 let desc = desc.split('.').next().unwrap_or(&desc).trim().to_string();
                 builder = builder.tool_description(def.name.clone(), desc);
             }
-            register_mcp_tools(conn);
+            register_mcp_tools(conn, builder.tool_registry_mut());
         }
     }
 
     // Create TaskTool and register as bash IPC command
-    let task_tool = TaskTool::new(cloud).with_builtins();
+    // Set base_dir to sandbox directory so paths like .subagents/ resolve correctly
+    let task_tool = TaskTool::new(cloud)
+        .with_builtins()
+        .with_base_dir(builder.sandbox_dir().to_string())
+        .with_bash_tool_factory(builder.bash_tool_factory());
     let mut task_desc = String::from("Spawn subagent for complex tasks (types: ");
-    let subagent_names: Vec<_> = task_tool.type_descriptions().iter().map(|(n, _)| *n).collect();
+    let subagent_names: Vec<_> = task_tool
+        .type_descriptions()
+        .iter()
+        .map(|(n, _)| *n)
+        .collect();
     task_desc.push_str(&subagent_names.join(", "));
     task_desc.push(')');
-    builder = builder.ipc_tool_with_desc(task_tool, task_desc);
+    builder = builder.tool_with_desc(task_tool, task_desc);
 
     // Add system prompt
     let builder = if let Some(ref system) = args.system {

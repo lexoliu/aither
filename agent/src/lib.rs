@@ -26,7 +26,6 @@
 //! - **Ergonomic API**: Simple `query()` for one-shot tasks, `run()` for streaming
 //! - **Internal Loop**: Tool execution handled automatically
 //! - **Trait-based Hooks**: Intercept operations at compile time
-//! - **Tool Search**: Auto-enabled when many tools are registered
 //! - **Smart Compression**: Intelligent context management preserving critical info
 //! - **Generic over LLM**: Works with any `LanguageModel` implementation
 
@@ -41,7 +40,6 @@ mod error;
 mod event;
 mod hook;
 mod model_group;
-mod search;
 mod stream;
 mod subagent_file;
 mod todo;
@@ -51,7 +49,7 @@ mod tools;
 pub mod specialized;
 
 // File-based subagent definitions
-pub use subagent_file::{builtin_subagents, SubagentDefinition};
+pub use subagent_file::{SubagentDefinition, builtin_subagents};
 
 // Re-export tool crates
 #[cfg(feature = "command")]
@@ -73,7 +71,7 @@ pub use builder::AgentBuilder;
 pub use compression::{
     CompressionLevel, ContextStrategy, PreserveConfig, PreservedContent, SmartCompressionConfig,
 };
-pub use config::{AgentConfig, SearchStrategy, ToolSearchConfig};
+pub use config::AgentConfig;
 pub use context::{ConversationMemory, MemoryCheckpoint};
 pub use error::AgentError;
 pub use event::AgentEvent;
@@ -86,7 +84,9 @@ pub use todo::{TodoItem, TodoList, TodoStatus, TodoTool, TodoWriteArgs};
 pub use tools::AgentTools;
 
 // Model groups for budget tracking and fallback
-pub use model_group::{Budget, BudgetedModel, ModelGroup, ModelGroupError, ModelTier, TieredModels};
+pub use model_group::{
+    Budget, BudgetedModel, ModelGroup, ModelGroupError, ModelTier, TieredModels,
+};
 
 // Re-export core tool trait for convenience
 pub use aither_core::llm::Tool;

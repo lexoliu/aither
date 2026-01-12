@@ -75,17 +75,18 @@ impl LanguageModelProvider for OpenAIProvider {
             let mut builder = backend
                 .get(endpoint)
                 .map_err(|e| OpenAIError::Http(e))?
-                .header(header::AUTHORIZATION.as_str(), format!("Bearer {}", cfg.api_key))
+                .header(
+                    header::AUTHORIZATION.as_str(),
+                    format!("Bearer {}", cfg.api_key),
+                )
                 .map_err(|e| OpenAIError::Http(e))?;
             if let Some(org) = &cfg.organization {
                 builder = builder
                     .header("OpenAI-Organization", org.clone())
                     .map_err(|e| OpenAIError::Http(e))?;
             }
-            let response: ModelListResponse = builder
-                .json()
-                .await
-                .map_err(|e| OpenAIError::Http(e))?;
+            let response: ModelListResponse =
+                builder.json().await.map_err(|e| OpenAIError::Http(e))?;
             Ok(response
                 .data
                 .into_iter()
