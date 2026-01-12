@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use aither_core::llm::tool::ToolDefinition;
+use async_channel::{Receiver, Sender};
 use serde::Deserialize;
 
 use crate::protocol::{CallToolResult, McpError, McpToolDefinition};
@@ -87,6 +88,22 @@ pub enum McpConnection {
         client: McpClient<StdioTransport>,
         tools: Vec<McpToolDefinition>,
         server_name: Option<String>,
+    },
+}
+
+/// Service wrapper that serializes MCP tool calls through a command channel.
+#[derive(Clone, Debug)]
+pub struct McpToolService {
+    tx: Sender<McpCommand>,
+    tools: Vec<McpToolDefinition>,
+}
+
+#[derive(Debug)]
+enum McpCommand {
+    Call {
+        name: String,
+        arguments: serde_json::Value,
+        reply: Sender<Result<CallToolResult, McpError>>,
     },
 }
 
@@ -338,4 +355,83 @@ impl McpConnection {
             Self::Stdio { client, .. } => client.close().await,
         }
     }
+}
+
+impl McpToolService {
+    /// Creates a new MCP tool service and starts its background worker.
+    #[must_use]
+    pub fn new(mut conn: McpConnection) -> Self {
+        let tools = conn.mcp_definitions().to_vec();
+        let (tx, rx) = async_channel::unbounded();
+        std::thread::spawn(move || run_service(rx, &mut conn));
+        Self { tx, tools }
+    }
+
+    /// Returns the MCP tool definitions.
+    #[must_use]
+    pub fn mcp_definitions(&self) -> &[McpToolDefinition] {
+        &self.tools
+    }
+
+    /// Returns aither-compatible tool definitions.
+    #[must_use]
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .iter()
+            .map(|def| {
+                let name: Cow<'static, str> = Cow::Owned(def.name.clone());
+                let description: Cow<'static, str> =
+                    Cow::Owned(def.description.clone().unwrap_or_default());
+                ToolDefinition::from_parts(name, description, def.input_schema.clone())
+            })
+            .collect()
+    }
+
+    /// Check if this service has a tool with the given name.
+    #[must_use]
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.tools.iter().any(|d| d.name == name)
+    }
+
+    /// Call a tool on this MCP service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tool call fails.
+    pub async fn call(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<CallToolResult, McpError> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.tx
+            .send(McpCommand::Call {
+                name: name.to_string(),
+                arguments,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| McpError::ConnectionClosed)?;
+        reply_rx
+            .recv()
+            .await
+            .map_err(|_| McpError::ConnectionClosed)?
+    }
+}
+
+fn run_service(rx: Receiver<McpCommand>, conn: &mut McpConnection) {
+    async_io::block_on(async {
+        while let Ok(cmd) = rx.recv().await {
+            match cmd {
+                McpCommand::Call {
+                    name,
+                    arguments,
+                    reply,
+                } => {
+                    let result = conn.call(&name, arguments).await;
+                    let _ = reply.send(result).await;
+                }
+            }
+        }
+    });
 }

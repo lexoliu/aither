@@ -3,6 +3,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use async_fs as afs;
+use futures_lite::stream::StreamExt;
+
 use crate::{Skill, SkillError};
 
 /// Loads skills from filesystem directories.
@@ -77,6 +80,54 @@ impl SkillLoader {
         Ok(skills)
     }
 
+    /// Load all skills from all configured paths asynchronously.
+    ///
+    /// Skills are loaded from subdirectories of each path.
+    /// Each subdirectory must contain a `SKILL.md` file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a skill directory cannot be read or parsed.
+    pub async fn load_all_async(&self) -> Result<Vec<Skill>, SkillError> {
+        let mut skills = Vec::new();
+
+        for base_path in &self.paths {
+            if !path_exists_async(base_path).await? {
+                continue;
+            }
+
+            let mut entries = afs::read_dir(base_path)
+                .await
+                .map_err(|source| SkillError::ReadFile {
+                    path: base_path.clone(),
+                    source,
+                })?;
+
+            while let Some(entry) = entries.try_next().await.map_err(|source| {
+                SkillError::ReadFile {
+                    path: base_path.clone(),
+                    source,
+                }
+            })? {
+                let path = entry.path();
+                let file_type = entry.file_type().await.map_err(|source| {
+                    SkillError::ReadFile {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+
+                if file_type.is_dir() {
+                    if let Ok(skill) = Self::load_from_dir_async(&path).await {
+                        skills.push(skill);
+                    }
+                }
+            }
+        }
+
+        Ok(skills)
+    }
+
     /// Load a specific skill by name.
     ///
     /// Searches all configured paths for a skill with the given name.
@@ -90,6 +141,27 @@ impl SkillLoader {
             let skill_path = base_path.join(name);
             if skill_path.exists() {
                 return Self::load_from_dir(&skill_path);
+            }
+        }
+
+        Err(SkillError::NotFound {
+            name: name.to_string(),
+        })
+    }
+
+    /// Load a specific skill by name asynchronously.
+    ///
+    /// Searches all configured paths for a skill with the given name.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SkillError::NotFound` if no skill with the given name exists,
+    /// or other errors if the skill cannot be parsed.
+    pub async fn load_async(&self, name: &str) -> Result<Skill, SkillError> {
+        for base_path in &self.paths {
+            let skill_path = base_path.join(name);
+            if path_exists_async(&skill_path).await? {
+                return Self::load_from_dir_async(&skill_path).await;
             }
         }
 
@@ -122,6 +194,30 @@ impl SkillLoader {
         Ok(skill)
     }
 
+    /// Load a skill from a specific directory asynchronously.
+    async fn load_from_dir_async(dir: &Path) -> Result<Skill, SkillError> {
+        let skill_file = dir.join("SKILL.md");
+
+        if !path_exists_async(&skill_file).await? {
+            return Err(SkillError::InvalidStructure {
+                path: dir.to_path_buf(),
+                reason: "missing SKILL.md file".to_string(),
+            });
+        }
+
+        let content = afs::read_to_string(&skill_file)
+            .await
+            .map_err(|source| SkillError::ReadFile {
+                path: skill_file,
+                source,
+            })?;
+
+        let mut skill = Skill::parse(&content)?;
+        Self::load_resources_async(dir, &mut skill).await?;
+
+        Ok(skill)
+    }
+
     /// Load additional resources (templates, scripts) from the skill directory.
     fn load_resources(dir: &Path, skill: &mut Skill) -> Result<(), SkillError> {
         // Load templates
@@ -134,6 +230,21 @@ impl SkillLoader {
         let scripts_dir = dir.join("scripts");
         if scripts_dir.exists() {
             Self::load_dir_contents(&scripts_dir, "scripts/", skill)?;
+        }
+
+        Ok(())
+    }
+
+    /// Load additional resources (templates, scripts) from the skill directory asynchronously.
+    async fn load_resources_async(dir: &Path, skill: &mut Skill) -> Result<(), SkillError> {
+        let templates_dir = dir.join("templates");
+        if path_exists_async(&templates_dir).await? {
+            Self::load_dir_contents_async(&templates_dir, "templates/", skill).await?;
+        }
+
+        let scripts_dir = dir.join("scripts");
+        if path_exists_async(&scripts_dir).await? {
+            Self::load_dir_contents_async(&scripts_dir, "scripts/", skill).await?;
         }
 
         Ok(())
@@ -162,6 +273,60 @@ impl SkillLoader {
         }
 
         Ok(())
+    }
+
+    /// Load all files from a directory into the skill's resources asynchronously.
+    async fn load_dir_contents_async(
+        dir: &Path,
+        prefix: &str,
+        skill: &mut Skill,
+    ) -> Result<(), SkillError> {
+        let mut entries = afs::read_dir(dir)
+            .await
+            .map_err(|source| SkillError::ReadFile {
+                path: dir.to_path_buf(),
+                source,
+            })?;
+
+        while let Some(entry) = entries.try_next().await.map_err(|source| {
+            SkillError::ReadFile {
+                path: dir.to_path_buf(),
+                source,
+            }
+        })? {
+            let path = entry.path();
+            let file_type = entry.file_type().await.map_err(|source| {
+                SkillError::ReadFile {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+            if file_type.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    let content = afs::read_to_string(&path)
+                        .await
+                        .map_err(|source| SkillError::ReadFile {
+                            path: path.clone(),
+                            source,
+                        })?;
+                    let key = format!("{prefix}{name}");
+                    skill.resources.insert(key, content);
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+async fn path_exists_async(path: &Path) -> Result<bool, SkillError> {
+    match afs::metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(SkillError::ReadFile {
+            path: path.to_path_buf(),
+            source: err,
+        }),
     }
 }
 

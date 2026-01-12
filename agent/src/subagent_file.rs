@@ -19,6 +19,9 @@
 
 use std::path::Path;
 
+use async_fs as fs;
+use futures_lite::stream::StreamExt;
+
 /// A subagent definition loaded from a file.
 #[derive(Debug, Clone)]
 pub struct SubagentDefinition {
@@ -86,6 +89,12 @@ impl SubagentDefinition {
         Ok(Self::parse(&content))
     }
 
+    /// Load a subagent definition from a file asynchronously.
+    pub async fn from_file_async(path: impl AsRef<Path>) -> std::io::Result<Option<Self>> {
+        let content = fs::read_to_string(path).await?;
+        Ok(Self::parse(&content))
+    }
+
     /// Load all subagent definitions from a directory.
     ///
     /// Looks for `.md` files in the directory.
@@ -102,6 +111,29 @@ impl SubagentDefinition {
             let path = entry.path();
             if path.extension().map(|e| e == "md").unwrap_or(false) {
                 if let Ok(Some(def)) = Self::from_file(&path) {
+                    definitions.push(def);
+                }
+            }
+        }
+
+        Ok(definitions)
+    }
+
+    /// Load all subagent definitions from a directory asynchronously.
+    pub async fn load_from_dir_async(dir: impl AsRef<Path>) -> std::io::Result<Vec<Self>> {
+        let mut definitions = Vec::new();
+        let dir = dir.as_ref();
+
+        let mut entries = match fs::read_dir(dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e),
+        };
+
+        while let Some(entry) = entries.try_next().await? {
+            let path = entry.path();
+            if path.extension().map(|e| e == "md").unwrap_or(false) {
+                if let Ok(Some(def)) = Self::from_file_async(&path).await {
                     definitions.push(def);
                 }
             }

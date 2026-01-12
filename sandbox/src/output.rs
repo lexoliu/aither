@@ -181,6 +181,20 @@ impl std::fmt::Display for OutputEntry {
     }
 }
 
+impl OutputEntry {
+    /// Returns the stored file path for entries written to disk.
+    #[must_use]
+    pub fn stored_path(&self, base_dir: &Path) -> Option<PathBuf> {
+        match self {
+            OutputEntry::Stored { url, .. } => {
+                let filename = url.strip_prefix("outputs/").unwrap_or(url);
+                Some(base_dir.join(filename))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Internal reference to a stored output.
 #[derive(Debug, Clone)]
 pub struct OutputRef {

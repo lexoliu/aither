@@ -38,6 +38,7 @@ mod config;
 mod context;
 mod error;
 mod event;
+mod fs_util;
 mod hook;
 mod model_group;
 mod stream;

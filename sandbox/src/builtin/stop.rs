@@ -51,7 +51,7 @@ impl Tool for StopTool {
     type Arguments = StopArgs;
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        if self.registry.kill(args.pid) {
+        if self.registry.kill(args.pid).await {
             tracing::info!(pid = %args.pid, "stopped background task");
             Ok(ToolOutput::text(format!("Stopped process {}", args.pid)))
         } else {

@@ -19,6 +19,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::AgentBuilder;
+use crate::fs_util::path_exists;
 use crate::subagent_file::SubagentDefinition;
 
 /// Builder function type for configuring a subagent.
@@ -239,15 +240,15 @@ where
             // 2. Under .subagents/ relative to base_dir
             // 3. Under .skills/ relative to base_dir
             let path = base.join(file_path);
-            let resolved_path = if path.exists() {
+            let resolved_path = if path_exists(&path).await {
                 path
             } else {
                 let subagents_path = base.join(".subagents").join(file_path);
-                if subagents_path.exists() {
+                if path_exists(&subagents_path).await {
                     subagents_path
                 } else {
                     let skills_path = base.join(".skills").join(file_path);
-                    if skills_path.exists() {
+                    if path_exists(&skills_path).await {
                         skills_path
                     } else {
                         // Return original path for error message
@@ -256,7 +257,8 @@ where
                 }
             };
 
-            let def = SubagentDefinition::from_file(&resolved_path)
+            let def = SubagentDefinition::from_file_async(&resolved_path)
+                .await
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "Failed to read subagent file '{}': {e}",

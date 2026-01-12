@@ -10,14 +10,17 @@
 use std::{
     borrow::Cow,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 
 use aither_core::llm::{Tool, ToolOutput};
 use crate::output::INLINE_OUTPUT_LIMIT;
 use async_channel::{Receiver, Sender};
 use executor_core::{Executor, Task};
-use leash::{AllowAll, DenyAll, IpcRouter, Sandbox, SandboxConfig, SecurityConfig, WorkingDir};
+use leash::{
+    AllowAll, DenyAll, IpcRouter, NetworkPolicy, Sandbox, SandboxConfig, SecurityConfig,
+    StdioConfig, WorkingDir,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
@@ -27,6 +30,7 @@ use crate::{
     command::ToolRegistry,
     output::{OutputEntry, OutputFormat, OutputStore},
     permission::{BashMode, PermissionError, PermissionHandler},
+    job_registry::{JobRegistry, job_registry_channel},
 };
 
 /// Generate a random four-word ID (e.g., "amber-forest-thunder-pearl").
@@ -279,7 +283,8 @@ pub struct BashTool<P, E, State = Unconfigured> {
     /// Permission handler wrapped in Arc for sharing between parent and child tools.
     permission_handler: Arc<P>,
     executor: E,
-    output_store: Arc<RwLock<OutputStore>>,
+    output_store: Arc<OutputStore>,
+    job_registry: JobRegistry,
     /// Channel for receiving completed background tasks.
     completed_rx: Receiver<CompletedTask>,
     /// Channel for sending completed background tasks (cloned for each background task).
@@ -298,6 +303,7 @@ impl<P, E: Clone, State: Clone> Clone for BashTool<P, E, State> {
             permission_handler: self.permission_handler.clone(),
             executor: self.executor.clone(),
             output_store: self.output_store.clone(),
+            job_registry: self.job_registry.clone(),
             completed_rx: self.completed_rx.clone(),
             completed_tx: self.completed_tx.clone(),
             writable_paths: self.writable_paths.clone(),
@@ -333,7 +339,13 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
         async_fs::create_dir_all(&outputs_dir).await?;
 
         // Create output store
-        let output_store = Arc::new(RwLock::new(OutputStore::new(&outputs_dir).await?));
+        let output_store = Arc::new(OutputStore::new(&outputs_dir).await?);
+
+        // Start job registry service
+        let (job_registry, job_registry_service) = job_registry_channel();
+        executor
+            .spawn(async move { job_registry_service.serve().await })
+            .detach();
 
         // Create channel for background task completion (unbounded to not block spawned tasks)
         let (completed_tx, completed_rx) = async_channel::unbounded();
@@ -343,6 +355,7 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
             permission_handler: Arc::new(permission_handler),
             executor,
             output_store,
+            job_registry,
             completed_rx,
             completed_tx,
             writable_paths: Vec::new(),
@@ -371,7 +384,13 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
         async_fs::create_dir_all(&outputs_dir).await?;
 
         // Create output store
-        let output_store = Arc::new(RwLock::new(OutputStore::new(&outputs_dir).await?));
+        let output_store = Arc::new(OutputStore::new(&outputs_dir).await?);
+
+        // Start job registry service
+        let (job_registry, job_registry_service) = job_registry_channel();
+        executor
+            .spawn(async move { job_registry_service.serve().await })
+            .detach();
 
         // Create channel for background task completion (unbounded to not block spawned tasks)
         let (completed_tx, completed_rx) = async_channel::unbounded();
@@ -381,6 +400,7 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
             permission_handler: Arc::new(permission_handler),
             executor,
             output_store,
+            job_registry,
             completed_rx,
             completed_tx,
             writable_paths: Vec::new(),
@@ -396,6 +416,7 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
             permission_handler: self.permission_handler,
             executor: self.executor,
             output_store: self.output_store,
+            job_registry: self.job_registry,
             completed_rx: self.completed_rx,
             completed_tx: self.completed_tx,
             writable_paths: self.writable_paths,
@@ -435,6 +456,7 @@ where
             permission_handler: self.permission_handler.clone(), // Arc clone - shares handler
             executor: self.executor.clone(),
             output_store: self.output_store.clone(),
+            job_registry: self.job_registry.clone(),
             completed_rx,
             completed_tx,
             writable_paths: self.writable_paths.clone(),
@@ -453,8 +475,13 @@ where
     }
 
     /// Returns the output store.
-    pub fn output_store(&self) -> &Arc<RwLock<OutputStore>> {
+    pub fn output_store(&self) -> &Arc<OutputStore> {
         &self.output_store
+    }
+
+    /// Returns the job registry handle.
+    pub fn job_registry(&self) -> JobRegistry {
+        self.job_registry.clone()
     }
 
     /// Returns a receiver for completed background tasks.
@@ -565,10 +592,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> BashTool<P, 
         };
 
         // Save stdout - get store dir first, then save async
-        let store_dir = {
-            let store = self.output_store.read().map_err(|_| BashError::StoreLock)?;
-            store.dir().to_path_buf()
-        };
+        let store_dir = self.output_store.dir().to_path_buf();
         let limit = Some(INLINE_OUTPUT_LIMIT);
         let stdout = OutputStore::save_to_dir_with_limit(&store_dir, &output.stdout, args.expect, limit).await?;
 
@@ -687,11 +711,9 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             let writable_paths = self.writable_paths.clone();
             let executor = self.executor.clone();
             let registry = self.registry().clone();
-            let store_dir = {
-                let store = self.output_store.read().map_err(|_| anyhow::anyhow!(BashError::StoreLock))?;
-                store.dir().to_path_buf()
-            };
+            let store_dir = self.output_store.dir().to_path_buf();
             let completed_tx = self.completed_tx.clone();
+            let job_registry = self.job_registry.clone();
 
             info!(task_id = %task_id, script_len = script.len(), "spawning background bash task");
 
@@ -705,6 +727,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                     &writable_paths,
                     executor,
                     registry,
+                    job_registry,
                     &script,
                     mode,
                     expect,
@@ -748,6 +771,7 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
     writable_paths: &[PathBuf],
     executor: E,
     registry: Arc<ToolRegistry>,
+    job_registry: JobRegistry,
     script: &str,
     mode: BashMode,
     expect: OutputFormat,
@@ -756,78 +780,81 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
     info!(script_len = script.len(), ?mode, "executing background bash script");
     debug!(script = %script, "script content");
 
-    // Execute based on mode
-    let output = match mode {
+    let (pid, output) = match mode {
         BashMode::Sandboxed => {
-            let router = create_ipc_router(registry.clone());
-            let config = SandboxConfig::builder()
-                .network(DenyAll)
-                .working_dir(working_dir)
-                .writable_paths(writable_paths)
-                .security(SecurityConfig::interactive())
-                .ipc(router)
-                .build()
-                .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
-
-            let sandbox = Sandbox::with_config_and_executor(config, executor)
-                .await
-                .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
-
-            sandbox
-                .command("bash")
-                .arg("-c")
-                .arg(script)
-                .output()
-                .await
-                .map_err(|e| BashError::Execution(e.to_string()))?
+            execute_sandboxed_background(
+                working_dir,
+                writable_paths,
+                executor.clone(),
+                registry.clone(),
+                script,
+                mode,
+                DenyAll,
+                &job_registry,
+            )
+            .await?
         }
         BashMode::Network => {
-            let router = create_ipc_router(registry.clone());
-            let config = SandboxConfig::builder()
-                .network(AllowAll)
-                .working_dir(working_dir)
-                .writable_paths(writable_paths)
-                .security(SecurityConfig::interactive())
-                .ipc(router)
-                .build()
-                .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
-
-            let sandbox = Sandbox::with_config_and_executor(config, executor)
-                .await
-                .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
-
-            sandbox
-                .command("bash")
-                .arg("-c")
-                .arg(script)
-                .output()
-                .await
-                .map_err(|e| BashError::Execution(e.to_string()))?
+            execute_sandboxed_background(
+                working_dir,
+                writable_paths,
+                executor,
+                registry,
+                script,
+                mode,
+                AllowAll,
+                &job_registry,
+            )
+            .await?
         }
         BashMode::Unsafe => {
-            async_process::Command::new("bash")
-                .arg("-c")
-                .arg(script)
-                .current_dir(working_dir)
-                .output()
-                .await
-                .map_err(|e| BashError::Execution(e.to_string()))?
+            execute_unsafe_background(working_dir, script, mode, &job_registry).await?
         }
     };
 
     // Save stdout with system-level size limit
     let limit = Some(INLINE_OUTPUT_LIMIT);
-    let stdout = OutputStore::save_to_dir_with_limit(store_dir, &output.stdout, expect, limit).await?;
+    let stdout = match OutputStore::save_to_dir_with_limit(store_dir, &output.stdout, expect, limit)
+        .await
+    {
+        Ok(entry) => entry,
+        Err(err) => {
+            job_registry
+                .fail(pid, &err.to_string(), None)
+                .await;
+            return Err(BashError::Io(err));
+        }
+    };
 
     // Save stderr if non-empty
     let stderr = if output.stderr.is_empty() {
         None
     } else {
-        Some(OutputStore::save_to_dir_with_limit(store_dir, &output.stderr, OutputFormat::Text, limit).await?)
+        match OutputStore::save_to_dir_with_limit(
+            store_dir,
+            &output.stderr,
+            OutputFormat::Text,
+            limit,
+        )
+        .await
+        {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                job_registry
+                    .fail(pid, &err.to_string(), None)
+                    .await;
+                return Err(BashError::Io(err));
+            }
+        }
     };
 
     let exit_code = output.status.code().unwrap_or(-1);
     debug!(exit_code, "background script completed");
+
+    let output_path = stdout.stored_path(store_dir);
+    job_registry
+        .complete(pid, exit_code, output_path)
+        .await;
 
     Ok(BashResult {
         stdout,
@@ -836,6 +863,111 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
         task_id: None,
         status: None,
     })
+}
+
+async fn execute_sandboxed_background<E, N>(
+    working_dir: &PathBuf,
+    writable_paths: &[PathBuf],
+    executor: E,
+    registry: Arc<ToolRegistry>,
+    script: &str,
+    mode: BashMode,
+    policy: N,
+    job_registry: &JobRegistry,
+) -> Result<(u32, std::process::Output), BashError>
+where
+    E: Executor + Clone + 'static,
+    N: NetworkPolicy + 'static,
+{
+    let router = create_ipc_router(registry);
+    let config = SandboxConfig::builder()
+        .network(policy)
+        .working_dir(working_dir)
+        .writable_paths(writable_paths)
+        .security(SecurityConfig::interactive())
+        .ipc(router)
+        .build()
+        .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
+
+    let sandbox = Sandbox::with_config_and_executor(config, executor)
+        .await
+        .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
+
+    let mut child = sandbox
+        .command("bash")
+        .arg("-c")
+        .arg(script)
+        .stdin(StdioConfig::Null)
+        .stdout(StdioConfig::Piped)
+        .stderr(StdioConfig::Piped)
+        .spawn()
+        .await
+        .map_err(|e| BashError::Execution(e.to_string()))?;
+
+    let pid = child.id();
+    job_registry
+        .register(pid, script, mode, None)
+        .await;
+
+    let output_result =
+        run_blocking(move || futures_lite::future::block_on(child.wait_with_output())).await;
+    let output = match output_result {
+        Ok(output) => output,
+        Err(err) => {
+            job_registry
+                .fail(pid, &err.to_string(), None)
+                .await;
+            return Err(BashError::Execution(err.to_string()));
+        }
+    };
+
+    Ok((pid, output))
+}
+
+async fn execute_unsafe_background(
+    working_dir: &PathBuf,
+    script: &str,
+    mode: BashMode,
+    job_registry: &JobRegistry,
+) -> Result<(u32, std::process::Output), BashError> {
+    let mut child = async_process::Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .current_dir(working_dir)
+        .stdin(async_process::Stdio::null())
+        .stdout(async_process::Stdio::piped())
+        .stderr(async_process::Stdio::piped())
+        .spawn()
+        .map_err(|e| BashError::Execution(e.to_string()))?;
+
+    let pid = child.id();
+    job_registry
+        .register(pid, script, mode, None)
+        .await;
+
+    match child.output().await {
+        Ok(output) => Ok((pid, output)),
+        Err(err) => {
+            job_registry
+                .fail(pid, &err.to_string(), None)
+                .await;
+            Err(BashError::Execution(err.to_string()))
+        }
+    }
+}
+
+async fn run_blocking<T, F>(task: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(task());
+    });
+    rx.recv()
+        .await
+        .expect("blocking task channel dropped")
 }
 
 /// Creates the IPC router with built-in and tool commands (standalone version).
@@ -870,10 +1002,6 @@ pub enum BashError {
     /// Script execution failed.
     #[error("execution failed: {0}")]
     Execution(String),
-
-    /// Output store lock poisoned.
-    #[error("output store lock poisoned")]
-    StoreLock,
 
     /// IO error.
     #[error("io error: {0}")]

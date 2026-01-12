@@ -36,6 +36,7 @@ use std::borrow::Cow;
 use aither_core::LanguageModel;
 use aither_core::llm::Tool;
 use aither_core::llm::tool::ToolDefinition;
+use async_fs as fs;
 use askama::Template;
 use executor_core::Executor;
 use schemars::JsonSchema;
@@ -47,7 +48,9 @@ use aither_sandbox::{
     BashTool, BashToolFactory, BashToolFactoryReceiver, PermissionHandler, ToolRegistryBuilder,
     Unconfigured, bash_tool_factory_channel,
 };
+use aither_sandbox::builtin::{StopTool, TasksTool};
 
+use crate::fs_util::path_exists;
 /// System prompt template for bash-centric agents.
 #[derive(Template)]
 #[template(path = "system.txt", escape = "none")]
@@ -132,13 +135,34 @@ where
     /// Use `.tool()` to register tools as bash commands.
     pub fn new(llm: LLM, bash_tool: BashTool<P, E, Unconfigured>) -> Self {
         let (bash_tool_factory, bash_tool_factory_receiver) = bash_tool_factory_channel();
+        let mut registry_builder = ToolRegistryBuilder::new();
+        let mut tool_descriptions = Vec::new();
+
+        let job_registry = bash_tool.job_registry();
+        let tasks_tool = TasksTool::new(job_registry.clone());
+        let stop_tool = StopTool::new(job_registry);
+
+        let tasks_def = ToolDefinition::new(&tasks_tool);
+        tool_descriptions.push((
+            tasks_def.name().to_string(),
+            short_description(tasks_def.description()),
+        ));
+        registry_builder.configure_tool(tasks_tool);
+
+        let stop_def = ToolDefinition::new(&stop_tool);
+        tool_descriptions.push((
+            stop_def.name().to_string(),
+            short_description(stop_def.description()),
+        ));
+        registry_builder.configure_tool(stop_tool);
+
         Self {
             inner: AgentBuilder::new(llm),
             bash_tool,
-            registry_builder: ToolRegistryBuilder::new(),
+            registry_builder,
             bash_tool_factory,
             bash_tool_factory_receiver: Some(bash_tool_factory_receiver),
-            tool_descriptions: Vec::new(),
+            tool_descriptions,
             skills: Vec::new(),
             subagents: Vec::new(),
         }
@@ -172,15 +196,8 @@ where
         // Extract description from schema (rustdoc on Args struct)
         let def = ToolDefinition::new(&tool);
         let description = def.description();
-        // Truncate description to first sentence
-        let short_desc = description
-            .split('.')
-            .next()
-            .unwrap_or(description)
-            .trim()
-            .to_string();
-
-        self.tool_descriptions.push((name, short_desc));
+        self.tool_descriptions
+            .push((name, short_description(description)));
         self.registry_builder.configure_tool(tool);
         self
     }
@@ -341,6 +358,48 @@ where
         self
     }
 
+    /// Loads skills from a filesystem path asynchronously.
+    #[cfg(feature = "skills")]
+    pub async fn with_skills_async(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        use aither_skills::SkillLoader;
+
+        let path = path.as_ref().to_path_buf();
+        if !path_exists(&path).await {
+            return self;
+        }
+
+        let loader = SkillLoader::new().add_path(&path);
+        match loader.load_all_async().await {
+            Ok(skills) => {
+                tracing::info!(count = skills.len(), path = %path.display(), "Loaded skills");
+                for skill in skills {
+                    tracing::debug!(name = %skill.name, "Loaded skill");
+                    self.skills.push(SkillInfo {
+                        name: skill.name,
+                        description: skill.description,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "Failed to load skills");
+            }
+        }
+
+        let symlink_path = self.bash_tool.working_dir().join(".skills");
+        if let Ok(abs_path) = fs::canonicalize(&path).await {
+            #[cfg(unix)]
+            {
+                let _ = fs::unix::symlink(&abs_path, &symlink_path).await;
+            }
+            #[cfg(windows)]
+            {
+                let _ = fs::windows::symlink_dir(&abs_path, &symlink_path).await;
+            }
+        }
+
+        self
+    }
+
     /// Adds a skill manually without loading from filesystem.
     pub fn skill(mut self, name: impl Into<String>, description: impl Into<String>) -> Self {
         self.skills.push(SkillInfo {
@@ -388,6 +447,41 @@ where
         let symlink_path = self.bash_tool.working_dir().join(".subagents");
         if let Ok(abs_path) = path.canonicalize() {
             let _ = std::os::unix::fs::symlink(&abs_path, &symlink_path);
+        }
+
+        self
+    }
+
+    /// Sets up the subagents directory and creates a symlink in the sandbox asynchronously.
+    pub async fn with_subagents_async(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        use crate::subagent_file::SubagentDefinition;
+
+        let path = path.as_ref();
+        if !path_exists(path).await {
+            return self;
+        }
+
+        if let Ok(defs) = SubagentDefinition::load_from_dir_async(path).await {
+            for def in defs {
+                let filename = format!("{}.md", def.id);
+                self.subagents.push(SubagentInfo {
+                    name: def.id,
+                    description: def.description,
+                    path: filename,
+                });
+            }
+        }
+
+        let symlink_path = self.bash_tool.working_dir().join(".subagents");
+        if let Ok(abs_path) = fs::canonicalize(path).await {
+            #[cfg(unix)]
+            {
+                let _ = fs::unix::symlink(&abs_path, &symlink_path).await;
+            }
+            #[cfg(windows)]
+            {
+                let _ = fs::windows::symlink_dir(&abs_path, &symlink_path).await;
+            }
         }
 
         self
@@ -441,6 +535,16 @@ where
         self.inner.bash(bash_tool).build()
     }
 }
+
+fn short_description(description: &str) -> String {
+    description
+        .split('.')
+        .next()
+        .unwrap_or(description)
+        .trim()
+        .to_string()
+}
+
 
 /// Returns (os_name, os_version) for the current system.
 fn get_os_info() -> (String, String) {

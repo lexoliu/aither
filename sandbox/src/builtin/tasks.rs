@@ -16,7 +16,7 @@ use aither_core::llm::{Tool, ToolOutput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::job_registry::{JobRegistry, JobStatus};
+use crate::job_registry::{JobRegistry, JobStatus, job_registry_channel};
 
 /// List background tasks.
 ///
@@ -49,7 +49,7 @@ impl Tool for TasksTool {
     type Arguments = TasksArgs;
 
     async fn call(&self, _args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        let jobs = self.registry.list();
+        let jobs = self.registry.list().await;
 
         if jobs.is_empty() {
             return Ok(ToolOutput::text("No background tasks."));
@@ -91,6 +91,8 @@ mod tests {
     use super::*;
     use crate::permission::BashMode;
     use aither_core::llm::Tool;
+    use executor_core::Executor;
+    use executor_core::tokio::TokioGlobal;
     use std::path::PathBuf;
 
     #[test]
@@ -103,15 +105,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_tasks_tool_lists_jobs() {
-        let registry = JobRegistry::new();
+        let (registry, service) = job_registry_channel();
+        TokioGlobal.spawn(async move { service.serve().await }).detach();
 
         // Register a running job
-        registry.register(
-            12345,
-            "sleep 100",
-            BashMode::Sandboxed,
-            Some(PathBuf::from("/tmp/12345.txt")),
-        );
+        registry
+            .register(
+                12345,
+                "sleep 100",
+                BashMode::Sandboxed,
+                Some(PathBuf::from("/tmp/12345.txt")),
+            )
+            .await;
 
         // Create tool with registry
         let tool = TasksTool::new(registry.clone());
@@ -128,7 +133,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_tasks_tool_empty_registry() {
-        let registry = JobRegistry::new();
+        let (registry, service) = job_registry_channel();
+        TokioGlobal.spawn(async move { service.serve().await }).detach();
         let tool = TasksTool::new(registry);
 
         let output = tool.call(TasksArgs::default()).await.unwrap();

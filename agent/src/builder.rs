@@ -3,7 +3,7 @@
 //! The builder pattern allows fluent configuration of agents with
 //! tools, hooks, and various settings.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use aither_core::{LanguageModel, llm::Tool};
 use aither_sandbox::{BackgroundTaskReceiver, OutputStore};
@@ -52,7 +52,7 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     hooks: H,
     config: AgentConfig,
     todo_list: Option<TodoList>,
-    output_store: Option<Arc<RwLock<OutputStore>>>,
+    output_store: Option<Arc<OutputStore>>,
     background_receiver: Option<BackgroundTaskReceiver>,
 }
 
