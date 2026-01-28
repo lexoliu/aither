@@ -209,7 +209,7 @@ where
     pub async fn query(&mut self, prompt: &str) -> Result<String, AgentError> {
         use futures_lite::StreamExt;
 
-        let stream = self.run(prompt);
+        let stream = self.run(prompt, std::iter::empty());
         futures_lite::pin!(stream);
 
         let mut final_text = String::new();
@@ -236,7 +236,7 @@ where
     /// ```rust,ignore
     /// use futures::StreamExt;
     ///
-    /// let mut stream = agent.run("Implement the feature");
+    /// let mut stream = agent.run("Implement the feature", std::iter::empty());
     /// while let Some(event) = stream.next().await {
     ///     match event? {
     ///         AgentEvent::Text(t) => print!("{}", t),
@@ -249,24 +249,20 @@ where
     pub fn run(
         &mut self,
         prompt: &str,
+        attachments: impl IntoIterator<Item = url::Url>,
     ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
         let prompt = prompt.to_string();
-        self.run_streaming(prompt)
-    }
+        let attachments: Vec<url::Url> = attachments.into_iter().collect();
 
-    /// Internal streaming implementation.
-    fn run_streaming(
-        &mut self,
-        prompt: String,
-    ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
         async_stream::try_stream! {
             self.ensure_initialized().await;
 
             // Apply context compression if needed
             self.maybe_compress().await?;
 
-            // Add user message
-            self.memory.push(Message::user(&prompt));
+            // Add user message with attachments
+            let user_msg = Message::user(&prompt).with_attachments(attachments);
+            self.memory.push(user_msg);
 
             // Run the tool loop
             let mut iteration = 0;

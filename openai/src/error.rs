@@ -64,6 +64,31 @@ impl fmt::Display for OpenAIError {
 
 impl std::error::Error for OpenAIError {}
 
+impl OpenAIError {
+    /// Convert a zenwave error to an OpenAIError.
+    pub(crate) fn from_http(err: zenwave::Error) -> Self {
+        // Check if it's a rate limit error
+        if let zenwave::Error::Http { status, .. } = &err {
+            if status.as_u16() == 429 {
+                return Self::RateLimit {
+                    message: "Rate limit exceeded".to_string(),
+                    retry_after: None,
+                };
+            }
+            if status.as_u16() >= 500 {
+                return Self::ServerError {
+                    status: status.as_u16(),
+                    message: err.to_string(),
+                };
+            }
+        }
+        if err.is_timeout() {
+            return Self::Timeout;
+        }
+        Self::Http(err)
+    }
+}
+
 impl From<BodyError> for OpenAIError {
     fn from(value: BodyError) -> Self {
         Self::Body(value)
@@ -85,5 +110,11 @@ impl From<serde_json::Error> for OpenAIError {
 impl From<base64::DecodeError> for OpenAIError {
     fn from(value: base64::DecodeError) -> Self {
         Self::Decode(value)
+    }
+}
+
+impl From<std::io::Error> for OpenAIError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Api(format!("IO error: {value}"))
     }
 }

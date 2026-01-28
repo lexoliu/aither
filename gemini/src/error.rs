@@ -132,6 +132,12 @@ impl ApiErrorResponse {
     }
 }
 
+impl From<std::io::Error> for GeminiError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Api(format!("IO error: {value}"))
+    }
+}
+
 impl fmt::Display for GeminiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -13,6 +13,7 @@ categories = ["api-bindings"]
 
 [dependencies]
 aither-core.workspace = true
+aither-attachments.workspace = true
 aither-sandbox.workspace = true
 executor-core = "0.7"
 anyhow = "1.0.100"
@@ -34,6 +35,8 @@ futures = "0.3"
 futures-core = "0.3.31"
 futures-lite = "2.6"
 pin-project-lite = "0.2.16"
+url = "2"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }

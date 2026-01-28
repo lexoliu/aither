@@ -1,6 +1,7 @@
 //! Request building and message conversion for the Claude API.
 
 use aither_core::llm::{Message, Role, model::Parameters, tool::ToolDefinition};
+use base64::Engine;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -226,6 +227,11 @@ fn build_user_content(message: &Message) -> ContentPayload {
 }
 
 /// Parse a URL string into an image source.
+///
+/// Handles:
+/// - `data:image/...;base64,...` - already base64 encoded
+/// - `file:///path/to/file` - reads file and converts to base64
+/// - `http://` or `https://` URLs - passed through as URL source
 fn parse_image_source(url: &str) -> Option<ImageSource> {
     if url.starts_with("data:image/") {
         // Parse data URL: data:image/jpeg;base64,/9j/4AAQ...
@@ -236,12 +242,64 @@ fn parse_image_source(url: &str) -> Option<ImageSource> {
             media_type: media_type.to_string(),
             data: data.to_string(),
         })
+    } else if url.starts_with("file://") {
+        // Read local file and convert to base64
+        read_file_to_base64_source(url)
     } else if is_image_url(url) {
         Some(ImageSource::Url {
             url: url.to_string(),
         })
     } else {
         None
+    }
+}
+
+/// Read a file:// URL and convert to base64 image source.
+fn read_file_to_base64_source(file_url: &str) -> Option<ImageSource> {
+    let url = url::Url::parse(file_url).ok()?;
+    let path = url.to_file_path().ok()?;
+
+    // Read the file
+    let data = std::fs::read(&path).ok()?;
+
+    // Determine media type from extension
+    let media_type = mime_from_path(&path)?;
+
+    // Encode to base64
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+
+    Some(ImageSource::Base64 {
+        media_type: media_type.to_string(),
+        data: base64_data,
+    })
+}
+
+/// Get MIME type from file path extension.
+///
+/// Supports images, video, audio, and PDFs.
+fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
+    match path.extension().and_then(|e| e.to_str())?.to_lowercase().as_str() {
+        // Images
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "heic" => Some("image/heic"),
+        "heif" => Some("image/heif"),
+        // Video
+        "mp4" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "mov" => Some("video/quicktime"),
+        "avi" => Some("video/x-msvideo"),
+        // Audio
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "ogg" => Some("audio/ogg"),
+        "m4a" => Some("audio/mp4"),
+        "flac" => Some("audio/flac"),
+        // Documents
+        "pdf" => Some("application/pdf"),
+        _ => None,
     }
 }
 

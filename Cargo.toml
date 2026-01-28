@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "attachments",
     "claude",
     "cloud",
     "copilot",
@@ -52,6 +53,7 @@ aither-derive = { path = "./derive", version = "0.1.0"}
 aither-ort = { path = "./ort" }
 zenwave = { path = "../zenwave" }
 aither-skills = { path = "./skills" }
+aither-attachments = { path = "./attachments" }
 aither-websearch = { path = "./tools/websearch" }
 aither-webfetch = { path = "./tools/webfetch" }
 aither-fs = { path = "./tools/fs" }

@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use tracing::debug;
 
 use crate::{
+    attachments::resolve_messages,
     client::stream_generate,
     config::Gemini,
     error::GeminiError,
@@ -108,6 +109,13 @@ fn respond_stream_inner(
 ) -> impl Stream<Item = Result<Event, GeminiError>> + Send {
     async_stream::stream! {
         let (messages, parameters, tool_defs) = request.into_parts();
+        let messages = match resolve_messages(&cfg, messages).await {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                yield Err(err);
+                return;
+            }
+        };
         let (system_instruction, contents) = messages_to_gemini(&messages);
         let mut gemini_tools_payload: Vec<GeminiTool> = Vec::new();
         let tool_defs = match &parameters.tool_choice {
@@ -321,7 +329,27 @@ fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<Gemin
         match message.role() {
             Role::System => system_parts.push(Part::text(message.content())),
             Role::User => {
-                contents.push(GeminiContent::text("user", message.content()));
+                let attachments = message.attachments();
+                if attachments.is_empty() {
+                    contents.push(GeminiContent::text("user", message.content()));
+                } else {
+                    // Build parts with attachments
+                    let mut parts = Vec::new();
+
+                    // Add attachment parts first
+                    for attachment in attachments {
+                        if let Some(part) = url_to_part(attachment) {
+                            parts.push(part);
+                        }
+                    }
+
+                    // Add text content
+                    if !message.content().is_empty() {
+                        parts.push(Part::text(message.content()));
+                    }
+
+                    contents.push(GeminiContent::with_parts("user", parts));
+                }
             }
             Role::Tool => {
                 // Get the function name from the tool_call_id
@@ -514,4 +542,105 @@ fn convert_tool_definitions(defs: Vec<ToolDefinition>) -> Vec<FunctionDeclaratio
             parameters: Some(tool.arguments_openai_schema()),
         })
         .collect()
+}
+
+/// Convert a URL attachment to a Gemini Part.
+///
+/// Handles:
+/// - `data:...;base64,...` - already base64 encoded
+/// - `file:///path/to/file` - reads file and converts to base64
+/// - Gemini file URI (https://generativelanguage.googleapis.com/...) - uses file reference
+/// - Other HTTP/HTTPS URLs - not currently supported (would need download)
+fn url_to_part(url: &url::Url) -> Option<Part> {
+    match url.scheme() {
+        "data" => parse_data_url(url.as_str()),
+        "file" => read_file_to_part(url),
+        "http" | "https" => {
+            // Check if this is a Gemini Files API URI
+            if is_gemini_file_uri(url) {
+                gemini_file_uri_to_part(url)
+            } else {
+                // Other HTTP/HTTPS URLs would need to be downloaded first
+                tracing::warn!("Unsupported attachment URL: {}", url);
+                None
+            }
+        }
+        _ => {
+            tracing::warn!("Unsupported attachment URL scheme: {}", url.scheme());
+            None
+        }
+    }
+}
+
+/// Check if a URL is a Gemini Files API URI.
+fn is_gemini_file_uri(url: &url::Url) -> bool {
+    url.host_str()
+        .map(|h| h == "generativelanguage.googleapis.com")
+        .unwrap_or(false)
+}
+
+/// Convert a Gemini Files API URI to a Part using file reference.
+fn gemini_file_uri_to_part(url: &url::Url) -> Option<Part> {
+    // The file URI contains the path which includes the file type info
+    // We need to infer the MIME type from the original file or use a generic one
+    // For now, use application/octet-stream as the API will handle it
+    let mime_type = infer_mime_from_gemini_uri(url).unwrap_or("application/octet-stream");
+    Some(Part::from_file(mime_type, url.as_str()))
+}
+
+/// Try to infer MIME type from a Gemini file URI.
+/// The URI doesn't typically contain MIME info, so we return None.
+fn infer_mime_from_gemini_uri(_url: &url::Url) -> Option<&'static str> {
+    // Gemini file URIs don't contain MIME type info in the URL
+    // The server knows the type from when it was uploaded
+    None
+}
+
+/// Parse a data URL into a Part with inline data.
+fn parse_data_url(url: &str) -> Option<Part> {
+    use base64::Engine;
+
+    // Format: data:mime/type;base64,<data>
+    let after_data = url.strip_prefix("data:")?;
+    let (header, data) = after_data.split_once(',')?;
+    let mime_type = header.strip_suffix(";base64")?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+
+    Some(Part::inline_media(mime_type, bytes))
+}
+
+/// Read a file:// URL and convert to a Part with inline data.
+fn read_file_to_part(url: &url::Url) -> Option<Part> {
+    let path = url.to_file_path().ok()?;
+    let data = std::fs::read(&path).ok()?;
+    let mime_type = mime_from_path(&path)?;
+
+    Some(Part::inline_media(mime_type, data))
+}
+
+/// Get MIME type from file path extension.
+fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
+    match path.extension().and_then(|e| e.to_str())?.to_lowercase().as_str() {
+        // Images
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "heic" => Some("image/heic"),
+        "heif" => Some("image/heif"),
+        // Video
+        "mp4" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "mov" => Some("video/quicktime"),
+        "avi" => Some("video/x-msvideo"),
+        // Audio
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "ogg" => Some("audio/ogg"),
+        "m4a" => Some("audio/mp4"),
+        "flac" => Some("audio/flac"),
+        // Documents
+        "pdf" => Some("application/pdf"),
+        _ => None,
+    }
 }

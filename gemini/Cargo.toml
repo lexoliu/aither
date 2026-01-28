@@ -14,14 +14,18 @@ categories = ["api-bindings"]
 [dependencies]
 aither-core.workspace = true
 aither-models.workspace = true
+aither-attachments.workspace = true
 async-stream = "0.3"
 futures-core = { version = "0.3", default-features = false }
 futures-lite = "2.6"
-base64 = "0.21"
+base64 = "0.22"
+mime_guess = "2"
 schemars = "1.0"
 async-io = "2.6.0"
+async-fs = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+url = "2"
 zenwave.workspace = true
 tracing.workspace = true
 

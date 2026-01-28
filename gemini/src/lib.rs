@@ -37,6 +37,8 @@ mod client;
 mod config;
 mod embedding;
 mod error;
+mod attachments;
+pub mod files;
 mod image;
 mod llm;
 mod moderation;

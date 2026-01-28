@@ -30,10 +30,13 @@
 //! ```
 
 mod audio;
+mod attachments;
 mod client;
 mod embedding;
 mod error;
+pub mod files;
 mod image;
+mod mime;
 mod moderation;
 mod provider;
 mod request;

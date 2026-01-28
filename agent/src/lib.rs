@@ -94,6 +94,7 @@ pub use model_group::{
 
 // Re-export core tool trait for convenience
 pub use aither_core::llm::Tool;
+pub use aither_attachments::{CacheEntry, FileCache};
 
 /// Default system prompt for bash-centric agents.
 ///

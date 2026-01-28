@@ -3,11 +3,15 @@ use aither_core::llm::{
     model::{Parameters, ReasoningEffort, ToolChoice},
     tool::ToolDefinition,
 };
+use url::Url;
+
 use schemars::Schema;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
+use crate::attachments::parse_openai_file_url;
+use crate::error::OpenAIError;
 #[derive(Clone)]
 pub struct ParameterSnapshot {
     pub(crate) temperature: Option<f32>,
@@ -139,11 +143,40 @@ impl ChatCompletionRequest {
 #[derive(Debug, Serialize, Clone)]
 pub struct ChatMessagePayload {
     role: &'static str,
-    content: String,
+    content: ContentPayload,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ChatToolCallPayload>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+}
+
+/// Message content - either simple string or array of content parts (for vision).
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ContentPayload {
+    /// Simple text content.
+    Text(String),
+    /// Array of content parts (for multimodal messages).
+    Parts(Vec<ContentPart>),
+}
+
+/// Content part for multimodal messages.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    /// Text content part.
+    #[serde(rename = "text")]
+    Text { text: String },
+    /// Image URL content part.
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlPayload },
+}
+
+/// Image URL payload for vision.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageUrlPayload {
+    /// URL to the image (can be data URL with base64).
+    url: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -230,9 +263,12 @@ pub fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
                 None
             };
 
+            // Build content - use multimodal format if there are attachments
+            let content = build_content(message);
+
             ChatMessagePayload {
                 role,
-                content: flatten_content(message),
+                content,
                 tool_calls,
                 tool_call_id,
             }
@@ -240,19 +276,93 @@ pub fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
         .collect()
 }
 
-fn flatten_content(message: &Message) -> String {
-    let mut content = message.content().to_owned();
+/// Build content payload for a message.
+///
+/// Returns simple text for messages without attachments,
+/// or multimodal content parts for messages with attachments.
+fn build_content(message: &Message) -> ContentPayload {
+    let attachments = message.attachments();
 
-    if !message.attachments().is_empty() {
-        content.push_str("\n\nAttachments:\n");
-        for attachment in message.attachments() {
-            content.push_str("- ");
-            content.push_str(attachment.as_str());
-            content.push('\n');
+    if attachments.is_empty() {
+        return ContentPayload::Text(message.content().to_owned());
+    }
+
+    let mut parts = Vec::new();
+
+    // Add image parts first
+    for attachment in attachments {
+        if let Some(data_url) = url_to_data_url(attachment) {
+            parts.push(ContentPart::ImageUrl {
+                image_url: ImageUrlPayload { url: data_url },
+            });
         }
     }
 
-    content
+    // Add text content
+    if !message.content().is_empty() {
+        parts.push(ContentPart::Text {
+            text: message.content().to_owned(),
+        });
+    }
+
+    ContentPayload::Parts(parts)
+}
+
+/// Flatten message content to a simple string.
+///
+/// For non-vision contexts (like Responses API), just returns the text content.
+fn flatten_content(message: &Message) -> String {
+    message.content().to_owned()
+}
+
+/// Convert a URL to a data URL suitable for OpenAI vision.
+///
+/// Handles:
+/// - `data:...` URLs - passed through as-is
+/// - `file:///path` URLs - reads file and converts to base64 data URL
+/// - HTTP/HTTPS URLs - passed through as-is (OpenAI can fetch them)
+fn url_to_data_url(url: &url::Url) -> Option<String> {
+    match url.scheme() {
+        "data" => Some(url.as_str().to_string()),
+        "http" | "https" => Some(url.as_str().to_string()),
+        "file" => read_file_to_data_url(url),
+        _ => {
+            tracing::warn!("Unsupported attachment URL scheme: {}", url.scheme());
+            None
+        }
+    }
+}
+
+/// Read a file:// URL and convert to a data URL.
+fn read_file_to_data_url(url: &url::Url) -> Option<String> {
+    use base64::Engine;
+
+    let path = url.to_file_path().ok()?;
+    let data = std::fs::read(&path).ok()?;
+    let mime_type = mime_from_path(&path)?;
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+
+    Some(format!("data:{};base64,{}", mime_type, base64_data))
+}
+
+/// Get MIME type from file path extension.
+fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
+    match path.extension().and_then(|e| e.to_str())?.to_lowercase().as_str() {
+        // Images
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        // Video (for providers that support it)
+        "mp4" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        // Audio (for providers that support it)
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        // Documents
+        "pdf" => Some("application/pdf"),
+        _ => None,
+    }
 }
 
 pub fn convert_tools(definitions: Vec<ToolDefinition>) -> Vec<ToolPayload> {
@@ -333,7 +443,7 @@ impl ChatMessagePayload {
     pub(crate) fn tool_output(call_id: String, output: String) -> Self {
         Self {
             role: "tool",
-            content: output,
+            content: ContentPayload::Text(output),
             tool_calls: None,
             tool_call_id: Some(call_id),
         }
@@ -345,7 +455,7 @@ impl ChatMessagePayload {
     ) -> Self {
         Self {
             role: "assistant",
-            content,
+            content: ContentPayload::Text(content),
             tool_calls: Some(tool_calls),
             tool_call_id: None,
         }
@@ -357,7 +467,7 @@ impl ChatMessagePayload {
 pub enum ResponsesInputItem {
     Message {
         role: String,
-        content: String,
+        content: ResponsesMessageContent,
     },
     FunctionCall {
         #[serde(rename = "type")]
@@ -374,9 +484,48 @@ pub enum ResponsesInputItem {
     },
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(untagged)]
+pub enum ResponsesMessageContent {
+    Text(String),
+    Parts(Vec<ResponsesInputContent>),
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesInputContent {
+    InputText { text: String },
+    InputImage { #[serde(flatten)] source: InputImageSource },
+    InputFile { file_id: String },
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct InputImageSource {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_id: Option<String>,
+}
+
+impl InputImageSource {
+    fn from_url(url: String) -> Self {
+        Self {
+            image_url: Some(url),
+            file_id: None,
+        }
+    }
+
+    fn from_file_id(file_id: String) -> Self {
+        Self {
+            image_url: None,
+            file_id: Some(file_id),
+        }
+    }
+}
+
 #[allow(dead_code)]
 impl ResponsesInputItem {
-    pub(crate) fn message(role: impl Into<String>, content: String) -> Self {
+    pub(crate) fn message(role: impl Into<String>, content: ResponsesMessageContent) -> Self {
         Self::Message {
             role: role.into(),
             content,
@@ -499,21 +648,38 @@ pub(crate) enum ResponsesToolChoice {
     },
 }
 
-pub fn to_responses_input(messages: &[Message]) -> Vec<ResponsesInputItem> {
+pub fn to_responses_input(messages: &[Message]) -> Result<Vec<ResponsesInputItem>, OpenAIError> {
     let mut items = Vec::new();
 
     for message in messages {
         match message.role() {
             Role::User => {
-                items.push(ResponsesInputItem::message(
-                    "user",
-                    flatten_content(message),
-                ));
+                let attachments = message.attachments();
+                if attachments.is_empty() {
+                    items.push(ResponsesInputItem::message(
+                        "user",
+                        ResponsesMessageContent::Text(flatten_content(message)),
+                    ));
+                } else {
+                    let mut parts = Vec::new();
+                    for attachment in attachments {
+                        parts.push(attachment_to_responses_part(attachment)?);
+                    }
+                    if !message.content().is_empty() {
+                        parts.push(ResponsesInputContent::InputText {
+                            text: message.content().to_owned(),
+                        });
+                    }
+                    items.push(ResponsesInputItem::message(
+                        "user",
+                        ResponsesMessageContent::Parts(parts),
+                    ));
+                }
             }
             Role::System => {
                 items.push(ResponsesInputItem::message(
                     "developer",
-                    flatten_content(message),
+                    ResponsesMessageContent::Text(flatten_content(message)),
                 ));
             }
             Role::Assistant => {
@@ -522,7 +688,7 @@ pub fn to_responses_input(messages: &[Message]) -> Vec<ResponsesInputItem> {
                     // Regular text response
                     items.push(ResponsesInputItem::message(
                         "assistant",
-                        flatten_content(message),
+                        ResponsesMessageContent::Text(flatten_content(message)),
                     ));
                 } else {
                     // Assistant message with function calls
@@ -530,7 +696,7 @@ pub fn to_responses_input(messages: &[Message]) -> Vec<ResponsesInputItem> {
                     if !message.content().is_empty() {
                         items.push(ResponsesInputItem::message(
                             "assistant",
-                            message.content().to_string(),
+                            ResponsesMessageContent::Text(message.content().to_string()),
                         ));
                     }
                     // Add function call items
@@ -555,14 +721,37 @@ pub fn to_responses_input(messages: &[Message]) -> Vec<ResponsesInputItem> {
                     // Fallback if no call_id (shouldn't happen)
                     items.push(ResponsesInputItem::message(
                         "user",
-                        flatten_content(message),
+                        ResponsesMessageContent::Text(flatten_content(message)),
                     ));
                 }
             }
         }
     }
 
-    items
+    Ok(items)
+}
+
+fn attachment_to_responses_part(url: &Url) -> Result<ResponsesInputContent, OpenAIError> {
+    if let Some((kind, id)) = parse_openai_file_url(url) {
+        if kind.is_image() {
+            return Ok(ResponsesInputContent::InputImage {
+                source: InputImageSource::from_file_id(id),
+            });
+        }
+        return Ok(ResponsesInputContent::InputFile { file_id: id });
+    }
+
+    match url.scheme() {
+        "http" | "https" | "data" => Ok(ResponsesInputContent::InputImage {
+            source: InputImageSource::from_url(url.as_str().to_string()),
+        }),
+        "file" => Err(OpenAIError::Api(
+            "file:// attachments must be uploaded via Files API".to_string(),
+        )),
+        other => Err(OpenAIError::Api(format!(
+            "Unsupported attachment URL scheme: {other}"
+        ))),
+    }
 }
 
 pub fn convert_responses_tools(definitions: Vec<ToolDefinition>) -> Vec<ResponsesTool> {
@@ -654,7 +843,10 @@ mod tests {
         let snapshot = ParameterSnapshot::from(&params);
         let req = ResponsesRequest::new(
             "gpt-5".into(),
-            vec![ResponsesInputItem::message("user", "hi".to_string())],
+            vec![ResponsesInputItem::message(
+                "user",
+                ResponsesMessageContent::Text("hi".to_string()),
+            )],
             &snapshot,
             None,
             responses_tool_choice(&snapshot, false),

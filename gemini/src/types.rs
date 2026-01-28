@@ -105,6 +105,8 @@ pub struct Part {
     pub(crate) thought_signature: Option<String>,
     #[serde(rename = "inlineData", skip_serializing_if = "Option::is_none")]
     pub(crate) inline_data: Option<InlineData>,
+    #[serde(rename = "fileData", skip_serializing_if = "Option::is_none")]
+    pub(crate) file_data: Option<FileData>,
     #[serde(rename = "functionCall", skip_serializing_if = "Option::is_none")]
     function_call: Option<FunctionCall>,
     #[serde(rename = "functionResponse", skip_serializing_if = "Option::is_none")]
@@ -127,6 +129,7 @@ impl Part {
             thought: None,
             thought_signature: None,
             inline_data: None,
+            file_data: None,
             function_call: None,
             function_response: None,
             executable_code: None,
@@ -141,6 +144,7 @@ impl Part {
             thought: None,
             thought_signature: None,
             inline_data: Some(InlineData::new("image/png", data)),
+            file_data: None,
             function_call: None,
             function_response: None,
             executable_code: None,
@@ -155,6 +159,7 @@ impl Part {
             thought: None,
             thought_signature: None,
             inline_data: Some(InlineData::new("application/octet-stream", data)),
+            file_data: None,
             function_call: None,
             function_response: None,
             executable_code: None,
@@ -169,6 +174,39 @@ impl Part {
             thought: None,
             thought_signature: None,
             inline_data: Some(InlineData::new("audio/wav", data)),
+            file_data: None,
+            function_call: None,
+            function_response: None,
+            executable_code: None,
+            code_execution_result: None,
+            metadata: None,
+        }
+    }
+
+    /// Create a part with inline media data of any supported MIME type.
+    pub(crate) fn inline_media(mime_type: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            text: None,
+            thought: None,
+            thought_signature: None,
+            inline_data: Some(InlineData::new(mime_type, data)),
+            file_data: None,
+            function_call: None,
+            function_response: None,
+            executable_code: None,
+            code_execution_result: None,
+            metadata: None,
+        }
+    }
+
+    /// Create a part referencing an uploaded file via the Files API.
+    pub(crate) fn from_file(mime_type: impl Into<String>, file_uri: impl Into<String>) -> Self {
+        Self {
+            text: None,
+            thought: None,
+            thought_signature: None,
+            inline_data: None,
+            file_data: Some(FileData::new(mime_type, file_uri)),
             function_call: None,
             function_response: None,
             executable_code: None,
@@ -187,6 +225,7 @@ impl Part {
             thought: None,
             thought_signature,
             inline_data: None,
+            file_data: None,
             function_call: None,
             function_response: Some(FunctionResponse { name, response }),
             executable_code: None,
@@ -201,6 +240,7 @@ impl Part {
             thought: None,
             thought_signature: None,
             inline_data: None,
+            file_data: None,
             function_call: Some(FunctionCall { name, args }),
             function_response: None,
             executable_code: None,
@@ -219,6 +259,7 @@ impl Part {
             thought: None,
             thought_signature,
             inline_data: None,
+            file_data: None,
             function_call: Some(FunctionCall { name, args }),
             function_response: None,
             executable_code: None,
@@ -299,6 +340,26 @@ impl InlineData {
 
     pub(crate) fn decode(&self) -> Result<Vec<u8>, base64::DecodeError> {
         BASE64.decode(&self.data)
+    }
+}
+
+/// Reference to a file uploaded via the Files API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileData {
+    /// MIME type of the file.
+    mime_type: String,
+    /// URI of the uploaded file (e.g., "https://generativelanguage.googleapis.com/v1beta/files/xyz").
+    file_uri: String,
+}
+
+impl FileData {
+    /// Create a new file data reference.
+    pub fn new(mime_type: impl Into<String>, file_uri: impl Into<String>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            file_uri: file_uri.into(),
+        }
     }
 }
 

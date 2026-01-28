@@ -3,6 +3,7 @@ use crate::{
     DEFAULT_BASE_URL, DEFAULT_EMBEDDING_DIM, DEFAULT_EMBEDDING_MODEL, DEFAULT_IMAGE_MODEL,
     DEFAULT_MODEL, DEFAULT_MODERATION_MODEL, DEFAULT_TRANSCRIPTION_MODEL, OPENROUTER_BASE_URL,
     error::OpenAIError,
+    attachments::resolve_messages,
     request::{
         ChatCompletionRequest, ChatMessagePayload, ParameterSnapshot, ResponsesInputItem,
         ResponsesRequest, ResponsesTool, ToolPayload, convert_responses_tools, convert_tools,
@@ -311,13 +312,31 @@ impl LanguageModel for OpenAI {
         let tool_defs = filter_tool_definitions(tool_defs, &parameters.tool_choice);
         let mut snapshot = ParameterSnapshot::from(&parameters);
         snapshot.legacy_max_tokens = cfg.legacy_max_tokens;
-
-        let payload_messages = to_chat_messages(&messages);
-        let responses_input = to_responses_input(&messages);
+        let has_attachments = messages.iter().any(|msg| !msg.attachments().is_empty());
 
         async_stream::stream! {
+            if cfg.api_kind == ApiKind::ChatCompletions && has_attachments {
+                yield Err(OpenAIError::Api(
+                    "Chat Completions does not support file attachments; use Responses API".to_string(),
+                ));
+                return;
+            }
+
+            let messages = if has_attachments {
+                match resolve_messages(&cfg, messages).await {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        yield Err(err);
+                        return;
+                    }
+                }
+            } else {
+                messages
+            };
+
             match cfg.api_kind {
                 ApiKind::ChatCompletions => {
+                    let payload_messages = to_chat_messages(&messages);
                     let openai_tools = if tool_defs.is_empty() {
                         None
                     } else {
@@ -336,6 +355,14 @@ impl LanguageModel for OpenAI {
                     }
                 }
                 ApiKind::Responses => {
+                    let responses_input = match to_responses_input(&messages) {
+                        Ok(input) => input,
+                        Err(err) => {
+                            yield Err(err);
+                            return;
+                        }
+                    };
+
                     let mut events = responses_stream(
                         cfg,
                         responses_input,
