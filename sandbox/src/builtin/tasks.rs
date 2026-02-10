@@ -2,7 +2,7 @@
 //!
 //! Implements `Tool` trait and can be registered via `ToolRegistryBuilder::configure_tool`.
 //!
-//! Named `tasks` to avoid collision with bash builtin `jobs`.
+//! Exposed as `jobs` to align with standard shell intuition.
 //!
 //! # Usage
 //!
@@ -43,7 +43,7 @@ pub struct TasksArgs {
 
 impl Tool for TasksTool {
     fn name(&self) -> Cow<'static, str> {
-        "tasks".into()
+        "jobs".into()
     }
 
     type Arguments = TasksArgs;
@@ -77,8 +77,8 @@ impl Tool for TasksTool {
                 .unwrap_or_else(|| "(no output)".to_string());
 
             output.push_str(&format!(
-                "PID {} [{}]\n  script: {}\n  output: {}\n\n",
-                job.pid, status_str, script_preview, output_str
+                "PID {} [{}]\n  shell_id: {}\n  script: {}\n  output: {}\n\n",
+                job.pid, status_str, job.shell_id, script_preview, output_str
             ));
         }
 
@@ -92,6 +92,7 @@ mod tests {
     use crate::permission::BashMode;
     use aither_core::llm::Tool;
     use executor_core::Executor;
+    use executor_core::Task;
     use executor_core::tokio::TokioGlobal;
     use std::path::PathBuf;
 
@@ -106,12 +107,15 @@ mod tests {
     #[tokio::test]
     async fn test_tasks_tool_lists_jobs() {
         let (registry, service) = job_registry_channel();
-        TokioGlobal.spawn(async move { service.serve().await }).detach();
+        TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
 
         // Register a running job
         registry
             .register(
                 12345,
+                "shell-test",
                 "sleep 100",
                 BashMode::Sandboxed,
                 Some(PathBuf::from("/tmp/12345.txt")),
@@ -134,7 +138,9 @@ mod tests {
     #[tokio::test]
     async fn test_tasks_tool_empty_registry() {
         let (registry, service) = job_registry_channel();
-        TokioGlobal.spawn(async move { service.serve().await }).detach();
+        TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
         let tool = TasksTool::new(registry);
 
         let output = tool.call(TasksArgs::default()).await.unwrap();

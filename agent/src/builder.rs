@@ -11,11 +11,12 @@ use aither_sandbox::{BackgroundTaskReceiver, OutputStore};
 use crate::{
     agent::{Agent, ModelTier},
     compression::ContextStrategy,
-    config::AgentConfig,
+    config::{AgentConfig, AgentKind, BuiltinToolHint, ContextBlock},
     context::ConversationMemory,
     hook::{HCons, Hook},
     todo::{TodoList, TodoTool},
     tools::AgentTools,
+    transcript::Transcript,
 };
 
 #[cfg(feature = "mcp")]
@@ -54,6 +55,8 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     todo_list: Option<TodoList>,
     output_store: Option<Arc<OutputStore>>,
     background_receiver: Option<BackgroundTaskReceiver>,
+    transcript: Option<Transcript>,
+    sandbox_dir: Option<std::path::PathBuf>,
 }
 
 impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Balanced, Fast, H> {
@@ -82,6 +85,8 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             todo_list: None,
             output_store: None,
             background_receiver: None,
+            transcript: None,
+            sandbox_dir: None,
         }
     }
 }
@@ -112,6 +117,8 @@ where
             todo_list: self.todo_list,
             output_store: self.output_store,
             background_receiver: self.background_receiver,
+            transcript: self.transcript,
+            sandbox_dir: self.sandbox_dir,
         }
     }
 
@@ -134,6 +141,8 @@ where
             todo_list: self.todo_list,
             output_store: self.output_store,
             background_receiver: self.background_receiver,
+            transcript: self.transcript,
+            sandbox_dir: self.sandbox_dir,
         }
     }
 
@@ -202,6 +211,8 @@ where
             todo_list: self.todo_list,
             output_store: self.output_store,
             background_receiver: self.background_receiver,
+            transcript: self.transcript,
+            sandbox_dir: self.sandbox_dir,
         }
     }
 
@@ -225,6 +236,48 @@ where
     /// Sets the context compression strategy.
     pub fn context_strategy(mut self, strategy: ContextStrategy) -> Self {
         self.config.context = strategy;
+        self
+    }
+
+    /// Sets an optional persona overlay prompt.
+    pub fn persona_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.config.persona_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Sets agent kind (coding or chatbot).
+    pub const fn agent_kind(mut self, kind: AgentKind) -> Self {
+        self.config.agent_kind = kind;
+        self
+    }
+
+    /// Sets transcript path for long-memory recovery guidance.
+    pub fn transcript_path(mut self, path: impl Into<String>) -> Self {
+        self.config.transcript_path = Some(path.into());
+        self
+    }
+
+    /// Enables writing a readable transcript to the given path.
+    pub fn transcript(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.transcript = Some(Transcript::new(path));
+        self
+    }
+
+    /// Sets sandbox directory for working document supervision.
+    pub fn sandbox_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.sandbox_dir = Some(path.into());
+        self
+    }
+
+    /// Adds a structured context block.
+    pub fn context_block(mut self, block: ContextBlock) -> Self {
+        self.config.context_blocks.push(block);
+        self
+    }
+
+    /// Adds a one-line builtin command hint.
+    pub fn builtin_tool_hint(mut self, hint: BuiltinToolHint) -> Self {
+        self.config.builtin_tool_hints.push(hint);
         self
     }
 
@@ -311,6 +364,7 @@ where
     {
         let output_store = bash_tool.output_store().clone();
         let background_receiver = bash_tool.background_receiver();
+        self.sandbox_dir = Some(bash_tool.working_dir().to_path_buf());
         self.tools.register(bash_tool);
         self.output_store = Some(output_store);
         self.background_receiver = Some(background_receiver);
@@ -372,6 +426,8 @@ where
             todo_list: self.todo_list,
             output_store: self.output_store,
             background_receiver: self.background_receiver,
+            transcript: self.transcript,
+            sandbox_dir: self.sandbox_dir,
         }
     }
 }

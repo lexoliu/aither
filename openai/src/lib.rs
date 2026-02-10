@@ -29,8 +29,8 @@
 //! # Ok(()) }
 //! ```
 
-mod audio;
 mod attachments;
+mod audio;
 mod client;
 mod embedding;
 mod error;

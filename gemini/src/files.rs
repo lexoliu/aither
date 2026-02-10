@@ -112,10 +112,7 @@ pub struct ListFilesResponse {
 /// # Returns
 /// The uploaded file metadata including the URI to use in requests.
 pub async fn upload_file(cfg: &GeminiConfig, path: &Path) -> Result<GeminiFile, GeminiError> {
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
 
     let mime_type = mime_from_path(path).unwrap_or("application/octet-stream");
 
@@ -151,10 +148,13 @@ pub async fn upload_file(cfg: &GeminiConfig, path: &Path) -> Result<GeminiFile, 
     }
 
     // Build multipart body
-    let boundary = format!("----aither{:x}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos());
+    let boundary = format!(
+        "----aither{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
 
     let mut body = Vec::new();
 

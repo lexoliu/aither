@@ -96,26 +96,31 @@ impl SkillLoader {
                 continue;
             }
 
-            let mut entries = afs::read_dir(base_path)
-                .await
-                .map_err(|source| SkillError::ReadFile {
-                    path: base_path.clone(),
-                    source,
-                })?;
+            let mut entries =
+                afs::read_dir(base_path)
+                    .await
+                    .map_err(|source| SkillError::ReadFile {
+                        path: base_path.clone(),
+                        source,
+                    })?;
 
-            while let Some(entry) = entries.try_next().await.map_err(|source| {
-                SkillError::ReadFile {
-                    path: base_path.clone(),
-                    source,
-                }
-            })? {
+            while let Some(entry) =
+                entries
+                    .try_next()
+                    .await
+                    .map_err(|source| SkillError::ReadFile {
+                        path: base_path.clone(),
+                        source,
+                    })?
+            {
                 let path = entry.path();
-                let file_type = entry.file_type().await.map_err(|source| {
-                    SkillError::ReadFile {
+                let file_type = entry
+                    .file_type()
+                    .await
+                    .map_err(|source| SkillError::ReadFile {
                         path: path.clone(),
                         source,
-                    }
-                })?;
+                    })?;
 
                 if file_type.is_dir() {
                     if let Ok(skill) = Self::load_from_dir_async(&path).await {
@@ -205,12 +210,13 @@ impl SkillLoader {
             });
         }
 
-        let content = afs::read_to_string(&skill_file)
-            .await
-            .map_err(|source| SkillError::ReadFile {
-                path: skill_file,
-                source,
-            })?;
+        let content =
+            afs::read_to_string(&skill_file)
+                .await
+                .map_err(|source| SkillError::ReadFile {
+                    path: skill_file,
+                    source,
+                })?;
 
         let mut skill = Skill::parse(&content)?;
         Self::load_resources_async(dir, &mut skill).await?;
@@ -288,27 +294,30 @@ impl SkillLoader {
                 source,
             })?;
 
-        while let Some(entry) = entries.try_next().await.map_err(|source| {
-            SkillError::ReadFile {
+        while let Some(entry) = entries
+            .try_next()
+            .await
+            .map_err(|source| SkillError::ReadFile {
                 path: dir.to_path_buf(),
                 source,
-            }
-        })? {
+            })?
+        {
             let path = entry.path();
-            let file_type = entry.file_type().await.map_err(|source| {
-                SkillError::ReadFile {
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|source| SkillError::ReadFile {
                     path: path.clone(),
                     source,
-                }
-            })?;
+                })?;
             if file_type.is_file() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    let content = afs::read_to_string(&path)
-                        .await
-                        .map_err(|source| SkillError::ReadFile {
+                    let content = afs::read_to_string(&path).await.map_err(|source| {
+                        SkillError::ReadFile {
                             path: path.clone(),
                             source,
-                        })?;
+                        }
+                    })?;
                     let key = format!("{prefix}{name}");
                     skill.resources.insert(key, content);
                 }

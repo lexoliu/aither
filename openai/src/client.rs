@@ -2,8 +2,8 @@ use crate::{
     DEEPSEEK_BASE_URL, DEFAULT_AUDIO_FORMAT, DEFAULT_AUDIO_MODEL, DEFAULT_AUDIO_VOICE,
     DEFAULT_BASE_URL, DEFAULT_EMBEDDING_DIM, DEFAULT_EMBEDDING_MODEL, DEFAULT_IMAGE_MODEL,
     DEFAULT_MODEL, DEFAULT_MODERATION_MODEL, DEFAULT_TRANSCRIPTION_MODEL, OPENROUTER_BASE_URL,
-    error::OpenAIError,
     attachments::resolve_messages,
+    error::OpenAIError,
     request::{
         ChatCompletionRequest, ChatMessagePayload, ParameterSnapshot, ResponsesInputItem,
         ResponsesRequest, ResponsesTool, ToolPayload, convert_responses_tools, convert_tools,

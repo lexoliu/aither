@@ -45,7 +45,10 @@ impl LanguageModelProvider for CopilotProvider {
             let response: ModelListResponse = backend
                 .get(endpoint)
                 .map_err(CopilotError::Http)?
-                .header(header::AUTHORIZATION.as_str(), format!("Bearer {}", cfg.token))
+                .header(
+                    header::AUTHORIZATION.as_str(),
+                    format!("Bearer {}", cfg.token),
+                )
                 .map_err(CopilotError::Http)?
                 .json()
                 .await

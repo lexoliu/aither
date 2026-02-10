@@ -56,6 +56,7 @@ mod bash;
 mod command;
 mod naming;
 mod output;
+mod shell_session;
 
 /// Built-in IPC commands (ask, reload).
 pub mod builtin;
@@ -73,9 +74,13 @@ pub use bash::{
 };
 pub use command::{
     DynBashTool, DynToolHandler, IpcToolCommand, ToolCallCommand, ToolCommand, ToolRegistry,
-    ToolRegistryBuilder, cli_to_json, register_tool_command, register_tool_direct,
-    schema_to_help,
+    ToolRegistryBuilder, cli_to_json, register_tool_command, register_tool_direct, schema_to_help,
 };
 pub use job_registry::{JobInfo, JobRegistry, JobStatus};
 pub use output::{Content, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{BashMode, PermissionHandler};
+pub use shell_session::{
+    CloseShellArgs, CloseShellTool, ListSshTool, OpenShellArgs, OpenShellBackend, OpenShellTool,
+    ShellBackend, ShellRuntimeAvailability, ShellSession, ShellSessionRegistry, SshRuntimeProfile,
+    SshServer, SshSessionAuthorizer,
+};

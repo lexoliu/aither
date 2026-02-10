@@ -597,7 +597,7 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
                     continue;
                 }
                 "/compact" => {
-                    match agent.compact().await {
+                    match agent.compact(None).await {
                         Ok(Some(result)) => {
                             println!(
                                 "\x1b[2mCompacted {} messages into summary, starting fresh session\x1b[22m",

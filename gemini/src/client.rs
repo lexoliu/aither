@@ -42,8 +42,10 @@ pub async fn stream_generate(
     cfg: &GeminiConfig,
     model: &str,
     request: GenerateContentRequest,
-) -> Result<impl futures_core::Stream<Item = Result<GenerateContentResponse, GeminiError>>, GeminiError>
-{
+) -> Result<
+    impl futures_core::Stream<Item = Result<GenerateContentResponse, GeminiError>>,
+    GeminiError,
+> {
     let endpoint = cfg.model_endpoint(model, "streamGenerateContent") + "&alt=sse";
     let debug = std::env::var("AITHER_GEMINI_DEBUG").as_deref() == Ok("1");
 
@@ -91,31 +93,36 @@ pub async fn stream_generate(
         }
     };
 
-    Ok(futures_lite::stream::unfold(sse_stream, |mut stream| async move {
-        use futures_lite::StreamExt;
-        loop {
-            match stream.next().await {
-                None => return None,
-                Some(result) => {
-                    let event = match result {
-                        Ok(e) => e,
-                        Err(e) => return Some((Err(GeminiError::Parse(e.to_string())), stream)),
-                    };
-                    let data = event.text_data();
-                    if data.is_empty() || data == "[DONE]" {
-                        continue;
-                    }
-                    match serde_json::from_str::<GenerateContentResponse>(data) {
-                        Ok(response) => return Some((Ok(response), stream)),
-                        Err(e) => {
-                            tracing::debug!("SSE parse error: {} for data: {}", e, data);
+    Ok(futures_lite::stream::unfold(
+        sse_stream,
+        |mut stream| async move {
+            use futures_lite::StreamExt;
+            loop {
+                match stream.next().await {
+                    None => return None,
+                    Some(result) => {
+                        let event = match result {
+                            Ok(e) => e,
+                            Err(e) => {
+                                return Some((Err(GeminiError::Parse(e.to_string())), stream));
+                            }
+                        };
+                        let data = event.text_data();
+                        if data.is_empty() || data == "[DONE]" {
                             continue;
+                        }
+                        match serde_json::from_str::<GenerateContentResponse>(data) {
+                            Ok(response) => return Some((Ok(response), stream)),
+                            Err(e) => {
+                                tracing::debug!("SSE parse error: {} for data: {}", e, data);
+                                continue;
+                            }
                         }
                     }
                 }
             }
-        }
-    }))
+        },
+    ))
 }
 
 /// Fetch model info including context window size.

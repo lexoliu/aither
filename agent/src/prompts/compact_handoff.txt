@@ -1,0 +1,29 @@
+Your context window is being compacted. Generate a structured handoff document so a fresh instance of yourself can continue seamlessly.
+
+{focus_instruction}
+
+Write the handoff as a single document covering ALL of the following sections:
+
+## Current Task
+What the user asked for and the current state of progress.
+
+## Key Decisions & Findings
+Important decisions made, constraints discovered, patterns established.
+
+## Files & Paths
+List every file path you have read, written, or plan to modify. Be exhaustive -- a fresh instance will use this list to rebuild context by reading these files.
+
+## Errors & Fixes
+Errors encountered and how they were resolved (or still pending).
+
+## Pending Work
+What remains to be done, in order. Include the immediate next action.
+
+## Recovery Hints
+- The full conversation transcript is available at: {transcript_path}
+- List any other files or locations that contain important state.
+
+Rules:
+- Be concise but complete -- every detail you omit is permanently lost.
+- Prefer file paths over inline content (the new instance can read them).
+- Do NOT include code blocks unless they capture a decision not yet written to a file.

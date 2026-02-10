@@ -13,7 +13,10 @@ pub use aither_openai::{self as openai, OpenAI, OpenAIProvider};
 
 use aither_core::{
     LanguageModel,
-    llm::{Event, LLMRequest, LanguageModelProvider, model::Profile, provider::Profile as ProviderProfile},
+    llm::{
+        Event, LLMRequest, LanguageModelProvider, model::Profile,
+        provider::Profile as ProviderProfile,
+    },
 };
 use futures_core::Stream;
 use futures_lite::StreamExt;
@@ -190,7 +193,9 @@ impl LanguageModelProvider for CloudModelProvider {
     type Model = CloudProvider;
     type Error = CloudError;
 
-    fn list_models(&self) -> impl std::future::Future<Output = Result<Vec<Profile>, Self::Error>> + Send {
+    fn list_models(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<Profile>, Self::Error>> + Send {
         let provider = self.clone();
         async move {
             match provider {
@@ -202,15 +207,34 @@ impl LanguageModelProvider for CloudModelProvider {
         }
     }
 
-    fn get_model(&self, name: &str) -> impl std::future::Future<Output = Result<Self::Model, Self::Error>> + Send {
+    fn get_model(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<Self::Model, Self::Error>> + Send {
         let provider = self.clone();
         let name = name.to_string();
         async move {
             match provider {
-                CloudModelProvider::OpenAI(p) => p.get_model(&name).await.map(CloudProvider::from).map_err(CloudError::from),
-                CloudModelProvider::Claude(p) => p.get_model(&name).await.map(CloudProvider::from).map_err(CloudError::from),
-                CloudModelProvider::Gemini(p) => p.get_model(&name).await.map(CloudProvider::from).map_err(CloudError::from),
-                CloudModelProvider::Copilot(p) => p.get_model(&name).await.map(CloudProvider::from).map_err(CloudError::from),
+                CloudModelProvider::OpenAI(p) => p
+                    .get_model(&name)
+                    .await
+                    .map(CloudProvider::from)
+                    .map_err(CloudError::from),
+                CloudModelProvider::Claude(p) => p
+                    .get_model(&name)
+                    .await
+                    .map(CloudProvider::from)
+                    .map_err(CloudError::from),
+                CloudModelProvider::Gemini(p) => p
+                    .get_model(&name)
+                    .await
+                    .map(CloudProvider::from)
+                    .map_err(CloudError::from),
+                CloudModelProvider::Copilot(p) => p
+                    .get_model(&name)
+                    .await
+                    .map(CloudProvider::from)
+                    .map_err(CloudError::from),
             }
         }
     }

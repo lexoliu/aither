@@ -166,11 +166,8 @@ impl FileCache {
     pub fn prune_expired(&mut self) -> bool {
         let now = SystemTime::now();
         let before = self.entries.len();
-        self.entries.retain(|_, entry| {
-            entry
-                .expires_at
-                .map_or(true, |expires| now < expires)
-        });
+        self.entries
+            .retain(|_, entry| entry.expires_at.map_or(true, |expires| now < expires));
         before != self.entries.len()
     }
 
@@ -233,7 +230,9 @@ mod tests {
             let dir = tempfile::tempdir().expect("create temp dir");
             let cache_dir = dir.path().join("cache");
             let file_path = dir.path().join("file.txt");
-            async_fs::write(&file_path, b"hello").await.expect("write file");
+            async_fs::write(&file_path, b"hello")
+                .await
+                .expect("write file");
 
             let mut cache = FileCache::open(cache_dir).await.expect("open cache");
             cache

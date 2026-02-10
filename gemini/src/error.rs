@@ -100,11 +100,10 @@ impl ApiErrorResponse {
                                 let quota_value = v.quota_value.as_deref().unwrap_or("?");
                                 return format!(
                                     "Rate limit exceeded: {} requests/min (limit: {})",
-                                    quota_id
-                                        .split('-')
-                                        .next()
-                                        .unwrap_or(quota_id)
-                                        .replace("GenerateRequestsPerMinutePerProjectPerModel", "requests"),
+                                    quota_id.split('-').next().unwrap_or(quota_id).replace(
+                                        "GenerateRequestsPerMinutePerProjectPerModel",
+                                        "requests"
+                                    ),
                                     quota_value
                                 );
                             }

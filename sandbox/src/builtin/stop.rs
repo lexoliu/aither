@@ -1,14 +1,12 @@
-//! Stop tool - terminate a background task by PID.
+//! Kill tool - terminate a background task by PID.
 //!
 //! Implements `Tool` trait and can be registered via `ToolRegistryBuilder::configure_tool`.
 //! Allows terminating tasks across sandbox boundaries.
 //!
-//! Named `stop` to avoid collision with bash builtin `kill`.
-//!
 //! # Usage
 //!
 //! ```bash
-//! stop 12345        # Stop process with PID 12345
+//! kill 12345        # Terminate process with PID 12345
 //! ```
 
 use std::borrow::Cow;
@@ -19,36 +17,36 @@ use serde::{Deserialize, Serialize};
 
 use crate::job_registry::JobRegistry;
 
-/// Stop a background task by PID.
+/// Kill a background task by PID.
 ///
 /// This tool allows sandboxed processes to terminate background tasks.
 /// The kill signal is sent from the parent process (outside the sandbox),
 /// bypassing sandbox restrictions.
 #[derive(Debug, Clone)]
-pub struct StopTool {
+pub struct KillTool {
     registry: JobRegistry,
 }
 
-impl StopTool {
-    /// Creates a new stop tool with the given registry.
+impl KillTool {
+    /// Creates a new kill tool with the given registry.
     pub fn new(registry: JobRegistry) -> Self {
         Self { registry }
     }
 }
 
-/// Arguments for the stop command.
+/// Arguments for the kill command.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct StopArgs {
-    /// Process ID to stop.
+pub struct KillArgs {
+    /// Process ID to kill.
     pub pid: u32,
 }
 
-impl Tool for StopTool {
+impl Tool for KillTool {
     fn name(&self) -> Cow<'static, str> {
-        "stop".into()
+        "kill".into()
     }
 
-    type Arguments = StopArgs;
+    type Arguments = KillArgs;
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
         if self.registry.kill(args.pid).await {
@@ -69,8 +67,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stop_args_schema() {
-        let schema = schemars::schema_for!(StopArgs);
+    fn test_kill_args_schema() {
+        let schema = schemars::schema_for!(KillArgs);
         let json = serde_json::to_string_pretty(&schema).unwrap();
         // Should have pid as required
         assert!(json.contains("pid"));

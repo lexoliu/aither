@@ -2,15 +2,15 @@
 //!
 //! These tools are always available and provide special functionality:
 //! - `ask`: Query a fast LLM about piped content
-//! - `tasks`: List background tasks (running, completed, failed, killed)
-//! - `stop`: Terminate a background task by PID
+//! - `jobs`: List background tasks (running, completed, failed, killed)
+//! - `kill`: Terminate a background task by PID
 
 mod ask;
 mod stop;
 mod tasks;
 
 pub use ask::AskCommand;
-pub use stop::{StopArgs, StopTool};
+pub use stop::{KillArgs, KillTool};
 pub use tasks::{TasksArgs, TasksTool};
 
 use leash::IpcRouter;

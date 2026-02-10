@@ -347,7 +347,12 @@ fn read_file_to_data_url(url: &url::Url) -> Option<String> {
 
 /// Get MIME type from file path extension.
 fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
-    match path.extension().and_then(|e| e.to_str())?.to_lowercase().as_str() {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_lowercase()
+        .as_str()
+    {
         // Images
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),
@@ -494,9 +499,16 @@ pub enum ResponsesMessageContent {
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponsesInputContent {
-    InputText { text: String },
-    InputImage { #[serde(flatten)] source: InputImageSource },
-    InputFile { file_id: String },
+    InputText {
+        text: String,
+    },
+    InputImage {
+        #[serde(flatten)]
+        source: InputImageSource,
+    },
+    InputFile {
+        file_id: String,
+    },
 }
 
 #[derive(Debug, Serialize, Clone)]

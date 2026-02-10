@@ -1,6 +1,10 @@
 //! Claude provider for listing and instantiating models.
 
-use crate::{Claude, error::ClaudeError, constant::{CLAUDE_BASE_URL, ANTHROPIC_VERSION}};
+use crate::{
+    Claude,
+    constant::{ANTHROPIC_VERSION, CLAUDE_BASE_URL},
+    error::ClaudeError,
+};
 use aither_core::llm::{
     LanguageModelProvider, model::Profile as ModelProfile, provider::Profile as ProviderProfile,
 };

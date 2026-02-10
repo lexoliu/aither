@@ -26,7 +26,10 @@
 //! # }
 //! ```
 
-use crate::{CopilotError, constant::{COPILOT_CLIENT_ID, GITHUB_DEVICE_CODE_URL, GITHUB_TOKEN_URL}};
+use crate::{
+    CopilotError,
+    constant::{COPILOT_CLIENT_ID, GITHUB_DEVICE_CODE_URL, GITHUB_TOKEN_URL},
+};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use zenwave::{Client, client};
@@ -129,7 +132,10 @@ pub async fn request_device_code() -> Result<DeviceCodeResponse, CopilotError> {
 /// # Errors
 ///
 /// Returns an error if authorization fails, expires, or is denied.
-pub async fn poll_for_token(device_code: &str, interval: u64) -> Result<CopilotToken, CopilotError> {
+pub async fn poll_for_token(
+    device_code: &str,
+    interval: u64,
+) -> Result<CopilotToken, CopilotError> {
     let poll_interval = Duration::from_secs(interval.max(5)); // At least 5 seconds
 
     loop {
@@ -277,7 +283,10 @@ pub async fn get_session_token(oauth_token: &str) -> Result<SessionToken, Copilo
         .map_err(CopilotError::Http)?
         .header("Accept", "application/json")
         .map_err(CopilotError::Http)?
-        .header("User-Agent", format!("aither-copilot/0.1 ({})", EDITOR_VERSION))
+        .header(
+            "User-Agent",
+            format!("aither-copilot/0.1 ({})", EDITOR_VERSION),
+        )
         .map_err(CopilotError::Http)?
         .json()
         .await

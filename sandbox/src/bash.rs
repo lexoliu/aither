@@ -7,14 +7,10 @@
 //! (e.g., `amber-forest-thunder-pearl/`). All bash executions share this
 //! directory, but each execution gets a fresh sandbox (new TTY/process).
 
-use std::{
-    borrow::Cow,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{borrow::Cow, path::PathBuf, process::Stdio, sync::Arc};
 
-use aither_core::llm::{Tool, ToolOutput};
 use crate::output::INLINE_OUTPUT_LIMIT;
+use aither_core::llm::{Tool, ToolOutput};
 use async_channel::{Receiver, Sender};
 use executor_core::{Executor, Task};
 use leash::{
@@ -23,14 +19,15 @@ use leash::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     builtin::builtin_router,
     command::ToolRegistry,
+    job_registry::{JobRegistry, job_registry_channel},
     output::{OutputEntry, OutputFormat, OutputStore},
     permission::{BashMode, PermissionError, PermissionHandler},
-    job_registry::{JobRegistry, job_registry_channel},
+    shell_session::{ShellSessionRegistry, SshRuntimeProfile},
 };
 
 /// Generate a random four-word ID (e.g., "amber-forest-thunder-pearl").
@@ -61,25 +58,15 @@ fn random_task_id() -> String {
 ///
 /// ## Permission Modes
 ///
-/// - `sandboxed` (default): Read-only host access, writes to sandbox only
-/// - `network`: Sandbox + network access (for curl, wget, ssh, git)
-/// - `unsafe`: No sandbox, full system access (requires approval with reason)
+/// Execution mode is selected when opening a shell session via `open_shell`.
+/// `bash` inherits the mode from that session.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BashArgs {
+    /// Active shell session id returned by `open_shell`.
+    pub shell_id: String,
+
     /// The bash script to execute.
     pub script: String,
-
-    /// Permission mode for execution.
-    /// - "sandboxed" (default): read-only filesystem, no network, IPC commands work
-    /// - "network": sandbox with network access enabled
-    /// - "unsafe": no sandbox, full system access (requires approval)
-    #[serde(default)]
-    pub mode: BashMode,
-
-    /// REQUIRED when mode is "unsafe". Explain why unsafe access is needed.
-    /// Examples: "Writing config to ~/.zshrc", "Running osascript to automate Mail app"
-    #[serde(default)]
-    pub reason: Option<String>,
 
     /// Expected output format for proper handling.
     /// - "text" (default): plain text
@@ -90,10 +77,10 @@ pub struct BashArgs {
     #[serde(default)]
     pub expect: OutputFormat,
 
-    /// Run command in background. Returns immediately with task ID.
-    /// Results are injected into context when complete.
-    #[serde(default)]
-    pub background: bool,
+    /// Per-command timeout in seconds.
+    /// - 0: run in background immediately
+    /// - >0: run foreground up to timeout, then move to background on timeout
+    pub timeout: u64,
 }
 
 /// Result of a bash execution.
@@ -109,7 +96,7 @@ pub struct BashResult {
     /// Exit code of the script.
     pub exit_code: i32,
 
-    /// Task ID for background execution (only present when background: true).
+    /// Task ID for background execution.
     /// Four random words like "amber-forest-thunder-pearl".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -176,14 +163,11 @@ impl BackgroundTaskReceiver {
     ///
     /// Returns `None` if no task completes within the timeout or if the channel is closed.
     pub async fn recv_timeout(&self, duration: std::time::Duration) -> Option<CompletedTask> {
-        futures_lite::future::or(
-            async { self.rx.recv().await.ok() },
-            async {
-                futures_lite::future::yield_now().await;
-                async_io::Timer::after(duration).await;
-                None
-            },
-        )
+        futures_lite::future::or(async { self.rx.recv().await.ok() }, async {
+            futures_lite::future::yield_now().await;
+            async_io::Timer::after(duration).await;
+            None
+        })
         .await
     }
 }
@@ -222,10 +206,7 @@ pub enum BashToolFactoryError {
 #[must_use]
 pub fn bash_tool_factory_channel() -> (BashToolFactory, BashToolFactoryReceiver) {
     let (tx, rx) = async_channel::unbounded();
-    (
-        BashToolFactory { tx },
-        BashToolFactoryReceiver { rx },
-    )
+    (BashToolFactory { tx }, BashToolFactoryReceiver { rx })
 }
 
 impl BashToolFactory {
@@ -280,6 +261,10 @@ pub struct Configured {
 pub struct BashTool<P, E, State = Unconfigured> {
     /// Shared working directory (four random words, e.g., `amber-forest-thunder-pearl/`)
     working_dir: PathBuf,
+    /// Shell session registry for open_shell/bash/close_shell lifecycle.
+    shell_sessions: ShellSessionRegistry,
+    /// Auto-open a default session when shell_id is missing or stale.
+    auto_open_default_session: bool,
     /// Permission handler wrapped in Arc for sharing between parent and child tools.
     permission_handler: Arc<P>,
     executor: E,
@@ -291,6 +276,8 @@ pub struct BashTool<P, E, State = Unconfigured> {
     completed_tx: Sender<CompletedTask>,
     /// Additional paths that should be writable in the sandbox.
     writable_paths: Vec<PathBuf>,
+    /// Additional paths that should be readable (but not writable) in the sandbox.
+    readable_paths: Vec<PathBuf>,
     /// Tool registry state.
     registry: State,
 }
@@ -300,6 +287,8 @@ impl<P, E: Clone, State: Clone> Clone for BashTool<P, E, State> {
     fn clone(&self) -> Self {
         Self {
             working_dir: self.working_dir.clone(),
+            shell_sessions: self.shell_sessions.clone(),
+            auto_open_default_session: self.auto_open_default_session,
             permission_handler: self.permission_handler.clone(),
             executor: self.executor.clone(),
             output_store: self.output_store.clone(),
@@ -307,12 +296,37 @@ impl<P, E: Clone, State: Clone> Clone for BashTool<P, E, State> {
             completed_rx: self.completed_rx.clone(),
             completed_tx: self.completed_tx.clone(),
             writable_paths: self.writable_paths.clone(),
+            readable_paths: self.readable_paths.clone(),
             registry: self.registry.clone(),
         }
     }
 }
 
 impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
+    /// Injects the shared shell-session registry used by open_shell/bash/close_shell.
+    #[must_use]
+    pub fn with_shell_sessions(mut self, sessions: ShellSessionRegistry) -> Self {
+        self.shell_sessions = sessions;
+        self
+    }
+
+    /// Sets dynamic shell runtime availability for open_shell.
+    #[must_use]
+    pub fn with_shell_runtime_availability(
+        self,
+        availability: crate::shell_session::ShellRuntimeAvailability,
+    ) -> Self {
+        let _ = self.shell_sessions.set_availability(availability);
+        self
+    }
+
+    /// Controls whether `bash` auto-opens a default session on missing/stale shell_id.
+    #[must_use]
+    pub fn with_auto_open_default_session(mut self, enabled: bool) -> Self {
+        self.auto_open_default_session = enabled;
+        self
+    }
+
     /// Creates a new bash tool with permission handler and executor.
     ///
     /// Creates a random four-word working directory under the specified parent directory.
@@ -352,6 +366,8 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
 
         Ok(Self {
             working_dir: working_dir_path,
+            shell_sessions: ShellSessionRegistry::new(Default::default()),
+            auto_open_default_session: false,
             permission_handler: Arc::new(permission_handler),
             executor,
             output_store,
@@ -359,6 +375,7 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
             completed_rx,
             completed_tx,
             writable_paths: Vec::new(),
+            readable_paths: Vec::new(),
             registry: Unconfigured,
         })
     }
@@ -397,6 +414,8 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
 
         Ok(Self {
             working_dir: working_dir_path,
+            shell_sessions: ShellSessionRegistry::new(Default::default()),
+            auto_open_default_session: false,
             permission_handler: Arc::new(permission_handler),
             executor,
             output_store,
@@ -404,6 +423,7 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
             completed_rx,
             completed_tx,
             writable_paths: Vec::new(),
+            readable_paths: Vec::new(),
             registry: Unconfigured,
         })
     }
@@ -413,6 +433,8 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
     pub fn with_registry(self, registry: Arc<ToolRegistry>) -> BashTool<P, E, Configured> {
         BashTool {
             working_dir: self.working_dir,
+            shell_sessions: self.shell_sessions,
+            auto_open_default_session: self.auto_open_default_session,
             permission_handler: self.permission_handler,
             executor: self.executor,
             output_store: self.output_store,
@@ -420,10 +442,10 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
             completed_rx: self.completed_rx,
             completed_tx: self.completed_tx,
             writable_paths: self.writable_paths,
+            readable_paths: self.readable_paths,
             registry: Configured { registry },
         }
     }
-
 }
 
 impl<P, E, State> BashTool<P, E, State>
@@ -438,7 +460,21 @@ where
         mut self,
         paths: impl IntoIterator<Item = impl Into<PathBuf>>,
     ) -> Self {
-        self.writable_paths.extend(paths.into_iter().map(Into::into));
+        self.writable_paths
+            .extend(paths.into_iter().map(Into::into));
+        self
+    }
+
+    /// Adds additional readable (but not writable) paths to the sandbox configuration.
+    ///
+    /// These paths will be readable in all sandbox modes, even in strict
+    /// filesystem mode where reads outside the sandbox are normally denied.
+    pub fn with_readable_paths(
+        mut self,
+        paths: impl IntoIterator<Item = impl Into<PathBuf>>,
+    ) -> Self {
+        self.readable_paths
+            .extend(paths.into_iter().map(Into::into));
         self
     }
 
@@ -453,6 +489,8 @@ where
         let (completed_tx, completed_rx) = async_channel::unbounded();
         Self {
             working_dir: self.working_dir.clone(),
+            shell_sessions: self.shell_sessions.clone(),
+            auto_open_default_session: self.auto_open_default_session,
             permission_handler: self.permission_handler.clone(), // Arc clone - shares handler
             executor: self.executor.clone(),
             output_store: self.output_store.clone(),
@@ -460,6 +498,7 @@ where
             completed_rx,
             completed_tx,
             writable_paths: self.writable_paths.clone(),
+            readable_paths: self.readable_paths.clone(),
             registry: self.registry.clone(),
         }
     }
@@ -537,10 +576,10 @@ where
     /// This is useful for creating child bash tools for subagents where
     /// the concrete type cannot be known at compile time.
     pub fn to_dyn(self) -> crate::command::DynBashTool {
-        use std::sync::Arc;
         use crate::command::{DynBashTool, DynToolHandler};
         use aither_core::llm::tool::ToolDefinition;
         use serde_json::Value;
+        use std::sync::Arc;
 
         // Create the definition - description comes from BashArgs rustdoc
         let schema = schemars::schema_for!(BashArgs);
@@ -550,7 +589,8 @@ where
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let definition = ToolDefinition::from_parts("bash".into(), description.into(), schema_value);
+        let definition =
+            ToolDefinition::from_parts("bash".into(), description.into(), schema_value);
 
         // Create the handler
         let tool = Arc::new(self);
@@ -560,7 +600,10 @@ where
             Box::pin(async move {
                 match serde_json::from_str::<BashArgs>(&args_str) {
                     Ok(parsed) => match tool.call(parsed).await {
-                        Ok(output) => output.as_str().unwrap_or("").to_string(),
+                        Ok(output) => {
+                            let text: &str = output.as_str().unwrap_or("");
+                            text.to_string()
+                        }
                         Err(e) => format!("{{\"error\": \"{}\"}}", e),
                     },
                     Err(e) => format!("{{\"error\": \"Parse error: {}\"}}", e),
@@ -568,53 +611,14 @@ where
             })
         });
 
-        DynBashTool { definition, handler }
+        DynBashTool {
+            definition,
+            handler,
+        }
     }
 }
 
 impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> BashTool<P, E, Configured> {
-    /// Executes a bash script with the given arguments.
-    #[instrument(skip(self), fields(mode = ?args.mode, expect = ?args.expect))]
-    async fn execute(&self, args: BashArgs) -> Result<BashResult, BashError> {
-        // Check permission
-        if !self.permission_handler.check(args.mode, &args.script).await? {
-            return Err(BashError::PermissionDenied(args.mode));
-        }
-
-        info!(script_len = args.script.len(), "executing bash script");
-        debug!(script = %args.script, "script content");
-
-        // Execute based on mode
-        let output = match args.mode {
-            BashMode::Sandboxed => self.execute_sandboxed(&args.script).await?,
-            BashMode::Network => self.execute_network(&args.script).await?,
-            BashMode::Unsafe => self.execute_unsafe(&args.script).await?,
-        };
-
-        // Save stdout - get store dir first, then save async
-        let store_dir = self.output_store.dir().to_path_buf();
-        let limit = Some(INLINE_OUTPUT_LIMIT);
-        let stdout = OutputStore::save_to_dir_with_limit(&store_dir, &output.stdout, args.expect, limit).await?;
-
-        // Save stderr if non-empty
-        let stderr = if output.stderr.is_empty() {
-            None
-        } else {
-            Some(OutputStore::save_to_dir_with_limit(&store_dir, &output.stderr, OutputFormat::Text, limit).await?)
-        };
-
-        let exit_code = output.status.code().unwrap_or(-1);
-        debug!(exit_code, "script completed");
-
-        Ok(BashResult {
-            stdout,
-            stderr,
-            exit_code,
-            task_id: None,
-            status: None,
-        })
-    }
-
     /// Executes in sandboxed mode (read-only, no network).
     async fn execute_sandboxed(&self, script: &str) -> Result<std::process::Output, BashError> {
         let router = create_ipc_router(self.registry().clone());
@@ -622,6 +626,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> BashTool<P, 
             .network(DenyAll)
             .working_dir(&self.working_dir)
             .writable_paths(&self.writable_paths)
+            .readable_paths(&self.readable_paths)
             .security(SecurityConfig::interactive())
             .ipc(router)
             .build()
@@ -647,6 +652,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> BashTool<P, 
             .network(AllowAll)
             .working_dir(&self.working_dir)
             .writable_paths(&self.writable_paths)
+            .readable_paths(&self.readable_paths)
             .security(SecurityConfig::interactive())
             .ipc(router)
             .build()
@@ -686,80 +692,148 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
 
     type Arguments = BashArgs;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        // Validate: unsafe mode requires a reason
-        if arguments.mode == BashMode::Unsafe && arguments.reason.is_none() {
-            return Err(anyhow::anyhow!(
-                "unsafe mode requires a 'reason' field explaining why unsafe access is needed"
-            ));
-        }
+    async fn call(&self, mut arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+        let session = if arguments.shell_id.trim().is_empty() {
+            if !self.auto_open_default_session {
+                return Err(anyhow::anyhow!(
+                    "shell_id is required; open a shell first with open_shell"
+                ));
+            }
+            let opened = self
+                .shell_sessions
+                .open(
+                    crate::shell_session::ShellBackend::Local,
+                    BashMode::Sandboxed,
+                    self.working_dir.clone(),
+                    None,
+                    None,
+                )
+                .map_err(anyhow::Error::msg)?;
+            arguments.shell_id = opened.id.clone();
+            opened
+        } else if let Some(existing) = self.shell_sessions.get(&arguments.shell_id) {
+            existing
+        } else {
+            if !self.auto_open_default_session {
+                return Err(anyhow::anyhow!(
+                    "unknown shell_id; session may be closed or disconnected"
+                ));
+            }
+            let opened = self
+                .shell_sessions
+                .open(
+                    crate::shell_session::ShellBackend::Local,
+                    BashMode::Sandboxed,
+                    self.working_dir.clone(),
+                    None,
+                    None,
+                )
+                .map_err(anyhow::Error::msg)?;
+            arguments.shell_id = opened.id.clone();
+            opened
+        };
 
-        // Check permission first (before potentially spawning background task)
-        if !self.permission_handler.check(arguments.mode, &arguments.script).await
+        if !self
+            .permission_handler
+            .check(session.mode, &arguments.script)
+            .await
             .map_err(|e| anyhow::anyhow!(e))?
         {
-            return Err(anyhow::anyhow!(BashError::PermissionDenied(arguments.mode)));
+            return Err(anyhow::anyhow!(BashError::PermissionDenied(session.mode)));
         }
 
-        if arguments.background {
-            // Background execution: spawn task and return immediately
-            let task_id = random_task_id();
-            let script = arguments.script.clone();
-            let mode = arguments.mode;
-            let expect = arguments.expect;
-            let working_dir = self.working_dir.clone();
-            let writable_paths = self.writable_paths.clone();
-            let executor = self.executor.clone();
-            let registry = self.registry().clone();
-            let store_dir = self.output_store.dir().to_path_buf();
-            let completed_tx = self.completed_tx.clone();
-            let job_registry = self.job_registry.clone();
+        let task_id = random_task_id();
+        let script = arguments.script.clone();
+        let shell_id = session.id.clone();
+        let mode = session.mode;
+        let backend = session.backend;
+        let ssh_target = session.ssh_target.clone();
+        let ssh_runtime = session.ssh_runtime.clone();
+        let expect = arguments.expect;
+        let working_dir = self.working_dir.clone();
+        let writable_paths = self.writable_paths.clone();
+        let readable_paths = self.readable_paths.clone();
+        let executor = self.executor.clone();
+        let registry = self.registry().clone();
+        let store_dir = self.output_store.dir().to_path_buf();
+        let completed_tx = self.completed_tx.clone();
+        let job_registry = self.job_registry.clone();
+        let (result_tx, result_rx) = async_channel::bounded(1);
 
-            info!(task_id = %task_id, script_len = script.len(), "spawning background bash task");
-
-            // Clone task_id for the spawned task
-            let task_id_for_spawn = task_id.clone();
-
-            // Spawn background task
-            self.executor.spawn(async move {
+        let task_id_for_spawn = task_id.clone();
+        self.executor
+            .spawn(async move {
                 let result = execute_script_standalone(
                     &working_dir,
                     &writable_paths,
+                    &readable_paths,
                     executor,
                     registry,
                     job_registry,
+                    &shell_id,
                     &script,
                     mode,
+                    backend,
+                    ssh_target.as_deref(),
+                    ssh_runtime.clone(),
                     expect,
                     &store_dir,
-                ).await;
+                )
+                .await;
 
-                // Send completion (ignore send error if receiver dropped)
-                let _ = completed_tx.send(CompletedTask {
-                    task_id: task_id_for_spawn,
-                    script,
-                    result,
-                }).await;
-            }).detach();
+                let quick_result = match &result {
+                    Ok(ok) => Ok(ok.clone()),
+                    Err(err) => Err(err.to_string()),
+                };
+                let _ = result_tx.send(quick_result).await;
 
-            // Return immediately with running status
-            let result = BashResult {
+                let _ = completed_tx
+                    .send(CompletedTask {
+                        task_id: task_id_for_spawn,
+                        script,
+                        result,
+                    })
+                    .await;
+            })
+            .detach();
+
+        if arguments.timeout == 0 {
+            let running = BashResult {
                 stdout: OutputEntry::Empty,
                 stderr: None,
                 exit_code: 0,
                 task_id: Some(task_id),
                 status: Some("running".to_string()),
             };
-            let json = serde_json::to_string(&result).map_err(|e| anyhow::anyhow!(e))?;
-            Ok(ToolOutput::text(json))
-        } else {
-            // Normal synchronous execution
-            match self.execute(arguments).await {
-                Ok(result) => {
-                    let json = serde_json::to_string(&result).map_err(|e| anyhow::anyhow!(e))?;
-                    Ok(ToolOutput::text(json))
-                }
-                Err(e) => Err(anyhow::anyhow!(e)),
+            let json = serde_json::to_string(&running).map_err(|e| anyhow::anyhow!(e))?;
+            return Ok(ToolOutput::text(json));
+        }
+
+        let timeout = std::time::Duration::from_secs(arguments.timeout);
+        let immediate = futures_lite::future::or(async { result_rx.recv().await.ok() }, async {
+            async_io::Timer::after(timeout).await;
+            None
+        })
+        .await;
+
+        match immediate {
+            Some(Ok(mut result)) => {
+                result.task_id = None;
+                result.status = None;
+                let json = serde_json::to_string(&result).map_err(|e| anyhow::anyhow!(e))?;
+                Ok(ToolOutput::text(json))
+            }
+            Some(Err(err)) => Err(anyhow::anyhow!(err)),
+            None => {
+                let running = BashResult {
+                    stdout: OutputEntry::Empty,
+                    stderr: None,
+                    exit_code: 0,
+                    task_id: Some(task_id),
+                    status: Some("running".to_string()),
+                };
+                let json = serde_json::to_string(&running).map_err(|e| anyhow::anyhow!(e))?;
+                Ok(ToolOutput::text(json))
             }
         }
     }
@@ -769,62 +843,85 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
 async fn execute_script_standalone<E: Executor + Clone + 'static>(
     working_dir: &PathBuf,
     writable_paths: &[PathBuf],
+    readable_paths: &[PathBuf],
     executor: E,
     registry: Arc<ToolRegistry>,
     job_registry: JobRegistry,
+    shell_id: &str,
     script: &str,
     mode: BashMode,
+    backend: crate::shell_session::ShellBackend,
+    ssh_target: Option<&str>,
+    ssh_runtime: Option<SshRuntimeProfile>,
     expect: OutputFormat,
     store_dir: &PathBuf,
 ) -> Result<BashResult, BashError> {
-    info!(script_len = script.len(), ?mode, "executing background bash script");
+    info!(
+        script_len = script.len(),
+        ?mode,
+        "executing background bash script"
+    );
     debug!(script = %script, "script content");
 
-    let (pid, output) = match mode {
-        BashMode::Sandboxed => {
-            execute_sandboxed_background(
-                working_dir,
-                writable_paths,
-                executor.clone(),
-                registry.clone(),
-                script,
-                mode,
-                DenyAll,
-                &job_registry,
-            )
-            .await?
-        }
-        BashMode::Network => {
-            execute_sandboxed_background(
-                working_dir,
-                writable_paths,
-                executor,
-                registry,
-                script,
-                mode,
-                AllowAll,
-                &job_registry,
-            )
-            .await?
-        }
-        BashMode::Unsafe => {
-            execute_unsafe_background(working_dir, script, mode, &job_registry).await?
+    let (pid, output) = if matches!(backend, crate::shell_session::ShellBackend::Ssh) {
+        execute_ssh_background(
+            shell_id,
+            script,
+            mode,
+            ssh_target,
+            ssh_runtime,
+            &job_registry,
+        )
+        .await?
+    } else {
+        match mode {
+            BashMode::Sandboxed => {
+                execute_sandboxed_background(
+                    working_dir,
+                    writable_paths,
+                    readable_paths,
+                    executor.clone(),
+                    registry.clone(),
+                    shell_id,
+                    script,
+                    mode,
+                    DenyAll,
+                    &job_registry,
+                )
+                .await?
+            }
+            BashMode::Network => {
+                execute_sandboxed_background(
+                    working_dir,
+                    writable_paths,
+                    readable_paths,
+                    executor,
+                    registry,
+                    shell_id,
+                    script,
+                    mode,
+                    AllowAll,
+                    &job_registry,
+                )
+                .await?
+            }
+            BashMode::Unsafe => {
+                execute_unsafe_background(working_dir, shell_id, script, mode, &job_registry)
+                    .await?
+            }
         }
     };
 
     // Save stdout with system-level size limit
     let limit = Some(INLINE_OUTPUT_LIMIT);
-    let stdout = match OutputStore::save_to_dir_with_limit(store_dir, &output.stdout, expect, limit)
-        .await
-    {
-        Ok(entry) => entry,
-        Err(err) => {
-            job_registry
-                .fail(pid, &err.to_string(), None)
-                .await;
-            return Err(BashError::Io(err));
-        }
-    };
+    let stdout =
+        match OutputStore::save_to_dir_with_limit(store_dir, &output.stdout, expect, limit).await {
+            Ok(entry) => entry,
+            Err(err) => {
+                job_registry.fail(pid, &err.to_string(), None).await;
+                return Err(BashError::Io(err));
+            }
+        };
 
     // Save stderr if non-empty
     let stderr = if output.stderr.is_empty() {
@@ -840,9 +937,7 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
         {
             Ok(entry) => Some(entry),
             Err(err) => {
-                job_registry
-                    .fail(pid, &err.to_string(), None)
-                    .await;
+                job_registry.fail(pid, &err.to_string(), None).await;
                 return Err(BashError::Io(err));
             }
         }
@@ -852,9 +947,7 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
     debug!(exit_code, "background script completed");
 
     let output_path = stdout.stored_path(store_dir);
-    job_registry
-        .complete(pid, exit_code, output_path)
-        .await;
+    job_registry.complete(pid, exit_code, output_path).await;
 
     Ok(BashResult {
         stdout,
@@ -868,8 +961,10 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
 async fn execute_sandboxed_background<E, N>(
     working_dir: &PathBuf,
     writable_paths: &[PathBuf],
+    readable_paths: &[PathBuf],
     executor: E,
     registry: Arc<ToolRegistry>,
+    shell_id: &str,
     script: &str,
     mode: BashMode,
     policy: N,
@@ -884,6 +979,7 @@ where
         .network(policy)
         .working_dir(working_dir)
         .writable_paths(writable_paths)
+        .readable_paths(readable_paths)
         .security(SecurityConfig::interactive())
         .ipc(router)
         .build()
@@ -906,7 +1002,7 @@ where
 
     let pid = child.id();
     job_registry
-        .register(pid, script, mode, None)
+        .register(pid, shell_id, script, mode, None)
         .await;
 
     let output_result =
@@ -914,9 +1010,7 @@ where
     let output = match output_result {
         Ok(output) => output,
         Err(err) => {
-            job_registry
-                .fail(pid, &err.to_string(), None)
-                .await;
+            job_registry.fail(pid, &err.to_string(), None).await;
             return Err(BashError::Execution(err.to_string()));
         }
     };
@@ -926,6 +1020,7 @@ where
 
 async fn execute_unsafe_background(
     working_dir: &PathBuf,
+    shell_id: &str,
     script: &str,
     mode: BashMode,
     job_registry: &JobRegistry,
@@ -942,18 +1037,88 @@ async fn execute_unsafe_background(
 
     let pid = child.id();
     job_registry
-        .register(pid, script, mode, None)
+        .register(pid, shell_id, script, mode, None)
         .await;
 
     match child.output().await {
         Ok(output) => Ok((pid, output)),
         Err(err) => {
-            job_registry
-                .fail(pid, &err.to_string(), None)
-                .await;
+            job_registry.fail(pid, &err.to_string(), None).await;
             Err(BashError::Execution(err.to_string()))
         }
     }
+}
+
+
+
+async fn execute_ssh_background(
+    shell_id: &str,
+    script: &str,
+    mode: BashMode,
+    ssh_target: Option<&str>,
+    ssh_runtime: Option<SshRuntimeProfile>,
+    job_registry: &JobRegistry,
+) -> Result<(u32, std::process::Output), BashError> {
+    let target = ssh_target.ok_or_else(|| BashError::Execution("missing ssh target".to_string()))?;
+    let runtime = ssh_runtime.ok_or_else(|| BashError::Execution("missing ssh runtime profile".to_string()))?;
+
+    let remote_cmd = match runtime {
+        SshRuntimeProfile::Leash { binary } => match mode {
+            BashMode::Sandboxed => format!(
+                "{} run --network deny -- /bin/bash -lc {}",
+                shell_escape(&binary),
+                shell_escape(script)
+            ),
+            BashMode::Network => format!(
+                "{} run --network allow -- /bin/bash -lc {}",
+                shell_escape(&binary),
+                shell_escape(script)
+            ),
+            BashMode::Unsafe => format!(
+                "{} run --network allow -- /bin/bash -lc {}",
+                shell_escape(&binary),
+                shell_escape(script)
+            ),
+        },
+        SshRuntimeProfile::Unsafe => {
+            if mode != BashMode::Unsafe {
+                return Err(BashError::Execution(
+                    "remote leash unavailable: only unsafe mode is allowed".to_string(),
+                ));
+            }
+            format!("/bin/bash -lc {}", shell_escape(script))
+        }
+    };
+
+    let mut child = async_process::Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(target)
+        .arg(remote_cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| BashError::Execution(e.to_string()))?;
+
+    let pid = child.id();
+    job_registry
+        .register(pid, shell_id, script, mode, None)
+        .await;
+
+    match child.output().await {
+        Ok(output) => Ok((pid, output)),
+        Err(err) => {
+            job_registry.fail(pid, &err.to_string(), None).await;
+            Err(BashError::Execution(err.to_string()))
+        }
+    }
+}
+
+fn shell_escape(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 async fn run_blocking<T, F>(task: F) -> T
@@ -965,9 +1130,7 @@ where
     std::thread::spawn(move || {
         let _ = tx.send_blocking(task());
     });
-    rx.recv()
-        .await
-        .expect("blocking task channel dropped")
+    rx.recv().await.expect("blocking task channel dropped")
 }
 
 /// Creates the IPC router with built-in and tool commands (standalone version).
@@ -1016,65 +1179,65 @@ impl<P, E, State> std::fmt::Debug for BashTool<P, E, State> {
     }
 }
 
-    /// Returns (os_name, os_version) for the current system.
-    pub fn get_os_info() -> (String, String) {
-        #[cfg(target_os = "macos")]
-        {
-            let version = std::process::Command::new("sw_vers")
-                .arg("-productVersion")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            ("macOS".to_string(), version)
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            // Try to get pretty name from os-release
-            let version = std::fs::read_to_string("/etc/os-release")
-                .ok()
-                .and_then(|content| {
-                    content
-                        .lines()
-                        .find(|line| line.starts_with("PRETTY_NAME="))
-                        .map(|line| {
-                            line.trim_start_matches("PRETTY_NAME=")
-                                .trim_matches('"')
-                                .to_string()
-                        })
-                })
-                .unwrap_or_else(|| {
-                    // Fallback to uname -r
-                    std::process::Command::new("uname")
-                        .arg("-r")
-                        .output()
-                        .ok()
-                        .and_then(|o| String::from_utf8(o.stdout).ok())
-                        .map(|s| s.trim().to_string())
-                        .unwrap_or_else(|| "unknown".to_string())
-                });
-            ("Linux".to_string(), version)
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            let version = std::process::Command::new("cmd")
-                .args(["/C", "ver"])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            ("Windows".to_string(), version)
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        {
-            (std::env::consts::OS.to_string(), "unknown".to_string())
-        }
+/// Returns (os_name, os_version) for the current system.
+pub fn get_os_info() -> (String, String) {
+    #[cfg(target_os = "macos")]
+    {
+        let version = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        ("macOS".to_string(), version)
     }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try to get pretty name from os-release
+        let version = std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|content| {
+                content
+                    .lines()
+                    .find(|line| line.starts_with("PRETTY_NAME="))
+                    .map(|line| {
+                        line.trim_start_matches("PRETTY_NAME=")
+                            .trim_matches('"')
+                            .to_string()
+                    })
+            })
+            .unwrap_or_else(|| {
+                // Fallback to uname -r
+                std::process::Command::new("uname")
+                    .arg("-r")
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+        ("Linux".to_string(), version)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let version = std::process::Command::new("cmd")
+            .args(["/C", "ver"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        ("Windows".to_string(), version)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        (std::env::consts::OS.to_string(), "unknown".to_string())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1082,9 +1245,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_args_defaults() {
-        let args: BashArgs = serde_json::from_str(r#"{"script": "echo hello"}"#).unwrap();
-        assert_eq!(args.mode, BashMode::Sandboxed);
+        let args: BashArgs =
+            serde_json::from_str(r#"{"shell_id":"s1","script":"echo hello","timeout":1}"#).unwrap();
         assert_eq!(args.expect, OutputFormat::Text);
+        assert_eq!(args.timeout, 1);
     }
 
     #[tokio::test]
@@ -1141,11 +1305,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bash_args_background() {
-        let args: BashArgs = serde_json::from_str(r#"{"script": "echo hello", "background": true}"#).unwrap();
-        assert!(args.background);
+    async fn test_bash_args_timeout() {
+        let args: BashArgs =
+            serde_json::from_str(r#"{"shell_id":"s1","script":"echo hello","timeout":0}"#).unwrap();
+        assert_eq!(args.timeout, 0);
 
-        let args_default: BashArgs = serde_json::from_str(r#"{"script": "echo hello"}"#).unwrap();
-        assert!(!args_default.background);
+        let args_default =
+            serde_json::from_str::<BashArgs>(r#"{"shell_id":"s1","script":"echo hello"}"#)
+                .unwrap_err();
+        assert!(args_default.to_string().contains("timeout"));
     }
 }

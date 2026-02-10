@@ -17,7 +17,11 @@ use futures_core::Stream;
 use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use zenwave::{Client, client, header};
 
 /// GitHub Copilot language model client.
@@ -65,7 +69,10 @@ impl Copilot {
 impl LanguageModel for Copilot {
     type Error = CopilotError;
 
-    fn respond(&self, request: LLMRequest) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+    fn respond(
+        &self,
+        request: LLMRequest,
+    ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         let cfg = self.inner.clone();
         let (messages, parameters, tool_defs) = request.into_parts();
         let tool_defs = filter_tool_definitions(tool_defs, &parameters.tool_choice);
@@ -218,11 +225,32 @@ struct ChatCompletionRequest {
 #[derive(Debug, Serialize, Clone)]
 struct ChatMessagePayload {
     role: &'static str,
-    content: String,
+    content: ContentPayload,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ChatToolCallPayload>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum ContentPayload {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlPayload },
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ImageUrlPayload {
+    url: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -329,16 +357,84 @@ fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
                     };
                     ("assistant", calls, None)
                 }
-                Role::Tool => ("tool", None, Some(msg.tool_call_id().unwrap_or_default().to_string())),
+                Role::Tool => (
+                    "tool",
+                    None,
+                    Some(msg.tool_call_id().unwrap_or_default().to_string()),
+                ),
             };
             ChatMessagePayload {
                 role,
-                content: msg.content().to_string(),
+                content: build_content(msg),
                 tool_calls,
                 tool_call_id,
             }
         })
         .collect()
+}
+
+fn build_content(message: &Message) -> ContentPayload {
+    let attachments = message.attachments();
+
+    if attachments.is_empty() {
+        return ContentPayload::Text(message.content().to_owned());
+    }
+
+    let mut parts = Vec::new();
+
+    for attachment in attachments {
+        if let Some(data_url) = url_to_data_url(attachment) {
+            parts.push(ContentPart::ImageUrl {
+                image_url: ImageUrlPayload { url: data_url },
+            });
+        }
+    }
+
+    if !message.content().is_empty() {
+        parts.push(ContentPart::Text {
+            text: message.content().to_owned(),
+        });
+    }
+
+    ContentPayload::Parts(parts)
+}
+
+fn url_to_data_url(url: &url::Url) -> Option<String> {
+    match url.scheme() {
+        "data" => Some(url.as_str().to_string()),
+        "http" | "https" => Some(url.as_str().to_string()),
+        "file" => read_file_to_data_url(url),
+        _ => {
+            tracing::warn!("Unsupported attachment URL scheme: {}", url.scheme());
+            None
+        }
+    }
+}
+
+fn read_file_to_data_url(url: &url::Url) -> Option<String> {
+    use base64::Engine;
+
+    let path = url.to_file_path().ok()?;
+    let data = std::fs::read(&path).ok()?;
+    let mime_type = mime_from_path(&path)?;
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+
+    Some(format!("data:{};base64,{}", mime_type, base64_data))
+}
+
+fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_lowercase()
+        .as_str()
+    {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
 }
 
 fn convert_tools(tool_defs: &[ToolDefinition]) -> Vec<ToolPayload> {
@@ -365,17 +461,12 @@ fn tool_choice(params: &Parameters, has_tools: bool) -> Option<ToolChoicePayload
         ToolChoice::None => Some(ToolChoicePayload::Mode("none")),
         ToolChoice::Exact(name) => Some(ToolChoicePayload::Function {
             kind: "function",
-            function: ToolChoiceFunction {
-                name: name.clone(),
-            },
+            function: ToolChoiceFunction { name: name.clone() },
         }),
     }
 }
 
-fn filter_tool_definitions(
-    defs: Vec<ToolDefinition>,
-    choice: &ToolChoice,
-) -> Vec<ToolDefinition> {
+fn filter_tool_definitions(defs: Vec<ToolDefinition>, choice: &ToolChoice) -> Vec<ToolDefinition> {
     match choice {
         ToolChoice::None => Vec::new(),
         ToolChoice::Exact(name) => defs
@@ -400,7 +491,12 @@ async fn open_sse_stream(
 
     let build_result = backend
         .post(&endpoint)
-        .and_then(|b| b.header(header::AUTHORIZATION.as_str(), format!("Bearer {}", cfg.token)))
+        .and_then(|b| {
+            b.header(
+                header::AUTHORIZATION.as_str(),
+                format!("Bearer {}", cfg.token),
+            )
+        })
         .and_then(|b| b.header(header::USER_AGENT.as_str(), "aither-copilot/0.1"))
         .and_then(|b| b.header(header::ACCEPT.as_str(), "text/event-stream"))
         .and_then(|b| b.header("editor-version", cfg.editor_version.clone()))
@@ -408,7 +504,12 @@ async fn open_sse_stream(
 
     let builder = build_result.map_err(CopilotError::Http)?;
 
-    match builder.json_body(request).map_err(CopilotError::Http)?.sse().await {
+    match builder
+        .json_body(request)
+        .map_err(CopilotError::Http)?
+        .sse()
+        .await
+    {
         Ok(stream) => Ok(stream),
         Err(zenwave::Error::Timeout) => Err(CopilotError::Timeout),
         Err(e) => Err(CopilotError::Http(e)),
@@ -443,7 +544,12 @@ fn chat_completions_stream(
     tools: Option<Vec<ToolPayload>>,
 ) -> impl Stream<Item = Result<Event, CopilotError>> + Send + Unpin {
     let params = params.clone();
-    Box::pin(chat_completions_stream_inner(cfg, payload_messages, params, tools))
+    Box::pin(chat_completions_stream_inner(
+        cfg,
+        payload_messages,
+        params,
+        tools,
+    ))
 }
 
 fn chat_completions_stream_inner(

@@ -278,7 +278,12 @@ fn read_file_to_base64_source(file_url: &str) -> Option<ImageSource> {
 ///
 /// Supports images, video, audio, and PDFs.
 fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
-    match path.extension().and_then(|e| e.to_str())?.to_lowercase().as_str() {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_lowercase()
+        .as_str()
+    {
         // Images
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),

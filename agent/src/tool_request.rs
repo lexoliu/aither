@@ -69,10 +69,10 @@ impl<Args, Response> ToolRequestQueue<Args, Response> {
 
 /// Create a new request broker/queue pair.
 #[must_use]
-pub fn channel<Args, Response>() -> (ToolRequestBroker<Args, Response>, ToolRequestQueue<Args, Response>) {
+pub fn channel<Args, Response>() -> (
+    ToolRequestBroker<Args, Response>,
+    ToolRequestQueue<Args, Response>,
+) {
     let (tx, rx) = async_channel::unbounded();
-    (
-        ToolRequestBroker { tx },
-        ToolRequestQueue { rx },
-    )
+    (ToolRequestBroker { tx }, ToolRequestQueue { rx })
 }

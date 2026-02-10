@@ -31,6 +31,7 @@
 
 // Core modules
 mod agent;
+pub mod ask_user;
 mod bash_agent;
 mod builder;
 mod compression;
@@ -44,9 +45,10 @@ mod model_group;
 mod stream;
 mod subagent_file;
 mod todo;
-mod tools;
-pub mod ask_user;
+pub mod transcript;
 pub mod tool_request;
+mod tools;
+pub mod working_docs;
 pub mod workspace_request;
 
 // Specialized agents
@@ -75,7 +77,10 @@ pub use builder::AgentBuilder;
 pub use compression::{
     CompressionLevel, ContextStrategy, PreserveConfig, PreservedContent, SmartCompressionConfig,
 };
-pub use config::AgentConfig;
+pub use config::{
+    AgentConfig, AgentKind, BuiltinToolHint, ContextAssemblerConfig, ContextBlock,
+    ContextBlockPriority,
+};
 pub use context::{ConversationMemory, MemoryCheckpoint};
 pub use error::AgentError;
 pub use event::AgentEvent;
@@ -93,8 +98,8 @@ pub use model_group::{
 };
 
 // Re-export core tool trait for convenience
-pub use aither_core::llm::Tool;
 pub use aither_attachments::{CacheEntry, FileCache};
+pub use aither_core::llm::Tool;
 
 /// Default system prompt for bash-centric agents.
 ///

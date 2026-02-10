@@ -3,6 +3,7 @@
 //! All registered tools are always loaded into the LLM context.
 
 use aither_core::llm::tool::{Tool, ToolDefinition, ToolOutput, Tools as CoreTools};
+use serde_json::json;
 
 #[cfg(feature = "mcp")]
 use aither_mcp::{McpConnection, McpToolService};
@@ -169,10 +170,7 @@ impl AgentTools {
     #[cfg(feature = "mcp")]
     #[must_use]
     pub fn mcp_definitions(&self) -> Vec<ToolDefinition> {
-        self.mcp
-            .iter()
-            .flat_map(|c| c.definitions())
-            .collect()
+        self.mcp.iter().flat_map(|c| c.definitions()).collect()
     }
 
     /// Merge another AgentTools into this one.
@@ -180,6 +178,37 @@ impl AgentTools {
     /// Note: MCP connections are not cloned (they would require ownership transfer).
     pub fn merge(&mut self, _other: Self) {
         // Core tools cannot be merged without re-registering concrete tool instances.
+    }
+
+    /// Force-close all active shell sessions and kill their running jobs.
+    pub async fn close_shell_sessions(&self) {
+        let defs = self.eager.definitions();
+        let Some(close_shell) = defs.iter().find(|d| d.name() == "close_shell") else {
+            return;
+        };
+
+        let mut shell_ids = Vec::new();
+        if let Ok(output) = self.eager.call("jobs", "{}").await {
+            if let Some(text) = output.as_str() {
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if let Some(rest) = trimmed.strip_prefix("shell_id:") {
+                        let id = rest.trim();
+                        if !id.is_empty() {
+                            shell_ids.push(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        shell_ids.sort();
+        shell_ids.dedup();
+
+        for shell_id in shell_ids {
+            let args = json!({ "shell_id": shell_id }).to_string();
+            let _ = self.eager.call(close_shell.name(), &args).await;
+        }
     }
 }
 

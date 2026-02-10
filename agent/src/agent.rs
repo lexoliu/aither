@@ -4,9 +4,9 @@
 //! It manages conversation memory, applies context compression, and
 //! handles tool execution in an agent-controlled loop.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use async_fs as fs;
 use aither_core::{
     LanguageModel,
     llm::{Event, LLMRequest, Message, model::Profile as ModelProfile},
@@ -15,8 +15,8 @@ use futures_core::Stream;
 use futures_lite::StreamExt;
 
 use crate::{
-    compression::{ContentWithUrl, ContextStrategy, estimate_context_usage},
-    config::AgentConfig,
+    compression::{ContextStrategy, estimate_context_usage},
+    config::{AgentConfig, AgentKind, ContextBlock},
     context::ConversationMemory,
     error::AgentError,
     event::AgentEvent,
@@ -24,8 +24,10 @@ use crate::{
         Hook, PostToolAction, PreToolAction, StopContext, StopReason, ToolResultContext,
         ToolUseContext,
     },
+    transcript::Transcript,
     todo::{TodoItem, TodoList, TodoStatus},
     tools::AgentTools,
+    working_docs,
 };
 
 use aither_sandbox::{BackgroundTaskReceiver, OutputStore};
@@ -145,6 +147,12 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
 
     /// Receiver for completed background bash tasks.
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
+
+    /// Optional readable transcript for long-context recovery.
+    pub(crate) transcript: Option<Transcript>,
+
+    /// Optional sandbox directory for working-doc supervision (TODO.md/PLAN.md).
+    pub(crate) sandbox_dir: Option<PathBuf>,
 }
 
 impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
@@ -176,6 +184,8 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             todo_list: None,
             output_store: None,
             background_receiver: None,
+            transcript: None,
+            sandbox_dir: None,
         }
     }
 }
@@ -216,7 +226,9 @@ where
         while let Some(event) = stream.next().await {
             match event? {
                 AgentEvent::Text(chunk) => final_text.push_str(&chunk),
-                AgentEvent::Complete { final_text: text, .. } => {
+                AgentEvent::Complete {
+                    final_text: text, ..
+                } => {
                     return Ok(text);
                 }
                 _ => {}
@@ -263,6 +275,9 @@ where
             // Add user message with attachments
             let user_msg = Message::user(&prompt).with_attachments(attachments);
             self.memory.push(user_msg);
+            if let Some(transcript) = &self.transcript {
+                transcript.write_user_message(&prompt).await;
+            }
 
             // Run the tool loop
             let mut iteration = 0;
@@ -277,7 +292,7 @@ where
                 }
 
                 // Build messages
-                let messages = self.build_request_messages();
+                let messages = self.build_request_messages().await;
 
                 // Create request with tool definitions
                 let tool_defs = self.tools.active_definitions();
@@ -414,10 +429,16 @@ where
                 let response_text = text_chunks.join("");
                 all_text_chunks.extend(text_chunks);
 
-                // If no tool calls, we're done
+                // If no tool calls, we're done unless working-doc supervision requires continuation.
                 if tool_calls.is_empty() {
                     if !response_text.is_empty() {
                         self.memory.push(Message::assistant(&response_text));
+                        if let Some(transcript) = &self.transcript {
+                            transcript.write_assistant_text(&response_text).await;
+                        }
+                    }
+                    if self.inject_working_doc_continue_reminder().await {
+                        continue;
                     }
                     break response_text;
                 }
@@ -440,10 +461,14 @@ where
 
                 // Yield tool call start events
                 for call in &tool_calls {
+                    let args = call.arguments.to_string();
+                    if let Some(transcript) = &self.transcript {
+                        transcript.write_tool_call(&call.name, &args).await;
+                    }
                     yield AgentEvent::ToolCallStart {
                         id: call.id.clone(),
                         name: call.name.clone(),
-                        arguments: call.arguments.to_string(),
+                        arguments: args,
                     };
                 }
 
@@ -522,6 +547,10 @@ where
                 for result in results {
                     let (call_id, call_name, content) = result?;
 
+                    if let Some(transcript) = &self.transcript {
+                        transcript.write_tool_result(&call_name, &Ok(content.clone())).await;
+                    }
+
                     // Yield tool call end event
                     yield AgentEvent::ToolCallEnd {
                         id: call_id.clone(),
@@ -529,7 +558,11 @@ where
                         result: Ok(content.clone()),
                     };
 
-                    if content.contains("not found") || content.contains("Invalid arguments") {
+                    if content.contains("unknown shell_id")
+                        || content.contains("shell_id is required")
+                        || content.contains("not found")
+                        || content.contains("Invalid arguments")
+                    {
                         has_tool_error = true;
                     }
                     let processed_content = self.process_reload_marker(&content);
@@ -540,13 +573,13 @@ where
                 if has_tool_error {
                     let reminder = concat!(
                         "<system-reminder>\n",
-                        "IMPORTANT: You have exactly ONE tool: `bash`. ",
-                        "All other capabilities (websearch, webfetch, task, etc.) are bash commands, not separate tools.\n\n",
+                        "IMPORTANT: You can ONLY act through tool calls: `open_shell`, `bash`, `close_shell`.\n",
+                        "All commands (websearch, webfetch, ask_user, todo, task, etc.) are CLI commands that MUST be executed via `bash` tool calls.\n",
+                        "You cannot execute commands by writing them in text -- always use tool calls.\n\n",
                         "Correct usage:\n",
-                        "- websearch: bash with script `websearch \"query\"`\n",
-                        "- webfetch: bash with script `webfetch \"url\"`\n",
-                        "- Network commands (websearch, webfetch) work in sandboxed mode - they handle network internally.\n",
-                        "- Only use mode=\"network\" when YOUR bash script needs direct network access (curl, wget, etc.).\n",
+                        "- open_shell first, then call bash with shell_id + timeout + script\n",
+                        "- Example: bash with script `websearch \"query\"` or `ask_user \"question\" --options A --options B`\n",
+                        "- IPC commands (websearch, webfetch, ask_user) work in sandboxed mode and only on local shells.\n",
                         "</system-reminder>"
                     );
                     self.memory.push(Message::system(reminder));
@@ -670,15 +703,17 @@ where
         self.memory.clear();
     }
 
-    /// Compacts the conversation by summarizing all messages and starting fresh.
-    ///
-    /// This generates a summary of the entire conversation, clears history,
-    /// and starts a new session with only the summary as context.
+    /// Force-closes active shell sessions and their running jobs.
+    pub async fn close_shell_sessions(&self) {
+        self.tools.close_shell_sessions().await;
+    }
+
+    /// Compacts the conversation by generating a structured handoff and starting fresh.
     ///
     /// # Errors
     ///
-    /// Returns an error if summary generation fails.
-    pub async fn compact(&mut self) -> Result<Option<CompactResult>, AgentError> {
+    /// Returns an error if handoff generation fails.
+    pub async fn compact(&mut self, focus: Option<&str>) -> Result<Option<CompactResult>, AgentError> {
         self.ensure_initialized().await;
 
         let messages = self.memory.all();
@@ -686,29 +721,117 @@ where
             return Ok(None);
         }
 
-        // Get compression config or use defaults
-        let config = match &self.config.context {
-            ContextStrategy::Smart(config) => config.clone(),
-            ContextStrategy::Unlimited => crate::compression::SmartCompressionConfig::default(),
-        };
-
-        let preserved = config.extract_preserved(&messages);
         let messages_compacted = messages.len();
+        let summary = self.generate_handoff_summary(focus).await?;
 
-        let summary = config
-            .generate_summary(&self.fast, &messages, &preserved)
-            .await
-            .map_err(|e| AgentError::Llm(e.to_string()))?;
+        if let Some(transcript) = &self.transcript {
+            transcript.write_compact_marker().await;
+        }
 
-        // Clear everything and start fresh with just the summary
         self.memory.clear();
         self.memory.push_summary(Message::system(summary.clone()));
+        self.memory.push(Message::system(
+            "Session continues from compacted context. Continue without asking the user to repeat details. Recover missing details from files, TODO.md/PLAN.md, or transcript when needed.",
+        ));
 
         Ok(Some(CompactResult {
             messages_compacted,
             messages_remaining: 0,
             summary,
         }))
+    }
+
+    /// Generates a structured handoff summary using the current tier model.
+    async fn generate_handoff_summary(&self, focus: Option<&str>) -> Result<String, AgentError> {
+        let focus_instruction = match focus.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(f) => format!("Focus the handoff on: {f}"),
+            None => "No additional focus hint was provided.".to_string(),
+        };
+
+        let transcript_path = self
+            .transcript
+            .as_ref()
+            .map(|t| t.path().display().to_string())
+            .or_else(|| self.config.transcript_path.clone())
+            .unwrap_or_else(|| "transcript.md".to_string());
+
+        let handoff_prompt = include_str!("prompts/compact_handoff.txt")
+            .replace("{focus_instruction}", &focus_instruction)
+            .replace("{transcript_path}", &transcript_path);
+
+        let mut messages = self.memory.all();
+        messages.push(Message::user(handoff_prompt));
+
+        let mut chunks = Vec::new();
+        match self.tier {
+            ModelTier::Advanced => {
+                let stream = self.advanced.respond(LLMRequest::new(messages.clone()));
+                futures_lite::pin!(stream);
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(Event::Text(text)) => chunks.push(text),
+                        Ok(Event::BuiltInToolResult { tool, result }) => {
+                            chunks.push(format!("[{tool}] {result}"));
+                        }
+                        Ok(_) => {}
+                        Err(e) => return Err(AgentError::Llm(e.to_string())),
+                    }
+                }
+            }
+            ModelTier::Balanced => {
+                let stream = self.balanced.respond(LLMRequest::new(messages.clone()));
+                futures_lite::pin!(stream);
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(Event::Text(text)) => chunks.push(text),
+                        Ok(Event::BuiltInToolResult { tool, result }) => {
+                            chunks.push(format!("[{tool}] {result}"));
+                        }
+                        Ok(_) => {}
+                        Err(e) => return Err(AgentError::Llm(e.to_string())),
+                    }
+                }
+            }
+            ModelTier::Fast => {
+                let stream = self.fast.respond(LLMRequest::new(messages));
+                futures_lite::pin!(stream);
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(Event::Text(text)) => chunks.push(text),
+                        Ok(Event::BuiltInToolResult { tool, result }) => {
+                            chunks.push(format!("[{tool}] {result}"));
+                        }
+                        Ok(_) => {}
+                        Err(e) => return Err(AgentError::Llm(e.to_string())),
+                    }
+                }
+            }
+        }
+
+        let summary = chunks.join("").trim().to_string();
+        if summary.is_empty() {
+            return Err(AgentError::Llm(
+                "Compaction failed to generate handoff summary".to_string(),
+            ));
+        }
+        Ok(summary)
+    }
+
+    /// Injects a continuation reminder when working documents still have pending tasks.
+    async fn inject_working_doc_continue_reminder(&mut self) -> bool {
+        let Some(sandbox_dir) = self.sandbox_dir.as_deref() else {
+            return false;
+        };
+
+        let docs = working_docs::read_snapshot(sandbox_dir).await;
+        if !docs.has_unchecked_items() {
+            return false;
+        }
+
+        self.memory.push(Message::system(
+            "<system-reminder>TODO.md or PLAN.md still has unchecked items. Continue working through the checklist. If user input is required, call ask_user and then proceed.</system-reminder>",
+        ));
+        true
     }
 
     /// Returns the current conversation history.
@@ -743,20 +866,158 @@ where
         self.initialized = true;
     }
 
-    /// Builds the message list for an LLM request (system prompt + todo context + memory).
-    fn build_request_messages(&self) -> Vec<Message> {
+    /// Builds the message list for an LLM request (structured system context + todo context + memory).
+    async fn build_request_messages(&self) -> Vec<Message> {
         let mut messages = Vec::new();
+        let usage = self.estimate_current_usage();
 
-        if let Some(ref system_prompt) = self.config.system_prompt {
-            messages.push(Message::system(system_prompt));
+        if let Some(system_ctx) = self.render_structured_system_context(usage) {
+            messages.push(Message::system(system_ctx));
         }
 
         if let Some(todo_ctx) = self.format_todo_context() {
             messages.push(Message::system(todo_ctx));
         }
 
+        if let Some(sandbox_dir) = self.sandbox_dir.as_deref() {
+            let docs = working_docs::read_snapshot(sandbox_dir).await;
+            if let Some(plan_md) = docs.plan_md {
+                messages.push(Message::system(render_plan_context(&plan_md)));
+            }
+            if let Some(todo_md) = docs.todo_md {
+                messages.push(Message::system(render_working_todo_context(&todo_md)));
+            }
+        }
+
+        if let Some(handoff_ctx) = self.format_handoff_context(usage) {
+            messages.push(Message::system(handoff_ctx));
+        }
+
         messages.extend(self.memory.all());
         messages
+    }
+
+    /// Estimates current context usage using the active and fast model windows.
+    fn estimate_current_usage(&self) -> f32 {
+        let tier_context = self
+            .profile
+            .as_ref()
+            .map(|p| p.context_length as usize)
+            .unwrap_or(100_000);
+
+        let fast_context = self
+            .fast_profile
+            .as_ref()
+            .map(|p| p.context_length as usize)
+            .unwrap_or(100_000);
+
+        let context_length = tier_context.min(fast_context);
+        estimate_context_usage(&self.memory.all(), context_length)
+    }
+
+    /// Renders structured XML system context with optional persona and custom blocks.
+    fn render_structured_system_context(&self, usage: f32) -> Option<String> {
+        if self.config.system_prompt.is_none()
+            && self.config.persona_prompt.is_none()
+            && self.config.context_blocks.is_empty()
+            && self.config.agent_kind != AgentKind::Coding
+            && self.config.transcript_path.is_none()
+        {
+            return None;
+        }
+
+        let mut blocks: Vec<ContextBlock> = Vec::new();
+
+        if let Some(system_prompt) = &self.config.system_prompt {
+            blocks.push(ContextBlock::new("base_system", system_prompt));
+        }
+
+        if let Some(persona_prompt) = &self.config.persona_prompt {
+            blocks.push(ContextBlock::new("persona", persona_prompt));
+        }
+
+        if self.config.agent_kind == AgentKind::Coding {
+            blocks.push(ContextBlock::new(
+                "workspace_facts",
+                "When discovering workspace guidance, load AGENT.md first. If AGENT.md is missing, load CLAUDE.md. Treat these files as repository policy for coding tasks; this behavior is not required for chatbot-style sessions.",
+            ));
+        }
+
+        blocks.push(ContextBlock::new(
+            "knowledge_and_time",
+            concat!(
+                "Your knowledge has a training cutoff -- it is frozen and does not update. ",
+                "Never answer time-sensitive questions from memory alone. ",
+                "Anything that could have changed since your training cutoff (current events, ",
+                "recent releases, stock prices, sports results, whether someone is alive) requires verification. ",
+                "Use `date` to get the current time, then `websearch` to look it up. ",
+                "If the user makes a time-of-day reference, either run `date` to confirm or respond without assuming the time. ",
+                "When in doubt about whether something is time-sensitive, err on the side of checking."
+            ),
+        ));
+
+        blocks.push(ContextBlock::new(
+            "permissions",
+            concat!(
+                "You have read access to the entire filesystem by default. ",
+                "Write access is restricted to your sandbox directory and directories the user has explicitly approved. ",
+                "When you need to modify files outside your sandbox, check if the directory is already approved. ",
+                "If not, use `request_workspace` to ask for permission -- request the project root, not individual subdirectories. ",
+                "Explain what changes you plan to make and wait for approval before proceeding."
+            ),
+        ));
+
+        if let Some(path) = &self.config.transcript_path {
+            blocks.push(ContextBlock::new(
+                "transcript_memory",
+                format!(
+                    "Compressed memory may only keep a summary, but the full transcript remains available at {}. If details are missing, recover them by searching/reading transcript content before making irreversible changes.",
+                    path
+                ),
+            ));
+        }
+
+        if !self.config.builtin_tool_hints.is_empty() {
+            let hints = self
+                .config
+                .builtin_tool_hints
+                .iter()
+                .map(|h| format!("{}: {}", h.name, h.hint))
+                .collect::<Vec<_>>()
+                .join("\n");
+            blocks.push(ContextBlock::new("builtin_tool_hints", hints));
+        }
+
+        blocks.extend(self.config.context_blocks.clone());
+        blocks.sort_by_key(|b| b.priority.rank());
+
+        let mut out = String::from("<context>\n");
+        out.push_str(&format!(
+            "<context_window usage=\"{usage:.3}\" handoff_threshold=\"{:.3}\" />\n",
+            self.config.context_assembler.handoff_threshold
+        ));
+
+        for block in blocks {
+            out.push_str(&render_xml_block(&block));
+        }
+
+        out.push_str("</context>");
+        Some(out)
+    }
+
+    /// Injects a handoff instruction when context usage approaches the threshold.
+    fn format_handoff_context(&self, usage: f32) -> Option<String> {
+        if usage < self.config.context_assembler.handoff_threshold {
+            return None;
+        }
+
+        let mut note = String::from("<system-reminder>\n");
+        note.push_str(&self.config.context_assembler.handoff_instruction);
+        if let Some(path) = &self.config.transcript_path {
+            note.push_str(&format!(" Transcript source: {path}."));
+        }
+        note.push_str("\n</system-reminder>");
+        Some(note)
     }
 
     /// Continues agent processing after background tasks complete (streaming version).
@@ -773,7 +1034,7 @@ where
                 return events;
             }
 
-            let messages = self.build_request_messages();
+            let messages = self.build_request_messages().await;
             let tool_defs = self.tools.active_definitions();
             let request = LLMRequest::new(messages).with_tool_definitions(tool_defs);
 
@@ -801,7 +1062,10 @@ where
                                 text_chunks.push(formatted);
                             }
                             Ok(Event::Usage(u)) => events.push(Ok(AgentEvent::Usage(u))),
-                            Err(e) => { error = Some(e.to_string()); break; }
+                            Err(e) => {
+                                error = Some(e.to_string());
+                                break;
+                            }
                         }
                     }
                 }
@@ -823,7 +1087,10 @@ where
                                 text_chunks.push(formatted);
                             }
                             Ok(Event::Usage(u)) => events.push(Ok(AgentEvent::Usage(u))),
-                            Err(e) => { error = Some(e.to_string()); break; }
+                            Err(e) => {
+                                error = Some(e.to_string());
+                                break;
+                            }
                         }
                     }
                 }
@@ -845,7 +1112,10 @@ where
                                 text_chunks.push(formatted);
                             }
                             Ok(Event::Usage(u)) => events.push(Ok(AgentEvent::Usage(u))),
-                            Err(e) => { error = Some(e.to_string()); break; }
+                            Err(e) => {
+                                error = Some(e.to_string());
+                                break;
+                            }
                         }
                     }
                 }
@@ -888,7 +1158,8 @@ where
                 }
             });
 
-            let results: Vec<(String, String, String)> = futures::future::join_all(tool_futures).await;
+            let results: Vec<(String, String, String)> =
+                futures::future::join_all(tool_futures).await;
 
             for (call_id, call_name, content) in results {
                 events.push(Ok(AgentEvent::ToolCallEnd {
@@ -909,10 +1180,6 @@ where
             }
         }
     }
-
-    /// Minimum content length to consider for URL allocation during compression.
-    /// Smaller content stays inline.
-    const MIN_CONTENT_FOR_URL: usize = 500;
 
     /// Compresses context if needed.
     ///
@@ -951,94 +1218,16 @@ where
         match &self.config.context {
             ContextStrategy::Unlimited => Ok(()),
             ContextStrategy::Smart(config) => {
-                // Use effective_trigger which reserves context for compaction process
+                // Use effective_trigger which reserves context for compaction process.
                 if usage >= config.effective_trigger() {
-                    let preserved = config.extract_preserved(&self.memory.all());
-                    let to_compress = self.memory.drain_oldest(config.preserve_recent);
-
-                    if !to_compress.is_empty() {
-                        let summary = self
-                            .compress_with_urls(config, &to_compress, &preserved)
-                            .await?;
-                        self.memory.push_summary(Message::system(summary));
+                    let preserve_recent = config.preserve_recent;
+                    if self.memory.len() > preserve_recent {
+                        let _ = self.compact(None).await?;
                     }
                 }
                 Ok(())
             }
         }
-    }
-
-    /// Compresses messages using URL-aware compression when OutputStore is available.
-    ///
-    /// This method:
-    /// 1. Allocates URLs for large tool outputs
-    /// 2. Calls the fast LLM with content + URL mappings
-    /// 3. Writes only the files for URLs referenced in the summary
-    async fn compress_with_urls(
-        &self,
-        config: &crate::compression::SmartCompressionConfig,
-        to_compress: &[Message],
-        preserved: &crate::compression::PreservedContent,
-    ) -> Result<String, AgentError> {
-        // If no output store, fall back to simple compression
-        let Some(output_store) = &self.output_store else {
-            return config
-                .generate_summary(&self.fast, to_compress, preserved)
-                .await
-                .map_err(|e| AgentError::Llm(e.to_string()));
-        };
-
-        // Allocate URLs for large tool outputs
-        let mut pending_urls: Vec<ContentWithUrl> = Vec::new();
-        let mut content_to_url: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-
-        for msg in to_compress {
-            // Only allocate URLs for large tool results
-            if msg.role() == aither_core::llm::Role::Tool
-                && msg.content().len() >= Self::MIN_CONTENT_FOR_URL
-            {
-                let content = msg.content().to_string();
-                // Avoid duplicate allocations for same content
-                if !content_to_url.contains_key(&content) {
-                    let url = output_store.allocate_text_url();
-                    content_to_url.insert(content.clone(), url.clone());
-                    pending_urls.push(ContentWithUrl { content, url });
-                }
-            }
-        }
-
-        // Generate summary with URL-aware compression
-        let result = config
-            .generate_summary_with_urls(&self.fast, to_compress, preserved, &pending_urls)
-            .await
-            .map_err(|e| AgentError::Llm(e.to_string()))?;
-
-        // Write only the files for referenced URLs
-        // Collect files to write outside the lock, then write them
-        let files_to_write: Vec<_> = pending_urls
-            .iter()
-            .filter(|p| result.referenced_urls.contains(&p.url))
-            .map(|p| (p.url.clone(), p.content.clone()))
-            .collect();
-
-        if !files_to_write.is_empty() {
-            // Get the output directory while holding the lock briefly
-            let output_dir = output_store.dir().to_path_buf();
-
-            // Write files without holding the lock
-            for (url, content) in files_to_write {
-                let filename = url.strip_prefix("outputs/").unwrap_or(&url);
-                let filepath = output_dir.join(filename);
-                if let Err(e) = fs::write(&filepath, content.as_bytes()).await {
-                    tracing::warn!(url = %url, error = %e, "failed to write referenced URL");
-                } else {
-                    tracing::debug!(url = %url, "wrote referenced URL");
-                }
-            }
-        }
-
-        Ok(result.summary)
     }
 
     /// Processes a tool result (currently passthrough).
@@ -1149,6 +1338,20 @@ fn format_todo_items_json(items: &[TodoItem]) -> String {
     serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
 }
 
+fn render_plan_context(content: &str) -> String {
+    format!(
+        "<plan>\n{}</plan>",
+        escape_xml_text(content)
+    )
+}
+
+fn render_working_todo_context(content: &str) -> String {
+    format!(
+        "<todo>\n{}</todo>",
+        escape_xml_text(content)
+    )
+}
+
 /// Truncates a script for display in messages.
 fn truncate_script(script: &str, max_chars: usize) -> &str {
     let script = script.trim();
@@ -1157,4 +1360,22 @@ fn truncate_script(script: &str, max_chars: usize) -> &str {
         Some((byte_idx, _)) => &script[..byte_idx],
         None => script, // String is shorter than max_chars
     }
+}
+
+fn render_xml_block(block: &ContextBlock) -> String {
+    let tag = escape_xml_tag(&block.tag);
+    let content = escape_xml_text(&block.content);
+    format!("<{tag}>\n{content}\n</{tag}>\n")
+}
+
+fn escape_xml_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_xml_tag(tag: &str) -> String {
+    tag.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect()
 }

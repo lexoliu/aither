@@ -15,6 +15,8 @@ use crate::permission::BashMode;
 pub struct JobInfo {
     /// Process ID.
     pub pid: u32,
+    /// Shell session id that owns this job.
+    pub shell_id: String,
     /// The script that was executed.
     pub script: String,
     /// The permission mode used.
@@ -49,6 +51,7 @@ pub enum JobStatus {
 enum JobCommand {
     Register {
         pid: u32,
+        shell_id: String,
         script: String,
         mode: BashMode,
         output_path: Option<PathBuf>,
@@ -73,6 +76,10 @@ enum JobCommand {
     Kill {
         pid: u32,
         reply: Sender<bool>,
+    },
+    KillBySession {
+        shell_id: String,
+        reply: Sender<usize>,
     },
     FormatRunning {
         reply: Sender<String>,
@@ -107,6 +114,7 @@ impl JobRegistry {
     pub async fn register(
         &self,
         pid: u32,
+        shell_id: &str,
         script: &str,
         mode: BashMode,
         output_path: Option<PathBuf>,
@@ -114,6 +122,7 @@ impl JobRegistry {
         self.tx
             .send(JobCommand::Register {
                 pid,
+                shell_id: shell_id.to_string(),
                 script: script.to_string(),
                 mode,
                 output_path,
@@ -163,7 +172,10 @@ impl JobRegistry {
     pub async fn get(&self, pid: u32) -> Option<JobInfo> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
-            .send(JobCommand::Get { pid, reply: reply_tx })
+            .send(JobCommand::Get {
+                pid,
+                reply: reply_tx,
+            })
             .await
             .expect("job registry service unavailable");
         reply_rx
@@ -178,13 +190,50 @@ impl JobRegistry {
     pub async fn kill(&self, pid: u32) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
-            .send(JobCommand::Kill { pid, reply: reply_tx })
+            .send(JobCommand::Kill {
+                pid,
+                reply: reply_tx,
+            })
             .await
             .expect("job registry service unavailable");
         reply_rx
             .recv()
             .await
             .expect("job registry response dropped")
+    }
+
+    /// Kills all running jobs owned by a shell session.
+    ///
+    /// Returns number of jobs that were successfully killed.
+    pub async fn kill_by_session(&self, shell_id: &str) -> usize {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.tx
+            .send(JobCommand::KillBySession {
+                shell_id: shell_id.to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .expect("job registry service unavailable");
+        reply_rx
+            .recv()
+            .await
+            .expect("job registry response dropped")
+    }
+
+    /// Blocking variant of `kill_by_session`, intended for drop-time cleanup.
+    pub fn kill_by_session_blocking(&self, shell_id: &str) -> usize {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        if self
+            .tx
+            .send_blocking(JobCommand::KillBySession {
+                shell_id: shell_id.to_string(),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return 0;
+        }
+        reply_rx.recv_blocking().unwrap_or(0)
     }
 
     /// Formats only RUNNING jobs for compression preservation.
@@ -226,12 +275,14 @@ impl JobRegistryService {
             match cmd {
                 JobCommand::Register {
                     pid,
+                    shell_id,
                     script,
                     mode,
                     output_path,
                 } => {
                     let info = JobInfo {
                         pid,
+                        shell_id,
                         script,
                         mode,
                         started_at: Instant::now(),
@@ -278,6 +329,27 @@ impl JobRegistryService {
                 JobCommand::Kill { pid, reply } => {
                     let result = kill_job(&mut jobs, pid).await;
                     let _ = reply.send(result).await;
+                }
+                JobCommand::KillBySession { shell_id, reply } => {
+                    let pids: Vec<u32> = jobs
+                        .iter()
+                        .filter_map(|(pid, job)| {
+                            if job.shell_id == shell_id && matches!(job.status, JobStatus::Running)
+                            {
+                                Some(*pid)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    let mut killed = 0usize;
+                    for pid in pids {
+                        if kill_job(&mut jobs, pid).await {
+                            killed += 1;
+                        }
+                    }
+                    let _ = reply.send(killed).await;
                 }
                 JobCommand::FormatRunning { reply } => {
                     let summary = format_running_jobs(&jobs);
@@ -373,16 +445,20 @@ fn format_running_jobs(jobs: &HashMap<u32, JobInfo>) -> String {
 mod tests {
     use super::*;
     use executor_core::Executor;
+    use executor_core::Task;
     use executor_core::tokio::TokioGlobal;
 
     #[tokio::test]
     async fn test_job_registry_lifecycle() {
         let (registry, service) = job_registry_channel();
-        TokioGlobal.spawn(async move { service.serve().await }).detach();
+        TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
 
         registry
             .register(
                 12345,
+                "shell-test",
                 "sleep 10",
                 BashMode::Sandboxed,
                 Some(PathBuf::from("outputs/12345.txt")),
@@ -392,6 +468,7 @@ mod tests {
         let jobs = registry.list().await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].pid, 12345);
+        assert_eq!(jobs[0].shell_id, "shell-test");
         assert!(matches!(jobs[0].status, JobStatus::Running));
 
         registry.complete(12345, 0, None).await;
@@ -402,18 +479,36 @@ mod tests {
     #[tokio::test]
     async fn test_format_running_jobs() {
         let (registry, service) = job_registry_channel();
-        TokioGlobal.spawn(async move { service.serve().await }).detach();
+        TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
 
         registry
-            .register(1, "echo hello", BashMode::Sandboxed, None)
+            .register(1, "shell-a", "echo hello", BashMode::Sandboxed, None)
             .await;
         registry
-            .register(2, "sleep 5", BashMode::Sandboxed, None)
+            .register(2, "shell-b", "sleep 5", BashMode::Sandboxed, None)
             .await;
         registry.complete(2, 0, None).await;
 
         let running = registry.format_running_jobs().await;
         assert!(running.contains("PID 1"));
         assert!(!running.contains("PID 2"));
+    }
+
+    #[tokio::test]
+    async fn test_kill_by_session_no_match() {
+        let (registry, service) = job_registry_channel();
+        TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
+
+        registry
+            .register(1, "shell-a", "echo hello", BashMode::Sandboxed, None)
+            .await;
+        registry.complete(1, 0, None).await;
+
+        let killed = registry.kill_by_session("shell-b").await;
+        assert_eq!(killed, 0);
     }
 }

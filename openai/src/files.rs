@@ -169,10 +169,7 @@ pub async fn upload_file(
     path: &Path,
     purpose: FilePurpose,
 ) -> Result<OpenAIFile, OpenAIError> {
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
 
     let mime_type = mime_from_path(path).unwrap_or("application/octet-stream");
 
@@ -203,10 +200,8 @@ pub async fn upload_file(
     // Part 2: file field
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     body.extend_from_slice(
-        format!(
-            "Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n"
-        )
-        .as_bytes(),
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n")
+            .as_bytes(),
     );
     body.extend_from_slice(format!("Content-Type: {mime_type}\r\n\r\n").as_bytes());
     body.extend_from_slice(&data);
@@ -223,7 +218,10 @@ pub async fn upload_file(
         .map_err(OpenAIError::from_http)?
         .header(header::CONTENT_TYPE.as_str(), &content_type)
         .map_err(OpenAIError::from_http)?
-        .header(header::AUTHORIZATION.as_str(), &format!("Bearer {}", cfg.api_key))
+        .header(
+            header::AUTHORIZATION.as_str(),
+            &format!("Bearer {}", cfg.api_key),
+        )
         .map_err(OpenAIError::from_http)?;
 
     if let Some(org) = &cfg.organization {
@@ -242,14 +240,20 @@ pub async fn upload_file(
 /// # Arguments
 /// * `cfg` - Files configuration
 /// * `file_id` - ID of the file to delete
-pub async fn delete_file(cfg: &FilesConfig, file_id: &str) -> Result<DeleteFileResponse, OpenAIError> {
+pub async fn delete_file(
+    cfg: &FilesConfig,
+    file_id: &str,
+) -> Result<DeleteFileResponse, OpenAIError> {
     let endpoint = format!("{}/{}", cfg.files_endpoint(), file_id);
 
     let mut backend = client();
     let mut builder = backend
         .delete(&endpoint)
         .map_err(OpenAIError::from_http)?
-        .header(header::AUTHORIZATION.as_str(), &format!("Bearer {}", cfg.api_key))
+        .header(
+            header::AUTHORIZATION.as_str(),
+            &format!("Bearer {}", cfg.api_key),
+        )
         .map_err(OpenAIError::from_http)?;
 
     if let Some(org) = &cfg.organization {
@@ -273,7 +277,10 @@ pub async fn get_file(cfg: &FilesConfig, file_id: &str) -> Result<OpenAIFile, Op
     let mut builder = backend
         .get(&endpoint)
         .map_err(OpenAIError::from_http)?
-        .header(header::AUTHORIZATION.as_str(), &format!("Bearer {}", cfg.api_key))
+        .header(
+            header::AUTHORIZATION.as_str(),
+            &format!("Bearer {}", cfg.api_key),
+        )
         .map_err(OpenAIError::from_http)?;
 
     if let Some(org) = &cfg.organization {
@@ -304,7 +311,10 @@ pub async fn list_files(
     let mut builder = backend
         .get(&endpoint)
         .map_err(OpenAIError::from_http)?
-        .header(header::AUTHORIZATION.as_str(), &format!("Bearer {}", cfg.api_key))
+        .header(
+            header::AUTHORIZATION.as_str(),
+            &format!("Bearer {}", cfg.api_key),
+        )
         .map_err(OpenAIError::from_http)?;
 
     if let Some(org) = &cfg.organization {

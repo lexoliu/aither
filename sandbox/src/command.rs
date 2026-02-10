@@ -160,19 +160,34 @@ impl ToolRegistryBuilder {
         let tool_name = tool.name().to_string();
         let help_text = schema_to_help(&schema);
 
+        let name_for_errors = tool_name.clone();
         let handler: ToolHandlerFn = Box::new(move |args: Vec<String>| {
             let tool = tool.clone();
             let schema = schema.clone();
+            let name = name_for_errors.clone();
             Box::pin(async move {
-                let json_args = cli_to_json(&schema, &args)
-                    .unwrap_or_else(|e| panic!("failed to parse CLI args: {e}"));
-                let parsed = serde_json::from_value(json_args)
-                    .unwrap_or_else(|e| panic!("failed to parse tool arguments: {e}"));
-                let output = tool
-                    .call(parsed)
-                    .await
-                    .unwrap_or_else(|e| panic!("tool execution failed: {e}"));
-                output.as_str().unwrap_or("").to_string()
+                tracing::debug!(tool = %name, ?args, "configure_tool handler: raw CLI args");
+                let json_args = match cli_to_json(&schema, &args) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return format!(
+                            "Error: {e}\n\nRun `{name} --help` for usage information."
+                        )
+                    }
+                };
+                tracing::debug!(tool = %name, json = %json_args, "configure_tool handler: parsed JSON");
+                let parsed = match serde_json::from_value(json_args) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return format!(
+                            "Error: invalid arguments: {e}\n\nRun `{name} --help` for usage information."
+                        )
+                    }
+                };
+                match tool.call(parsed).await {
+                    Ok(output) => output.as_str().unwrap_or("").to_string(),
+                    Err(e) => format!("Error: {e}"),
+                }
             })
         });
 
@@ -229,16 +244,36 @@ pub struct ToolRegistry {
 
 /// Detects positional arguments from a JSON schema.
 ///
-/// Returns all required field names in order, which will be used for
-/// positional argument conversion in wrapper scripts.
+/// Returns required field names that are suitable for positional argument
+/// conversion in wrapper scripts. Array-typed fields are excluded because
+/// they need repeated `--flag value` syntax (e.g. `--options A --options B`).
 fn detect_positional_args(schema: &Value) -> Vec<String> {
-    // Get the required array
-    let required = schema.get("required")
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object);
+
+    let required: Vec<String> = schema
+        .get("required")
         .and_then(|r| r.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     required
+        .into_iter()
+        .filter(|name| {
+            // Exclude array-typed fields -- they require repeated --flag syntax
+            if let Some(props) = properties {
+                if let Some(prop_schema) = props.get(name) {
+                    return get_instance_type(prop_schema) != Some("array");
+                }
+            }
+            true
+        })
+        .collect()
 }
 
 /// Detects the stdin argument from a JSON schema.
@@ -373,12 +408,31 @@ impl ToolCallCommand {
         // Otherwise, convert to --key value format
         let mut cli_args = Vec::new();
         for (key, value) in &self.args {
-            cli_args.push(format!("--{key}"));
             match value {
-                Value::String(s) => cli_args.push(s.clone()),
-                Value::Number(n) => cli_args.push(n.to_string()),
-                Value::Bool(b) => cli_args.push(b.to_string()),
-                _ => cli_args.push(value.to_string()),
+                Value::Bool(true) => cli_args.push(format!("--{key}")),
+                Value::Bool(false) => {}
+                Value::String(s) => {
+                    cli_args.push(format!("--{key}"));
+                    cli_args.push(s.clone());
+                }
+                Value::Number(n) => {
+                    cli_args.push(format!("--{key}"));
+                    cli_args.push(n.to_string());
+                }
+                Value::Array(arr) => {
+                    for item in arr {
+                        cli_args.push(format!("--{key}"));
+                        if let Some(s) = item.as_str() {
+                            cli_args.push(s.to_string());
+                        } else {
+                            cli_args.push(item.to_string());
+                        }
+                    }
+                }
+                _ => {
+                    cli_args.push(format!("--{key}"));
+                    cli_args.push(value.to_string());
+                }
             }
         }
         cli_args
@@ -402,7 +456,9 @@ impl IpcCommand for ToolCallCommand {
     }
 
     fn stdin_arg(&self) -> Option<Cow<'static, str>> {
-        self.registry.tool_stdin_arg(&self.tool_name).map(Cow::Owned)
+        self.registry
+            .tool_stdin_arg(&self.tool_name)
+            .map(Cow::Owned)
     }
 
     fn set_method_name(&mut self, name: &str) {
@@ -678,13 +734,23 @@ where
         // Parse CLI args to JSON
         let json_args = match cli_to_json(&self.schema, &cli_args) {
             Ok(args) => args,
-            Err(e) => return Value::String(format!("Error: {e}")),
+            Err(e) => {
+                return Value::String(format!(
+                    "Error: {e}\n\nRun `{} --help` for usage information.",
+                    self.name
+                ))
+            }
         };
 
         // Deserialize and call tool
         let parsed: T::Arguments = match serde_json::from_value(json_args) {
             Ok(args) => args,
-            Err(e) => return Value::String(format!("Error: failed to parse arguments: {e}")),
+            Err(e) => {
+                return Value::String(format!(
+                    "Error: invalid arguments: {e}\n\nRun `{} --help` for usage information.",
+                    self.name
+                ))
+            }
         };
 
         match self.tool.call(parsed).await {
@@ -932,11 +998,16 @@ fn find_similar_option<'a>(input: &str, options: impl Iterator<Item = &'a str>) 
 
 /// Parses an object schema from CLI arguments.
 fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
+    // Strip leading "--" separator (from leash-ipc wrapper) without disabling flag parsing.
+    // A standalone "--" later in the args still acts as end-of-options.
     let args = if args.first().map(|s| s.as_str()) == Some("--") {
         &args[1..]
     } else {
         args
     };
+    let mut start_idx = 0;
+    let mut end_of_options = false;
+
     let mut result: HashMap<String, Value> = HashMap::new();
     let mut positional_idx = 0;
 
@@ -958,13 +1029,22 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
         })
         .unwrap_or_default();
 
-    // Positional fields are the required fields in schema order
-    let positional_fields = required.clone();
+    // Positional fields are required non-array fields in schema order
+    let positional_fields: Vec<String> = required
+        .iter()
+        .filter(|name| {
+            if let Some(prop_schema) = properties.get(name.as_str()) {
+                get_instance_type(prop_schema) != Some("array")
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
     let (short_to_field, _) = build_short_option_maps(&properties);
     let long_names: Vec<String> = properties.keys().map(|k| k.replace('_', "-")).collect();
 
-    let mut i = 0;
-    let mut end_of_options = false;
+    let mut i = start_idx;
     while i < args.len() {
         let arg = &args[i];
 
@@ -1286,16 +1366,38 @@ pub fn schema_to_help(schema: &Value) -> String {
             .map(|arr| arr.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
 
-        // Show positional usage for required args
-        if !required.is_empty() {
-            let positional: Vec<_> = required
-                .iter()
-                .map(|n| format!("<{}>", n.replace('_', "-")))
-                .collect();
-            help.push_str(&format!("  {} [options]\n", positional.join(" ")));
-        } else {
-            help.push_str("  [options]\n");
+        // Show positional usage: only non-array required fields are positional
+        let positional: Vec<_> = required
+            .iter()
+            .filter(|n| {
+                props
+                    .get(**n)
+                    .map(|s| get_instance_type(s) != Some("array"))
+                    .unwrap_or(true)
+            })
+            .map(|n| format!("<{}>", n.replace('_', "-")))
+            .collect();
+        // Show required array fields as repeatable flags in usage
+        let repeatable: Vec<_> = required
+            .iter()
+            .filter(|n| {
+                props
+                    .get(**n)
+                    .map(|s| get_instance_type(s) == Some("array"))
+                    .unwrap_or(false)
+            })
+            .map(|n| format!("--{} <value>...", n.replace('_', "-")))
+            .collect();
+
+        let mut usage_parts = Vec::new();
+        if !positional.is_empty() {
+            usage_parts.push(positional.join(" "));
         }
+        for r in &repeatable {
+            usage_parts.push(r.clone());
+        }
+        usage_parts.push("[options]".to_string());
+        help.push_str(&format!("  {}\n", usage_parts.join(" ")));
 
         help.push_str("\nOptions:\n  -h, --help  Show help\n");
         help.push_str("\nArguments:\n");
@@ -1304,6 +1406,7 @@ pub fn schema_to_help(schema: &Value) -> String {
 
         for (name, prop) in props {
             let is_required = required.contains(&name.as_str());
+            let is_array = get_instance_type(prop) == Some("array");
             let flag = name.replace('_', "-");
 
             if let Some(short) = field_to_short.get(name) {
@@ -1311,7 +1414,13 @@ pub fn schema_to_help(schema: &Value) -> String {
             } else {
                 help.push_str(&format!("  --{flag}"));
             }
-            if is_required {
+            if is_array {
+                help.push_str(" <value>  (repeatable");
+                if is_required {
+                    help.push_str(", required");
+                }
+                help.push(')');
+            } else if is_required {
                 help.push_str(" (required)");
             }
 
@@ -1405,11 +1514,30 @@ mod tests {
     }
 
     #[test]
-    fn test_end_of_options() {
+    fn test_leading_separator_stripped() {
         let schema = schemars::schema_for!(SimpleArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
-        let result = cli_to_json(&schema, &["--".to_string(), "-dash.txt".to_string()]).unwrap();
+        // Leading "--" from leash-ipc is stripped; flags still work after it
+        let result = cli_to_json(
+            &schema,
+            &["--".to_string(), "--path".to_string(), "foo.txt".to_string()],
+        )
+        .unwrap();
+        assert_eq!(result["path"], "foo.txt");
+    }
+
+    #[test]
+    fn test_end_of_options_after_separator() {
+        let schema = schemars::schema_for!(SimpleArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        // Double "--": first is leash-ipc separator, second is end-of-options
+        let result = cli_to_json(
+            &schema,
+            &["--".to_string(), "--".to_string(), "-dash.txt".to_string()],
+        )
+        .unwrap();
         assert_eq!(result["path"], "-dash.txt");
     }
 
@@ -1495,4 +1623,278 @@ mod tests {
         let cmd = ToolCallCommand::new("my_tool", Arc::new(registry));
         assert_eq!(cmd.name(), "my_tool");
     }
+
+    // ========================================================================
+    // Array / repeated flag tests
+    // ========================================================================
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct AskUserLikeArgs {
+        /// The question to ask
+        question: String,
+        /// Options to choose from
+        options: Vec<String>,
+        /// Allow multiple selections
+        #[serde(default)]
+        multi_select: bool,
+    }
+
+    #[test]
+    fn test_repeated_flag_for_array() {
+        let schema = schemars::schema_for!(AskUserLikeArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        let result = cli_to_json(
+            &schema,
+            &[
+                "--question".into(), "Pick one".into(),
+                "--options".into(), "A".into(),
+                "--options".into(), "B".into(),
+                "--options".into(), "C".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(result["question"], "Pick one");
+        assert_eq!(result["options"], serde_json::json!(["A", "B", "C"]));
+    }
+
+    #[test]
+    fn test_positional_then_repeated_flag() {
+        let schema = schemars::schema_for!(AskUserLikeArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        // question as positional, options as repeated flags
+        let result = cli_to_json(
+            &schema,
+            &[
+                "Pick one".into(),
+                "--options".into(), "A".into(),
+                "--options".into(), "B".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(result["question"], "Pick one");
+        assert_eq!(result["options"], serde_json::json!(["A", "B"]));
+    }
+
+    #[test]
+    fn test_array_not_positional() {
+        let schema = schemars::schema_for!(AskUserLikeArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        // Only question should be positional, not options
+        let positional = detect_positional_args(&schema);
+        assert_eq!(positional, vec!["question"]);
+    }
+
+    #[test]
+    fn test_missing_required_array() {
+        let schema = schemars::schema_for!(AskUserLikeArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        // Provide question but no options -> should fail with clear message
+        let err = cli_to_json(&schema, &["Pick one".into()]).unwrap_err();
+        assert!(
+            err.to_string().contains("missing required argument: options"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_boolean_flag_with_array() {
+        let schema = schemars::schema_for!(AskUserLikeArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        let result = cli_to_json(
+            &schema,
+            &[
+                "--question".into(), "Pick many".into(),
+                "--options".into(), "X".into(),
+                "--options".into(), "Y".into(),
+                "--multi-select".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(result["question"], "Pick many");
+        assert_eq!(result["options"], serde_json::json!(["X", "Y"]));
+        assert_eq!(result["multi_select"], true);
+    }
+
+    // ========================================================================
+    // Help text tests
+    // ========================================================================
+
+    #[test]
+    fn test_help_shows_array_as_repeatable() {
+        let schema = schemars::schema_for!(AskUserLikeArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+        let help = schema_to_help(&schema);
+
+        // Usage line should show options as repeatable flag, not positional
+        assert!(
+            help.contains("--options <value>..."),
+            "usage should show --options as repeatable, got:\n{help}"
+        );
+        // question should be positional
+        assert!(
+            help.contains("<question>"),
+            "usage should show <question> as positional, got:\n{help}"
+        );
+        // Arguments section should mark options as repeatable
+        assert!(
+            help.contains("repeatable"),
+            "options should be marked repeatable, got:\n{help}"
+        );
+    }
+
+    // ========================================================================
+    // Error message tests
+    // ========================================================================
+
+    #[test]
+    fn test_unknown_option_error() {
+        let schema = schemars::schema_for!(SimpleArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        let err = cli_to_json(&schema, &["--unknown".into(), "val".into()]).unwrap_err();
+        assert!(err.to_string().contains("unknown option: --unknown"));
+    }
+
+    #[test]
+    fn test_unexpected_positional_error() {
+        let schema = schemars::schema_for!(SimpleArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        // Two positional args when only one is expected
+        let err = cli_to_json(&schema, &["a.txt".into(), "extra".into()]).unwrap_err();
+        assert!(err.to_string().contains("unexpected positional argument"));
+    }
+
+    #[test]
+    fn test_missing_value_error() {
+        let schema = schemars::schema_for!(SimpleArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        let err = cli_to_json(&schema, &["--path".into()]).unwrap_err();
+        // path is consumed as positional, so we get missing required
+        // Actually --path starts with --, so it enters the named path and needs a value
+        assert!(
+            err.to_string().contains("missing"),
+            "got: {}",
+            err
+        );
+    }
+
+    // ========================================================================
+    // ToolCallCommand args_to_cli with arrays
+    // ========================================================================
+
+    #[test]
+    fn test_tool_call_command_args_to_cli_with_array() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = ToolRegistryBuilder::new().build(tmp.path());
+        let mut cmd = ToolCallCommand::new("ask_user", Arc::new(registry));
+        cmd.args = serde_json::from_value(serde_json::json!({
+            "question": "Pick one",
+            "options": ["A", "B", "C"]
+        }))
+        .unwrap();
+
+        let cli = cmd.args_to_cli();
+        // Should produce repeated --options flags
+        let options_count = cli.iter().filter(|a| *a == "--options").count();
+        assert_eq!(options_count, 3, "expected 3 --options flags, got: {:?}", cli);
+        assert!(cli.contains(&"A".to_string()));
+        assert!(cli.contains(&"B".to_string()));
+        assert!(cli.contains(&"C".to_string()));
+    }
+
+    #[test]
+    fn test_tool_call_command_raw_args_passthrough() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = ToolRegistryBuilder::new().build(tmp.path());
+        let mut cmd = ToolCallCommand::new("ask_user", Arc::new(registry));
+        // Simulates what leash-ipc sends
+        cmd.args = serde_json::from_value(serde_json::json!({
+            "args": ["--question", "Pick one", "--options", "A", "--options", "B"]
+        }))
+        .unwrap();
+
+        let cli = cmd.args_to_cli();
+        assert_eq!(
+            cli,
+            vec!["--question", "Pick one", "--options", "A", "--options", "B"]
+        );
+    }
+
+    #[test]
+    fn test_ask_user_e2e_repeated_option() {
+        use std::borrow::Cow;
+        use aither_core::llm::{Tool, ToolOutput, tool::ToolDefinition};
+
+        #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+        struct Question {
+            section: String,
+            question: String,
+            option: Vec<String>,
+            #[serde(default)]
+            multi_select: bool,
+        }
+
+        #[derive(Debug, Clone, Deserialize, JsonSchema)]
+        struct AskUserArgs {
+            #[serde(default)]
+            question: Option<String>,
+            #[serde(default, alias = "options", alias = "choices")]
+            option: Vec<String>,
+            #[serde(default)]
+            multi_select: bool,
+            #[serde(default)]
+            questions: Vec<Question>,
+        }
+
+        #[derive(Debug, Clone)]
+        struct FakeAskUser;
+        impl Tool for FakeAskUser {
+            fn name(&self) -> Cow<'static, str> { "ask_user".into() }
+            type Arguments = AskUserArgs;
+            async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+                // Return the parsed args as JSON so we can inspect
+                Ok(ToolOutput::text(serde_json::to_string(&serde_json::json!({
+                    "question": args.question,
+                    "option": args.option,
+                    "multi_select": args.multi_select,
+                })).unwrap()))
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(FakeAskUser);
+        let registry = std::sync::Arc::new(builder.build(tmp.path()));
+
+        // Simulate what leash-ipc sends: all args in an "args" array
+        let mut cmd = ToolCallCommand::new("ask_user", registry);
+        cmd.args = serde_json::from_value(serde_json::json!({
+            "args": [
+                "--", "--question", "你喜欢哪种薯条？",
+                "--option", "原味", "--option", "番茄味", "--option", "芝士味"
+            ]
+        })).unwrap();
+
+        let result = futures_lite::future::block_on(cmd.handle());
+        eprintln!("result: {}", serde_json::to_string_pretty(&result).unwrap());
+
+        let parsed: serde_json::Value = serde_json::from_value(result).unwrap();
+        let options = parsed["option"].as_array().expect("option should be array");
+        assert_eq!(options.len(), 3, "expected 3 options, got: {:?}", options);
+        assert_eq!(options[0], "原味");
+        assert_eq!(options[1], "番茄味");
+        assert_eq!(options[2], "芝士味");
+    }
+
 }

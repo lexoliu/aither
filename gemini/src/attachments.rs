@@ -16,12 +16,18 @@ pub(crate) async fn resolve_messages(
         return Ok(messages);
     }
 
-    let mut cache = FileCache::open(default_cache_dir()).await.map_err(GeminiError::from)?;
+    let mut cache = FileCache::open(default_cache_dir())
+        .await
+        .map_err(GeminiError::from)?;
     let mut cache_dirty = cache.prune_expired();
 
     let mut resolved = Vec::with_capacity(messages.len());
     for message in messages {
-        let Message::User { content, attachments } = message else {
+        let Message::User {
+            content,
+            attachments,
+        } = message
+        else {
             resolved.push(message);
             continue;
         };
@@ -108,7 +114,9 @@ async fn resolve_file_attachment(
         )));
     }
     if file.uri.is_empty() {
-        return Err(GeminiError::Api("Gemini file upload missing URI".to_string()));
+        return Err(GeminiError::Api(
+            "Gemini file upload missing URI".to_string(),
+        ));
     }
 
     let expires_at = file.expiration();

@@ -4,10 +4,10 @@ use aither_attachments::{FileCache, default_cache_dir};
 use aither_core::llm::Message;
 use url::Url;
 
+use crate::client::Config;
 use crate::error::OpenAIError;
 use crate::files::{FilePurpose, FilesConfig, upload_file};
 use crate::mime::mime_from_path;
-use crate::client::Config;
 
 #[derive(Clone, Copy)]
 pub(crate) struct OpenAIFileKind(&'static str);
@@ -29,12 +29,18 @@ pub(crate) async fn resolve_messages(
         return Ok(messages);
     }
 
-    let mut cache = FileCache::open(default_cache_dir()).await.map_err(OpenAIError::from)?;
+    let mut cache = FileCache::open(default_cache_dir())
+        .await
+        .map_err(OpenAIError::from)?;
     let mut cache_dirty = cache.prune_expired();
 
     let mut resolved = Vec::with_capacity(messages.len());
     for message in messages {
-        let Message::User { content, attachments } = message else {
+        let Message::User {
+            content,
+            attachments,
+        } = message
+        else {
             resolved.push(message);
             continue;
         };
@@ -134,7 +140,10 @@ fn build_files_config(cfg: &Config) -> FilesConfig {
 
 fn file_kind_for_path(path: &Path) -> Result<OpenAIFileKind, OpenAIError> {
     let mime = mime_from_path(path).ok_or_else(|| {
-        OpenAIError::Api(format!("Unable to infer MIME type for attachment: {}", path.display()))
+        OpenAIError::Api(format!(
+            "Unable to infer MIME type for attachment: {}",
+            path.display()
+        ))
     })?;
     Ok(if mime.starts_with("image/") {
         OpenAIFileKind::IMAGE

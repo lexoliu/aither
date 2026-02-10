@@ -604,7 +604,9 @@ fn parse_data_url(url: &str) -> Option<Part> {
     let after_data = url.strip_prefix("data:")?;
     let (header, data) = after_data.split_once(',')?;
     let mime_type = header.strip_suffix(";base64")?;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
 
     Some(Part::inline_media(mime_type, bytes))
 }
@@ -620,7 +622,12 @@ fn read_file_to_part(url: &url::Url) -> Option<Part> {
 
 /// Get MIME type from file path extension.
 fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
-    match path.extension().and_then(|e| e.to_str())?.to_lowercase().as_str() {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_lowercase()
+        .as_str()
+    {
         // Images
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),

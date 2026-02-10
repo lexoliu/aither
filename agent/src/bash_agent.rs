@@ -32,23 +32,28 @@
 //! ```
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use aither_core::LanguageModel;
 use aither_core::llm::Tool;
 use aither_core::llm::tool::ToolDefinition;
-use async_fs as fs;
 use askama::Template;
+use async_fs as fs;
 use executor_core::Executor;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::hook::Hook;
-use crate::{Agent, AgentBuilder};
-use aither_sandbox::{
-    BashTool, BashToolFactory, BashToolFactoryReceiver, PermissionHandler, ToolRegistryBuilder,
-    Unconfigured, bash_tool_factory_channel,
+use crate::{
+    Agent, AgentBuilder,
+    config::{AgentKind, BuiltinToolHint, ContextBlock, ContextBlockPriority},
 };
-use aither_sandbox::builtin::{StopTool, TasksTool};
+use aither_sandbox::builtin::{KillTool, TasksTool};
+use aither_sandbox::{
+    BashTool, BashToolFactory, BashToolFactoryReceiver, CloseShellTool, ListSshTool, OpenShellTool,
+    PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, SshServer,
+    SshSessionAuthorizer, ToolRegistryBuilder, Unconfigured, bash_tool_factory_channel,
+};
 
 use crate::fs_util::path_exists;
 /// System prompt template for bash-centric agents.
@@ -61,6 +66,7 @@ struct SystemPrompt {
     user_cwd: String,
     sandbox_dir: String,
     tools: String,
+    host_runtime_context: String,
     skills: String,
     has_skills: bool,
     subagents: String,
@@ -106,6 +112,7 @@ where
     tool_descriptions: Vec<(String, String)>,
     skills: Vec<SkillInfo>,
     subagents: Vec<SubagentInfo>,
+    shell_sessions: ShellSessionRegistry,
 }
 
 impl<LLM, P, E, H> std::fmt::Debug for BashAgentBuilder<LLM, P, E, H>
@@ -131,33 +138,53 @@ where
 {
     /// Creates a new bash-centric agent builder.
     ///
-    /// The bash tool is the only direct tool available to the LLM.
-    /// Use `.tool()` to register tools as bash commands.
-    pub fn new(llm: LLM, bash_tool: BashTool<P, E, Unconfigured>) -> Self {
+    /// Creates the agent with native tools (`open_shell`, `close_shell`, `list_ssh`, `bash`)
+    /// and IPC commands accessible through bash (`jobs`, `kill`, plus any registered via `.tool()`).
+    pub fn new(llm: LLM, mut bash_tool: BashTool<P, E, Unconfigured>) -> Self {
         let (bash_tool_factory, bash_tool_factory_receiver) = bash_tool_factory_channel();
         let mut registry_builder = ToolRegistryBuilder::new();
         let mut tool_descriptions = Vec::new();
 
+        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: true,
+            container: false,
+            ssh: false,
+        });
+
+        let open_shell = OpenShellTool::new(
+            shell_sessions.clone(),
+            bash_tool.working_dir().to_path_buf(),
+        );
+        let list_ssh = ListSshTool::new(shell_sessions.clone());
         let job_registry = bash_tool.job_registry();
-        let tasks_tool = TasksTool::new(job_registry.clone());
-        let stop_tool = StopTool::new(job_registry);
+        let close_shell = CloseShellTool::new(shell_sessions.clone(), job_registry.clone());
+        let jobs_tool = TasksTool::new(job_registry.clone());
+        let kill_tool = KillTool::new(job_registry);
+        bash_tool = bash_tool.with_shell_sessions(shell_sessions.clone());
 
-        let tasks_def = ToolDefinition::new(&tasks_tool);
-        tool_descriptions.push((
-            tasks_def.name().to_string(),
-            short_description(tasks_def.description()),
-        ));
-        registry_builder.configure_tool(tasks_tool);
+        // Shell lifecycle tools are native LLM tool calls (not bash IPC commands).
+        let inner = AgentBuilder::new(llm)
+            .tool(open_shell)
+            .tool(list_ssh)
+            .tool(close_shell);
 
-        let stop_def = ToolDefinition::new(&stop_tool);
+        // jobs/kill are bash IPC commands (invoked via `$ jobs`, `$ kill <id>`).
+        let jobs_def = ToolDefinition::new(&jobs_tool);
         tool_descriptions.push((
-            stop_def.name().to_string(),
-            short_description(stop_def.description()),
+            jobs_def.name().to_string(),
+            short_description(jobs_def.description()),
         ));
-        registry_builder.configure_tool(stop_tool);
+        registry_builder.configure_tool(jobs_tool);
+
+        let kill_def = ToolDefinition::new(&kill_tool);
+        tool_descriptions.push((
+            kill_def.name().to_string(),
+            short_description(kill_def.description()),
+        ));
+        registry_builder.configure_tool(kill_tool);
 
         Self {
-            inner: AgentBuilder::new(llm),
+            inner,
             bash_tool,
             registry_builder,
             bash_tool_factory,
@@ -165,6 +192,7 @@ where
             tool_descriptions,
             skills: Vec::new(),
             subagents: Vec::new(),
+            shell_sessions,
         }
     }
 }
@@ -176,6 +204,28 @@ where
     E: Executor + Clone + 'static,
     H: Hook,
 {
+    /// Sets runtime shell backend availability for `open_shell`.
+    pub fn shell_runtime_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
+        self.bash_tool = self
+            .bash_tool
+            .with_shell_runtime_availability(availability.clone());
+        let _ = self.shell_sessions.set_availability(availability);
+        self
+    }
+
+
+    /// Sets preconfigured SSH targets that can be used by `open_shell` with ssh backend.
+    pub fn ssh_servers(mut self, servers: Vec<SshServer>) -> Self {
+        let _ = self.shell_sessions.set_ssh_servers(servers);
+        self
+    }
+
+    /// Sets the SSH session authorizer for interactive connect/install/unsafe consent prompts.
+    pub fn ssh_authorizer(self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
+        let _ = self.shell_sessions.set_ssh_authorizer(authorizer);
+        self
+    }
+
     /// Registers a tool as an IPC command accessible via bash.
     ///
     /// The tool becomes a bash command with the same name.
@@ -233,10 +283,75 @@ where
         self
     }
 
+    /// Sets an optional persona overlay prompt.
+    pub fn persona_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.inner = self.inner.persona_prompt(prompt.into());
+        self
+    }
+
+    /// Sets agent kind (coding/chatbot).
+    pub fn agent_kind(mut self, kind: AgentKind) -> Self {
+        self.inner = self.inner.agent_kind(kind);
+        self
+    }
+
+    /// Sets transcript path for long-memory recovery guidance.
+    pub fn transcript_path(mut self, path: impl Into<String>) -> Self {
+        self.inner = self.inner.transcript_path(path.into());
+        self
+    }
+
+    /// Enables writing readable transcript entries to the given file path.
+    pub fn transcript(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.inner = self.inner.transcript(path);
+        self
+    }
+
+    /// Adds a structured context block.
+    pub fn context_block(mut self, block: ContextBlock) -> Self {
+        self.inner = self.inner.context_block(block);
+        self
+    }
+
+    /// Adds a one-line builtin command hint.
+    pub fn builtin_tool_hint(mut self, hint: BuiltinToolHint) -> Self {
+        self.inner = self.inner.builtin_tool_hint(hint);
+        self
+    }
+
     /// Generates and sets the default system prompt using the built-in template.
     ///
     /// This should be called after all tools are registered.
     pub fn with_default_prompt(mut self) -> Self {
+        let availability = self.shell_sessions.availability();
+        let host_profile = if availability.container {
+            "container"
+        } else {
+            "leash"
+        };
+        let shell_context = format!(
+            "<shell_runtime><available_backends local=\"{}\" ssh=\"{}\" /><local_profile>{}</local_profile></shell_runtime>",
+            availability.local || availability.container,
+            availability.ssh,
+            host_profile,
+        );
+        self.inner = self.inner.context_block(
+            ContextBlock::new("shell_runtime", shell_context)
+                .with_priority(ContextBlockPriority::High),
+        );
+
+        let host_runtime_context = if host_profile == "container" {
+            format!(
+                "local_profile=container_local (virtualized local runtime; unrestricted by leash levels) | ssh_available={} (local IPC commands are local-only)",
+                availability.ssh
+            )
+        } else {
+            format!(
+                "local_profile=leash_local (real host with leash isolation; honor sandboxed/network/unsafe) | ssh_available={} (local IPC commands are local-only)",
+                availability.ssh
+            )
+        };
+
         // Build tools description
         let tools = self
             .tool_descriptions
@@ -281,6 +396,7 @@ where
             user_cwd,
             sandbox_dir,
             tools,
+            host_runtime_context,
             skills,
             has_skills,
             subagents,
@@ -306,6 +422,7 @@ where
             tool_descriptions: self.tool_descriptions,
             skills: self.skills,
             subagents: self.subagents,
+            shell_sessions: self.shell_sessions,
         }
     }
 
@@ -325,66 +442,82 @@ where
         use aither_skills::SkillLoader;
 
         let path = path.as_ref();
-        if !path.exists() {
-            return self;
-        }
 
-        // Load all skills from the path
-        tracing::debug!(path = %path.display(), "Loading skills from path");
-        let loader = SkillLoader::new().add_path(path);
-        match loader.load_all() {
-            Ok(skills) => {
-                tracing::info!(count = skills.len(), path = %path.display(), "Loaded skills");
-                for skill in skills {
-                    tracing::debug!(name = %skill.name, "Loaded skill");
-                    self.skills.push(SkillInfo {
-                        name: skill.name,
-                        description: skill.description,
-                    });
+        // Ensure the skills directory exists.
+        let _ = std::fs::create_dir_all(path);
+
+        if path.exists() {
+            tracing::debug!(path = %path.display(), "Loading skills from path");
+            let loader = SkillLoader::new().add_path(path);
+            match loader.load_all() {
+                Ok(skills) => {
+                    tracing::info!(count = skills.len(), path = %path.display(), "Loaded skills");
+                    for skill in skills {
+                        tracing::debug!(name = %skill.name, "Loaded skill");
+                        self.skills.push(SkillInfo {
+                            name: skill.name,
+                            description: skill.description,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "Failed to load skills");
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, path = %path.display(), "Failed to load skills");
-            }
         }
 
-        // Create symlink to .skills in sandbox working directory
-        // Canonicalize path to ensure symlink works from sandbox directory
+        // Create the symlink and register as a readable sandbox path.
         let symlink_path = self.bash_tool.working_dir().join(".skills");
         if let Ok(abs_path) = path.canonicalize() {
-            let _ = std::os::unix::fs::symlink(&abs_path, &symlink_path);
+            #[cfg(unix)]
+            {
+                let _ = std::os::unix::fs::symlink(&abs_path, &symlink_path);
+            }
+            #[cfg(windows)]
+            {
+                let _ = std::os::windows::fs::symlink_dir(&abs_path, &symlink_path);
+            }
+            self.bash_tool = self.bash_tool.with_readable_paths([abs_path]);
         }
 
         self
     }
 
     /// Loads skills from a filesystem path asynchronously.
+    ///
+    /// Creates the directory if it does not exist and always creates a
+    /// read-only `.skills` symlink inside the sandbox so the agent can
+    /// `cat .skills/<name>/SKILL.md` at runtime.  The path is also
+    /// registered as a readable (but not writable) sandbox path.
     #[cfg(feature = "skills")]
     pub async fn with_skills_async(mut self, path: impl AsRef<std::path::Path>) -> Self {
         use aither_skills::SkillLoader;
 
         let path = path.as_ref().to_path_buf();
-        if !path_exists(&path).await {
-            return self;
-        }
 
-        let loader = SkillLoader::new().add_path(&path);
-        match loader.load_all_async().await {
-            Ok(skills) => {
-                tracing::info!(count = skills.len(), path = %path.display(), "Loaded skills");
-                for skill in skills {
-                    tracing::debug!(name = %skill.name, "Loaded skill");
-                    self.skills.push(SkillInfo {
-                        name: skill.name,
-                        description: skill.description,
-                    });
+        // Ensure the skills directory exists.
+        let _ = fs::create_dir_all(&path).await;
+
+        if path_exists(&path).await {
+            let loader = SkillLoader::new().add_path(&path);
+            match loader.load_all_async().await {
+                Ok(skills) => {
+                    tracing::info!(count = skills.len(), path = %path.display(), "Loaded skills");
+                    for skill in skills {
+                        tracing::debug!(name = %skill.name, "Loaded skill");
+                        self.skills.push(SkillInfo {
+                            name: skill.name,
+                            description: skill.description,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "Failed to load skills");
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, path = %path.display(), "Failed to load skills");
-            }
         }
 
+        // Create the symlink and register as a readable sandbox path.
         let symlink_path = self.bash_tool.working_dir().join(".skills");
         if let Ok(abs_path) = fs::canonicalize(&path).await {
             #[cfg(unix)]
@@ -395,6 +528,7 @@ where
             {
                 let _ = fs::windows::symlink_dir(&abs_path, &symlink_path).await;
             }
+            self.bash_tool = self.bash_tool.with_readable_paths([abs_path]);
         }
 
         self
@@ -425,53 +559,66 @@ where
         use crate::subagent_file::SubagentDefinition;
 
         let path = path.as_ref();
-        if !path.exists() {
-            return self;
-        }
 
-        // Load all subagent definitions from the directory
-        if let Ok(defs) = SubagentDefinition::load_from_dir(path) {
-            for def in defs {
-                // Get relative path for the subagent file
-                let filename = format!("{}.md", def.id);
-                self.subagents.push(SubagentInfo {
-                    name: def.id,
-                    description: def.description,
-                    path: filename,
-                });
+        // Ensure the subagents directory exists.
+        let _ = std::fs::create_dir_all(path);
+
+        if path.exists() {
+            if let Ok(defs) = SubagentDefinition::load_from_dir(path) {
+                for def in defs {
+                    let filename = format!("{}.md", def.id);
+                    self.subagents.push(SubagentInfo {
+                        name: def.id,
+                        description: def.description,
+                        path: filename,
+                    });
+                }
             }
         }
 
-        // Create symlink to .subagents in sandbox working directory
-        // Canonicalize path to ensure symlink works from sandbox directory
+        // Create the symlink and register as a readable sandbox path.
         let symlink_path = self.bash_tool.working_dir().join(".subagents");
         if let Ok(abs_path) = path.canonicalize() {
-            let _ = std::os::unix::fs::symlink(&abs_path, &symlink_path);
+            #[cfg(unix)]
+            {
+                let _ = std::os::unix::fs::symlink(&abs_path, &symlink_path);
+            }
+            #[cfg(windows)]
+            {
+                let _ = std::os::windows::fs::symlink_dir(&abs_path, &symlink_path);
+            }
+            self.bash_tool = self.bash_tool.with_readable_paths([abs_path]);
         }
 
         self
     }
 
     /// Sets up the subagents directory and creates a symlink in the sandbox asynchronously.
+    ///
+    /// Creates the directory if it does not exist and always creates a
+    /// read-only `.subagents` symlink inside the sandbox.
     pub async fn with_subagents_async(mut self, path: impl AsRef<std::path::Path>) -> Self {
         use crate::subagent_file::SubagentDefinition;
 
         let path = path.as_ref();
-        if !path_exists(path).await {
-            return self;
-        }
 
-        if let Ok(defs) = SubagentDefinition::load_from_dir_async(path).await {
-            for def in defs {
-                let filename = format!("{}.md", def.id);
-                self.subagents.push(SubagentInfo {
-                    name: def.id,
-                    description: def.description,
-                    path: filename,
-                });
+        // Ensure the subagents directory exists.
+        let _ = fs::create_dir_all(path).await;
+
+        if path_exists(path).await {
+            if let Ok(defs) = SubagentDefinition::load_from_dir_async(path).await {
+                for def in defs {
+                    let filename = format!("{}.md", def.id);
+                    self.subagents.push(SubagentInfo {
+                        name: def.id,
+                        description: def.description,
+                        path: filename,
+                    });
+                }
             }
         }
 
+        // Create the symlink and register as a readable sandbox path.
         let symlink_path = self.bash_tool.working_dir().join(".subagents");
         if let Ok(abs_path) = fs::canonicalize(path).await {
             #[cfg(unix)]
@@ -482,6 +629,7 @@ where
             {
                 let _ = fs::windows::symlink_dir(&abs_path, &symlink_path).await;
             }
+            self.bash_tool = self.bash_tool.with_readable_paths([abs_path]);
         }
 
         self
@@ -522,7 +670,8 @@ where
     /// All registered IPC tools are accessible as bash commands.
     pub fn build(self) -> Agent<LLM, LLM, LLM, H> {
         // Build registry
-        let registry = std::sync::Arc::new(self.registry_builder.build(self.bash_tool.outputs_dir()));
+        let registry =
+            std::sync::Arc::new(self.registry_builder.build(self.bash_tool.outputs_dir()));
 
         // Configure bash tool
         let bash_tool = self.bash_tool.with_registry(registry);
@@ -544,7 +693,6 @@ fn short_description(description: &str) -> String {
         .trim()
         .to_string()
 }
-
 
 /// Returns (os_name, os_version) for the current system.
 fn get_os_info() -> (String, String) {
