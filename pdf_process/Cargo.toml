@@ -13,14 +13,19 @@ categories = ["api-bindings", "text-processing"]
 [dependencies]
 lopdf = "0.35"
 thiserror = "2.0"
+async-fs = "2"
+blocking = "1.6"
 oar-ocr = { version = "0.6.1", optional = true, default-features = false }
-pdfium-render = { version = "0.8.37", optional = true }
-image = { version = "0.25", optional = true }
+pdfium-render = "0.8.37"
+image = "0.25"
 
 [features]
 default = []
-ocr = ["dep:oar-ocr", "dep:pdfium-render", "dep:image"]
+ocr = ["dep:oar-ocr"]
 render = []
+
+[dev-dependencies]
+futures-lite = "2.6"
 
 [lints]
 workspace = true

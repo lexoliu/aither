@@ -135,11 +135,13 @@ mod tests {
     fn chunks_respect_non_empty_content() {
         let pages = vec![Page {
             index: 1,
+            source_page: 1,
             mode: PageMode::Native,
             text: "A. B. C.".to_string(),
             text_chars: 8,
             token_estimate: 2,
             vision_ref: None,
+            image_ref: None,
         }];
         let chunks = build_chunks(&pages, ChunkStrategy::Sentence, 8, 20);
         assert!(!chunks.is_empty());

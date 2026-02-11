@@ -107,11 +107,13 @@ fn parse_document(
 
         pages.push(Page {
             index: idx + 1,
+            source_page: *page_number as usize,
             mode,
             text,
             text_chars,
             token_estimate,
             vision_ref,
+            image_ref: None,
         });
     }
 

@@ -57,6 +57,8 @@ pub(crate) fn to_xml(doc: &ProcessedDocument) -> String {
 fn write_page(page: &Page, out: &mut String) {
     out.push_str("<p i=\"");
     out.push_str(&page.index.to_string());
+    out.push_str("\" sp=\"");
+    out.push_str(&page.source_page.to_string());
     out.push_str("\" m=\"");
     out.push_str(page.mode.as_str());
     out.push_str("\" tc=\"");
@@ -69,6 +71,11 @@ fn write_page(page: &Page, out: &mut String) {
         out.push_str("<t>");
         escape_into(&page.text, out);
         out.push_str("</t>");
+    }
+    if let Some(img) = &page.image_ref {
+        out.push_str("<img src=\"");
+        escape_into(img, out);
+        out.push_str("\"/>");
     }
     if let Some(v) = &page.vision_ref {
         out.push_str("<v r=\"");
@@ -109,11 +116,13 @@ mod tests {
             },
             pages: vec![Page {
                 index: 1,
+                source_page: 1,
                 mode: PageMode::Native,
                 text: "hello".to_string(),
                 text_chars: 5,
                 token_estimate: 2,
                 vision_ref: None,
+                image_ref: None,
             }],
             chunks: vec![Chunk {
                 id: "p1c0".to_string(),

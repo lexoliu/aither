@@ -38,6 +38,19 @@ pub enum MetadataVerbosity {
     Standard,
 }
 
+/// Paddle OCR model configuration.
+#[derive(Debug, Clone)]
+pub struct PaddleOcrConfig {
+    /// Path to Paddle/OAR text detection model (.onnx).
+    pub det_model_path: String,
+    /// Optional path to text line orientation model (.onnx).
+    pub cls_model_path: Option<String>,
+    /// Path to Paddle/OAR text recognition model (.onnx).
+    pub rec_model_path: String,
+    /// Path to OCR character dictionary file.
+    pub char_dict_path: String,
+}
+
 /// Runtime options for PDF processing.
 #[derive(Debug, Clone)]
 pub struct PdfProcessOptions {
@@ -57,14 +70,12 @@ pub struct PdfProcessOptions {
     pub ocr_language: String,
     /// OCR render DPI for rasterizing PDF pages before recognition.
     pub ocr_dpi: u16,
-    /// Path to Paddle/OAR text detection model (.onnx).
-    pub ocr_det_model_path: Option<String>,
-    /// Optional path to text line orientation model (.onnx).
-    pub ocr_cls_model_path: Option<String>,
-    /// Path to Paddle/OAR text recognition model (.onnx).
-    pub ocr_rec_model_path: Option<String>,
-    /// Path to OCR character dictionary file.
-    pub ocr_char_dict_path: Option<String>,
+    /// Render DPI for page image assets in folder export mode.
+    pub page_image_dpi: u16,
+    /// Absolute path to Pdfium dynamic library file (for example `/opt/lib/libpdfium.dylib`).
+    pub pdfium_library_path: Option<String>,
+    /// Paddle OCR model bundle used when OCR is enabled.
+    pub paddle_ocr: Option<PaddleOcrConfig>,
     /// Emit vision references for non-text-heavy pages.
     pub include_vision_refs: bool,
     /// Metadata detail level in XML output.
@@ -78,14 +89,13 @@ impl Default for PdfProcessOptions {
             chunk_strategy: ChunkStrategy::Hybrid,
             target_chunk_chars: 1800,
             target_chunk_tokens: 450,
-            ocr_mode: OcrMode::Auto,
+            ocr_mode: OcrMode::Off,
             ocr_backend: OcrBackend::Paddle,
             ocr_language: "en".to_string(),
             ocr_dpi: 300,
-            ocr_det_model_path: None,
-            ocr_cls_model_path: None,
-            ocr_rec_model_path: None,
-            ocr_char_dict_path: None,
+            page_image_dpi: 144,
+            pdfium_library_path: None,
+            paddle_ocr: None,
             include_vision_refs: true,
             metadata_verbosity: MetadataVerbosity::Minimal,
         }
@@ -148,6 +158,8 @@ impl PageMode {
 pub struct Page {
     /// 1-based page index in selected output set.
     pub index: usize,
+    /// Original 1-based page index in source PDF.
+    pub source_page: usize,
     /// Modality classification for this page.
     pub mode: PageMode,
     /// Canonical text for this page (native or OCR).
@@ -158,6 +170,8 @@ pub struct Page {
     pub token_estimate: usize,
     /// Optional vision reference identifier.
     pub vision_ref: Option<String>,
+    /// Optional rendered page image path (relative in bundle export mode).
+    pub image_ref: Option<String>,
 }
 
 /// Chunk unit for prompt budget-aware packing.
