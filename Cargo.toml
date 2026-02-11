@@ -25,6 +25,7 @@ members = [
     "acp",
     "cli",
     "sandbox",
+    "pdf_process",
 ]
 
 [workspace.package]
@@ -72,6 +73,7 @@ aither-mistral = { path = "./mistral" }
 aither-llama = { path = "./llama" }
 aither-copilot = { path = "./copilot" }
 aither-models = { path = "./models" }
+aither-pdf-process = { path = "./pdf_process" }
 
 [dependencies]
 aither-core.workspace = true
@@ -98,6 +100,7 @@ aither-agent = { path = "./agent", optional = true }
 aither-rag = { path = "./rag", optional = true }
 aither-mem0 = { path = "./mem0", optional = true }
 aither-skills = { workspace = true, optional = true }
+aither-pdf-process = { workspace = true, optional = true }
 
 # Tools
 aither-websearch = { workspace = true, optional = true }
@@ -167,6 +170,7 @@ agent = ["aither-agent"]
 rag = ["aither-rag"]
 mem0 = ["aither-mem0"]
 skills = ["aither-skills"]
+pdf-process = ["aither-pdf-process"]
 
 # Tools
 websearch = ["aither-websearch"]
@@ -184,7 +188,7 @@ all-providers = ["openai", "claude", "gemini", "mistral", "llama", "ort"]
 all-tools = ["websearch", "webfetch", "fs", "command"]
 
 # Convenience feature to enable everything
-full = ["all-providers", "all-tools", "agent", "rag", "mem0", "skills", "mcp"]
+full = ["all-providers", "all-tools", "agent", "rag", "mem0", "skills", "pdf-process", "mcp"]
 
 [lints]
 workspace = true

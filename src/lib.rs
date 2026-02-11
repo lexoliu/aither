@@ -82,6 +82,9 @@ pub use aither_rag as rag;
 #[cfg(feature = "mem0")]
 pub use aither_mem0 as mem0;
 
+#[cfg(feature = "pdf-process")]
+pub use aither_pdf_process as pdf_process;
+
 // Tools
 #[cfg(feature = "websearch")]
 pub use aither_websearch as websearch;
