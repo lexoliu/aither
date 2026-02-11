@@ -63,6 +63,12 @@ pub use aither_claude as claude;
 #[cfg(feature = "gemini")]
 pub use aither_gemini as gemini;
 
+#[cfg(feature = "mistral")]
+pub use aither_mistral as mistral;
+
+#[cfg(feature = "llama")]
+pub use aither_llama as llama;
+
 #[cfg(feature = "ort")]
 pub use aither_ort as ort;
 

@@ -1,0 +1,43 @@
+[package]
+name = "aither-mistral"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "mistral.rs local inference integration for aither"
+readme = "../README.md"
+keywords = ["ai", "llm", "mistralrs", "local"]
+categories = ["api-bindings"]
+
+[dependencies]
+aither-core.workspace = true
+aither-models.workspace = true
+anyhow = "1.0"
+async-stream = "0.3"
+base64 = "0.22"
+futures-core = { version = "0.3", default-features = false }
+futures-lite = "2.6"
+mistralrs = { version = "0.7.0-alpha.4", default-features = false }
+serde_json = "1.0"
+tracing.workspace = true
+
+[features]
+default = ["llm", "embedding", "image"]
+llm = []
+embedding = []
+image = []
+
+# Forward mistralrs accelerator features (all optional)
+cuda = ["mistralrs/cuda"]
+cudnn = ["mistralrs/cudnn"]
+metal = ["mistralrs/metal"]
+flash-attn = ["mistralrs/flash-attn"]
+accelerate = ["mistralrs/accelerate"]
+mkl = ["mistralrs/mkl"]
+nccl = ["mistralrs/nccl"]
+ring = ["mistralrs/ring"]
+
+[lints]
+workspace = true

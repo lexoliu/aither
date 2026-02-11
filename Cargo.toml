@@ -9,12 +9,14 @@ members = [
     "openai",
     "core",
     "gemini",
+    "llama",
     "ort",
     "agent",
     "rag",
     "mem0",
     "skills",
     "models",
+    "mistral",
     "tools/websearch",
     "tools/webfetch",
     "tools/fs",
@@ -66,6 +68,8 @@ aither-openai = { path = "./openai" }
 aither-claude = { path = "./claude" }
 aither-cloud = { path = "./cloud" }
 aither-gemini = { path = "./gemini" }
+aither-mistral = { path = "./mistral" }
+aither-llama = { path = "./llama" }
 aither-copilot = { path = "./copilot" }
 aither-models = { path = "./models" }
 
@@ -85,6 +89,8 @@ url = { version = "2.5", default-features = false }
 aither-openai = { path = "./openai", optional = true }
 aither-claude = { path = "./claude", optional = true }
 aither-gemini = { path = "./gemini", optional = true }
+aither-mistral = { path = "./mistral", optional = true }
+aither-llama = { path = "./llama", optional = true }
 aither-ort = { workspace = true, optional = true }
 
 # High-level features
@@ -152,6 +158,8 @@ derive = ["aither-derive"]
 openai = ["aither-openai"]
 claude = ["aither-claude"]
 gemini = ["aither-gemini"]
+mistral = ["aither-mistral"]
+llama = ["aither-llama"]
 ort = ["aither-ort"]
 
 # High-level features
@@ -170,7 +178,7 @@ command = ["aither-command"]
 mcp = ["aither-mcp"]
 
 # Convenience feature to enable all providers
-all-providers = ["openai", "claude", "gemini", "ort"]
+all-providers = ["openai", "claude", "gemini", "mistral", "llama", "ort"]
 
 # Convenience feature to enable all tools
 all-tools = ["websearch", "webfetch", "fs", "command"]
