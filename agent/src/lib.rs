@@ -45,9 +45,9 @@ mod model_group;
 mod stream;
 mod subagent_file;
 mod todo;
-pub mod transcript;
 pub mod tool_request;
 mod tools;
+pub mod transcript;
 pub mod working_docs;
 pub mod workspace_request;
 

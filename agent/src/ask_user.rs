@@ -165,14 +165,24 @@ mod tests {
     fn test_schema_option_is_array() {
         let schema = schemars::schema_for!(AskUserArgs);
         let val = serde_json::to_value(schema).unwrap();
-        eprintln!("AskUserArgs schema:\n{}", serde_json::to_string_pretty(&val).unwrap());
+        eprintln!(
+            "AskUserArgs schema:\n{}",
+            serde_json::to_string_pretty(&val).unwrap()
+        );
 
         let props = val.get("properties").unwrap().as_object().unwrap();
         let opt = props.get("option").unwrap();
-        eprintln!("option field schema: {}", serde_json::to_string_pretty(opt).unwrap());
+        eprintln!(
+            "option field schema: {}",
+            serde_json::to_string_pretty(opt).unwrap()
+        );
 
         let opt_type = opt.get("type").and_then(|t| t.as_str());
-        assert_eq!(opt_type, Some("array"), "option must be array type in schema");
+        assert_eq!(
+            opt_type,
+            Some("array"),
+            "option must be array type in schema"
+        );
     }
 
     #[test]
@@ -183,18 +193,32 @@ mod tests {
         let result = aither_sandbox::cli_to_json(
             &schema_val,
             &[
-                "--question".into(), "请选择你喜欢的水果？".into(),
-                "--option".into(), "苹果".into(),
-                "--option".into(), "香蕉".into(),
-                "--option".into(), "橘子".into(),
-                "--option".into(), "梨".into(),
+                "--question".into(),
+                "请选择你喜欢的水果？".into(),
+                "--option".into(),
+                "苹果".into(),
+                "--option".into(),
+                "香蕉".into(),
+                "--option".into(),
+                "橘子".into(),
+                "--option".into(),
+                "梨".into(),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
-        eprintln!("cli_to_json result: {}", serde_json::to_string_pretty(&result).unwrap());
+        eprintln!(
+            "cli_to_json result: {}",
+            serde_json::to_string_pretty(&result).unwrap()
+        );
 
         let args: AskUserArgs = serde_json::from_value(result).unwrap();
-        assert_eq!(args.option.len(), 4, "expected 4 options, got: {:?}", args.option);
+        assert_eq!(
+            args.option.len(),
+            4,
+            "expected 4 options, got: {:?}",
+            args.option
+        );
         assert_eq!(args.option, vec!["苹果", "香蕉", "橘子", "梨"]);
     }
 }

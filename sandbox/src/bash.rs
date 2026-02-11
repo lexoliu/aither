@@ -1049,8 +1049,6 @@ async fn execute_unsafe_background(
     }
 }
 
-
-
 async fn execute_ssh_background(
     shell_id: &str,
     script: &str,
@@ -1059,8 +1057,10 @@ async fn execute_ssh_background(
     ssh_runtime: Option<SshRuntimeProfile>,
     job_registry: &JobRegistry,
 ) -> Result<(u32, std::process::Output), BashError> {
-    let target = ssh_target.ok_or_else(|| BashError::Execution("missing ssh target".to_string()))?;
-    let runtime = ssh_runtime.ok_or_else(|| BashError::Execution("missing ssh runtime profile".to_string()))?;
+    let target =
+        ssh_target.ok_or_else(|| BashError::Execution("missing ssh target".to_string()))?;
+    let runtime = ssh_runtime
+        .ok_or_else(|| BashError::Execution("missing ssh runtime profile".to_string()))?;
 
     let remote_cmd = match runtime {
         SshRuntimeProfile::Leash { binary } => match mode {

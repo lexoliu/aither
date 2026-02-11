@@ -24,9 +24,9 @@ use crate::{
         Hook, PostToolAction, PreToolAction, StopContext, StopReason, ToolResultContext,
         ToolUseContext,
     },
-    transcript::Transcript,
     todo::{TodoItem, TodoList, TodoStatus},
     tools::AgentTools,
+    transcript::Transcript,
     working_docs,
 };
 
@@ -713,7 +713,10 @@ where
     /// # Errors
     ///
     /// Returns an error if handoff generation fails.
-    pub async fn compact(&mut self, focus: Option<&str>) -> Result<Option<CompactResult>, AgentError> {
+    pub async fn compact(
+        &mut self,
+        focus: Option<&str>,
+    ) -> Result<Option<CompactResult>, AgentError> {
         self.ensure_initialized().await;
 
         let messages = self.memory.all();
@@ -1339,17 +1342,11 @@ fn format_todo_items_json(items: &[TodoItem]) -> String {
 }
 
 fn render_plan_context(content: &str) -> String {
-    format!(
-        "<plan>\n{}</plan>",
-        escape_xml_text(content)
-    )
+    format!("<plan>\n{}</plan>", escape_xml_text(content))
 }
 
 fn render_working_todo_context(content: &str) -> String {
-    format!(
-        "<todo>\n{}</todo>",
-        escape_xml_text(content)
-    )
+    format!("<todo>\n{}</todo>", escape_xml_text(content))
 }
 
 /// Truncates a script for display in messages.

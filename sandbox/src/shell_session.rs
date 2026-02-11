@@ -91,7 +91,8 @@ pub struct ShellSessionRegistry {
 
 impl std::fmt::Debug for ShellSessionRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShellSessionRegistry").finish_non_exhaustive()
+        f.debug_struct("ShellSessionRegistry")
+            .finish_non_exhaustive()
     }
 }
 

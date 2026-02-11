@@ -170,9 +170,7 @@ impl ToolRegistryBuilder {
                 let json_args = match cli_to_json(&schema, &args) {
                     Ok(v) => v,
                     Err(e) => {
-                        return format!(
-                            "Error: {e}\n\nRun `{name} --help` for usage information."
-                        )
+                        return format!("Error: {e}\n\nRun `{name} --help` for usage information.");
                     }
                 };
                 tracing::debug!(tool = %name, json = %json_args, "configure_tool handler: parsed JSON");
@@ -181,7 +179,7 @@ impl ToolRegistryBuilder {
                     Err(e) => {
                         return format!(
                             "Error: invalid arguments: {e}\n\nRun `{name} --help` for usage information."
-                        )
+                        );
                     }
                 };
                 match tool.call(parsed).await {
@@ -248,9 +246,7 @@ pub struct ToolRegistry {
 /// conversion in wrapper scripts. Array-typed fields are excluded because
 /// they need repeated `--flag value` syntax (e.g. `--options A --options B`).
 fn detect_positional_args(schema: &Value) -> Vec<String> {
-    let properties = schema
-        .get("properties")
-        .and_then(Value::as_object);
+    let properties = schema.get("properties").and_then(Value::as_object);
 
     let required: Vec<String> = schema
         .get("required")
@@ -738,7 +734,7 @@ where
                 return Value::String(format!(
                     "Error: {e}\n\nRun `{} --help` for usage information.",
                     self.name
-                ))
+                ));
             }
         };
 
@@ -749,7 +745,7 @@ where
                 return Value::String(format!(
                     "Error: invalid arguments: {e}\n\nRun `{} --help` for usage information.",
                     self.name
-                ))
+                ));
             }
         };
 
@@ -1521,7 +1517,11 @@ mod tests {
         // Leading "--" from leash-ipc is stripped; flags still work after it
         let result = cli_to_json(
             &schema,
-            &["--".to_string(), "--path".to_string(), "foo.txt".to_string()],
+            &[
+                "--".to_string(),
+                "--path".to_string(),
+                "foo.txt".to_string(),
+            ],
         )
         .unwrap();
         assert_eq!(result["path"], "foo.txt");
@@ -1647,10 +1647,14 @@ mod tests {
         let result = cli_to_json(
             &schema,
             &[
-                "--question".into(), "Pick one".into(),
-                "--options".into(), "A".into(),
-                "--options".into(), "B".into(),
-                "--options".into(), "C".into(),
+                "--question".into(),
+                "Pick one".into(),
+                "--options".into(),
+                "A".into(),
+                "--options".into(),
+                "B".into(),
+                "--options".into(),
+                "C".into(),
             ],
         )
         .unwrap();
@@ -1669,8 +1673,10 @@ mod tests {
             &schema,
             &[
                 "Pick one".into(),
-                "--options".into(), "A".into(),
-                "--options".into(), "B".into(),
+                "--options".into(),
+                "A".into(),
+                "--options".into(),
+                "B".into(),
             ],
         )
         .unwrap();
@@ -1697,7 +1703,8 @@ mod tests {
         // Provide question but no options -> should fail with clear message
         let err = cli_to_json(&schema, &["Pick one".into()]).unwrap_err();
         assert!(
-            err.to_string().contains("missing required argument: options"),
+            err.to_string()
+                .contains("missing required argument: options"),
             "got: {}",
             err
         );
@@ -1711,9 +1718,12 @@ mod tests {
         let result = cli_to_json(
             &schema,
             &[
-                "--question".into(), "Pick many".into(),
-                "--options".into(), "X".into(),
-                "--options".into(), "Y".into(),
+                "--question".into(),
+                "Pick many".into(),
+                "--options".into(),
+                "X".into(),
+                "--options".into(),
+                "Y".into(),
                 "--multi-select".into(),
             ],
         )
@@ -1782,11 +1792,7 @@ mod tests {
         let err = cli_to_json(&schema, &["--path".into()]).unwrap_err();
         // path is consumed as positional, so we get missing required
         // Actually --path starts with --, so it enters the named path and needs a value
-        assert!(
-            err.to_string().contains("missing"),
-            "got: {}",
-            err
-        );
+        assert!(err.to_string().contains("missing"), "got: {}", err);
     }
 
     // ========================================================================
@@ -1807,7 +1813,11 @@ mod tests {
         let cli = cmd.args_to_cli();
         // Should produce repeated --options flags
         let options_count = cli.iter().filter(|a| *a == "--options").count();
-        assert_eq!(options_count, 3, "expected 3 --options flags, got: {:?}", cli);
+        assert_eq!(
+            options_count, 3,
+            "expected 3 --options flags, got: {:?}",
+            cli
+        );
         assert!(cli.contains(&"A".to_string()));
         assert!(cli.contains(&"B".to_string()));
         assert!(cli.contains(&"C".to_string()));
@@ -1833,8 +1843,8 @@ mod tests {
 
     #[test]
     fn test_ask_user_e2e_repeated_option() {
-        use std::borrow::Cow;
         use aither_core::llm::{Tool, ToolOutput, tool::ToolDefinition};
+        use std::borrow::Cow;
 
         #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
         struct Question {
@@ -1860,15 +1870,20 @@ mod tests {
         #[derive(Debug, Clone)]
         struct FakeAskUser;
         impl Tool for FakeAskUser {
-            fn name(&self) -> Cow<'static, str> { "ask_user".into() }
+            fn name(&self) -> Cow<'static, str> {
+                "ask_user".into()
+            }
             type Arguments = AskUserArgs;
             async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
                 // Return the parsed args as JSON so we can inspect
-                Ok(ToolOutput::text(serde_json::to_string(&serde_json::json!({
-                    "question": args.question,
-                    "option": args.option,
-                    "multi_select": args.multi_select,
-                })).unwrap()))
+                Ok(ToolOutput::text(
+                    serde_json::to_string(&serde_json::json!({
+                        "question": args.question,
+                        "option": args.option,
+                        "multi_select": args.multi_select,
+                    }))
+                    .unwrap(),
+                ))
             }
         }
 
@@ -1884,7 +1899,8 @@ mod tests {
                 "--", "--question", "你喜欢哪种薯条？",
                 "--option", "原味", "--option", "番茄味", "--option", "芝士味"
             ]
-        })).unwrap();
+        }))
+        .unwrap();
 
         let result = futures_lite::future::block_on(cmd.handle());
         eprintln!("result: {}", serde_json::to_string_pretty(&result).unwrap());
@@ -1896,5 +1912,4 @@ mod tests {
         assert_eq!(options[1], "番茄味");
         assert_eq!(options[2], "芝士味");
     }
-
 }

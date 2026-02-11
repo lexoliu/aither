@@ -213,7 +213,6 @@ where
         self
     }
 
-
     /// Sets preconfigured SSH targets that can be used by `open_shell` with ssh backend.
     pub fn ssh_servers(mut self, servers: Vec<SshServer>) -> Self {
         let _ = self.shell_sessions.set_ssh_servers(servers);
