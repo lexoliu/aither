@@ -42,7 +42,7 @@ pub struct BudgetedModel<M> {
     pub budget: Budget,
     /// Tokens used (atomic for thread safety).
     tokens_used: AtomicU64,
-    /// Cost used in microdollars (1 USD = 1_000_000 microdollars).
+    /// Cost used in microdollars (1 USD = `1_000_000` microdollars).
     cost_used_micro: AtomicU64,
     /// Whether this model's budget is exhausted.
     exhausted: std::sync::atomic::AtomicBool,
@@ -51,7 +51,7 @@ pub struct BudgetedModel<M> {
 impl<M> BudgetedModel<M> {
     /// Creates a new budgeted model.
     #[must_use]
-    pub fn new(model: M, budget: Budget) -> Self {
+    pub const fn new(model: M, budget: Budget) -> Self {
         Self {
             model,
             budget,
@@ -63,7 +63,7 @@ impl<M> BudgetedModel<M> {
 
     /// Creates a model with unlimited budget.
     #[must_use]
-    pub fn unlimited(model: M) -> Self {
+    pub const fn unlimited(model: M) -> Self {
         Self::new(model, Budget::Unlimited)
     }
 
@@ -154,7 +154,7 @@ impl<M> ModelGroup<M> {
 
     /// Creates a group from multiple budgeted models.
     #[must_use]
-    pub fn from_models(models: Vec<BudgetedModel<M>>) -> Self {
+    pub const fn from_models(models: Vec<BudgetedModel<M>>) -> Self {
         Self {
             models,
             current: std::sync::atomic::AtomicUsize::new(0),
@@ -307,7 +307,7 @@ impl<M> TieredModels<M> {
 
     /// Gets the model group for a specific tier.
     #[must_use]
-    pub fn get(&self, tier: ModelTier) -> Option<&ModelGroup<M>> {
+    pub const fn get(&self, tier: ModelTier) -> Option<&ModelGroup<M>> {
         match tier {
             ModelTier::Advanced => self.advanced.as_ref(),
             ModelTier::Balanced => self.balanced.as_ref(),
@@ -316,7 +316,7 @@ impl<M> TieredModels<M> {
     }
 
     /// Gets a mutable reference to the model group for a specific tier.
-    pub fn get_mut(&mut self, tier: ModelTier) -> Option<&mut ModelGroup<M>> {
+    pub const fn get_mut(&mut self, tier: ModelTier) -> Option<&mut ModelGroup<M>> {
         match tier {
             ModelTier::Advanced => self.advanced.as_mut(),
             ModelTier::Balanced => self.balanced.as_mut(),
@@ -403,7 +403,7 @@ where
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-/// Stream wrapper for ModelGroup that tracks usage and detects quota errors.
+/// Stream wrapper for `ModelGroup` that tracks usage and detects quota errors.
 struct ModelGroupStream<'a, M: LanguageModel> {
     group: &'a ModelGroup<M>,
     inner: Option<Pin<Box<dyn Stream<Item = Result<Event, M::Error>> + Send + 'a>>>,
@@ -494,12 +494,12 @@ mod tests {
         ]);
 
         // Initially on primary
-        assert_eq!(group.current().map(|m| m.inner()), Some(&"primary"));
+        assert_eq!(group.current().map(super::BudgetedModel::inner), Some(&"primary"));
 
         // Exhaust primary
         group.record_usage(&Usage::new(50, 51));
         assert!(group.try_advance());
-        assert_eq!(group.current().map(|m| m.inner()), Some(&"fallback"));
+        assert_eq!(group.current().map(super::BudgetedModel::inner), Some(&"fallback"));
 
         // Exhaust fallback
         group.record_usage(&Usage::new(50, 51));
@@ -514,10 +514,10 @@ mod tests {
             BudgetedModel::unlimited("fallback"),
         ]);
 
-        assert_eq!(group.current().map(|m| m.inner()), Some(&"primary"));
+        assert_eq!(group.current().map(super::BudgetedModel::inner), Some(&"primary"));
 
         // Mark as exhausted (e.g., from API quota error)
         assert!(group.mark_current_exhausted());
-        assert_eq!(group.current().map(|m| m.inner()), Some(&"fallback"));
+        assert_eq!(group.current().map(super::BudgetedModel::inner), Some(&"fallback"));
     }
 }

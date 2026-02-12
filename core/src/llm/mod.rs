@@ -167,7 +167,7 @@ impl LLMRequest {
     }
 
     /// Returns a mutable reference to messages for modification.
-    pub fn messages_mut(&mut self) -> &mut Vec<Message> {
+    pub const fn messages_mut(&mut self) -> &mut Vec<Message> {
         &mut self.messages
     }
 
@@ -217,13 +217,13 @@ impl LLMRequest {
 impl<'tools> LLMRequestWithTools<'tools> {
     /// Returns the inner request.
     #[must_use]
-    pub fn request(&self) -> &LLMRequest {
+    pub const fn request(&self) -> &LLMRequest {
         &self.inner
     }
 
     /// Returns the tool registry.
     #[must_use]
-    pub fn tools(&mut self) -> &mut Tools {
+    pub const fn tools(&mut self) -> &mut Tools {
         self.tools
     }
 
@@ -425,6 +425,10 @@ mod prompts;
 impl_language_model!(Arc, Box);
 
 /// Collects text from an event stream.
+///
+/// # Errors
+///
+/// Returns the first stream error encountered while collecting text chunks.
 pub async fn collect_text<S, E>(stream: S) -> Result<String, E>
 where
     S: Stream<Item = Result<Event, E>>,
@@ -518,9 +522,10 @@ fn parse_json_with_recovery<T: DeserializeOwned + 'static>(json: &str) -> crate:
         }
     }
 
-    let primary = last_error
-        .map(anyhow::Error::new)
-        .unwrap_or_else(|| anyhow!("structured output was empty or missing JSON block"));
+    let primary = last_error.map_or_else(
+        || anyhow!("structured output was empty or missing JSON block"),
+        anyhow::Error::new,
+    );
     let snippet = last_candidate
         .as_deref()
         .unwrap_or(trimmed)
@@ -539,11 +544,7 @@ fn strip_code_fences(raw: &str) -> Option<String> {
     let mut lines = after_fence.lines();
     let _maybe_lang = lines.next();
     let body = lines.collect::<Vec<_>>().join("\n");
-    let content = if let Some(end) = body.rfind("```") {
-        &body[..end]
-    } else {
-        &body
-    };
+    let content = body.rfind("```").map_or(body.as_str(), |end| &body[..end]);
 
     let cleaned = content.trim();
     if cleaned.is_empty() {

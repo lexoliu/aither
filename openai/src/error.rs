@@ -65,7 +65,7 @@ impl fmt::Display for OpenAIError {
 impl std::error::Error for OpenAIError {}
 
 impl OpenAIError {
-    /// Convert a zenwave error to an OpenAIError.
+    /// Convert a zenwave error to an `OpenAIError`.
     pub(crate) fn from_http(err: zenwave::Error) -> Self {
         // Check if it's a rate limit error
         if let zenwave::Error::Http { status, .. } = &err {

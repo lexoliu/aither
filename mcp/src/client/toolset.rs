@@ -159,7 +159,7 @@ impl McpConnection {
             Self::http(url).await
         } else if let Some(ref command) = config.command {
             // Process-based server
-            let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
+            let args: Vec<&str> = config.args.iter().map(std::string::String::as_str).collect();
             Self::spawn(command, &args).await
         } else {
             Err(McpError::InvalidConfig(

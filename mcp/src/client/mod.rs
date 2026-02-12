@@ -6,5 +6,5 @@
 mod client;
 mod toolset;
 
-pub(crate) use client::McpClient;
+pub use client::McpClient;
 pub use toolset::{McpConnection, McpServerConfig, McpServersConfig, McpToolService};

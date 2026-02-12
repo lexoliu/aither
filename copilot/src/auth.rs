@@ -279,13 +279,13 @@ pub async fn get_session_token(oauth_token: &str) -> Result<SessionToken, Copilo
     let response: SessionTokenResponse = backend
         .get(COPILOT_TOKEN_URL)
         .map_err(CopilotError::Http)?
-        .header("Authorization", format!("token {}", oauth_token))
+        .header("Authorization", format!("token {oauth_token}"))
         .map_err(CopilotError::Http)?
         .header("Accept", "application/json")
         .map_err(CopilotError::Http)?
         .header(
             "User-Agent",
-            format!("aither-copilot/0.1 ({})", EDITOR_VERSION),
+            format!("aither-copilot/0.1 ({EDITOR_VERSION})"),
         )
         .map_err(CopilotError::Http)?
         .json()

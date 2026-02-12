@@ -88,16 +88,13 @@ impl<T: BidirectionalTransport> AcpServer<T> {
         debug!("ACP server starting: {}", self.info.name);
 
         loop {
-            match self.recv().await? {
-                Some(msg) => {
-                    if let Err(e) = self.handle_message(msg).await {
-                        debug!("Error handling message: {e}");
-                    }
+            if let Some(msg) = self.recv().await? {
+                if let Err(e) = self.handle_message(msg).await {
+                    debug!("Error handling message: {e}");
                 }
-                None => {
-                    debug!("Connection closed");
-                    break;
-                }
+            } else {
+                debug!("Connection closed");
+                break;
             }
         }
 

@@ -349,7 +349,7 @@ pub struct PlanEntry {
 }
 
 /// Plan entry status.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanEntryStatus {
     /// Not started.
@@ -436,7 +436,7 @@ pub struct ToolCallUpdate {
 }
 
 /// Tool kind.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolKind {
     /// Read operation.
@@ -453,7 +453,7 @@ pub enum ToolKind {
 }
 
 /// Tool call status.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallStatus {
     /// Pending execution.

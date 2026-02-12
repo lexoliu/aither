@@ -230,7 +230,7 @@ async fn print_memories(mem0: &MemoryManager) -> Result<()> {
     {
         let who = user_id
             .as_deref()
-            .or_else(|| agent_id.as_deref())
+            .or(agent_id.as_deref())
             .unwrap_or("unknown");
         println!("- {} ({who})", content.trim());
     }

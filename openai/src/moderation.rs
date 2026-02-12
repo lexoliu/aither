@@ -25,15 +25,15 @@ async fn moderate_once(cfg: Arc<Config>, content: String) -> Result<ModerationRe
     let mut backend = client();
     let mut builder = backend
         .post(endpoint)
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(header::AUTHORIZATION.as_str(), cfg.request_auth())
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(header::USER_AGENT.as_str(), "aither-openai/0.1")
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
     if let Some(org) = &cfg.organization {
         builder = builder
             .header("OpenAI-Organization", org.clone())
-            .map_err(|e| OpenAIError::Http(e))?;
+            .map_err(OpenAIError::Http)?;
     }
 
     let request = ModerationRequest {
@@ -42,10 +42,10 @@ async fn moderate_once(cfg: Arc<Config>, content: String) -> Result<ModerationRe
     };
     let response: ModerationResponse = builder
         .json_body(&request)
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .json()
         .await
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
 
     response.into_result()
 }

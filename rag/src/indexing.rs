@@ -21,7 +21,7 @@ pub struct IndexProgress {
 impl IndexProgress {
     /// Creates a new progress update.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         processed: usize,
         total: usize,
         current_file: Option<PathBuf>,

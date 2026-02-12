@@ -14,7 +14,7 @@
 //! use aither_copilot::{Copilot, auth};
 //! use aither_core::LanguageModel;
 //!
-//! # async fn demo() -> anyhow::Result<()> {
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! // Request device code
 //! let device_code = auth::request_device_code().await?;
 //! println!("Visit {} and enter code: {}", device_code.verification_uri, device_code.user_code);

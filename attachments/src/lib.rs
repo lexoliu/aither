@@ -14,9 +14,10 @@ const CACHE_FILE_NAME: &str = "file_cache.json";
 /// Returns the default cache directory for attachments.
 #[must_use]
 pub fn default_cache_dir() -> PathBuf {
-    std::env::var_os("AITHER_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("aither").join("cache"))
+    std::env::var_os("AITHER_CACHE_DIR").map_or_else(
+        || std::env::temp_dir().join("aither").join("cache"),
+        PathBuf::from,
+    )
 }
 
 /// A cache entry for an uploaded file.
@@ -26,7 +27,7 @@ pub struct CacheEntry {
     pub content_hash: String,
     /// Provider name (e.g., "gemini", "openai").
     pub provider: String,
-    /// Provider-specific reference (file URI or file_id).
+    /// Provider-specific reference (file URI or `file_id`).
     pub reference: String,
     /// When this reference expires (None if it never expires).
     #[serde(with = "system_time_option")]
@@ -36,7 +37,7 @@ pub struct CacheEntry {
 impl CacheEntry {
     /// Create a new cache entry.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         content_hash: String,
         provider: String,
         reference: String,
@@ -56,10 +57,8 @@ impl CacheEntry {
         if self.content_hash != current_hash {
             return false;
         }
-        match self.expires_at {
-            Some(expires) => SystemTime::now() < expires,
-            None => true,
-        }
+        self.expires_at
+            .is_none_or(|expires| SystemTime::now() < expires)
     }
 }
 
@@ -72,7 +71,7 @@ pub struct FileCache {
     /// Cache directory for persistence.
     #[serde(skip)]
     cache_dir: PathBuf,
-    /// Map of (canonical_path, provider) -> CacheEntry.
+    /// Map of (`canonical_path`, provider) -> `CacheEntry`.
     entries: HashMap<String, CacheEntry>,
 }
 
@@ -80,6 +79,10 @@ impl FileCache {
     /// Open a file cache with the given cache directory.
     ///
     /// Loads existing cache data if the cache file exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache file cannot be read or parsed.
     pub async fn open(cache_dir: PathBuf) -> std::io::Result<Self> {
         let cache_file = cache_dir.join(CACHE_FILE_NAME);
         if async_fs::metadata(&cache_file).await.is_ok() {
@@ -98,6 +101,10 @@ impl FileCache {
     }
 
     /// Save cache to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache directory cannot be created or file cannot be written.
     pub async fn save(&self) -> std::io::Result<()> {
         async_fs::create_dir_all(&self.cache_dir).await?;
         let cache_file = self.cache_dir.join(CACHE_FILE_NAME);
@@ -118,15 +125,18 @@ impl FileCache {
     /// - No cache entry exists
     /// - The file has changed (hash mismatch)
     /// - The cache entry has expired
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when file hashing fails.
     pub async fn get(
         &self,
         file_path: &Path,
         provider: &str,
     ) -> std::io::Result<Option<CacheEntry>> {
         let key = Self::cache_key(file_path, provider);
-        let entry = match self.entries.get(&key) {
-            Some(entry) => entry,
-            None => return Ok(None),
+        let Some(entry) = self.entries.get(&key) else {
+            return Ok(None);
         };
 
         let current_hash = hash_file(file_path).await?;
@@ -140,6 +150,10 @@ impl FileCache {
     /// Insert a new cache entry.
     ///
     /// The content hash is computed automatically from the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when file hashing fails.
     pub async fn insert(
         &mut self,
         file_path: &Path,
@@ -167,7 +181,7 @@ impl FileCache {
         let now = SystemTime::now();
         let before = self.entries.len();
         self.entries
-            .retain(|_, entry| entry.expires_at.map_or(true, |expires| now < expires));
+            .retain(|_, entry| entry.expires_at.is_none_or(|expires| now < expires));
         before != self.entries.len()
     }
 
@@ -190,7 +204,7 @@ async fn hash_file(path: &Path) -> std::io::Result<String> {
         hasher.update(&buffer[..bytes_read]);
     }
     let result = hasher.finalize();
-    Ok(format!("{:x}", result))
+    Ok(format!("{result:x}"))
 }
 
 /// Serde support for Option<SystemTime>.
@@ -198,6 +212,7 @@ mod system_time_option {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    #[allow(clippy::ref_option)]
     pub fn serialize<S>(time: &Option<SystemTime>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,

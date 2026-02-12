@@ -1,4 +1,4 @@
-//! SubAgent - Wrap an agent configuration as a callable tool.
+//! `SubAgent` - Wrap an agent configuration as a callable tool.
 //!
 //! Allows composing agents by delegating tasks to specialized sub-agents.
 //! Each call spawns a fresh agent instance.

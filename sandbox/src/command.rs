@@ -38,7 +38,7 @@ use aither_core::llm::Tool;
 use leash::IpcCommand;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 // ============================================================================
@@ -106,7 +106,7 @@ use aither_core::llm::tool::ToolDefinition;
 pub type DynToolHandler =
     Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
 
-/// A type-erased bash tool that can be registered with AgentTools.
+/// A type-erased bash tool that can be registered with `AgentTools`.
 pub struct DynBashTool {
     /// Tool definition (name, description, schema).
     pub definition: ToolDefinition,
@@ -309,8 +309,7 @@ impl ToolRegistry {
                 handle_large_output(output, &self.output_dir).await
             }
             None => format!(
-                "Error: unknown command '{}'. Run 'help' to see available commands.",
-                tool_name
+                "Error: unknown command '{tool_name}'. Run 'help' to see available commands."
             ),
         }
     }
@@ -357,7 +356,7 @@ impl ToolRegistry {
 
 /// IPC command for invoking tools from the sandbox.
 ///
-/// The tool_name comes from the IPC method name, and args are flattened
+/// The `tool_name` comes from the IPC method name, and args are flattened
 /// from the key-value pairs sent by leash-ipc.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolCallCommand {
@@ -383,56 +382,55 @@ impl ToolCallCommand {
         }
     }
 
-    /// Convert args HashMap to CLI-style Vec<String> for the handler.
-    ///
-    /// If there's an "args" key with an array value, use those as positional args.
-    /// Otherwise, convert key-value pairs to `--key value` format.
+    /// Convert args `HashMap` to CLI-style Vec<String> for the handler.
     fn args_to_cli(&self) -> Vec<String> {
-        // Check for positional args array (from `todo add "Task 1"` style commands)
-        if let Some(Value::Array(arr)) = self.args.get("args") {
-            return arr
-                .iter()
-                .filter_map(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    Value::Number(n) => Some(n.to_string()),
-                    Value::Bool(b) => Some(b.to_string()),
-                    _ => None,
-                })
-                .collect();
-        }
+        flatten_args_to_cli(&self.args)
+    }
+}
 
-        // Otherwise, convert to --key value format
-        let mut cli_args = Vec::new();
-        for (key, value) in &self.args {
-            match value {
-                Value::Bool(true) => cli_args.push(format!("--{key}")),
-                Value::Bool(false) => {}
-                Value::String(s) => {
+fn flatten_args_to_cli(args: &std::collections::HashMap<String, Value>) -> Vec<String> {
+    if let Some(Value::Array(arr)) = args.get("args") {
+        return arr
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            })
+            .collect();
+    }
+
+    let mut cli_args = Vec::new();
+    for (key, value) in args {
+        match value {
+            Value::Bool(true) => cli_args.push(format!("--{key}")),
+            Value::Bool(false) => {}
+            Value::String(s) => {
+                cli_args.push(format!("--{key}"));
+                cli_args.push(s.clone());
+            }
+            Value::Number(n) => {
+                cli_args.push(format!("--{key}"));
+                cli_args.push(n.to_string());
+            }
+            Value::Array(arr) => {
+                for item in arr {
                     cli_args.push(format!("--{key}"));
-                    cli_args.push(s.clone());
-                }
-                Value::Number(n) => {
-                    cli_args.push(format!("--{key}"));
-                    cli_args.push(n.to_string());
-                }
-                Value::Array(arr) => {
-                    for item in arr {
-                        cli_args.push(format!("--{key}"));
-                        if let Some(s) = item.as_str() {
-                            cli_args.push(s.to_string());
-                        } else {
-                            cli_args.push(item.to_string());
-                        }
+                    if let Some(s) = item.as_str() {
+                        cli_args.push(s.to_string());
+                    } else {
+                        cli_args.push(item.to_string());
                     }
                 }
-                _ => {
-                    cli_args.push(format!("--{key}"));
-                    cli_args.push(value.to_string());
-                }
+            }
+            _ => {
+                cli_args.push(format!("--{key}"));
+                cli_args.push(value.to_string());
             }
         }
-        cli_args
     }
+    cli_args
 }
 
 impl IpcCommand for ToolCallCommand {
@@ -509,12 +507,81 @@ impl IpcCommand for ToolCallCommand {
 /// let registry = std::sync::Arc::new(ToolRegistryBuilder::new().build("./outputs"));
 /// let router = register_tool_command(router, registry, "websearch");
 /// ```
+#[must_use] 
 pub fn register_tool_command(
     router: leash::IpcRouter,
     registry: Arc<ToolRegistry>,
     tool_name: &str,
 ) -> leash::IpcRouter {
     router.register(ToolCallCommand::new(tool_name, registry))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IpcGatewayCommand {
+    #[serde(skip)]
+    pub registry: Arc<ToolRegistry>,
+    #[serde(flatten)]
+    pub args: std::collections::HashMap<String, Value>,
+}
+
+impl IpcGatewayCommand {
+    #[must_use]
+    pub fn new(registry: Arc<ToolRegistry>) -> Self {
+        Self {
+            registry,
+            args: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl IpcCommand for IpcGatewayCommand {
+    type Response = Value;
+
+    fn name(&self) -> String {
+        "ipc".to_string()
+    }
+
+    fn set_method_name(&mut self, _name: &str) {}
+
+    fn apply_args(&mut self, params: &[u8]) -> Result<(), leash::rmp_serde::decode::Error> {
+        self.args = leash::rmp_serde::from_slice(params)?;
+        Ok(())
+    }
+
+    async fn handle(&mut self) -> Value {
+        let cli_args = flatten_args_to_cli(&self.args);
+        if cli_args.is_empty() {
+            return Value::String("Error: usage: ipc <tool> [args ...]".to_string());
+        }
+
+        if has_help_flag(&cli_args)
+            && cli_args.len() == 1 {
+                let mut names = self.registry.registered_tool_names();
+                names.sort();
+                return Value::String(format!(
+                    "Usage: ipc <tool> [args ...]\nAvailable tools: {}",
+                    names.join(", ")
+                ));
+            }
+
+        let tool_name = &cli_args[0];
+        let tool_args = cli_args[1..].to_vec();
+        let result = self
+            .registry
+            .query_tool_handler(tool_name, &tool_args)
+            .await;
+
+        serde_json::from_str(&result).unwrap_or_else(|_| Value::String(result))
+    }
+}
+
+/// Registers the generic `ipc` gateway command that dispatches to any tool by name.
+#[must_use] 
+pub fn register_ipc_gateway_command(
+    router: leash::IpcRouter,
+    registry: Arc<ToolRegistry>,
+) -> leash::IpcRouter {
+    router.register(IpcGatewayCommand::new(registry))
 }
 
 // ============================================================================
@@ -852,7 +919,7 @@ fn parse_tagged_enum(
     tag: &str,
     args: &[String],
 ) -> anyhow::Result<Value> {
-    let args = if args.first().map(|s| s.as_str()) == Some("--") {
+    let args = if args.first().map(std::string::String::as_str) == Some("--") {
         &args[1..]
     } else {
         args
@@ -923,7 +990,7 @@ fn get_variant_name(schema: &Value, tag: &str) -> Option<String> {
 
 /// Returns true if args contain -h/--help before "--".
 fn has_help_flag(args: &[String]) -> bool {
-    let args = if args.first().map(|s| s.as_str()) == Some("--") {
+    let args = if args.first().map(std::string::String::as_str) == Some("--") {
         &args[1..]
     } else {
         args
@@ -940,11 +1007,10 @@ fn has_help_flag(args: &[String]) -> bool {
         if arg == "--help" || arg == "-h" {
             return true;
         }
-        if arg.starts_with('-') && !arg.starts_with("--") {
-            if arg.chars().skip(1).any(|c| c == 'h') {
+        if arg.starts_with('-') && !arg.starts_with("--")
+            && arg.chars().skip(1).any(|c| c == 'h') {
                 return true;
             }
-        }
     }
     false
 }
@@ -996,12 +1062,12 @@ fn find_similar_option<'a>(input: &str, options: impl Iterator<Item = &'a str>) 
 fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
     // Strip leading "--" separator (from leash-ipc wrapper) without disabling flag parsing.
     // A standalone "--" later in the args still acts as end-of-options.
-    let args = if args.first().map(|s| s.as_str()) == Some("--") {
+    let args = if args.first().map(std::string::String::as_str) == Some("--") {
         &args[1..]
     } else {
         args
     };
-    let mut start_idx = 0;
+    let start_idx = 0;
     let mut end_of_options = false;
 
     let mut result: HashMap<String, Value> = HashMap::new();
@@ -1060,7 +1126,7 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
                 }
                 positional_idx += 1;
             } else {
-                anyhow::bail!("unexpected positional argument: {}", arg);
+                anyhow::bail!("unexpected positional argument: {arg}");
             }
             i += 1;
             continue;
@@ -1094,12 +1160,12 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
                 let prop_type = get_instance_type(prop_schema);
 
                 if negated && prop_type != Some("boolean") {
-                    anyhow::bail!("--no-{} is only valid for boolean options", name);
+                    anyhow::bail!("--no-{name} is only valid for boolean options");
                 }
 
                 let parsed_value = if prop_type == Some("boolean") {
                     if negated && value.is_some() {
-                        anyhow::bail!("unexpected value for --no-{}", name);
+                        anyhow::bail!("unexpected value for --no-{name}");
                     }
                     if let Some(v) = value {
                         parse_value(&v, prop_type)
@@ -1113,7 +1179,7 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
                     });
                     match val {
                         Some(v) => parse_value(&v, prop_type),
-                        None => anyhow::bail!("missing value for --{}", name),
+                        None => anyhow::bail!("missing value for --{name}"),
                     }
                 };
 
@@ -1121,10 +1187,9 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
             } else {
                 let suggestion = find_similar_option(&name, long_names.iter().map(String::as_str));
                 if let Some(similar) = suggestion {
-                    anyhow::bail!("unknown option: --{}. Did you mean --{}?", name, similar);
-                } else {
-                    anyhow::bail!("unknown option: --{}", name);
+                    anyhow::bail!("unknown option: --{name}. Did you mean --{similar}?");
                 }
+                anyhow::bail!("unknown option: --{name}");
             }
         } else if !end_of_options && arg.starts_with('-') && arg.len() > 1 {
             parse_short_options(arg, args, &mut i, &properties, &short_to_field, &mut result)?;
@@ -1138,7 +1203,7 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
                 }
                 positional_idx += 1;
             } else {
-                anyhow::bail!("unexpected positional argument: {}", arg);
+                anyhow::bail!("unexpected positional argument: {arg}");
             }
         }
 
@@ -1148,7 +1213,7 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
     // Check required fields
     for req in &required {
         if !result.contains_key(req) {
-            anyhow::bail!("missing required argument: {}", req);
+            anyhow::bail!("missing required argument: {req}");
         }
     }
 
@@ -1191,7 +1256,7 @@ fn parse_short_options(
                 }
             } else {
                 if value_from_eq.is_some() {
-                    anyhow::bail!("unexpected value for -{}", ch);
+                    anyhow::bail!("unexpected value for -{ch}");
                 }
                 insert_value(result, &field_name, Value::Bool(true), prop_schema);
             }
@@ -1200,7 +1265,7 @@ fn parse_short_options(
 
         let value = if let Some(v) = value_from_eq.take() {
             if chars.peek().is_some() {
-                anyhow::bail!("unexpected value for -{}", ch);
+                anyhow::bail!("unexpected value for -{ch}");
             }
             v
         } else if chars.peek().is_some() {
@@ -1210,7 +1275,7 @@ fn parse_short_options(
             *i += 1;
             args.get(*i)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing value for -{}", ch))?
+                .ok_or_else(|| anyhow::anyhow!("missing value for -{ch}"))?
         };
 
         let parsed = parse_value(&value, prop_type);
@@ -1228,19 +1293,16 @@ fn insert_value(
     prop_schema: &Value,
 ) {
     if get_instance_type(prop_schema) == Some("array") {
-        match result.get_mut(field_name) {
-            Some(Value::Array(existing)) => match value {
-                Value::Array(mut items) => existing.append(&mut items),
-                other => existing.push(other),
-            },
-            _ => {
-                let mut items = Vec::new();
-                match value {
-                    Value::Array(mut arr) => items.append(&mut arr),
-                    other => items.push(other),
-                }
-                result.insert(field_name.to_string(), Value::Array(items));
+        if let Some(Value::Array(existing)) = result.get_mut(field_name) { match value {
+            Value::Array(mut items) => existing.append(&mut items),
+            other => existing.push(other),
+        } } else {
+            let mut items = Vec::new();
+            match value {
+                Value::Array(mut arr) => items.append(&mut arr),
+                other => items.push(other),
             }
+            result.insert(field_name.to_string(), Value::Array(items));
         }
     } else {
         result.insert(field_name.to_string(), value);
@@ -1292,13 +1354,9 @@ fn get_instance_type(schema: &Value) -> Option<&str> {
 fn parse_value(s: &str, expected_type: Option<&str>) -> Value {
     match expected_type {
         Some("integer") => s
-            .parse::<i64>()
-            .map(Value::from)
-            .unwrap_or_else(|_| Value::String(s.to_string())),
+            .parse::<i64>().map_or_else(|_| Value::String(s.to_string()), Value::from),
         Some("number") => s
-            .parse::<f64>()
-            .map(Value::from)
-            .unwrap_or_else(|_| Value::String(s.to_string())),
+            .parse::<f64>().map_or_else(|_| Value::String(s.to_string()), Value::from),
         Some("boolean") => match s.to_lowercase().as_str() {
             "true" | "1" | "yes" => Value::Bool(true),
             "false" | "0" | "no" => Value::Bool(false),
@@ -1368,8 +1426,7 @@ pub fn schema_to_help(schema: &Value) -> String {
             .filter(|n| {
                 props
                     .get(**n)
-                    .map(|s| get_instance_type(s) != Some("array"))
-                    .unwrap_or(true)
+                    .is_none_or(|s| get_instance_type(s) != Some("array"))
             })
             .map(|n| format!("<{}>", n.replace('_', "-")))
             .collect();
@@ -1379,8 +1436,7 @@ pub fn schema_to_help(schema: &Value) -> String {
             .filter(|n| {
                 props
                     .get(**n)
-                    .map(|s| get_instance_type(s) == Some("array"))
-                    .unwrap_or(false)
+                    .is_some_and(|s| get_instance_type(s) == Some("array"))
             })
             .map(|n| format!("--{} <value>...", n.replace('_', "-")))
             .collect();
@@ -1843,7 +1899,7 @@ mod tests {
 
     #[test]
     fn test_ask_user_e2e_repeated_option() {
-        use aither_core::llm::{Tool, ToolOutput, tool::ToolDefinition};
+        use aither_core::llm::{Tool, ToolOutput};
         use std::borrow::Cow;
 
         #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -1903,7 +1959,7 @@ mod tests {
         .unwrap();
 
         let result = futures_lite::future::block_on(cmd.handle());
-        eprintln!("result: {}", serde_json::to_string_pretty(&result).unwrap());
+        tracing::debug!("result: {}", serde_json::to_string_pretty(&result).unwrap());
 
         let parsed: serde_json::Value = serde_json::from_value(result).unwrap();
         let options = parsed["option"].as_array().expect("option should be array");

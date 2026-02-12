@@ -8,7 +8,7 @@
 //! - **No auto-download**: You provide the model and tokenizer paths
 //! - **Auto-detect dimension**: Embedding dimension is detected from model outputs
 //! - **Multiple pooling strategies**: `LastToken`, `Mean`, `Cls`
-//! - **GPU acceleration**: CUDA and CoreML enabled by default
+//! - **GPU acceleration**: CUDA and `CoreML` enabled by default
 //!
 //! # Example
 //!
@@ -114,19 +114,19 @@ impl OrtEmbedding {
 
     /// Returns the embedding dimension.
     #[must_use]
-    pub fn dimension(&self) -> usize {
+    pub const fn dimension(&self) -> usize {
         self.dimension
     }
 
     /// Returns the pooling strategy.
     #[must_use]
-    pub fn pooling(&self) -> PoolingStrategy {
+    pub const fn pooling(&self) -> PoolingStrategy {
         self.pooling
     }
 
     /// Returns whether L2 normalization is enabled.
     #[must_use]
-    pub fn normalize(&self) -> bool {
+    pub const fn normalize(&self) -> bool {
         self.normalize
     }
 }
@@ -174,7 +174,7 @@ impl EmbeddingModel for OrtEmbedding {
                 .get("last_hidden_state")
                 .or_else(|| outputs.get("hidden_states"))
                 .or_else(|| outputs.get("output"))
-                .ok_or_else(|| OrtError::InvalidOutputShape(0))?;
+                .ok_or(OrtError::InvalidOutputShape(0))?;
 
             let view = hidden_states
                 .try_extract_array::<f32>()
@@ -192,10 +192,10 @@ impl EmbeddingModel for OrtEmbedding {
 
         let view_3d = hidden_states_owned
             .into_dimensionality::<Ix3>()
-            .map_err(|e: ndarray::ShapeError| OrtError::Shape(e.to_string()))?;
+            .map_err(|e| OrtError::Shape(e.to_string()))?;
 
         // Apply pooling
-        let attention_mask_u32: Vec<u32> = encoding.get_attention_mask().iter().copied().collect();
+        let attention_mask_u32: Vec<u32> = encoding.get_attention_mask().to_vec();
         let mut embedding = self.pooling.apply(&view_3d.view(), &attention_mask_u32);
 
         // Normalize if enabled
@@ -235,7 +235,7 @@ impl OrtEmbeddingBuilder {
     ///
     /// Default: [`PoolingStrategy::LastToken`] (for Qwen3-style models)
     #[must_use]
-    pub fn pooling(mut self, strategy: PoolingStrategy) -> Self {
+    pub const fn pooling(mut self, strategy: PoolingStrategy) -> Self {
         self.pooling = strategy;
         self
     }
@@ -244,7 +244,7 @@ impl OrtEmbeddingBuilder {
     ///
     /// Default: `true`
     #[must_use]
-    pub fn normalize(mut self, enabled: bool) -> Self {
+    pub const fn normalize(mut self, enabled: bool) -> Self {
         self.normalize = enabled;
         self
     }
@@ -369,9 +369,9 @@ fn find_tokenizer_file(dir: &Path) -> Result<PathBuf, OrtError> {
 /// Detect the embedding dimension from model output metadata.
 fn detect_embedding_dimension(session: &Session) -> Result<usize, OrtError> {
     // Look for the output that contains hidden states
-    for output in session.outputs.iter() {
+    for output in session.outputs() {
         // Get tensor type info if available
-        if let ort::value::ValueType::Tensor { shape, .. } = &output.output_type {
+        if let ort::value::ValueType::Tensor { shape, .. } = output.dtype() {
             // Expect shape [batch, seq_len, hidden_dim] or [batch, hidden_dim]
             if shape.len() >= 2 {
                 // Last dimension is typically the hidden dimension
@@ -393,7 +393,7 @@ fn detect_embedding_dimension(session: &Session) -> Result<usize, OrtError> {
 /// Get number of CPU cores for parallelism.
 fn num_cpus() -> usize {
     std::thread::available_parallelism()
-        .map(|p| p.get())
+        .map(std::num::NonZero::get)
         .unwrap_or(4)
 }
 

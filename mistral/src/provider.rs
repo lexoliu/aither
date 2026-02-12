@@ -13,6 +13,7 @@ pub struct MistralProvider {
 
 impl MistralProvider {
     /// Create a new provider with no preconfigured model IDs.
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             inner: Arc::new(ProviderConfig::default()),

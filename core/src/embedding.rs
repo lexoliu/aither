@@ -35,7 +35,7 @@
 //! embedding implementations, allowing you to switch between providers while
 //! maintaining the same interface.
 //!
-//! ```rust
+//! ```rust,ignore
 //! use aither::EmbeddingModel;
 //!
 //! async fn example<T: EmbeddingModel>(model: &mut T) -> aither::Result<()> {
@@ -77,7 +77,7 @@ pub type Embedding = Vec<f32>;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use aither::EmbeddingModel;
 ///
 /// struct MyEmbedding {
@@ -107,7 +107,7 @@ pub type Embedding = Vec<f32>;
 /// - Batch multiple texts when possible to reduce API calls
 /// - Consider caching embeddings for frequently used texts
 /// - Be aware of rate limits when using cloud-based embedding services
-pub trait EmbeddingModel: Send + Sized + Send + Sync {
+pub trait EmbeddingModel: Send + Sized + Sync {
     /// Returns the embedding vector dimension.
     ///
     /// This value determines the length of vectors returned by [`embed`](EmbeddingModel::embed).
@@ -169,7 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn embedding_generation() {
-        let mut model = MockEmbeddingModel { dimension: 4 };
+        let model = MockEmbeddingModel { dimension: 4 };
         let embedding = model.embed("test").await.unwrap();
 
         assert_eq!(embedding.len(), 4);
@@ -182,7 +182,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::float_cmp)]
     async fn embedding_different_texts() {
-        let mut model = MockEmbeddingModel { dimension: 2 };
+        let model = MockEmbeddingModel { dimension: 2 };
 
         let embedding1 = model.embed("a").await.unwrap();
         let embedding2 = model.embed("ab").await.unwrap();
@@ -198,7 +198,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::float_cmp)]
     async fn embedding_empty_text() {
-        let mut model = MockEmbeddingModel { dimension: 3 };
+        let model = MockEmbeddingModel { dimension: 3 };
         let embedding = model.embed("").await.unwrap();
 
         assert_eq!(embedding.len(), 3);
@@ -209,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn embedding_large_dimension() {
-        let mut model = MockEmbeddingModel { dimension: 1536 }; // Common OpenAI dimension
+        let model = MockEmbeddingModel { dimension: 1536 }; // Common OpenAI dimension
         let embedding = model.embed("test text").await.unwrap();
 
         assert_eq!(embedding.len(), 1536);

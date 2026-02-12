@@ -1,4 +1,4 @@
-//! Unified cloud provider wrapping OpenAI, Claude, Gemini, and GitHub Copilot.
+//! Unified cloud provider wrapping `OpenAI`, Claude, Gemini, and GitHub Copilot.
 //!
 //! This crate provides a single `CloudProvider` enum that implements `LanguageModel`,
 //! allowing seamless switching between providers.
@@ -21,10 +21,10 @@ use aither_core::{
 use futures_core::Stream;
 use futures_lite::StreamExt;
 
-/// Unified cloud provider wrapping OpenAI, Claude, Gemini, and GitHub Copilot.
+/// Unified cloud provider wrapping `OpenAI`, Claude, Gemini, and GitHub Copilot.
 #[derive(Clone)]
 pub enum CloudProvider {
-    /// OpenAI GPT models.
+    /// `OpenAI` GPT models.
     OpenAI(OpenAI),
     /// Anthropic Claude models.
     Claude(Claude),
@@ -72,7 +72,7 @@ impl std::fmt::Debug for CloudProvider {
 /// Error type for cloud provider operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CloudError {
-    /// OpenAI API error.
+    /// `OpenAI` API error.
     #[error("OpenAI error: {0}")]
     OpenAI(#[from] aither_openai::OpenAIError),
     /// Claude API error.
@@ -150,12 +150,12 @@ enum ProviderInner {
     Copilot(Copilot),
 }
 
-/// Unified model provider wrapping OpenAI, Claude, Gemini, and Copilot providers.
+/// Unified model provider wrapping `OpenAI`, Claude, Gemini, and Copilot providers.
 ///
 /// Implements `LanguageModelProvider` to allow unified model listing and instantiation.
 #[derive(Clone, Debug)]
 pub enum CloudModelProvider {
-    /// OpenAI provider.
+    /// `OpenAI` provider.
     OpenAI(OpenAIProvider),
     /// Anthropic Claude provider.
     Claude(ClaudeProvider),
@@ -199,10 +199,10 @@ impl LanguageModelProvider for CloudModelProvider {
         let provider = self.clone();
         async move {
             match provider {
-                CloudModelProvider::OpenAI(p) => p.list_models().await.map_err(CloudError::from),
-                CloudModelProvider::Claude(p) => p.list_models().await.map_err(CloudError::from),
-                CloudModelProvider::Gemini(p) => p.list_models().await.map_err(CloudError::from),
-                CloudModelProvider::Copilot(p) => p.list_models().await.map_err(CloudError::from),
+                Self::OpenAI(p) => p.list_models().await.map_err(CloudError::from),
+                Self::Claude(p) => p.list_models().await.map_err(CloudError::from),
+                Self::Gemini(p) => p.list_models().await.map_err(CloudError::from),
+                Self::Copilot(p) => p.list_models().await.map_err(CloudError::from),
             }
         }
     }
@@ -215,22 +215,22 @@ impl LanguageModelProvider for CloudModelProvider {
         let name = name.to_string();
         async move {
             match provider {
-                CloudModelProvider::OpenAI(p) => p
+                Self::OpenAI(p) => p
                     .get_model(&name)
                     .await
                     .map(CloudProvider::from)
                     .map_err(CloudError::from),
-                CloudModelProvider::Claude(p) => p
+                Self::Claude(p) => p
                     .get_model(&name)
                     .await
                     .map(CloudProvider::from)
                     .map_err(CloudError::from),
-                CloudModelProvider::Gemini(p) => p
+                Self::Gemini(p) => p
                     .get_model(&name)
                     .await
                     .map(CloudProvider::from)
                     .map_err(CloudError::from),
-                CloudModelProvider::Copilot(p) => p
+                Self::Copilot(p) => p
                     .get_model(&name)
                     .await
                     .map(CloudProvider::from)

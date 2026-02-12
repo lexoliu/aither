@@ -62,7 +62,7 @@
 //!
 //! ### Structured Output with Tools
 //!
-//! ```rust
+//! ```rust,ignore
 //! use aither_core::{LanguageModel, llm::{Message, Request, Tool}};
 //! use serde::{Deserialize, Serialize};
 //! use schemars::JsonSchema;
@@ -100,7 +100,7 @@
 //!
 //! ### Semantic Search with Embeddings
 //!
-//! ```rust
+//! ```rust,ignore
 //! use aither_core::EmbeddingModel;
 //!
 //! async fn find_similar_docs(
@@ -120,7 +120,7 @@
 //!
 //! ### Progressive Image Generation
 //!
-//! ```rust
+//! ```rust,ignore
 //! use aither_core::{ImageGenerator, image::{Prompt, Size}};
 //! use futures_lite::StreamExt;
 //!

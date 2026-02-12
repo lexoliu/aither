@@ -23,6 +23,7 @@ pub struct AcpSession {
 
 impl AcpSession {
     /// Create a new session.
+    #[must_use] 
     pub fn new(cwd: PathBuf, mcp_servers: Vec<McpServerSpec>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -40,7 +41,7 @@ impl AcpSession {
 
     /// Get the working directory.
     #[must_use]
-    pub fn cwd(&self) -> &PathBuf {
+    pub const fn cwd(&self) -> &PathBuf {
         &self.cwd
     }
 

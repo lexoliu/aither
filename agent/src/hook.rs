@@ -144,7 +144,7 @@ pub trait Hook: Send + Sync {
     }
 }
 
-/// No-op implementation for unit type (base case for HCons).
+/// No-op implementation for unit type (base case for `HCons`).
 impl Hook for () {}
 
 /// Heterogeneous list cons cell for composing hooks at compile time.

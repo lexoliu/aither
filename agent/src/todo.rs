@@ -1,7 +1,7 @@
 //! Built-in todo list system for tracking long tasks.
 //!
 //! Provides a tool for agents to manage tasks during complex operations.
-//! Designed to work like Claude Code's TodoWrite for tracking multi-step work.
+//! Designed to work like Claude Code's `TodoWrite` for tracking multi-step work.
 
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
@@ -159,13 +159,16 @@ impl TodoList {
     }
 }
 
-/// Manage a structured task list for tracking progress on complex work.
+/// Manage an in-memory structured task list for tracking progress on complex work.
+///
+/// This tool only updates runtime task state shown in UI/context.
+/// It does NOT create or edit TODO.md files on disk.
 ///
 /// Use proactively when tasks require 3+ steps, involve multiple files,
 /// or need careful organization. Updates replace the entire list.
 ///
-/// Task states: pending, in_progress, completed.
-/// Keep exactly one task in_progress at a time.
+/// Task states: pending, `in_progress`, completed.
+/// Keep exactly one task `in_progress` at a time.
 /// Mark tasks complete immediately when done.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TodoWriteArgs {
@@ -193,13 +196,13 @@ impl TodoTool {
 
     /// Creates a todo tool sharing the given list.
     #[must_use]
-    pub fn with_list(list: TodoList) -> Self {
+    pub const fn with_list(list: TodoList) -> Self {
         Self { list }
     }
 
     /// Returns a reference to the underlying todo list.
     #[must_use]
-    pub fn list(&self) -> &TodoList {
+    pub const fn list(&self) -> &TodoList {
         &self.list
     }
 }

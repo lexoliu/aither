@@ -62,7 +62,7 @@ impl ContextBlock {
 
     /// Sets block priority.
     #[must_use]
-    pub fn with_priority(mut self, priority: ContextBlockPriority) -> Self {
+    pub const fn with_priority(mut self, priority: ContextBlockPriority) -> Self {
         self.priority = priority;
         self
     }
@@ -77,26 +77,6 @@ pub struct ContextAssemblerConfig {
     pub handoff_threshold: f32,
     /// Instruction injected near context exhaustion.
     pub handoff_instruction: String,
-}
-
-/// Optional one-line hint for a builtin command exposed through bash.
-#[derive(Debug, Clone)]
-pub struct BuiltinToolHint {
-    /// Command name, e.g. `ask` or `task`.
-    pub name: String,
-    /// One-line hint (model can still call `<command> --help` for details).
-    pub hint: String,
-}
-
-impl BuiltinToolHint {
-    /// Creates a one-line hint for an available command.
-    #[must_use]
-    pub fn new(name: impl Into<String>, hint: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            hint: hint.into(),
-        }
-    }
 }
 
 impl Default for ContextAssemblerConfig {
@@ -135,9 +115,6 @@ pub struct AgentConfig {
 
     /// Context assembly behavior.
     pub context_assembler: ContextAssemblerConfig,
-
-    /// Optional builtin command hints (only for commands that are actually enabled).
-    pub builtin_tool_hints: Vec<BuiltinToolHint>,
 }
 
 impl Default for AgentConfig {
@@ -153,7 +130,6 @@ impl Default for AgentConfig {
             transcript_path: None,
             context_blocks: Vec::new(),
             context_assembler: ContextAssemblerConfig::default(),
-            builtin_tool_hints: Vec::new(),
         }
     }
 }
@@ -174,7 +150,7 @@ impl AgentConfig {
 
     /// Sets the context strategy.
     #[must_use]
-    pub fn with_context(mut self, strategy: ContextStrategy) -> Self {
+    pub const fn with_context(mut self, strategy: ContextStrategy) -> Self {
         self.context = strategy;
         self
     }
@@ -211,13 +187,6 @@ impl AgentConfig {
     #[must_use]
     pub fn with_context_block(mut self, block: ContextBlock) -> Self {
         self.context_blocks.push(block);
-        self
-    }
-
-    /// Adds a one-line builtin command hint.
-    #[must_use]
-    pub fn with_builtin_tool_hint(mut self, hint: BuiltinToolHint) -> Self {
-        self.builtin_tool_hints.push(hint);
         self
     }
 }

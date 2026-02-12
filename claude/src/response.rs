@@ -187,7 +187,7 @@ impl StreamState {
     }
 
     /// Check if the response requested tool use.
-    pub fn has_tool_calls(&self) -> bool {
+    pub const fn has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
     }
 }
@@ -197,7 +197,7 @@ impl StreamState {
 /// Updates the stream state and returns events to emit.
 pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEvent>, ClaudeError> {
     let event_name = event.event();
-    let event_type = event_name.as_deref().unwrap_or("");
+    let event_type = event_name.unwrap_or("");
     let data = event.text_data();
 
     let mut events = Vec::new();
@@ -326,5 +326,5 @@ fn ensure_block_capacity(state: &mut StreamState, index: usize) {
 /// Check if an SSE event should be skipped.
 pub fn should_skip_event(event: &Event) -> bool {
     let data = event.text_data();
-    data.is_empty() || event.event().as_deref() == Some("ping")
+    data.is_empty() || event.event() == Some("ping")
 }

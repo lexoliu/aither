@@ -16,7 +16,7 @@ use aither_core::llm::{Tool, ToolOutput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::job_registry::{JobRegistry, JobStatus, job_registry_channel};
+use crate::job_registry::{JobRegistry, JobStatus};
 
 /// List background tasks.
 ///
@@ -28,7 +28,8 @@ pub struct TasksTool {
 
 impl TasksTool {
     /// Creates a new tasks tool with the given registry.
-    pub fn new(registry: JobRegistry) -> Self {
+    #[must_use] 
+    pub const fn new(registry: JobRegistry) -> Self {
         Self { registry }
     }
 }
@@ -59,8 +60,8 @@ impl Tool for TasksTool {
         for job in &jobs {
             let status_str = match &job.status {
                 JobStatus::Running => "running".to_string(),
-                JobStatus::Completed { exit_code } => format!("exit {}", exit_code),
-                JobStatus::Failed { error } => format!("failed: {}", error),
+                JobStatus::Completed { exit_code } => format!("exit {exit_code}"),
+                JobStatus::Failed { error } => format!("failed: {error}"),
                 JobStatus::Killed => "killed".to_string(),
             };
 
@@ -72,9 +73,7 @@ impl Tool for TasksTool {
 
             let output_str = job
                 .output_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(no output)".to_string());
+                .as_ref().map_or_else(|| "(no output)".to_string(), |p| p.display().to_string());
 
             output.push_str(&format!(
                 "PID {} [{}]\n  shell_id: {}\n  script: {}\n  output: {}\n\n",
@@ -89,6 +88,7 @@ impl Tool for TasksTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job_registry::job_registry_channel;
     use crate::permission::BashMode;
     use aither_core::llm::Tool;
     use executor_core::Executor;

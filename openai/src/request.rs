@@ -111,7 +111,7 @@ impl ChatCompletionRequest {
         tools: Option<Vec<ToolPayload>>,
         stream: bool,
     ) -> Self {
-        let has_tools = tools.as_ref().map_or(false, |t| !t.is_empty());
+        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
         Self {
             model,
             messages,
@@ -204,7 +204,7 @@ enum ToolChoicePayload {
 }
 
 #[derive(Debug, Serialize, Clone)]
-pub(crate) struct ToolChoiceFunction {
+pub struct ToolChoiceFunction {
     name: String,
 }
 
@@ -244,7 +244,9 @@ pub fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
             let tool_call_id = message.tool_call_id().map(String::from);
 
             // Handle tool_calls for Assistant messages
-            let tool_calls = if !message.tool_calls().is_empty() {
+            let tool_calls = if message.tool_calls().is_empty() {
+                None
+            } else {
                 Some(
                     message
                         .tool_calls()
@@ -259,8 +261,6 @@ pub fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
                         })
                         .collect(),
                 )
-            } else {
-                None
             };
 
             // Build content - use multimodal format if there are attachments
@@ -315,12 +315,12 @@ fn flatten_content(message: &Message) -> String {
     message.content().to_owned()
 }
 
-/// Convert a URL to a data URL suitable for OpenAI vision.
+/// Convert a URL to a data URL suitable for `OpenAI` vision.
 ///
 /// Handles:
 /// - `data:...` URLs - passed through as-is
 /// - `file:///path` URLs - reads file and converts to base64 data URL
-/// - HTTP/HTTPS URLs - passed through as-is (OpenAI can fetch them)
+/// - HTTP/HTTPS URLs - passed through as-is (`OpenAI` can fetch them)
 fn url_to_data_url(url: &url::Url) -> Option<String> {
     match url.scheme() {
         "data" => Some(url.as_str().to_string()),
@@ -342,7 +342,7 @@ fn read_file_to_data_url(url: &url::Url) -> Option<String> {
     let mime_type = mime_from_path(&path)?;
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
 
-    Some(format!("data:{};base64,{}", mime_type, base64_data))
+    Some(format!("data:{mime_type};base64,{base64_data}"))
 }
 
 /// Get MIME type from file path extension.
@@ -445,7 +445,7 @@ pub struct ChatToolFunctionPayload {
 
 #[allow(dead_code)]
 impl ChatMessagePayload {
-    pub(crate) fn tool_output(call_id: String, output: String) -> Self {
+    pub(crate) const fn tool_output(call_id: String, output: String) -> Self {
         Self {
             role: "tool",
             content: ContentPayload::Text(output),
@@ -454,7 +454,7 @@ impl ChatMessagePayload {
         }
     }
 
-    pub(crate) fn assistant_tool_calls(
+    pub(crate) const fn assistant_tool_calls(
         content: String,
         tool_calls: Vec<ChatToolCallPayload>,
     ) -> Self {
@@ -520,14 +520,14 @@ struct InputImageSource {
 }
 
 impl InputImageSource {
-    fn from_url(url: String) -> Self {
+    const fn from_url(url: String) -> Self {
         Self {
             image_url: Some(url),
             file_id: None,
         }
     }
 
-    fn from_file_id(file_id: String) -> Self {
+    const fn from_file_id(file_id: String) -> Self {
         Self {
             image_url: None,
             file_id: Some(file_id),
@@ -651,7 +651,7 @@ pub enum ResponsesTool {
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
-pub(crate) enum ResponsesToolChoice {
+pub enum ResponsesToolChoice {
     Mode(&'static str),
     Function {
         #[serde(rename = "type")]
@@ -777,7 +777,7 @@ pub fn convert_responses_tools(definitions: Vec<ToolDefinition>) -> Vec<Response
         .collect()
 }
 
-pub(crate) fn responses_tool_choice(
+pub const fn responses_tool_choice(
     params: &ParameterSnapshot,
     has_tools: bool,
 ) -> Option<ResponsesToolChoice> {

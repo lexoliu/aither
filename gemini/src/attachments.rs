@@ -8,7 +8,7 @@ use crate::config::GeminiConfig;
 use crate::error::GeminiError;
 use crate::files::upload_file;
 
-pub(crate) async fn resolve_messages(
+pub async fn resolve_messages(
     cfg: &GeminiConfig,
     messages: Vec<Message>,
 ) -> Result<Vec<Message>, GeminiError> {
@@ -64,7 +64,7 @@ async fn resolve_attachment(
 ) -> Result<ResolvedUrl, GeminiError> {
     match attachment.scheme() {
         "file" => {
-            let path = attachment.to_file_path().map_err(|_| {
+            let path = attachment.to_file_path().map_err(|()| {
                 GeminiError::Api("Attachment file URL could not be converted to path".to_string())
             })?;
             resolve_file_attachment(cfg, cache, &path).await
@@ -135,6 +135,5 @@ async fn resolve_file_attachment(
 
 fn is_gemini_file_uri(url: &Url) -> bool {
     url.host_str()
-        .map(|h| h == "generativelanguage.googleapis.com")
-        .unwrap_or(false)
+        .is_some_and(|h| h == "generativelanguage.googleapis.com")
 }

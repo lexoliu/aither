@@ -1,6 +1,6 @@
 //! Interactive CLI for testing aither agents.
 //!
-//! A REPL-style interface for testing agents with OpenAI, Claude, or Gemini.
+//! A REPL-style interface for testing agents with `OpenAI`, Claude, or Gemini.
 //!
 //! # Bash-First Design
 //!
@@ -154,7 +154,7 @@ impl PermissionHandler for InteractivePermissionHandler {
         }
 
         // Check default whitelist
-        if DEFAULT_DOMAIN_WHITELIST.iter().any(|d| *d == domain) {
+        if DEFAULT_DOMAIN_WHITELIST.contains(&domain) {
             return true;
         }
 
@@ -204,11 +204,11 @@ fn read_yes_no() -> Result<bool> {
         if event::poll(Duration::from_secs(30))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    KeyCode::Char('y' | 'Y') => {
                         eprint!("y");
                         return Ok(true);
                     }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter | KeyCode::Esc => {
+                    KeyCode::Char('n' | 'N') | KeyCode::Enter | KeyCode::Esc => {
                         eprint!("n");
                         return Ok(false);
                     }
@@ -299,7 +299,7 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
                             .collect::<Vec<_>>()
                             .join("\n")
                     }
-                    Err(e) => format!("{{\"error\": \"{}\"}}", e),
+                    Err(e) => format!("{{\"error\": \"{e}\"}}"),
                 }
             })
         });
@@ -391,6 +391,7 @@ async fn main() -> Result<()> {
             CloudProvider::OpenAI(_) => "OpenAI",
             CloudProvider::Claude(_) => "Claude",
             CloudProvider::Gemini(_) => "Gemini",
+            CloudProvider::Copilot(_) => "Copilot",
         };
         (cloud, model, provider_name.to_string())
     };

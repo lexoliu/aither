@@ -1,9 +1,9 @@
-//! OpenAI Files API client for file uploads.
+//! `OpenAI` Files API client for file uploads.
 //!
-//! This module provides a client for the OpenAI Files API, which allows uploading
+//! This module provides a client for the `OpenAI` Files API, which allows uploading
 //! files for use in various endpoints (vision, assistants, fine-tuning).
 //!
-//! See: https://platform.openai.com/docs/api-reference/files
+//! See: <https://platform.openai.com/docs/api-reference/files>
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,7 +30,7 @@ pub enum FilePurpose {
 }
 
 impl FilePurpose {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Vision => "vision",
             Self::Assistants => "assistants",
@@ -40,7 +40,7 @@ impl FilePurpose {
     }
 }
 
-/// Status of a file in the OpenAI system.
+/// Status of a file in the `OpenAI` system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileStatus {
@@ -57,7 +57,7 @@ pub enum FileStatus {
     Unknown,
 }
 
-/// A file object from the OpenAI Files API.
+/// A file object from the `OpenAI` Files API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIFile {
     /// File ID (e.g., "file-abc123").
@@ -89,7 +89,7 @@ impl OpenAIFile {
 
     /// Check if the file is ready for use.
     #[must_use]
-    pub fn is_ready(&self) -> bool {
+    pub const fn is_ready(&self) -> bool {
         matches!(self.status, Some(FileStatus::Processed) | None)
     }
 }
@@ -114,7 +114,7 @@ pub struct ListFilesResponse {
     pub data: Vec<OpenAIFile>,
 }
 
-/// Configuration for OpenAI Files API.
+/// Configuration for `OpenAI` Files API.
 #[derive(Debug, Clone)]
 pub struct FilesConfig {
     /// API key for authentication.
@@ -155,7 +155,7 @@ impl FilesConfig {
     }
 }
 
-/// Upload a file to OpenAI.
+/// Upload a file to `OpenAI`.
 ///
 /// # Arguments
 /// * `cfg` - Files configuration
@@ -235,7 +235,7 @@ pub async fn upload_file(
     builder.json().await.map_err(OpenAIError::from_http)
 }
 
-/// Delete a file from OpenAI.
+/// Delete a file from `OpenAI`.
 ///
 /// # Arguments
 /// * `cfg` - Files configuration

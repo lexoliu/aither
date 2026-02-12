@@ -23,7 +23,7 @@ use crate::fs_util::path_exists;
 use crate::subagent_file::SubagentDefinition;
 
 /// Builder function type for configuring a subagent.
-/// Returns an AgentBuilder so we can add hooks before building.
+/// Returns an `AgentBuilder` so we can add hooks before building.
 /// The builder returns a single-model agent (all tiers use the same LLM).
 pub type SubagentBuilder<LLM> = Arc<dyn Fn(LLM) -> AgentBuilder<LLM, LLM, LLM, ()> + Send + Sync>;
 
@@ -135,7 +135,7 @@ impl<LLM> std::fmt::Debug for TaskTool<LLM> {
 }
 
 impl<LLM: Clone> TaskTool<LLM> {
-    /// Creates a new TaskTool with the given LLM.
+    /// Creates a new `TaskTool` with the given LLM.
     pub fn new(llm: LLM) -> Self {
         Self {
             llm,
@@ -199,7 +199,7 @@ impl<LLM: LanguageModel + Clone> TaskTool<LLM> {
                 .system_prompt(&def.system_prompt)
                 .max_iterations(def.max_iterations)
         });
-        self.with_type(def.id.clone(), subagent)
+        self.with_type(def.id, subagent)
     }
 
     /// Register all builtin subagents.
@@ -281,7 +281,7 @@ where
             // Use registered subagent type
             let type_name = &args.subagent;
             let subagent_type = self.types.get(type_name).ok_or_else(|| {
-                let available: Vec<&str> = self.types.keys().map(|s| s.as_str()).collect();
+                let available: Vec<&str> = self.types.keys().map(std::string::String::as_str).collect();
                 anyhow::anyhow!(
                     "Unknown subagent type '{}'. Available: {}",
                     type_name,
@@ -310,13 +310,12 @@ where
         let result = agent
             .query(&args.prompt)
             .await
-            .map_err(|e| anyhow::anyhow!("Subagent '{}' error: {e}", subagent_id))?;
+            .map_err(|e| anyhow::anyhow!("Subagent '{subagent_id}' error: {e}"))?;
 
         tracing::info!(subagent = %subagent_id, "Subagent completed");
 
         Ok(ToolOutput::text(format!(
-            "[Subagent '{}' completed]\n\n{}",
-            subagent_id, result
+            "[Subagent '{subagent_id}' completed]\n\n{result}"
         )))
     }
 }

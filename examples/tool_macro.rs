@@ -14,7 +14,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // Basic tool example - no parameters needed
-#[tool(description = "Get current time in UTC")]
+#[tool]
 pub async fn time() -> Result<&'static str> {
     Ok("2023-10-01T12:00:00Z")
 }
@@ -27,7 +27,7 @@ pub struct SearchResult {
 }
 
 // Tool with multiple simple parameters
-#[tool(description = "Search on the web")]
+#[tool]
 pub async fn search(keywords: Vec<String>, max_results: u32) -> Result<Vec<SearchResult>> {
     // Simulate a search result
     let results = keywords
@@ -51,7 +51,7 @@ pub struct GenerateImageArgs {
 }
 
 // Tool with complex documented arguments using a single struct parameter
-#[tool(description = "Generate an image from a text prompt")]
+#[tool]
 pub async fn generate_image(args: GenerateImageArgs) -> aither::Result<String> {
     let file_name = format!("image_{}.png", args.prompt.replace(' ', "_"));
     // Simulate image generation

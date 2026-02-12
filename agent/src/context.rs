@@ -60,7 +60,7 @@ impl ConversationMemory {
 
     /// Returns the total number of messages (summaries + recent).
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.summaries.len() + self.recent.len()
     }
 
@@ -151,13 +151,13 @@ pub struct MemoryCheckpoint {
 impl MemoryCheckpoint {
     /// Returns the total number of messages in this checkpoint.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.summaries.len() + self.recent.len()
     }
 
     /// Returns `true` if this checkpoint is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.summaries.is_empty() && self.recent.is_empty()
     }
 }

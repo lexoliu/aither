@@ -113,16 +113,13 @@ impl<T: BidirectionalTransport> McpServer<T> {
         debug!("MCP server starting: {}", self.info.name);
 
         loop {
-            match self.transport.recv().await? {
-                Some(msg) => {
-                    if let Err(e) = self.handle_message(msg).await {
-                        debug!("Error handling message: {e}");
-                    }
+            if let Some(msg) = self.transport.recv().await? {
+                if let Err(e) = self.handle_message(msg).await {
+                    debug!("Error handling message: {e}");
                 }
-                None => {
-                    debug!("Connection closed");
-                    break;
-                }
+            } else {
+                debug!("Connection closed");
+                break;
             }
         }
 

@@ -145,7 +145,10 @@ mod tests {
         Skill {
             name: name.to_string(),
             description: format!("{name} description"),
-            triggers: triggers.iter().map(|s| s.to_string()).collect(),
+            triggers: triggers
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             instructions: format!("Instructions for {name}"),
             allowed_tools: None,
             resources: HashMap::new(),

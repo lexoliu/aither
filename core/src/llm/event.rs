@@ -149,7 +149,7 @@ pub enum Event {
     /// Internal reasoning or thinking from reasoning models.
     ///
     /// Not all models emit reasoning. For models like Claude with extended thinking
-    /// or OpenAI's o1, this contains the model's internal thought process.
+    /// or `OpenAI`'s o1, this contains the model's internal thought process.
     /// This is for observability only - it's not part of the conversation.
     Reasoning(String),
 
@@ -167,7 +167,7 @@ pub enum Event {
     ///
     /// Some providers have native tools that are executed server-side:
     /// - Gemini: Google Search grounding
-    /// - OpenAI: Code interpreter, file search
+    /// - `OpenAI`: Code interpreter, file search
     /// - Claude: (future built-in tools)
     ///
     /// These are already executed - this event contains the result.
@@ -241,7 +241,7 @@ impl Event {
         }
     }
 
-    /// Returns the tool call if this is a ToolCall event.
+    /// Returns the tool call if this is a `ToolCall` event.
     #[must_use]
     pub const fn as_tool_call(&self) -> Option<&ToolCall> {
         match self {
@@ -286,7 +286,7 @@ impl Event {
 /// 2. Parsing and validating arguments
 /// 3. Executing the tool
 /// 4. Returning results to the model
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ToolCall {
     /// Unique identifier for this tool call.

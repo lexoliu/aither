@@ -43,7 +43,7 @@ pub struct AskCommand<LLM> {
 
 impl<LLM> AskCommand<LLM> {
     /// Creates a new ask command with the given LLM.
-    pub fn new(llm: LLM) -> Self {
+    pub const fn new(llm: LLM) -> Self {
         Self { llm }
     }
 }

@@ -131,6 +131,7 @@ impl BackgroundTaskReceiver {
     /// Takes all completed background tasks without blocking.
     ///
     /// Returns an empty vector if no tasks have completed.
+    #[must_use] 
     pub fn take_completed(&self) -> Vec<CompletedTask> {
         let mut completed = Vec::new();
         while let Ok(task) = self.rx.try_recv() {
@@ -140,14 +141,16 @@ impl BackgroundTaskReceiver {
     }
 
     /// Checks if there are any completed tasks waiting.
+    #[must_use] 
     pub fn has_completed(&self) -> bool {
         !self.rx.is_empty()
     }
 
     /// Checks if there are any background tasks still running.
     ///
-    /// This works by checking the sender count - BashTool holds one sender,
+    /// This works by checking the sender count - `BashTool` holds one sender,
     /// and each running background task holds a cloned sender.
+    #[must_use] 
     pub fn has_running(&self) -> bool {
         self.rx.sender_count() > 1
     }
@@ -261,9 +264,9 @@ pub struct Configured {
 pub struct BashTool<P, E, State = Unconfigured> {
     /// Shared working directory (four random words, e.g., `amber-forest-thunder-pearl/`)
     working_dir: PathBuf,
-    /// Shell session registry for open_shell/bash/close_shell lifecycle.
+    /// Shell session registry for `open_shell/bash/close_shell` lifecycle.
     shell_sessions: ShellSessionRegistry,
-    /// Auto-open a default session when shell_id is missing or stale.
+    /// Auto-open a default session when `shell_id` is missing or stale.
     auto_open_default_session: bool,
     /// Permission handler wrapped in Arc for sharing between parent and child tools.
     permission_handler: Arc<P>,
@@ -303,14 +306,14 @@ impl<P, E: Clone, State: Clone> Clone for BashTool<P, E, State> {
 }
 
 impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
-    /// Injects the shared shell-session registry used by open_shell/bash/close_shell.
+    /// Injects the shared shell-session registry used by `open_shell/bash/close_shell`.
     #[must_use]
     pub fn with_shell_sessions(mut self, sessions: ShellSessionRegistry) -> Self {
         self.shell_sessions = sessions;
         self
     }
 
-    /// Sets dynamic shell runtime availability for open_shell.
+    /// Sets dynamic shell runtime availability for `open_shell`.
     #[must_use]
     pub fn with_shell_runtime_availability(
         self,
@@ -320,9 +323,9 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
         self
     }
 
-    /// Controls whether `bash` auto-opens a default session on missing/stale shell_id.
+    /// Controls whether `bash` auto-opens a default session on missing/stale `shell_id`.
     #[must_use]
-    pub fn with_auto_open_default_session(mut self, enabled: bool) -> Self {
+    pub const fn with_auto_open_default_session(mut self, enabled: bool) -> Self {
         self.auto_open_default_session = enabled;
         self
     }
@@ -478,7 +481,7 @@ where
         self
     }
 
-    /// Creates a child BashTool that shares the same sandbox and permission handler
+    /// Creates a child `BashTool` that shares the same sandbox and permission handler
     /// but has independent background task tracking.
     ///
     /// Use this to create bash tools for subagents that:
@@ -504,7 +507,7 @@ where
     }
 
     /// Returns the working directory path.
-    pub fn working_dir(&self) -> &PathBuf {
+    pub const fn working_dir(&self) -> &PathBuf {
         &self.working_dir
     }
 
@@ -514,7 +517,7 @@ where
     }
 
     /// Returns the output store.
-    pub fn output_store(&self) -> &Arc<OutputStore> {
+    pub const fn output_store(&self) -> &Arc<OutputStore> {
         &self.output_store
     }
 
@@ -525,7 +528,7 @@ where
 
     /// Returns a receiver for completed background tasks.
     ///
-    /// The returned `BackgroundTaskReceiver` can be used independently of the BashTool
+    /// The returned `BackgroundTaskReceiver` can be used independently of the `BashTool`
     /// to poll for completed background tasks. This is useful for integrating with
     /// the Agent's main loop.
     pub fn background_receiver(&self) -> BackgroundTaskReceiver {
@@ -559,7 +562,7 @@ where
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
-    fn registry(&self) -> &Arc<ToolRegistry> {
+    const fn registry(&self) -> &Arc<ToolRegistry> {
         &self.registry.registry
     }
 
@@ -571,7 +574,7 @@ where
             .detach();
     }
 
-    /// Converts this BashTool into a type-erased DynBashTool.
+    /// Converts this `BashTool` into a type-erased `DynBashTool`.
     ///
     /// This is useful for creating child bash tools for subagents where
     /// the concrete type cannot be known at compile time.
@@ -604,9 +607,9 @@ where
                             let text: &str = output.as_str().unwrap_or("");
                             text.to_string()
                         }
-                        Err(e) => format!("{{\"error\": \"{}\"}}", e),
+                        Err(e) => format!("{{\"error\": \"{e}\"}}"),
                     },
-                    Err(e) => format!("{{\"error\": \"Parse error: {}\"}}", e),
+                    Err(e) => format!("{{\"error\": \"Parse error: {e}\"}}"),
                 }
             })
         });
@@ -750,7 +753,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         let ssh_target = session.ssh_target.clone();
         let ssh_runtime = session.ssh_runtime.clone();
         let expect = arguments.expect;
-        let working_dir = self.working_dir.clone();
+        let working_dir = session.cwd.clone();
         let writable_paths = self.writable_paths.clone();
         let readable_paths = self.readable_paths.clone();
         let executor = self.executor.clone();
@@ -820,7 +823,14 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             Some(Ok(mut result)) => {
                 result.task_id = None;
                 result.status = None;
+
+                let failed = result.exit_code != 0;
                 let json = serde_json::to_string(&result).map_err(|e| anyhow::anyhow!(e))?;
+
+                if failed {
+                    return Err(anyhow::anyhow!(format!("bash command failed: {json}")));
+                }
+
                 Ok(ToolOutput::text(json))
             }
             Some(Err(err)) => Err(anyhow::anyhow!(err)),
@@ -895,8 +905,8 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
                     working_dir,
                     writable_paths,
                     readable_paths,
-                    executor,
-                    registry,
+                    executor.clone(),
+                    registry.clone(),
                     shell_id,
                     script,
                     mode,
@@ -906,8 +916,18 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
                 .await?
             }
             BashMode::Unsafe => {
-                execute_unsafe_background(working_dir, shell_id, script, mode, &job_registry)
-                    .await?
+                execute_unsafe_background(
+                    working_dir,
+                    writable_paths,
+                    readable_paths,
+                    executor,
+                    registry,
+                    shell_id,
+                    script,
+                    mode,
+                    &job_registry,
+                )
+                .await?
             }
         }
     };
@@ -989,7 +1009,7 @@ where
         .await
         .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
 
-    let mut child = sandbox
+    let child = sandbox
         .command("bash")
         .arg("-c")
         .arg(script)
@@ -1018,21 +1038,41 @@ where
     Ok((pid, output))
 }
 
-async fn execute_unsafe_background(
+async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     working_dir: &PathBuf,
+    writable_paths: &[PathBuf],
+    readable_paths: &[PathBuf],
+    executor: E,
+    registry: Arc<ToolRegistry>,
     shell_id: &str,
     script: &str,
     mode: BashMode,
     job_registry: &JobRegistry,
 ) -> Result<(u32, std::process::Output), BashError> {
-    let mut child = async_process::Command::new("bash")
+    let router = create_ipc_gateway_router(registry);
+    let config = SandboxConfig::builder()
+        .network(AllowAll)
+        .working_dir(working_dir)
+        .writable_paths(writable_paths)
+        .readable_paths(readable_paths)
+        .security(SecurityConfig::interactive())
+        .ipc(router)
+        .build()
+        .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
+
+    let sandbox = Sandbox::with_config_and_executor(config, executor)
+        .await
+        .map_err(|e| BashError::SandboxSetup(e.to_string()))?;
+
+    let child = sandbox
+        .command("bash")
         .arg("-c")
         .arg(script)
-        .current_dir(working_dir)
-        .stdin(async_process::Stdio::null())
-        .stdout(async_process::Stdio::piped())
-        .stderr(async_process::Stdio::piped())
+        .stdin(StdioConfig::Null)
+        .stdout(StdioConfig::Piped)
+        .stderr(StdioConfig::Piped)
         .spawn()
+        .await
         .map_err(|e| BashError::Execution(e.to_string()))?;
 
     let pid = child.id();
@@ -1040,13 +1080,17 @@ async fn execute_unsafe_background(
         .register(pid, shell_id, script, mode, None)
         .await;
 
-    match child.output().await {
-        Ok(output) => Ok((pid, output)),
+    let output_result =
+        run_blocking(move || futures_lite::future::block_on(child.wait_with_output())).await;
+    let output = match output_result {
+        Ok(output) => output,
         Err(err) => {
             job_registry.fail(pid, &err.to_string(), None).await;
-            Err(BashError::Execution(err.to_string()))
+            return Err(BashError::Execution(err.to_string()));
         }
-    }
+    };
+
+    Ok((pid, output))
 }
 
 async fn execute_ssh_background(
@@ -1090,7 +1134,7 @@ async fn execute_ssh_background(
         }
     };
 
-    let mut child = async_process::Command::new("ssh")
+    let child = async_process::Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
@@ -1147,6 +1191,23 @@ fn create_ipc_router(registry: Arc<ToolRegistry>) -> IpcRouter {
     router
 }
 
+fn create_ipc_gateway_router(registry: Arc<ToolRegistry>) -> IpcRouter {
+    let mut router = crate::register_ipc_gateway_command(IpcRouter::new(), registry.clone());
+
+    // In unsafe mode, keep tool commands usable (websearch/webfetch/ask/task/todo...),
+    // but never override native shell task/process commands like kill/jobs.
+    let blocked = ["kill", "jobs"];
+    let tool_names = registry.registered_tool_names();
+    for name in tool_names {
+        if blocked.contains(&name.as_str()) {
+            continue;
+        }
+        router = crate::register_tool_command(router, registry.clone(), &name);
+    }
+
+    router
+}
+
 /// Errors that can occur during bash execution.
 #[derive(Debug, thiserror::Error)]
 pub enum BashError {
@@ -1179,7 +1240,7 @@ impl<P, E, State> std::fmt::Debug for BashTool<P, E, State> {
     }
 }
 
-/// Returns (os_name, os_version) for the current system.
+/// Returns (`os_name`, `os_version`) for the current system.
 pub fn get_os_info() -> (String, String) {
     #[cfg(target_os = "macos")]
     {
@@ -1187,9 +1248,7 @@ pub fn get_os_info() -> (String, String) {
             .arg("-productVersion")
             .output()
             .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+            .and_then(|o| String::from_utf8(o.stdout).ok()).map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
         ("macOS".to_string(), version)
     }
 

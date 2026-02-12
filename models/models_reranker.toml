@@ -1,0 +1,10 @@
+# Reranker model registry
+
+[[models]]
+id = "bge-reranker-v2-m3"
+aliases = ["BAAI/bge-reranker-v2-m3"]
+name = "BGE Reranker v2 M3"
+provider = "opensource"
+context_window = 8192
+capabilities = ["reranker"]
+reranker_max_documents = 200

@@ -67,28 +67,28 @@ impl RagConfigBuilder {
 
     /// Sets the minimum similarity threshold for search results.
     #[must_use]
-    pub fn similarity_threshold(mut self, threshold: f32) -> Self {
+    pub const fn similarity_threshold(mut self, threshold: f32) -> Self {
         self.config.similarity_threshold = threshold;
         self
     }
 
     /// Sets the default number of results to return.
     #[must_use]
-    pub fn default_top_k(mut self, k: usize) -> Self {
+    pub const fn default_top_k(mut self, k: usize) -> Self {
         self.config.default_top_k = k;
         self
     }
 
     /// Enables or disables content deduplication.
     #[must_use]
-    pub fn deduplication(mut self, enabled: bool) -> Self {
+    pub const fn deduplication(mut self, enabled: bool) -> Self {
         self.config.deduplication = enabled;
         self
     }
 
     /// Enables or disables automatic saving after indexing.
     #[must_use]
-    pub fn auto_save(mut self, enabled: bool) -> Self {
+    pub const fn auto_save(mut self, enabled: bool) -> Self {
         self.config.auto_save = enabled;
         self
     }

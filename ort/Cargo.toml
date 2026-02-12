@@ -7,12 +7,15 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Local ONNX Runtime embedding models for aither"
+readme = "../README.md"
+keywords = ["onnx", "embedding", "local", "ai"]
+categories = ["api-bindings"]
 
 [dependencies]
 aither-core.workspace = true
 ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "ndarray"] }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-ndarray = "0.16"
+ndarray = "0.17"
 thiserror = "2.0"
 
 [dev-dependencies]
@@ -22,7 +25,7 @@ tokio = { version = "1.0", features = ["macros", "rt"] }
 default = ["cuda", "coreml", "download-binaries"]
 cuda = ["ort/cuda"]
 coreml = ["ort/coreml"]
-download-binaries = ["ort/download-binaries"]
+download-binaries = ["ort/download-binaries", "ort/tls-rustls"]
 
 [lints]
 workspace = true

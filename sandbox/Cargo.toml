@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Bash-based tool execution with leash sandboxing"
+readme = "../README.md"
+keywords = ["sandbox", "agent", "tooling", "bash"]
+categories = ["api-bindings"]
 
 [dependencies]
 aither-core.workspace = true

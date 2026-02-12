@@ -70,7 +70,7 @@ impl Claude {
         self
     }
 
-    /// Override the default max_tokens.
+    /// Override the default `max_tokens`.
     #[must_use]
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         Arc::make_mut(&mut self.inner).default_max_tokens = max_tokens;
@@ -251,32 +251,32 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, ClaudeError> {
     #[derive(serde::Deserialize)]
     struct ModelInfo {
         id: String,
-        /// Anthropic uses max_tokens, OpenRouter uses context_length
+        /// Anthropic uses `max_tokens`, `OpenRouter` uses `context_length`
         #[serde(default, alias = "max_tokens")]
         context_length: Option<u32>,
     }
 
     let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
     let mut backend = client();
-    let mut req = backend.get(&url).map_err(|e| ClaudeError::Http(e))?;
+    let mut req = backend.get(&url).map_err(ClaudeError::Http)?;
 
     // Anthropic uses x-api-key header, proxies use Bearer token
     if cfg.base_url.contains("anthropic.com") {
         req = req
             .header("x-api-key", cfg.api_key.clone())
-            .map_err(|e| ClaudeError::Http(e))?
+            .map_err(ClaudeError::Http)?
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .map_err(|e| ClaudeError::Http(e))?;
+            .map_err(ClaudeError::Http)?;
     } else {
         req = req
             .header(
                 header::AUTHORIZATION.as_str(),
                 format!("Bearer {}", cfg.api_key),
             )
-            .map_err(|e| ClaudeError::Http(e))?;
+            .map_err(ClaudeError::Http)?;
     }
 
-    let response: ModelsResponse = req.json().await.map_err(|e| ClaudeError::Http(e))?;
+    let response: ModelsResponse = req.json().await.map_err(ClaudeError::Http)?;
 
     for model in response.data {
         if model.id == cfg.model {
@@ -327,9 +327,9 @@ impl Builder {
         self
     }
 
-    /// Set the default max_tokens for requests.
+    /// Set the default `max_tokens` for requests.
     #[must_use]
-    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
+    pub const fn max_tokens(mut self, max_tokens: u32) -> Self {
         self.default_max_tokens = max_tokens;
         self
     }

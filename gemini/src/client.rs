@@ -171,10 +171,10 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
     let debug = std::env::var("AITHER_GEMINI_DEBUG").as_deref() == Ok("1");
     if debug {
         if let Ok(json) = serde_json::to_string_pretty(body) {
-            eprintln!("Gemini request to {endpoint}:\n{json}");
+            tracing::debug!("Gemini request to {endpoint}:\n{json}");
         }
         if cfg.auth == AuthMode::Query {
-            eprintln!("Gemini using query auth (key redacted)");
+            tracing::debug!("Gemini using query auth (key redacted)");
         }
     }
 
@@ -198,7 +198,7 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
             Ok(res) => {
                 if debug {
                     if let Ok(json) = serde_json::to_string_pretty(&res) {
-                        eprintln!("Gemini response from {endpoint}:\n{json}");
+                        tracing::debug!("Gemini response from {endpoint}:\n{json}");
                     }
                 }
                 return Ok(res);

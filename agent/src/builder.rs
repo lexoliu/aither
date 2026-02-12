@@ -11,7 +11,7 @@ use aither_sandbox::{BackgroundTaskReceiver, OutputStore};
 use crate::{
     agent::{Agent, ModelTier},
     compression::ContextStrategy,
-    config::{AgentConfig, AgentKind, BuiltinToolHint, ContextBlock},
+    config::{AgentConfig, AgentKind, ContextBlock},
     context::ConversationMemory,
     hook::{HCons, Hook},
     todo::{TodoList, TodoTool},
@@ -163,7 +163,7 @@ where
     ///     .tier(ModelTier::Balanced)  // Use sonnet for reasoning
     ///     .build();
     /// ```
-    pub fn tier(mut self, tier: ModelTier) -> Self {
+    pub const fn tier(mut self, tier: ModelTier) -> Self {
         self.tier = tier;
         self
     }
@@ -187,7 +187,7 @@ where
 
     /// Adds a hook to intercept agent operations.
     ///
-    /// Hooks are composed using the HCons pattern, allowing multiple
+    /// Hooks are composed using the `HCons` pattern, allowing multiple
     /// hooks to be chained at compile time.
     ///
     /// # Example
@@ -228,13 +228,13 @@ where
     /// Sets the maximum number of iterations (turns).
     ///
     /// The agent will stop and return an error if this limit is exceeded.
-    pub fn max_iterations(mut self, limit: usize) -> Self {
+    pub const fn max_iterations(mut self, limit: usize) -> Self {
         self.config.max_iterations = limit;
         self
     }
 
     /// Sets the context compression strategy.
-    pub fn context_strategy(mut self, strategy: ContextStrategy) -> Self {
+    pub const fn context_strategy(mut self, strategy: ContextStrategy) -> Self {
         self.config.context = strategy;
         self
     }
@@ -272,12 +272,6 @@ where
     /// Adds a structured context block.
     pub fn context_block(mut self, block: ContextBlock) -> Self {
         self.config.context_blocks.push(block);
-        self
-    }
-
-    /// Adds a one-line builtin command hint.
-    pub fn builtin_tool_hint(mut self, hint: BuiltinToolHint) -> Self {
-        self.config.builtin_tool_hints.push(hint);
         self
     }
 
@@ -364,7 +358,7 @@ where
     {
         let output_store = bash_tool.output_store().clone();
         let background_receiver = bash_tool.background_receiver();
-        self.sandbox_dir = Some(bash_tool.working_dir().to_path_buf());
+        self.sandbox_dir = Some(bash_tool.working_dir().clone());
         self.tools.register(bash_tool);
         self.output_store = Some(output_store);
         self.background_receiver = Some(background_receiver);

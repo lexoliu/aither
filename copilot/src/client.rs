@@ -419,7 +419,7 @@ fn read_file_to_data_url(url: &url::Url) -> Option<String> {
     let mime_type = mime_from_path(&path)?;
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
 
-    Some(format!("data:{};base64,{}", mime_type, base64_data))
+    Some(format!("data:{mime_type};base64,{base64_data}"))
 }
 
 fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
@@ -516,7 +516,7 @@ async fn open_sse_stream(
     }
 }
 
-fn is_unauthorized(err: &CopilotError) -> bool {
+const fn is_unauthorized(err: &CopilotError) -> bool {
     matches!(
         err,
         CopilotError::Http(zenwave::Error::Http { status, .. }) if status.as_u16() == 401
@@ -577,7 +577,7 @@ fn chat_completions_stream_inner(
             "Sending Copilot chat completion request"
         );
 
-        let mut sse_stream = match open_sse_stream(&cfg, &request).await {
+        let sse_stream = match open_sse_stream(&cfg, &request).await {
             Ok(stream) => stream,
             Err(err) if is_unauthorized(&err) => {
                 match refresh_session_config(&cfg).await {
@@ -616,7 +616,7 @@ fn chat_completions_stream_inner(
         // Accumulate tool calls by index
         let mut tool_calls: HashMap<usize, ToolCallAccumulator> = HashMap::new();
 
-        let mut sse_stream = sse_stream;
+        let sse_stream = sse_stream;
         futures_lite::pin!(sse_stream);
 
         loop {

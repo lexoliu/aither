@@ -1,7 +1,7 @@
 //! # ACP (Agent Client Protocol) for Aither
 //!
 //! This crate provides an ACP server implementation for the aither ecosystem,
-//! enabling code editors like Zed, Neovim, and JetBrains IDEs to connect to
+//! enabling code editors like Zed, Neovim, and `JetBrains` IDEs to connect to
 //! aither agents via a standardized JSON-RPC interface.
 //!
 //! ## Overview
@@ -60,7 +60,7 @@
 //!
 //! - `AgentThoughtChunk`: Internal reasoning (extended thinking)
 //! - `AgentMessageChunk`: Response text being generated
-//! - `Plan`: Task list updates (from TodoWrite)
+//! - `Plan`: Task list updates (from `TodoWrite`)
 //! - `ToolCall`: Tool execution started
 //! - `ToolCallUpdate`: Tool execution progress/completion
 //!

@@ -128,7 +128,7 @@ where
         // Delete all numbered chunks
         let mut chunk_idx = 0;
         loop {
-            let chunk_id = format!("{}#chunk_{}", doc_id, chunk_idx);
+            let chunk_id = format!("{doc_id}#chunk_{chunk_idx}");
             if self.index.remove(&chunk_id) {
                 removed = true;
                 chunk_idx += 1;
@@ -193,12 +193,12 @@ where
     }
 
     /// Returns a reference to the embedder.
-    pub fn embedder(&self) -> &M {
+    pub const fn embedder(&self) -> &M {
         &self.embedder
     }
 
     /// Returns the configuration.
-    pub fn config(&self) -> &RagConfig {
+    pub const fn config(&self) -> &RagConfig {
         &self.config
     }
 }
@@ -242,7 +242,7 @@ mod tests {
     #[tokio::test]
     async fn insert_and_search() {
         let embedder = MockEmbedder::new(4);
-        let mut store = RagStore::new(embedder);
+        let store = RagStore::new(embedder);
 
         let doc = Document::new("doc1", "Hello world");
         store.insert(doc).await.unwrap();
@@ -256,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn delete_document() {
         let embedder = MockEmbedder::new(4);
-        let mut store = RagStore::new(embedder);
+        let store = RagStore::new(embedder);
 
         let doc = Document::new("doc1", "Hello world");
         store.insert(doc).await.unwrap();
@@ -270,7 +270,7 @@ mod tests {
     async fn deduplication() {
         let embedder = MockEmbedder::new(4);
         let config = RagConfig::builder().deduplication(true).build();
-        let mut store = RagStore::with_config(embedder, config);
+        let store = RagStore::with_config(embedder, config);
 
         // Insert same content twice with different IDs
         let doc1 = Document::new("doc1", "Same content");
@@ -288,7 +288,7 @@ mod tests {
     async fn no_deduplication() {
         let embedder = MockEmbedder::new(4);
         let config = RagConfig::builder().deduplication(false).build();
-        let mut store = RagStore::with_config(embedder, config);
+        let store = RagStore::with_config(embedder, config);
 
         let doc1 = Document::new("doc1", "Same content");
         let doc2 = Document::new("doc2", "Same content");

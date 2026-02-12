@@ -156,7 +156,7 @@ impl From<&Parameters> for ParameterSnapshot {
 
 /// Convert aither messages to Claude format, extracting system messages.
 ///
-/// Returns (system_prompt, messages) where system messages are concatenated
+/// Returns (`system_prompt`, messages) where system messages are concatenated
 /// into a single system prompt.
 pub fn to_claude_messages(messages: &[Message]) -> (Option<String>, Vec<MessagePayload>) {
     let mut system_parts: Vec<&str> = Vec::new();

@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "MCP (Model Context Protocol) client and server for aither"
+readme = "../README.md"
+keywords = ["mcp", "tooling", "agent", "protocol"]
+categories = ["api-bindings"]
 
 [dependencies]
 aither-core = { path = "../core" }

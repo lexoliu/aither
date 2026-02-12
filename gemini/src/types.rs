@@ -44,7 +44,7 @@ impl GeminiContent {
         }
     }
 
-    pub(crate) fn system(parts: Vec<Part>) -> Self {
+    pub(crate) const fn system(parts: Vec<Part>) -> Self {
         Self { role: None, parts }
     }
 
@@ -215,7 +215,7 @@ impl Part {
         }
     }
 
-    pub(crate) fn function_response_with_signature(
+    pub(crate) const fn function_response_with_signature(
         name: String,
         response: Value,
         thought_signature: Option<String>,
@@ -234,7 +234,7 @@ impl Part {
         }
     }
 
-    pub(crate) fn function_call(name: String, args: Value) -> Self {
+    pub(crate) const fn function_call(name: String, args: Value) -> Self {
         Self {
             text: None,
             thought: None,
@@ -249,7 +249,7 @@ impl Part {
         }
     }
 
-    pub(crate) fn function_call_with_signature(
+    pub(crate) const fn function_call_with_signature(
         name: String,
         args: Value,
         thought_signature: Option<String>,
@@ -349,7 +349,7 @@ impl InlineData {
 pub struct FileData {
     /// MIME type of the file.
     mime_type: String,
-    /// URI of the uploaded file (e.g., "https://generativelanguage.googleapis.com/v1beta/files/xyz").
+    /// URI of the uploaded file (e.g., "<https://generativelanguage.googleapis.com/v1beta/files/xyz>").
     file_uri: String,
 }
 

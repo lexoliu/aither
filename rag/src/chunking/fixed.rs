@@ -169,7 +169,7 @@ mod tests {
 
         assert!(chunks.len() > 1);
         for (i, chunk) in chunks.iter().enumerate() {
-            assert_eq!(chunk.id, format!("doc1#chunk_{}", i));
+            assert_eq!(chunk.id, format!("doc1#chunk_{i}"));
             assert_eq!(chunk.source_id, "doc1");
             assert_eq!(chunk.index, i);
         }

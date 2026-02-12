@@ -16,7 +16,7 @@ impl EmbeddingModel for DemoEmbedder {
         let mut vector = vec![0.0; self.dim()];
         for (idx, byte) in text.bytes().enumerate() {
             let bucket = idx % self.dim();
-            vector[bucket] += byte as f32;
+            vector[bucket] += f32::from(byte);
         }
         // Normalize
         let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
     let index_path = working_dir.join("index.redb");
 
     // Create RAG instance with custom configuration
-    let mut rag = Rag::builder(DemoEmbedder)
+    let rag = Rag::builder(DemoEmbedder)
         .index_path(&index_path)
         .top_k(3)
         .auto_save(true)

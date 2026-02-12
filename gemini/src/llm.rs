@@ -251,7 +251,7 @@ fn uuid_v4() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{:032x}", timestamp)
+    format!("{timestamp:032x}")
 }
 
 const TOOL_SIGNATURE_SEPARATOR: &str = "|ts|";
@@ -454,8 +454,7 @@ fn format_prompt_feedback(feedback: &PromptFeedback) -> String {
 fn format_safety_rating(rating: &SafetyRating) -> String {
     let status = rating
         .blocked
-        .map(|b| if b { "blocked" } else { "allowed" })
-        .unwrap_or("unspecified");
+        .map_or("unspecified", |b| if b { "blocked" } else { "allowed" });
     let probability = rating.probability.as_deref().unwrap_or("unknown");
     format!("{} ({status}, probability: {probability})", rating.category)
 }
@@ -549,7 +548,7 @@ fn convert_tool_definitions(defs: Vec<ToolDefinition>) -> Vec<FunctionDeclaratio
 /// Handles:
 /// - `data:...;base64,...` - already base64 encoded
 /// - `file:///path/to/file` - reads file and converts to base64
-/// - Gemini file URI (https://generativelanguage.googleapis.com/...) - uses file reference
+/// - Gemini file URI (<https://generativelanguage.googleapis.com>/...) - uses file reference
 /// - Other HTTP/HTTPS URLs - not currently supported (would need download)
 fn url_to_part(url: &url::Url) -> Option<Part> {
     match url.scheme() {
@@ -575,8 +574,7 @@ fn url_to_part(url: &url::Url) -> Option<Part> {
 /// Check if a URL is a Gemini Files API URI.
 fn is_gemini_file_uri(url: &url::Url) -> bool {
     url.host_str()
-        .map(|h| h == "generativelanguage.googleapis.com")
-        .unwrap_or(false)
+        .is_some_and(|h| h == "generativelanguage.googleapis.com")
 }
 
 /// Convert a Gemini Files API URI to a Part using file reference.
@@ -590,7 +588,7 @@ fn gemini_file_uri_to_part(url: &url::Url) -> Option<Part> {
 
 /// Try to infer MIME type from a Gemini file URI.
 /// The URI doesn't typically contain MIME info, so we return None.
-fn infer_mime_from_gemini_uri(_url: &url::Url) -> Option<&'static str> {
+const fn infer_mime_from_gemini_uri(_url: &url::Url) -> Option<&'static str> {
     // Gemini file URIs don't contain MIME type info in the URL
     // The server knows the type from when it was uploaded
     None

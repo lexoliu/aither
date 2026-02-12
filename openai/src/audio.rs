@@ -36,15 +36,15 @@ async fn synthesize(cfg: Arc<Config>, text: String) -> Result<Vec<u8>, OpenAIErr
     let mut backend = client();
     let mut builder = backend
         .post(endpoint)
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(header::AUTHORIZATION.as_str(), cfg.request_auth())
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(header::USER_AGENT.as_str(), "aither-openai/0.1")
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
     if let Some(org) = &cfg.organization {
         builder = builder
             .header("OpenAI-Organization", org.clone())
-            .map_err(|e| OpenAIError::Http(e))?;
+            .map_err(OpenAIError::Http)?;
     }
 
     let request = SpeechRequest {
@@ -55,10 +55,10 @@ async fn synthesize(cfg: Arc<Config>, text: String) -> Result<Vec<u8>, OpenAIErr
     };
     let bytes = builder
         .json_body(&request)
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .bytes()
         .await
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
 
     Ok(bytes.to_vec())
 }
@@ -68,15 +68,15 @@ async fn transcribe_once(cfg: Arc<Config>, audio: Vec<u8>) -> Result<String, Ope
     let mut backend = client();
     let mut builder = backend
         .post(endpoint)
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(header::AUTHORIZATION.as_str(), cfg.request_auth())
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(header::USER_AGENT.as_str(), "aither-openai/0.1")
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
     if let Some(org) = &cfg.organization {
         builder = builder
             .header("OpenAI-Organization", org.clone())
-            .map_err(|e| OpenAIError::Http(e))?;
+            .map_err(OpenAIError::Http)?;
     }
 
     let parts = vec![
@@ -91,11 +91,11 @@ async fn transcribe_once(cfg: Arc<Config>, audio: Vec<u8>) -> Result<String, Ope
             header::CONTENT_TYPE.as_str(),
             format!("multipart/form-data; boundary={boundary}"),
         )
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .bytes_body(body)
         .json()
         .await
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
 
     Ok(response.text)
 }

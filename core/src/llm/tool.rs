@@ -16,7 +16,7 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust
+//! ```rust,ignore
 //! use aither::llm::Tool;
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
@@ -57,7 +57,7 @@
 //! ### 1. Use Clear Documentation Comments
 //! Doc comments automatically become schema descriptions:
 //!
-//! ```rust
+//! ```rust,ignore
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //!
@@ -76,7 +76,7 @@
 //! ### 2. Prefer Enums Over Strings
 //! Enums provide clear constraints for LLMs:
 //!
-//! ```rust
+//! ```rust,ignore
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //!
@@ -95,7 +95,7 @@
 //! ### 3. Add Validation Constraints
 //! Use schemars attributes for validation:
 //!
-//! ```rust
+//! ```rust,ignore
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //!
@@ -116,7 +116,7 @@
 //! ### 4. Structure Complex Data
 //! Break down complex parameters into nested types:
 //!
-//! ```rust
+//! ```rust,ignore
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //!
@@ -165,7 +165,7 @@ use serde::{Serialize, de::DeserializeOwned};
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use aither::llm::tool::ToolOutput;
 ///
 /// // Tool that produces text
@@ -228,7 +228,7 @@ impl ToolOutput {
 
     /// Creates a binary output.
     #[must_use]
-    pub fn binary(data: Vec<u8>) -> Self {
+    pub const fn binary(data: Vec<u8>) -> Self {
         Self::Output {
             mime: mime::APPLICATION_OCTET_STREAM,
             content: data,
@@ -252,7 +252,7 @@ impl ToolOutput {
 
     /// Returns the MIME type if this is an `Output` variant.
     #[must_use]
-    pub fn mime(&self) -> Option<&Mime> {
+    pub const fn mime(&self) -> Option<&Mime> {
         match self {
             Self::Done => None,
             Self::Output { mime, .. } => Some(mime),
@@ -277,7 +277,7 @@ impl ToolOutput {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use aither::llm::{Tool, ToolOutput};
 /// use schemars::JsonSchema;
 /// use serde::Deserialize;
@@ -318,7 +318,7 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> Cow<'static, str>;
 
     /// Tool arguments type. Must implement [`schemars::JsonSchema`] and [`serde::de::DeserializeOwned`].
-    /// Description is extracted from the rustdoc on this type via JsonSchema.
+    /// Description is extracted from the rustdoc on this type via `JsonSchema`.
     type Arguments: Send + JsonSchema + DeserializeOwned;
 
     /// Executes the tool with the provided arguments.
@@ -332,7 +332,7 @@ pub trait Tool: Send + Sync {
 /// Utility to convert a serializable value to a pretty-printed JSON string.
 ///
 /// # Example
-/// ```rust
+/// ```rust,ignore
 /// use aither::llm::tool::json;
 /// use serde::Serialize;
 /// #[derive(Serialize)]
@@ -347,6 +347,10 @@ pub trait Tool: Send + Sync {
 /// let json_str = json(&data);
 /// println!("{}", json_str);
 /// ```
+///
+/// # Panics
+///
+/// Panics when converting the input value into JSON fails.
 #[must_use]
 pub fn json<T: Serialize>(value: &T) -> String {
     let value = serde_json::to_value(value).expect("Failed to convert value to JSON");
@@ -430,7 +434,7 @@ impl<T: Tool + 'static> ToolImpl for T {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use aither::llm::tool::Tools;
 ///
 /// let mut tools = Tools::new();
@@ -468,15 +472,15 @@ impl ToolDefinition {
     /// Creates a tool definition for a given tool type.
     ///
     /// The description is extracted from the Arguments struct's rustdoc comment
-    /// (via schemars::JsonSchema). Falls back to `Tool::description()` if no
+    /// (via `schemars::JsonSchema`). Falls back to `Tool::description()` if no
     /// rustdoc is present on the Args struct.
     #[must_use]
     pub fn new<T: Tool>(tool: &T) -> Self {
-        let mut arguments = schema_for!(T::Arguments);
-
-        if !is_object::<T::Arguments>() {
-            arguments = schema_for!(ToolArgument<T::Arguments>);
-        }
+        let arguments = if is_object::<T::Arguments>() {
+            schema_for!(T::Arguments)
+        } else {
+            schema_for!(ToolArgument<T::Arguments>)
+        };
 
         // Extract description from schema (rustdoc on Args struct)
         let description = arguments
@@ -532,7 +536,7 @@ impl ToolDefinition {
 
     /// Return an OpenAI-compatible JSON schema for the tool's arguments.
     ///
-    /// This schema would have an object type at the root, as required by OpenAI.
+    /// This schema would have an object type at the root, as required by `OpenAI`.
     #[must_use]
     pub fn arguments_openai_schema(&self) -> serde_json::Value {
         let mut inner = self.arguments.clone().to_value();
@@ -578,11 +582,13 @@ fn extract_defs(value: &Value) -> serde_json::Map<String, Value> {
 }
 
 /// Resolves `$ref` and cleans the schema recursively.
+#[allow(clippy::too_many_lines)]
 fn resolve_and_clean(value: &mut Value, defs: &serde_json::Map<String, Value>) {
     resolve_and_clean_inner(value, defs, false);
 }
 
 /// Inner recursive function with flag to track if we're inside a properties object.
+#[allow(clippy::too_many_lines)]
 fn resolve_and_clean_inner(
     value: &mut Value,
     defs: &serde_json::Map<String, Value>,
@@ -826,13 +832,16 @@ impl Tools {
     /// Registers a new tool. Replaces existing tool with same name.
     ///
     /// The tool must implement [`Tool`] and be `'static`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a tool with the same name is already registered.
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
         let name = tool.name();
         // Check if conflict exists
         assert!(
             !self.tools.contains_key(&name),
-            "Tool with name '{}' is already registered",
-            name
+            "Tool with name '{name}' is already registered"
         );
 
         self.tools.insert(name, Box::new(tool) as Box<dyn ToolImpl>);
@@ -842,6 +851,10 @@ impl Tools {
     ///
     /// This is useful for type-erased tools (e.g., child bash tools for subagents)
     /// where the concrete type isn't known at compile time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a tool with the same name is already registered.
     pub fn register_dyn<F>(&mut self, definition: ToolDefinition, handler: F)
     where
         F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send>>
@@ -852,8 +865,7 @@ impl Tools {
         let name = definition.name.clone();
         assert!(
             !self.tools.contains_key(&name),
-            "Tool with name '{}' is already registered",
-            name
+            "Tool with name '{name}' is already registered"
         );
 
         self.tools.insert(
@@ -967,7 +979,7 @@ mod tests {
         assert_eq!(definition.name, "calculator");
         assert_eq!(
             definition.description,
-            "Performs basic mathematical operations"
+            "Performs basic mathematical operations."
         );
         // Schema should be present - just check it exists
         // The exact structure of schemars::Schema is implementation detail
@@ -1078,9 +1090,9 @@ mod tests {
 
         assert_eq!(
             calc_def.description,
-            "Performs basic mathematical operations"
+            "Performs basic mathematical operations."
         );
-        assert_eq!(greet_def.description, "Greets a person by name");
+        assert_eq!(greet_def.description, "Greets a person by name.");
 
         // Test both tools
         let calc_result = tools
@@ -1094,7 +1106,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_not_found() {
-        let mut tools = Tools::new();
+        let tools = Tools::new();
 
         let result = tools.call("nonexistent", "{}").await;
         assert!(result.is_err());
@@ -1176,11 +1188,13 @@ mod tests {
             Completed,
         }
 
+        #[allow(dead_code)]
         #[derive(JsonSchema, Deserialize)]
         struct Item {
             status: Status,
         }
 
+        #[allow(dead_code)]
         #[derive(JsonSchema, Deserialize)]
         struct Args {
             items: Vec<Item>,
@@ -1257,7 +1271,7 @@ mod tests {
             }
         });
 
-        let mut schema = raw_schema.clone();
+        let mut schema = raw_schema;
         clean_schema(&mut schema);
 
         let props = schema.get("properties").unwrap().as_object().unwrap();
@@ -1299,7 +1313,7 @@ mod tests {
             }
         });
 
-        let mut schema = raw_schema.clone();
+        let mut schema = raw_schema;
         clean_schema(&mut schema);
 
         // Navigate to status

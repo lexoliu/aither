@@ -76,6 +76,7 @@ impl Default for Mistral {
 
 impl Mistral {
     /// Create a new mistral backend with no preconfigured model IDs.
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -167,7 +168,7 @@ impl Mistral {
 
     /// Override the advertised embedding dimensions.
     #[must_use]
-    pub fn with_embedding_dimensions(mut self, dim: usize) -> Self {
+    pub const fn with_embedding_dimensions(mut self, dim: usize) -> Self {
         self.embedding_dimensions = dim;
         self
     }
@@ -198,7 +199,7 @@ impl Mistral {
 
         let mut guard = inner.lock().expect("mistral state poisoned");
         if guard.llm.is_none() {
-            guard.llm = Some(built.clone());
+            guard.llm = Some(built);
         }
         Ok(guard.llm.clone().expect("llm model must be initialized"))
     }
@@ -234,7 +235,7 @@ impl Mistral {
 
         let mut guard = inner.lock().expect("mistral state poisoned");
         if guard.embedding.is_none() {
-            guard.embedding = Some(built.clone());
+            guard.embedding = Some(built);
         }
         Ok(guard
             .embedding
@@ -267,7 +268,7 @@ impl Mistral {
 
         let mut guard = inner.lock().expect("mistral state poisoned");
         if guard.image.is_none() {
-            guard.image = Some(built.clone());
+            guard.image = Some(built);
         }
         Ok(guard
             .image
@@ -356,8 +357,7 @@ impl LanguageModel for Mistral {
                 .clone()
                 .unwrap_or_else(|| "mistral-local".to_string());
             let context_length = aither_models::lookup(&name)
-                .map(|model| model.context_window)
-                .unwrap_or(32_768);
+                .map_or(32_768, |model| model.context_window);
 
             Profile::new(
                 name.clone(),
@@ -385,8 +385,7 @@ impl EmbeddingModel for Mistral {
         let text = text.to_string();
         async move {
             let model = Self::ensure_embedding(&inner).await?;
-            model.generate_embedding(text).await.map_err(Into::into)
-        }
+            model.generate_embedding(text).await}
     }
 }
 
@@ -508,8 +507,7 @@ fn to_mistral_request(
         ToolChoice::Exact(name) => tools
             .into_iter()
             .find(|tool| tool.function.name == *name)
-            .map(MistralToolChoice::Tool)
-            .unwrap_or(MistralToolChoice::Auto),
+            .map_or(MistralToolChoice::Auto, MistralToolChoice::Tool),
     };
     request.set_tool_choice(tool_choice)
 }

@@ -110,7 +110,7 @@ mod tests {
         let embedder = MockEmbedder::new(4);
         let index_dir = tempdir().unwrap();
 
-        let mut rag = Rag::builder(embedder)
+        let rag = Rag::builder(embedder)
             .index_path(index_dir.path().join("index.redb"))
             .build()
             .unwrap();

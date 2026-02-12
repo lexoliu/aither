@@ -155,7 +155,7 @@ where
                 }
                 Err(e) if is_non_retryable(&e) => {
                     // Non-retryable error (e.g., CAPTCHA), fail immediately
-                    return Err(e.into());
+                    return Err(e);
                 }
                 Err(e) if attempt < MAX_RETRIES - 1 => {
                     // Retryable error, retry after delay
@@ -163,7 +163,7 @@ where
                     tracing::warn!(attempt, error = %e, "websearch failed, retrying");
                 }
                 Err(e) => {
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         }

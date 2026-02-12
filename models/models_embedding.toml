@@ -1,0 +1,38 @@
+# Embedding model registry
+
+[[models]]
+id = "text-embedding-3-large"
+aliases = []
+name = "Text Embedding 3 Large"
+provider = "openai"
+context_window = 8_192
+capabilities = ["embedding"]
+embedding_dimensions = 3072
+
+[[models]]
+id = "text-embedding-3-small"
+aliases = []
+name = "Text Embedding 3 Small"
+provider = "openai"
+context_window = 8_192
+capabilities = ["embedding"]
+embedding_dimensions = 1536
+
+[[models]]
+id = "text-embedding-ada-002"
+aliases = []
+name = "Text Embedding Ada 002"
+provider = "openai"
+context_window = 8_192
+capabilities = ["embedding"]
+embedding_dimensions = 1536
+outdated = true
+
+[[models]]
+id = "deepseek-embed-v3"
+aliases = ["deepseek-embedding-v3"]
+name = "DeepSeek Embed V3"
+provider = "deepseek"
+context_window = 8_192
+capabilities = ["embedding"]
+embedding_dimensions = 2048

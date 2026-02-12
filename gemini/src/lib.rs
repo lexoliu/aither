@@ -10,24 +10,19 @@
 //! ```no_run
 //! use aither_core::{
 //!     LanguageModel,
-//!     llm::{Message, tool::Tools, model::Parameters},
+//!     llm::{LLMRequest, Message, collect_text, model::Parameters},
 //! };
 //! use aither_gemini::Gemini;
-//! use futures_lite::StreamExt;
 //!
-//! # async fn run() -> anyhow::Result<()> {
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let gemini = Gemini::new(std::env::var("GEMINI_API_KEY")?);
-//! let messages = [
+//! let request = LLMRequest::new([
 //!     Message::system("You are a concise assistant."),
 //!     Message::user("Explain Tokio in two bullet points."),
-//! ];
-//! let mut tools = Tools::new();
-//! let params = Parameters::default();
-//! let mut stream = gemini.respond(&messages, &mut tools, &params);
-//! let mut full = String::new();
-//! while let Some(chunk) = stream.next().await {
-//!     full.push_str(&chunk?);
-//! }
+//! ])
+//! .with_parameters(Parameters::default());
+//! let stream = gemini.respond(request);
+//! let full = collect_text(stream).await?;
 //! println!("{full}");
 //! # Ok(()) }
 //! ```

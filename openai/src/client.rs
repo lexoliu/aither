@@ -68,7 +68,7 @@ impl RetryConfig {
 }
 
 /// Check if an error is retryable.
-fn is_retryable_error(err: &OpenAIError) -> bool {
+const fn is_retryable_error(err: &OpenAIError) -> bool {
     match err {
         // Network/transport errors are retryable
         OpenAIError::Http(_) => true,
@@ -161,12 +161,12 @@ pub struct OpenAI {
     inner: Arc<Config>,
 }
 
-/// Selects which OpenAI API surface to use.
+/// Selects which `OpenAI` API surface to use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiKind {
     /// The recommended Responses API.
     Responses,
-    /// Legacy Chat Completions API (deprecated by OpenAI).
+    /// Legacy Chat Completions API (deprecated by `OpenAI`).
     ChatCompletions,
 }
 
@@ -206,7 +206,7 @@ impl OpenAI {
         self
     }
 
-    /// Select which OpenAI API to call.
+    /// Select which `OpenAI` API to call.
     #[must_use]
     pub fn with_api(mut self, api: ApiKind) -> Self {
         Arc::make_mut(&mut self.inner).api_kind = api;
@@ -219,7 +219,7 @@ impl OpenAI {
         self.with_api(ApiKind::Responses)
     }
 
-    /// Use the legacy Chat Completions API (deprecated by OpenAI).
+    /// Use the legacy Chat Completions API (deprecated by `OpenAI`).
     #[must_use]
     pub fn with_chat_completions_api(self) -> Self {
         self.with_api(ApiKind::ChatCompletions)
@@ -227,7 +227,7 @@ impl OpenAI {
 
     /// Send deprecated `max_tokens` alongside `max_completion_tokens` for compatibility.
     ///
-    /// OpenAI deprecates `max_tokens` and it is incompatible with reasoning models.
+    /// `OpenAI` deprecates `max_tokens` and it is incompatible with reasoning models.
     #[must_use]
     pub fn with_legacy_max_tokens(mut self, enabled: bool) -> Self {
         Arc::make_mut(&mut self.inner).legacy_max_tokens = enabled;
@@ -432,15 +432,15 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, OpenAIError> {
     let mut backend = client();
     let response: ModelsListResponse = backend
         .get(&url)
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(
             header::AUTHORIZATION.as_str(),
             format!("Bearer {}", cfg.api_key),
         )
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .json()
         .await
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
 
     // Find matching model
     let mut model_found = false;
@@ -963,23 +963,23 @@ impl Builder {
 
     /// Use the recommended Responses API.
     #[must_use]
-    pub fn use_responses_api(mut self) -> Self {
+    pub const fn use_responses_api(mut self) -> Self {
         self.api_kind = ApiKind::Responses;
         self
     }
 
-    /// Use the legacy Chat Completions API (deprecated by OpenAI).
+    /// Use the legacy Chat Completions API (deprecated by `OpenAI`).
     #[must_use]
-    pub fn use_chat_completions_api(mut self) -> Self {
+    pub const fn use_chat_completions_api(mut self) -> Self {
         self.api_kind = ApiKind::ChatCompletions;
         self
     }
 
     /// Send deprecated `max_tokens` alongside `max_completion_tokens` for compatibility.
     ///
-    /// OpenAI deprecates `max_tokens` and it is incompatible with reasoning models.
+    /// `OpenAI` deprecates `max_tokens` and it is incompatible with reasoning models.
     #[must_use]
-    pub fn legacy_max_tokens(mut self, enabled: bool) -> Self {
+    pub const fn legacy_max_tokens(mut self, enabled: bool) -> Self {
         self.legacy_max_tokens = enabled;
         self
     }
@@ -1086,14 +1086,14 @@ impl Builder {
     /// By default, requests are retried up to 3 times with exponential backoff.
     /// Retries happen on network errors and certain HTTP status codes (429, 500, 502, 503, 504).
     #[must_use]
-    pub fn retry(mut self, config: RetryConfig) -> Self {
+    pub const fn retry(mut self, config: RetryConfig) -> Self {
         self.retry = config;
         self
     }
 
     /// Set maximum number of retry attempts.
     #[must_use]
-    pub fn max_retries(mut self, max_retries: u32) -> Self {
+    pub const fn max_retries(mut self, max_retries: u32) -> Self {
         self.retry.max_retries = max_retries;
         self
     }
@@ -1110,7 +1110,7 @@ impl Builder {
     /// Default is 5 minutes, which is generous for long completions.
     /// The timeout applies to the entire request, including connection and response streaming.
     #[must_use]
-    pub fn timeout(mut self, timeout: Duration) -> Self {
+    pub const fn timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
     }

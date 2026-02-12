@@ -16,7 +16,7 @@ pub struct ToolRequest<Args, Response> {
 impl<Args, Response> ToolRequest<Args, Response> {
     /// Create a new request with its response channel.
     #[must_use]
-    pub fn new(args: Args, response_tx: Sender<Response>) -> Self {
+    pub const fn new(args: Args, response_tx: Sender<Response>) -> Self {
         Self { args, response_tx }
     }
 

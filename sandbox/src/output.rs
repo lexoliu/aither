@@ -57,7 +57,7 @@ pub enum Content {
 /// Serializes to a flat JSON object with optional fields.
 #[derive(Debug, Clone)]
 pub enum OutputEntry {
-    /// No output (ToolOutput::Done) - nothing to store
+    /// No output (`ToolOutput::Done`) - nothing to store
     Empty,
 
     /// Super tiny content - always in context, NEVER gets URL.
@@ -93,21 +93,21 @@ impl Serialize for OutputEntry {
         S: Serializer,
     {
         match self {
-            OutputEntry::Empty => {
+            Self::Empty => {
                 let map = serializer.serialize_map(Some(0))?;
                 map.end()
             }
-            OutputEntry::Inline { content } => {
+            Self::Inline { content } => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("content", content)?;
                 map.end()
             }
-            OutputEntry::Loaded { content, .. } => {
+            Self::Loaded { content, .. } => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("content", content)?;
                 map.end()
             }
-            OutputEntry::Stored { url, content } => {
+            Self::Stored { url, content } => {
                 let count = if content.is_some() { 2 } else { 1 };
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("url", url)?;
@@ -134,9 +134,9 @@ impl<'de> Deserialize<'de> for OutputEntry {
         let h = Helper::deserialize(deserializer)?;
 
         Ok(match (h.url, h.content) {
-            (Some(url), content) => OutputEntry::Stored { url, content },
-            (None, Some(content)) => OutputEntry::Inline { content },
-            (None, None) => OutputEntry::Empty,
+            (Some(url), content) => Self::Stored { url, content },
+            (None, Some(content)) => Self::Inline { content },
+            (None, None) => Self::Empty,
         })
     }
 }
@@ -144,13 +144,16 @@ impl<'de> Deserialize<'de> for OutputEntry {
 impl std::fmt::Display for OutputEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OutputEntry::Empty => Ok(()),
-            OutputEntry::Inline { content } | OutputEntry::Loaded { content, .. } => {
+            Self::Empty => Ok(()),
+            Self::Inline { content } | Self::Loaded { content, .. } => {
                 match content {
                     Content::Text { text, truncated } => {
                         write!(f, "{text}")?;
                         if *truncated {
-                            write!(f, "\n[truncated]")?;
+                            write!(
+                                f,
+                                "\n[truncated: full output is available in the stored file]"
+                            )?;
                         }
                         Ok(())
                     }
@@ -159,13 +162,16 @@ impl std::fmt::Display for OutputEntry {
                     }
                 }
             }
-            OutputEntry::Stored { url, content } => {
+            Self::Stored { url, content } => {
                 if let Some(content) = content {
                     match content {
                         Content::Text { text, truncated } => {
                             write!(f, "{text}")?;
                             if *truncated {
-                                write!(f, "\n[full content at {url}]")?;
+                                write!(
+                                    f,
+                                    "\n[full content at {url}; output was truncated in-chat]"
+                                )?;
                             }
                         }
                         Content::Image { media_type, .. } => {
@@ -186,7 +192,7 @@ impl OutputEntry {
     #[must_use]
     pub fn stored_path(&self, base_dir: &Path) -> Option<PathBuf> {
         match self {
-            OutputEntry::Stored { url, .. } => {
+            Self::Stored { url, .. } => {
                 let filename = url.strip_prefix("outputs/").unwrap_or(url);
                 Some(base_dir.join(filename))
             }
@@ -291,7 +297,7 @@ impl OutputStore {
 
     /// Saves output data to a directory.
     ///
-    /// Uses the system-wide INLINE_OUTPUT_LIMIT constant:
+    /// Uses the system-wide `INLINE_OUTPUT_LIMIT` constant:
     /// - Empty data → `Empty`
     /// - Below limit → `Inline` (shown directly)
     /// - Above limit → `Stored` (file created, path returned)
@@ -495,8 +501,8 @@ impl OutputStore {
 
 /// Saves text output with simple size-based classification.
 ///
-/// - Below INLINE_OUTPUT_LIMIT → show inline
-/// - Above INLINE_OUTPUT_LIMIT → save to file, return only file reference
+/// - Below `INLINE_OUTPUT_LIMIT` → show inline
+/// - Above `INLINE_OUTPUT_LIMIT` → save to file, return only file reference
 async fn save_text_output(
     dir: &Path,
     data: &[u8],

@@ -53,6 +53,10 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 use zenwave::{Client, client, header};
 
+fn ensure_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Result of fetching web content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchResult {
@@ -80,6 +84,7 @@ pub struct ImageResult {
 /// This is fast but won't execute JavaScript. For JS-rendered pages,
 /// use [`fetch_with_browser`] (requires `headless` feature).
 pub async fn fetch(url: &str) -> Result<FetchResult> {
+    ensure_rustls_provider();
     let html = fetch_html_static(url).await?;
     html_to_result(url, &html)
 }
@@ -137,6 +142,7 @@ pub async fn fetch_smart(url: &str) -> Result<FetchResult> {
 ///
 /// A tuple of (JPEG data, MIME type).
 pub async fn fetch_image(url: &str) -> Result<(Vec<u8>, String)> {
+    ensure_rustls_provider();
     let bytes = fetch_bytes(url).await?;
     convert_to_jpeg(&bytes)
 }

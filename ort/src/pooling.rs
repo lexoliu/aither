@@ -6,7 +6,7 @@ use ndarray::ArrayView3;
 ///
 /// Different embedding models require different pooling strategies:
 /// - Decoder models (Qwen3-Embedding) use [`LastToken`](PoolingStrategy::LastToken)
-/// - Encoder models (BERT, MiniLM) typically use [`Cls`](PoolingStrategy::Cls) or [`Mean`](PoolingStrategy::Mean)
+/// - Encoder models (BERT, `MiniLM`) typically use [`Cls`](PoolingStrategy::Cls) or [`Mean`](PoolingStrategy::Mean)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PoolingStrategy {
     /// Use the last non-padding token's hidden state.

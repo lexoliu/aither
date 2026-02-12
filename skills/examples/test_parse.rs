@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 use aither_skills::{Skill, SkillLoader};
 
 fn main() {
@@ -14,7 +16,7 @@ fn main() {
             skill.name,
             &skill.description[..50.min(skill.description.len())]
         ),
-        Err(e) => println!("Parse error: {:?}", e),
+        Err(e) => println!("Parse error: {e:?}"),
     }
 
     // Test loader
@@ -31,6 +33,6 @@ fn main() {
                 );
             }
         }
-        Err(e) => println!("Loader error: {:?}", e),
+        Err(e) => println!("Loader error: {e:?}"),
     }
 }

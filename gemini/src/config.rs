@@ -54,7 +54,7 @@ impl Gemini {
 
     /// Select header-based authentication.
     #[must_use]
-    pub fn with_auth_mode(mut self, mode: AuthMode) -> Self {
+    pub const fn with_auth_mode(mut self, mode: AuthMode) -> Self {
         self.inner.auth = mode;
         self
     }

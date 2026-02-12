@@ -456,7 +456,7 @@ fn extract_reasoning(value: Option<Value>) -> Vec<String> {
                     .get("text")
                     .and_then(|inner| inner.as_str())
                     .filter(|text| !text.is_empty())
-                    .map(|text| text.to_string()),
+                    .map(std::string::ToString::to_string),
                 _ => None,
             })
             .collect(),
@@ -468,7 +468,7 @@ fn extract_reasoning(value: Option<Value>) -> Vec<String> {
 // Model Info (for fetching context window)
 // ============================================================================
 
-/// Response from GET /v1/models endpoint (OpenRouter format).
+/// Response from GET /v1/models endpoint (`OpenRouter` format).
 #[derive(Debug, Deserialize)]
 pub struct ModelsListResponse {
     pub data: Vec<ModelInfo>,
@@ -479,10 +479,10 @@ pub struct ModelsListResponse {
 pub struct ModelInfo {
     /// Model ID
     pub id: String,
-    /// Context window size (OpenRouter returns this)
+    /// Context window size (`OpenRouter` returns this)
     #[serde(default)]
     pub context_length: Option<u32>,
-    /// Some providers use max_tokens instead
+    /// Some providers use `max_tokens` instead
     #[serde(default)]
     pub max_tokens: Option<u32>,
 }

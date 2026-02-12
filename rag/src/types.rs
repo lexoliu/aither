@@ -122,7 +122,7 @@ pub struct IndexEntry {
 impl IndexEntry {
     /// Creates a new index entry.
     #[must_use]
-    pub fn new(chunk: Chunk, embedding: Vec<f32>) -> Self {
+    pub const fn new(chunk: Chunk, embedding: Vec<f32>) -> Self {
         Self { chunk, embedding }
     }
 }

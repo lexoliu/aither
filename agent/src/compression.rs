@@ -106,7 +106,7 @@ pub struct PreservedContent {
 
 /// Estimate tokens in a string (rough approximation: ~4 chars per token).
 #[must_use]
-pub fn estimate_tokens(content: &str) -> usize {
+pub const fn estimate_tokens(content: &str) -> usize {
     content.len() / 4
 }
 

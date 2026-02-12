@@ -46,7 +46,7 @@ use serde::de::DeserializeOwned;
 use crate::hook::Hook;
 use crate::{
     Agent, AgentBuilder,
-    config::{AgentKind, BuiltinToolHint, ContextBlock, ContextBlockPriority},
+    config::{AgentKind, ContextBlock, ContextBlockPriority},
 };
 use aither_sandbox::builtin::{KillTool, TasksTool};
 use aither_sandbox::{
@@ -153,7 +153,7 @@ where
 
         let open_shell = OpenShellTool::new(
             shell_sessions.clone(),
-            bash_tool.working_dir().to_path_buf(),
+            bash_tool.working_dir().clone(),
         );
         let list_ssh = ListSshTool::new(shell_sessions.clone());
         let job_registry = bash_tool.job_registry();
@@ -214,7 +214,7 @@ where
     }
 
     /// Sets preconfigured SSH targets that can be used by `open_shell` with ssh backend.
-    pub fn ssh_servers(mut self, servers: Vec<SshServer>) -> Self {
+    pub fn ssh_servers(self, servers: Vec<SshServer>) -> Self {
         let _ = self.shell_sessions.set_ssh_servers(servers);
         self
     }
@@ -312,12 +312,6 @@ where
         self
     }
 
-    /// Adds a one-line builtin command hint.
-    pub fn builtin_tool_hint(mut self, hint: BuiltinToolHint) -> Self {
-        self.inner = self.inner.builtin_tool_hint(hint);
-        self
-    }
-
     /// Generates and sets the default system prompt using the built-in template.
     ///
     /// This should be called after all tools are registered.
@@ -379,9 +373,7 @@ where
 
         // Get directory paths
         let sandbox_dir = self.bash_tool.working_dir().display().to_string();
-        let user_cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+        let user_cwd = std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
 
         // Get system info
         let (os, os_version) = get_os_info();
@@ -654,7 +646,7 @@ where
     }
 
     /// Returns a mutable reference to the tool registry builder.
-    pub fn tool_registry_mut(&mut self) -> &mut ToolRegistryBuilder {
+    pub const fn tool_registry_mut(&mut self) -> &mut ToolRegistryBuilder {
         &mut self.registry_builder
     }
 
@@ -693,7 +685,7 @@ fn short_description(description: &str) -> String {
         .to_string()
 }
 
-/// Returns (os_name, os_version) for the current system.
+/// Returns (`os_name`, `os_version`) for the current system.
 fn get_os_info() -> (String, String) {
     #[cfg(target_os = "macos")]
     {
@@ -701,9 +693,7 @@ fn get_os_info() -> (String, String) {
             .arg("-productVersion")
             .output()
             .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+            .and_then(|o| String::from_utf8(o.stdout).ok()).map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
         ("macOS".to_string(), version)
     }
 

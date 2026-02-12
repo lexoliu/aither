@@ -29,37 +29,38 @@ pub use aither_core::llm::model::{Ability, ModelInfo, ModelTier};
 // Include generated code from build.rs
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
-/// Look up model info by ID or alias.
-///
-/// Performs matching in this order:
-/// 1. Exact match on canonical ID (case-insensitive)
-/// 2. Exact match on alias (case-insensitive)
-/// 3. Prefix match on canonical ID (e.g., "gpt-4o-2024-05-13" matches "gpt-4o")
+/// Resolve model ID or alias to canonical model ID.
 #[must_use]
-pub fn lookup(model_id: &str) -> Option<&'static ModelInfo> {
+fn canonical_model_id(model_id: &str) -> Option<&'static str> {
     let model_lower = model_id.to_lowercase();
 
-    // 1. Exact match on canonical ID
-    if let Some(info) = MODELS
+    if let Some((id, _, _, _)) = MODEL_META
         .iter()
-        .find(|m| m.id.eq_ignore_ascii_case(&model_lower))
+        .find(|(id, _, _, _)| id.eq_ignore_ascii_case(&model_lower))
     {
-        return Some(info);
+        return Some(*id);
     }
 
-    // 2. Check aliases (binary search since ALIASES is sorted)
     if let Ok(idx) = ALIASES.binary_search_by_key(&model_lower.as_str(), |(alias, _)| *alias) {
-        let canonical_id = ALIASES[idx].1;
-        if let Some(info) = MODELS.iter().find(|m| m.id == canonical_id) {
-            return Some(info);
-        }
+        return Some(ALIASES[idx].1);
     }
 
-    // 3. Prefix match - find the longest matching canonical ID
+    MODEL_META
+        .iter()
+        .filter(|(id, _, _, _)| model_lower.starts_with(&id.to_lowercase()))
+        .max_by_key(|(id, _, _, _)| id.len())
+        .map(|(id, _, _, _)| *id)
+}
+
+/// Look up LLM model info by ID or alias.
+///
+/// Non-LLM models (image/embedding/reranker) intentionally return `None` here.
+#[must_use]
+pub fn lookup(model_id: &str) -> Option<&'static ModelInfo> {
+    let canonical_id = canonical_model_id(model_id)?;
     MODELS
         .iter()
-        .filter(|m| model_lower.starts_with(&m.id.to_lowercase()))
-        .max_by_key(|m| m.id.len())
+        .find(|m| m.id.eq_ignore_ascii_case(canonical_id))
 }
 
 /// Get all models for a provider.
@@ -89,6 +90,162 @@ pub fn models_by_tier(tier: ModelTier) -> impl Iterator<Item = &'static ModelInf
 #[must_use]
 pub fn all_models() -> impl Iterator<Item = &'static ModelInfo> {
     MODELS.iter()
+}
+
+/// Returns metadata-only capability labels for a model id/alias.
+#[must_use]
+pub fn metadata_capabilities(model_id: &str) -> &'static [&'static str] {
+    let Some(id) = canonical_model_id(model_id) else {
+        return &[];
+    };
+
+    MODEL_CAPABILITIES
+        .iter()
+        .find_map(|(model_id, caps)| {
+            if model_id.eq_ignore_ascii_case(id) {
+                Some(*caps)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(&[])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelMeta {
+    pub kind: &'static str,
+    pub name: &'static str,
+    pub provider: &'static str,
+    pub context_window: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecializedMeta {
+    pub embedding_dimensions: Option<u32>,
+    pub image_max_resolution: Option<&'static str>,
+    pub reranker_max_documents: Option<u32>,
+}
+
+#[must_use]
+pub fn model_kind(model_id: &str) -> Option<&'static str> {
+    let id = canonical_model_id(model_id)?;
+    MODEL_KINDS.iter().find_map(|(model_id, kind)| {
+        if model_id.eq_ignore_ascii_case(id) {
+            Some(*kind)
+        } else {
+            None
+        }
+    })
+}
+
+#[must_use]
+pub fn model_meta(model_id: &str) -> Option<ModelMeta> {
+    let id = canonical_model_id(model_id)?;
+    MODEL_META
+        .iter()
+        .find_map(|(model_id, name, provider, context_window)| {
+            if model_id.eq_ignore_ascii_case(id) {
+                Some(ModelMeta {
+                    kind: model_kind(id).unwrap_or("llm"),
+                    name,
+                    provider,
+                    context_window: *context_window,
+                })
+            } else {
+                None
+            }
+        })
+}
+
+#[must_use]
+pub fn specialized_meta(model_id: &str) -> SpecializedMeta {
+    let Some(id) = canonical_model_id(model_id) else {
+        return SpecializedMeta {
+            embedding_dimensions: None,
+            image_max_resolution: None,
+            reranker_max_documents: None,
+        };
+    };
+
+    MODEL_SPECIALIZED_META
+        .iter()
+        .find_map(
+            |(model_id, embedding_dimensions, image_max_resolution, reranker_max_documents)| {
+                if model_id.eq_ignore_ascii_case(id) {
+                    Some(SpecializedMeta {
+                        embedding_dimensions: *embedding_dimensions,
+                        image_max_resolution: *image_max_resolution,
+                        reranker_max_documents: *reranker_max_documents,
+                    })
+                } else {
+                    None
+                }
+            },
+        )
+        .unwrap_or(SpecializedMeta {
+            embedding_dimensions: None,
+            image_max_resolution: None,
+            reranker_max_documents: None,
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReasoningMeta {
+    pub default_effort: Option<&'static str>,
+    pub adaptive_reasoning: bool,
+    pub budget_tokens_min: Option<u32>,
+    pub budget_tokens_max: Option<u32>,
+}
+
+#[must_use]
+pub fn reasoning_efforts(model_id: &str) -> &'static [&'static str] {
+    let Some(id) = canonical_model_id(model_id) else {
+        return &[];
+    };
+
+    MODEL_REASONING_EFFORTS
+        .iter()
+        .find_map(|(model_id, efforts)| {
+            if model_id.eq_ignore_ascii_case(id) {
+                Some(*efforts)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(&[])
+}
+
+#[must_use]
+pub fn reasoning_meta(model_id: &str) -> ReasoningMeta {
+    let Some(id) = canonical_model_id(model_id) else {
+        return ReasoningMeta {
+            default_effort: None,
+            adaptive_reasoning: false,
+            budget_tokens_min: None,
+            budget_tokens_max: None,
+        };
+    };
+
+    MODEL_REASONING_META
+        .iter()
+        .find_map(|(model_id, default_effort, adaptive_reasoning, min, max)| {
+            if model_id.eq_ignore_ascii_case(id) {
+                Some(ReasoningMeta {
+                    default_effort: *default_effort,
+                    adaptive_reasoning: *adaptive_reasoning,
+                    budget_tokens_min: *min,
+                    budget_tokens_max: *max,
+                })
+            } else {
+                None
+            }
+        })
+        .unwrap_or(ReasoningMeta {
+            default_effort: None,
+            adaptive_reasoning: false,
+            budget_tokens_min: None,
+            budget_tokens_max: None,
+        })
 }
 
 #[cfg(test)]

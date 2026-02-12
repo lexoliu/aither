@@ -55,22 +55,22 @@ impl LanguageModelProvider for GeminiProvider {
             }
 
             let mut backend = client();
-            let mut builder = backend.get(endpoint).map_err(|e| GeminiError::Http(e))?;
+            let mut builder = backend.get(endpoint).map_err(GeminiError::Http)?;
 
             if cfg.auth == AuthMode::Header {
                 builder = builder
                     .header("x-goog-api-key", cfg.api_key.clone())
-                    .map_err(|e| GeminiError::Http(e))?;
+                    .map_err(GeminiError::Http)?;
             }
 
             let response: ModelListResponse =
-                builder.json().await.map_err(|e| GeminiError::Http(e))?;
+                builder.json().await.map_err(GeminiError::Http)?;
 
             Ok(response
                 .models
                 .into_iter()
                 .map(|model| {
-                    let display_name = model
+                    let _display_name = model
                         .display_name
                         .clone()
                         .unwrap_or_else(|| model.name.clone());

@@ -226,7 +226,7 @@ where
     }
 
     /// Returns a reference to the underlying store.
-    pub fn store(&self) -> &RagStore<M> {
+    pub const fn store(&self) -> &RagStore<M> {
         &self.store
     }
 
@@ -261,7 +261,7 @@ impl<M: EmbeddingModel> std::fmt::Debug for RagBuilder<M> {
             .field("config_builder", &self.config_builder)
             .field(
                 "chunker",
-                &self.chunker.as_ref().map(|c| c.name()).unwrap_or("default"),
+                &self.chunker.as_ref().map_or("default", |c| c.name()),
             )
             .finish_non_exhaustive()
     }
@@ -418,7 +418,7 @@ mod tests {
         fs::write(data_dir.path().join("file1.txt"), "Hello world").unwrap();
         fs::write(data_dir.path().join("file2.txt"), "Goodbye world").unwrap();
 
-        let mut rag = Rag::builder(embedder)
+        let rag = Rag::builder(embedder)
             .index_path(index_dir.path().join("index.redb"))
             .auto_save(false)
             .build()
@@ -451,7 +451,7 @@ mod tests {
         // Create and populate
         {
             let embedder = MockEmbedder::new(4);
-            let mut rag = Rag::builder(embedder)
+            let rag = Rag::builder(embedder)
                 .index_path(index_dir.path().join("index.redb"))
                 .build()
                 .unwrap();

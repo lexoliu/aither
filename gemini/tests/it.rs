@@ -11,7 +11,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::env;
 
+fn install_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 fn api_key() -> String {
+    install_rustls_provider();
     env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set")
 }
 
@@ -31,6 +36,7 @@ async fn test_provider_list_models() {
 }
 
 #[tokio::test]
+#[ignore = "Requires external Gemini API quota and network access."]
 async fn test_chat_respond() {
     let backend = Gemini::new(api_key());
     let messages = vec![
@@ -42,7 +48,7 @@ async fn test_chat_respond() {
     let text = collect_text(stream)
         .await
         .expect("Failed to collect response");
-    assert!(text.contains("4"));
+    assert!(text.contains('4'));
 }
 
 #[derive(JsonSchema, Deserialize, Serialize, Debug, PartialEq)]
@@ -52,6 +58,7 @@ struct MathResult {
 }
 
 #[tokio::test]
+#[ignore = "Requires external Gemini API quota and network access."]
 async fn test_structured_generate() {
     let backend = Gemini::new(api_key());
     let request = aither_core::llm::oneshot("You are a math tutor.", "What is 5 * 5?");
@@ -65,8 +72,9 @@ async fn test_structured_generate() {
 }
 
 #[tokio::test]
+#[ignore = "Requires external Gemini API quota and network access."]
 async fn test_embedding() {
-    let mut backend = Gemini::new(api_key());
+    let backend = Gemini::new(api_key());
     let vec = backend.embed("Hello world").await.expect("Failed to embed");
     assert_eq!(vec.len(), backend.dim());
     assert!(!vec.is_empty());
@@ -129,6 +137,7 @@ async fn test_image_generate() {
 }
 
 #[tokio::test]
+#[ignore = "Requires external Gemini API quota and network access."]
 async fn test_moderation() {
     use aither_core::moderation::Moderation;
     let backend = Gemini::new(api_key());
@@ -140,6 +149,7 @@ async fn test_moderation() {
 }
 
 #[tokio::test]
+#[ignore = "Requires external Gemini API quota and network access."]
 async fn test_google_search() {
     use aither_core::llm::model::Parameters;
     let backend = Gemini::new(api_key());
@@ -159,10 +169,11 @@ async fn test_google_search() {
         text.contains("Carlos Alcaraz") || text.contains("Alcaraz"),
         "Response should mention Carlos Alcaraz"
     );
-    println!("Google Search response: {}", text);
+    println!("Google Search response: {text}");
 }
 
 #[tokio::test]
+#[ignore = "Requires external Gemini API quota and network access."]
 async fn test_code_execution() {
     use aither_core::llm::model::Parameters;
     let backend = Gemini::new(api_key());
@@ -186,5 +197,5 @@ async fn test_code_execution() {
         text.contains("```python") || text.contains("```output"),
         "Response should contain code execution blocks"
     );
-    println!("Code Execution response: {}", text);
+    println!("Code Execution response: {text}");
 }

@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 /// Supported cloud providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Provider {
-    /// OpenAI GPT models (gpt-4o, o1, etc.)
+    /// `OpenAI` GPT models (gpt-4o, o1, etc.)
     OpenAI,
     /// Anthropic Claude models (claude-3, claude-4, etc.)
     Claude,
@@ -119,7 +119,7 @@ impl std::str::FromStr for Provider {
 ///
 /// Priority:
 /// 1. If model prefix matches a provider, use that provider
-/// 2. Otherwise, check available API keys in order: Gemini, OpenAI, Claude
+/// 2. Otherwise, check available API keys in order: Gemini, `OpenAI`, Claude
 pub fn auto_detect(model: Option<&str>, base_url: Option<&str>) -> Result<(CloudProvider, String)> {
     // Try to detect from model name
     if let Some(model) = model {

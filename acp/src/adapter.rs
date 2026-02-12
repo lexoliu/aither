@@ -61,7 +61,7 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
                 kind: None,
                 locations: None,
                 raw_input: None,
-                raw_output: output.map(|s| serde_json::Value::String(s)),
+                raw_output: output.map(serde_json::Value::String),
             }))
         }
 
@@ -69,6 +69,7 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
         AgentEvent::TurnComplete { .. } => None,
         AgentEvent::Complete { .. } => None,
         AgentEvent::Error(_) => None,
+        AgentEvent::Usage(_) => None,
     }
 }
 

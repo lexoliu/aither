@@ -137,7 +137,10 @@ mod tests {
         Skill {
             name: name.to_string(),
             description: format!("{name} description"),
-            triggers: triggers.iter().map(|s| s.to_string()).collect(),
+            triggers: triggers
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             instructions: String::new(),
             allowed_tools: None,
             resources: std::collections::HashMap::new(),
@@ -152,11 +155,11 @@ mod tests {
         ];
 
         let matcher = SkillMatcher::new();
-        let matches = matcher.match_prompt("please review this code", &skills);
+        let found = matcher.match_prompt("please review this code", &skills);
 
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].skill.name, "code-review");
-        assert_eq!(matches[0].matched_trigger, Some("review".to_string()));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].skill.name, "code-review");
+        assert_eq!(found[0].matched_trigger, Some("review".to_string()));
     }
 
     #[test]
@@ -164,11 +167,11 @@ mod tests {
         let skills = vec![make_skill("code-review", &[])];
 
         let matcher = SkillMatcher::new();
-        let matches = matcher.match_prompt("run code-review", &skills);
+        let found = matcher.match_prompt("run code-review", &skills);
 
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].skill.name, "code-review");
-        assert!(matches[0].matched_trigger.is_none());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].skill.name, "code-review");
+        assert!(found[0].matched_trigger.is_none());
     }
 
     #[test]
@@ -176,9 +179,9 @@ mod tests {
         let skills = vec![make_skill("code-review", &["Review"])];
 
         let matcher = SkillMatcher::new();
-        let matches = matcher.match_prompt("REVIEW this code", &skills);
+        let found = matcher.match_prompt("REVIEW this code", &skills);
 
-        assert_eq!(matches.len(), 1);
+        assert_eq!(found.len(), 1);
     }
 
     #[test]
@@ -186,9 +189,9 @@ mod tests {
         let skills = vec![make_skill("code-review", &["review"])];
 
         let matcher = SkillMatcher::new();
-        let matches = matcher.match_prompt("write some tests", &skills);
+        let found = matcher.match_prompt("write some tests", &skills);
 
-        assert!(matches.is_empty());
+        assert!(found.is_empty());
     }
 
     #[test]
@@ -197,21 +200,21 @@ mod tests {
 
         // High threshold - short trigger won't match long prompt
         let matcher = SkillMatcher::new().with_threshold(0.9);
-        let matches = matcher.match_prompt(
+        let found = matcher.match_prompt(
             "this is a very long prompt that mentions test somewhere",
             &skills,
         );
 
-        assert!(matches.is_empty());
+        assert!(found.is_empty());
 
         // Low threshold - will match
         let matcher = SkillMatcher::new().with_threshold(0.3);
-        let matches = matcher.match_prompt(
+        let found = matcher.match_prompt(
             "this is a very long prompt that mentions test somewhere",
             &skills,
         );
 
-        assert_eq!(matches.len(), 1);
+        assert_eq!(found.len(), 1);
     }
 
     #[test]
@@ -222,10 +225,10 @@ mod tests {
         ];
 
         let matcher = SkillMatcher::new().with_threshold(0.0);
-        let matches = matcher.match_prompt("do a security code review", &skills);
+        let found = matcher.match_prompt("do a security code review", &skills);
 
         // More specific match should be first
-        assert!(matches.len() >= 1);
-        assert_eq!(matches[0].skill.name, "specific");
+        assert!(!found.is_empty());
+        assert_eq!(found[0].skill.name, "specific");
     }
 }

@@ -133,13 +133,13 @@ When reviewing code, follow these steps:
 
     #[test]
     fn test_parse_skill_no_tools() {
-        let content = r#"---
+        let content = r"---
 name: simple
 description: A simple skill
 ---
 
 Instructions here.
-"#;
+";
 
         let skill = Skill::parse(content).unwrap();
         assert_eq!(skill.name, "simple");

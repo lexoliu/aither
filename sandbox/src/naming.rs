@@ -8,7 +8,7 @@ use uuid::Uuid;
 /// # Panics
 ///
 /// Panics if `words` is zero.
-pub(crate) fn random_word_slug(words: usize) -> String {
+pub fn random_word_slug(words: usize) -> String {
     assert!(words > 0, "word count must be positive");
     let id = Uuid::new_v4();
     humanize(&id, words)

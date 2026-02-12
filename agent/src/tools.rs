@@ -39,7 +39,7 @@ impl std::fmt::Debug for AgentTools {
 impl AgentTools {
     /// Creates a new empty tools registry.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             eager: CoreTools::new(),
             #[cfg(feature = "mcp")]
@@ -87,7 +87,7 @@ impl AgentTools {
             for conn in &self.mcp {
                 defs.extend(conn.definitions());
             }
-            return defs;
+            defs
         }
 
         #[cfg(not(feature = "mcp"))]
@@ -147,7 +147,7 @@ impl AgentTools {
     }
 
     /// Returns a mutable reference to the underlying eager tools.
-    pub fn eager_mut(&mut self) -> &mut CoreTools {
+    pub const fn eager_mut(&mut self) -> &mut CoreTools {
         &mut self.eager
     }
 
@@ -162,7 +162,7 @@ impl AgentTools {
     /// Returns the number of registered MCP connections.
     #[cfg(feature = "mcp")]
     #[must_use]
-    pub fn mcp_count(&self) -> usize {
+    pub const fn mcp_count(&self) -> usize {
         self.mcp.len()
     }
 
@@ -170,10 +170,10 @@ impl AgentTools {
     #[cfg(feature = "mcp")]
     #[must_use]
     pub fn mcp_definitions(&self) -> Vec<ToolDefinition> {
-        self.mcp.iter().flat_map(|c| c.definitions()).collect()
+        self.mcp.iter().flat_map(aither_mcp::McpToolService::definitions).collect()
     }
 
-    /// Merge another AgentTools into this one.
+    /// Merge another `AgentTools` into this one.
     ///
     /// Note: MCP connections are not cloned (they would require ownership transfer).
     pub fn merge(&mut self, _other: Self) {

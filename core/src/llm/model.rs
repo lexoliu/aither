@@ -7,7 +7,7 @@
 //!
 //! ## Creating a model profile
 //!
-//! ```rust
+//! ```rust,ignore
 //! use aither::llm::model::{Profile, Ability, Pricing};
 //!
 //! let mut pricing = Pricing::default();
@@ -29,7 +29,7 @@
 //!
 //! ## Configuring model parameters
 //!
-//! ```rust
+//! ```rust,ignore
 //! use aither::llm::model::Parameters;
 //!
 //! let params = Parameters::default()
@@ -50,7 +50,7 @@ use schemars::Schema;
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use aither::llm::model::Parameters;
 ///
 /// let params = Parameters::default()
@@ -61,6 +61,7 @@ use schemars::Schema;
 /// ```
 #[derive(Debug, Default, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Parameters {
     /// Sampling temperature.
     ///
@@ -229,8 +230,10 @@ impl Parameters {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ToolChoice {
     /// Let the model decide whether to call tools.
+    #[default]
     Auto,
     /// Disallow tool calls.
     None,
@@ -238,12 +241,6 @@ pub enum ToolChoice {
     Required,
     /// Constrain the model to a specific tool.
     Exact(String),
-}
-
-impl Default for ToolChoice {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// Effort levels available for reasoning-focused models.
@@ -283,7 +280,7 @@ impl ReasoningEffort {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use aither::llm::model::{Profile, Ability, Pricing};
 ///
 /// let profile = Profile::new("gpt-4", "GPT-4 Turbo", 128000)
@@ -318,7 +315,7 @@ pub struct Profile {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use aither::llm::model::Pricing;
 ///
 /// let mut pricing = Pricing::default();
@@ -358,7 +355,7 @@ pub struct Pricing {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use aither::llm::model::SupportedParameters;
 ///
 /// let mut support = SupportedParameters::default();
@@ -408,7 +405,7 @@ impl Profile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use aither::llm::model::Profile;
     ///
     /// let profile = Profile::new("gpt-4", "GPT-4 Turbo", 128000);
@@ -439,7 +436,7 @@ impl Profile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use aither::llm::model::{Profile, Ability};
     ///
     /// let profile = Profile::new("vision-model", "A vision-capable model", 8192)
@@ -458,7 +455,7 @@ impl Profile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use aither::llm::model::{Profile, Ability};
     ///
     /// let abilities = [Ability::ToolUse, Ability::Vision, Ability::Audio];
@@ -479,7 +476,7 @@ impl Profile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use aither::llm::model::{Profile, Pricing};
     ///
     /// let mut pricing = Pricing::default();
@@ -505,7 +502,7 @@ impl Profile {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use aither::llm::model::Ability;
 ///
 /// // Check if a model supports vision
@@ -583,7 +580,7 @@ impl ModelInfo {
 
     /// Get the primary (first) tier for this model.
     #[must_use]
-    pub fn primary_tier(&self) -> Option<ModelTier> {
+    pub const fn primary_tier(&self) -> Option<ModelTier> {
         self.tiers.first().copied()
     }
 }

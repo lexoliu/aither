@@ -62,7 +62,7 @@ impl From<EntryData> for IndexEntry {
             data.chunk_content_hash,
             metadata,
         );
-        IndexEntry::new(chunk, data.embedding)
+        Self::new(chunk, data.embedding)
     }
 }
 

@@ -15,27 +15,19 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use aither::{LanguageModel, llm::{Message, Request, model::Parameters}};
+//! use aither::{LanguageModel, llm::{LLMRequest, Message, collect_text, model::Parameters}};
 //! use aither_openai::OpenAI;
-//! use futures_lite::{StreamExt, future::poll_fn};
-//! use core::pin::Pin;
 //!
 //! async fn demo(api_key: &str) -> aither::Result<String> {
 //!     let model = OpenAI::new(api_key);
-//!     let request = Request::new([
+//!     let request = LLMRequest::new([
 //!         Message::system("You are a creative assistant."),
-//!         Message::user("Plan a day of food in Osaka.")
+//!         Message::user("Plan a day of food in Osaka."),
 //!     ])
 //!     .with_parameters(Parameters::default().include_reasoning(true));
 //!
-//!     let mut response = model.respond(request);
-//!     while let Some(step) = poll_fn(|cx| Pin::new(&mut response).poll_reasoning_next(cx)).await {
-//!         eprintln!("thinking: {}", step?);
-//!     }
-//!     let mut answer = String::new();
-//!     while let Some(chunk) = response.next().await {
-//!         answer.push_str(&chunk?);
-//!     }
+//!     let response = model.respond(request);
+//!     let answer = collect_text(response).await?;
 //!     Ok(answer)
 //! }
 //! ```

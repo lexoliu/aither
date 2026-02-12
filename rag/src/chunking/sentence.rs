@@ -35,13 +35,13 @@ impl SentenceChunker {
     /// # Arguments
     /// * `max_chunk_size` - Maximum characters per chunk
     #[must_use]
-    pub fn new(max_chunk_size: usize) -> Self {
+    pub const fn new(max_chunk_size: usize) -> Self {
         Self { max_chunk_size }
     }
 
     /// Creates a chunker with default settings (512 chars).
     #[must_use]
-    pub fn default_settings() -> Self {
+    pub const fn default_settings() -> Self {
         Self::new(512)
     }
 }

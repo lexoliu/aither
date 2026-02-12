@@ -78,8 +78,7 @@ pub use compression::{
     CompressionLevel, ContextStrategy, PreserveConfig, PreservedContent, SmartCompressionConfig,
 };
 pub use config::{
-    AgentConfig, AgentKind, BuiltinToolHint, ContextAssemblerConfig, ContextBlock,
-    ContextBlockPriority,
+    AgentConfig, AgentKind, ContextAssemblerConfig, ContextBlock, ContextBlockPriority,
 };
 pub use context::{ConversationMemory, MemoryCheckpoint};
 pub use error::AgentError;

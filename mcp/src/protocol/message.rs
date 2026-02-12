@@ -115,7 +115,7 @@ impl JsonRpcResponse {
 
     /// Check if this response is an error.
     #[must_use]
-    pub fn is_error(&self) -> bool {
+    pub const fn is_error(&self) -> bool {
         self.error.is_some()
     }
 
@@ -178,25 +178,25 @@ pub enum JsonRpcMessage {
 impl JsonRpcMessage {
     /// Check if this is a request.
     #[must_use]
-    pub fn is_request(&self) -> bool {
+    pub const fn is_request(&self) -> bool {
         matches!(self, Self::Request(_))
     }
 
     /// Check if this is a response.
     #[must_use]
-    pub fn is_response(&self) -> bool {
+    pub const fn is_response(&self) -> bool {
         matches!(self, Self::Response(_))
     }
 
     /// Check if this is a notification.
     #[must_use]
-    pub fn is_notification(&self) -> bool {
+    pub const fn is_notification(&self) -> bool {
         matches!(self, Self::Notification(_))
     }
 
     /// Try to get as a request.
     #[must_use]
-    pub fn as_request(&self) -> Option<&JsonRpcRequest> {
+    pub const fn as_request(&self) -> Option<&JsonRpcRequest> {
         match self {
             Self::Request(req) => Some(req),
             _ => None,
@@ -205,7 +205,7 @@ impl JsonRpcMessage {
 
     /// Try to get as a response.
     #[must_use]
-    pub fn as_response(&self) -> Option<&JsonRpcResponse> {
+    pub const fn as_response(&self) -> Option<&JsonRpcResponse> {
         match self {
             Self::Response(res) => Some(res),
             _ => None,
@@ -214,7 +214,7 @@ impl JsonRpcMessage {
 
     /// Try to get as a notification.
     #[must_use]
-    pub fn as_notification(&self) -> Option<&JsonRpcNotification> {
+    pub const fn as_notification(&self) -> Option<&JsonRpcNotification> {
         match self {
             Self::Notification(notif) => Some(notif),
             _ => None,

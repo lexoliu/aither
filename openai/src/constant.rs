@@ -67,7 +67,7 @@ pub const GPT4O_MINI: &str = "gpt-4o-mini";
 
 /// Dynamic alias used by `ChatGPT` for “best available 4o”.
 ///
-/// OpenAI recommends using non-ChatGPT model identifiers for API usage.
+/// `OpenAI` recommends using non-ChatGPT model identifiers for API usage.
 pub const CHATGPT_4O_LATEST: &str = "chatgpt-4o-latest";
 
 // ============================================================

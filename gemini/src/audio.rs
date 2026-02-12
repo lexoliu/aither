@@ -110,7 +110,7 @@ fn handle_audio_result(result: Result<Vec<u8>, GeminiError>, context: &'static s
     match result {
         Ok(bytes) => bytes,
         Err(err) => {
-            eprintln!("Gemini audio {context} failed: {err}");
+            tracing::error!("Gemini audio {context} failed: {err}");
             Vec::new()
         }
     }
@@ -120,7 +120,7 @@ fn handle_transcription_result(result: Result<String, GeminiError>) -> String {
     match result {
         Ok(text) => text,
         Err(err) => {
-            eprintln!("Gemini transcription failed: {err}");
+            tracing::error!("Gemini transcription failed: {err}");
             String::new()
         }
     }

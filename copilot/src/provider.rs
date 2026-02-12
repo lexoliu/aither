@@ -1,6 +1,10 @@
 //! Copilot provider for listing and instantiating models.
 
-use crate::{Copilot, constant::COPILOT_BASE_URL, error::CopilotError};
+use crate::{
+    Copilot,
+    constant::{COPILOT_BASE_URL, COPILOT_INTEGRATION_ID, EDITOR_VERSION},
+    error::CopilotError,
+};
 use aither_core::llm::{
     LanguageModelProvider, model::Profile as ModelProfile, provider::Profile as ProviderProfile,
 };
@@ -21,6 +25,8 @@ impl CopilotProvider {
             inner: Arc::new(ProviderConfig {
                 token: token.into(),
                 base_url: COPILOT_BASE_URL.to_string(),
+                editor_version: EDITOR_VERSION.to_string(),
+                integration_id: COPILOT_INTEGRATION_ID.to_string(),
             }),
         }
     }
@@ -49,6 +55,14 @@ impl LanguageModelProvider for CopilotProvider {
                     header::AUTHORIZATION.as_str(),
                     format!("Bearer {}", cfg.token),
                 )
+                .map_err(CopilotError::Http)?
+                .header(header::USER_AGENT.as_str(), "aither-copilot/0.1")
+                .map_err(CopilotError::Http)?
+                .header(header::ACCEPT.as_str(), "application/json")
+                .map_err(CopilotError::Http)?
+                .header("Editor-Version", cfg.editor_version.clone())
+                .map_err(CopilotError::Http)?
+                .header("Copilot-Integration-Id", cfg.integration_id.clone())
                 .map_err(CopilotError::Http)?
                 .json()
                 .await
@@ -92,6 +106,8 @@ impl LanguageModelProvider for CopilotProvider {
 struct ProviderConfig {
     token: String,
     base_url: String,
+    editor_version: String,
+    integration_id: String,
 }
 
 #[derive(Debug, Deserialize)]

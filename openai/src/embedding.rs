@@ -27,15 +27,15 @@ async fn embed_once(cfg: Arc<Config>, input: String) -> Result<Vec<f32>, OpenAIE
     let mut backend = client();
     let mut builder = backend
         .post(endpoint)
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(header::AUTHORIZATION.as_str(), cfg.request_auth())
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(header::USER_AGENT.as_str(), "aither-openai/0.1")
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
     if let Some(org) = &cfg.organization {
         builder = builder
             .header("OpenAI-Organization", org.clone())
-            .map_err(|e| OpenAIError::Http(e))?;
+            .map_err(OpenAIError::Http)?;
     }
     let request = EmbeddingRequest {
         model: &cfg.embedding_model,
@@ -44,10 +44,10 @@ async fn embed_once(cfg: Arc<Config>, input: String) -> Result<Vec<f32>, OpenAIE
     };
     let response: EmbeddingResponse = builder
         .json_body(&request)
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .json()
         .await
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
     response
         .data
         .into_iter()

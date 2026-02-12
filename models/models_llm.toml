@@ -1,10 +1,4 @@
-# Model Registry Database
-# This file contains metadata for popular LLM models.
-# Edit this file to add or update models.
-
-# =============================================================================
-# OpenAI Models
-# =============================================================================
+# LLM model registry
 
 [[models]]
 id = "gpt-5.2"
@@ -17,47 +11,6 @@ tier = "flagship"
 capabilities = ["vision", "tool_use", "audio", "reasoning"]
 reasoning_efforts = ["low", "medium", "high", "xhigh"]
 reasoning_effort_default = "high"
-
-[[models]]
-id = "gpt-image-1.5"
-aliases = ["gpt-image-latest"]
-name = "GPT Image 1.5"
-provider = "openai"
-context_window = 32_768
-max_output_tokens = 8_192
-tier = "balanced"
-capabilities = ["image_generation"]
-
-[[models]]
-id = "text-embedding-3-large"
-aliases = []
-name = "Text Embedding 3 Large"
-provider = "openai"
-context_window = 8_192
-max_output_tokens = 8_192
-tier = "fast"
-capabilities = ["embedding"]
-
-[[models]]
-id = "text-embedding-3-small"
-aliases = []
-name = "Text Embedding 3 Small"
-provider = "openai"
-context_window = 8_192
-max_output_tokens = 8_192
-tier = "fast"
-capabilities = ["embedding"]
-
-[[models]]
-id = "text-embedding-ada-002"
-aliases = []
-name = "Text Embedding Ada 002"
-provider = "openai"
-context_window = 8_192
-max_output_tokens = 8_192
-tier = "fast"
-outdated = true
-capabilities = ["embedding"]
 
 [[models]]
 id = "gpt-4.1"
@@ -193,10 +146,6 @@ max_output_tokens = 100_000
 tier = "balanced"
 capabilities = ["vision", "tool_use", "reasoning"]
 
-# =============================================================================
-# Anthropic Claude Models
-# =============================================================================
-
 [[models]]
 id = "claude-opus-4.5"
 aliases = ["claude-opus-4-5", "claude-opus-4-5-20251101"]
@@ -209,7 +158,7 @@ capabilities = ["vision", "tool_use", "pdf", "reasoning"]
 reasoning_efforts = ["none", "low", "medium", "high"]
 reasoning_effort_default = "high"
 adaptive_reasoning = true
-reasoning_budget_tokens_min = 1024
+reasoning_budget_tokens_min = 1_024
 reasoning_budget_tokens_max = 32_768
 
 [[models]]
@@ -224,7 +173,7 @@ capabilities = ["vision", "tool_use", "pdf", "reasoning"]
 reasoning_efforts = ["none", "low", "medium", "high", "max"]
 reasoning_effort_default = "high"
 adaptive_reasoning = true
-reasoning_budget_tokens_min = 1024
+reasoning_budget_tokens_min = 1_024
 reasoning_budget_tokens_max = 64_000
 
 [[models]]
@@ -236,6 +185,9 @@ context_window = 200_000
 max_output_tokens = 64_000
 tier = "balanced"
 capabilities = ["vision", "tool_use", "pdf", "reasoning"]
+reasoning_efforts = ["none", "low", "medium", "high"]
+reasoning_effort_default = "high"
+adaptive_reasoning = true
 
 [[models]]
 id = "claude-haiku-4.5"
@@ -346,10 +298,6 @@ tier = "balanced"
 capabilities = []
 outdated = true
 
-# =============================================================================
-# Google Gemini Models
-# =============================================================================
-
 [[models]]
 id = "gemini-3-pro-preview"
 aliases = ["gemini-3-pro"]
@@ -363,16 +311,6 @@ reasoning_efforts = ["low", "high"]
 reasoning_effort_default = "high"
 
 [[models]]
-id = "gemini-3-pro-image-preview"
-aliases = ["gemini-3-pro-image", "nano-banana-pro"]
-name = "Gemini 3 Pro Image Preview"
-provider = "google"
-context_window = 65_536
-max_output_tokens = 32_768
-tier = "balanced"
-capabilities = ["image_generation", "vision"]
-
-[[models]]
 id = "gemini-3-flash-preview"
 aliases = ["gemini-3-flash"]
 name = "Gemini 3 Flash Preview"
@@ -382,7 +320,6 @@ max_output_tokens = 65_536
 tiers = ["balanced", "fast"]
 capabilities = ["vision", "tool_use", "audio", "video", "pdf", "reasoning"]
 
-# Legacy models below - kept for compatibility but not recommended
 [[models]]
 id = "gemini-2.5-pro"
 aliases = ["gemini-2.5-pro-preview-05-06"]
@@ -424,8 +361,8 @@ provider = "google"
 context_window = 2_097_152
 max_output_tokens = 8_192
 tier = "flagship"
-outdated = true
 capabilities = ["vision", "tool_use", "audio", "video", "pdf"]
+outdated = true
 
 [[models]]
 id = "gemini-1.5-flash"
@@ -435,8 +372,8 @@ provider = "google"
 context_window = 1_048_576
 max_output_tokens = 8_192
 tier = "fast"
-outdated = true
 capabilities = ["vision", "tool_use", "audio", "video", "pdf"]
+outdated = true
 
 [[models]]
 id = "gemini-1.0-pro"
@@ -446,12 +383,8 @@ provider = "google"
 context_window = 32_768
 max_output_tokens = 8_192
 tier = "balanced"
-outdated = true
 capabilities = ["tool_use"]
-
-# =============================================================================
-# DeepSeek Models
-# =============================================================================
+outdated = true
 
 [[models]]
 id = "deepseek-v3"
@@ -496,20 +429,6 @@ tier = "flagship"
 capabilities = ["tool_use", "reasoning"]
 reasoning_efforts = ["low", "medium", "high"]
 reasoning_effort_default = "high"
-
-[[models]]
-id = "deepseek-embed-v3"
-aliases = ["deepseek-embedding-v3"]
-name = "DeepSeek Embed V3"
-provider = "deepseek"
-context_window = 8_192
-max_output_tokens = 8_192
-tier = "fast"
-capabilities = ["embedding"]
-
-# =============================================================================
-# Mistral Models
-# =============================================================================
 
 [[models]]
 id = "mistral-large"
@@ -561,10 +480,6 @@ max_output_tokens = 8_192
 tier = "flagship"
 capabilities = ["vision", "tool_use"]
 
-# =============================================================================
-# Meta Llama Models
-# =============================================================================
-
 [[models]]
 id = "llama-3.3-70b"
 aliases = ["llama-3.3-70b-instruct"]
@@ -615,10 +530,6 @@ max_output_tokens = 8_192
 tier = "fast"
 capabilities = ["tool_use"]
 
-# =============================================================================
-# xAI Grok Models
-# =============================================================================
-
 [[models]]
 id = "grok-4"
 aliases = ["grok-4-0709"]
@@ -665,7 +576,6 @@ max_output_tokens = 16_384
 tier = "fast"
 capabilities = ["tool_use", "reasoning"]
 
-# Legacy models
 [[models]]
 id = "grok-2"
 aliases = ["grok-2-1212"]
@@ -676,10 +586,6 @@ max_output_tokens = 8_192
 tier = "balanced"
 capabilities = ["vision", "tool_use"]
 outdated = true
-
-# =============================================================================
-# Qwen Models
-# =============================================================================
 
 [[models]]
 id = "qwen3-235b"

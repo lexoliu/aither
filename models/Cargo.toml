@@ -6,6 +6,7 @@ rust-version = "1.87"
 description = "Model registry with capabilities, context windows, and metadata for popular LLMs"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/phaedrus-ai/aither"
+readme = "../README.md"
 keywords = ["llm", "ai", "models", "registry"]
 categories = ["data-structures"]
 

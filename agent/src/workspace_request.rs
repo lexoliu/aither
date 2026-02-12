@@ -66,7 +66,8 @@ pub struct RequestWorkspaceTool {
 
 impl RequestWorkspaceTool {
     /// Create a new workspace request tool.
-    pub fn new(broker: WorkspaceRequestBroker) -> Self {
+    #[must_use] 
+    pub const fn new(broker: WorkspaceRequestBroker) -> Self {
         Self { broker }
     }
 }
@@ -85,6 +86,6 @@ impl Tool for RequestWorkspaceTool {
             reason: args.reason,
             approved,
         };
-        Ok(ToolOutput::json(&access)?)
+        ToolOutput::json(&access)
     }
 }

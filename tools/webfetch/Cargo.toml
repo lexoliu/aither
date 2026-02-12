@@ -22,6 +22,7 @@ zenwave.workspace = true
 tracing.workspace = true
 regex = "1.11"
 html-escape = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Image processing for format conversion
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }

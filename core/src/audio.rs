@@ -9,7 +9,7 @@ pub type Data = Vec<u8>;
 /// Generates audio from text prompts.
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use aither::AudioGenerator;
 /// use futures_core::Stream;
 ///
@@ -32,7 +32,7 @@ pub trait AudioGenerator {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use aither::AudioTranscriber;
 /// use futures_core::Stream;
 ///

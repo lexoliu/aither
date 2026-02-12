@@ -2,29 +2,24 @@
 //! HTTP client and the shared `aither-core` abstractions.
 //!
 //! By default this client uses the Responses API. The legacy `chat.completions`
-//! endpoint is still available via [`OpenAI::builder`], but OpenAI has deprecated it.
+//! endpoint is still available via [`OpenAI::builder`], but `OpenAI` has deprecated it.
 //! If you must keep using `max_tokens`, enable the legacy compatibility flag on the builder.
 //!
 //! ```no_run
-//! use aither_core::{LanguageModel, llm::{Message, Tools, model::Parameters}};
+//! use aither_core::{LanguageModel, llm::{LLMRequest, Message, collect_text, model::Parameters}};
 //! use aither_openai::OpenAI;
-//! use futures_lite::StreamExt;
 //!
-//! # async fn demo() -> anyhow::Result<()> {
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! let model = OpenAI::new(std::env::var("OPENAI_API_KEY")?)
 //!     .with_model("gpt-4o-mini");
 //!
-//! let messages = [
+//! let request = LLMRequest::new([
 //!     Message::system("You are a concise assistant."),
 //!     Message::user("Explain the Rust ownership model in one paragraph."),
-//! ];
-//! let mut tools = Tools::new();
-//! let params = Parameters::default();
-//! let mut stream = model.respond(&messages, &mut tools, &params);
-//! let mut collected = String::new();
-//! while let Some(chunk) = stream.next().await {
-//!     collected.push_str(&chunk?);
-//! }
+//! ])
+//! .with_parameters(Parameters::default());
+//! let stream = model.respond(request);
+//! let collected = collect_text(stream).await?;
 //! println!("{collected}");
 //! # Ok(()) }
 //! ```

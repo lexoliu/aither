@@ -10,7 +10,7 @@ use crate::files::{FilePurpose, FilesConfig, upload_file};
 use crate::mime::mime_from_path;
 
 #[derive(Clone, Copy)]
-pub(crate) struct OpenAIFileKind(&'static str);
+pub struct OpenAIFileKind(&'static str);
 
 impl OpenAIFileKind {
     pub(crate) const IMAGE: Self = Self("image");
@@ -21,7 +21,7 @@ impl OpenAIFileKind {
     }
 }
 
-pub(crate) async fn resolve_messages(
+pub async fn resolve_messages(
     cfg: &Config,
     messages: Vec<Message>,
 ) -> Result<Vec<Message>, OpenAIError> {
@@ -77,7 +77,7 @@ async fn resolve_attachment(
 ) -> Result<ResolvedUrl, OpenAIError> {
     match attachment.scheme() {
         "file" => {
-            let path = attachment.to_file_path().map_err(|_| {
+            let path = attachment.to_file_path().map_err(|()| {
                 OpenAIError::Api("Attachment file URL could not be converted to path".to_string())
             })?;
             resolve_file_attachment(cfg, cache, &path).await
@@ -165,7 +165,7 @@ fn build_openai_file_url(kind: OpenAIFileKind, id: &str) -> Result<Url, OpenAIEr
     Url::parse(&raw).map_err(|e| OpenAIError::Api(format!("Invalid OpenAI file URL: {e}")))
 }
 
-pub(crate) fn parse_openai_file_url(url: &Url) -> Option<(OpenAIFileKind, String)> {
+pub fn parse_openai_file_url(url: &Url) -> Option<(OpenAIFileKind, String)> {
     if url.scheme() != "openai" {
         return None;
     }

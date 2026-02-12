@@ -378,13 +378,13 @@ Instructions here.
         let skill_dir = dir.path().join("my-skill");
         fs::create_dir(&skill_dir).unwrap();
 
-        let skill_content = r#"---
+        let skill_content = r"---
 name: my-skill
 description: My skill
 ---
 
 Content.
-"#;
+";
 
         fs::write(skill_dir.join("SKILL.md"), skill_content).unwrap();
 
@@ -409,13 +409,13 @@ Content.
         let skill_dir = dir.path().join("with-resources");
         fs::create_dir(&skill_dir).unwrap();
 
-        let skill_content = r#"---
+        let skill_content = r"---
 name: with-resources
 description: Skill with resources
 ---
 
 Content.
-"#;
+";
 
         fs::write(skill_dir.join("SKILL.md"), skill_content).unwrap();
 

@@ -9,6 +9,7 @@ use aither_core::{
 };
 use futures_core::Stream;
 use llama_cpp_2::{
+    LlamaCppError,
     context::params::{LlamaContextParams, LlamaPoolingType},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
@@ -21,21 +22,15 @@ use serde_json::{Value, json};
 use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-static BACKEND: OnceLock<Result<&'static LlamaBackend, String>> = OnceLock::new();
-
-fn backend() -> Result<&'static LlamaBackend, LlamaError> {
-    let state = BACKEND.get_or_init(|| {
-        LlamaBackend::init()
-            .map(|backend| Box::leak(Box::new(backend)) as &'static LlamaBackend)
-            .map_err(|err| err.to_string())
-    });
-    match state {
-        Ok(backend) => Ok(*backend),
-        Err(err) => Err(LlamaError::Model(err.clone())),
+fn init_backend() -> Result<LlamaBackend, LlamaError> {
+    match LlamaBackend::init() {
+        Ok(backend) => Ok(backend),
+        Err(LlamaCppError::BackendAlreadyInitialized) => Ok(LlamaBackend {}),
+        Err(err) => Err(LlamaError::Model(err.to_string())),
     }
 }
 
@@ -44,6 +39,7 @@ fn backend() -> Result<&'static LlamaBackend, LlamaError> {
 pub struct Llama {
     inner: Arc<LlamaConfig>,
     model: Arc<LlamaModel>,
+    backend: Arc<LlamaBackend>,
 }
 
 impl Llama {
@@ -80,9 +76,7 @@ impl LanguageModel for Llama {
         &self,
         request: LLMRequest,
     ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
-        let outcome = run_response(&self.model, &self.inner, request)
-            .map(|events| events.into_iter().map(Ok).collect::<Vec<_>>())
-            .unwrap_or_else(|err| vec![Err(err)]);
+        let outcome = run_response(&self.model, &self.backend, &self.inner, request).map_or_else(|err| vec![Err(err)], |events| events.into_iter().map(Ok).collect::<Vec<_>>());
         futures_lite::stream::iter(outcome)
     }
 
@@ -124,7 +118,7 @@ impl EmbeddingModel for Llama {
         let input = text.to_owned();
 
         async move {
-            let mut context = create_context(&model, &cfg, true)?;
+            let mut context = create_context(&model, &self.backend, &cfg, true)?;
 
             let tokens = model
                 .str_to_token(&input, AddBos::Never)
@@ -176,6 +170,7 @@ pub struct Builder {
     chat_template: Option<String>,
     n_threads: i32,
     n_threads_batch: i32,
+    backend: Option<Arc<LlamaBackend>>,
 }
 
 impl Builder {
@@ -188,6 +183,7 @@ impl Builder {
             chat_template: None,
             n_threads: 4,
             n_threads_batch: 4,
+            backend: None,
         }
     }
 
@@ -238,7 +234,12 @@ impl Builder {
         let model_params = LlamaModelParams::default()
             .with_n_gpu_layers(self.n_gpu_layers)
             .with_use_mlock(self.use_mlock);
-        let model = LlamaModel::load_from_file(backend()?, &self.model_path, &model_params)
+        let backend = if let Some(backend) = self.backend {
+            backend
+        } else {
+            Arc::new(init_backend()?)
+        };
+        let model = LlamaModel::load_from_file(backend.as_ref(), &self.model_path, &model_params)
             .map_err(|err| LlamaError::Model(err.to_string()))?;
 
         Ok(Llama {
@@ -250,12 +251,14 @@ impl Builder {
                 n_threads_batch: self.n_threads_batch,
             }),
             model: Arc::new(model),
+            backend,
         })
     }
 }
 
 fn run_response(
     model: &LlamaModel,
+    backend: &LlamaBackend,
     cfg: &LlamaConfig,
     request: LLMRequest,
 ) -> Result<Vec<Event>, LlamaError> {
@@ -271,7 +274,7 @@ fn run_response(
     let template = resolve_chat_template(model, cfg)?;
     let prompt = build_prompt(model, &template, &messages, &parameters, &tool_defs)?;
 
-    let mut context = create_context(model, cfg, false)?;
+    let mut context = create_context(model, backend, cfg, false)?;
     let prompt_tokens = model
         .str_to_token(&prompt.template_result.prompt, AddBos::Never)
         .map_err(|err| LlamaError::Token(err.to_string()))?;
@@ -340,6 +343,7 @@ fn run_response(
 
 fn create_context<'a>(
     model: &'a LlamaModel,
+    backend: &LlamaBackend,
     cfg: &LlamaConfig,
     embeddings: bool,
 ) -> Result<llama_cpp_2::context::LlamaContext<'a>, LlamaError> {
@@ -356,7 +360,7 @@ fn create_context<'a>(
     }
 
     model
-        .new_context(backend()?, params)
+        .new_context(backend, params)
         .map_err(|err| LlamaError::Context(err.to_string()))
 }
 

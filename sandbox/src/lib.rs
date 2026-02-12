@@ -74,7 +74,8 @@ pub use bash::{
 };
 pub use command::{
     DynBashTool, DynToolHandler, IpcToolCommand, ToolCallCommand, ToolCommand, ToolRegistry,
-    ToolRegistryBuilder, cli_to_json, register_tool_command, register_tool_direct, schema_to_help,
+    ToolRegistryBuilder, cli_to_json, register_ipc_gateway_command, register_tool_command,
+    register_tool_direct, schema_to_help,
 };
 pub use job_registry::{JobInfo, JobRegistry, JobStatus};
 pub use output::{Content, OutputEntry, OutputFormat, OutputStore, PendingUrl};

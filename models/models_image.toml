@@ -1,0 +1,19 @@
+# Image generation model registry
+
+[[models]]
+id = "gpt-image-1.5"
+aliases = ["gpt-image-latest"]
+name = "GPT Image 1.5"
+provider = "openai"
+context_window = 32_768
+capabilities = ["image_generation"]
+image_max_resolution = "4096x4096"
+
+[[models]]
+id = "gemini-3-pro-image-preview"
+aliases = ["gemini-3-pro-image", "nano-banana-pro"]
+name = "Gemini 3 Pro Image Preview"
+provider = "google"
+context_window = 65_536
+capabilities = ["image_generation", "vision"]
+image_max_resolution = "2048x2048"

@@ -63,7 +63,7 @@ async fn structured_output(gemini: &Gemini) -> Result<()> {
     println!("Raw structured response:\n{raw}\n");
 
     match serde_json::from_str::<SimpleStruct>(&raw) {
-        Ok(parsed) => println!("Parsed struct: {:?}", parsed),
+        Ok(parsed) => println!("Parsed struct: {parsed:?}"),
         Err(err) => println!("Failed to parse into SimpleStruct: {err}"),
     }
     Ok(())

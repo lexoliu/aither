@@ -29,8 +29,8 @@ pub enum Role {
 /// Different message types have different fields:
 /// - User/System: content with optional attachments
 /// - Assistant: content with optional tool calls
-/// - Tool: content with required tool_call_id
-#[derive(Debug, Clone, PartialEq)]
+/// - Tool: content with required `tool_call_id`
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "role", rename_all = "snake_case"))]
 pub enum Message {
@@ -163,6 +163,10 @@ impl Message {
     }
 
     /// Adds an attachment URL to the message (only works for User messages).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the provided URL cannot be converted into a valid [`Url`].
     #[must_use]
     pub fn with_attachment<U: TryInto<Url, Error: Debug>>(mut self, url: U) -> Self {
         if let Self::User { attachments, .. } = &mut self {
@@ -172,6 +176,10 @@ impl Message {
     }
 
     /// Adds multiple attachment URLs to the message.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any provided URL cannot be converted into a valid [`Url`].
     #[must_use]
     pub fn with_attachments<U: TryInto<Url, Error: Debug>>(
         mut self,
@@ -236,7 +244,7 @@ mod tests {
             serde_json::json!({"city": "NYC"}),
         )];
 
-        let msg = Message::assistant_with_tool_calls("", tool_calls.clone());
+        let msg = Message::assistant_with_tool_calls("", tool_calls);
         assert_eq!(msg.tool_calls().len(), 1);
         assert_eq!(msg.tool_calls()[0].name, "get_weather");
     }

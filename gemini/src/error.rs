@@ -28,12 +28,12 @@ pub enum GeminiError {
 
 /// Gemini API error response structure.
 #[derive(Debug, Deserialize)]
-pub(crate) struct ApiErrorResponse {
+pub struct ApiErrorResponse {
     pub error: Option<ApiErrorDetail>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ApiErrorDetail {
+pub struct ApiErrorDetail {
     pub code: Option<i32>,
     pub message: Option<String>,
     pub status: Option<String>,
@@ -42,14 +42,14 @@ pub(crate) struct ApiErrorDetail {
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-pub(crate) enum ApiErrorInfo {
+pub enum ApiErrorInfo {
     QuotaFailure(QuotaFailureInfo),
     RetryInfo(RetryInfoDetail),
     Other(serde_json::Value),
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct QuotaFailureInfo {
+pub struct QuotaFailureInfo {
     #[serde(rename = "@type")]
     pub type_url: Option<String>,
     pub violations: Option<Vec<QuotaViolation>>,
@@ -57,14 +57,14 @@ pub(crate) struct QuotaFailureInfo {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct QuotaViolation {
+pub struct QuotaViolation {
     pub quota_metric: Option<String>,
     pub quota_id: Option<String>,
     pub quota_value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct RetryInfoDetail {
+pub struct RetryInfoDetail {
     #[serde(rename = "@type")]
     pub type_url: Option<String>,
     #[serde(rename = "retryDelay")]
@@ -92,7 +92,7 @@ impl ApiErrorResponse {
                     if quota
                         .type_url
                         .as_deref()
-                        .map_or(false, |t| t.contains("QuotaFailure"))
+                        .is_some_and(|t| t.contains("QuotaFailure"))
                     {
                         if let Some(violations) = &quota.violations {
                             if let Some(v) = violations.first() {
@@ -178,7 +178,7 @@ fn parse_http_error_message(err: &ZenwaveError) -> String {
             404 => "Model not found".to_string(),
             429 => "Rate limit exceeded - please wait before retrying".to_string(),
             500 => "Server error - please try again".to_string(),
-            502 | 503 | 504 => "Service temporarily unavailable - please try again".to_string(),
+            502..=504 => "Service temporarily unavailable - please try again".to_string(),
             _ => format!("HTTP error {status}"),
         };
     }
@@ -198,7 +198,7 @@ impl std::error::Error for GeminiError {}
 
 impl GeminiError {
     /// Check if this error is retryable.
-    pub fn is_retryable(&self) -> bool {
+    pub const fn is_retryable(&self) -> bool {
         match self {
             Self::Http(err) => {
                 // Retry on rate limit, server errors, network errors, and timeouts
@@ -233,7 +233,7 @@ impl GeminiError {
         }
     }
 
-    /// Convert a zenwave error to a GeminiError, detecting rate limits.
+    /// Convert a zenwave error to a `GeminiError`, detecting rate limits.
     pub(crate) fn from_http(err: ZenwaveError) -> Self {
         // Check if it's a rate limit error
         if let zenwave::Error::Http { status, .. } = &err {

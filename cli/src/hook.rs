@@ -151,7 +151,7 @@ fn parse_bash_result(result: &str) -> Option<BashOutput> {
 
     let exit_code = parsed
         .get("exit_code")
-        .and_then(|v| v.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .unwrap_or(0) as i32;
     let task_id = parsed
         .get("task_id")

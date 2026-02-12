@@ -453,7 +453,7 @@ where
                 let old_todo_items: Vec<TodoItem> = self
                     .todo_list
                     .as_ref()
-                    .map(|l| l.items())
+                    .map(super::todo::TodoList::items)
                     .unwrap_or_default();
 
                 // Track tool names for later todo detection
@@ -505,38 +505,41 @@ where
                             }
                         };
 
-                        let result_str = match &result {
-                            Ok(s) => s.clone(),
-                            Err(e) => format!("Error: {e}"),
-                        };
                         let result_ref = result
                             .as_ref()
-                            .map(|s| s.as_str())
-                            .map_err(|e| e.to_string());
+                            .map(std::string::String::as_str)
+                            .map_err(std::string::ToString::to_string);
                         let result_ctx = ToolResultContext {
                             tool_name: &call.name,
                             arguments: &args_json,
-                            result: result_ref.as_ref().map(|s| *s).map_err(|s| s.as_str()),
+                            result: result_ref.as_ref().map(|s| *s).map_err(std::string::String::as_str),
                             duration,
                         };
 
-                        let tool_content = match hooks.post_tool_use(&result_ctx).await {
+                        let tool_result = match hooks.post_tool_use(&result_ctx).await {
                             PostToolAction::Abort(reason) => {
                                 return Err(AgentError::HookRejected {
                                     hook: "post_tool_use",
                                     reason,
                                 });
                             }
-                            PostToolAction::Replace(replacement) => replacement,
-                            PostToolAction::Keep => result_str,
+                            PostToolAction::Replace(replacement) => {
+                                if result.is_ok() {
+                                    Ok(replacement)
+                                } else {
+                                    Err(replacement)
+                                }
+                            }
+                            PostToolAction::Keep => result
+                                .map_err(|e| format!("Error: {e}")),
                         };
 
-                        Ok((call.id.clone(), call.name.clone(), tool_content))
+                        Ok((call.id.clone(), call.name.clone(), tool_result))
                     }
                 });
 
                 // Wait for all tool calls to complete
-                let results: Vec<Result<(String, String, String), AgentError>> =
+                let results: Vec<Result<(String, String, Result<String, String>), AgentError>> =
                     futures::future::join_all(tool_futures).await;
 
                 // Check if todo tool was called
@@ -545,27 +548,33 @@ where
                 // Add results to memory and yield tool end events
                 let mut has_tool_error = false;
                 for result in results {
-                    let (call_id, call_name, content) = result?;
+                    let (call_id, call_name, tool_result) = result?;
 
                     if let Some(transcript) = &self.transcript {
-                        transcript.write_tool_result(&call_name, &Ok(content.clone())).await;
+                        transcript.write_tool_result(&call_name, &tool_result).await;
                     }
 
                     // Yield tool call end event
                     yield AgentEvent::ToolCallEnd {
                         id: call_id.clone(),
                         name: call_name,
-                        result: Ok(content.clone()),
+                        result: tool_result.clone(),
                     };
 
-                    if content.contains("unknown shell_id")
+                    let content = match &tool_result {
+                        Ok(content) => content,
+                        Err(error) => error,
+                    };
+
+                    if tool_result.is_err()
+                        || content.contains("unknown shell_id")
                         || content.contains("shell_id is required")
                         || content.contains("not found")
                         || content.contains("Invalid arguments")
                     {
                         has_tool_error = true;
                     }
-                    let processed_content = self.process_reload_marker(&content);
+                    let processed_content = self.process_reload_marker(content);
                     self.memory.push(Message::tool(&call_id, processed_content));
                 }
 
@@ -590,7 +599,7 @@ where
                     let new_items = self
                         .todo_list
                         .as_ref()
-                        .map(|l| l.items())
+                        .map(super::todo::TodoList::items)
                         .unwrap_or_default();
 
                     let newly_completed: Vec<_> = new_items
@@ -648,7 +657,7 @@ where
                         let has_running = self
                             .background_receiver
                             .as_ref()
-                            .is_some_and(|receiver| receiver.has_running());
+                            .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running);
                         if !has_running {
                             break;
                         }
@@ -692,7 +701,7 @@ where
         self.tools.register(tool);
     }
 
-    /// Registers a tool (alias for register_tool).
+    /// Registers a tool (alias for `register_tool`).
     /// Adds a message to the conversation history.
     pub fn push_message(&mut self, message: Message) {
         self.memory.push(message);
@@ -905,14 +914,12 @@ where
         let tier_context = self
             .profile
             .as_ref()
-            .map(|p| p.context_length as usize)
-            .unwrap_or(100_000);
+            .map_or(100_000, |p| p.context_length as usize);
 
         let fast_context = self
             .fast_profile
             .as_ref()
-            .map(|p| p.context_length as usize)
-            .unwrap_or(100_000);
+            .map_or(100_000, |p| p.context_length as usize);
 
         let context_length = tier_context.min(fast_context);
         estimate_context_usage(&self.memory.all(), context_length)
@@ -974,21 +981,14 @@ where
             blocks.push(ContextBlock::new(
                 "transcript_memory",
                 format!(
-                    "Compressed memory may only keep a summary, but the full transcript remains available at {}. If details are missing, recover them by searching/reading transcript content before making irreversible changes.",
-                    path
+                    "Compressed memory may only keep a summary, but the full transcript remains available at {path}. If details are missing, recover them by searching/reading transcript content before making irreversible changes."
                 ),
             ));
         }
 
-        if !self.config.builtin_tool_hints.is_empty() {
-            let hints = self
-                .config
-                .builtin_tool_hints
-                .iter()
-                .map(|h| format!("{}: {}", h.name, h.hint))
-                .collect::<Vec<_>>()
-                .join("\n");
-            blocks.push(ContextBlock::new("builtin_tool_hints", hints));
+        let tool_hints = self.format_tool_hints_block();
+        if !tool_hints.is_empty() {
+            blocks.push(ContextBlock::new("tool_hints", tool_hints));
         }
 
         blocks.extend(self.config.context_blocks.clone());
@@ -1021,6 +1021,21 @@ where
         }
         note.push_str("\n</system-reminder>");
         Some(note)
+    }
+
+    fn format_tool_hints_block(&self) -> String {
+        let defs = self.tools.active_definitions();
+        let mut lines = Vec::new();
+
+        for def in defs {
+            let desc = first_paragraph(def.description());
+            if desc.is_empty() {
+                continue;
+            }
+            lines.push(format!("{}: {}", def.name(), desc));
+        }
+
+        lines.join("\n")
     }
 
     /// Continues agent processing after background tasks complete (streaming version).
@@ -1152,25 +1167,29 @@ where
             let tool_futures = tool_calls.iter().map(|call| {
                 let args_json = call.arguments.to_string();
                 async move {
-                    let result = tools.call(&call.name, &args_json).await;
-                    let result_str = match result {
-                        Ok(output) => output.as_str().unwrap_or("").to_string(),
-                        Err(e) => format!("Error: {e}"),
-                    };
-                    (call.id.clone(), call.name.clone(), result_str)
+                    let result = tools
+                        .call(&call.name, &args_json)
+                        .await
+                        .map(|output| output.as_str().unwrap_or("").to_string())
+                        .map_err(|e| format!("Error: {e}"));
+                    (call.id.clone(), call.name.clone(), result)
                 }
             });
 
-            let results: Vec<(String, String, String)> =
+            let results: Vec<(String, String, Result<String, String>)> =
                 futures::future::join_all(tool_futures).await;
 
-            for (call_id, call_name, content) in results {
+            for (call_id, call_name, tool_result) in results {
                 events.push(Ok(AgentEvent::ToolCallEnd {
                     id: call_id.clone(),
                     name: call_name,
-                    result: Ok(content.clone()),
+                    result: tool_result.clone(),
                 }));
-                let processed_content = self.process_reload_marker(&content);
+                let content = match &tool_result {
+                    Ok(content) => content,
+                    Err(error) => error,
+                };
+                let processed_content = self.process_reload_marker(content);
                 self.memory.push(Message::tool(&call_id, processed_content));
             }
 
@@ -1194,7 +1213,7 @@ where
     /// Uses `effective_trigger()` which accounts for a 20% context reservation
     /// to ensure there's room for the fast LLM during compaction.
     ///
-    /// When an OutputStore is available, uses lazy URL allocation:
+    /// When an `OutputStore` is available, uses lazy URL allocation:
     /// 1. Allocates URLs for large tool outputs before compression
     /// 2. Lets the fast LLM decide which URLs to reference in the summary
     /// 3. Only writes files for URLs actually referenced in the summary
@@ -1206,14 +1225,12 @@ where
         let tier_context = self
             .profile
             .as_ref()
-            .map(|p| p.context_length as usize)
-            .unwrap_or(100_000);
+            .map_or(100_000, |p| p.context_length as usize);
 
         let fast_context = self
             .fast_profile
             .as_ref()
-            .map(|p| p.context_length as usize)
-            .unwrap_or(100_000);
+            .map_or(100_000, |p| p.context_length as usize);
 
         let context_length = tier_context.min(fast_context);
         let usage = estimate_context_usage(&self.memory.all(), context_length);
@@ -1327,8 +1344,7 @@ where
             ))
         } else if items.iter().all(|i| i.status == TodoStatus::Completed) {
             Some(format!(
-                "<system-reminder>\nTask \"{}\" completed. All tasks in the todo list are now complete!\n</system-reminder>",
-                completed_task
+                "<system-reminder>\nTask \"{completed_task}\" completed. All tasks in the todo list are now complete!\n</system-reminder>"
             ))
         } else {
             None
@@ -1347,6 +1363,19 @@ fn render_plan_context(content: &str) -> String {
 
 fn render_working_todo_context(content: &str) -> String {
     format!("<todo>\n{}</todo>", escape_xml_text(content))
+}
+
+fn first_paragraph(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Some((first, _)) = trimmed.split_once("\n\n") {
+        return first.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+
+    trimmed.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Truncates a script for display in messages.

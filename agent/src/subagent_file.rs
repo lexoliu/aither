@@ -47,6 +47,7 @@ impl SubagentDefinition {
     ///
     /// System prompt content...
     /// ```
+    #[must_use] 
     pub fn parse(content: &str) -> Option<Self> {
         let content = content.trim();
 
@@ -109,7 +110,7 @@ impl SubagentDefinition {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map(|e| e == "md").unwrap_or(false) {
+            if path.extension().is_some_and(|e| e == "md") {
                 if let Ok(Some(def)) = Self::from_file(&path) {
                     definitions.push(def);
                 }
@@ -132,7 +133,7 @@ impl SubagentDefinition {
 
         while let Some(entry) = entries.try_next().await? {
             let path = entry.path();
-            if path.extension().map(|e| e == "md").unwrap_or(false) {
+            if path.extension().is_some_and(|e| e == "md") {
                 if let Ok(Some(def)) = Self::from_file_async(&path).await {
                     definitions.push(def);
                 }
@@ -144,6 +145,7 @@ impl SubagentDefinition {
 }
 
 /// Default subagent definitions embedded in the binary.
+#[must_use] 
 pub fn builtin_subagents() -> Vec<SubagentDefinition> {
     let mut defs = Vec::new();
 
@@ -166,7 +168,7 @@ mod tests {
 
     #[test]
     fn parse_subagent_definition() {
-        let content = r#"---
+        let content = r"---
 name: test-agent
 description: This is a test agent for exploring and testing.
 ---
@@ -174,7 +176,7 @@ description: This is a test agent for exploring and testing.
 # Test Agent
 
 You are a test agent. Do test things.
-"#;
+";
 
         let def = SubagentDefinition::parse(content).unwrap();
         assert_eq!(def.id, "test-agent");

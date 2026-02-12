@@ -10,7 +10,7 @@ use crate::tool_request::{
     ToolRequest, ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
 
-/// A single question within an ask_user request.
+/// A single question within an `ask_user` request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Question {
     /// Short section label for navigation (e.g. "database", "theme").
@@ -55,7 +55,7 @@ pub struct AskUserArgs {
     /// Allow selecting multiple options (for single-question mode).
     #[serde(default)]
     pub multi_select: bool,
-    /// Multiple questions (JSON array). Overrides question/options/multi_select if set.
+    /// Multiple questions (JSON array). Overrides `question/options/multi_select` if set.
     #[serde(default)]
     pub questions: Vec<Question>,
 }
@@ -64,6 +64,7 @@ impl AskUserArgs {
     /// Normalize into a list of questions.
     /// If `questions` is non-empty, use that directly.
     /// Otherwise, build a single question from the flat fields.
+    #[must_use] 
     pub fn into_questions(self) -> Vec<Question> {
         if !self.questions.is_empty() {
             return self.questions;
@@ -105,13 +106,13 @@ pub enum AnswerValue {
 /// A request from the agent to ask the user questions.
 pub type AskUserRequest = ToolRequest<AskUserArgs, Vec<QuestionAnswer>>;
 
-/// Broker for ask_user requests.
+/// Broker for `ask_user` requests.
 pub type AskUserBroker = ToolRequestBroker<AskUserArgs, Vec<QuestionAnswer>>;
 
-/// Queue for pending ask_user requests.
+/// Queue for pending `ask_user` requests.
 pub type AskUserQueue = ToolRequestQueue<AskUserArgs, Vec<QuestionAnswer>>;
 
-/// Create a new ask_user channel pair.
+/// Create a new `ask_user` channel pair.
 #[must_use]
 pub fn channel() -> (AskUserBroker, AskUserQueue) {
     tool_request_channel()
@@ -124,8 +125,9 @@ pub struct AskUserTool {
 }
 
 impl AskUserTool {
-    /// Create a new AskUserTool with the given sender.
-    pub fn new(broker: AskUserBroker) -> Self {
+    /// Create a new `AskUserTool` with the given sender.
+    #[must_use] 
+    pub const fn new(broker: AskUserBroker) -> Self {
         Self { broker }
     }
 }
@@ -139,7 +141,7 @@ impl Tool for AskUserTool {
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
         let response = self.broker.request(args).await?;
-        Ok(ToolOutput::json(&response)?)
+        ToolOutput::json(&response)
     }
 }
 
@@ -165,14 +167,14 @@ mod tests {
     fn test_schema_option_is_array() {
         let schema = schemars::schema_for!(AskUserArgs);
         let val = serde_json::to_value(schema).unwrap();
-        eprintln!(
+        tracing::debug!(
             "AskUserArgs schema:\n{}",
             serde_json::to_string_pretty(&val).unwrap()
         );
 
         let props = val.get("properties").unwrap().as_object().unwrap();
         let opt = props.get("option").unwrap();
-        eprintln!(
+        tracing::debug!(
             "option field schema: {}",
             serde_json::to_string_pretty(opt).unwrap()
         );
@@ -207,7 +209,7 @@ mod tests {
         )
         .unwrap();
 
-        eprintln!(
+        tracing::debug!(
             "cli_to_json result: {}",
             serde_json::to_string_pretty(&result).unwrap()
         );

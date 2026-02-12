@@ -24,6 +24,10 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use zenwave::{Client, client, header};
 
+fn ensure_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Default public SearXNG endpoint.
 pub const DEFAULT_SEARXNG_URL: &str = "https://serxng-deployment-production.up.railway.app";
 
@@ -76,6 +80,7 @@ impl SearXNG {
 
 impl SearchProvider for SearXNG {
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        ensure_rustls_provider();
         let mut url = format!(
             "{}/search?q={}&format=json",
             self.base_url,
@@ -156,9 +161,9 @@ mod tests {
         let results = provider.search("rust programming language", 5).await;
         match results {
             Ok(r) if !r.is_empty() => {} // Success
-            Ok(_) => eprintln!("Warning: SearXNG returned no results - endpoint may be degraded"),
+            Ok(_) => tracing::warn!("SearXNG returned no results; endpoint may be degraded"),
             Err(e) if e.to_string().contains("CAPTCHA") => {
-                eprintln!("Warning: SearXNG CAPTCHA detected - skipping test");
+                tracing::warn!("SearXNG CAPTCHA detected; skipping test");
             }
             Err(e) => panic!("SearXNG search failed: {e}"),
         }
@@ -172,7 +177,7 @@ mod tests {
         match results {
             Ok(_) => {} // Success (empty is ok for unicode)
             Err(e) if e.to_string().contains("CAPTCHA") => {
-                eprintln!("Warning: SearXNG CAPTCHA detected - skipping test");
+                tracing::warn!("SearXNG CAPTCHA detected; skipping test");
             }
             Err(e) => panic!("SearXNG unicode search failed: {e}"),
         }

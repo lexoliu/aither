@@ -3,7 +3,7 @@
 //! This module provides a client for the Gemini Files API, which allows uploading
 //! files for use in multimodal requests. Files are stored for 48 hours before expiration.
 //!
-//! See: https://ai.google.dev/api/files
+//! See: <https://ai.google.dev/api/files>
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -321,6 +321,9 @@ mod tests {
             mime_from_path(Path::new("/path/to/doc.pdf")),
             Some("application/pdf")
         );
-        assert_eq!(mime_from_path(Path::new("/path/to/unknown.xyz")), None);
+        assert_eq!(
+            mime_from_path(Path::new("/path/to/unknown.aither_unknown")),
+            None
+        );
     }
 }

@@ -129,7 +129,7 @@ impl AgentEvent {
 
     /// Creates a new error event.
     #[must_use]
-    pub fn error(error: AgentError) -> Self {
+    pub const fn error(error: AgentError) -> Self {
         Self::Error(error)
     }
 

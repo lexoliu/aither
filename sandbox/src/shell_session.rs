@@ -177,7 +177,7 @@ impl ShellSessionRegistry {
             ShellBackend::Ssh => availability.ssh,
         };
         if !enabled {
-            return Err(format!("backend {:?} is not available", backend));
+            return Err(format!("backend {backend:?} is not available"));
         }
 
         let ssh_target = if matches!(backend, ShellBackend::Ssh) {
@@ -292,7 +292,7 @@ pub struct ListSshTool {
 
 impl ListSshTool {
     #[must_use]
-    pub fn new(registry: ShellSessionRegistry) -> Self {
+    pub const fn new(registry: ShellSessionRegistry) -> Self {
         Self { registry }
     }
 }
@@ -320,7 +320,7 @@ pub struct OpenShellTool {
 
 impl OpenShellTool {
     #[must_use]
-    pub fn new(registry: ShellSessionRegistry, default_cwd: PathBuf) -> Self {
+    pub const fn new(registry: ShellSessionRegistry, default_cwd: PathBuf) -> Self {
         Self {
             registry,
             default_cwd,
@@ -352,9 +352,7 @@ impl Tool for OpenShellTool {
         }
 
         let cwd = args
-            .cwd
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.default_cwd.clone());
+            .cwd.map_or_else(|| self.default_cwd.clone(), PathBuf::from);
 
         let (mode, ssh_runtime) = if matches!(requested, OpenShellBackend::Ssh) {
             let target = args
@@ -441,10 +439,10 @@ async fn bootstrap_ssh_runtime(
         }
     }
 
-    let reason = if requested_mode != BashMode::Unsafe {
-        "Remote leash is unavailable; requested sandboxed/network cannot be enforced remotely."
-    } else {
+    let reason = if requested_mode == BashMode::Unsafe {
         "Remote leash is unavailable; session will run unsafe without sandbox isolation."
+    } else {
+        "Remote leash is unavailable; requested sandboxed/network cannot be enforced remotely."
     };
     if let Some(auth) = authorizer {
         let allow_unsafe = auth
@@ -612,7 +610,7 @@ pub struct CloseShellTool {
 
 impl CloseShellTool {
     #[must_use]
-    pub fn new(registry: ShellSessionRegistry, jobs: crate::job_registry::JobRegistry) -> Self {
+    pub const fn new(registry: ShellSessionRegistry, jobs: crate::job_registry::JobRegistry) -> Self {
         Self { registry, jobs }
     }
 }

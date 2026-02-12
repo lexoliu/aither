@@ -173,7 +173,7 @@ where
                 .await
                 .embed(&fact)
                 .await
-                .map_err(|e| Mem0Error::Embedding(e.into()))?;
+                .map_err(Mem0Error::Embedding)?;
 
             debug!("Embedding generated for fact: {}", fact);
 
@@ -221,7 +221,7 @@ where
                                 .await
                                 .embed(&content)
                                 .await
-                                .map_err(|e| Mem0Error::Llm(e.into()))?;
+                                .map_err(Mem0Error::Llm)?;
 
                             // Fetch existing to check existence
                             if let Some(mut existing) = store.read_blocking().get(id).await? {
@@ -258,7 +258,7 @@ where
             .await
             .embed(query)
             .await
-            .map_err(|e| Mem0Error::Llm(e.into()))?;
+            .map_err(Mem0Error::Llm)?;
         let filters = SearchFilters {
             user_id: self.inner.config.user_id.clone(),
             agent_id: self.inner.config.agent_id.clone(),
@@ -326,7 +326,7 @@ where
             .llm
             .generate(request)
             .await
-            .map_err(|e| Mem0Error::Llm(e.into()))?;
+            .map_err(Mem0Error::Llm)?;
         Ok(extracted.facts)
     }
 
@@ -360,7 +360,7 @@ where
             .llm
             .generate(request)
             .await
-            .map_err(|e| Mem0Error::Llm(e.into()))?;
+            .map_err(Mem0Error::Llm)?;
 
         Ok(decision)
     }

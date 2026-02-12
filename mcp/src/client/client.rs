@@ -77,13 +77,13 @@ impl<T: Transport> McpClient<T> {
 
     /// Get the server information.
     #[must_use]
-    pub fn server_info(&self) -> Option<&ServerInfo> {
+    pub const fn server_info(&self) -> Option<&ServerInfo> {
         self.server_info.as_ref()
     }
 
     /// Get the server capabilities.
     #[must_use]
-    pub fn capabilities(&self) -> &ServerCapabilities {
+    pub const fn capabilities(&self) -> &ServerCapabilities {
         &self.capabilities
     }
 

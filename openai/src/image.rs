@@ -70,15 +70,15 @@ async fn generate_images(
     let mut backend = client();
     let mut builder = backend
         .post(endpoint)
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(header::AUTHORIZATION.as_str(), cfg.request_auth())
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(header::USER_AGENT.as_str(), "aither-openai/0.1")
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
     if let Some(org) = &cfg.organization {
         builder = builder
             .header("OpenAI-Organization", org.clone())
-            .map_err(|e| OpenAIError::Http(e))?;
+            .map_err(OpenAIError::Http)?;
     }
     let request = ImageGenerationRequest {
         model: &cfg.image_model,
@@ -89,10 +89,10 @@ async fn generate_images(
     };
     let response: ImageResponse = builder
         .json_body(&request)
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .json()
         .await
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
     response.into_images()
 }
 
@@ -107,15 +107,15 @@ async fn edit_image(
     let mut backend = client();
     let mut builder = backend
         .post(endpoint)
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(header::AUTHORIZATION.as_str(), cfg.request_auth())
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .header(header::USER_AGENT.as_str(), "aither-openai/0.1")
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
     if let Some(org) = &cfg.organization {
         builder = builder
             .header("OpenAI-Organization", org.clone())
-            .map_err(|e| OpenAIError::Http(e))?;
+            .map_err(OpenAIError::Http)?;
     }
     let mut parts = vec![
         MultipartPart::text("model", cfg.image_model.clone()),
@@ -138,11 +138,11 @@ async fn edit_image(
             header::CONTENT_TYPE.as_str(),
             format!("multipart/form-data; boundary={boundary}"),
         )
-        .map_err(|e| OpenAIError::Http(e))?
+        .map_err(OpenAIError::Http)?
         .bytes_body(body)
         .json()
         .await
-        .map_err(|e| OpenAIError::Http(e))?;
+        .map_err(OpenAIError::Http)?;
     response.into_images()
 }
 

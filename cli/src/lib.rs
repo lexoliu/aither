@@ -5,7 +5,7 @@
 //! # Features
 //!
 //! - Interactive REPL with streaming responses
-//! - Multi-provider support (OpenAI, Claude, Gemini)
+//! - Multi-provider support (`OpenAI`, Claude, Gemini)
 //! - Built-in filesystem and command tools
 //! - MCP server support via configuration file
 //! - Debug hook for logging tool calls
