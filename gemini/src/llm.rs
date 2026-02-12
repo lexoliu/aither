@@ -14,7 +14,6 @@ use serde::de::DeserializeOwned;
 use tracing::debug;
 
 use crate::{
-    attachments::resolve_messages,
     client::stream_generate,
     config::Gemini,
     error::GeminiError,
@@ -109,13 +108,16 @@ fn respond_stream_inner(
 ) -> impl Stream<Item = Result<Event, GeminiError>> + Send {
     async_stream::stream! {
         let (messages, parameters, tool_defs) = request.into_parts();
-        let messages = match resolve_messages(&cfg, messages).await {
+        #[cfg(not(target_arch = "wasm32"))]
+        let messages = match crate::attachments::resolve_messages(&cfg, messages).await {
             Ok(resolved) => resolved,
             Err(err) => {
                 yield Err(err);
                 return;
             }
         };
+        #[cfg(target_arch = "wasm32")]
+        let messages = messages;
         let (system_instruction, contents) = messages_to_gemini(&messages);
         let mut gemini_tools_payload: Vec<GeminiTool> = Vec::new();
         let tool_defs = match &parameters.tool_choice {
@@ -610,12 +612,18 @@ fn parse_data_url(url: &str) -> Option<Part> {
 }
 
 /// Read a file:// URL and convert to a Part with inline data.
+#[cfg(not(target_arch = "wasm32"))]
 fn read_file_to_part(url: &url::Url) -> Option<Part> {
     let path = url.to_file_path().ok()?;
     let data = std::fs::read(&path).ok()?;
     let mime_type = mime_from_path(&path)?;
 
     Some(Part::inline_media(mime_type, data))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_file_to_part(_url: &url::Url) -> Option<Part> {
+    None
 }
 
 /// Get MIME type from file path extension.

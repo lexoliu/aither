@@ -5,9 +5,11 @@
 //!
 //! See: <https://ai.google.dev/api/files>
 
-use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
 use async_fs;
 use serde::{Deserialize, Serialize};
 use zenwave::{Client, client, header};
@@ -101,26 +103,15 @@ pub struct ListFilesResponse {
     pub next_page_token: Option<String>,
 }
 
-/// Upload a file to the Gemini Files API.
+/// Upload raw bytes to the Gemini Files API.
 ///
-/// The file will be available for 48 hours after upload.
-///
-/// # Arguments
-/// * `cfg` - Gemini configuration
-/// * `path` - Path to the file to upload
-///
-/// # Returns
-/// The uploaded file metadata including the URI to use in requests.
-pub async fn upload_file(cfg: &GeminiConfig, path: &Path) -> Result<GeminiFile, GeminiError> {
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-
-    let mime_type = mime_from_path(path).unwrap_or("application/octet-stream");
-
-    // Read file content
-    let data = async_fs::read(path)
-        .await
-        .map_err(|e| GeminiError::Parse(format!("Failed to read file: {e}")))?;
-
+/// This is the cross-platform upload entry point (including wasm).
+pub async fn upload_bytes(
+    cfg: &GeminiConfig,
+    file_name: &str,
+    mime_type: &str,
+    data: Vec<u8>,
+) -> Result<GeminiFile, GeminiError> {
     // Build upload URL
     let upload_url = build_upload_url(cfg);
 
@@ -182,6 +173,20 @@ pub async fn upload_file(cfg: &GeminiConfig, path: &Path) -> Result<GeminiFile, 
     let response: UploadFileResponse = builder.json().await.map_err(GeminiError::from_http)?;
 
     Ok(response.file)
+}
+
+/// Upload a local file path to the Gemini Files API.
+///
+/// This is a native-only convenience API. For wasm, use [`upload_bytes`].
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn upload_file(cfg: &GeminiConfig, path: &Path) -> Result<GeminiFile, GeminiError> {
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let mime_type = mime_from_path(path).unwrap_or("application/octet-stream");
+    let data = async_fs::read(path)
+        .await
+        .map_err(|e| GeminiError::Parse(format!("Failed to read file: {e}")))?;
+
+    upload_bytes(cfg, file_name, mime_type, data).await
 }
 
 /// Delete a file from the Gemini Files API.
@@ -295,7 +300,7 @@ fn parse_rfc3339(s: &str) -> Option<SystemTime> {
 }
 
 /// Determine MIME type from file extension.
-fn mime_from_path(path: &Path) -> Option<&'static str> {
+fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
     mime_guess::from_path(path).first_raw()
 }
 

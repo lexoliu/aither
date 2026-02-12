@@ -1,13 +1,20 @@
+
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
-
-use aither_attachments::{FileCache, default_cache_dir};
-use aither_core::llm::Message;
+#[cfg(not(target_arch = "wasm32"))]
 use url::Url;
-
+#[cfg(not(target_arch = "wasm32"))]
+use aither_attachments::{FileCache, default_cache_dir};
+#[cfg(not(target_arch = "wasm32"))]
+use aither_core::llm::Message;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::config::GeminiConfig;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::error::GeminiError;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::files::upload_file;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn resolve_messages(
     cfg: &GeminiConfig,
     messages: Vec<Message>,
@@ -52,11 +59,13 @@ pub async fn resolve_messages(
     Ok(resolved)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct ResolvedUrl {
     url: Url,
     cache_updated: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn resolve_attachment(
     cfg: &GeminiConfig,
     cache: &mut FileCache,
@@ -90,6 +99,7 @@ async fn resolve_attachment(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn resolve_file_attachment(
     cfg: &GeminiConfig,
     cache: &mut FileCache,
@@ -133,6 +143,7 @@ async fn resolve_file_attachment(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn is_gemini_file_uri(url: &Url) -> bool {
     url.host_str()
         .is_some_and(|h| h == "generativelanguage.googleapis.com")

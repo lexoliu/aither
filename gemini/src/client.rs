@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use async_io::Timer;
 use serde::{Deserialize, Serialize};
 use zenwave::{Client, client, header};
 
@@ -85,7 +84,12 @@ pub async fn stream_generate(
                             err
                         );
                     }
-                    Timer::after(Duration::from_secs(delay_secs)).await;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    async_io::Timer::after(Duration::from_secs(delay_secs)).await;
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let _ = delay_secs;
+                    }
                     continue;
                 }
                 return Err(err);
@@ -216,7 +220,12 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
                             err
                         );
                     }
-                    Timer::after(Duration::from_secs(delay_secs)).await;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    async_io::Timer::after(Duration::from_secs(delay_secs)).await;
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let _ = delay_secs;
+                    }
                     continue;
                 }
                 return Err(err);
