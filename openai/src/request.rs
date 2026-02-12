@@ -325,7 +325,17 @@ fn url_to_data_url(url: &url::Url) -> Option<String> {
     match url.scheme() {
         "data" => Some(url.as_str().to_string()),
         "http" | "https" => Some(url.as_str().to_string()),
-        "file" => read_file_to_data_url(url),
+        "file" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                read_file_to_data_url(url)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                tracing::warn!("file:// attachments are not supported on wasm32");
+                None
+            }
+        }
         _ => {
             tracing::warn!("Unsupported attachment URL scheme: {}", url.scheme());
             None
@@ -334,6 +344,7 @@ fn url_to_data_url(url: &url::Url) -> Option<String> {
 }
 
 /// Read a file:// URL and convert to a data URL.
+#[cfg(not(target_arch = "wasm32"))]
 fn read_file_to_data_url(url: &url::Url) -> Option<String> {
     use base64::Engine;
 
@@ -343,6 +354,11 @@ fn read_file_to_data_url(url: &url::Url) -> Option<String> {
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
 
     Some(format!("data:{mime_type};base64,{base64_data}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_file_to_data_url(_url: &url::Url) -> Option<String> {
+    None
 }
 
 /// Get MIME type from file path extension.

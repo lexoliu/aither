@@ -5,14 +5,17 @@
 //!
 //! See: <https://platform.openai.com/docs/api-reference/files>
 
-use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
 use async_fs;
 use serde::{Deserialize, Serialize};
 use zenwave::{Client, client, header};
 
 use crate::error::OpenAIError;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::mime::mime_from_path;
 
 /// The purpose of the uploaded file.
@@ -155,29 +158,23 @@ impl FilesConfig {
     }
 }
 
-/// Upload a file to `OpenAI`.
+/// Upload raw bytes to `OpenAI` Files API.
+///
+/// This is the cross-platform upload entry point (including wasm).
 ///
 /// # Arguments
 /// * `cfg` - Files configuration
-/// * `path` - Path to the file to upload
+/// * `file_name` - File name reported to OpenAI
+/// * `mime_type` - MIME type for multipart metadata
+/// * `data` - File content bytes
 /// * `purpose` - Purpose of the file
-///
-/// # Returns
-/// The uploaded file metadata.
-pub async fn upload_file(
+pub async fn upload_bytes(
     cfg: &FilesConfig,
-    path: &Path,
+    file_name: &str,
+    mime_type: &str,
+    data: Vec<u8>,
     purpose: FilePurpose,
 ) -> Result<OpenAIFile, OpenAIError> {
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-
-    let mime_type = mime_from_path(path).unwrap_or("application/octet-stream");
-
-    // Read file content
-    let data = async_fs::read(path)
-        .await
-        .map_err(|e| OpenAIError::Api(format!("Failed to read file: {e}")))?;
-
     let endpoint = cfg.files_endpoint();
 
     // Build multipart form data
@@ -233,6 +230,24 @@ pub async fn upload_file(
     let builder = builder.bytes_body(body);
 
     builder.json().await.map_err(OpenAIError::from_http)
+}
+
+/// Upload a local file path to `OpenAI`.
+///
+/// This is a native-only convenience API. For wasm, use [`upload_bytes`].
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn upload_file(
+    cfg: &FilesConfig,
+    path: &Path,
+    purpose: FilePurpose,
+) -> Result<OpenAIFile, OpenAIError> {
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let mime_type = mime_from_path(path).unwrap_or("application/octet-stream");
+    let data = async_fs::read(path)
+        .await
+        .map_err(|e| OpenAIError::Api(format!("Failed to read file: {e}")))?;
+
+    upload_bytes(cfg, file_name, mime_type, data, purpose).await
 }
 
 /// Delete a file from `OpenAI`.

@@ -2,7 +2,6 @@ use crate::{
     DEEPSEEK_BASE_URL, DEFAULT_AUDIO_FORMAT, DEFAULT_AUDIO_MODEL, DEFAULT_AUDIO_VOICE,
     DEFAULT_BASE_URL, DEFAULT_EMBEDDING_DIM, DEFAULT_EMBEDDING_MODEL, DEFAULT_IMAGE_MODEL,
     DEFAULT_MODEL, DEFAULT_MODERATION_MODEL, DEFAULT_TRANSCRIPTION_MODEL, OPENROUTER_BASE_URL,
-    attachments::resolve_messages,
     error::OpenAIError,
     request::{
         ChatCompletionRequest, ChatMessagePayload, ParameterSnapshot, ResponsesInputItem,
@@ -111,7 +110,7 @@ async fn sleep(duration: Duration) {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        gloo_timers::future::TimeoutFuture::new(duration.as_millis() as u32).await;
+        let _ = duration;
     }
 }
 
@@ -323,12 +322,22 @@ impl LanguageModel for OpenAI {
             }
 
             let messages = if has_attachments {
-                match resolve_messages(&cfg, messages).await {
-                    Ok(resolved) => resolved,
-                    Err(err) => {
-                        yield Err(err);
-                        return;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    match crate::attachments::resolve_messages(&cfg, messages).await {
+                        Ok(resolved) => resolved,
+                        Err(err) => {
+                            yield Err(err);
+                            return;
+                        }
                     }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    yield Err(OpenAIError::Api(
+                        "file:// attachments are not supported on wasm32 targets".to_string(),
+                    ));
+                    return;
                 }
             } else {
                 messages

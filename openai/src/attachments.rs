@@ -1,12 +1,19 @@
-use std::path::Path;
-
-use aither_attachments::{FileCache, default_cache_dir};
-use aither_core::llm::Message;
 use url::Url;
 
-use crate::client::Config;
 use crate::error::OpenAIError;
+
+#[cfg(not(target_arch = "wasm32"))]
+use aither_core::llm::Message;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::client::Config;
+
+#[cfg(not(target_arch = "wasm32"))]
+use aither_attachments::{FileCache, default_cache_dir};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::files::{FilePurpose, FilesConfig, upload_file};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::mime::mime_from_path;
 
 #[derive(Clone, Copy)]
@@ -21,6 +28,7 @@ impl OpenAIFileKind {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn resolve_messages(
     cfg: &Config,
     messages: Vec<Message>,
@@ -65,11 +73,13 @@ pub async fn resolve_messages(
     Ok(resolved)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct ResolvedUrl {
     url: Url,
     cache_updated: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn resolve_attachment(
     cfg: &Config,
     cache: &mut FileCache,
@@ -92,6 +102,7 @@ async fn resolve_attachment(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn resolve_file_attachment(
     cfg: &Config,
     cache: &mut FileCache,
@@ -130,6 +141,7 @@ async fn resolve_file_attachment(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_files_config(cfg: &Config) -> FilesConfig {
     let mut files_cfg = FilesConfig::new(cfg.api_key.clone()).with_base_url(cfg.base_url.clone());
     if let Some(org) = &cfg.organization {
@@ -138,6 +150,7 @@ fn build_files_config(cfg: &Config) -> FilesConfig {
     files_cfg
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn file_kind_for_path(path: &Path) -> Result<OpenAIFileKind, OpenAIError> {
     let mime = mime_from_path(path).ok_or_else(|| {
         OpenAIError::Api(format!(
@@ -152,6 +165,7 @@ fn file_kind_for_path(path: &Path) -> Result<OpenAIFileKind, OpenAIError> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn purpose_for_kind(kind: OpenAIFileKind) -> FilePurpose {
     if kind.is_image() {
         FilePurpose::Vision
