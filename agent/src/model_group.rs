@@ -170,6 +170,9 @@ impl<M> ModelGroup<M> {
     /// Returns the current active model, or None if all are exhausted.
     #[must_use]
     pub fn current(&self) -> Option<&BudgetedModel<M>> {
+        if !self.try_advance() {
+            return None;
+        }
         let idx = self.current.load(Ordering::Acquire);
         self.models.get(idx).filter(|m| !m.is_exhausted())
     }
@@ -216,8 +219,12 @@ impl<M> ModelGroup<M> {
 
     /// Records usage for the current model.
     pub fn record_usage(&self, usage: &Usage) {
-        if let Some(model) = self.current() {
+        let idx = self.current.load(Ordering::Acquire);
+        if let Some(model) = self.models.get(idx) {
             model.record_usage(usage);
+            if model.is_exhausted() {
+                let _ = self.try_advance();
+            }
         }
     }
 
@@ -444,9 +451,7 @@ where
                 // Check if this is a quota error
                 let error_msg = e.to_string();
                 if is_quota_error(&error_msg) {
-                    if let Some(model) = self.group.current() {
-                        model.mark_exhausted();
-                    }
+                    let _ = self.group.mark_current_exhausted();
                     tracing::warn!("Model quota exhausted: {}", error_msg);
                 }
                 self.inner = None;
@@ -461,6 +466,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aither_core::{
+        LanguageModel,
+        llm::{Event, LLMRequest, model::Profile},
+    };
+    use futures_lite::{StreamExt, stream};
+
+    #[derive(Debug, Clone)]
+    struct DummyModel {
+        name: &'static str,
+    }
+
+    #[derive(Debug)]
+    struct DummyError;
+
+    impl std::fmt::Display for DummyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("dummy error")
+        }
+    }
+
+    impl std::error::Error for DummyError {}
+
+    impl LanguageModel for DummyModel {
+        type Error = DummyError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl futures_core::Stream<Item = Result<Event, Self::Error>> + Send {
+            stream::iter([Ok(Event::Text(self.name.to_string()))])
+        }
+
+        async fn profile(&self) -> Profile {
+            Profile::new("dummy", self.name, "test", "dummy", 0)
+        }
+    }
 
     #[test]
     fn test_budget_tokens() {
@@ -494,12 +535,17 @@ mod tests {
         ]);
 
         // Initially on primary
-        assert_eq!(group.current().map(super::BudgetedModel::inner), Some(&"primary"));
+        assert_eq!(
+            group.current().map(super::BudgetedModel::inner),
+            Some(&"primary")
+        );
 
         // Exhaust primary
         group.record_usage(&Usage::new(50, 51));
-        assert!(group.try_advance());
-        assert_eq!(group.current().map(super::BudgetedModel::inner), Some(&"fallback"));
+        assert_eq!(
+            group.current().map(super::BudgetedModel::inner),
+            Some(&"fallback")
+        );
 
         // Exhaust fallback
         group.record_usage(&Usage::new(50, 51));
@@ -514,10 +560,47 @@ mod tests {
             BudgetedModel::unlimited("fallback"),
         ]);
 
-        assert_eq!(group.current().map(super::BudgetedModel::inner), Some(&"primary"));
+        assert_eq!(
+            group.current().map(super::BudgetedModel::inner),
+            Some(&"primary")
+        );
 
         // Mark as exhausted (e.g., from API quota error)
         assert!(group.mark_current_exhausted());
-        assert_eq!(group.current().map(super::BudgetedModel::inner), Some(&"fallback"));
+        assert_eq!(
+            group.current().map(super::BudgetedModel::inner),
+            Some(&"fallback")
+        );
+    }
+
+    #[test]
+    fn current_advances_past_exhausted_models() {
+        let group = ModelGroup::from_models(vec![
+            BudgetedModel::new("primary", Budget::tokens(1)),
+            BudgetedModel::new("fallback", Budget::tokens(100)),
+        ]);
+        group.models[0].mark_exhausted();
+        assert_eq!(
+            group.current().map(super::BudgetedModel::inner),
+            Some(&"fallback")
+        );
+    }
+
+    #[test]
+    fn stream_uses_fallback_after_primary_is_exhausted() {
+        let group = ModelGroup::from_models(vec![
+            BudgetedModel::new(DummyModel { name: "primary" }, Budget::tokens(1)),
+            BudgetedModel::new(DummyModel { name: "fallback" }, Budget::tokens(100)),
+        ]);
+        group.models[0].mark_exhausted();
+
+        let request = LLMRequest::new([aither_core::llm::Message::user("hello")]);
+        let mut stream = group.respond(request);
+        let first = futures_lite::future::block_on(async { stream.next().await });
+
+        match first {
+            Some(Ok(Event::Text(text))) => assert_eq!(text, "fallback"),
+            other => panic!("expected fallback model text event, got {other:?}"),
+        }
     }
 }

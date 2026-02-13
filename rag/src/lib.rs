@@ -62,6 +62,7 @@
 //! - [`RagStore`] - Lower-level store for manual control
 
 pub mod chunking;
+pub mod cleaning;
 pub mod config;
 mod dedup;
 pub mod error;
@@ -74,11 +75,14 @@ mod tool;
 pub mod types;
 
 // Re-exports for convenience
-pub use chunking::{Chunker, FixedSizeChunker, SentenceChunker};
+pub use chunking::{Chunker, CodeChunker, FixedSizeChunker, ParagraphChunker, SentenceChunker};
+pub use cleaning::{BasicCleaner, Cleaner};
 pub use config::{RagConfig, RagConfigBuilder};
 pub use error::{RagError, Result};
 pub use index::{HnswIndex, VectorIndex};
 pub use indexing::{IndexProgress, IndexStage};
+#[cfg(feature = "lancedb-persistence")]
+pub use persistence::LanceDbPersistence;
 pub use persistence::{Persistence, RedbPersistence, RkyvPersistence};
 pub use rag::{Rag, RagBuilder};
 pub use store::RagStore;

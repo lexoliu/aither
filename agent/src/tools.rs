@@ -170,7 +170,10 @@ impl AgentTools {
     #[cfg(feature = "mcp")]
     #[must_use]
     pub fn mcp_definitions(&self) -> Vec<ToolDefinition> {
-        self.mcp.iter().flat_map(aither_mcp::McpToolService::definitions).collect()
+        self.mcp
+            .iter()
+            .flat_map(aither_mcp::McpToolService::definitions)
+            .collect()
     }
 
     /// Merge another `AgentTools` into this one.

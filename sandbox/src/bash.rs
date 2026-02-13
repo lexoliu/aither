@@ -43,6 +43,22 @@ fn random_task_id() -> String {
 ///
 /// ## Output Handling
 ///
+/// By default, stdout is **compressed** before being returned. Compression
+/// is semantics-preserving: the meaning is identical to the raw output, but
+/// the representation may differ. Specifically:
+///
+/// - **JSON** outputs (arrays of objects or single objects) are automatically
+///   converted to **TSV** with dot-notation flattened column headers, but
+///   only when the TSV is smaller than the original JSON.
+/// - **Source code** outputs (detected via content analysis) are folded
+///   using syntax-aware block folding with line numbers. The full raw
+///   output is saved to a file whose URL is included in the result.
+/// - **Empty lines** and **invisible/control characters** are stripped.
+///
+/// If you need the exact verbatim output (e.g., for checksums, binary
+/// protocols, or diffing), either set `raw: true`, pipe through further
+/// processing in the script, or redirect to a file within the script.
+///
 /// Large outputs are automatically saved to file to manage context. When this
 /// happens, you receive the file path and can process it using standard Unix
 /// tools (head, tail, grep, less) or pipe through `ask` for summarization.
@@ -81,7 +97,26 @@ pub struct BashArgs {
     /// - 0: run in background immediately
     /// - >0: run foreground up to timeout, then move to background on timeout
     pub timeout: u64,
+
+    /// Maximum number of output lines to include inline.
+    /// When the actual output exceeds this limit, the full output is saved
+    /// to a file and only the file path is returned. Clamped to 800 max.
+    /// Default: 200.
+    #[serde(default = "default_max_lines")]
+    pub max_lines: u32,
+
+    /// When true, skip all output compression and return the verbatim
+    /// stdout bytes. Use this when you need exact byte-level fidelity
+    /// (checksums, binary protocols, diff inputs). Default: false.
+    #[serde(default)]
+    pub raw: bool,
 }
+
+const fn default_max_lines() -> u32 {
+    200
+}
+
+const MAX_LINES_CEILING: u32 = 800;
 
 /// Result of a bash execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,7 +166,7 @@ impl BackgroundTaskReceiver {
     /// Takes all completed background tasks without blocking.
     ///
     /// Returns an empty vector if no tasks have completed.
-    #[must_use] 
+    #[must_use]
     pub fn take_completed(&self) -> Vec<CompletedTask> {
         let mut completed = Vec::new();
         while let Ok(task) = self.rx.try_recv() {
@@ -141,7 +176,7 @@ impl BackgroundTaskReceiver {
     }
 
     /// Checks if there are any completed tasks waiting.
-    #[must_use] 
+    #[must_use]
     pub fn has_completed(&self) -> bool {
         !self.rx.is_empty()
     }
@@ -150,7 +185,7 @@ impl BackgroundTaskReceiver {
     ///
     /// This works by checking the sender count - `BashTool` holds one sender,
     /// and each running background task holds a cloned sender.
-    #[must_use] 
+    #[must_use]
     pub fn has_running(&self) -> bool {
         self.rx.sender_count() > 1
     }
@@ -736,7 +771,11 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             opened
         };
 
-        if !self
+        // Container backend skips permission check — the container IS the sandbox.
+        if !matches!(
+            session.backend,
+            crate::shell_session::ShellBackend::Container
+        ) && !self
             .permission_handler
             .check(session.mode, &arguments.script)
             .await
@@ -752,7 +791,11 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         let backend = session.backend;
         let ssh_target = session.ssh_target.clone();
         let ssh_runtime = session.ssh_runtime.clone();
+        let container_id = session.container_id.clone();
+        let container_exec = self.shell_sessions.container_exec();
         let expect = arguments.expect;
+        let max_lines = arguments.max_lines.min(MAX_LINES_CEILING) as usize;
+        let raw = arguments.raw;
         let working_dir = session.cwd.clone();
         let writable_paths = self.writable_paths.clone();
         let readable_paths = self.readable_paths.clone();
@@ -779,8 +822,12 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                     backend,
                     ssh_target.as_deref(),
                     ssh_runtime.clone(),
+                    container_id.as_deref(),
+                    container_exec.as_ref(),
                     expect,
                     &store_dir,
+                    max_lines,
+                    raw,
                 )
                 .await;
 
@@ -863,8 +910,12 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
     backend: crate::shell_session::ShellBackend,
     ssh_target: Option<&str>,
     ssh_runtime: Option<SshRuntimeProfile>,
+    container_id: Option<&str>,
+    container_exec: Option<&Arc<dyn crate::shell_session::ContainerExec>>,
     expect: OutputFormat,
     store_dir: &PathBuf,
+    max_lines: usize,
+    raw: bool,
 ) -> Result<BashResult, BashError> {
     info!(
         script_len = script.len(),
@@ -873,7 +924,16 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
     );
     debug!(script = %script, "script content");
 
-    let (pid, output) = if matches!(backend, crate::shell_session::ShellBackend::Ssh) {
+    let (pid, output) = if matches!(backend, crate::shell_session::ShellBackend::Container) {
+        execute_container_background(
+            shell_id,
+            script,
+            container_id,
+            container_exec,
+            &job_registry,
+        )
+        .await?
+    } else if matches!(backend, crate::shell_session::ShellBackend::Ssh) {
         execute_ssh_background(
             shell_id,
             script,
@@ -932,16 +992,52 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
         }
     };
 
-    // Save stdout with system-level size limit
-    let limit = Some(INLINE_OUTPUT_LIMIT);
-    let stdout =
-        match OutputStore::save_to_dir_with_limit(store_dir, &output.stdout, expect, limit).await {
+    // Compress and save stdout
+    let byte_limit = Some(INLINE_OUTPUT_LIMIT);
+    let stdout = {
+        // Determine the data to save: apply compression unless raw mode
+        let is_text = matches!(expect, OutputFormat::Text | OutputFormat::Auto);
+        let compressed = if !raw && is_text && !output.stdout.is_empty() {
+            if let Ok(text) = std::str::from_utf8(&output.stdout) {
+                crate::output_compress::compress_text(text)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // If compression produced a raw file (source code folding), save the raw original
+        if let Some(ref c) = compressed {
+            if let Some(ref raw_text) = c.raw_for_file {
+                if let Err(err) =
+                    crate::output::save_raw_to_file(store_dir, raw_text.as_bytes()).await
+                {
+                    warn!(error = %err, "failed to save raw source code output");
+                }
+            }
+        }
+
+        let data_to_save = compressed
+            .as_ref()
+            .map_or(&output.stdout[..], |c| c.text.as_bytes());
+
+        match crate::output::save_text_with_line_limit(
+            store_dir,
+            data_to_save,
+            expect,
+            max_lines,
+            byte_limit,
+        )
+        .await
+        {
             Ok(entry) => entry,
             Err(err) => {
                 job_registry.fail(pid, &err.to_string(), None).await;
                 return Err(BashError::Io(err));
             }
-        };
+        }
+    };
 
     // Save stderr if non-empty
     let stderr = if output.stderr.is_empty() {
@@ -951,7 +1047,7 @@ async fn execute_script_standalone<E: Executor + Clone + 'static>(
             store_dir,
             &output.stderr,
             OutputFormat::Text,
-            limit,
+            byte_limit,
         )
         .await
         {
@@ -1091,6 +1187,34 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     };
 
     Ok((pid, output))
+}
+
+async fn execute_container_background(
+    shell_id: &str,
+    script: &str,
+    container_id: Option<&str>,
+    container_exec: Option<&Arc<dyn crate::shell_session::ContainerExec>>,
+    job_registry: &JobRegistry,
+) -> Result<(u32, std::process::Output), BashError> {
+    let container_id = container_id
+        .ok_or_else(|| BashError::Execution("missing container_id for container backend".into()))?;
+    let exec = container_exec.ok_or_else(|| {
+        BashError::Execution("missing container executor for container backend".into())
+    })?;
+
+    // Use lower 32 bits of a UUID as a synthetic PID for job tracking.
+    let pid = uuid::Uuid::new_v4().as_u128() as u32;
+    job_registry
+        .register(pid, shell_id, script, BashMode::Unsafe, None)
+        .await;
+
+    match exec.exec(container_id, script, "/workspace").await {
+        Ok(output) => Ok((pid, output)),
+        Err(err) => {
+            job_registry.fail(pid, &err, None).await;
+            Err(BashError::Execution(err))
+        }
+    }
 }
 
 async fn execute_ssh_background(
@@ -1248,7 +1372,8 @@ pub fn get_os_info() -> (String, String) {
             .arg("-productVersion")
             .output()
             .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok()).map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
         ("macOS".to_string(), version)
     }
 

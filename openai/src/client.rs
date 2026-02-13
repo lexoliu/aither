@@ -20,7 +20,7 @@ use aither_core::{
 };
 use futures_core::Stream;
 use futures_lite::StreamExt;
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use zenwave::{Client, client, header};
 
 /// Configuration for request retry behavior.
@@ -111,6 +111,43 @@ async fn sleep(duration: Duration) {
     #[cfg(target_arch = "wasm32")]
     {
         let _ = duration;
+    }
+}
+
+fn map_zenwave_error(error: zenwave::Error) -> OpenAIError {
+    if matches!(error, zenwave::Error::Timeout) {
+        OpenAIError::Timeout
+    } else {
+        OpenAIError::Http(error)
+    }
+}
+
+async fn request_with_timeout<T>(
+    timeout: Duration,
+    fut: impl Future<Output = Result<T, zenwave::Error>>,
+) -> Result<T, OpenAIError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        futures_lite::future::or(
+            async move { fut.await.map_err(map_zenwave_error) },
+            async move {
+                async_io::Timer::after(timeout).await;
+                Err(OpenAIError::Timeout)
+            },
+        )
+        .await
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let millis = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        futures_lite::future::or(
+            async move { fut.await.map_err(map_zenwave_error) },
+            async move {
+                gloo_timers::future::TimeoutFuture::new(millis).await;
+                Err(OpenAIError::Timeout)
+            },
+        )
+        .await
     }
 }
 
@@ -439,17 +476,19 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, OpenAIError> {
 
     let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
     let mut backend = client();
-    let response: ModelsListResponse = backend
-        .get(&url)
-        .map_err(OpenAIError::Http)?
-        .header(
-            header::AUTHORIZATION.as_str(),
-            format!("Bearer {}", cfg.api_key),
-        )
-        .map_err(OpenAIError::Http)?
-        .json()
-        .await
-        .map_err(OpenAIError::Http)?;
+    let response: ModelsListResponse = request_with_timeout(
+        cfg.request_timeout,
+        backend
+            .get(&url)
+            .map_err(OpenAIError::Http)?
+            .header(
+                header::AUTHORIZATION.as_str(),
+                format!("Bearer {}", cfg.api_key),
+            )
+            .map_err(OpenAIError::Http)?
+            .json(),
+    )
+    .await?;
 
     // Find matching model
     let mut model_found = false;
@@ -525,15 +564,14 @@ async fn chat_completions_request(
             .map_err(OpenAIError::Http)?;
     }
 
-    let sse_stream = match builder
-        .json_body(request)
-        .map_err(OpenAIError::Http)?
-        .sse()
-        .await
+    let sse_stream = match request_with_timeout(
+        cfg.request_timeout,
+        builder.json_body(request).map_err(OpenAIError::Http)?.sse(),
+    )
+    .await
     {
         Ok(stream) => stream,
-        Err(zenwave::Error::Timeout) => return Err(OpenAIError::Timeout),
-        Err(e) => return Err(OpenAIError::Http(e)),
+        Err(error) => return Err(error),
     };
 
     let events: Vec<_> = sse_stream
@@ -698,6 +736,56 @@ struct FunctionCallAccumulator {
     call_id: Option<String>,
     name: Option<String>,
     arguments: String,
+    emitted: bool,
+}
+
+fn parse_tool_call_arguments(arguments: &str) -> serde_json::Value {
+    if arguments.is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Object(Default::default()))
+    }
+}
+
+fn mark_and_emit_done_function_call(
+    function_calls: &mut HashMap<String, FunctionCallAccumulator>,
+    id: String,
+    call_id: Option<String>,
+    name: String,
+    arguments: String,
+) -> ToolCall {
+    let resolved_call_id = call_id.unwrap_or_else(|| id.clone());
+
+    let acc = function_calls.entry(id).or_default();
+    acc.call_id = Some(resolved_call_id.clone());
+    acc.name = Some(name.clone());
+    acc.arguments = arguments.clone();
+    acc.emitted = true;
+
+    ToolCall {
+        id: resolved_call_id,
+        name,
+        arguments: parse_tool_call_arguments(&arguments),
+    }
+}
+
+fn drain_pending_function_calls(
+    function_calls: HashMap<String, FunctionCallAccumulator>,
+) -> Vec<ToolCall> {
+    function_calls
+        .into_values()
+        .filter(|acc| !acc.emitted)
+        .filter_map(|acc| {
+            let (Some(call_id), Some(name)) = (acc.call_id, acc.name) else {
+                return None;
+            };
+            Some(ToolCall {
+                id: call_id,
+                name,
+                arguments: parse_tool_call_arguments(&acc.arguments),
+            })
+        })
+        .collect()
 }
 
 /// Make a responses API SSE request (single attempt).
@@ -719,15 +807,14 @@ async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStrea
             .map_err(OpenAIError::Http)?;
     }
 
-    let sse_stream = match builder
-        .json_body(request)
-        .map_err(OpenAIError::Http)?
-        .sse()
-        .await
+    let sse_stream = match request_with_timeout(
+        cfg.request_timeout,
+        builder.json_body(request).map_err(OpenAIError::Http)?.sse(),
+    )
+    .await
     {
         Ok(stream) => stream,
-        Err(zenwave::Error::Timeout) => return Err(OpenAIError::Timeout),
-        Err(e) => return Err(OpenAIError::Http(e)),
+        Err(error) => return Err(error),
     };
 
     let events: Vec<_> = sse_stream
@@ -792,8 +879,7 @@ fn responses_stream_inner(
         tracing::debug!(event_count = events.len(), "Collected Responses API SSE events");
 
         // Accumulate function calls by item_id
-        let mut function_calls: std::collections::HashMap<String, FunctionCallAccumulator> =
-            std::collections::HashMap::new();
+        let mut function_calls: HashMap<String, FunctionCallAccumulator> = HashMap::new();
 
         for event in events {
             match event {
@@ -845,14 +931,14 @@ fn responses_stream_inner(
                                 ResponsesStreamEvent::OutputItemDone { item, .. } => {
                                     // Emit function call when item is done
                                     if let ResponsesOutputItem::FunctionCall { id, call_id, name, arguments } = item {
-                                        let call_id = call_id.unwrap_or(id);
-                                        let args = serde_json::from_str(&arguments)
-                                            .unwrap_or(serde_json::Value::Object(Default::default()));
-                                        yield Ok(Event::ToolCall(ToolCall {
-                                            id: call_id,
+                                        let tool_call = mark_and_emit_done_function_call(
+                                            &mut function_calls,
+                                            id,
+                                            call_id,
                                             name,
-                                            arguments: args,
-                                        }));
+                                            arguments,
+                                        );
+                                        yield Ok(Event::ToolCall(tool_call));
                                     }
                                 }
                                 ResponsesStreamEvent::ResponseFailed { error } => {
@@ -884,20 +970,61 @@ fn responses_stream_inner(
         }
 
         // Emit any remaining accumulated function calls (fallback if OutputItemDone wasn't received)
-        for (_item_id, acc) in function_calls {
-            if let (Some(call_id), Some(name)) = (acc.call_id, acc.name) {
-                // Skip if already emitted via OutputItemDone
-                if !acc.arguments.is_empty() {
-                    let args = serde_json::from_str(&acc.arguments)
-                        .unwrap_or(serde_json::Value::Object(Default::default()));
-                    yield Ok(Event::ToolCall(ToolCall {
-                        id: call_id,
-                        name,
-                        arguments: args,
-                    }));
-                }
-            }
+        for tool_call in drain_pending_function_calls(function_calls) {
+            yield Ok(Event::ToolCall(tool_call));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_lite::future::block_on;
+    use std::time::Duration;
+
+    #[test]
+    fn done_function_call_is_not_emitted_twice() {
+        let mut function_calls = HashMap::new();
+        let emitted = mark_and_emit_done_function_call(
+            &mut function_calls,
+            "item_1".to_string(),
+            Some("call_1".to_string()),
+            "search".to_string(),
+            r#"{"q":"rust"}"#.to_string(),
+        );
+        assert_eq!(emitted.id, "call_1");
+        assert_eq!(emitted.name, "search");
+        assert_eq!(drain_pending_function_calls(function_calls).len(), 0);
+    }
+
+    #[test]
+    fn pending_function_call_is_emitted_once_via_fallback() {
+        let mut function_calls = HashMap::new();
+        function_calls.insert(
+            "item_2".to_string(),
+            FunctionCallAccumulator {
+                call_id: Some("call_2".to_string()),
+                name: Some("lookup".to_string()),
+                arguments: r#"{"id":42}"#.to_string(),
+                emitted: false,
+            },
+        );
+        let pending = drain_pending_function_calls(function_calls);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "call_2");
+        assert_eq!(pending[0].name, "lookup");
+    }
+
+    #[test]
+    fn configured_timeout_is_enforced_for_sse_requests() {
+        block_on(async {
+            let timeout = request_with_timeout(
+                Duration::from_millis(20),
+                futures_lite::future::pending::<Result<(), zenwave::Error>>(),
+            )
+            .await;
+            assert!(matches!(timeout, Err(OpenAIError::Timeout)));
+        });
     }
 }
 

@@ -76,7 +76,10 @@ impl LanguageModel for Llama {
         &self,
         request: LLMRequest,
     ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
-        let outcome = run_response(&self.model, &self.backend, &self.inner, request).map_or_else(|err| vec![Err(err)], |events| events.into_iter().map(Ok).collect::<Vec<_>>());
+        let outcome = run_response(&self.model, &self.backend, &self.inner, request).map_or_else(
+            |err| vec![Err(err)],
+            |events| events.into_iter().map(Ok).collect::<Vec<_>>(),
+        );
         futures_lite::stream::iter(outcome)
     }
 

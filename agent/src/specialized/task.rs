@@ -22,6 +22,12 @@ use crate::AgentBuilder;
 use crate::fs_util::path_exists;
 use crate::subagent_file::SubagentDefinition;
 
+async fn checked_path_exists(path: &Path) -> anyhow::Result<bool> {
+    path_exists(path)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to inspect path '{}': {error}", path.display()))
+}
+
 /// Builder function type for configuring a subagent.
 /// Returns an `AgentBuilder` so we can add hooks before building.
 /// The builder returns a single-model agent (all tiers use the same LLM).
@@ -240,15 +246,15 @@ where
             // 2. Under .subagents/ relative to base_dir
             // 3. Under .skills/ relative to base_dir
             let path = base.join(file_path);
-            let resolved_path = if path_exists(&path).await {
+            let resolved_path = if checked_path_exists(&path).await? {
                 path
             } else {
                 let subagents_path = base.join(".subagents").join(file_path);
-                if path_exists(&subagents_path).await {
+                if checked_path_exists(&subagents_path).await? {
                     subagents_path
                 } else {
                     let skills_path = base.join(".skills").join(file_path);
-                    if path_exists(&skills_path).await {
+                    if checked_path_exists(&skills_path).await? {
                         skills_path
                     } else {
                         // Return original path for error message
@@ -281,7 +287,8 @@ where
             // Use registered subagent type
             let type_name = &args.subagent;
             let subagent_type = self.types.get(type_name).ok_or_else(|| {
-                let available: Vec<&str> = self.types.keys().map(std::string::String::as_str).collect();
+                let available: Vec<&str> =
+                    self.types.keys().map(std::string::String::as_str).collect();
                 anyhow::anyhow!(
                     "Unknown subagent type '{}'. Available: {}",
                     type_name,

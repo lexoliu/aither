@@ -66,7 +66,7 @@ pub struct RequestWorkspaceTool {
 
 impl RequestWorkspaceTool {
     /// Create a new workspace request tool.
-    #[must_use] 
+    #[must_use]
     pub const fn new(broker: WorkspaceRequestBroker) -> Self {
         Self { broker }
     }

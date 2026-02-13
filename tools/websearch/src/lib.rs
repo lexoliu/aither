@@ -25,6 +25,7 @@
 //! | [`Tavily`] | Required | AI-optimized search for RAG workflows |
 //! | [`GoogleSearch`] | Required (+CX ID) | Google Custom Search API |
 //! | [`Serper`] | Required | Fast Google SERP API |
+//! | [`Exa`] | Required | Semantic web search optimized for AI |
 //!
 //! # Custom Provider
 //!

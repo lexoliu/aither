@@ -221,7 +221,7 @@ impl JobRegistry {
     }
 
     /// Blocking variant of `kill_by_session`, intended for drop-time cleanup.
-    #[must_use] 
+    #[must_use]
     pub fn kill_by_session_blocking(&self, shell_id: &str) -> usize {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         if self
@@ -429,7 +429,8 @@ fn format_running_jobs(jobs: &HashMap<u32, JobInfo>) -> String {
 
         let output_path = job
             .output_path
-            .as_ref().map_or_else(|| "(no output)".to_string(), |p| p.display().to_string());
+            .as_ref()
+            .map_or_else(|| "(no output)".to_string(), |p| p.display().to_string());
 
         output.push_str(&format!(
             "  - PID {}: `{}` → {}\n",

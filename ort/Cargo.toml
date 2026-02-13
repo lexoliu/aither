@@ -25,7 +25,7 @@ tokio = { version = "1.0", features = ["macros", "rt"] }
 default = ["cuda", "coreml", "download-binaries"]
 cuda = ["ort/cuda"]
 coreml = ["ort/coreml"]
-download-binaries = ["ort/download-binaries", "ort/tls-rustls"]
+download-binaries = ["ort/download-binaries"]
 
 [lints]
 workspace = true

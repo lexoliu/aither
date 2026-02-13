@@ -14,7 +14,7 @@ use crate::{MatchResult, Skill, SkillError, SkillLoader, SkillMatcher};
 /// ```rust,ignore
 /// let loader = SkillLoader::new().add_path("~/.aither/skills");
 /// let mut registry = SkillRegistry::new();
-/// registry.load_from(&loader)?;
+/// registry.load_from(&loader).await?;
 ///
 /// // Find skills relevant to a prompt
 /// let matches = registry.match_prompt("review this code");
@@ -52,8 +52,8 @@ impl SkillRegistry {
     /// # Errors
     ///
     /// Returns an error if the loader fails to load skills.
-    pub fn load_from(&mut self, loader: &SkillLoader) -> Result<usize, SkillError> {
-        let skills = loader.load_all()?;
+    pub async fn load_from(&mut self, loader: &SkillLoader) -> Result<usize, SkillError> {
+        let skills = loader.load_all().await?;
         let count = skills.len();
 
         for skill in skills {

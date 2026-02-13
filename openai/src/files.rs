@@ -8,10 +8,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(not(target_arch = "wasm32"))]
-use std::path::Path;
-#[cfg(not(target_arch = "wasm32"))]
 use async_fs;
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
 use zenwave::{Client, client, header};
 
 use crate::error::OpenAIError;

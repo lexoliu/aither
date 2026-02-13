@@ -3,8 +3,6 @@
 //! This module provides types for representing messages in conversations with AI language models.
 //! Messages are represented as an enum with variants for different roles (User, Assistant, System, Tool).
 
-use core::fmt::Debug;
-
 use alloc::{string::String, vec::Vec};
 use url::Url;
 
@@ -163,30 +161,19 @@ impl Message {
     }
 
     /// Adds an attachment URL to the message (only works for User messages).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the provided URL cannot be converted into a valid [`Url`].
     #[must_use]
-    pub fn with_attachment<U: TryInto<Url, Error: Debug>>(mut self, url: U) -> Self {
+    pub fn with_attachment(mut self, url: Url) -> Self {
         if let Self::User { attachments, .. } = &mut self {
-            attachments.push(url.try_into().unwrap());
+            attachments.push(url);
         }
         self
     }
 
     /// Adds multiple attachment URLs to the message.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any provided URL cannot be converted into a valid [`Url`].
     #[must_use]
-    pub fn with_attachments<U: TryInto<Url, Error: Debug>>(
-        mut self,
-        urls: impl IntoIterator<Item = U>,
-    ) -> Self {
+    pub fn with_attachments(mut self, urls: impl IntoIterator<Item = Url>) -> Self {
         if let Self::User { attachments, .. } = &mut self {
-            attachments.extend(urls.into_iter().map(|url| url.try_into().unwrap()));
+            attachments.extend(urls);
         }
         self
     }
@@ -255,6 +242,23 @@ mod tests {
         let message = Message::user("Hello").with_attachment(url.clone());
         assert_eq!(message.attachments().len(), 1);
         assert_eq!(message.attachments()[0], url);
+    }
+
+    #[test]
+    fn message_with_attachments() {
+        let urls = vec![
+            "https://example.com/a".parse::<Url>().unwrap(),
+            "https://example.com/b".parse::<Url>().unwrap(),
+        ];
+        let message = Message::user("Hello").with_attachments(urls.clone());
+        assert_eq!(message.attachments(), urls.as_slice());
+    }
+
+    #[test]
+    fn attachments_are_ignored_for_non_user_messages() {
+        let url = "https://example.com/a".parse::<Url>().unwrap();
+        let message = Message::assistant("Hello").with_attachment(url);
+        assert!(message.attachments().is_empty());
     }
 
     #[test]

@@ -37,8 +37,8 @@ use std::sync::Arc;
 use aither_core::llm::Tool;
 use leash::IpcCommand;
 use schemars::JsonSchema;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 // ============================================================================
@@ -507,7 +507,7 @@ impl IpcCommand for ToolCallCommand {
 /// let registry = std::sync::Arc::new(ToolRegistryBuilder::new().build("./outputs"));
 /// let router = register_tool_command(router, registry, "websearch");
 /// ```
-#[must_use] 
+#[must_use]
 pub fn register_tool_command(
     router: leash::IpcRouter,
     registry: Arc<ToolRegistry>,
@@ -554,15 +554,14 @@ impl IpcCommand for IpcGatewayCommand {
             return Value::String("Error: usage: ipc <tool> [args ...]".to_string());
         }
 
-        if has_help_flag(&cli_args)
-            && cli_args.len() == 1 {
-                let mut names = self.registry.registered_tool_names();
-                names.sort();
-                return Value::String(format!(
-                    "Usage: ipc <tool> [args ...]\nAvailable tools: {}",
-                    names.join(", ")
-                ));
-            }
+        if has_help_flag(&cli_args) && cli_args.len() == 1 {
+            let mut names = self.registry.registered_tool_names();
+            names.sort();
+            return Value::String(format!(
+                "Usage: ipc <tool> [args ...]\nAvailable tools: {}",
+                names.join(", ")
+            ));
+        }
 
         let tool_name = &cli_args[0];
         let tool_args = cli_args[1..].to_vec();
@@ -576,7 +575,7 @@ impl IpcCommand for IpcGatewayCommand {
 }
 
 /// Registers the generic `ipc` gateway command that dispatches to any tool by name.
-#[must_use] 
+#[must_use]
 pub fn register_ipc_gateway_command(
     router: leash::IpcRouter,
     registry: Arc<ToolRegistry>,
@@ -1007,10 +1006,9 @@ fn has_help_flag(args: &[String]) -> bool {
         if arg == "--help" || arg == "-h" {
             return true;
         }
-        if arg.starts_with('-') && !arg.starts_with("--")
-            && arg.chars().skip(1).any(|c| c == 'h') {
-                return true;
-            }
+        if arg.starts_with('-') && !arg.starts_with("--") && arg.chars().skip(1).any(|c| c == 'h') {
+            return true;
+        }
     }
     false
 }
@@ -1293,10 +1291,12 @@ fn insert_value(
     prop_schema: &Value,
 ) {
     if get_instance_type(prop_schema) == Some("array") {
-        if let Some(Value::Array(existing)) = result.get_mut(field_name) { match value {
-            Value::Array(mut items) => existing.append(&mut items),
-            other => existing.push(other),
-        } } else {
+        if let Some(Value::Array(existing)) = result.get_mut(field_name) {
+            match value {
+                Value::Array(mut items) => existing.append(&mut items),
+                other => existing.push(other),
+            }
+        } else {
             let mut items = Vec::new();
             match value {
                 Value::Array(mut arr) => items.append(&mut arr),
@@ -1354,9 +1354,11 @@ fn get_instance_type(schema: &Value) -> Option<&str> {
 fn parse_value(s: &str, expected_type: Option<&str>) -> Value {
     match expected_type {
         Some("integer") => s
-            .parse::<i64>().map_or_else(|_| Value::String(s.to_string()), Value::from),
+            .parse::<i64>()
+            .map_or_else(|_| Value::String(s.to_string()), Value::from),
         Some("number") => s
-            .parse::<f64>().map_or_else(|_| Value::String(s.to_string()), Value::from),
+            .parse::<f64>()
+            .map_or_else(|_| Value::String(s.to_string()), Value::from),
         Some("boolean") => match s.to_lowercase().as_str() {
             "true" | "1" | "yes" => Value::Bool(true),
             "false" | "0" | "no" => Value::Bool(false),

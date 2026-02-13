@@ -28,7 +28,7 @@ pub struct TasksTool {
 
 impl TasksTool {
     /// Creates a new tasks tool with the given registry.
-    #[must_use] 
+    #[must_use]
     pub const fn new(registry: JobRegistry) -> Self {
         Self { registry }
     }
@@ -73,7 +73,8 @@ impl Tool for TasksTool {
 
             let output_str = job
                 .output_path
-                .as_ref().map_or_else(|| "(no output)".to_string(), |p| p.display().to_string());
+                .as_ref()
+                .map_or_else(|| "(no output)".to_string(), |p| p.display().to_string());
 
             output.push_str(&format!(
                 "PID {} [{}]\n  shell_id: {}\n  script: {}\n  output: {}\n\n",

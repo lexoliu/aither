@@ -3,18 +3,18 @@ use url::Url;
 use crate::error::OpenAIError;
 
 #[cfg(not(target_arch = "wasm32"))]
-use aither_core::llm::Message;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::client::Config;
+#[cfg(not(target_arch = "wasm32"))]
+use aither_core::llm::Message;
 
-#[cfg(not(target_arch = "wasm32"))]
-use aither_attachments::{FileCache, default_cache_dir};
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::Path;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::files::{FilePurpose, FilesConfig, upload_file};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::mime::mime_from_path;
+#[cfg(not(target_arch = "wasm32"))]
+use aither_attachments::{FileCache, default_cache_dir};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
 
 #[derive(Clone, Copy)]
 pub struct OpenAIFileKind(&'static str);

@@ -195,6 +195,14 @@ fn expand_tilde(path: &std::path::Path) -> PathBuf {
     path.to_path_buf()
 }
 
+async fn path_exists(path: &std::path::Path) -> Result<bool> {
+    match tokio::fs::metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Read y/n response from stdin.
 fn read_yes_no() -> Result<bool> {
     enable_raw_mode()?;
@@ -229,24 +237,18 @@ fn read_yes_no() -> Result<bool> {
 /// This makes MCP tools available as bash commands (e.g., `resolve-library-id "tokio"`)
 /// instead of direct LLM tool calls.
 fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
-    let conn = Arc::new(AsyncMutex::new(conn));
+    let tools: Vec<_> = conn
+        .mcp_definitions()
+        .iter()
+        .map(|def| {
+            let name = def.name.clone();
+            let description = def.description.clone().unwrap_or_default();
+            let schema = def.input_schema.clone();
+            (name, description, schema)
+        })
+        .collect();
 
-    // Get tool definitions before moving conn into closures
-    let tools: Vec<_> = {
-        // We need to block to get definitions since this is called from async context
-        // but we can access the definitions synchronously through the stored tools
-        let conn_guard = futures_lite::future::block_on(conn.lock());
-        conn_guard
-            .mcp_definitions()
-            .iter()
-            .map(|def| {
-                let name = def.name.clone();
-                let description = def.description.clone().unwrap_or_default();
-                let schema = def.input_schema.clone();
-                (name, description, schema)
-            })
-            .collect()
-    };
+    let conn = Arc::new(AsyncMutex::new(conn));
 
     for (name, description, schema) in tools {
         let conn = conn.clone();
@@ -453,8 +455,8 @@ async fn build_agent(
     if let Some(ref skills_path) = args.skills {
         // Expand ~ to home directory
         let expanded = expand_tilde(skills_path);
-        if expanded.exists() {
-            builder = builder.with_skills(&expanded);
+        if path_exists(&expanded).await? {
+            builder = builder.with_skills(&expanded).await?;
             if !args.quiet {
                 println!("Loaded skills from: {}", expanded.display());
             }
@@ -469,8 +471,8 @@ async fn build_agent(
     // Set up subagents directory if path provided
     if let Some(ref subagents_path) = args.subagents {
         let expanded = expand_tilde(subagents_path);
-        if expanded.exists() {
-            builder = builder.with_subagents(&expanded);
+        if path_exists(&expanded).await? {
+            builder = builder.with_subagents(&expanded).await?;
             if !args.quiet {
                 println!("Subagents directory: {}", expanded.display());
             }
@@ -507,7 +509,8 @@ async fn build_agent(
 
     // Add MCP connections from config file
     if let Some(ref mcp_path) = args.mcp {
-        let config_str = std::fs::read_to_string(mcp_path)
+        let config_str = tokio::fs::read_to_string(mcp_path)
+            .await
             .with_context(|| format!("failed to read MCP config from {}", mcp_path.display()))?;
         let config: McpServersConfig =
             serde_json::from_str(&config_str).with_context(|| "failed to parse MCP config")?;

@@ -5,33 +5,36 @@ use std::sync::Arc;
 use aither_core::embedding::EmbeddingModel;
 
 use crate::chunking::{Chunker, FixedSizeChunker};
+use crate::cleaning::{BasicCleaner, Cleaner};
 use crate::config::RagConfig;
 use crate::error::{RagError, Result};
 use crate::index::{HnswIndex, VectorIndex};
 use crate::types::{Chunk, Document, SearchResult};
 
-/// The core RAG store that manages documents, chunking, and indexing.
+/// The core RAG store that manages documents, cleaning, chunking, and indexing.
 ///
 /// `RagStore` combines an embedding model with a vector index to provide
 /// efficient semantic search over documents.
-pub struct RagStore<M: EmbeddingModel> {
+pub struct RagStore<M: EmbeddingModel, C: Chunker = FixedSizeChunker, L: Cleaner = BasicCleaner> {
     embedder: M,
     index: Arc<HnswIndex>,
-    chunker: Arc<dyn Chunker>,
+    chunker: C,
+    cleaner: L,
     config: RagConfig,
 }
 
-impl<M: EmbeddingModel> std::fmt::Debug for RagStore<M> {
+impl<M: EmbeddingModel, C: Chunker, L: Cleaner> std::fmt::Debug for RagStore<M, C, L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RagStore")
             .field("index", &self.index)
             .field("chunker", &self.chunker.name())
+            .field("cleaner", &self.cleaner.name())
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
 }
 
-impl<M> RagStore<M>
+impl<M> RagStore<M, FixedSizeChunker, BasicCleaner>
 where
     M: EmbeddingModel + Send + Sync + 'static,
 {
@@ -44,7 +47,8 @@ where
         Self {
             embedder,
             index: Arc::new(HnswIndex::new(dimension)),
-            chunker: Arc::new(FixedSizeChunker::default()),
+            chunker: FixedSizeChunker::default(),
+            cleaner: BasicCleaner,
             config: RagConfig::default(),
         }
     }
@@ -56,31 +60,69 @@ where
         Self {
             embedder,
             index: Arc::new(HnswIndex::new(dimension)),
-            chunker: Arc::new(FixedSizeChunker::default()),
+            chunker: FixedSizeChunker::default(),
+            cleaner: BasicCleaner,
+            config,
+        }
+    }
+}
+
+impl<M, C, L> RagStore<M, C, L>
+where
+    M: EmbeddingModel + Send + Sync + 'static,
+    C: Chunker,
+    L: Cleaner,
+{
+    /// Creates a new RAG store with explicit components.
+    #[must_use]
+    pub fn with_components(embedder: M, config: RagConfig, chunker: C, cleaner: L) -> Self {
+        let dimension = embedder.dim();
+        Self {
+            embedder,
+            index: Arc::new(HnswIndex::new(dimension)),
+            chunker,
+            cleaner,
             config,
         }
     }
 
     /// Sets a custom chunker for this store.
     #[must_use]
-    pub fn with_chunker(mut self, chunker: impl Chunker + 'static) -> Self {
-        self.chunker = Arc::new(chunker);
-        self
+    pub fn with_chunker<C2: Chunker>(self, chunker: C2) -> RagStore<M, C2, L> {
+        RagStore {
+            embedder: self.embedder,
+            index: self.index,
+            chunker,
+            cleaner: self.cleaner,
+            config: self.config,
+        }
+    }
+
+    /// Sets a custom cleaner for this store.
+    #[must_use]
+    pub fn with_cleaner<L2: Cleaner>(self, cleaner: L2) -> RagStore<M, C, L2> {
+        RagStore {
+            embedder: self.embedder,
+            index: self.index,
+            chunker: self.chunker,
+            cleaner,
+            config: self.config,
+        }
     }
 
     /// Inserts a document into the store.
     ///
-    /// The document is chunked, deduplicated (if enabled), embedded, and indexed.
+    /// The document is cleaned, chunked, deduplicated (if enabled), embedded, and indexed.
     ///
     /// # Returns
     /// The number of chunks actually inserted (may be less than total chunks
     /// if deduplication is enabled and duplicates are found).
     pub async fn insert(&self, document: Document) -> Result<usize> {
-        let chunks = self.chunker.chunk(&document)?;
+        let cleaned = self.cleaner.clean(&document);
+        let chunks = self.chunker.chunk(&cleaned)?;
         let mut inserted = 0;
 
         for chunk in chunks {
-            // Check for duplicate content
             if self.config.deduplication && self.index.contains_hash(chunk.content_hash) {
                 continue;
             }
@@ -122,10 +164,8 @@ where
     /// # Returns
     /// `true` if any chunks were removed.
     pub fn delete(&self, doc_id: &str) -> bool {
-        // Delete the main document chunk
         let mut removed = self.index.remove(doc_id);
 
-        // Delete all numbered chunks
         let mut chunk_idx = 0;
         loop {
             let chunk_id = format!("{doc_id}#chunk_{chunk_idx}");
@@ -141,24 +181,11 @@ where
     }
 
     /// Searches for chunks similar to the query.
-    ///
-    /// # Arguments
-    /// * `query` - The search query text
-    ///
-    /// # Returns
-    /// Search results sorted by similarity score (highest first).
     pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
         self.search_with_k(query, self.config.default_top_k).await
     }
 
     /// Searches for chunks similar to the query with a custom result count.
-    ///
-    /// # Arguments
-    /// * `query` - The search query text
-    /// * `top_k` - Maximum number of results to return
-    ///
-    /// # Returns
-    /// Search results sorted by similarity score (highest first).
     pub async fn search_with_k(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         let embedding = self
             .embedder
@@ -195,6 +222,16 @@ where
     /// Returns a reference to the embedder.
     pub const fn embedder(&self) -> &M {
         &self.embedder
+    }
+
+    /// Returns a reference to the chunker.
+    pub const fn chunker(&self) -> &C {
+        &self.chunker
+    }
+
+    /// Returns a reference to the cleaner.
+    pub const fn cleaner(&self) -> &L {
+        &self.cleaner
     }
 
     /// Returns the configuration.
@@ -272,7 +309,6 @@ mod tests {
         let config = RagConfig::builder().deduplication(true).build();
         let store = RagStore::with_config(embedder, config);
 
-        // Insert same content twice with different IDs
         let doc1 = Document::new("doc1", "Same content");
         let doc2 = Document::new("doc2", "Same content");
 
@@ -280,7 +316,7 @@ mod tests {
         let inserted2 = store.insert(doc2).await.unwrap();
 
         assert_eq!(inserted1, 1);
-        assert_eq!(inserted2, 0); // Deduplicated
+        assert_eq!(inserted2, 0);
         assert_eq!(store.len(), 1);
     }
 

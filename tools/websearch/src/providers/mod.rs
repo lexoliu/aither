@@ -5,6 +5,7 @@
 
 mod brave;
 mod duckduckgo;
+mod exa;
 mod google;
 mod searxng;
 mod serper;
@@ -12,6 +13,7 @@ mod tavily;
 
 pub use brave::BraveSearch;
 pub use duckduckgo::DuckDuckGo;
+pub use exa::Exa;
 pub use google::GoogleSearch;
 pub use searxng::{DEFAULT_SEARXNG_URL, SearXNG};
 pub use serper::Serper;

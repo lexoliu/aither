@@ -29,7 +29,7 @@ pub struct KillTool {
 
 impl KillTool {
     /// Creates a new kill tool with the given registry.
-    #[must_use] 
+    #[must_use]
     pub const fn new(registry: JobRegistry) -> Self {
         Self { registry }
     }

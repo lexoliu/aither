@@ -50,12 +50,11 @@ use crate::{
 };
 use aither_sandbox::builtin::{KillTool, TasksTool};
 use aither_sandbox::{
-    BashTool, BashToolFactory, BashToolFactoryReceiver, CloseShellTool, ListSshTool, OpenShellTool,
-    PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, SshServer,
+    BashTool, BashToolFactory, BashToolFactoryReceiver, CloseShellTool, ContainerExec, ListSshTool,
+    OpenShellTool, PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, SshServer,
     SshSessionAuthorizer, ToolRegistryBuilder, Unconfigured, bash_tool_factory_channel,
 };
 
-use crate::fs_util::path_exists;
 /// System prompt template for bash-centric agents.
 #[derive(Template)]
 #[template(path = "system.txt", escape = "none")]
@@ -151,10 +150,8 @@ where
             ssh: false,
         });
 
-        let open_shell = OpenShellTool::new(
-            shell_sessions.clone(),
-            bash_tool.working_dir().clone(),
-        );
+        let open_shell =
+            OpenShellTool::new(shell_sessions.clone(), bash_tool.working_dir().clone());
         let list_ssh = ListSshTool::new(shell_sessions.clone());
         let job_registry = bash_tool.job_registry();
         let close_shell = CloseShellTool::new(shell_sessions.clone(), job_registry.clone());
@@ -204,6 +201,75 @@ where
     E: Executor + Clone + 'static,
     H: Hook,
 {
+    async fn attach_readable_symlink(
+        mut self,
+        source_path: &std::path::Path,
+        link_name: &str,
+    ) -> Result<Self, crate::AgentError> {
+        let abs_path = fs::canonicalize(source_path).await.map_err(|error| {
+            crate::AgentError::Config(format!(
+                "failed to canonicalize path '{}': {error}",
+                source_path.display()
+            ))
+        })?;
+        let symlink_path = self.bash_tool.working_dir().join(link_name);
+
+        match fs::symlink_metadata(&symlink_path).await {
+            Ok(metadata) => {
+                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+                    fs::remove_dir(&symlink_path).await.map_err(|error| {
+                        crate::AgentError::Config(format!(
+                            "failed to remove existing directory '{}': {error}",
+                            symlink_path.display()
+                        ))
+                    })?;
+                } else {
+                    fs::remove_file(&symlink_path).await.map_err(|error| {
+                        crate::AgentError::Config(format!(
+                            "failed to remove existing file '{}': {error}",
+                            symlink_path.display()
+                        ))
+                    })?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(crate::AgentError::Config(format!(
+                    "failed to inspect '{}': {error}",
+                    symlink_path.display()
+                )));
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            fs::unix::symlink(&abs_path, &symlink_path)
+                .await
+                .map_err(|error| {
+                    crate::AgentError::Config(format!(
+                        "failed to create symlink '{}' -> '{}': {error}",
+                        symlink_path.display(),
+                        abs_path.display()
+                    ))
+                })?;
+        }
+        #[cfg(windows)]
+        {
+            fs::windows::symlink_dir(&abs_path, &symlink_path)
+                .await
+                .map_err(|error| {
+                    crate::AgentError::Config(format!(
+                        "failed to create symlink '{}' -> '{}': {error}",
+                        symlink_path.display(),
+                        abs_path.display()
+                    ))
+                })?;
+        }
+
+        self.bash_tool = self.bash_tool.with_readable_paths([abs_path]);
+        Ok(self)
+    }
+
     /// Sets runtime shell backend availability for `open_shell`.
     pub fn shell_runtime_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
         self.bash_tool = self
@@ -222,6 +288,15 @@ where
     /// Sets the SSH session authorizer for interactive connect/install/unsafe consent prompts.
     pub fn ssh_authorizer(self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
         let _ = self.shell_sessions.set_ssh_authorizer(authorizer);
+        self
+    }
+
+    /// Sets the container executor for Docker-based shell backends.
+    ///
+    /// This is shared across all clones of the internal `ShellSessionRegistry`
+    /// via `OnceLock`, so it must only be called once.
+    pub fn container_exec(self, exec: Arc<dyn ContainerExec>) -> Self {
+        self.shell_sessions.set_container_exec(exec);
         self
     }
 
@@ -373,7 +448,8 @@ where
 
         // Get directory paths
         let sandbox_dir = self.bash_tool.working_dir().display().to_string();
-        let user_cwd = std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
+        let user_cwd =
+            std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
 
         // Get system info
         let (os, os_version) = get_os_info();
@@ -417,112 +493,46 @@ where
         }
     }
 
-    /// Loads skills from a filesystem path and creates a symlink in the sandbox.
-    ///
-    /// Skills are loaded from SKILL.md files in subdirectories of the provided path.
-    /// A symlink `.skills` is created in the sandbox working directory pointing to
-    /// the skills directory, allowing the agent to read skill contents.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// builder.with_skills("/path/to/skills")
-    /// ```
-    #[cfg(feature = "skills")]
-    pub fn with_skills(mut self, path: impl AsRef<std::path::Path>) -> Self {
-        use aither_skills::SkillLoader;
-
-        let path = path.as_ref();
-
-        // Ensure the skills directory exists.
-        let _ = std::fs::create_dir_all(path);
-
-        if path.exists() {
-            tracing::debug!(path = %path.display(), "Loading skills from path");
-            let loader = SkillLoader::new().add_path(path);
-            match loader.load_all() {
-                Ok(skills) => {
-                    tracing::info!(count = skills.len(), path = %path.display(), "Loaded skills");
-                    for skill in skills {
-                        tracing::debug!(name = %skill.name, "Loaded skill");
-                        self.skills.push(SkillInfo {
-                            name: skill.name,
-                            description: skill.description,
-                        });
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, path = %path.display(), "Failed to load skills");
-                }
-            }
-        }
-
-        // Create the symlink and register as a readable sandbox path.
-        let symlink_path = self.bash_tool.working_dir().join(".skills");
-        if let Ok(abs_path) = path.canonicalize() {
-            #[cfg(unix)]
-            {
-                let _ = std::os::unix::fs::symlink(&abs_path, &symlink_path);
-            }
-            #[cfg(windows)]
-            {
-                let _ = std::os::windows::fs::symlink_dir(&abs_path, &symlink_path);
-            }
-            self.bash_tool = self.bash_tool.with_readable_paths([abs_path]);
-        }
-
-        self
-    }
-
-    /// Loads skills from a filesystem path asynchronously.
+    /// Loads skills from a filesystem path.
     ///
     /// Creates the directory if it does not exist and always creates a
     /// read-only `.skills` symlink inside the sandbox so the agent can
     /// `cat .skills/<name>/SKILL.md` at runtime.  The path is also
     /// registered as a readable (but not writable) sandbox path.
     #[cfg(feature = "skills")]
-    pub async fn with_skills_async(mut self, path: impl AsRef<std::path::Path>) -> Self {
+    pub async fn with_skills(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, crate::AgentError> {
         use aither_skills::SkillLoader;
 
         let path = path.as_ref().to_path_buf();
 
-        // Ensure the skills directory exists.
-        let _ = fs::create_dir_all(&path).await;
+        fs::create_dir_all(&path).await.map_err(|error| {
+            crate::AgentError::Config(format!(
+                "failed to create skills directory '{}': {error}",
+                path.display()
+            ))
+        })?;
 
-        if path_exists(&path).await {
-            let loader = SkillLoader::new().add_path(&path);
-            match loader.load_all_async().await {
-                Ok(skills) => {
-                    tracing::info!(count = skills.len(), path = %path.display(), "Loaded skills");
-                    for skill in skills {
-                        tracing::debug!(name = %skill.name, "Loaded skill");
-                        self.skills.push(SkillInfo {
-                            name: skill.name,
-                            description: skill.description,
-                        });
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, path = %path.display(), "Failed to load skills");
-                }
-            }
+        let loader = SkillLoader::new().add_path(&path);
+        let skills = loader.load_all().await.map_err(|error| {
+            crate::AgentError::Config(format!(
+                "failed to load skills from '{}': {error}",
+                path.display()
+            ))
+        })?;
+
+        tracing::info!(count = skills.len(), path = %path.display(), "Loaded skills");
+        for skill in skills {
+            tracing::debug!(name = %skill.name, "Loaded skill");
+            self.skills.push(SkillInfo {
+                name: skill.name,
+                description: skill.description,
+            });
         }
 
-        // Create the symlink and register as a readable sandbox path.
-        let symlink_path = self.bash_tool.working_dir().join(".skills");
-        if let Ok(abs_path) = fs::canonicalize(&path).await {
-            #[cfg(unix)]
-            {
-                let _ = fs::unix::symlink(&abs_path, &symlink_path).await;
-            }
-            #[cfg(windows)]
-            {
-                let _ = fs::windows::symlink_dir(&abs_path, &symlink_path).await;
-            }
-            self.bash_tool = self.bash_tool.with_readable_paths([abs_path]);
-        }
-
-        self
+        self.attach_readable_symlink(&path, ".skills").await
     }
 
     /// Adds a skill manually without loading from filesystem.
@@ -544,86 +554,43 @@ where
     /// # Example
     ///
     /// ```rust,ignore
-    /// builder.with_subagents("/path/to/subagents")
+    /// builder.with_subagents("/path/to/subagents").await?
     /// ```
-    pub fn with_subagents(mut self, path: impl AsRef<std::path::Path>) -> Self {
+    pub async fn with_subagents(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, crate::AgentError> {
         use crate::subagent_file::SubagentDefinition;
 
-        let path = path.as_ref();
+        let path = path.as_ref().to_path_buf();
 
         // Ensure the subagents directory exists.
-        let _ = std::fs::create_dir_all(path);
+        fs::create_dir_all(&path).await.map_err(|error| {
+            crate::AgentError::Config(format!(
+                "failed to create subagents directory '{}': {error}",
+                path.display()
+            ))
+        })?;
 
-        if path.exists() {
-            if let Ok(defs) = SubagentDefinition::load_from_dir(path) {
-                for def in defs {
-                    let filename = format!("{}.md", def.id);
-                    self.subagents.push(SubagentInfo {
-                        name: def.id,
-                        description: def.description,
-                        path: filename,
-                    });
-                }
-            }
+        let defs = SubagentDefinition::load_from_dir_async(&path)
+            .await
+            .map_err(|error| {
+                crate::AgentError::Config(format!(
+                    "failed to load subagents from '{}': {error}",
+                    path.display()
+                ))
+            })?;
+
+        for def in defs {
+            let filename = format!("{}.md", def.id);
+            self.subagents.push(SubagentInfo {
+                name: def.id,
+                description: def.description,
+                path: filename,
+            });
         }
 
-        // Create the symlink and register as a readable sandbox path.
-        let symlink_path = self.bash_tool.working_dir().join(".subagents");
-        if let Ok(abs_path) = path.canonicalize() {
-            #[cfg(unix)]
-            {
-                let _ = std::os::unix::fs::symlink(&abs_path, &symlink_path);
-            }
-            #[cfg(windows)]
-            {
-                let _ = std::os::windows::fs::symlink_dir(&abs_path, &symlink_path);
-            }
-            self.bash_tool = self.bash_tool.with_readable_paths([abs_path]);
-        }
-
-        self
-    }
-
-    /// Sets up the subagents directory and creates a symlink in the sandbox asynchronously.
-    ///
-    /// Creates the directory if it does not exist and always creates a
-    /// read-only `.subagents` symlink inside the sandbox.
-    pub async fn with_subagents_async(mut self, path: impl AsRef<std::path::Path>) -> Self {
-        use crate::subagent_file::SubagentDefinition;
-
-        let path = path.as_ref();
-
-        // Ensure the subagents directory exists.
-        let _ = fs::create_dir_all(path).await;
-
-        if path_exists(path).await {
-            if let Ok(defs) = SubagentDefinition::load_from_dir_async(path).await {
-                for def in defs {
-                    let filename = format!("{}.md", def.id);
-                    self.subagents.push(SubagentInfo {
-                        name: def.id,
-                        description: def.description,
-                        path: filename,
-                    });
-                }
-            }
-        }
-
-        // Create the symlink and register as a readable sandbox path.
-        let symlink_path = self.bash_tool.working_dir().join(".subagents");
-        if let Ok(abs_path) = fs::canonicalize(path).await {
-            #[cfg(unix)]
-            {
-                let _ = fs::unix::symlink(&abs_path, &symlink_path).await;
-            }
-            #[cfg(windows)]
-            {
-                let _ = fs::windows::symlink_dir(&abs_path, &symlink_path).await;
-            }
-            self.bash_tool = self.bash_tool.with_readable_paths([abs_path]);
-        }
-
-        self
+        self.attach_readable_symlink(&path, ".subagents").await
     }
 
     /// Sets the maximum number of iterations.
@@ -693,7 +660,8 @@ fn get_os_info() -> (String, String) {
             .arg("-productVersion")
             .output()
             .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok()).map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
         ("macOS".to_string(), version)
     }
 

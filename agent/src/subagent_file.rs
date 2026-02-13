@@ -47,7 +47,7 @@ impl SubagentDefinition {
     ///
     /// System prompt content...
     /// ```
-    #[must_use] 
+    #[must_use]
     pub fn parse(content: &str) -> Option<Self> {
         let content = content.trim();
 
@@ -145,7 +145,7 @@ impl SubagentDefinition {
 }
 
 /// Default subagent definitions embedded in the binary.
-#[must_use] 
+#[must_use]
 pub fn builtin_subagents() -> Vec<SubagentDefinition> {
     let mut defs = Vec::new();
 

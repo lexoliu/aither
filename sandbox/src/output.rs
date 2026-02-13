@@ -145,23 +145,21 @@ impl std::fmt::Display for OutputEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Empty => Ok(()),
-            Self::Inline { content } | Self::Loaded { content, .. } => {
-                match content {
-                    Content::Text { text, truncated } => {
-                        write!(f, "{text}")?;
-                        if *truncated {
-                            write!(
-                                f,
-                                "\n[truncated: full output is available in the stored file]"
-                            )?;
-                        }
-                        Ok(())
+            Self::Inline { content } | Self::Loaded { content, .. } => match content {
+                Content::Text { text, truncated } => {
+                    write!(f, "{text}")?;
+                    if *truncated {
+                        write!(
+                            f,
+                            "\n[truncated: full output is available in the stored file]"
+                        )?;
                     }
-                    Content::Image { media_type, .. } => {
-                        write!(f, "[Image: {media_type}]")
-                    }
+                    Ok(())
                 }
-            }
+                Content::Image { media_type, .. } => {
+                    write!(f, "[Image: {media_type}]")
+                }
+            },
             Self::Stored { url, content } => {
                 if let Some(content) = content {
                     match content {
@@ -499,6 +497,19 @@ impl OutputStore {
     }
 }
 
+/// Saves raw data to a file without any processing, returning the URL.
+///
+/// Used to preserve the original uncompressed output alongside a compressed version.
+///
+/// # Errors
+///
+/// Returns an error if file creation fails.
+pub async fn save_raw_to_file(dir: &Path, data: &[u8]) -> std::io::Result<String> {
+    let (url, _) = create_file(dir, data, OutputFormat::Text).await?;
+    debug!(url = %url, size = data.len(), "saved raw output");
+    Ok(url)
+}
+
 /// Saves text output with simple size-based classification.
 ///
 /// - Below `INLINE_OUTPUT_LIMIT` → show inline
@@ -535,6 +546,73 @@ async fn save_text_output(
             content: Some(content),
         })
     }
+}
+
+/// Saves text output with a line-count limit.
+///
+/// When the output exceeds `max_lines`, the full content is saved to a file
+/// and a message indicating the truncation reason is returned.
+pub async fn save_text_with_line_limit(
+    dir: &Path,
+    data: &[u8],
+    format: OutputFormat,
+    max_lines: usize,
+    byte_limit: Option<usize>,
+) -> std::io::Result<OutputEntry> {
+    if data.is_empty() {
+        return Ok(OutputEntry::Empty);
+    }
+
+    let format = if format == OutputFormat::Auto {
+        detect_format(data)
+    } else {
+        format
+    };
+
+    // For non-text formats, fall back to the standard byte-based logic
+    if !matches!(format, OutputFormat::Text | OutputFormat::Auto) {
+        return OutputStore::save_to_dir_with_limit(dir, data, format, byte_limit).await;
+    }
+
+    let text = String::from_utf8_lossy(data);
+    let line_count = text.lines().count();
+
+    // Check byte limit first
+    let exceeds_bytes = byte_limit.is_some_and(|max| data.len() > max);
+    let exceeds_lines = line_count > max_lines;
+
+    if !exceeds_bytes && !exceeds_lines {
+        let content = Content::Text {
+            text: text.into_owned(),
+            truncated: false,
+        };
+        return Ok(OutputEntry::Inline { content });
+    }
+
+    // Save full output to file
+    let (url, _) = create_file(dir, data, format).await?;
+
+    let message = if exceeds_lines {
+        format!(
+            "Output exceeded max_lines limit ({line_count} lines > {max_lines} max), \
+             so full output was saved to {url} ({} bytes). \
+             Use head/tail/grep/sed to read the file.",
+            data.len()
+        )
+    } else {
+        format!(
+            "Output saved to {url} ({line_count} lines, {} bytes)",
+            data.len()
+        )
+    };
+
+    Ok(OutputEntry::Stored {
+        url,
+        content: Some(Content::Text {
+            text: message,
+            truncated: true,
+        }),
+    })
 }
 
 /// Saves output that exceeds limit - stores full content, returns only file reference.

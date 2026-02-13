@@ -1,6 +1,7 @@
 #![allow(missing_docs)]
 
 use aither_skills::{Skill, SkillLoader};
+use futures_lite::future::block_on;
 
 fn main() {
     // Test parsing the skill file directly
@@ -22,7 +23,7 @@ fn main() {
     // Test loader
     println!("\nTesting loader...");
     let loader = SkillLoader::new().add_path("./outputs");
-    match loader.load_all() {
+    match block_on(loader.load_all()) {
         Ok(skills) => {
             println!("Loaded {} skills", skills.len());
             for skill in skills {

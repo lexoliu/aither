@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["mistral"]
 members = [
     "attachments",
     "claude",
@@ -16,7 +17,6 @@ members = [
     "mem0",
     "skills",
     "models",
-    "mistral",
     "tools/websearch",
     "tools/webfetch",
     "tools/fs",
@@ -68,7 +68,7 @@ aither-openai = { path = "./openai" }
 aither-claude = { path = "./claude" }
 aither-cloud = { path = "./cloud" }
 aither-gemini = { path = "./gemini" }
-aither-mistral = { path = "./mistral" }
+# aither-mistral = { path = "./mistral" }  # excluded: transitive dep conflicts
 aither-llama = { path = "./llama" }
 aither-copilot = { path = "./copilot" }
 aither-models = { path = "./models" }
@@ -89,7 +89,7 @@ url = { version = "2.5", default-features = false }
 aither-openai = { path = "./openai", optional = true }
 aither-claude = { path = "./claude", optional = true }
 aither-gemini = { path = "./gemini", optional = true }
-aither-mistral = { path = "./mistral", optional = true }
+# aither-mistral = { path = "./mistral", optional = true }  # excluded: transitive dep conflicts
 aither-llama = { path = "./llama", optional = true }
 aither-ort = { workspace = true, optional = true }
 
@@ -158,7 +158,7 @@ derive = ["aither-derive"]
 openai = ["aither-openai"]
 claude = ["aither-claude"]
 gemini = ["aither-gemini"]
-mistral = ["aither-mistral"]
+# mistral = ["aither-mistral"]  # excluded: transitive dep conflicts
 llama = ["aither-llama"]
 ort = ["aither-ort"]
 
@@ -178,7 +178,7 @@ command = ["aither-command"]
 mcp = ["aither-mcp"]
 
 # Convenience feature to enable all providers
-all-providers = ["openai", "claude", "gemini", "mistral", "llama", "ort"]
+all-providers = ["openai", "claude", "gemini", "llama", "ort"]
 
 # Convenience feature to enable all tools
 all-tools = ["websearch", "webfetch", "fs", "command"]

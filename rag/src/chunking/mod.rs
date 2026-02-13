@@ -3,10 +3,14 @@
 //! This module provides the [`Chunker`] trait and implementations for
 //! splitting documents into smaller, indexable chunks.
 
+mod code;
 mod fixed;
+mod paragraph;
 mod sentence;
 
+pub use code::CodeChunker;
 pub use fixed::FixedSizeChunker;
+pub use paragraph::ParagraphChunker;
 pub use sentence::SentenceChunker;
 
 use crate::error::Result;

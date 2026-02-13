@@ -3,9 +3,13 @@
 //! This module provides the [`Persistence`] trait and implementations for
 //! saving and loading index data.
 
+#[cfg(feature = "lancedb-persistence")]
+mod lancedb_backend;
 mod redb_backend;
 mod rkyv_backend;
 
+#[cfg(feature = "lancedb-persistence")]
+pub use lancedb_backend::LanceDbPersistence;
 pub use redb_backend::RedbPersistence;
 pub use rkyv_backend::RkyvPersistence;
 

@@ -1,18 +1,17 @@
-
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::Path;
-#[cfg(not(target_arch = "wasm32"))]
-use url::Url;
-#[cfg(not(target_arch = "wasm32"))]
-use aither_attachments::{FileCache, default_cache_dir};
-#[cfg(not(target_arch = "wasm32"))]
-use aither_core::llm::Message;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::config::GeminiConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::error::GeminiError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::files::upload_file;
+#[cfg(not(target_arch = "wasm32"))]
+use aither_attachments::{FileCache, default_cache_dir};
+#[cfg(not(target_arch = "wasm32"))]
+use aither_core::llm::Message;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
+use url::Url;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn resolve_messages(

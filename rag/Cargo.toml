@@ -16,11 +16,13 @@ thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 schemars = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
-rayon = "1.10"
+rayon = "1.11"
 serde_json = "1.0"
 
 # Chunking
 unicode-segmentation = "1.12"
+tree-sitter = "0.22.5"
+tree-sitter-rust = "0.21.2"
 
 # HNSW Index
 instant-distance = "0.6"
@@ -30,12 +32,18 @@ ordered-float = "4.6"
 # Persistence
 rkyv = { version = "0.8", features = ["bytecheck"] }
 redb = "2.4"
+lancedb = { version = "0.23.1", default-features = false, optional = true }
+arrow-array = { version = "56.2", optional = true }
+arrow-schema = { version = "56.2", optional = true }
+futures = { version = "0.3", optional = true }
+tokio = { version = "1.0", features = ["rt-multi-thread"], optional = true }
 
 # Deduplication
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [features]
 default = []
+lancedb-persistence = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures", "dep:tokio"]
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros"] }

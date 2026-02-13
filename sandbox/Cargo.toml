@@ -45,6 +45,11 @@ async-channel = "2"
 strsim = "0.11.1"
 human-hash = "0.4"
 
+# Output compression: content detection + code folding
+magika = "1"
+tree-sitter = "0.22"
+rs-tree-sitter-languages = "0.0.2"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

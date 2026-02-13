@@ -64,7 +64,7 @@ impl AskUserArgs {
     /// Normalize into a list of questions.
     /// If `questions` is non-empty, use that directly.
     /// Otherwise, build a single question from the flat fields.
-    #[must_use] 
+    #[must_use]
     pub fn into_questions(self) -> Vec<Question> {
         if !self.questions.is_empty() {
             return self.questions;
@@ -126,7 +126,7 @@ pub struct AskUserTool {
 
 impl AskUserTool {
     /// Create a new `AskUserTool` with the given sender.
-    #[must_use] 
+    #[must_use]
     pub const fn new(broker: AskUserBroker) -> Self {
         Self { broker }
     }

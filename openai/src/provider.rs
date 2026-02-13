@@ -85,8 +85,7 @@ impl LanguageModelProvider for OpenAIProvider {
                     .header("OpenAI-Organization", org.clone())
                     .map_err(OpenAIError::Http)?;
             }
-            let response: ModelListResponse =
-                builder.json().await.map_err(OpenAIError::Http)?;
+            let response: ModelListResponse = builder.json().await.map_err(OpenAIError::Http)?;
             Ok(response
                 .data
                 .into_iter()

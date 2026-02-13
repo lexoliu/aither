@@ -4,7 +4,7 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
 use aither_core::llm::{Tool, ToolOutput};
@@ -13,6 +13,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::naming::random_word_slug;
 use crate::permission::BashMode;
+
+/// Trait for executing commands inside a container.
+///
+/// Implementations provide the bridge between aither-sandbox and a specific
+/// container runtime (e.g., Docker via bollard). The framework defines this trait;
+/// the application (may) provides the implementation.
+pub trait ContainerExec: Send + Sync {
+    /// Execute a bash script inside the container, returning stdout/stderr and exit code.
+    fn exec(
+        &self,
+        container_id: &str,
+        script: &str,
+        working_dir: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<std::process::Output, String>> + Send + '_>>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -43,6 +58,8 @@ pub struct ShellSession {
     pub cwd: PathBuf,
     pub ssh_target: Option<String>,
     pub ssh_runtime: Option<SshRuntimeProfile>,
+    /// Docker container ID (set when backend is Container).
+    pub container_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +104,8 @@ pub struct ShellSessionRegistry {
     availability: Arc<RwLock<ShellRuntimeAvailability>>,
     ssh_servers: Arc<RwLock<Vec<SshServer>>>,
     ssh_authorizer: Arc<RwLock<Option<Arc<dyn SshSessionAuthorizer>>>>,
+    /// Container executor — set once, shared across all clones via `OnceLock`.
+    container_exec: Arc<OnceLock<Arc<dyn ContainerExec>>>,
 }
 
 impl std::fmt::Debug for ShellSessionRegistry {
@@ -104,7 +123,14 @@ impl ShellSessionRegistry {
             availability: Arc::new(RwLock::new(availability)),
             ssh_servers: Arc::new(RwLock::new(Vec::new())),
             ssh_authorizer: Arc::new(RwLock::new(None)),
+            container_exec: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Set the container executor (can only be called once; subsequent calls are no-ops).
+    /// All clones of this registry share the same executor via `Arc<OnceLock<...>>`.
+    pub fn set_container_exec(&self, exec: Arc<dyn ContainerExec>) {
+        let _ = self.container_exec.set(exec);
     }
 
     pub fn set_availability(&self, availability: ShellRuntimeAvailability) -> Result<(), String> {
@@ -132,6 +158,11 @@ impl ShellSessionRegistry {
             .read()
             .map(|g| g.clone())
             .unwrap_or_default()
+    }
+
+    /// Get the container executor (if set).
+    pub fn container_exec(&self) -> Option<Arc<dyn ContainerExec>> {
+        self.container_exec.get().cloned()
     }
 
     pub fn set_ssh_servers(&self, servers: Vec<SshServer>) -> Result<(), String> {
@@ -165,6 +196,18 @@ impl ShellSessionRegistry {
         cwd: PathBuf,
         ssh_target: Option<String>,
         ssh_runtime: Option<SshRuntimeProfile>,
+    ) -> Result<ShellSession, String> {
+        self.open_with_container(backend, mode, cwd, ssh_target, ssh_runtime, None)
+    }
+
+    pub fn open_with_container(
+        &self,
+        backend: ShellBackend,
+        mode: BashMode,
+        cwd: PathBuf,
+        ssh_target: Option<String>,
+        ssh_runtime: Option<SshRuntimeProfile>,
+        container_id: Option<String>,
     ) -> Result<ShellSession, String> {
         let availability = self
             .availability
@@ -228,6 +271,7 @@ impl ShellSessionRegistry {
             cwd,
             ssh_target,
             ssh_runtime,
+            container_id,
         };
         self.sessions
             .write()
@@ -352,7 +396,8 @@ impl Tool for OpenShellTool {
         }
 
         let cwd = args
-            .cwd.map_or_else(|| self.default_cwd.clone(), PathBuf::from);
+            .cwd
+            .map_or_else(|| self.default_cwd.clone(), PathBuf::from);
 
         let (mode, ssh_runtime) = if matches!(requested, OpenShellBackend::Ssh) {
             let target = args
@@ -610,7 +655,10 @@ pub struct CloseShellTool {
 
 impl CloseShellTool {
     #[must_use]
-    pub const fn new(registry: ShellSessionRegistry, jobs: crate::job_registry::JobRegistry) -> Self {
+    pub const fn new(
+        registry: ShellSessionRegistry,
+        jobs: crate::job_registry::JobRegistry,
+    ) -> Self {
         Self { registry, jobs }
     }
 }
