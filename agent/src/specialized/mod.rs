@@ -7,4 +7,4 @@ mod subagent;
 pub mod task;
 
 pub use subagent::{IntoSubAgent, SubAgentQuery, SubAgentTool};
-pub use task::{SubagentType, TaskArgs, TaskTool};
+pub use task::{SubagentArgs, SubagentTool, SubagentType};

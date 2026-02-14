@@ -46,7 +46,7 @@ use aither_agent::sandbox::{
     permission::{BashMode, PermissionError, PermissionHandler, StatefulPermissionHandler},
     schema_to_help,
 };
-use aither_agent::specialized::TaskTool;
+use aither_agent::specialized::SubagentTool;
 use aither_agent::{Agent, BashAgentBuilder, Hook};
 use aither_core::LanguageModel;
 use aither_core::llm::Role;
@@ -529,21 +529,21 @@ async fn build_agent(
         }
     }
 
-    // Create TaskTool and register as bash IPC command
+    // Create SubagentTool and register as bash IPC command
     // Set base_dir to sandbox directory so paths like .subagents/ resolve correctly
-    let task_tool = TaskTool::new(cloud)
+    let subagent_tool = SubagentTool::new(cloud)
         .with_builtins()
         .with_base_dir(builder.sandbox_dir().to_string())
         .with_bash_tool_factory(builder.bash_tool_factory());
-    let mut task_desc = String::from("Spawn subagent for complex tasks (types: ");
-    let subagent_names: Vec<_> = task_tool
+    let mut subagent_desc = String::from("Spawn subagent for complex tasks (types: ");
+    let subagent_names: Vec<_> = subagent_tool
         .type_descriptions()
         .iter()
         .map(|(n, _)| *n)
         .collect();
-    task_desc.push_str(&subagent_names.join(", "));
-    task_desc.push(')');
-    builder = builder.tool_with_desc(task_tool, task_desc);
+    subagent_desc.push_str(&subagent_names.join(", "));
+    subagent_desc.push(')');
+    builder = builder.tool_with_desc(subagent_tool, subagent_desc);
 
     // Add system prompt
     let builder = if let Some(ref system) = args.system {

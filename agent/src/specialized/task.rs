@@ -1,4 +1,4 @@
-//! Task tool for spawning specialized subagents.
+//! Subagent tool for spawning specialized subagents.
 //!
 //! Allows the main agent to delegate complex tasks to specialized subagents
 //! that run autonomously and return results.
@@ -86,7 +86,7 @@ impl<LLM: Clone> SubagentType<LLM> {
 /// You can also load custom subagents from `.md` files by specifying a path
 /// (e.g., `./custom-agent.md` or `.subagents/researcher.md`).
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
-pub struct TaskArgs {
+pub struct SubagentArgs {
     /// Subagent type name (e.g., "explore", "plan") or path to a subagent file.
     /// If the value contains '/' or ends with '.md', it's treated as a file path.
     pub subagent: String,
@@ -96,19 +96,19 @@ pub struct TaskArgs {
 
 /// A tool that spawns specialized subagents to handle complex tasks.
 ///
-/// Similar to Claude Code's Task tool, this allows the main agent to
-/// delegate work to specialized subagents that have different capabilities.
+/// Allows the main agent to delegate work to specialized subagents
+/// that have different capabilities and run in isolated context windows.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use aither_agent::specialized::task::{TaskTool, SubagentType};
+/// use aither_agent::specialized::task::{SubagentTool, SubagentType};
 ///
-/// // Create task tool
-/// let mut task_tool = TaskTool::new(llm.clone());
+/// // Create subagent tool
+/// let mut subagent_tool = SubagentTool::new(llm.clone());
 ///
 /// // Register an "explore" subagent type
-/// task_tool.register("explore", SubagentType::new(
+/// subagent_tool.register("explore", SubagentType::new(
 ///     "Codebase explorer for finding files and searching code",
 ///     |llm| Agent::builder(llm)
 ///         .system_prompt("You are a codebase explorer...")
@@ -118,10 +118,10 @@ pub struct TaskArgs {
 /// ));
 ///
 /// let agent = Agent::builder(llm)
-///     .tool(task_tool)
+///     .tool(subagent_tool)
 ///     .build();
 /// ```
-pub struct TaskTool<LLM> {
+pub struct SubagentTool<LLM> {
     llm: LLM,
     types: HashMap<String, SubagentType<LLM>>,
     /// Base directory for resolving relative paths (e.g., sandbox directory).
@@ -130,17 +130,17 @@ pub struct TaskTool<LLM> {
     bash_tool_factory: Option<BashToolFactory>,
 }
 
-impl<LLM> std::fmt::Debug for TaskTool<LLM> {
+impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let type_names: Vec<_> = self.types.keys().cloned().collect();
-        f.debug_struct("TaskTool")
+        f.debug_struct("SubagentTool")
             .field("type_names", &type_names)
             .field("base_dir", &self.base_dir)
             .finish()
     }
 }
 
-impl<LLM: Clone> TaskTool<LLM> {
+impl<LLM: Clone> SubagentTool<LLM> {
     /// Creates a new `TaskTool` with the given LLM.
     pub fn new(llm: LLM) -> Self {
         Self {
@@ -193,7 +193,7 @@ impl<LLM: Clone> TaskTool<LLM> {
     }
 }
 
-impl<LLM: LanguageModel + Clone> TaskTool<LLM> {
+impl<LLM: LanguageModel + Clone> SubagentTool<LLM> {
     /// Register a subagent from a definition (builder pattern).
     ///
     /// Creates a subagent type from a `SubagentDefinition` loaded from a file.
@@ -220,15 +220,15 @@ impl<LLM: LanguageModel + Clone> TaskTool<LLM> {
     }
 }
 
-impl<LLM> Tool for TaskTool<LLM>
+impl<LLM> Tool for SubagentTool<LLM>
 where
     LLM: LanguageModel + Clone + 'static,
 {
     fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("task")
+        Cow::Borrowed("subagent")
     }
 
-    type Arguments = TaskArgs;
+    type Arguments = SubagentArgs;
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
         // Determine if subagent is a file path or a registered type name
@@ -332,8 +332,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_args_schema() {
-        let schema = schemars::schema_for!(TaskArgs);
+    fn subagent_args_schema() {
+        let schema = schemars::schema_for!(SubagentArgs);
         let value = schema.to_value();
         let props = value.get("properties").expect("should have properties");
         assert!(props.get("subagent").is_some());

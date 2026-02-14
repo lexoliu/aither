@@ -27,7 +27,7 @@
 //! let agent = BashAgentBuilder::new(llm, bash_tool)
 //!     .tool(WebSearchTool::default())  // Becomes `websearch` bash command
 //!     .tool(WebFetchTool::new())       // Becomes `webfetch` bash command
-//!     .tool(TaskTool::new(llm))        // Becomes `task` bash command
+//!     .tool(SubagentTool::new(llm))    // Becomes `subagent` bash command
 //!     .build();
 //! ```
 
