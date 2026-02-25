@@ -45,7 +45,10 @@ pub async fn stream_generate(
     impl futures_core::Stream<Item = Result<GenerateContentResponse, GeminiError>>,
     GeminiError,
 > {
-    let endpoint = cfg.model_endpoint(model, "streamGenerateContent") + "&alt=sse";
+    let mut endpoint = cfg.model_endpoint(model, "streamGenerateContent");
+    let separator = if endpoint.contains('?') { '&' } else { '?' };
+    endpoint.push(separator);
+    endpoint.push_str("alt=sse");
     let debug = std::env::var("AITHER_GEMINI_DEBUG").as_deref() == Ok("1");
 
     let mut attempt = 0u32;

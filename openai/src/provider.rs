@@ -4,6 +4,7 @@ use crate::{
 use aither_core::llm::{
     LanguageModelProvider, model::Profile as ModelProfile, provider::Profile as ProviderProfile,
 };
+use aither_models::lookup as lookup_model_info;
 use serde::Deserialize;
 use std::{future::Future, sync::Arc};
 use zenwave::{Client, client, header};
@@ -89,14 +90,26 @@ impl LanguageModelProvider for OpenAIProvider {
             Ok(response
                 .data
                 .into_iter()
-                .map(|model| {
-                    ModelProfile::new(
+                .filter_map(|model| {
+                    let context_length = model
+                        .context_length
+                        .or(model.max_tokens)
+                        .or(model.input_token_limit)
+                        .or_else(|| lookup_model_info(&model.id).map(|info| info.context_window));
+                    let Some(context_length) = context_length else {
+                        tracing::warn!(
+                            model = %model.id,
+                            "skip model from OpenAI list: missing context_length and no aither-models fallback"
+                        );
+                        return None;
+                    };
+                    Some(ModelProfile::new(
                         model.id.clone(),
                         model.owned_by.clone().unwrap_or_else(|| "openai".into()),
                         model.id,
                         "OpenAI model",
-                        128_000,
-                    )
+                        context_length,
+                    ))
                 })
                 .collect())
         }
@@ -132,4 +145,10 @@ struct ModelDescriptor {
     id: String,
     #[serde(default)]
     owned_by: Option<String>,
+    #[serde(default)]
+    context_length: Option<u32>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default, alias = "inputTokenLimit", alias = "input_token_limit")]
+    input_token_limit: Option<u32>,
 }

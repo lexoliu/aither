@@ -1,6 +1,6 @@
 //! SSE response parsing for the Claude API.
 
-use aither_core::llm::Event as LLMEvent;
+use aither_core::llm::{Event as LLMEvent, Usage as TokenUsage};
 use serde::Deserialize;
 use serde_json::Value;
 use zenwave::sse::Event;
@@ -39,6 +39,12 @@ pub struct Usage {
     pub input_tokens: u32,
     /// Number of output tokens.
     pub output_tokens: u32,
+    /// Number of input tokens written into cache.
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Number of input tokens read from cache.
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 /// Content block start event data.
@@ -137,7 +143,14 @@ pub struct MessageDelta {
 #[allow(dead_code)]
 pub struct DeltaUsage {
     /// Total output tokens.
-    pub output_tokens: u32,
+    #[serde(default)]
+    pub output_tokens: Option<u32>,
+    /// Number of input tokens written into cache.
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Number of input tokens read from cache.
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 /// Parsed tool call from a completed `tool_use` block.
@@ -160,6 +173,16 @@ pub struct StreamState {
     pub tool_calls: Vec<ToolCall>,
     /// Final stop reason.
     pub stop_reason: Option<String>,
+    /// Prompt/input token usage.
+    pub prompt_tokens: Option<u32>,
+    /// Completion/output token usage.
+    pub completion_tokens: Option<u32>,
+    /// Prompt cache read token usage.
+    pub cache_read_tokens: Option<u32>,
+    /// Prompt cache write token usage.
+    pub cache_write_tokens: Option<u32>,
+    /// Whether usage has already been emitted.
+    pub usage_emitted: bool,
 }
 
 /// State of an individual content block.
@@ -190,6 +213,35 @@ impl StreamState {
     pub const fn has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
     }
+
+    fn maybe_usage_event(&mut self) -> Option<LLMEvent> {
+        if self.usage_emitted {
+            return None;
+        }
+        if self.prompt_tokens.is_none()
+            && self.completion_tokens.is_none()
+            && self.cache_read_tokens.is_none()
+            && self.cache_write_tokens.is_none()
+            && self.stop_reason.is_none()
+        {
+            return None;
+        }
+        self.usage_emitted = true;
+        let total_tokens = match (self.prompt_tokens, self.completion_tokens) {
+            (Some(prompt), Some(completion)) => Some(prompt + completion),
+            _ => None,
+        };
+        Some(LLMEvent::Usage(TokenUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens,
+            reasoning_tokens: None,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            cost_usd: None,
+            stop_reason: self.stop_reason.clone(),
+        }))
+    }
 }
 
 /// Parse a single SSE event into LLM events.
@@ -205,7 +257,13 @@ pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEven
     match event_type {
         "message_start" => {
             // Store message metadata if needed
-            let _ev: MessageStartEvent = serde_json::from_str(data)?;
+            let ev: MessageStartEvent = serde_json::from_str(data)?;
+            if let Some(usage) = ev.message.usage {
+                state.prompt_tokens = Some(usage.input_tokens);
+                state.completion_tokens = Some(usage.output_tokens);
+                state.cache_write_tokens = usage.cache_creation_input_tokens;
+                state.cache_read_tokens = usage.cache_read_input_tokens;
+            }
         }
         "content_block_start" => {
             let ev: ContentBlockStartEvent = serde_json::from_str(data)?;
@@ -288,9 +346,25 @@ pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEven
         "message_delta" => {
             let ev: MessageDeltaEvent = serde_json::from_str(data)?;
             state.stop_reason = ev.delta.stop_reason;
+            if let Some(usage) = ev.usage {
+                if let Some(output_tokens) = usage.output_tokens {
+                    state.completion_tokens = Some(output_tokens);
+                }
+                if let Some(cache_write_tokens) = usage.cache_creation_input_tokens {
+                    state.cache_write_tokens = Some(cache_write_tokens);
+                }
+                if let Some(cache_read_tokens) = usage.cache_read_input_tokens {
+                    state.cache_read_tokens = Some(cache_read_tokens);
+                }
+            }
         }
-        "message_stop" | "ping" | "" => {
-            // Stream complete or keepalive - no action needed
+        "message_stop" => {
+            if let Some(usage_event) = state.maybe_usage_event() {
+                events.push(usage_event);
+            }
+        }
+        "ping" | "" => {
+            // Keepalive - no action needed
         }
         "error" => {
             // Parse error response
@@ -327,4 +401,42 @@ fn ensure_block_capacity(state: &mut StreamState, index: usize) {
 pub fn should_skip_event(event: &Event) -> bool {
     let data = event.text_data();
     data.is_empty() || event.event() == Some("ping")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_event_includes_claude_cache_token_stats() {
+        let mut state = StreamState::new();
+        state.prompt_tokens = Some(120);
+        state.completion_tokens = Some(30);
+        state.cache_read_tokens = Some(90);
+        state.cache_write_tokens = Some(45);
+        state.stop_reason = Some("end_turn".to_string());
+
+        let event = state
+            .maybe_usage_event()
+            .expect("usage event should be emitted");
+        match event {
+            LLMEvent::Usage(usage) => {
+                assert_eq!(usage.prompt_tokens, Some(120));
+                assert_eq!(usage.completion_tokens, Some(30));
+                assert_eq!(usage.total_tokens, Some(150));
+                assert_eq!(usage.cache_read_tokens, Some(90));
+                assert_eq!(usage.cache_write_tokens, Some(45));
+                assert_eq!(usage.stop_reason.as_deref(), Some("end_turn"));
+            }
+            _ => panic!("expected usage event"),
+        }
+    }
+
+    #[test]
+    fn usage_event_is_not_reemitted() {
+        let mut state = StreamState::new();
+        state.prompt_tokens = Some(1);
+        assert!(state.maybe_usage_event().is_some());
+        assert!(state.maybe_usage_event().is_none());
+    }
 }

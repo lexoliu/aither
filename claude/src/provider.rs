@@ -8,6 +8,7 @@ use crate::{
 use aither_core::llm::{
     LanguageModelProvider, model::Profile as ModelProfile, provider::Profile as ProviderProfile,
 };
+use aither_models::lookup as lookup_model_info;
 use serde::Deserialize;
 use std::{future::Future, sync::Arc};
 use zenwave::{Client, client};
@@ -60,14 +61,26 @@ impl LanguageModelProvider for ClaudeProvider {
             Ok(response
                 .data
                 .into_iter()
-                .map(|model| {
-                    ModelProfile::new(
+                .filter_map(|model| {
+                    let context_length = model
+                        .input_token_limit
+                        .or(model.context_length)
+                        .or(model.max_tokens)
+                        .or_else(|| lookup_model_info(&model.id).map(|info| info.context_window));
+                    let Some(context_length) = context_length else {
+                        tracing::warn!(
+                            model = %model.id,
+                            "skip model from Claude list: missing context_length and no aither-models fallback"
+                        );
+                        return None;
+                    };
+                    Some(ModelProfile::new(
                         model.id.clone(),
                         "anthropic",
                         model.id,
                         model.display_name,
-                        200_000, // Claude models generally have 200k context
-                    )
+                        context_length,
+                    ))
                 })
                 .collect())
         }
@@ -106,4 +119,10 @@ struct ModelListResponse {
 struct ModelDescriptor {
     id: String,
     display_name: String,
+    #[serde(default, alias = "inputTokenLimit")]
+    input_token_limit: Option<u32>,
+    #[serde(default)]
+    context_length: Option<u32>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
 }

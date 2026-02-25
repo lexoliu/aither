@@ -57,6 +57,7 @@ async fn synthesize_audio(cfg: &GeminiConfig, text: String) -> Result<Vec<u8>, G
         tools: Vec::new(),
         tool_config: None,
         safety_settings: Vec::new(),
+        cached_content: None,
     };
     let response = call_generate(cfg, &model, request).await?;
     if let Some(candidate) = response.primary_candidate() {
@@ -93,6 +94,7 @@ async fn transcribe_audio(cfg: &GeminiConfig, audio: Vec<u8>) -> Result<String, 
         tools: Vec::new(),
         tool_config: None,
         safety_settings: Vec::new(),
+        cached_content: None,
     };
     let response = call_generate(cfg, &cfg.text_model, request).await?;
     if let Some(candidate) = response.primary_candidate() {

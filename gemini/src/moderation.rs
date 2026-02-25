@@ -30,6 +30,7 @@ impl Moderation for Gemini {
                 tools: Vec::new(),
                 tool_config: None,
                 safety_settings: default_safety_settings(),
+                cached_content: None,
             };
             let model_id = cfg.text_model.clone();
             let response = call_generate(cfg, &model_id, request).await?;

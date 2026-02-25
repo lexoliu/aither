@@ -23,6 +23,7 @@ use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -76,11 +77,12 @@ impl LanguageModel for Llama {
         &self,
         request: LLMRequest,
     ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
-        let outcome = run_response(&self.model, &self.backend, &self.inner, request).map_or_else(
-            |err| vec![Err(err)],
-            |events| events.into_iter().map(Ok).collect::<Vec<_>>(),
-        );
-        futures_lite::stream::iter(outcome)
+        response_stream(
+            self.model.clone(),
+            self.backend.clone(),
+            self.inner.clone(),
+            request,
+        )
     }
 
     fn profile(&self) -> impl std::future::Future<Output = Profile> + Send {
@@ -259,12 +261,40 @@ impl Builder {
     }
 }
 
-fn run_response(
-    model: &LlamaModel,
-    backend: &LlamaBackend,
-    cfg: &LlamaConfig,
+fn response_stream(
+    model: Arc<LlamaModel>,
+    backend: Arc<LlamaBackend>,
+    cfg: Arc<LlamaConfig>,
     request: LLMRequest,
-) -> Result<Vec<Event>, LlamaError> {
+) -> impl Stream<Item = Result<Event, LlamaError>> + Send {
+    let (sender, receiver) = async_channel::unbounded();
+    let worker_sender = sender.clone();
+    match thread::Builder::new()
+        .name("aither-llama-respond".to_string())
+        .spawn(move || {
+            if let Err(err) = run_response_generation(model, backend, cfg, request, &worker_sender)
+            {
+                let _ = worker_sender.send_blocking(Err(err));
+            }
+        }) {
+        Ok(_handle) => receiver,
+        Err(err) => {
+            let _ = sender.try_send(Err(LlamaError::Model(format!(
+                "failed to spawn llama response thread: {err}"
+            ))));
+            drop(sender);
+            receiver
+        }
+    }
+}
+
+fn run_response_generation(
+    model: Arc<LlamaModel>,
+    backend: Arc<LlamaBackend>,
+    cfg: Arc<LlamaConfig>,
+    request: LLMRequest,
+    sender: &async_channel::Sender<Result<Event, LlamaError>>,
+) -> Result<(), LlamaError> {
     let (messages, parameters, tool_defs) = request.into_parts();
 
     if messages.iter().any(|msg| !msg.attachments().is_empty()) {
@@ -274,10 +304,16 @@ fn run_response(
     }
 
     let tool_defs = filter_tool_definitions(tool_defs, &parameters.tool_choice);
-    let template = resolve_chat_template(model, cfg)?;
-    let prompt = build_prompt(model, &template, &messages, &parameters, &tool_defs)?;
+    let template = resolve_chat_template(model.as_ref(), cfg.as_ref())?;
+    let prompt = build_prompt(
+        model.as_ref(),
+        &template,
+        &messages,
+        &parameters,
+        &tool_defs,
+    )?;
 
-    let mut context = create_context(model, backend, cfg, false)?;
+    let mut context = create_context(model.as_ref(), backend.as_ref(), cfg.as_ref(), false)?;
     let prompt_tokens = model
         .str_to_token(&prompt.template_result.prompt, AddBos::Never)
         .map_err(|err| LlamaError::Token(err.to_string()))?;
@@ -299,7 +335,6 @@ fn run_response(
     let mut sampler = build_sampler(&parameters);
     sampler.accept_many(prompt_tokens.iter());
 
-    let mut events = Vec::new();
     let mut generated = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut pos = prompt_tokens.len() as i32;
@@ -316,10 +351,11 @@ fn run_response(
         let piece = model
             .token_to_piece(token, &mut decoder, true, None)
             .map_err(|err| LlamaError::Token(err.to_string()))?;
-
         if !piece.is_empty() {
             generated.push_str(&piece);
-            events.push(Event::Text(piece));
+            if sender.send_blocking(Ok(Event::Text(piece))).is_err() {
+                return Ok(());
+            }
         }
 
         let mut step_batch = LlamaBatch::new(1, 1);
@@ -337,11 +373,13 @@ fn run_response(
         .parse_response_oaicompat(&generated, false)
     {
         for call in parse_openai_message(&parsed)? {
-            events.push(Event::ToolCall(call));
+            if sender.send_blocking(Ok(Event::ToolCall(call))).is_err() {
+                return Ok(());
+            }
         }
     }
 
-    Ok(events)
+    Ok(())
 }
 
 fn create_context<'a>(

@@ -1,6 +1,6 @@
 use aither_core::llm::{
     Message, Role,
-    model::{Parameters, ReasoningEffort, ToolChoice},
+    model::{OpenAIPromptCacheRetention, Parameters, ReasoningEffort, ToolChoice},
     tool::ToolDefinition,
 };
 use url::Url;
@@ -32,6 +32,8 @@ pub struct ParameterSnapshot {
     pub(crate) websearch: bool,
     pub(crate) code_execution: bool,
     pub(crate) legacy_max_tokens: bool,
+    pub(crate) prompt_cache_key: Option<String>,
+    pub(crate) prompt_cache_retention: Option<OpenAIPromptCacheRetention>,
 }
 
 impl From<&Parameters> for ParameterSnapshot {
@@ -58,6 +60,16 @@ impl From<&Parameters> for ParameterSnapshot {
             websearch: value.websearch,
             code_execution: value.code_execution,
             legacy_max_tokens: false,
+            prompt_cache_key: value
+                .cache
+                .openai
+                .as_ref()
+                .and_then(|cache| cache.key.clone()),
+            prompt_cache_retention: value
+                .cache
+                .openai
+                .as_ref()
+                .and_then(|cache| cache.retention),
         }
     }
 }
@@ -67,6 +79,8 @@ pub struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessagePayload>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,6 +115,15 @@ pub struct ChatCompletionRequest {
     response_format: Option<ResponseFormatPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_retention: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 impl ChatCompletionRequest {
@@ -116,6 +139,9 @@ impl ChatCompletionRequest {
             model,
             messages,
             stream,
+            stream_options: stream.then_some(StreamOptions {
+                include_usage: true,
+            }),
             temperature: params.temperature,
             top_p: params.top_p,
             max_completion_tokens: params.max_tokens,
@@ -136,6 +162,8 @@ impl ChatCompletionRequest {
             parallel_tool_calls: if has_tools { Some(true) } else { None },
             response_format: response_format(params),
             reasoning: reasoning(params),
+            prompt_cache_key: params.prompt_cache_key.clone(),
+            prompt_cache_retention: prompt_cache_retention(params),
         }
     }
 }
@@ -602,6 +630,10 @@ pub struct ResponsesRequest {
     reasoning: Option<ReasoningPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     include: Option<Vec<&'static str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_retention: Option<&'static str>,
 }
 
 impl ResponsesRequest {
@@ -630,6 +662,8 @@ impl ResponsesRequest {
             text: responses_text(params),
             reasoning: reasoning(params),
             include: responses_include(params),
+            prompt_cache_key: params.prompt_cache_key.clone(),
+            prompt_cache_retention: prompt_cache_retention(params),
         }
     }
 }
@@ -672,7 +706,7 @@ pub enum ResponsesToolChoice {
     Function {
         #[serde(rename = "type")]
         kind: &'static str,
-        function: ToolChoiceFunction,
+        name: String,
     },
 }
 
@@ -793,7 +827,7 @@ pub fn convert_responses_tools(definitions: Vec<ToolDefinition>) -> Vec<Response
         .collect()
 }
 
-pub const fn responses_tool_choice(
+pub fn responses_tool_choice(
     params: &ParameterSnapshot,
     has_tools: bool,
 ) -> Option<ResponsesToolChoice> {
@@ -804,7 +838,10 @@ pub const fn responses_tool_choice(
         ToolChoice::Auto => None,
         ToolChoice::None => Some(ResponsesToolChoice::Mode("none")),
         ToolChoice::Required => Some(ResponsesToolChoice::Mode("required")),
-        ToolChoice::Exact(_) => None,
+        ToolChoice::Exact(name) => Some(ResponsesToolChoice::Function {
+            kind: "function",
+            name: name.clone(),
+        }),
     }
 }
 
@@ -845,10 +882,16 @@ fn responses_include(params: &ParameterSnapshot) -> Option<Vec<&'static str>> {
     }
 }
 
+fn prompt_cache_retention(params: &ParameterSnapshot) -> Option<&'static str> {
+    params
+        .prompt_cache_retention
+        .map(OpenAIPromptCacheRetention::as_str)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aither_core::llm::model::Parameters;
+    use aither_core::llm::model::{OpenAIPromptCacheRetention, Parameters, ToolChoice};
 
     #[test]
     fn chat_json_object_when_structured_outputs_without_schema() {
@@ -882,5 +925,57 @@ mod tests {
         );
         let value = serde_json::to_value(&req).expect("serialize responses request");
         assert_eq!(value["text"]["format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn chat_stream_request_includes_usage_option() {
+        let snapshot = ParameterSnapshot::from(&Parameters::default());
+        let req = ChatCompletionRequest::new("gpt-5".into(), Vec::new(), &snapshot, None, true);
+        let value = serde_json::to_value(&req).expect("serialize stream chat request");
+        assert_eq!(value["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn responses_tool_choice_exact_serializes_function_choice() {
+        let params = Parameters::default().tool_choice(ToolChoice::Exact("lookup".to_string()));
+        let snapshot = ParameterSnapshot::from(&params);
+        let choice = responses_tool_choice(&snapshot, true).expect("tool choice should exist");
+        let json = serde_json::to_value(choice).expect("serialize tool choice");
+        assert_eq!(json["type"], "function");
+        assert_eq!(json["name"], "lookup");
+    }
+
+    #[test]
+    fn responses_request_serializes_prompt_cache_fields() {
+        let params = Parameters::default()
+            .prompt_cache_key("session:alpha")
+            .prompt_cache_retention(OpenAIPromptCacheRetention::Hours24);
+        let snapshot = ParameterSnapshot::from(&params);
+        let req = ResponsesRequest::new(
+            "gpt-5".into(),
+            vec![ResponsesInputItem::message(
+                "user",
+                ResponsesMessageContent::Text("hi".to_string()),
+            )],
+            &snapshot,
+            None,
+            responses_tool_choice(&snapshot, false),
+            false,
+        );
+        let value = serde_json::to_value(&req).expect("serialize responses request");
+        assert_eq!(value["prompt_cache_key"], "session:alpha");
+        assert_eq!(value["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn chat_request_serializes_prompt_cache_fields() {
+        let params = Parameters::default()
+            .prompt_cache_key("session:beta")
+            .prompt_cache_retention(OpenAIPromptCacheRetention::InMemory);
+        let snapshot = ParameterSnapshot::from(&params);
+        let req = ChatCompletionRequest::new("gpt-5".into(), Vec::new(), &snapshot, None, false);
+        let value = serde_json::to_value(&req).expect("serialize chat request");
+        assert_eq!(value["prompt_cache_key"], "session:beta");
+        assert_eq!(value["prompt_cache_retention"], "in-memory");
     }
 }

@@ -45,6 +45,8 @@ pub struct Usage {
     pub cache_write_tokens: Option<u32>,
     /// Estimated cost in USD for this request.
     pub cost_usd: Option<f64>,
+    /// Provider-specific reason the generation stopped (e.g. `stop`, `length`, `tool_use`).
+    pub stop_reason: Option<String>,
 }
 
 impl Usage {
@@ -59,6 +61,7 @@ impl Usage {
             cache_read_tokens: None,
             cache_write_tokens: None,
             cost_usd: None,
+            stop_reason: None,
         }
     }
 
@@ -84,6 +87,13 @@ impl Usage {
         self
     }
 
+    /// Adds provider stop reason metadata.
+    #[must_use]
+    pub fn with_stop_reason(mut self, reason: impl Into<String>) -> Self {
+        self.stop_reason = Some(reason.into());
+        self
+    }
+
     /// Accumulates usage from another instance.
     pub fn accumulate(&mut self, other: &Self) {
         if let Some(v) = other.prompt_tokens {
@@ -106,6 +116,9 @@ impl Usage {
         }
         if let Some(v) = other.cost_usd {
             *self.cost_usd.get_or_insert(0.0) += v;
+        }
+        if self.stop_reason.is_none() {
+            self.stop_reason = other.stop_reason.clone();
         }
     }
 }

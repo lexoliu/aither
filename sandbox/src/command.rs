@@ -84,9 +84,12 @@ async fn handle_large_output(output: String, output_dir: &PathBuf) -> String {
 
     let line_count = output.lines().count();
 
-    async_fs::write(&filepath, &output)
-        .await
-        .unwrap_or_else(|e| panic!("failed to write output to {}: {}", filepath.display(), e));
+    if let Err(error) = async_fs::write(&filepath, &output).await {
+        return format!(
+            "Error: failed to write output to {}: {error}",
+            filepath.display()
+        );
+    }
 
     format!(
         "Output saved to outputs/{} ({} lines, {} bytes)",
@@ -939,8 +942,10 @@ fn parse_tagged_enum(
     for variant in variants {
         if let Some(name) = get_variant_name(variant, tag) {
             if name.eq_ignore_ascii_case(subcommand) {
+                let mut variant_schema = variant.clone();
+                remove_required_field(&mut variant_schema, tag);
                 // Parse the variant's fields
-                let mut result = parse_object(variant, remaining)?;
+                let mut result = parse_object(&variant_schema, remaining)?;
 
                 // Add the tag field
                 if let Value::Object(ref mut map) = result {
@@ -961,6 +966,12 @@ fn parse_tagged_enum(
         subcommand,
         variant_names.join(", ")
     );
+}
+
+fn remove_required_field(schema: &mut Value, field: &str) {
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|entry| entry.as_str() != Some(field));
+    }
 }
 
 /// Gets the variant name from a schema object.
@@ -1101,6 +1112,10 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
         })
         .cloned()
         .collect();
+    let command_capture_enabled = properties
+        .get("command")
+        .is_some_and(|schema| get_instance_type(schema) == Some("string"));
+    let mut seen_positionals: Vec<String> = Vec::new();
     let (short_to_field, _) = build_short_option_maps(&properties);
     let long_names: Vec<String> = properties.keys().map(|k| k.replace('_', "-")).collect();
 
@@ -1123,6 +1138,9 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
                     result.insert(field_name.clone(), parse_value(arg, prop_type));
                 }
                 positional_idx += 1;
+                seen_positionals.push(arg.clone());
+            } else if command_capture_enabled {
+                seen_positionals.push(arg.clone());
             } else {
                 anyhow::bail!("unexpected positional argument: {arg}");
             }
@@ -1200,12 +1218,22 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
                     result.insert(field_name.clone(), parse_value(arg, prop_type));
                 }
                 positional_idx += 1;
+                seen_positionals.push(arg.clone());
+            } else if command_capture_enabled {
+                seen_positionals.push(arg.clone());
             } else {
                 anyhow::bail!("unexpected positional argument: {arg}");
             }
         }
 
         i += 1;
+    }
+
+    if command_capture_enabled && !seen_positionals.is_empty() && !result.contains_key("command") {
+        result.insert(
+            "command".to_string(),
+            Value::String(seen_positionals.join(" ")),
+        );
     }
 
     // Check required fields
@@ -1607,6 +1635,13 @@ mod tests {
         second: String,
     }
 
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(tag = "operation", rename_all = "snake_case")]
+    enum TaggedOperationArgs {
+        Read { path: String },
+        Write { path: String, content: String },
+    }
+
     #[test]
     fn test_multiple_positional_args() {
         let schema = schemars::schema_for!(TwoPositionalArgs);
@@ -1629,6 +1664,40 @@ mod tests {
         .unwrap();
         assert_eq!(result["first"], "hello");
         assert_eq!(result["second"], "world");
+    }
+
+    #[test]
+    fn test_tagged_enum_subcommand_parsing() {
+        let schema = schemars::schema_for!(TaggedOperationArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        let result = cli_to_json(
+            &schema,
+            &[
+                "read".to_string(),
+                "--path".to_string(),
+                "foo.txt".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result["operation"], "read");
+        assert_eq!(result["path"], "foo.txt");
+
+        let err = cli_to_json(
+            &schema,
+            &[
+                "write".to_string(),
+                "--path".to_string(),
+                "foo.txt".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("missing required argument: content"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -1853,6 +1922,34 @@ mod tests {
         assert!(err.to_string().contains("missing"), "got: {}", err);
     }
 
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct SessionLikeArgs {
+        query: String,
+        #[serde(default)]
+        command: Option<String>,
+    }
+
+    #[test]
+    fn test_command_field_captures_single_positional_for_session_like_tools() {
+        let schema = schemars::schema_for!(SessionLikeArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        let value = cli_to_json(&schema, &["gold".into()]).unwrap();
+        assert_eq!(value["query"], "gold");
+        assert_eq!(value["command"], "gold");
+    }
+
+    #[test]
+    fn test_command_field_captures_multi_positional_for_session_like_tools() {
+        let schema = schemars::schema_for!(SessionLikeArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        let value = cli_to_json(&schema, &["abc123".into(), "search".into(), "gold".into()])
+            .expect("session-like positional command should parse");
+        assert_eq!(value["query"], "abc123");
+        assert_eq!(value["command"], "abc123 search gold");
+    }
+
     // ========================================================================
     // ToolCallCommand args_to_cli with arrays
     // ========================================================================
@@ -1897,6 +1994,17 @@ mod tests {
             cli,
             vec!["--question", "Pick one", "--options", "A", "--options", "B"]
         );
+    }
+
+    #[test]
+    fn test_handle_large_output_write_failure_returns_error_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join("not-a-directory");
+        std::fs::write(&output_dir, "occupied").unwrap();
+        let output = "x".repeat(INLINE_OUTPUT_LIMIT + 1);
+
+        let result = futures_lite::future::block_on(handle_large_output(output, &output_dir));
+        assert!(result.contains("failed to write output"));
     }
 
     #[test]

@@ -1,8 +1,8 @@
-//! Bash-centric agent builder where all tools are IPC commands.
+//! Bash-centric agent builder with stateless bash execution and native terminal controls.
 //!
 //! This module provides a streamlined API for creating agents where:
-//! - **LLM perspective**: `bash` is the only tool call entry point
-//! - **Developer perspective**: Tools are registered normally but become bash commands
+//! - **LLM perspective**: core execution happens via `bash`, with native terminal tools
+//! - **Developer perspective**: domain tools are registered as bash CLI commands
 //!
 //! # Architecture
 //!
@@ -48,10 +48,10 @@ use crate::{
     Agent, AgentBuilder,
     config::{AgentKind, ContextBlock, ContextBlockPriority},
 };
-use aither_sandbox::builtin::{KillTool, TasksTool};
+use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool};
 use aither_sandbox::{
-    BashTool, BashToolFactory, BashToolFactoryReceiver, CloseShellTool, ContainerExec, ListSshTool,
-    OpenShellTool, PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, SshServer,
+    BashTool, BashToolFactory, BashToolFactoryReceiver, ContainerExec, ListSshTool, OpenSshTool,
+    PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, SshServer,
     SshSessionAuthorizer, ToolRegistryBuilder, Unconfigured, bash_tool_factory_channel,
 };
 
@@ -65,6 +65,7 @@ struct SystemPrompt {
     user_cwd: String,
     sandbox_dir: String,
     tools: String,
+    host_profile: &'static str,
     host_runtime_context: String,
     skills: String,
     has_skills: bool,
@@ -137,11 +138,12 @@ where
 {
     /// Creates a new bash-centric agent builder.
     ///
-    /// Creates the agent with native tools (`open_shell`, `close_shell`, `list_ssh`, `bash`)
-    /// and IPC commands accessible through bash (`jobs`, `kill`, plus any registered via `.tool()`).
+    /// Creates the agent with native tools (`open_ssh`, `list_ssh`, `kill_terminal`,
+    /// `input_terminal`, `bash`) and IPC commands accessible through
+    /// bash (registered via `.tool()`).
     pub fn new(llm: LLM, mut bash_tool: BashTool<P, E, Unconfigured>) -> Self {
         let (bash_tool_factory, bash_tool_factory_receiver) = bash_tool_factory_channel();
-        let mut registry_builder = ToolRegistryBuilder::new();
+        let registry_builder = ToolRegistryBuilder::new();
         let mut tool_descriptions = Vec::new();
 
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
@@ -150,35 +152,30 @@ where
             ssh: false,
         });
 
-        let open_shell =
-            OpenShellTool::new(shell_sessions.clone(), bash_tool.working_dir().clone());
+        let open_ssh = OpenSshTool::new(shell_sessions.clone());
         let list_ssh = ListSshTool::new(shell_sessions.clone());
         let job_registry = bash_tool.job_registry();
-        let close_shell = CloseShellTool::new(shell_sessions.clone(), job_registry.clone());
-        let jobs_tool = TasksTool::new(job_registry.clone());
-        let kill_tool = KillTool::new(job_registry);
+        let kill_terminal_tool = KillTerminalTool::new(job_registry.clone());
+        let input_terminal_tool = InputTerminalTool::new(job_registry);
         bash_tool = bash_tool.with_shell_sessions(shell_sessions.clone());
 
-        // Shell lifecycle tools are native LLM tool calls (not bash IPC commands).
-        let inner = AgentBuilder::new(llm)
-            .tool(open_shell)
-            .tool(list_ssh)
-            .tool(close_shell);
-
-        // jobs/kill are bash IPC commands (invoked via `$ jobs`, `$ kill <id>`).
-        let jobs_def = ToolDefinition::new(&jobs_tool);
-        tool_descriptions.push((
-            jobs_def.name().to_string(),
-            short_description(jobs_def.description()),
-        ));
-        registry_builder.configure_tool(jobs_tool);
-
-        let kill_def = ToolDefinition::new(&kill_tool);
+        // SSH management tools are native LLM tool calls (not bash IPC commands).
+        let kill_def = ToolDefinition::new(&kill_terminal_tool);
         tool_descriptions.push((
             kill_def.name().to_string(),
             short_description(kill_def.description()),
         ));
-        registry_builder.configure_tool(kill_tool);
+        let input_def = ToolDefinition::new(&input_terminal_tool);
+        tool_descriptions.push((
+            input_def.name().to_string(),
+            short_description(input_def.description()),
+        ));
+
+        let inner = AgentBuilder::new(llm)
+            .tool(open_ssh)
+            .tool(list_ssh)
+            .tool(kill_terminal_tool)
+            .tool(input_terminal_tool);
 
         Self {
             inner,
@@ -201,17 +198,42 @@ where
     E: Executor + Clone + 'static,
     H: Hook,
 {
+    async fn resolve_absolute_dir(
+        path: &std::path::Path,
+        kind: &str,
+    ) -> Result<std::path::PathBuf, crate::AgentError> {
+        fs::create_dir_all(path).await.map_err(|error| {
+            crate::AgentError::Config(format!(
+                "failed to create {kind} directory '{}': {error}",
+                path.display()
+            ))
+        })?;
+
+        fs::canonicalize(path).await.map_err(|error| {
+            crate::AgentError::Config(format!(
+                "failed to canonicalize {kind} directory '{}': {error}",
+                path.display()
+            ))
+        })
+    }
+
+    async fn register_readable_dir(
+        mut self,
+        source_path: &std::path::Path,
+        kind: &str,
+    ) -> Result<Self, crate::AgentError> {
+        let abs_path = Self::resolve_absolute_dir(source_path, kind).await?;
+        self.bash_tool = self.bash_tool.with_readable_paths([abs_path]);
+        Ok(self)
+    }
+
     async fn attach_readable_symlink(
         mut self,
         source_path: &std::path::Path,
+        kind: &str,
         link_name: &str,
     ) -> Result<Self, crate::AgentError> {
-        let abs_path = fs::canonicalize(source_path).await.map_err(|error| {
-            crate::AgentError::Config(format!(
-                "failed to canonicalize path '{}': {error}",
-                source_path.display()
-            ))
-        })?;
+        let abs_path = Self::resolve_absolute_dir(source_path, kind).await?;
         let symlink_path = self.bash_tool.working_dir().join(link_name);
 
         match fs::symlink_metadata(&symlink_path).await {
@@ -270,7 +292,7 @@ where
         Ok(self)
     }
 
-    /// Sets runtime shell backend availability for `open_shell`.
+    /// Sets runtime shell backend availability for `bash`.
     pub fn shell_runtime_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
         self.bash_tool = self
             .bash_tool
@@ -279,13 +301,13 @@ where
         self
     }
 
-    /// Sets preconfigured SSH targets that can be used by `open_shell` with ssh backend.
+    /// Sets preconfigured SSH targets that can be used by `bash` with ssh mode.
     pub fn ssh_servers(self, servers: Vec<SshServer>) -> Self {
         let _ = self.shell_sessions.set_ssh_servers(servers);
         self
     }
 
-    /// Sets the SSH session authorizer for interactive connect/install/unsafe consent prompts.
+    /// Sets the SSH session authorizer for interactive connect/install consent prompts.
     pub fn ssh_authorizer(self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
         let _ = self.shell_sessions.set_ssh_authorizer(authorizer);
         self
@@ -295,8 +317,17 @@ where
     ///
     /// This is shared across all clones of the internal `ShellSessionRegistry`
     /// via `OnceLock`, so it must only be called once.
-    pub fn container_exec(self, exec: Arc<dyn ContainerExec>) -> Self {
+    pub fn container_exec<T>(self, exec: Arc<T>) -> Self
+    where
+        T: ContainerExec + 'static,
+    {
         self.shell_sessions.set_container_exec(exec);
+        self
+    }
+
+    /// Sets the default container ID for Container shell sessions.
+    pub fn container_id(self, id: String) -> Self {
+        self.shell_sessions.set_container_id(id);
         self
     }
 
@@ -397,11 +428,16 @@ where
         } else {
             "leash"
         };
+        let runtime_kind = if host_profile == "container" {
+            "linux_container"
+        } else {
+            "user_local_machine"
+        };
         let shell_context = format!(
-            "<shell_runtime><available_backends local=\"{}\" ssh=\"{}\" /><local_profile>{}</local_profile></shell_runtime>",
+            "<shell_runtime><available_backends local=\"{}\" ssh=\"{}\" /><runtime>{}</runtime></shell_runtime>",
             availability.local || availability.container,
             availability.ssh,
-            host_profile,
+            runtime_kind,
         );
         self.inner = self.inner.context_block(
             ContextBlock::new("shell_runtime", shell_context)
@@ -410,12 +446,12 @@ where
 
         let host_runtime_context = if host_profile == "container" {
             format!(
-                "local_profile=container_local (virtualized local runtime; unrestricted by leash levels) | ssh_available={} (local IPC commands are local-only)",
+                "Linux container runtime. Default mode has network enabled. You may install dependencies freely. SSH available: {}.",
                 availability.ssh
             )
         } else {
             format!(
-                "local_profile=leash_local (real host with leash isolation; honor sandboxed/network/unsafe) | ssh_available={} (local IPC commands are local-only)",
+                "User machine runtime in sandbox. Default mode has network enabled. Use unsafe for host-level side effects. SSH available: {}.",
                 availability.ssh
             )
         };
@@ -463,6 +499,7 @@ where
             user_cwd,
             sandbox_dir,
             tools,
+            host_profile,
             host_runtime_context,
             skills,
             has_skills,
@@ -500,30 +537,23 @@ where
     /// `cat .skills/<name>/SKILL.md` at runtime.  The path is also
     /// registered as a readable (but not writable) sandbox path.
     #[cfg(feature = "skills")]
-    pub async fn with_skills(
+    async fn load_skills(
         mut self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, crate::AgentError> {
         use aither_skills::SkillLoader;
 
         let path = path.as_ref().to_path_buf();
-
-        fs::create_dir_all(&path).await.map_err(|error| {
-            crate::AgentError::Config(format!(
-                "failed to create skills directory '{}': {error}",
-                path.display()
-            ))
-        })?;
-
-        let loader = SkillLoader::new().add_path(&path);
+        let abs_path = Self::resolve_absolute_dir(&path, "skills").await?;
+        let loader = SkillLoader::new().add_path(&abs_path);
         let skills = loader.load_all().await.map_err(|error| {
             crate::AgentError::Config(format!(
                 "failed to load skills from '{}': {error}",
-                path.display()
+                abs_path.display()
             ))
         })?;
 
-        tracing::info!(count = skills.len(), path = %path.display(), "Loaded skills");
+        tracing::info!(count = skills.len(), path = %abs_path.display(), "Loaded skills");
         for skill in skills {
             tracing::debug!(name = %skill.name, "Loaded skill");
             self.skills.push(SkillInfo {
@@ -532,7 +562,35 @@ where
             });
         }
 
-        self.attach_readable_symlink(&path, ".skills").await
+        Ok(self)
+    }
+
+    #[cfg(feature = "skills")]
+    pub async fn with_skills(
+        self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, crate::AgentError> {
+        let path = path.as_ref().to_path_buf();
+        self.load_skills(&path)
+            .await?
+            .attach_readable_symlink(&path, "skills", ".skills")
+            .await
+    }
+
+    /// Loads skill metadata and grants read-only access to the source
+    /// directory without creating a `.skills` symlink in the sandbox.
+    ///
+    /// Use this when the runtime already mounts `.skills` inside the sandbox.
+    #[cfg(feature = "skills")]
+    pub async fn with_skills_readable_only(
+        self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, crate::AgentError> {
+        let path = path.as_ref().to_path_buf();
+        self.load_skills(&path)
+            .await?
+            .register_readable_dir(&path, "skills")
+            .await
     }
 
     /// Adds a skill manually without loading from filesystem.
@@ -556,28 +614,21 @@ where
     /// ```rust,ignore
     /// builder.with_subagents("/path/to/subagents").await?
     /// ```
-    pub async fn with_subagents(
+    async fn load_subagents(
         mut self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, crate::AgentError> {
         use crate::subagent_file::SubagentDefinition;
 
         let path = path.as_ref().to_path_buf();
+        let abs_path = Self::resolve_absolute_dir(&path, "subagents").await?;
 
-        // Ensure the subagents directory exists.
-        fs::create_dir_all(&path).await.map_err(|error| {
-            crate::AgentError::Config(format!(
-                "failed to create subagents directory '{}': {error}",
-                path.display()
-            ))
-        })?;
-
-        let defs = SubagentDefinition::load_from_dir_async(&path)
+        let defs = SubagentDefinition::load_from_dir_async(&abs_path)
             .await
             .map_err(|error| {
                 crate::AgentError::Config(format!(
                     "failed to load subagents from '{}': {error}",
-                    path.display()
+                    abs_path.display()
                 ))
             })?;
 
@@ -590,7 +641,33 @@ where
             });
         }
 
-        self.attach_readable_symlink(&path, ".subagents").await
+        Ok(self)
+    }
+
+    pub async fn with_subagents(
+        self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, crate::AgentError> {
+        let path = path.as_ref().to_path_buf();
+        self.load_subagents(&path)
+            .await?
+            .attach_readable_symlink(&path, "subagents", ".subagents")
+            .await
+    }
+
+    /// Loads subagent metadata and grants read-only access to the source
+    /// directory without creating a `.subagents` symlink in the sandbox.
+    ///
+    /// Use this when the runtime already mounts `.subagents` inside the sandbox.
+    pub async fn with_subagents_readable_only(
+        self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, crate::AgentError> {
+        let path = path.as_ref().to_path_buf();
+        self.load_subagents(&path)
+            .await?
+            .register_readable_dir(&path, "subagents")
+            .await
     }
 
     /// Sets the maximum number of iterations.
@@ -731,5 +808,56 @@ mod tests {
         // On macOS, should return "macOS" and a version like "14.0"
         #[cfg(target_os = "macos")]
         assert_eq!(os_name, "macOS");
+    }
+
+    #[test]
+    fn test_system_prompt_container_profile_excludes_leash_modes() {
+        let prompt = SystemPrompt {
+            os: "macOS".to_string(),
+            os_version: "15.0".to_string(),
+            arch: "arm64",
+            user_cwd: "/tmp/project".to_string(),
+            sandbox_dir: "/tmp/sandbox".to_string(),
+            tools: "- bash: Execute shell commands".to_string(),
+            host_profile: "container",
+            host_runtime_context: "runtime=linux_container".to_string(),
+            skills: String::new(),
+            has_skills: false,
+            subagents: String::new(),
+            has_subagents: false,
+            is_macos: true,
+        }
+        .render()
+        .expect("failed to render container prompt");
+
+        assert!(prompt.contains("<runtime>Linux container runtime</runtime>"));
+        assert!(prompt.contains("<shell-runtime>"));
+        assert!(!prompt.contains("<shell-modes>"));
+        assert!(prompt.contains("install dependencies freely"));
+    }
+
+    #[test]
+    fn test_system_prompt_leash_profile_includes_shell_modes() {
+        let prompt = SystemPrompt {
+            os: "macOS".to_string(),
+            os_version: "15.0".to_string(),
+            arch: "arm64",
+            user_cwd: "/tmp/project".to_string(),
+            sandbox_dir: "/tmp/sandbox".to_string(),
+            tools: "- bash: Execute shell commands".to_string(),
+            host_profile: "leash",
+            host_runtime_context: "runtime=user_local_machine".to_string(),
+            skills: String::new(),
+            has_skills: false,
+            subagents: String::new(),
+            has_subagents: false,
+            is_macos: true,
+        }
+        .render()
+        .expect("failed to render leash prompt");
+
+        assert!(prompt.contains("<shell-modes>"));
+        assert!(!prompt.contains("<shell-runtime>"));
+        assert!(prompt.contains("<unsafe>"));
     }
 }

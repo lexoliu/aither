@@ -63,6 +63,20 @@ impl fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
+impl AgentError {
+    /// Returns `true` if this is a provider-level failure worth retrying
+    /// (e.g. with a different provider in a multi-provider setup).
+    ///
+    /// Only `Llm` errors are considered retryable — they indicate the
+    /// LLM provider itself failed (rate limit, timeout, auth, server error, etc.).
+    /// Other variants (`MaxIterations`, `HookRejected`, `ToolNotFound`, etc.)
+    /// are not provider-related and retrying would not help.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, Self::Llm(_))
+    }
+}
+
 impl From<anyhow::Error> for AgentError {
     fn from(error: anyhow::Error) -> Self {
         Self::Llm(error.to_string())

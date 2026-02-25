@@ -53,7 +53,9 @@
 #![allow(clippy::module_name_repetitions)]
 
 mod bash;
+mod bollard_exec;
 mod command;
+mod container;
 mod naming;
 mod output;
 mod output_compress;
@@ -69,20 +71,25 @@ pub mod job_registry;
 pub mod permission;
 
 pub use bash::{
-    BackgroundTaskReceiver, BashArgs, BashError, BashResult, BashTool, BashToolFactory,
-    BashToolFactoryError, BashToolFactoryReceiver, CompletedTask, Configured, Unconfigured,
-    bash_tool_factory_channel,
+    BackgroundTaskReceiver, BashArgs, BashError, BashExecutionMode, BashResult, BashTool,
+    BashToolFactory, BashToolFactoryError, BashToolFactoryReceiver, CompletedTask, Configured,
+    Unconfigured, bash_tool_factory_channel,
 };
+pub use bollard_exec::{BollardContainerExec, CONTAINER_STDIN_BLOCKED_NOTICE, is_waiting_on_stdin};
 pub use command::{
     DynBashTool, DynToolHandler, IpcToolCommand, ToolCallCommand, ToolCommand, ToolRegistry,
     ToolRegistryBuilder, cli_to_json, register_ipc_gateway_command, register_tool_command,
     register_tool_direct, schema_to_help,
 };
+pub use container::{
+    ContainerImageSpec, ContainerLaunchSpec, ContainerRuntimeKind, MountAccess, MountRoot,
+    MountRootError, MountSpec, RuntimePreference,
+};
 pub use job_registry::{JobInfo, JobRegistry, JobStatus};
 pub use output::{Content, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{BashMode, PermissionHandler};
 pub use shell_session::{
-    CloseShellArgs, CloseShellTool, ContainerExec, ListSshTool, OpenShellArgs, OpenShellBackend,
-    OpenShellTool, ShellBackend, ShellRuntimeAvailability, ShellSession, ShellSessionRegistry,
-    SshRuntimeProfile, SshServer, SshSessionAuthorizer,
+    ContainerExec, ContainerExecOutcome, ListSshTool, OpenSshArgs, OpenSshTool, ShellBackend,
+    ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile, SshServer,
+    SshSessionAuthorizer, bootstrap_ssh_runtime,
 };

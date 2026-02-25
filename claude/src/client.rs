@@ -6,7 +6,7 @@ use aither_core::{
     LanguageModel,
     llm::{
         Event, LLMRequest,
-        model::{Ability, Profile as ModelProfile},
+        model::{Ability, Profile as ModelProfile, ToolChoice},
         oneshot,
     },
 };
@@ -18,7 +18,10 @@ use zenwave::{Client, client, header};
 use crate::{
     constant::{ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL},
     error::ClaudeError,
-    request::{MessagesRequest, ParameterSnapshot, convert_tools, to_claude_messages},
+    request::{
+        CacheControlPayload, MessagesRequest, ParameterSnapshot, convert_tools,
+        filter_tool_definitions, to_claude_messages, tool_choice_payload,
+    },
     response::{StreamState, parse_event, should_skip_event},
 };
 
@@ -92,17 +95,34 @@ impl LanguageModel for Claude {
         let cfg = self.config();
         let (core_messages, parameters, tool_definitions) = request.into_parts();
         let (system_prompt, claude_messages) = to_claude_messages(&core_messages);
-
-        let claude_tools = if tool_definitions.is_empty() {
-            None
-        } else {
-            Some(convert_tools(&tool_definitions))
-        };
-
         let snapshot = ParameterSnapshot::from(&parameters);
+        let filtered_tool_definitions =
+            filter_tool_definitions(tool_definitions, &snapshot.tool_choice);
+        let missing_exact_tool = match &snapshot.tool_choice {
+            ToolChoice::Exact(name) if filtered_tool_definitions.is_empty() => Some(name.clone()),
+            _ => None,
+        };
+        let has_tools = !filtered_tool_definitions.is_empty();
+        let claude_tools = has_tools.then(|| convert_tools(&filtered_tool_definitions));
+        let claude_tool_choice = tool_choice_payload(&snapshot.tool_choice, has_tools);
+
         let max_tokens = snapshot.max_tokens.unwrap_or(cfg.default_max_tokens);
 
         async_stream::stream! {
+            if parameters.cache.openai.is_some() || parameters.cache.gemini.is_some() {
+                yield Err(ClaudeError::Api(
+                    "Claude provider only accepts cache.claude settings".to_string(),
+                ));
+                return;
+            }
+
+            if let Some(tool_name) = &missing_exact_tool {
+                yield Err(ClaudeError::Api(format!(
+                    "Exact tool choice '{tool_name}' is not present in tool definitions"
+                )));
+                return;
+            }
+
             // Build and send request
             let request_body = MessagesRequest {
                 model: cfg.model.clone(),
@@ -115,6 +135,8 @@ impl LanguageModel for Claude {
                 top_k: snapshot.top_k,
                 stop_sequences: snapshot.stop_sequences.clone(),
                 tools: claude_tools,
+                tool_choice: claude_tool_choice,
+                cache_control: snapshot.cache.map(CacheControlPayload::from),
             };
 
             debug!("Claude request: {:?}", request_body);
@@ -146,22 +168,17 @@ impl LanguageModel for Claude {
                     return;
                 }
             };
+            futures_lite::pin!(sse_stream);
 
             // Process SSE events
             let mut state = StreamState::new();
 
-            let events: Vec<_> = sse_stream
-                .filter_map(|event| match event {
-                    Ok(e) if !should_skip_event(&e) => Some(Ok(e)),
-                    Ok(_) => None,
-                    Err(e) => Some(Err(e)),
-                })
-                .collect()
-                .await;
-
-            for event in events {
+            while let Some(event) = sse_stream.next().await {
                 match event {
                     Ok(e) => {
+                        if should_skip_event(&e) {
+                            continue;
+                        }
                         match parse_event(&e, &mut state) {
                             Ok(llm_events) => {
                                 for llm_event in llm_events {
@@ -214,11 +231,10 @@ impl LanguageModel for Claude {
                     aither_models::lookup(&cfg.model)
                         .map(|info| info.context_window)
                         .unwrap_or_else(|| {
-                            tracing::warn!(
-                                "Model '{}' not found in database, using default 200k",
+                            panic!(
+                                "Claude model '{}' missing context metadata from provider and aither-models",
                                 cfg.model
-                            );
-                            200_000
+                            )
                         })
                 }
             };

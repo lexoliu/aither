@@ -1,18 +1,22 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     future::Future,
-    path::PathBuf,
     pin::Pin,
     sync::{Arc, OnceLock, RwLock},
 };
 
 use aither_core::llm::{Tool, ToolOutput};
+use async_channel::{Receiver, Sender};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::naming::random_word_slug;
-use crate::permission::BashMode;
+/// Outcome of a container execution request.
+#[derive(Debug)]
+pub enum ContainerExecOutcome {
+    Completed(std::process::Output),
+    Killed,
+}
 
 /// Trait for executing commands inside a container.
 ///
@@ -21,12 +25,49 @@ use crate::permission::BashMode;
 /// the application (may) provides the implementation.
 pub trait ContainerExec: Send + Sync {
     /// Execute a bash script inside the container, returning stdout/stderr and exit code.
+    ///
+    /// Implementations should send a human-readable message to
+    /// `stdin_blocked_notice` when they detect the process is blocked on stdin
+    /// (for example via `/proc/<pid>/syscall`), allowing callers to auto-promote
+    /// foreground execution into background mode.
     fn exec(
         &self,
         container_id: &str,
         script: &str,
         working_dir: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<std::process::Output, String>> + Send + '_>>;
+        kill_rx: Receiver<()>,
+        stdin_blocked_notice: Option<Sender<String>>,
+    ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
+}
+
+pub(crate) trait ContainerExecObject: Send + Sync {
+    fn exec_boxed<'a>(
+        &'a self,
+        container_id: &'a str,
+        script: &'a str,
+        working_dir: &'a str,
+        kill_rx: Receiver<()>,
+        stdin_blocked_notice: Option<Sender<String>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
+}
+
+impl<T: ContainerExec> ContainerExecObject for T {
+    fn exec_boxed<'a>(
+        &'a self,
+        container_id: &'a str,
+        script: &'a str,
+        working_dir: &'a str,
+        kill_rx: Receiver<()>,
+        stdin_blocked_notice: Option<Sender<String>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>> {
+        Box::pin(self.exec(
+            container_id,
+            script,
+            working_dir,
+            kill_rx,
+            stdin_blocked_notice,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -43,23 +84,16 @@ pub struct SshServer {
     pub target: String,
 }
 
-#[derive(Debug, Clone)]
-pub enum SshRuntimeProfile {
-    Leash { binary: String },
-    Unsafe,
+impl SshServer {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.name
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct ShellSession {
-    pub id: String,
-    pub backend: ShellBackend,
-    pub host_runtime: &'static str,
-    pub mode: BashMode,
-    pub cwd: PathBuf,
-    pub ssh_target: Option<String>,
-    pub ssh_runtime: Option<SshRuntimeProfile>,
-    /// Docker container ID (set when backend is Container).
-    pub container_id: Option<String>,
+pub enum SshRuntimeProfile {
+    Leash { binary: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,22 +124,17 @@ pub trait SshSessionAuthorizer: Send + Sync {
         target: &str,
         details: &str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
-
-    fn authorize_unsafe_fallback(
-        &self,
-        target: &str,
-        reason: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
 }
 
 #[derive(Clone)]
 pub struct ShellSessionRegistry {
-    sessions: Arc<RwLock<HashMap<String, ShellSession>>>,
     availability: Arc<RwLock<ShellRuntimeAvailability>>,
     ssh_servers: Arc<RwLock<Vec<SshServer>>>,
     ssh_authorizer: Arc<RwLock<Option<Arc<dyn SshSessionAuthorizer>>>>,
     /// Container executor — set once, shared across all clones via `OnceLock`.
-    container_exec: Arc<OnceLock<Arc<dyn ContainerExec>>>,
+    container_exec: Arc<OnceLock<Arc<dyn ContainerExecObject>>>,
+    /// Default container ID — set once, used by container backend.
+    container_id: Arc<OnceLock<String>>,
 }
 
 impl std::fmt::Debug for ShellSessionRegistry {
@@ -119,18 +148,26 @@ impl ShellSessionRegistry {
     #[must_use]
     pub fn new(availability: ShellRuntimeAvailability) -> Self {
         Self {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             availability: Arc::new(RwLock::new(availability)),
             ssh_servers: Arc::new(RwLock::new(Vec::new())),
             ssh_authorizer: Arc::new(RwLock::new(None)),
             container_exec: Arc::new(OnceLock::new()),
+            container_id: Arc::new(OnceLock::new()),
         }
     }
 
     /// Set the container executor (can only be called once; subsequent calls are no-ops).
-    /// All clones of this registry share the same executor via `Arc<OnceLock<...>>`.
-    pub fn set_container_exec(&self, exec: Arc<dyn ContainerExec>) {
+    pub fn set_container_exec<T>(&self, exec: Arc<T>)
+    where
+        T: ContainerExec + 'static,
+    {
+        let exec: Arc<dyn ContainerExecObject> = exec;
         let _ = self.container_exec.set(exec);
+    }
+
+    /// Set the default container ID for container backend commands.
+    pub fn set_container_id(&self, id: String) {
+        let _ = self.container_id.set(id);
     }
 
     pub fn set_availability(&self, availability: ShellRuntimeAvailability) -> Result<(), String> {
@@ -161,17 +198,29 @@ impl ShellSessionRegistry {
     }
 
     /// Get the container executor (if set).
-    pub fn container_exec(&self) -> Option<Arc<dyn ContainerExec>> {
+    pub(crate) fn container_exec(&self) -> Option<Arc<dyn ContainerExecObject>> {
         self.container_exec.get().cloned()
+    }
+
+    /// Get the configured container ID (if set).
+    #[must_use]
+    pub fn container_id(&self) -> Option<String> {
+        self.container_id.get().cloned()
     }
 
     pub fn set_ssh_servers(&self, servers: Vec<SshServer>) -> Result<(), String> {
         let mut seen = HashSet::new();
         let mut deduped = Vec::new();
         for server in servers {
-            if seen.insert(server.target.clone()) {
-                deduped.push(server);
+            let id = server.id().trim().to_string();
+            let target = server.target.trim().to_string();
+            if id.is_empty() || target.is_empty() {
+                return Err("ssh server entries require non-empty name and target".to_string());
             }
+            if !seen.insert(id.clone()) {
+                return Err(format!("duplicate ssh server id: {id}"));
+            }
+            deduped.push(SshServer { name: id, target });
         }
 
         *self
@@ -189,144 +238,42 @@ impl ShellSessionRegistry {
             .unwrap_or_default()
     }
 
-    pub fn open(
-        &self,
-        backend: ShellBackend,
-        mode: BashMode,
-        cwd: PathBuf,
-        ssh_target: Option<String>,
-        ssh_runtime: Option<SshRuntimeProfile>,
-    ) -> Result<ShellSession, String> {
-        self.open_with_container(backend, mode, cwd, ssh_target, ssh_runtime, None)
-    }
-
-    pub fn open_with_container(
-        &self,
-        backend: ShellBackend,
-        mode: BashMode,
-        cwd: PathBuf,
-        ssh_target: Option<String>,
-        ssh_runtime: Option<SshRuntimeProfile>,
-        container_id: Option<String>,
-    ) -> Result<ShellSession, String> {
-        let availability = self
-            .availability
+    pub fn resolve_ssh_server(&self, server_id: &str) -> Result<SshServer, String> {
+        let wanted = server_id.trim();
+        if wanted.is_empty() {
+            return Err("ssh_server_id is required for ssh mode".to_string());
+        }
+        self.ssh_servers
             .read()
-            .map_err(|_| "shell availability lock poisoned".to_string())?
-            .clone();
-        let enabled = match backend {
-            ShellBackend::Local => availability.local || availability.container,
-            ShellBackend::Container => availability.container,
-            ShellBackend::Ssh => availability.ssh,
-        };
-        if !enabled {
-            return Err(format!("backend {backend:?} is not available"));
-        }
+            .map_err(|_| "ssh server lock poisoned".to_string())?
+            .iter()
+            .find(|s| s.id() == wanted)
+            .cloned()
+            .ok_or_else(|| format!("unknown ssh_server_id: {wanted}"))
+    }
 
-        let ssh_target = if matches!(backend, ShellBackend::Ssh) {
-            let target = ssh_target
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| {
-                    "ssh_target is required for ssh backend; use list_ssh to select one".to_string()
-                })?;
-            let allowed = self
-                .ssh_servers
-                .read()
-                .map_err(|_| "ssh server lock poisoned".to_string())?
-                .iter()
-                .any(|server| server.target == target);
-            if !allowed {
-                return Err(
-                    "ssh_target is not preconfigured; model may only connect to list_ssh targets"
-                        .to_string(),
-                );
-            }
-            Some(target)
+    pub fn resolve_local_backend(&self) -> Result<ShellBackend, String> {
+        let availability = self.availability();
+        if availability.container {
+            return Ok(ShellBackend::Container);
+        }
+        if availability.local {
+            return Ok(ShellBackend::Local);
+        }
+        Err("no local backend available".to_string())
+    }
+
+    pub fn ensure_ssh_available(&self) -> Result<(), String> {
+        if self.availability().ssh {
+            Ok(())
         } else {
-            None
-        };
-
-        if matches!(backend, ShellBackend::Ssh) && ssh_runtime.is_none() {
-            return Err("missing ssh runtime profile".to_string());
+            Err("ssh backend is not available".to_string())
         }
-
-        let id = random_word_slug(4);
-        let host_runtime = match backend {
-            ShellBackend::Local => {
-                if availability.container {
-                    "container"
-                } else {
-                    "leash"
-                }
-            }
-            ShellBackend::Container => "container",
-            ShellBackend::Ssh => "ssh",
-        };
-        let session = ShellSession {
-            id: id.clone(),
-            backend,
-            host_runtime,
-            mode,
-            cwd,
-            ssh_target,
-            ssh_runtime,
-            container_id,
-        };
-        self.sessions
-            .write()
-            .map_err(|_| "shell session lock poisoned".to_string())?
-            .insert(id, session.clone());
-        Ok(session)
     }
 
-    pub fn close(&self, shell_id: &str) -> Result<bool, String> {
-        let removed = self
-            .sessions
-            .write()
-            .map_err(|_| "shell session lock poisoned".to_string())?
-            .remove(shell_id)
-            .is_some();
-        Ok(removed)
-    }
-
-    #[must_use]
-    pub fn get(&self, shell_id: &str) -> Option<ShellSession> {
-        self.sessions.read().ok()?.get(shell_id).cloned()
-    }
-
-    pub fn close_all(&self) -> Result<Vec<String>, String> {
-        let mut sessions = self
-            .sessions
-            .write()
-            .map_err(|_| "shell session lock poisoned".to_string())?;
-        let ids = sessions.keys().cloned().collect::<Vec<_>>();
-        sessions.clear();
-        Ok(ids)
-    }
-
-    fn ssh_authorizer(&self) -> Option<Arc<dyn SshSessionAuthorizer>> {
+    pub fn ssh_authorizer(&self) -> Option<Arc<dyn SshSessionAuthorizer>> {
         self.ssh_authorizer.read().ok()?.clone()
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum OpenShellBackend {
-    Local,
-    Ssh,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct OpenShellArgs {
-    #[serde(default)]
-    pub backend: Option<OpenShellBackend>,
-    #[serde(default)]
-    pub mode: BashMode,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub ssh_target: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -356,87 +303,55 @@ impl Tool for ListSshTool {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OpenSshArgs {
+    pub ssh_server_id: String,
+}
+
 #[derive(Debug, Clone)]
-pub struct OpenShellTool {
+pub struct OpenSshTool {
     registry: ShellSessionRegistry,
-    default_cwd: PathBuf,
 }
 
-impl OpenShellTool {
+impl OpenSshTool {
     #[must_use]
-    pub const fn new(registry: ShellSessionRegistry, default_cwd: PathBuf) -> Self {
-        Self {
-            registry,
-            default_cwd,
-        }
+    pub const fn new(registry: ShellSessionRegistry) -> Self {
+        Self { registry }
     }
 }
 
-impl Tool for OpenShellTool {
+impl Tool for OpenSshTool {
     fn name(&self) -> Cow<'static, str> {
-        "open_shell".into()
+        "open_ssh".into()
     }
 
-    type Arguments = OpenShellArgs;
+    type Arguments = OpenSshArgs;
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        let requested = args.backend.unwrap_or(OpenShellBackend::Local);
-        let availability = self.registry.availability();
-        let backend = match requested {
-            OpenShellBackend::Local => ShellBackend::Local,
-            OpenShellBackend::Ssh => ShellBackend::Ssh,
-        };
-        if matches!(requested, OpenShellBackend::Ssh) && !availability.ssh {
-            return Err(anyhow::anyhow!("backend Ssh is not available"));
-        }
-        if matches!(requested, OpenShellBackend::Local)
-            && !(availability.local || availability.container)
-        {
-            return Err(anyhow::anyhow!("backend Local is not available"));
-        }
-
-        let cwd = args
-            .cwd
-            .map_or_else(|| self.default_cwd.clone(), PathBuf::from);
-
-        let (mode, ssh_runtime) = if matches!(requested, OpenShellBackend::Ssh) {
-            let target = args
-                .ssh_target
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("ssh_target is required for ssh backend"))?;
-            bootstrap_ssh_runtime(&target, &self.registry.ssh_authorizer(), args.mode).await?
-        } else {
-            (args.mode, None)
-        };
-
-        let session = self
-            .registry
-            .open(backend, mode, cwd, args.ssh_target, ssh_runtime)
+        self.registry
+            .ensure_ssh_available()
             .map_err(anyhow::Error::msg)?;
-
+        let server = self
+            .registry
+            .resolve_ssh_server(&args.ssh_server_id)
+            .map_err(anyhow::Error::msg)?;
+        let runtime =
+            bootstrap_ssh_runtime(&server.target, &self.registry.ssh_authorizer()).await?;
         let payload = serde_json::json!({
-            "shell_id": session.id,
-            "backend": session.backend,
-            "mode": session.mode,
-            "cwd": session.cwd,
-            "ssh_target": session.ssh_target,
-            "runtime": match session.ssh_runtime {
-                Some(SshRuntimeProfile::Leash { .. }) => "leash",
-                Some(SshRuntimeProfile::Unsafe) => "unsafe",
-                None => "local",
-            },
-            "availability": self.registry.availability(),
+            "ssh_server_id": server.id(),
+            "target": server.target,
+            "runtime": match runtime {
+                SshRuntimeProfile::Leash { .. } => "leash",
+            }
         });
-
         Ok(ToolOutput::text(payload.to_string()))
     }
 }
 
-async fn bootstrap_ssh_runtime(
+pub async fn bootstrap_ssh_runtime(
     target: &str,
     authorizer: &Option<Arc<dyn SshSessionAuthorizer>>,
-    requested_mode: BashMode,
-) -> Result<(BashMode, Option<SshRuntimeProfile>), anyhow::Error> {
+) -> Result<SshRuntimeProfile, anyhow::Error> {
     if let Some(auth) = authorizer {
         let allowed = auth
             .authorize_connect(target)
@@ -449,15 +364,11 @@ async fn bootstrap_ssh_runtime(
 
     let remote = detect_remote(target).await?;
     if remote.leash_found {
-        return Ok((
-            requested_mode,
-            Some(SshRuntimeProfile::Leash {
-                binary: remote.leash_path,
-            }),
-        ));
+        return Ok(SshRuntimeProfile::Leash {
+            binary: remote.leash_path,
+        });
     }
 
-    let mut installed = false;
     if let Some(auth) = authorizer {
         let details = format!(
             "Remote {} ({}) does not have leash installed.",
@@ -467,43 +378,19 @@ async fn bootstrap_ssh_runtime(
             .authorize_leash_install(target, &details)
             .await
             .map_err(anyhow::Error::msg)?;
-        if approve_install {
-            installed = install_leash(target, &remote).await?;
-        }
-    }
-
-    if installed {
-        let verified = detect_remote(target).await?;
-        if verified.leash_found {
-            return Ok((
-                requested_mode,
-                Some(SshRuntimeProfile::Leash {
+        if approve_install && install_leash(target, &remote).await? {
+            let verified = detect_remote(target).await?;
+            if verified.leash_found {
+                return Ok(SshRuntimeProfile::Leash {
                     binary: verified.leash_path,
-                }),
-            ));
+                });
+            }
         }
     }
 
-    let reason = if requested_mode == BashMode::Unsafe {
-        "Remote leash is unavailable; session will run unsafe without sandbox isolation."
-    } else {
-        "Remote leash is unavailable; requested sandboxed/network cannot be enforced remotely."
-    };
-    if let Some(auth) = authorizer {
-        let allow_unsafe = auth
-            .authorize_unsafe_fallback(target, reason)
-            .await
-            .map_err(anyhow::Error::msg)?;
-        if !allow_unsafe {
-            return Err(anyhow::anyhow!("user denied unsafe fallback"));
-        }
-    } else {
-        return Err(anyhow::anyhow!(
-            "ssh session requires interactive approval for unsafe fallback"
-        ));
-    }
-
-    Ok((BashMode::Unsafe, Some(SshRuntimeProfile::Unsafe)))
+    Err(anyhow::anyhow!(
+        "remote leash runtime unavailable; ssh mode requires leash on the remote host"
+    ))
 }
 
 struct RemoteInfo {
@@ -514,7 +401,7 @@ struct RemoteInfo {
 }
 
 async fn detect_remote(target: &str) -> Result<RemoteInfo, anyhow::Error> {
-    let probe = "uname -s; uname -m; command -v leash >/dev/null 2>&1 && command -v leash || echo __NO_LEASH__";
+    let probe = "uname -s; uname -m; if command -v leash >/dev/null 2>&1; then command -v leash; elif [ -x \"$HOME/.local/bin/leash\" ]; then printf '%s\\n' \"$HOME/.local/bin/leash\"; else echo __NO_LEASH__; fi";
     let output = async_process::Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
@@ -534,7 +421,11 @@ async fn detect_remote(target: &str) -> Result<RemoteInfo, anyhow::Error> {
         ));
     }
 
-    let lines = String::from_utf8_lossy(&output.stdout)
+    parse_remote_probe_output(&output.stdout)
+}
+
+fn parse_remote_probe_output(stdout: &[u8]) -> Result<RemoteInfo, anyhow::Error> {
+    let lines = String::from_utf8_lossy(stdout)
         .lines()
         .map(|s| s.trim().to_string())
         .collect::<Vec<_>>();
@@ -544,17 +435,20 @@ async fn detect_remote(target: &str) -> Result<RemoteInfo, anyhow::Error> {
 
     let leash_line = lines[2].clone();
     let leash_found = leash_line != "__NO_LEASH__";
-    let leash_path = if leash_found {
-        leash_line
-    } else {
-        "~/.local/bin/leash".to_string()
-    };
+    if !leash_found {
+        return Ok(RemoteInfo {
+            os: lines[0].clone(),
+            arch: lines[1].clone(),
+            leash_found,
+            leash_path: String::new(),
+        });
+    }
 
     Ok(RemoteInfo {
         os: lines[0].clone(),
         arch: lines[1].clone(),
         leash_found,
-        leash_path,
+        leash_path: leash_line,
     })
 }
 
@@ -642,47 +536,25 @@ fn normalize_arch(raw: &str) -> &str {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct CloseShellArgs {
-    pub shell_id: String,
-}
+#[cfg(test)]
+mod tests {
+    use super::parse_remote_probe_output;
 
-#[derive(Debug, Clone)]
-pub struct CloseShellTool {
-    registry: ShellSessionRegistry,
-    jobs: crate::job_registry::JobRegistry,
-}
-
-impl CloseShellTool {
-    #[must_use]
-    pub const fn new(
-        registry: ShellSessionRegistry,
-        jobs: crate::job_registry::JobRegistry,
-    ) -> Self {
-        Self { registry, jobs }
-    }
-}
-
-impl Tool for CloseShellTool {
-    fn name(&self) -> Cow<'static, str> {
-        "close_shell".into()
+    #[test]
+    fn parse_remote_probe_detects_local_bin_leash_path() {
+        let stdout = b"Linux\nx86_64\n/home/test/.local/bin/leash\n";
+        let remote = parse_remote_probe_output(stdout).expect("probe output should parse");
+        assert_eq!(remote.os, "Linux");
+        assert_eq!(remote.arch, "x86_64");
+        assert!(remote.leash_found);
+        assert_eq!(remote.leash_path, "/home/test/.local/bin/leash");
     }
 
-    type Arguments = CloseShellArgs;
-
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        let shell_id = args.shell_id;
-        let closed = self.registry.close(&shell_id).map_err(anyhow::Error::msg)?;
-        let killed_jobs = if closed {
-            self.jobs.kill_by_session(&shell_id).await
-        } else {
-            0
-        };
-        let payload = serde_json::json!({
-            "shell_id": shell_id,
-            "closed": closed,
-            "killed_jobs": killed_jobs,
-        });
-        Ok(ToolOutput::text(payload.to_string()))
+    #[test]
+    fn parse_remote_probe_handles_missing_leash() {
+        let stdout = b"Linux\naarch64\n__NO_LEASH__\n";
+        let remote = parse_remote_probe_output(stdout).expect("probe output should parse");
+        assert!(!remote.leash_found);
+        assert!(remote.leash_path.is_empty());
     }
 }

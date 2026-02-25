@@ -1,17 +1,10 @@
-//! Built-in tools for the bash sandbox.
-//!
-//! These tools are always available and provide special functionality:
-//! - `ask`: Query a fast LLM about piped content
-//! - `jobs`: List background tasks (running, completed, failed, killed)
-//! - `kill`: Terminate a background task by PID
+//! Built-in sandbox tools.
 
 mod ask;
-mod stop;
-mod tasks;
+mod terminal;
 
 pub use ask::AskCommand;
-pub use stop::{KillArgs, KillTool};
-pub use tasks::{TasksArgs, TasksTool};
+pub use terminal::{InputTerminalArgs, InputTerminalTool, KillTerminalArgs, KillTerminalTool};
 
 use leash::IpcRouter;
 

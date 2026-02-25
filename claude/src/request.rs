@@ -1,6 +1,10 @@
 //! Request building and message conversion for the Claude API.
 
-use aither_core::llm::{Message, Role, model::Parameters, tool::ToolDefinition};
+use aither_core::llm::{
+    Message, Role,
+    model::{ClaudePromptCache, ClaudePromptCacheTtl, Parameters, ToolChoice},
+    tool::ToolDefinition,
+};
 use base64::Engine;
 use serde::Serialize;
 use serde_json::Value;
@@ -35,6 +39,12 @@ pub struct MessagesRequest {
     /// Available tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolPayload>>,
+    /// Tool choice policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoicePayload>,
+    /// Prompt cache control.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlPayload>,
 }
 
 /// Individual message in Claude format.
@@ -123,6 +133,45 @@ pub struct ToolPayload {
     pub input_schema: Value,
 }
 
+/// Claude prompt cache control payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheControlPayload {
+    /// Cache type.
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    /// Optional TTL override (`1h`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<&'static str>,
+}
+
+impl From<ClaudePromptCache> for CacheControlPayload {
+    fn from(cache: ClaudePromptCache) -> Self {
+        let ttl = match cache.ttl {
+            ClaudePromptCacheTtl::FiveMinutes => None,
+            ClaudePromptCacheTtl::OneHour => Some(ClaudePromptCacheTtl::OneHour.as_str()),
+        };
+        Self {
+            kind: "ephemeral",
+            ttl,
+        }
+    }
+}
+
+/// Tool choice payload for Claude Messages API.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoicePayload {
+    /// Let Claude decide when to call a tool.
+    Auto,
+    /// Require Claude to call at least one tool.
+    Any,
+    /// Restrict tool calling to a single tool by name.
+    Tool {
+        /// Name of the tool Claude is allowed to call.
+        name: String,
+    },
+}
+
 /// Snapshot of parameters for request building.
 #[derive(Clone, Default)]
 #[allow(dead_code)]
@@ -139,6 +188,10 @@ pub struct ParameterSnapshot {
     pub stop_sequences: Option<Vec<String>>,
     /// Whether to include reasoning/thinking.
     pub include_reasoning: bool,
+    /// Tool choice policy.
+    pub tool_choice: ToolChoice,
+    /// Claude-specific cache controls.
+    pub cache: Option<ClaudePromptCache>,
 }
 
 impl From<&Parameters> for ParameterSnapshot {
@@ -150,6 +203,8 @@ impl From<&Parameters> for ParameterSnapshot {
             max_tokens: params.max_tokens,
             stop_sequences: params.stop.clone(),
             include_reasoning: params.include_reasoning,
+            tool_choice: params.tool_choice.clone(),
+            cache: params.cache.claude,
         }
     }
 }
@@ -168,7 +223,11 @@ pub fn to_claude_messages(messages: &[Message]) -> (Option<String>, Vec<MessageP
                 system_parts.push(message.content());
             }
             Role::User | Role::Tool => {
-                let content = build_user_content(message);
+                let content = if matches!(message.role(), Role::Tool) {
+                    build_tool_result_content(message)
+                } else {
+                    build_user_content(message)
+                };
                 claude_messages.push(MessagePayload {
                     role: "user",
                     content,
@@ -177,7 +236,7 @@ pub fn to_claude_messages(messages: &[Message]) -> (Option<String>, Vec<MessageP
             Role::Assistant => {
                 claude_messages.push(MessagePayload {
                     role: "assistant",
-                    content: ContentPayload::Text(flatten_content(message)),
+                    content: build_assistant_content(message),
                 });
             }
         }
@@ -224,6 +283,40 @@ fn build_user_content(message: &Message) -> ContentPayload {
     }
 
     ContentPayload::Blocks(blocks)
+}
+
+fn build_assistant_content(message: &Message) -> ContentPayload {
+    let tool_calls = message.tool_calls();
+    if tool_calls.is_empty() {
+        return ContentPayload::Text(flatten_content(message));
+    }
+
+    let mut blocks = Vec::new();
+    let text = flatten_content(message);
+    if !text.is_empty() {
+        blocks.push(ContentBlock::Text { text });
+    }
+
+    for call in tool_calls {
+        blocks.push(ContentBlock::ToolUse {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            input: call.arguments.clone(),
+        });
+    }
+
+    ContentPayload::Blocks(blocks)
+}
+
+fn build_tool_result_content(message: &Message) -> ContentPayload {
+    let tool_use_id = message.tool_call_id().unwrap_or_else(|| {
+        panic!("Tool message missing tool_call_id required by Claude tool_result payload")
+    });
+    let content = flatten_content(message);
+    ContentPayload::Blocks(vec![ContentBlock::ToolResult {
+        tool_use_id: tool_use_id.to_string(),
+        content,
+    }])
 }
 
 /// Parse a URL string into an image source.
@@ -334,4 +427,129 @@ pub fn convert_tools(definitions: &[ToolDefinition]) -> Vec<ToolPayload> {
             input_schema: tool.arguments_openai_schema(),
         })
         .collect()
+}
+
+pub fn filter_tool_definitions(
+    definitions: Vec<ToolDefinition>,
+    choice: &ToolChoice,
+) -> Vec<ToolDefinition> {
+    match choice {
+        ToolChoice::None => Vec::new(),
+        ToolChoice::Exact(name) => definitions
+            .into_iter()
+            .filter(|tool| tool.name() == name)
+            .collect(),
+        ToolChoice::Auto | ToolChoice::Required => definitions,
+    }
+}
+
+pub fn tool_choice_payload(choice: &ToolChoice, has_tools: bool) -> Option<ToolChoicePayload> {
+    if !has_tools {
+        return None;
+    }
+    match choice {
+        ToolChoice::None => None,
+        ToolChoice::Auto => Some(ToolChoicePayload::Auto),
+        ToolChoice::Required => Some(ToolChoicePayload::Any),
+        ToolChoice::Exact(name) => Some(ToolChoicePayload::Tool { name: name.clone() }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aither_core::llm::{
+        ToolCall,
+        model::{ClaudePromptCache, ClaudePromptCacheTtl, Parameters, ToolChoice},
+    };
+
+    #[test]
+    fn assistant_tool_calls_are_encoded_as_tool_use_blocks() {
+        let messages = vec![Message::assistant_with_tool_calls(
+            "Working on it",
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "lookup".to_string(),
+                arguments: serde_json::json!({"q":"rust"}),
+            }],
+        )];
+        let (_, encoded) = to_claude_messages(&messages);
+        assert_eq!(encoded.len(), 1);
+        assert_eq!(encoded[0].role, "assistant");
+        match &encoded[0].content {
+            ContentPayload::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(matches!(blocks[0], ContentBlock::Text { .. }));
+                assert!(matches!(blocks[1], ContentBlock::ToolUse { .. }));
+            }
+            other => panic!("expected assistant blocks payload, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_message_is_encoded_as_tool_result_block() {
+        let messages = vec![Message::tool("call_9", "{\"ok\":true}")];
+        let (_, encoded) = to_claude_messages(&messages);
+        assert_eq!(encoded.len(), 1);
+        assert_eq!(encoded[0].role, "user");
+        match &encoded[0].content {
+            ContentPayload::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                match &blocks[0] {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                    } => {
+                        assert_eq!(tool_use_id, "call_9");
+                        assert_eq!(content, "{\"ok\":true}");
+                    }
+                    other => panic!("expected tool_result block, got: {other:?}"),
+                }
+            }
+            other => panic!("expected user blocks payload, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_tool_choice_maps_to_any() {
+        let payload = tool_choice_payload(&ToolChoice::Required, true)
+            .expect("required should create payload");
+        let json = serde_json::to_value(payload).expect("serialize tool choice");
+        assert_eq!(json["type"], "any");
+    }
+
+    #[test]
+    fn exact_tool_choice_maps_to_named_tool() {
+        let payload = tool_choice_payload(&ToolChoice::Exact("search".to_string()), true)
+            .expect("exact should create payload");
+        let json = serde_json::to_value(payload).expect("serialize tool choice");
+        assert_eq!(json["type"], "tool");
+        assert_eq!(json["name"], "search");
+    }
+
+    #[test]
+    fn parameter_snapshot_preserves_claude_cache_setting() {
+        let params = Parameters::default()
+            .claude_prompt_cache(ClaudePromptCache::new(ClaudePromptCacheTtl::OneHour));
+        let snapshot = ParameterSnapshot::from(&params);
+        assert_eq!(
+            snapshot.cache,
+            Some(ClaudePromptCache::new(ClaudePromptCacheTtl::OneHour))
+        );
+    }
+
+    #[test]
+    fn cache_control_payload_serializes_expected_shape() {
+        let one_hour =
+            CacheControlPayload::from(ClaudePromptCache::new(ClaudePromptCacheTtl::OneHour));
+        let one_hour_json = serde_json::to_value(one_hour).expect("serialize one hour payload");
+        assert_eq!(one_hour_json["type"], "ephemeral");
+        assert_eq!(one_hour_json["ttl"], "1h");
+
+        let short =
+            CacheControlPayload::from(ClaudePromptCache::new(ClaudePromptCacheTtl::FiveMinutes));
+        let short_json = serde_json::to_value(short).expect("serialize five minute payload");
+        assert_eq!(short_json["type"], "ephemeral");
+        assert!(short_json.get("ttl").is_none());
+    }
 }

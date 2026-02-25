@@ -13,7 +13,7 @@ categories = ["api-bindings"]
 
 [dependencies]
 aither-core.workspace = true
-async-stream = "0.3"
+async-channel = "2"
 futures-core = { version = "0.3", default-features = false }
 futures-lite = "2.6"
 encoding_rs = "0.8"

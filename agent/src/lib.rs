@@ -80,7 +80,7 @@ pub use compression::{
 pub use config::{
     AgentConfig, AgentKind, ContextAssemblerConfig, ContextBlock, ContextBlockPriority,
 };
-pub use context::{ConversationMemory, MemoryCheckpoint};
+pub use context::{Context, ContextCheckpoint, ConversationMemory, MemoryCheckpoint};
 pub use error::AgentError;
 pub use event::AgentEvent;
 pub use hook::{

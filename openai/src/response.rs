@@ -118,6 +118,34 @@ pub struct ResponsesStreamResponse {
     pub id: Option<String>,
     #[serde(default)]
     pub output: Vec<ResponsesOutputItem>,
+    #[serde(default)]
+    pub usage: Option<ResponsesUsage>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ResponsesUsage {
+    #[serde(default)]
+    pub input_tokens: Option<u32>,
+    #[serde(default)]
+    pub output_tokens: Option<u32>,
+    #[serde(default)]
+    pub total_tokens: Option<u32>,
+    #[serde(default)]
+    pub input_token_details: Option<ResponsesInputTokenDetails>,
+    #[serde(default)]
+    pub output_token_details: Option<ResponsesOutputTokenDetails>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ResponsesInputTokenDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ResponsesOutputTokenDetails {
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
 }
 
 /// Output item in streaming response
@@ -192,7 +220,35 @@ pub struct ResponsesError {
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionChunk {
+    #[serde(default)]
+    pub usage: Option<ChatCompletionUsage>,
     pub choices: Vec<ChunkChoice>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ChatCompletionUsage {
+    #[serde(default)]
+    pub prompt_tokens: Option<u32>,
+    #[serde(default)]
+    pub completion_tokens: Option<u32>,
+    #[serde(default)]
+    pub total_tokens: Option<u32>,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<ChatPromptTokensDetails>,
+    #[serde(default)]
+    pub completion_tokens_details: Option<ChatCompletionTokensDetails>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ChatPromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ChatCompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

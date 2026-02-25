@@ -7,8 +7,10 @@ use crate::{
 use aither_core::{
     LanguageModel,
     llm::{
-        Event, LLMRequest, Message, Role, ToolCall,
-        model::{Ability, Parameters, Profile as ModelProfile, ToolChoice},
+        Event, LLMRequest, Message, Role, ToolCall, Usage,
+        model::{
+            Ability, OpenAIPromptCacheRetention, Parameters, Profile as ModelProfile, ToolChoice,
+        },
         tool::ToolDefinition,
     },
 };
@@ -78,6 +80,13 @@ impl LanguageModel for Copilot {
         let tool_defs = filter_tool_definitions(tool_defs, &parameters.tool_choice);
 
         async_stream::stream! {
+            if parameters.cache.claude.is_some() || parameters.cache.gemini.is_some() {
+                yield Err(CopilotError::Api(
+                    "Copilot provider only accepts cache.openai settings".to_string(),
+                ));
+                return;
+            }
+
             let payload_messages = to_chat_messages(&messages);
             let openai_tools = if tool_defs.is_empty() {
                 None
@@ -100,11 +109,13 @@ impl LanguageModel for Copilot {
             let context_length = aither_models::lookup(&cfg.model)
                 .map(|info| info.context_window)
                 .unwrap_or_else(|| {
+                    const DEFAULT_CONTEXT_LENGTH: u32 = 8192;
                     tracing::warn!(
-                        "Model '{}' not found in database, using default 128k",
-                        cfg.model
+                        model = %cfg.model,
+                        fallback_context_length = DEFAULT_CONTEXT_LENGTH,
+                        "Copilot model missing context metadata in aither-models, using fallback",
                     );
-                    128_000
+                    DEFAULT_CONTEXT_LENGTH
                 });
 
             ModelProfile::new(
@@ -211,6 +222,8 @@ struct ChatCompletionRequest {
     messages: Vec<ChatMessagePayload>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
@@ -220,6 +233,15 @@ struct ChatCompletionRequest {
     tools: Option<Vec<ToolPayload>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoicePayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_retention: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -298,7 +320,35 @@ struct ToolChoiceFunction {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChunk {
+    #[serde(default)]
+    usage: Option<ChatCompletionUsage>,
     choices: Vec<ChunkChoice>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct ChatCompletionUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokenDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokenDetails>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct PromptTokenDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct CompletionTokenDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -477,6 +527,15 @@ fn filter_tool_definitions(defs: Vec<ToolDefinition>, choice: &ToolChoice) -> Ve
     }
 }
 
+fn prompt_cache_retention(params: &Parameters) -> Option<&'static str> {
+    params
+        .cache
+        .openai
+        .as_ref()
+        .and_then(|cache| cache.retention)
+        .map(OpenAIPromptCacheRetention::as_str)
+}
+
 // === Streaming ===
 
 const SSE_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(90);
@@ -565,11 +624,20 @@ fn chat_completions_stream_inner(
             model: cfg.model.clone(),
             messages: payload_messages,
             stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
             temperature: params.temperature,
             top_p: params.top_p,
             max_tokens: params.max_tokens,
             tools,
             tool_choice: tool_choice(&params, has_tools),
+            prompt_cache_key: params
+                .cache
+                .openai
+                .as_ref()
+                .and_then(|cache| cache.key.clone()),
+            prompt_cache_retention: prompt_cache_retention(&params),
         };
 
         tracing::debug!(
@@ -615,6 +683,7 @@ fn chat_completions_stream_inner(
 
         // Accumulate tool calls by index
         let mut tool_calls: HashMap<usize, ToolCallAccumulator> = HashMap::new();
+        let mut usage: Option<Usage> = None;
 
         let sse_stream = sse_stream;
         futures_lite::pin!(sse_stream);
@@ -682,6 +751,11 @@ fn chat_completions_stream_inner(
 
                             match serde_json::from_str::<ChatCompletionChunk>(data) {
                                 Ok(chunk) => {
+                                    if let Some(chunk_usage) = &chunk.usage {
+                                        usage = Some(usage_from_chat_completion(chunk_usage));
+                                        saw_payload = true;
+                                        last_progress = Instant::now();
+                                    }
                                     if !chunk.choices.is_empty()
                                         && chunk
                                             .choices
@@ -769,6 +843,9 @@ fn chat_completions_stream_inner(
                 yield Ok(Event::ToolCall(ToolCall { id, name, arguments }));
             }
         }
+        if let Some(final_usage) = usage {
+            yield Ok(Event::Usage(final_usage));
+        }
     }
 }
 
@@ -777,4 +854,23 @@ struct ToolCallAccumulator {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+}
+
+fn usage_from_chat_completion(raw: &ChatCompletionUsage) -> Usage {
+    Usage {
+        prompt_tokens: raw.prompt_tokens,
+        completion_tokens: raw.completion_tokens,
+        total_tokens: raw.total_tokens,
+        reasoning_tokens: raw
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens),
+        cache_read_tokens: raw
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens),
+        cache_write_tokens: None,
+        cost_usd: None,
+        stop_reason: None,
+    }
 }

@@ -16,8 +16,8 @@ use futures_lite::StreamExt;
 
 use crate::{
     compression::{ContextStrategy, estimate_context_usage},
-    config::{AgentConfig, AgentKind, ContextBlock},
-    context::ConversationMemory,
+    config::{AgentConfig, AgentKind},
+    context::Context,
     error::AgentError,
     event::AgentEvent,
     hook::{
@@ -30,7 +30,7 @@ use crate::{
     working_docs,
 };
 
-use aither_sandbox::{BackgroundTaskReceiver, OutputStore};
+use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, OutputStore};
 use std::sync::Arc;
 
 /// Result of a compaction operation.
@@ -127,8 +127,8 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Agent configuration.
     pub(crate) config: AgentConfig,
 
-    /// Conversation memory.
-    pub(crate) memory: ConversationMemory,
+    /// Unified context manager.
+    pub(crate) context: Context,
 
     /// Cached model profile (for the selected tier).
     pub(crate) profile: Option<ModelProfile>,
@@ -147,6 +147,8 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
 
     /// Receiver for completed background bash tasks.
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
+    /// Registry for running background bash tasks.
+    pub(crate) job_registry: Option<JobRegistry>,
 
     /// Optional readable transcript for long-context recovery.
     pub(crate) transcript: Option<Transcript>,
@@ -177,13 +179,14 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             tools: AgentTools::new(),
             hooks: (),
             config,
-            memory: ConversationMemory::default(),
+            context: Context::default(),
             profile: None,
             fast_profile: None,
             initialized: false,
             todo_list: None,
             output_store: None,
             background_receiver: None,
+            job_registry: None,
             transcript: None,
             sandbox_dir: None,
         }
@@ -274,7 +277,7 @@ where
 
             // Add user message with attachments
             let user_msg = Message::user(&prompt).with_attachments(attachments);
-            self.memory.push(user_msg);
+            self.context.push(user_msg);
             if let Some(transcript) = &self.transcript {
                 transcript.write_user_message(&prompt).await;
             }
@@ -432,7 +435,7 @@ where
                 // If no tool calls, we're done unless working-doc supervision requires continuation.
                 if tool_calls.is_empty() {
                     if !response_text.is_empty() {
-                        self.memory.push(Message::assistant(&response_text));
+                        self.context.push(Message::assistant(&response_text));
                         if let Some(transcript) = &self.transcript {
                             transcript.write_assistant_text(&response_text).await;
                         }
@@ -444,7 +447,7 @@ where
                 }
 
                 // Store assistant response with tool calls in memory
-                self.memory.push(Message::assistant_with_tool_calls(
+                self.context.push(Message::assistant_with_tool_calls(
                     &response_text,
                     tool_calls.clone(),
                 ));
@@ -477,7 +480,7 @@ where
                 let hooks = &self.hooks;
                 let tool_futures = tool_calls.iter().map(|call| {
                     let args_json = call.arguments.to_string();
-                    let message_count = self.memory.len();
+                    let message_count = self.context.len_recent();
 
                     async move {
                         let tool_ctx = ToolUseContext {
@@ -549,6 +552,7 @@ where
                 let mut has_tool_error = false;
                 for result in results {
                     let (call_id, call_name, tool_result) = result?;
+                    let is_bash_call = call_name == "bash";
 
                     if let Some(transcript) = &self.transcript {
                         transcript.write_tool_result(&call_name, &tool_result).await;
@@ -557,7 +561,7 @@ where
                     // Yield tool call end event
                     yield AgentEvent::ToolCallEnd {
                         id: call_id.clone(),
-                        name: call_name,
+                        name: call_name.clone(),
                         result: tool_result.clone(),
                     };
 
@@ -567,31 +571,26 @@ where
                     };
 
                     if tool_result.is_err()
-                        || content.contains("unknown shell_id")
-                        || content.contains("shell_id is required")
+                        || content.contains("ssh_server_id is required")
+                        || content.contains("unknown ssh_server_id")
                         || content.contains("not found")
                         || content.contains("Invalid arguments")
                     {
                         has_tool_error = true;
                     }
                     let processed_content = self.process_reload_marker(content);
-                    self.memory.push(Message::tool(&call_id, processed_content));
+                    self.context.push(Message::tool(&call_id, processed_content));
+                    if is_bash_call
+                        && tool_result.is_ok()
+                        && let Some(reminder) = self.format_background_started_reminder(content)
+                    {
+                        self.context.push(Message::system(reminder));
+                    }
                 }
 
                 // If there was a tool error, inject a reminder
                 if has_tool_error {
-                    let reminder = concat!(
-                        "<system-reminder>\n",
-                        "IMPORTANT: You can ONLY act through tool calls: `open_shell`, `bash`, `close_shell`.\n",
-                        "All commands (websearch, webfetch, ask_user, todo, task, etc.) are CLI commands that MUST be executed via `bash` tool calls.\n",
-                        "You cannot execute commands by writing them in text -- always use tool calls.\n\n",
-                        "Correct usage:\n",
-                        "- open_shell first, then call bash with shell_id + timeout + script\n",
-                        "- Example: bash with script `websearch \"query\"` or `ask_user \"question\" --options A --options B`\n",
-                        "- IPC commands (websearch, webfetch, ask_user) work in sandboxed mode and only on local shells.\n",
-                        "</system-reminder>"
-                    );
-                    self.memory.push(Message::system(reminder));
+                    self.context.push(Message::system(include_str!("prompts/tool_error_reminder.txt")));
                 }
 
                 // If todo tool was called, inject updated todo list
@@ -615,10 +614,10 @@ where
 
                     if let Some(completed) = newly_completed.first() {
                         if let Some(reminder) = self.format_next_task_reminder(&completed.content) {
-                            self.memory.push(Message::system(&reminder));
+                            self.context.push(Message::system(&reminder));
                         }
                     } else if let Some(reminder) = self.format_todo_reminder() {
-                        self.memory.push(Message::system(&reminder));
+                        self.context.push(Message::system(&reminder));
                     }
                 }
 
@@ -628,7 +627,7 @@ where
                     for task in completed_tasks {
                         tracing::info!(task_id = %task.task_id, "background task completed");
                         let result_msg = self.format_background_task_result(&task);
-                        self.memory.push(Message::system(&result_msg));
+                        self.context.push(Message::system(&result_msg));
                     }
                 }
             };
@@ -640,7 +639,7 @@ where
                 for task in completed_tasks {
                     tracing::info!(task_id = %task.task_id, "background task completed (final check)");
                     let result_msg = self.format_background_task_result(&task);
-                    self.memory.push(Message::system(&result_msg));
+                    self.context.push(Message::system(&result_msg));
                 }
 
                 const MAX_WAIT: Duration = Duration::from_secs(300);
@@ -651,7 +650,7 @@ where
                     if let Some(task) = receiver.recv_timeout(POLL_INTERVAL).await {
                         tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
                         let result_msg = self.format_background_task_result(&task);
-                        self.memory.push(Message::system(&result_msg));
+                        self.context.push(Message::system(&result_msg));
                         had_completed = true;
                     } else {
                         let has_running = self
@@ -701,20 +700,27 @@ where
         self.tools.register(tool);
     }
 
-    /// Registers a tool (alias for `register_tool`).
+    /// Returns a reference to the unified context manager.
+    #[must_use]
+    pub fn context(&self) -> &Context {
+        &self.context
+    }
+
+    /// Returns a mutable reference to the unified context manager.
+    ///
+    /// Use this to insert/update system blocks, push messages, etc.
+    pub fn context_mut(&mut self) -> &mut Context {
+        &mut self.context
+    }
+
     /// Adds a message to the conversation history.
     pub fn push_message(&mut self, message: Message) {
-        self.memory.push(message);
+        self.context.push(message);
     }
 
     /// Clears the conversation history.
     pub fn clear_history(&mut self) {
-        self.memory.clear();
-    }
-
-    /// Force-closes active shell sessions and their running jobs.
-    pub async fn close_shell_sessions(&self) {
-        self.tools.close_shell_sessions().await;
+        self.context.clear_conversation();
     }
 
     /// Compacts the conversation by generating a structured handoff and starting fresh.
@@ -728,7 +734,7 @@ where
     ) -> Result<Option<CompactResult>, AgentError> {
         self.ensure_initialized().await;
 
-        let messages = self.memory.all();
+        let messages = self.context.conversation_messages();
         if messages.is_empty() {
             return Ok(None);
         }
@@ -740,9 +746,11 @@ where
             transcript.write_compact_marker().await;
         }
 
-        self.memory.clear();
-        self.memory.push_summary(Message::system(summary.clone()));
-        self.memory.push(Message::system(
+        self.context.clear_conversation();
+        // Push the handoff summary as a system message in the conversation.
+        // This preserves it as part of the conversation flow.
+        self.context.push(Message::system(&summary));
+        self.context.push(Message::system(
             "Session continues from compacted context. Continue without asking the user to repeat details. Recover missing details from files, TODO.md/PLAN.md, or transcript when needed.",
         ));
 
@@ -771,7 +779,7 @@ where
             .replace("{focus_instruction}", &focus_instruction)
             .replace("{transcript_path}", &transcript_path);
 
-        let mut messages = self.memory.all();
+        let mut messages = self.context.conversation_messages();
         messages.push(Message::user(handoff_prompt));
 
         let mut chunks = Vec::new();
@@ -840,7 +848,7 @@ where
             return false;
         }
 
-        self.memory.push(Message::system(
+        self.context.push(Message::system(
             "<system-reminder>TODO.md or PLAN.md still has unchecked items. Continue working through the checklist. If user input is required, call ask_user and then proceed.</system-reminder>",
         ));
         true
@@ -849,7 +857,7 @@ where
     /// Returns the current conversation history.
     #[must_use]
     pub fn history(&self) -> Vec<Message> {
-        self.memory.all()
+        self.context.conversation_messages()
     }
 
     /// Returns the model profile if available.
@@ -858,7 +866,7 @@ where
         self.profile.as_ref()
     }
 
-    /// Ensures the agent is initialized (profiles fetched, etc.).
+    /// Ensures the agent is initialized (profiles fetched, static blocks set up).
     async fn ensure_initialized(&mut self) {
         if self.initialized {
             return;
@@ -875,42 +883,131 @@ where
         // We always need this because compression uses the fast model
         self.fast_profile = Some(self.fast.profile().await);
 
+        // Populate static system blocks in Context from AgentConfig.
+        // These form the stable, cacheable prefix.
+        self.populate_system_blocks();
+
         self.initialized = true;
     }
 
-    /// Builds the message list for an LLM request (structured system context + todo context + memory).
-    async fn build_request_messages(&self) -> Vec<Message> {
-        let mut messages = Vec::new();
-        let usage = self.estimate_current_usage();
-
-        if let Some(system_ctx) = self.render_structured_system_context(usage) {
-            messages.push(Message::system(system_ctx));
+    /// Populates the Context's system blocks from AgentConfig.
+    ///
+    /// Called once during initialization. These blocks form the stable
+    /// cacheable prefix of the system message.
+    fn populate_system_blocks(&mut self) {
+        if let Some(ref system_prompt) = self.config.system_prompt {
+            self.context
+                .insert_system_named("base_system", system_prompt);
         }
 
+        if let Some(ref persona_prompt) = self.config.persona_prompt {
+            self.context.insert_system_named("persona", persona_prompt);
+        }
+
+        if self.config.agent_kind == AgentKind::Coding {
+            self.context.insert_system_named(
+                "workspace_facts",
+                "When discovering workspace guidance, load AGENT.md first. If AGENT.md is missing, load CLAUDE.md. Treat these files as repository policy for coding tasks; this behavior is not required for chatbot-style sessions.",
+            );
+        }
+
+        self.context.insert_system_named(
+            "knowledge_and_time",
+            include_str!("prompts/knowledge_and_time.txt"),
+        );
+
+        self.context
+            .insert_system_named("permissions", include_str!("prompts/permissions.txt"));
+
+        if let Some(ref path) = self.config.transcript_path {
+            self.context.insert_system_named(
+                "transcript_memory",
+                format!(
+                    "Compressed memory may only keep a summary, but the full transcript remains available at {path}. If details are missing, recover them by searching/reading transcript content before making irreversible changes."
+                ),
+            );
+        }
+
+        let tool_hints = self.format_tool_hints_block();
+        if !tool_hints.is_empty() {
+            self.context.insert_system_named("tool_hints", &tool_hints);
+        }
+
+        // Insert application-provided context blocks (sorted by priority).
+        let mut blocks = self.config.context_blocks.clone();
+        blocks.sort_by_key(|b| b.priority.rank());
+        for block in blocks {
+            self.context.insert_system_named(&block.tag, &block.content);
+        }
+    }
+
+    /// Builds the message list for an LLM request.
+    ///
+    /// Uses `context.build_messages()` for the stable system prefix + conversation,
+    /// then prepends per-turn ephemeral context (todo, working docs, background
+    /// jobs, context usage) as system messages inserted before conversation messages.
+    async fn build_request_messages(&self) -> Vec<Message> {
+        // Collect per-turn ephemeral messages that should appear between
+        // the system prefix and the conversation.
+        let mut ephemeral = Vec::new();
+
         if let Some(todo_ctx) = self.format_todo_context() {
-            messages.push(Message::system(todo_ctx));
+            ephemeral.push(Message::system(todo_ctx));
         }
 
         if let Some(sandbox_dir) = self.sandbox_dir.as_deref() {
             let docs = working_docs::read_snapshot(sandbox_dir).await;
             if let Some(plan_md) = docs.plan_md {
-                messages.push(Message::system(render_plan_context(&plan_md)));
+                ephemeral.push(Message::system(render_plan_context(&plan_md)));
             }
             if let Some(todo_md) = docs.todo_md {
-                messages.push(Message::system(render_working_todo_context(&todo_md)));
+                ephemeral.push(Message::system(render_working_todo_context(&todo_md)));
             }
         }
 
-        if let Some(handoff_ctx) = self.format_handoff_context(usage) {
-            messages.push(Message::system(handoff_ctx));
+        if let Some(job_registry) = &self.job_registry {
+            let running = job_registry.format_running_jobs().await;
+            if !running.is_empty() {
+                ephemeral.push(Message::system(format!(
+                    "<system-reminder>\nRunning background terminals:\n{running}Read redirected output files via bash (head/tail/grep/cat). Use input_terminal for stdin and kill_terminal to stop when needed.\n</system-reminder>"
+                )));
+            }
         }
 
-        messages.extend(self.memory.all());
+        // Context usage estimation uses conversation messages
+        let conversation = self.context.conversation_messages();
+        let usage = self.estimate_usage_for_messages(&conversation);
+
+        if let Some(handoff_ctx) = self.format_handoff_context(usage) {
+            ephemeral.push(Message::system(handoff_ctx));
+        }
+
+        // Build: system_blocks prefix + ephemeral + conversation
+        let mut messages = Vec::new();
+
+        // System blocks → one system message (cacheable prefix)
+        if self.context.system_block_count() > 0 {
+            let system_xml: String = self
+                .context
+                .system_blocks()
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            messages.push(Message::system(system_xml));
+        }
+
+        // Ephemeral per-turn context (todo, docs, jobs, handoff warning)
+        messages.extend(ephemeral);
+
+        // Conversation messages (includes reminders, handoff, user/assistant/tool)
+        messages.extend(conversation);
+
         messages
     }
 
     /// Estimates current context usage using the active and fast model windows.
-    fn estimate_current_usage(&self) -> f32 {
+    fn estimate_usage_for_messages(&self, messages: &[Message]) -> f32 {
         let tier_context = self
             .profile
             .as_ref()
@@ -922,90 +1019,26 @@ where
             .map_or(100_000, |p| p.context_length as usize);
 
         let context_length = tier_context.min(fast_context);
-        estimate_context_usage(&self.memory.all(), context_length)
+        estimate_context_usage(messages, context_length)
     }
 
-    /// Renders structured XML system context with optional persona and custom blocks.
-    fn render_structured_system_context(&self, usage: f32) -> Option<String> {
-        if self.config.system_prompt.is_none()
-            && self.config.persona_prompt.is_none()
-            && self.config.context_blocks.is_empty()
-            && self.config.agent_kind != AgentKind::Coding
-            && self.config.transcript_path.is_none()
-        {
-            return None;
-        }
-
-        let mut blocks: Vec<ContextBlock> = Vec::new();
-
-        if let Some(system_prompt) = &self.config.system_prompt {
-            blocks.push(ContextBlock::new("base_system", system_prompt));
-        }
-
-        if let Some(persona_prompt) = &self.config.persona_prompt {
-            blocks.push(ContextBlock::new("persona", persona_prompt));
-        }
-
-        if self.config.agent_kind == AgentKind::Coding {
-            blocks.push(ContextBlock::new(
-                "workspace_facts",
-                "When discovering workspace guidance, load AGENT.md first. If AGENT.md is missing, load CLAUDE.md. Treat these files as repository policy for coding tasks; this behavior is not required for chatbot-style sessions.",
-            ));
-        }
-
-        blocks.push(ContextBlock::new(
-            "knowledge_and_time",
-            concat!(
-                "Your knowledge has a training cutoff -- it is frozen and does not update. ",
-                "Never answer time-sensitive questions from memory alone. ",
-                "Anything that could have changed since your training cutoff (current events, ",
-                "recent releases, stock prices, sports results, whether someone is alive) requires verification. ",
-                "Use `date` to get the current time, then `websearch` to look it up. ",
-                "If the user makes a time-of-day reference, either run `date` to confirm or respond without assuming the time. ",
-                "When in doubt about whether something is time-sensitive, err on the side of checking."
-            ),
-        ));
-
-        blocks.push(ContextBlock::new(
-            "permissions",
-            concat!(
-                "You have read access to the entire filesystem by default. ",
-                "Write access is restricted to your sandbox directory and directories the user has explicitly approved. ",
-                "When you need to modify files outside your sandbox, check if the directory is already approved. ",
-                "If not, use `request_workspace` to ask for permission -- request the project root, not individual subdirectories. ",
-                "Explain what changes you plan to make and wait for approval before proceeding."
-            ),
-        ));
-
-        if let Some(path) = &self.config.transcript_path {
-            blocks.push(ContextBlock::new(
-                "transcript_memory",
-                format!(
-                    "Compressed memory may only keep a summary, but the full transcript remains available at {path}. If details are missing, recover them by searching/reading transcript content before making irreversible changes."
-                ),
-            ));
-        }
-
-        let tool_hints = self.format_tool_hints_block();
-        if !tool_hints.is_empty() {
-            blocks.push(ContextBlock::new("tool_hints", tool_hints));
-        }
-
-        blocks.extend(self.config.context_blocks.clone());
-        blocks.sort_by_key(|b| b.priority.rank());
-
-        let mut out = String::from("<context>\n");
-        out.push_str(&format!(
-            "<context_window usage=\"{usage:.3}\" handoff_threshold=\"{:.3}\" />\n",
-            self.config.context_assembler.handoff_threshold
-        ));
-
-        for block in blocks {
-            out.push_str(&render_xml_block(&block));
-        }
-
-        out.push_str("</context>");
-        Some(out)
+    /// Returns the exact request message sequence that would be sent for the next turn.
+    ///
+    /// This is intended for observability/debug UIs and does not mutate agent memory.
+    /// Temporarily adds the prompt to a forked context, builds the messages, then discards.
+    pub async fn preview_request_messages(
+        &mut self,
+        prompt: &str,
+        attachments: impl IntoIterator<Item = url::Url>,
+    ) -> Vec<Message> {
+        self.ensure_initialized().await;
+        // Fork context, add the user message, build messages
+        let checkpoint = self.context.checkpoint();
+        self.context
+            .push(Message::user(prompt).with_attachments(attachments));
+        let messages = self.build_request_messages().await;
+        self.context.restore(checkpoint);
+        messages
     }
 
     /// Injects a handoff instruction when context usage approaches the threshold.
@@ -1148,7 +1181,7 @@ where
 
             if tool_calls.is_empty() {
                 if !response_text.is_empty() {
-                    self.memory.push(Message::assistant(&response_text));
+                    self.context.push(Message::assistant(&response_text));
                 }
                 events.push(Ok(AgentEvent::Complete {
                     final_text: response_text,
@@ -1157,7 +1190,7 @@ where
                 return events;
             }
 
-            self.memory.push(Message::assistant_with_tool_calls(
+            self.context.push(Message::assistant_with_tool_calls(
                 &response_text,
                 tool_calls.clone(),
             ));
@@ -1180,6 +1213,7 @@ where
                 futures::future::join_all(tool_futures).await;
 
             for (call_id, call_name, tool_result) in results {
+                let is_bash_call = call_name == "bash";
                 events.push(Ok(AgentEvent::ToolCallEnd {
                     id: call_id.clone(),
                     name: call_name,
@@ -1190,14 +1224,21 @@ where
                     Err(error) => error,
                 };
                 let processed_content = self.process_reload_marker(content);
-                self.memory.push(Message::tool(&call_id, processed_content));
+                self.context
+                    .push(Message::tool(&call_id, processed_content));
+                if is_bash_call
+                    && tool_result.is_ok()
+                    && let Some(reminder) = self.format_background_started_reminder(content)
+                {
+                    self.context.push(Message::system(reminder));
+                }
             }
 
             if let Some(ref receiver) = self.background_receiver {
                 let completed_tasks = receiver.take_completed();
                 for task in completed_tasks {
                     let result_msg = self.format_background_task_result(&task);
-                    self.memory.push(Message::system(&result_msg));
+                    self.context.push(Message::system(&result_msg));
                 }
             }
         }
@@ -1233,7 +1274,7 @@ where
             .map_or(100_000, |p| p.context_length as usize);
 
         let context_length = tier_context.min(fast_context);
-        let usage = estimate_context_usage(&self.memory.all(), context_length);
+        let usage = estimate_context_usage(&self.context.conversation_messages(), context_length);
 
         match &self.config.context {
             ContextStrategy::Unlimited => Ok(()),
@@ -1241,7 +1282,7 @@ where
                 // Use effective_trigger which reserves context for compaction process.
                 if usage >= config.effective_trigger() {
                     let preserve_recent = config.preserve_recent;
-                    if self.memory.len() > preserve_recent {
+                    if self.context.len_recent() > preserve_recent {
                         let _ = self.compact(None).await?;
                     }
                 }
@@ -1283,6 +1324,39 @@ where
         let items_json = format_todo_items_json(&items);
         Some(format!(
             "<system-reminder>\nCurrent todo list (do not mention this explicitly to the user):\n\n{items_json}\n</system-reminder>"
+        ))
+    }
+
+    /// Formats a reminder when `bash` has been auto-promoted to background.
+    fn format_background_started_reminder(&self, tool_content: &str) -> Option<String> {
+        let payload: serde_json::Value = serde_json::from_str(tool_content).ok()?;
+        let status = payload.get("status")?.as_str()?;
+        if status != "running" {
+            return None;
+        }
+
+        let task_id = payload.get("task_id")?.as_str()?.trim();
+        if task_id.is_empty() {
+            return None;
+        }
+
+        let output_preview = payload
+            .get("stdout")
+            .and_then(|stdout| stdout.get("content"))
+            .and_then(|content| content.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("(no output yet)");
+
+        let output_file = payload
+            .get("stdout")
+            .and_then(|stdout| stdout.get("url"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(missing output file)");
+
+        Some(format!(
+            "<system-reminder>\nA bash command is running in background (task_id={task_id}).\nCurrent output snapshot (first max_lines):\n{output_preview}\nFull redirected output file: {output_file}\nRead the file via bash when needed. If the command waits for stdin, use input_terminal. Use kill_terminal to stop it.\n</system-reminder>"
         ))
     }
 
@@ -1358,11 +1432,11 @@ fn format_todo_items_json(items: &[TodoItem]) -> String {
 }
 
 fn render_plan_context(content: &str) -> String {
-    format!("<plan>\n{}</plan>", escape_xml_text(content))
+    format!("<plan>\n{content}</plan>")
 }
 
 fn render_working_todo_context(content: &str) -> String {
-    format!("<todo>\n{}</todo>", escape_xml_text(content))
+    format!("<todo>\n{content}</todo>")
 }
 
 fn first_paragraph(text: &str) -> String {
@@ -1386,22 +1460,4 @@ fn truncate_script(script: &str, max_chars: usize) -> &str {
         Some((byte_idx, _)) => &script[..byte_idx],
         None => script, // String is shorter than max_chars
     }
-}
-
-fn render_xml_block(block: &ContextBlock) -> String {
-    let tag = escape_xml_tag(&block.tag);
-    let content = escape_xml_text(&block.content);
-    format!("<{tag}>\n{content}\n</{tag}>\n")
-}
-
-fn escape_xml_text(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn escape_xml_tag(tag: &str) -> String {
-    tag.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect()
 }

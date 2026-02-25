@@ -1,7 +1,7 @@
 use aither_core::{
     Error, LanguageModel,
     llm::{
-        Event, LLMRequest, Message, Role,
+        Event, LLMRequest, Message, Role, Usage,
         model::{Ability, Parameters, Profile, ReasoningEffort, ToolChoice},
         tool::ToolDefinition,
     },
@@ -20,7 +20,7 @@ use crate::{
     types::{
         FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration, GeminiContent, GeminiTool,
         GenerateContentRequest, GenerationConfig, GoogleSearch, Part, PromptFeedback, SafetyRating,
-        ThinkingConfig, ToolConfig,
+        ThinkingConfig, ToolConfig, UsageMetadata,
     },
 };
 use schemars::schema_for;
@@ -68,11 +68,10 @@ impl LanguageModel for Gemini {
                     aither_models::lookup(&model_name)
                         .map(|info| info.context_window)
                         .unwrap_or_else(|| {
-                            tracing::warn!(
-                                "Model '{}' not found in database, using default 1M",
+                            panic!(
+                                "Gemini model '{}' missing context metadata from provider and aither-models",
                                 model_name
-                            );
-                            1_000_000
+                            )
                         })
                 }
             };
@@ -108,6 +107,13 @@ fn respond_stream_inner(
 ) -> impl Stream<Item = Result<Event, GeminiError>> + Send {
     async_stream::stream! {
         let (messages, parameters, tool_defs) = request.into_parts();
+        if parameters.cache.openai.is_some() || parameters.cache.claude.is_some() {
+            yield Err(GeminiError::Api(
+                "Gemini provider only accepts cache.gemini settings".to_string(),
+            ));
+            return;
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
         let messages = match crate::attachments::resolve_messages(&cfg, messages).await {
             Ok(resolved) => resolved,
@@ -129,6 +135,14 @@ fn respond_stream_inner(
             ToolChoice::Auto | ToolChoice::Required => tool_defs,
         };
         let has_function_tools = !tool_defs.is_empty();
+        if let ToolChoice::Exact(name) = &parameters.tool_choice
+            && !has_function_tools
+        {
+            yield Err(GeminiError::Api(format!(
+                "Exact tool choice '{name}' is not present in tool definitions"
+            )));
+            return;
+        }
 
         // Add function declarations from aither-core Tools
         if has_function_tools {
@@ -161,6 +175,11 @@ fn respond_stream_inner(
             tools: gemini_tools_payload,
             tool_config,
             safety_settings: Vec::new(),
+            cached_content: parameters
+                .cache
+                .gemini
+                .as_ref()
+                .map(|cache| cache.cached_content.clone()),
         };
 
         debug!("Gemini request: {:?}", gemini_request);
@@ -174,6 +193,8 @@ fn respond_stream_inner(
             }
         };
         futures_lite::pin!(stream);
+        let mut usage: Option<Usage> = None;
+        let mut finish_reason: Option<String> = None;
 
         while let Some(result) = stream.next().await {
             let response = match result {
@@ -186,6 +207,10 @@ fn respond_stream_inner(
 
             debug!("Gemini stream chunk: {:?}", response);
 
+            if let Some(meta) = &response.usage_metadata {
+                usage = Some(usage_from_metadata(meta));
+            }
+
             let Some(candidate) = response.primary_candidate() else {
                 // Skip chunks without candidates (might be metadata)
                 if let Some(feedback) = &response.prompt_feedback {
@@ -196,6 +221,10 @@ fn respond_stream_inner(
             };
 
             let Some(content) = &candidate.content else {
+                if let Some(reason) = candidate.finish_reason.clone() {
+                    finish_reason = Some(reason);
+                    break;
+                }
                 continue;
             };
 
@@ -242,6 +271,21 @@ fn respond_stream_inner(
                     arguments: call.args.clone(),
                 }));
             }
+
+            if let Some(reason) = candidate.finish_reason.clone() {
+                finish_reason = Some(reason);
+                break;
+            }
+        }
+
+        if let Some(mut final_usage) = usage {
+            final_usage.stop_reason = finish_reason;
+            yield Ok(Event::Usage(final_usage));
+        } else if let Some(reason) = finish_reason {
+            yield Ok(Event::Usage(Usage {
+                stop_reason: Some(reason),
+                ..Usage::default()
+            }));
         }
     }
 }
@@ -311,6 +355,19 @@ fn parse_tool_signature(id: &str) -> (String, Option<String>) {
         }
     }
     (id.to_string(), None)
+}
+
+fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
+    Usage {
+        prompt_tokens: meta.prompt_token_count,
+        completion_tokens: meta.candidates_token_count,
+        total_tokens: meta.total_token_count,
+        reasoning_tokens: meta.thoughts_token_count,
+        cache_read_tokens: meta.cached_content_token_count,
+        cache_write_tokens: None,
+        cost_usd: None,
+        stop_reason: None,
+    }
 }
 
 fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<GeminiContent>) {
@@ -500,7 +557,7 @@ fn build_tool_config(parameters: &Parameters, has_tools: bool) -> Option<ToolCon
         ToolChoice::None => return None,
         ToolChoice::Auto => (FunctionCallingMode::Auto, None),
         ToolChoice::Required => (FunctionCallingMode::Any, None),
-        ToolChoice::Exact(name) => (FunctionCallingMode::Auto, Some(vec![name.clone()])),
+        ToolChoice::Exact(name) => (FunctionCallingMode::Any, Some(vec![name.clone()])),
     };
     Some(ToolConfig {
         function_calling_config: Some(FunctionCallingConfig {

@@ -1,0 +1,5 @@
+<system-reminder>
+You can only perform actions via tool calls.
+Native tools: `bash`, `open_ssh`, `list_ssh`, `kill_terminal`, `input_terminal`.
+Other capabilities exposed as CLI commands must run through `bash`.
+</system-reminder>

@@ -7,7 +7,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::Component;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use aither_core::{
@@ -39,6 +41,22 @@ pub struct SubagentType<LLM> {
     pub description: String,
     /// Builder function that creates the configured agent builder.
     builder: SubagentBuilder<LLM>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SubagentFileMount {
+    pub virtual_prefix: PathBuf,
+    pub host_root: PathBuf,
+}
+
+impl SubagentFileMount {
+    #[must_use]
+    pub fn new(virtual_prefix: impl Into<PathBuf>, host_root: impl Into<PathBuf>) -> Self {
+        Self {
+            virtual_prefix: virtual_prefix.into(),
+            host_root: host_root.into(),
+        }
+    }
 }
 
 impl<LLM> std::fmt::Debug for SubagentType<LLM> {
@@ -125,7 +143,9 @@ pub struct SubagentTool<LLM> {
     llm: LLM,
     types: HashMap<String, SubagentType<LLM>>,
     /// Base directory for resolving relative paths (e.g., sandbox directory).
-    base_dir: Option<std::path::PathBuf>,
+    base_dir: Option<PathBuf>,
+    /// Ordered mount map used to resolve virtual sandbox paths into host paths.
+    mounts: Vec<SubagentFileMount>,
     /// Factory for creating child bash tools for subagents.
     bash_tool_factory: Option<BashToolFactory>,
 }
@@ -147,6 +167,7 @@ impl<LLM: Clone> SubagentTool<LLM> {
             llm,
             types: HashMap::new(),
             base_dir: None,
+            mounts: Vec::new(),
             bash_tool_factory: None,
         }
     }
@@ -158,6 +179,18 @@ impl<LLM: Clone> SubagentTool<LLM> {
     #[must_use]
     pub fn with_base_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.base_dir = Some(dir.into());
+        self
+    }
+
+    /// Sets explicit mount mappings for resolving subagent file paths.
+    ///
+    /// Mappings are checked in order and matched by virtual path prefix.
+    #[must_use]
+    pub fn with_file_mounts<I>(mut self, mounts: I) -> Self
+    where
+        I: IntoIterator<Item = SubagentFileMount>,
+    {
+        self.mounts = mounts.into_iter().collect();
         self
     }
 
@@ -190,6 +223,171 @@ impl<LLM: Clone> SubagentTool<LLM> {
             .iter()
             .map(|(name, t)| (name.as_str(), t.description.as_str()))
             .collect()
+    }
+
+    fn effective_mounts(&self) -> Vec<SubagentFileMount> {
+        if !self.mounts.is_empty() {
+            return self.mounts.clone();
+        }
+
+        let base = self
+            .base_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(Path::new(".")));
+        vec![
+            SubagentFileMount::new(PathBuf::from("."), base.clone()),
+            SubagentFileMount::new(PathBuf::from(".subagents"), base.join(".subagents")),
+            SubagentFileMount::new(PathBuf::from(".skills"), base.join(".skills")),
+        ]
+    }
+
+    fn strip_leading_curdir(path: &Path) -> PathBuf {
+        let mut stripped = PathBuf::new();
+        for component in path.components() {
+            if matches!(component, Component::CurDir) {
+                continue;
+            }
+            stripped.push(component.as_os_str());
+        }
+        stripped
+    }
+
+    fn to_mount_relative(path: &Path, virtual_prefix: &Path) -> Option<PathBuf> {
+        let normalized_path = Self::strip_leading_curdir(path);
+        if normalized_path.as_os_str().is_empty() {
+            return None;
+        }
+        if normalized_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return None;
+        }
+
+        let normalized_prefix = Self::strip_leading_curdir(virtual_prefix);
+        if normalized_prefix.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return None;
+        }
+        if normalized_prefix.as_os_str().is_empty() {
+            return Some(normalized_path);
+        }
+
+        if normalized_path.starts_with(&normalized_prefix) {
+            let Ok(stripped) = normalized_path.strip_prefix(&normalized_prefix) else {
+                return None;
+            };
+            let relative = Self::strip_leading_curdir(stripped);
+            if relative.as_os_str().is_empty() {
+                None
+            } else {
+                Some(relative)
+            }
+        } else {
+            None
+        }
+    }
+
+    fn mount_specificity(prefix: &Path) -> usize {
+        Self::strip_leading_curdir(prefix).components().count()
+    }
+
+    fn matching_mounts<'a>(
+        mounts: &'a [SubagentFileMount],
+        file_path: &Path,
+    ) -> Vec<(usize, &'a SubagentFileMount, PathBuf)> {
+        let mut matched = mounts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, mount)| {
+                Self::to_mount_relative(file_path, &mount.virtual_prefix)
+                    .map(|relative| (index, mount, relative))
+            })
+            .collect::<Vec<_>>();
+        matched.sort_by(|(index_a, mount_a, _), (index_b, mount_b, _)| {
+            Self::mount_specificity(&mount_b.virtual_prefix)
+                .cmp(&Self::mount_specificity(&mount_a.virtual_prefix))
+                .then(index_a.cmp(index_b))
+        });
+        matched
+    }
+
+    async fn resolve_relative_path_through_mounts(
+        &self,
+        requested_display: &Path,
+        file_path: &Path,
+        mounts: &[SubagentFileMount],
+    ) -> anyhow::Result<PathBuf> {
+        let mut attempted = Vec::new();
+        let matched = Self::matching_mounts(mounts, file_path);
+
+        for (_, mount, relative) in matched {
+            let candidate = mount.host_root.join(relative);
+            let display_prefix = Self::strip_leading_curdir(&mount.virtual_prefix);
+            let display_path = if display_prefix.as_os_str().is_empty() {
+                candidate
+                    .strip_prefix(&mount.host_root)
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|_| requested_display.to_path_buf())
+            } else {
+                display_prefix.join(
+                    candidate
+                        .strip_prefix(&mount.host_root)
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|_| requested_display.to_path_buf()),
+                )
+            };
+            attempted.push(display_path.display().to_string());
+            if checked_path_exists(&candidate).await? {
+                return Ok(candidate);
+            }
+        }
+
+        if attempted.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Subagent file '{}' is outside mounted paths or uses forbidden path components",
+                requested_display.display()
+            ));
+        }
+
+        Err(anyhow::anyhow!(
+            "Subagent file '{}' not found. Attempted: {}",
+            requested_display.display(),
+            attempted.join(", ")
+        ))
+    }
+
+    async fn resolve_subagent_path(&self, file_path: &Path) -> anyhow::Result<PathBuf> {
+        let mounts = self.effective_mounts();
+        if file_path.is_absolute() {
+            if let Some(base_dir) = &self.base_dir
+                && let Ok(stripped) = file_path.strip_prefix(base_dir)
+            {
+                let relative = Self::strip_leading_curdir(stripped);
+                if !relative.as_os_str().is_empty() {
+                    return self
+                        .resolve_relative_path_through_mounts(&relative, &relative, &mounts)
+                        .await;
+                }
+            }
+
+            if checked_path_exists(file_path).await? {
+                return Ok(file_path.to_path_buf());
+            }
+            return Err(anyhow::anyhow!(
+                "Subagent file '{}' not found",
+                file_path.display()
+            ));
+        }
+
+        self.resolve_relative_path_through_mounts(file_path, file_path, &mounts)
+            .await
     }
 }
 
@@ -237,31 +435,9 @@ where
 
         let (subagent_id, agent_builder) = if is_file_path {
             // Load subagent from file
-            // Resolve paths relative to base_dir if set (e.g., sandbox directory)
-            let file_path = &args.subagent;
-            let base = self.base_dir.as_deref().unwrap_or(Path::new("."));
-
-            // Try paths in order:
-            // 1. As-is relative to base_dir
-            // 2. Under .subagents/ relative to base_dir
-            // 3. Under .skills/ relative to base_dir
-            let path = base.join(file_path);
-            let resolved_path = if checked_path_exists(&path).await? {
-                path
-            } else {
-                let subagents_path = base.join(".subagents").join(file_path);
-                if checked_path_exists(&subagents_path).await? {
-                    subagents_path
-                } else {
-                    let skills_path = base.join(".skills").join(file_path);
-                    if checked_path_exists(&skills_path).await? {
-                        skills_path
-                    } else {
-                        // Return original path for error message
-                        path
-                    }
-                }
-            };
+            // Resolve paths using explicit search roots.
+            let file_path = PathBuf::from(&args.subagent);
+            let resolved_path = self.resolve_subagent_path(&file_path).await?;
 
             let def = SubagentDefinition::from_file_async(&resolved_path)
                 .await
@@ -329,6 +505,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -342,5 +520,114 @@ mod tests {
         // Check required order
         let required = value.get("required").expect("should have required");
         assert!(required.is_array());
+    }
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "aither-subagent-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test temp dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn resolves_file_through_mount_prefix() {
+        let root = unique_temp_dir("mount-resolve");
+        let skills_root = root.join("skills");
+        let skill_file = skills_root.join("slide").join("SKILL.md");
+        std::fs::create_dir_all(skill_file.parent().expect("skill parent"))
+            .expect("create skill parent");
+        std::fs::write(&skill_file, "# slide").expect("write skill file");
+
+        let tool = SubagentTool::new(()).with_file_mounts([
+            SubagentFileMount::new(".", root.join("workspace")),
+            SubagentFileMount::new(".skills", skills_root.clone()),
+        ]);
+        let resolved = tool
+            .resolve_subagent_path(Path::new(".skills/slide/SKILL.md"))
+            .await
+            .expect("resolve mounted skill path");
+        assert_eq!(resolved, skill_file);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn rejects_parent_traversal_paths() {
+        let root = unique_temp_dir("mount-traversal");
+        let tool = SubagentTool::new(())
+            .with_file_mounts([SubagentFileMount::new(".skills", root.join("skills"))]);
+
+        let error = tool
+            .resolve_subagent_path(Path::new("../outside.md"))
+            .await
+            .expect_err("parent traversal should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("outside mounted paths or uses forbidden path components"),
+            "unexpected error: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn missing_file_error_does_not_leak_host_mount_path() {
+        let root = unique_temp_dir("mount-errors");
+        let skills_root = root.join("skills");
+        std::fs::create_dir_all(&skills_root).expect("create skills root");
+        let tool = SubagentTool::new(())
+            .with_file_mounts([SubagentFileMount::new(".skills", skills_root.clone())]);
+
+        let error = tool
+            .resolve_subagent_path(Path::new(".skills/missing.md"))
+            .await
+            .expect_err("missing file should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains(".skills/missing.md"),
+            "missing virtual path in error: {message}"
+        );
+        assert!(
+            !message.contains(skills_root.to_string_lossy().as_ref()),
+            "host path leaked in error: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn absolute_workspace_skills_path_resolves_to_skills_mount() {
+        let root = unique_temp_dir("absolute-workspace-skills");
+        let workspace_root = root.join("workspace");
+        let skills_root = root.join("skills");
+        let session_skills_file = workspace_root.join(".skills/slide/subagents/art_direction.md");
+        let mounted_skill_file = skills_root.join("slide/subagents/art_direction.md");
+        std::fs::create_dir_all(session_skills_file.parent().expect("session skill parent"))
+            .expect("create session skill parent");
+        std::fs::create_dir_all(mounted_skill_file.parent().expect("mounted skill parent"))
+            .expect("create mounted skill parent");
+        std::fs::write(&mounted_skill_file, "# art direction").expect("write mounted skill file");
+
+        let tool = SubagentTool::new(())
+            .with_base_dir(workspace_root.clone())
+            .with_file_mounts([
+                SubagentFileMount::new(".", workspace_root.clone()),
+                SubagentFileMount::new(".skills", skills_root.clone()),
+            ]);
+
+        let resolved = tool
+            .resolve_subagent_path(&session_skills_file)
+            .await
+            .expect("resolve absolute workspace .skills path");
+        assert_eq!(resolved, mounted_skill_file);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

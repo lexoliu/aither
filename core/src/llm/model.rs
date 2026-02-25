@@ -145,6 +145,12 @@ pub struct Parameters {
     pub websearch: bool,
     /// Whether to enable native Code Execution tool.
     pub code_execution: bool,
+    /// Provider-specific prompt cache controls.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "CacheOptions::is_empty")
+    )]
+    pub cache: CacheOptions,
 }
 
 macro_rules! impl_with_methods {
@@ -218,6 +224,53 @@ impl Parameters {
         self
     }
 
+    /// Sets the OpenAI-compatible prompt cache key.
+    #[must_use]
+    pub fn prompt_cache_key(mut self, key: impl Into<String>) -> Self {
+        let cache = self
+            .cache
+            .openai
+            .get_or_insert_with(OpenAIPromptCache::default);
+        cache.key = Some(key.into());
+        self
+    }
+
+    /// Sets the OpenAI-compatible prompt cache retention policy.
+    #[must_use]
+    pub fn prompt_cache_retention(mut self, retention: OpenAIPromptCacheRetention) -> Self {
+        let cache = self
+            .cache
+            .openai
+            .get_or_insert_with(OpenAIPromptCache::default);
+        cache.retention = Some(retention);
+        self
+    }
+
+    /// Sets Claude prompt caching options.
+    #[must_use]
+    pub const fn claude_prompt_cache(mut self, cache: ClaudePromptCache) -> Self {
+        self.cache.claude = Some(cache);
+        self
+    }
+
+    /// Sets the Gemini cached content resource name.
+    #[must_use]
+    pub fn gemini_cached_content(mut self, cached_content: impl Into<String>) -> Self {
+        self.cache.gemini = Some(GeminiPromptCache::new(cached_content));
+        self
+    }
+
+    /// Clears all provider-specific cache options.
+    #[must_use]
+    pub fn without_cache(mut self) -> Self {
+        self.cache = CacheOptions {
+            openai: None,
+            claude: None,
+            gemini: None,
+        };
+        self
+    }
+
     /// Sets the tool choice policy.
     #[must_use]
     pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
@@ -268,6 +321,135 @@ impl ReasoningEffort {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+        }
+    }
+}
+
+/// Provider-specific prompt cache controls.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CacheOptions {
+    /// OpenAI-compatible prompt cache controls (`OpenAI`, `Copilot`).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub openai: Option<OpenAIPromptCache>,
+    /// Anthropic Claude prompt cache controls.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub claude: Option<ClaudePromptCache>,
+    /// Gemini cached content reference.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub gemini: Option<GeminiPromptCache>,
+}
+
+impl CacheOptions {
+    /// Returns true when no provider cache options are set.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.openai.is_none() && self.claude.is_none() && self.gemini.is_none()
+    }
+}
+
+/// OpenAI-compatible prompt cache controls.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIPromptCache {
+    /// Stable key used to route related prompts to the same cache shard.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub key: Option<String>,
+    /// Retention policy for prompt cache entries.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub retention: Option<OpenAIPromptCacheRetention>,
+}
+
+/// OpenAI prompt cache retention policies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum OpenAIPromptCacheRetention {
+    /// Keep cache entries in-memory (default OpenAI retention mode).
+    InMemory,
+    /// Keep cache entries for 24 hours.
+    #[cfg_attr(feature = "serde", serde(rename = "24h"))]
+    Hours24,
+}
+
+impl OpenAIPromptCacheRetention {
+    /// Returns the API value expected by OpenAI-compatible endpoints.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InMemory => "in-memory",
+            Self::Hours24 => "24h",
+        }
+    }
+}
+
+/// Claude prompt cache control for the Messages API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ClaudePromptCache {
+    /// Requested cache TTL policy.
+    pub ttl: ClaudePromptCacheTtl,
+}
+
+impl ClaudePromptCache {
+    /// Build a cache configuration with the chosen TTL.
+    #[must_use]
+    pub const fn new(ttl: ClaudePromptCacheTtl) -> Self {
+        Self { ttl }
+    }
+}
+
+/// Claude prompt cache TTL values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ClaudePromptCacheTtl {
+    /// Short-lived cache (5 minutes).
+    #[default]
+    FiveMinutes,
+    /// Extended cache (1 hour).
+    OneHour,
+}
+
+impl ClaudePromptCacheTtl {
+    /// Returns the API value expected by Claude.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
+        }
+    }
+}
+
+/// Gemini cached content reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GeminiPromptCache {
+    /// Resource name returned by Gemini cache creation APIs.
+    pub cached_content: String,
+}
+
+impl GeminiPromptCache {
+    /// Creates a Gemini cached content reference.
+    #[must_use]
+    pub fn new(cached_content: impl Into<String>) -> Self {
+        Self {
+            cached_content: cached_content.into(),
         }
     }
 }
@@ -849,5 +1031,58 @@ mod tests {
         assert!(debug_str.contains("0.7"));
         assert!(debug_str.contains("42"));
         assert!(debug_str.contains("1000"));
+    }
+
+    #[test]
+    fn parameters_cache_builder_sets_expected_fields() {
+        let params = Parameters::default()
+            .prompt_cache_key("project:chat:42")
+            .prompt_cache_retention(OpenAIPromptCacheRetention::Hours24)
+            .claude_prompt_cache(ClaudePromptCache::new(ClaudePromptCacheTtl::OneHour))
+            .gemini_cached_content("cachedContents/session-42");
+
+        let openai_cache = params
+            .cache
+            .openai
+            .as_ref()
+            .expect("openai cache should be set");
+        assert_eq!(openai_cache.key.as_deref(), Some("project:chat:42"));
+        assert_eq!(
+            openai_cache.retention,
+            Some(OpenAIPromptCacheRetention::Hours24)
+        );
+        assert_eq!(
+            params.cache.claude,
+            Some(ClaudePromptCache::new(ClaudePromptCacheTtl::OneHour))
+        );
+        assert_eq!(
+            params
+                .cache
+                .gemini
+                .as_ref()
+                .map(|cache| cache.cached_content.as_str()),
+            Some("cachedContents/session-42")
+        );
+    }
+
+    #[test]
+    fn cache_options_empty_state_changes_with_provider_values() {
+        let mut cache = CacheOptions::default();
+        assert!(cache.is_empty());
+
+        cache.openai = Some(OpenAIPromptCache::default());
+        assert!(!cache.is_empty());
+    }
+
+    #[test]
+    fn prompt_cache_retention_string_values_match_api() {
+        assert_eq!(OpenAIPromptCacheRetention::InMemory.as_str(), "in-memory");
+        assert_eq!(OpenAIPromptCacheRetention::Hours24.as_str(), "24h");
+    }
+
+    #[test]
+    fn claude_prompt_cache_ttl_string_values_match_api() {
+        assert_eq!(ClaudePromptCacheTtl::FiveMinutes.as_str(), "5m");
+        assert_eq!(ClaudePromptCacheTtl::OneHour.as_str(), "1h");
     }
 }

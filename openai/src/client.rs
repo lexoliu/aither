@@ -8,12 +8,15 @@ use crate::{
         ResponsesRequest, ResponsesTool, ToolPayload, convert_responses_tools, convert_tools,
         responses_tool_choice, to_chat_messages, to_responses_input,
     },
-    response::{ChatCompletionChunk, ResponsesOutputItem, ResponsesStreamEvent, should_skip_event},
+    response::{
+        ChatCompletionChunk, ChatCompletionUsage, ResponsesOutputItem, ResponsesStreamEvent,
+        ResponsesUsage, should_skip_event,
+    },
 };
 use aither_core::{
     LanguageModel,
     llm::{
-        Event, LLMRequest, ToolCall,
+        Event, LLMRequest, ToolCall, Usage,
         model::{Ability, Profile as ModelProfile, ToolChoice},
         oneshot,
     },
@@ -152,12 +155,11 @@ async fn request_with_timeout<T>(
 }
 
 /// Result of attempting to establish an SSE stream.
-type SseStreamResult =
-    Result<Vec<Result<zenwave::sse::Event, zenwave::sse::ParseError>>, OpenAIError>;
+type SseStreamResult = Result<zenwave::sse::SseStream, OpenAIError>;
 
 /// Attempt to make an SSE request with retry logic.
 ///
-/// Returns the collected SSE events on success, or the last error on failure.
+/// Returns a streaming SSE connection on success, or the last error on failure.
 async fn sse_request_with_retry<F, Fut>(cfg: &Config, make_request: F) -> SseStreamResult
 where
     F: Fn() -> Fut,
@@ -168,7 +170,7 @@ where
 
     loop {
         match make_request().await {
-            Ok(events) => return Ok(events),
+            Ok(stream) => return Ok(stream),
             Err(err) => {
                 // Check if we should retry
                 if attempt < retry_config.max_retries && is_retryable_error(&err) {
@@ -351,6 +353,13 @@ impl LanguageModel for OpenAI {
         let has_attachments = messages.iter().any(|msg| !msg.attachments().is_empty());
 
         async_stream::stream! {
+            if parameters.cache.claude.is_some() || parameters.cache.gemini.is_some() {
+                yield Err(OpenAIError::Api(
+                    "OpenAI provider only accepts cache.openai settings".to_string(),
+                ));
+                return;
+            }
+
             if cfg.api_kind == ApiKind::ChatCompletions && has_attachments {
                 yield Err(OpenAIError::Api(
                     "Chat Completions does not support file attachments; use Responses API".to_string(),
@@ -443,11 +452,10 @@ impl LanguageModel for OpenAI {
                     aither_models::lookup(&cfg.chat_model)
                         .map(|info| info.context_window)
                         .unwrap_or_else(|| {
-                            tracing::warn!(
-                                "Model '{}' not found in database, using default 128k",
+                            panic!(
+                                "OpenAI model '{}' missing context metadata from provider and aither-models",
                                 cfg.chat_model
-                            );
-                            128_000
+                            )
                         })
                 }
             };
@@ -564,26 +572,15 @@ async fn chat_completions_request(
             .map_err(OpenAIError::Http)?;
     }
 
-    let sse_stream = match request_with_timeout(
+    match request_with_timeout(
         cfg.request_timeout,
         builder.json_body(request).map_err(OpenAIError::Http)?.sse(),
     )
     .await
     {
-        Ok(stream) => stream,
+        Ok(stream) => Ok(stream),
         Err(error) => return Err(error),
-    };
-
-    let events: Vec<_> = sse_stream
-        .filter_map(|event| match event {
-            Ok(e) if !should_skip_event(&e) && e.text_data() != "[DONE]" => Some(Ok(e)),
-            Ok(_) => None,
-            Err(e) => Some(Err(e)),
-        })
-        .collect()
-        .await;
-
-    Ok(events)
+    }
 }
 
 fn chat_completions_stream_inner(
@@ -606,29 +603,29 @@ fn chat_completions_stream_inner(
         tracing::debug!(request = %serde_json::to_string_pretty(&request).unwrap_or_default(), "Sending chat completion request");
 
         // Make request with retry
-        let events = match sse_request_with_retry(&cfg, || chat_completions_request(&cfg, &request)).await {
-            Ok(events) => events,
+        let sse_stream = match sse_request_with_retry(&cfg, || chat_completions_request(&cfg, &request)).await {
+            Ok(stream) => stream,
             Err(e) => {
                 yield Err(e);
                 return;
             }
         };
-
-        tracing::debug!(event_count = events.len(), "Collected SSE events");
-
-        if events.is_empty() {
-            tracing::warn!("No SSE events received from API");
-        }
+        futures_lite::pin!(sse_stream);
 
         // Accumulate tool calls by index - streaming sends id/name first, then arguments incrementally
         let mut tool_calls: std::collections::HashMap<usize, ToolCallAccumulator> =
             std::collections::HashMap::new();
-        let mut _text_yielded = false;
-
-        for event in events {
+        let mut usage: Option<Usage> = None;
+        while let Some(event) = sse_stream.next().await {
             match event {
                 Ok(e) => {
+                    if should_skip_event(&e) {
+                        continue;
+                    }
                     let data = e.text_data();
+                    if data == "[DONE]" {
+                        continue;
+                    }
                     tracing::debug!(sse_event = %data, "Received SSE event");
 
                     // Check for API error response
@@ -644,6 +641,9 @@ fn chat_completions_stream_inner(
 
                     match serde_json::from_str::<ChatCompletionChunk>(data) {
                         Ok(chunk) => {
+                            if let Some(chunk_usage) = &chunk.usage {
+                                usage = Some(usage_from_chat_completion(chunk_usage));
+                            }
                             // Emit text events
                             for choice in &chunk.choices {
                                 // Check for malformed function call
@@ -718,6 +718,9 @@ fn chat_completions_stream_inner(
                 }));
             }
         }
+        if let Some(final_usage) = usage {
+            yield Ok(Event::Usage(final_usage));
+        }
     }
 }
 
@@ -744,6 +747,44 @@ fn parse_tool_call_arguments(arguments: &str) -> serde_json::Value {
         serde_json::Value::Object(Default::default())
     } else {
         serde_json::from_str(arguments).unwrap_or(serde_json::Value::Object(Default::default()))
+    }
+}
+
+fn usage_from_chat_completion(raw: &ChatCompletionUsage) -> Usage {
+    Usage {
+        prompt_tokens: raw.prompt_tokens,
+        completion_tokens: raw.completion_tokens,
+        total_tokens: raw.total_tokens,
+        reasoning_tokens: raw
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens),
+        cache_read_tokens: raw
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens),
+        cache_write_tokens: None,
+        cost_usd: None,
+        stop_reason: None,
+    }
+}
+
+fn usage_from_responses(raw: &ResponsesUsage) -> Usage {
+    Usage {
+        prompt_tokens: raw.input_tokens,
+        completion_tokens: raw.output_tokens,
+        total_tokens: raw.total_tokens,
+        reasoning_tokens: raw
+            .output_token_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens),
+        cache_read_tokens: raw
+            .input_token_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens),
+        cache_write_tokens: None,
+        cost_usd: None,
+        stop_reason: None,
     }
 }
 
@@ -807,26 +848,15 @@ async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStrea
             .map_err(OpenAIError::Http)?;
     }
 
-    let sse_stream = match request_with_timeout(
+    match request_with_timeout(
         cfg.request_timeout,
         builder.json_body(request).map_err(OpenAIError::Http)?.sse(),
     )
     .await
     {
-        Ok(stream) => stream,
+        Ok(stream) => Ok(stream),
         Err(error) => return Err(error),
-    };
-
-    let events: Vec<_> = sse_stream
-        .filter_map(|event| match event {
-            Ok(e) if !should_skip_event(&e) && e.text_data() != "[DONE]" => Some(Ok(e)),
-            Ok(_) => None,
-            Err(e) => Some(Err(e)),
-        })
-        .collect()
-        .await;
-
-    Ok(events)
+    }
 }
 
 fn responses_stream_inner(
@@ -868,23 +898,30 @@ fn responses_stream_inner(
         tracing::debug!(request = %serde_json::to_string_pretty(&request).unwrap_or_default(), "Sending responses request");
 
         // Make request with retry
-        let events = match sse_request_with_retry(&cfg, || responses_request(&cfg, &request)).await {
-            Ok(events) => events,
+        let sse_stream = match sse_request_with_retry(&cfg, || responses_request(&cfg, &request)).await {
+            Ok(stream) => stream,
             Err(e) => {
                 yield Err(e);
                 return;
             }
         };
-
-        tracing::debug!(event_count = events.len(), "Collected Responses API SSE events");
+        futures_lite::pin!(sse_stream);
 
         // Accumulate function calls by item_id
         let mut function_calls: HashMap<String, FunctionCallAccumulator> = HashMap::new();
+        let mut usage: Option<Usage> = None;
+        let mut usage_emitted = false;
 
-        for event in events {
+        while let Some(event) = sse_stream.next().await {
             match event {
                 Ok(e) => {
+                    if should_skip_event(&e) {
+                        continue;
+                    }
                     let data = e.text_data();
+                    if data == "[DONE]" {
+                        continue;
+                    }
                     tracing::trace!(sse_event = %data, "Received Responses API SSE event");
 
                     // Check for API error response
@@ -901,6 +938,11 @@ fn responses_stream_inner(
                     match serde_json::from_str::<ResponsesStreamEvent>(data) {
                         Ok(stream_event) => {
                             match stream_event {
+                                ResponsesStreamEvent::ResponseCreated { response } => {
+                                    if let Some(meta) = response.and_then(|resp| resp.usage) {
+                                        usage = Some(usage_from_responses(&meta));
+                                    }
+                                }
                                 ResponsesStreamEvent::OutputTextDelta { delta, .. } => {
                                     if !delta.is_empty() {
                                         yield Ok(Event::Text(delta));
@@ -941,6 +983,14 @@ fn responses_stream_inner(
                                         yield Ok(Event::ToolCall(tool_call));
                                     }
                                 }
+                                ResponsesStreamEvent::ResponseCompleted { response } => {
+                                    if let Some(meta) = response.usage {
+                                        let final_usage = usage_from_responses(&meta);
+                                        usage = Some(final_usage.clone());
+                                        yield Ok(Event::Usage(final_usage));
+                                        usage_emitted = true;
+                                    }
+                                }
                                 ResponsesStreamEvent::ResponseFailed { error } => {
                                     let msg = error
                                         .and_then(|e| e.message)
@@ -973,12 +1023,19 @@ fn responses_stream_inner(
         for tool_call in drain_pending_function_calls(function_calls) {
             yield Ok(Event::ToolCall(tool_call));
         }
+        if !usage_emitted && let Some(final_usage) = usage {
+            yield Ok(Event::Usage(final_usage));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::response::{
+        ChatCompletionTokensDetails, ChatCompletionUsage, ChatPromptTokensDetails,
+        ResponsesInputTokenDetails, ResponsesOutputTokenDetails, ResponsesUsage,
+    };
     use futures_lite::future::block_on;
     use std::time::Duration;
 
@@ -1025,6 +1082,48 @@ mod tests {
             .await;
             assert!(matches!(timeout, Err(OpenAIError::Timeout)));
         });
+    }
+
+    #[test]
+    fn chat_usage_mapping_keeps_reasoning_and_cache_tokens() {
+        let usage = ChatCompletionUsage {
+            prompt_tokens: Some(11),
+            completion_tokens: Some(7),
+            total_tokens: Some(18),
+            prompt_tokens_details: Some(ChatPromptTokensDetails {
+                cached_tokens: Some(3),
+            }),
+            completion_tokens_details: Some(ChatCompletionTokensDetails {
+                reasoning_tokens: Some(2),
+            }),
+        };
+        let mapped = usage_from_chat_completion(&usage);
+        assert_eq!(mapped.prompt_tokens, Some(11));
+        assert_eq!(mapped.completion_tokens, Some(7));
+        assert_eq!(mapped.total_tokens, Some(18));
+        assert_eq!(mapped.reasoning_tokens, Some(2));
+        assert_eq!(mapped.cache_read_tokens, Some(3));
+    }
+
+    #[test]
+    fn responses_usage_mapping_keeps_reasoning_and_cache_tokens() {
+        let usage = ResponsesUsage {
+            input_tokens: Some(19),
+            output_tokens: Some(5),
+            total_tokens: Some(24),
+            input_token_details: Some(ResponsesInputTokenDetails {
+                cached_tokens: Some(4),
+            }),
+            output_token_details: Some(ResponsesOutputTokenDetails {
+                reasoning_tokens: Some(1),
+            }),
+        };
+        let mapped = usage_from_responses(&usage);
+        assert_eq!(mapped.prompt_tokens, Some(19));
+        assert_eq!(mapped.completion_tokens, Some(5));
+        assert_eq!(mapped.total_tokens, Some(24));
+        assert_eq!(mapped.reasoning_tokens, Some(1));
+        assert_eq!(mapped.cache_read_tokens, Some(4));
     }
 }
 

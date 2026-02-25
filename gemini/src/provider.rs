@@ -2,6 +2,7 @@ use crate::{GEMINI_API_BASE_URL, Gemini, config::AuthMode, error::GeminiError};
 use aither_core::llm::{
     LanguageModelProvider, model::Profile as ModelProfile, provider::Profile as ProviderProfile,
 };
+use aither_models::lookup as lookup_model_info;
 use serde::Deserialize;
 use std::{future::Future, sync::Arc};
 use zenwave::{Client, client};
@@ -68,18 +69,27 @@ impl LanguageModelProvider for GeminiProvider {
             Ok(response
                 .models
                 .into_iter()
-                .map(|model| {
-                    let _display_name = model
-                        .display_name
-                        .clone()
-                        .unwrap_or_else(|| model.name.clone());
-                    ModelProfile::new(
-                        model.name.clone().trim_start_matches("models/"), // Profile name usually short
+                .filter_map(|model| {
+                    let model_id = model.name.trim_start_matches("models/").to_string();
+                    let context_length = model
+                        .input_token_limit
+                        .and_then(|value| u32::try_from(value).ok())
+                        .or_else(|| lookup_model_info(&model_id).map(|info| info.context_window))
+                        .or_else(|| lookup_model_info(&model.name).map(|info| info.context_window));
+                    let Some(context_length) = context_length else {
+                        tracing::warn!(
+                            model = %model.name,
+                            "skip model from Gemini list: missing input_token_limit and no aither-models fallback"
+                        );
+                        return None;
+                    };
+                    Some(ModelProfile::new(
+                        model_id,
                         "google",
-                        model.name, // Slug includes 'models/' prefix usually
+                        model.name,
                         model.description.unwrap_or_default(),
-                        model.input_token_limit.unwrap_or(32768) as u32,
-                    )
+                        context_length,
+                    ))
                 })
                 .collect())
         }

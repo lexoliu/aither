@@ -25,6 +25,8 @@ pub struct GenerateContentRequest {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub(crate) safety_settings: Vec<SafetySetting>,
+    #[serde(rename = "cachedContent", skip_serializing_if = "Option::is_none")]
+    pub(crate) cached_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -559,6 +561,8 @@ pub struct GenerateContentResponse {
     #[serde(rename = "promptFeedback")]
     #[serde(default)]
     pub(crate) prompt_feedback: Option<PromptFeedback>,
+    #[serde(rename = "usageMetadata", default)]
+    pub(crate) usage_metadata: Option<UsageMetadata>,
 }
 
 impl GenerateContentResponse {
@@ -574,6 +578,21 @@ pub struct Candidate {
     pub(crate) finish_reason: Option<String>,
     #[serde(rename = "safetyRatings", default)]
     pub(crate) safety_ratings: Vec<SafetyRating>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageMetadata {
+    #[serde(default)]
+    pub(crate) prompt_token_count: Option<u32>,
+    #[serde(default)]
+    pub(crate) candidates_token_count: Option<u32>,
+    #[serde(default)]
+    pub(crate) total_token_count: Option<u32>,
+    #[serde(default)]
+    pub(crate) cached_content_token_count: Option<u32>,
+    #[serde(default)]
+    pub(crate) thoughts_token_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

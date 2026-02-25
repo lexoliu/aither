@@ -44,6 +44,7 @@ impl ImageGenerator for Gemini {
                 tools: Vec::new(),
                 tool_config: None,
                 safety_settings: Vec::new(),
+                cached_content: None,
             };
             call_generate(cfg, &model, request).await
         }])
@@ -98,6 +99,7 @@ impl ImageGenerator for Gemini {
                 tools: Vec::new(),
                 tool_config: None,
                 safety_settings: Vec::new(),
+                cached_content: None,
             };
             call_generate(cfg, &model, request).await
         }])

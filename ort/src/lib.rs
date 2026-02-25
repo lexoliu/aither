@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use aither_core::EmbeddingModel;
-use ndarray::Ix3;
+use ndarray::{Axis, Ix2, Ix3};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use tokenizers::Tokenizer;
 
@@ -184,19 +184,23 @@ impl EmbeddingModel for OrtEmbedding {
             view.to_owned()
         };
 
-        // Ensure 3D shape [batch, seq_len, hidden_dim]
-        let shape = hidden_states_owned.shape();
-        if shape.len() != 3 {
-            return Err(OrtError::InvalidOutputShape(shape.len()).into());
-        }
-
-        let view_3d = hidden_states_owned
-            .into_dimensionality::<Ix3>()
-            .map_err(|e| OrtError::Shape(e.to_string()))?;
+        let rank = hidden_states_owned.shape().len();
+        let hidden_states_3d = match rank {
+            3 => hidden_states_owned
+                .into_dimensionality::<Ix3>()
+                .map_err(|e| OrtError::Shape(e.to_string()))?,
+            2 => hidden_states_owned
+                .into_dimensionality::<Ix2>()
+                .map_err(|e| OrtError::Shape(e.to_string()))?
+                .insert_axis(Axis(0)),
+            _ => return Err(OrtError::InvalidOutputShape(rank).into()),
+        };
 
         // Apply pooling
         let attention_mask_u32: Vec<u32> = encoding.get_attention_mask().to_vec();
-        let mut embedding = self.pooling.apply(&view_3d.view(), &attention_mask_u32);
+        let mut embedding = self
+            .pooling
+            .apply(&hidden_states_3d.view(), &attention_mask_u32);
 
         // Normalize if enabled
         if self.normalize {
@@ -369,9 +373,9 @@ fn find_tokenizer_file(dir: &Path) -> Result<PathBuf, OrtError> {
 /// Detect the embedding dimension from model output metadata.
 fn detect_embedding_dimension(session: &Session) -> Result<usize, OrtError> {
     // Look for the output that contains hidden states
-    for output in session.outputs() {
+    for output in &session.outputs {
         // Get tensor type info if available
-        if let ort::value::ValueType::Tensor { shape, .. } = output.dtype() {
+        if let ort::value::ValueType::Tensor { shape, .. } = &output.output_type {
             // Expect shape [batch, seq_len, hidden_dim] or [batch, hidden_dim]
             if shape.len() >= 2 {
                 // Last dimension is typically the hidden dimension
