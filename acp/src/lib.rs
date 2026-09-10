@@ -115,7 +115,7 @@
 
 mod adapter;
 mod client;
-mod protocol;
+pub mod protocol;
 mod server;
 mod session;
 
