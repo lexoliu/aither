@@ -32,6 +32,10 @@ async-process = "2"
 async-lock = "3"
 tracing = "0.1"
 
+[[example]]
+name = "context7"
+required-features = ["http"]
+
 [dev-dependencies]
 futures-lite = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

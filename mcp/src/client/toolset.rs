@@ -13,7 +13,9 @@ use async_lock::Mutex;
 use serde::Deserialize;
 
 use crate::protocol::{CallToolResult, McpError, McpToolDefinition};
-use crate::transport::{ChildProcessTransport, HttpTransport, StdioTransport};
+#[cfg(feature = "http")]
+use crate::transport::HttpTransport;
+use crate::transport::{ChildProcessTransport, StdioTransport};
 
 use super::McpClient;
 
@@ -38,7 +40,7 @@ pub struct McpServerConfig {
     #[serde(default)]
     pub args: Vec<String>,
 
-    /// URL for HTTP-based servers.
+    /// URL for HTTP-based servers (requires the `http` feature).
     pub url: Option<String>,
 
     /// Optional environment variables for the process.
@@ -68,8 +70,8 @@ pub type McpServersConfig = HashMap<String, McpServerConfig>;
 ///
 /// This enum handles all transport types internally, hiding the
 /// transport abstraction from users. Use the constructor methods
-/// ([`spawn`](Self::spawn), [`http`](Self::http), [`stdio`](Self::stdio))
-/// to create connections.
+/// ([`spawn`](Self::spawn), [`stdio`](Self::stdio), and `http` with
+/// the `http` feature) to create connections.
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum McpConnection {
@@ -79,7 +81,8 @@ pub enum McpConnection {
         tools: Vec<McpToolDefinition>,
         server_name: Option<String>,
     },
-    /// Connection via HTTP.
+    /// Connection via HTTP (requires the `http` feature).
+    #[cfg(feature = "http")]
     Http {
         client: McpClient<HttpTransport>,
         tools: Vec<McpToolDefinition>,
@@ -110,6 +113,7 @@ impl std::fmt::Debug for McpConnection {
                 .field("server_name", server_name)
                 .field("tool_count", &tools.len())
                 .finish(),
+            #[cfg(feature = "http")]
             Self::Http {
                 server_name, tools, ..
             } => f
@@ -149,8 +153,14 @@ impl McpConnection {
     pub async fn from_config(config: &McpServerConfig) -> Result<Self, McpError> {
         if let Some(ref url) = config.url {
             // HTTP-based server
-            Self::http(url).await
-        } else if let Some(ref command) = config.command {
+            #[cfg(feature = "http")]
+            return Self::http(url).await;
+            #[cfg(not(feature = "http"))]
+            return Err(McpError::InvalidConfig(format!(
+                "HTTP MCP server '{url}' requires the `http` feature"
+            )));
+        }
+        if let Some(ref command) = config.command {
             // Process-based server
             let args: Vec<&str> = config
                 .args
@@ -234,6 +244,7 @@ impl McpConnection {
     /// # Errors
     ///
     /// Returns an error if the HTTP connection fails.
+    #[cfg(feature = "http")]
     pub async fn http(url: &str) -> Result<Self, McpError> {
         let transport = HttpTransport::new(url);
         let mut client = McpClient::connect(transport).await?;
@@ -252,6 +263,7 @@ impl McpConnection {
     /// # Errors
     ///
     /// Returns an error if the HTTP connection fails.
+    #[cfg(feature = "http")]
     pub async fn http_with_auth(url: &str, auth: &str) -> Result<Self, McpError> {
         let transport = HttpTransport::new(url).with_auth(auth);
         let mut client = McpClient::connect(transport).await?;
@@ -287,9 +299,11 @@ impl McpConnection {
     #[must_use]
     pub fn server_name(&self) -> Option<&str> {
         match self {
-            Self::Process { server_name, .. }
-            | Self::Http { server_name, .. }
-            | Self::Stdio { server_name, .. } => server_name.as_deref(),
+            Self::Process { server_name, .. } | Self::Stdio { server_name, .. } => {
+                server_name.as_deref()
+            }
+            #[cfg(feature = "http")]
+            Self::Http { server_name, .. } => server_name.as_deref(),
         }
     }
 
@@ -297,9 +311,9 @@ impl McpConnection {
     #[must_use]
     pub fn mcp_definitions(&self) -> &[McpToolDefinition] {
         match self {
-            Self::Process { tools, .. } | Self::Http { tools, .. } | Self::Stdio { tools, .. } => {
-                tools
-            }
+            Self::Process { tools, .. } | Self::Stdio { tools, .. } => tools,
+            #[cfg(feature = "http")]
+            Self::Http { tools, .. } => tools,
         }
     }
 
@@ -331,6 +345,7 @@ impl McpConnection {
     ) -> Result<CallToolResult, McpError> {
         match self {
             Self::Process { client, .. } => client.call_tool(name, arguments).await,
+            #[cfg(feature = "http")]
             Self::Http { client, .. } => client.call_tool(name, arguments).await,
             Self::Stdio { client, .. } => client.call_tool(name, arguments).await,
         }
@@ -344,6 +359,7 @@ impl McpConnection {
     pub async fn close(&mut self) -> Result<(), McpError> {
         match self {
             Self::Process { client, .. } => client.close().await,
+            #[cfg(feature = "http")]
             Self::Http { client, .. } => client.close().await,
             Self::Stdio { client, .. } => client.close().await,
         }
