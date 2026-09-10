@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::RequestId;
+
 /// MCP protocol version.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -208,6 +210,20 @@ impl CallToolResult {
             is_error: true,
         }
     }
+}
+
+/// Parameters of a `notifications/cancelled` notification.
+///
+/// Sent by either peer to abort an in-flight request; the peer drops the
+/// named request's execution and sends no response for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelledParams {
+    /// ID of the request to cancel.
+    pub request_id: RequestId,
+    /// Optional human-readable reason for the cancellation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Content types in MCP responses.
