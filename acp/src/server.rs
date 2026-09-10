@@ -194,7 +194,7 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
         self.initialized = true;
 
         let result = InitializeResult {
-            protocol_version: PROTOCOL_VERSION.to_string(),
+            protocol_version: PROTOCOL_VERSION,
             agent_capabilities: AgentCapabilities {
                 load_session: false, // No session persistence
                 prompt_capabilities: PromptCapabilities {
@@ -206,10 +206,12 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
                     http: true,
                     sse: false,
                 },
-                session_capabilities: SessionCapabilities {},
+                session_capabilities: SessionCapabilities::default(),
+                meta: None,
             },
-            agent_info: self.info.clone(),
+            agent_info: Some(self.info.clone()),
             auth_methods: vec![],
+            meta: None,
         };
 
         JsonRpcResponse::success(req.id, result)
@@ -245,7 +247,13 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
 
         self.sessions.insert(session_id.clone(), session);
 
-        JsonRpcResponse::success(req.id, SessionNewResult { session_id })
+        JsonRpcResponse::success(
+            req.id,
+            SessionNewResult {
+                session_id,
+                ..SessionNewResult::default()
+            },
+        )
     }
 
     /// Handle session/prompt request.
@@ -297,6 +305,7 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
             let notif = SessionNotification {
                 session_id: params.session_id.clone(),
                 update,
+                meta: None,
             };
             match serde_json::to_value(&notif) {
                 Ok(value) => {
@@ -321,7 +330,13 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
 
         self.sessions.insert(params.session_id, session);
 
-        JsonRpcResponse::success(req.id, PromptResult { stop_reason })
+        JsonRpcResponse::success(
+            req.id,
+            PromptResult {
+                stop_reason,
+                meta: None,
+            },
+        )
     }
 
     /// Handle session/stop request.
@@ -362,6 +377,7 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
             SessionNotification {
                 session_id: session_id.to_string(),
                 update,
+                meta: None,
             },
         );
         self.notify(notif).await

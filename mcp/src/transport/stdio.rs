@@ -7,9 +7,10 @@ use std::future::Future;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use blocking::Unblock;
-use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use futures_lite::io::{AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
 
+use super::lines::read_message;
 use super::traits::{BidirectionalTransport, Result, Transport};
 use crate::protocol::{
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError, RequestId,
@@ -25,6 +26,9 @@ pub struct StdioTransport {
     stdin: BufReader<Unblock<std::io::Stdin>>,
     /// Stdout, written on a blocking thread.
     stdout: Unblock<std::io::Stdout>,
+    /// Bytes already consumed from stdin that do not yet form a complete
+    /// message, keeping `recv` cancellation-safe.
+    read_buf: Vec<u8>,
     /// Next request ID.
     next_id: AtomicI64,
     /// Whether the transport is closed.
@@ -53,6 +57,7 @@ impl StdioTransport {
         Self {
             stdin: BufReader::new(Unblock::new(std::io::stdin())),
             stdout: Unblock::new(std::io::stdout()),
+            read_buf: Vec::new(),
             next_id: AtomicI64::new(1),
             closed: false,
         }
@@ -76,29 +81,13 @@ impl StdioTransport {
 
     /// Read a message from stdin.
     async fn read_message(&mut self) -> Result<Option<JsonRpcMessage>> {
-        read_message(&mut self.stdin).await
+        read_message(&mut self.stdin, &mut self.read_buf).await
     }
 }
 
 impl Default for StdioTransport {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-async fn read_message(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Option<JsonRpcMessage>> {
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 {
-            return Ok(None);
-        }
-
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        debug!("MCP RX: {}", line);
-        return serde_json::from_str(line).map(Some).map_err(Into::into);
     }
 }
 
@@ -163,6 +152,13 @@ impl BidirectionalTransport for StdioTransport {
         }
         self.write_message(serde_json::to_string(&response)?).await
     }
+
+    async fn send_request(&mut self, req: JsonRpcRequest) -> Result<()> {
+        if self.closed {
+            return Err(McpError::ConnectionClosed);
+        }
+        self.write_message(serde_json::to_string(&req)?).await
+    }
 }
 
 #[cfg(test)]
@@ -176,9 +172,20 @@ mod tests {
         {
             let input = b"\n  \r\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
             let mut reader = BufReader::new(Cursor::new(input));
+            let mut read_buf = Vec::new();
 
-            assert!(read_message(&mut reader).await.unwrap().is_some());
-            assert!(read_message(&mut reader).await.unwrap().is_none());
+            assert!(
+                read_message(&mut reader, &mut read_buf)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                read_message(&mut reader, &mut read_buf)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
@@ -188,9 +195,15 @@ mod tests {
             let input =
                 b"not json\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
             let mut reader = BufReader::new(Cursor::new(input));
+            let mut read_buf = Vec::new();
 
-            assert!(read_message(&mut reader).await.is_err());
-            assert!(read_message(&mut reader).await.unwrap().is_some());
+            assert!(read_message(&mut reader, &mut read_buf).await.is_err());
+            assert!(
+                read_message(&mut reader, &mut read_buf)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
 }
