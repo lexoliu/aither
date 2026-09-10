@@ -51,10 +51,16 @@ jobs:
 
       - name: Create pull request
         if: steps.snapshot.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: chore/update-models-snapshot
           delete-branch: true
+          # v6 committed through git with the workflow token, which leaves the
+          # commit unsigned and shown as Unverified next to every other commit
+          # on the branch. `sign-commits` creates it through the API instead, so
+          # GitHub signs it as github-actions[bot]. The input does not exist
+          # before v7.
+          sign-commits: true
           commit-message: "Update LiteLLM model snapshot"
           title: "Update LiteLLM model snapshot"
           body: |

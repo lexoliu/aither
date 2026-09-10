@@ -78,7 +78,7 @@
 //!
 //! ### HTTP-based MCP Servers
 //!
-//! Connect to MCP servers over HTTP:
+//! Connect to MCP servers over HTTP (requires the `http` feature):
 //!
 //! ```ignore
 //! let conn = McpConnection::http("http://localhost:3000/mcp").await?;

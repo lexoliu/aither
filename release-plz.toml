@@ -1,9 +1,7 @@
 [workspace]
 pr_draft = false
-changelog_config = "cliff.toml"
 pr_labels = ["release"]
 git_release_name = "{{ crate_name }}-v{{ version }}"
-commit_message = "chore(release): {{ crate_name }} v{{ version }} [skip ci]"
 publish = true
 git_tag_enable = true
 changelog_update = true
@@ -11,138 +9,112 @@ changelog_update = true
 # Every workspace member is released. release-plz works out the publish order from
 # the dependency graph, so these entries only fix each crate's tag name -- omitting
 # one gives it a tag inconsistent with the rest rather than holding it back.
+#
+# Only the fields in release-plz's own schema belong here: it rejects the file
+# outright on an unknown key rather than ignoring it, and the release job is the
+# one place where that is not discovered until a release is being cut. Check a
+# change against the version the action pins, with `release-plz generate-schema`.
 
 [[package]]
 name = "aither"
-path = "."
 git_tag_name = "v{{ version }}"
-
-[[package.files_to_update]]
-path = "README.md"
-search = 'aither = "[0-9]+\.[0-9]+(\.[0-9]+)?"'
-replace = 'aither = "{{ version }}"'
 
 [[package]]
 name = "aither-acp"
-path = "acp"
 git_tag_name = "acp-v{{ version }}"
 
 [[package]]
 name = "aither-agent"
-path = "agent"
 git_tag_name = "agent-v{{ version }}"
 
 [[package]]
 name = "aither-attachments"
-path = "attachments"
 git_tag_name = "attachments-v{{ version }}"
 
 [[package]]
 name = "aither-browser"
-path = "tools/browser"
 git_tag_name = "browser-v{{ version }}"
 
 [[package]]
 name = "aither-claude"
-path = "claude"
 git_tag_name = "claude-v{{ version }}"
 
 [[package]]
 name = "aither-cli"
-path = "cli"
 git_tag_name = "cli-v{{ version }}"
 
 [[package]]
 name = "aither-cloud"
-path = "cloud"
 git_tag_name = "cloud-v{{ version }}"
 
 [[package]]
 name = "aither-command"
-path = "tools/command"
 git_tag_name = "command-v{{ version }}"
 
 [[package]]
 name = "aither-copilot"
-path = "copilot"
 git_tag_name = "copilot-v{{ version }}"
 
 [[package]]
 name = "aither-core"
-path = "core"
 git_tag_name = "core-v{{ version }}"
 
 [[package]]
 name = "aither-derive"
-path = "derive"
 git_tag_name = "derive-v{{ version }}"
 
 [[package]]
 name = "aither-fs"
-path = "tools/fs"
 git_tag_name = "fs-v{{ version }}"
 
 [[package]]
 name = "aither-gemini"
-path = "gemini"
 git_tag_name = "gemini-v{{ version }}"
 
 [[package]]
 name = "aither-llama"
-path = "llama"
 git_tag_name = "llama-v{{ version }}"
 
 [[package]]
 name = "aither-mcp"
-path = "mcp"
 git_tag_name = "mcp-v{{ version }}"
 
 [[package]]
 name = "aither-mem0"
-path = "mem0"
 git_tag_name = "mem0-v{{ version }}"
 
 [[package]]
 name = "aither-models"
-path = "models"
 git_tag_name = "models-v{{ version }}"
 
 [[package]]
 name = "aither-openai"
-path = "openai"
 git_tag_name = "openai-v{{ version }}"
 
 [[package]]
 name = "aither-ort"
-path = "ort"
 git_tag_name = "ort-v{{ version }}"
 
 [[package]]
 name = "aither-rag"
-path = "rag"
 git_tag_name = "rag-v{{ version }}"
 
 [[package]]
 name = "aither-sandbox"
-path = "sandbox"
 git_tag_name = "sandbox-v{{ version }}"
 
 [[package]]
 name = "aither-search"
-path = "tools/search"
 git_tag_name = "search-v{{ version }}"
 
 [[package]]
 name = "aither-skills"
-path = "skills"
 git_tag_name = "skills-v{{ version }}"
 
 [[package]]
 name = "aither-webfetch"
-path = "tools/webfetch"
 git_tag_name = "webfetch-v{{ version }}"
 
 [[package]]
 name = "aither-websearch"
-path = "tools/websearch"
 git_tag_name = "websearch-v{{ version }}"

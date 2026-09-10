@@ -118,13 +118,14 @@ impl<LLM: LanguageModel> AcpSession<LLM> {
                         locations: Vec::new(),
                         raw_input: serde_json::from_str(&arguments).ok(),
                         raw_output: None,
+                        meta: None,
                     }));
                 }
                 AgentEvent::ToolCallEnd { id, result, .. } => {
                     // The agent reports a typed ToolResult; ACP wants a status
                     // and the text a reader should see.
                     let status = if result.is_error() {
-                        ToolCallStatus::Error
+                        ToolCallStatus::Failed
                     } else {
                         ToolCallStatus::Completed
                     };
@@ -145,6 +146,7 @@ impl<LLM: LanguageModel> AcpSession<LLM> {
                         locations: None,
                         raw_input: None,
                         raw_output: None,
+                        meta: None,
                     }));
                 }
                 // Remaining events carry no ACP equivalent.
@@ -163,5 +165,6 @@ const fn text_chunk(text: String) -> ContentChunk {
             text,
             annotations: None,
         }),
+        message_id: None,
     }
 }

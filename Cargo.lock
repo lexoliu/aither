@@ -73,7 +73,10 @@ dependencies = [
  "aither-agent",
  "aither-core",
  "aither-mcp",
+ "async-channel",
+ "async-process",
  "futures-lite",
+ "futures-util",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -325,6 +328,7 @@ version = "0.2.0"
 dependencies = [
  "aither-core",
  "aither-sandbox",
+ "async-channel",
  "async-lock",
  "async-process",
  "blocking",

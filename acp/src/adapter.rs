@@ -20,6 +20,7 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
                 text: text.clone(),
                 annotations: None,
             }),
+            message_id: None,
         })),
 
         AgentEvent::Reasoning(text) => Some(SessionUpdate::AgentThoughtChunk(ContentChunk {
@@ -27,6 +28,7 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
                 text: text.clone(),
                 annotations: None,
             }),
+            message_id: None,
         })),
 
         AgentEvent::ToolCallStart {
@@ -42,6 +44,7 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
             locations: vec![],
             raw_input: serde_json::from_str(arguments).ok(),
             raw_output: None,
+            meta: None,
         })),
 
         AgentEvent::ToolCallDelta {
@@ -57,6 +60,7 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
             locations: None,
             raw_input: Some(serde_json::Value::String(arguments_fragment.clone())),
             raw_output: None,
+            meta: None,
         })),
 
         AgentEvent::ToolCallEnd {
@@ -72,6 +76,7 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
             locations: None,
             raw_input: None,
             raw_output: Some(tool_result_raw_output(result)),
+            meta: None,
         })),
 
         AgentEvent::RunStart { .. }
@@ -91,7 +96,7 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
 
 const fn tool_result_status(result: &ToolResult) -> ToolCallStatus {
     if result.is_error() {
-        ToolCallStatus::Error
+        ToolCallStatus::Failed
     } else {
         ToolCallStatus::Completed
     }
@@ -116,8 +121,10 @@ pub fn todos_to_plan(todos: &[TodoItem]) -> Plan {
                 content: item.content.clone(),
                 status: todo_status_to_plan_status(item.status),
                 priority: PlanEntryPriority::Medium,
+                meta: None,
             })
             .collect(),
+        meta: None,
     }
 }
 
