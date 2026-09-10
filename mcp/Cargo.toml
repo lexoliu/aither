@@ -30,11 +30,13 @@ thiserror = "2"
 blocking = "1"
 async-process = "2"
 async-lock = "3"
+# FuturesUnordered + Abortable for concurrent tools/call; see server.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tracing = "0.1"
 
 [dev-dependencies]
 futures-lite = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints]
