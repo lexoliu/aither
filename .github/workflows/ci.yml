@@ -142,10 +142,19 @@ jobs:
       os: '["ubuntu-latest"]'
       free-disk: true
 
+  # `cargo hack` expands both flags into one `cargo check` per feature
+  # combination, and over a 25-crate workspace that list cannot finish inside
+  # one job's timeout — every run was being cancelled at 45 minutes.
+  # `--partition k/8` slices the generated command list into eighths, so the
+  # same two invocations run in eight parallel jobs with identical coverage.
   feature-checks:
-    name: Features
+    name: Features (${{ matrix.part }}/8)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
       - name: Reclaim runner disk
@@ -155,18 +164,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-ubuntu
+          # Each partition gets its own cache: eight jobs sharing one key
+          # would evict each other's artifacts on every save.
+          shared-key: ci-features-${{ matrix.part }}
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack check --each-feature --no-dev-deps
+      - run: cargo hack check --each-feature --no-dev-deps --partition ${{ matrix.part }}/8
       # The full powerset of this crate's 20 features is 89,766 `cargo check`
       # runs, which no CI job can finish. Depth 2 covers every pair of features
       # — where feature-interaction bugs actually live — in 152 runs. The three
       # aggregate aliases are unions of features already covered individually
       # and pairwise, and are what makes the full powerset explode.
-      - run: cargo hack check --feature-powerset --depth 2 --exclude-features all-providers,all-tools,full --no-dev-deps
+      - run: cargo hack check --feature-powerset --depth 2 --exclude-features all-providers,all-tools,full --no-dev-deps --partition ${{ matrix.part }}/8
 
   # ------------------------------------------------------------------ coverage
   # Instrumented builds cost roughly double, and coverage of a crate that is
