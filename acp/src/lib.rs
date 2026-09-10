@@ -1,90 +1,126 @@
-//! # ACP (Agent Client Protocol) for Aither
+//! # aither-acp
 //!
-//! This crate provides an ACP server implementation for the aither ecosystem,
-//! enabling code editors like Zed, Neovim, and `JetBrains` IDEs to connect to
-//! aither agents via a standardized JSON-RPC interface.
+//! `Agent Client Protocol` (ACP) implementation for the aither agent framework.
 //!
-//! ## Overview
+//! This crate implements both directions of ACP v1:
 //!
-//! The Agent Client Protocol (ACP) standardizes communication between code editors
-//! and AI coding agents. This crate implements the server side of ACP, allowing
-//! aither agents to be used from any ACP-compatible editor.
+//! - [`AcpServer`] runs an aither [`LanguageModel`](aither_core::LanguageModel)
+//!   as an ACP agent over stdio, answering `initialize`, `session/new`,
+//!   `session/prompt`, and `session/stop` while streaming [`SessionUpdate`]
+//!   notifications.
+//! - [`AcpClient`] connects to a spawned or piped ACP agent (such as
+//!   `devin acp`) over any
+//!   [`BidirectionalTransport`](aither_mcp::transport::BidirectionalTransport),
+//!   driving sessions,
+//!   prompts, modes, and config options while a [`ClientHandler`] receives
+//!   streamed updates and answers permission, file-system, and terminal
+//!   requests from the agent.
 //!
-//! Key concepts:
-//! - **MCP**: aither acts as *client* connecting to tool servers
-//! - **ACP**: aither acts as *server* exposing the agent to editors
+//! # Protocol Overview
 //!
-//! Both protocols use JSON-RPC 2.0 over stdio, but the roles are reversed.
+//! ACP uses JSON-RPC 2.0 over newline-delimited stdio or pipes. ACP describes
+//! the client direction (editor → agent): an aither agent is the ACP **server**
+//! (agent) and [`AcpClient`] plays the ACP **client** (editor) role.
 //!
-//! ## Running as an ACP Server
+//! # Client
 //!
-//! To expose an aither agent as an ACP server:
+//! ```no_run
+//! use aither_acp::{AcpClient, ContentBlock, TextContent};
+//! # use aither_acp::{ClientCapabilities, ClientHandler, SessionNotification};
+//! # use aither_acp::{RequestPermissionParams, RequestPermissionResult, RequestPermissionOutcome};
+//! # use aither_mcp::protocol::JsonRpcError;
+//! # use std::future::Future;
 //!
-//! ```ignore
-//! use aither_acp::AcpServer;
+//! # struct H;
+//! # impl ClientHandler for H {
+//! #     fn session_update(&self, _: SessionNotification) -> impl Future<Output = ()> + Send {
+//! #         async {}
+//! #     }
+//! #     fn request_permission(&self, _: RequestPermissionParams)
+//! #         -> impl Future<Output = Result<RequestPermissionResult, JsonRpcError>> + Send
+//! #     {
+//! #         async { Ok(RequestPermissionResult { outcome: RequestPermissionOutcome::Cancelled, meta: None }) }
+//! #     }
+//! # }
+//! # async fn run() -> Result<(), aither_acp::ClientError> {
+//! let (client, connection) = AcpClient::spawn(
+//!     "devin",
+//!     &["acp"],
+//!     [],
+//!     "/tmp",
+//!     H,
+//! )?;
+//! tokio::spawn(connection);
 //!
-//! // Create and run the ACP server over stdio
-//! let mut server = AcpServer::stdio("my-agent", "1.0.0");
-//! server.run().await?;
+//! let init = client.initialize().await?;
+//! let session = client.new_session("/tmp", vec![]).await?;
+//! let result = client
+//!     .prompt(&session.session_id, vec![ContentBlock::Text(TextContent {
+//!         text: "hi".to_string(),
+//!         annotations: None,
+//!     })])
+//!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
-//! ## Editor Integration
+//! # Server
 //!
-//! ### Zed
+//! ```no_run
+//! use aither_acp::{AcpError, AcpServer};
+//! use aither_agent::Agent;
+//! use aither_core::LanguageModel;
+//! use aither_core::llm::{Event, LLMRequest, model::Profile};
+//! use futures_lite::{Stream, stream};
+//! use std::future::Future;
 //!
-//! Add to your Zed settings (`settings.json`):
+//! #[derive(Clone)]
+//! struct EchoModel;
 //!
-//! ```json
-//! {
-//!   "agents": [{
-//!     "name": "aither",
-//!     "command": "aither",
-//!     "args": ["--acp"]
-//!   }]
+//! #[derive(Debug)]
+//! struct EchoError;
+//! impl std::fmt::Display for EchoError {
+//!     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//!         f.write_str("echo model error")
+//!     }
 //! }
+//! impl std::error::Error for EchoError {}
+//!
+//! impl LanguageModel for EchoModel {
+//!     type Error = EchoError;
+//!
+//!     fn respond(&self, _request: LLMRequest) -> impl Stream<Item = Result<Event, EchoError>> + Send {
+//!         stream::once(Ok(Event::Text("Hello from ACP".to_string())))
+//!     }
+//!
+//!     fn profile(&self) -> impl Future<Output = Profile> + Send {
+//!         std::future::ready(Profile::new("echo", "test", "echo", "Echo model", 128_000))
+//!     }
+//! }
+//!
+//! # async fn run() -> Result<(), AcpError> {
+//! let mut server = AcpServer::stdio("echo-agent", "0.1.0", |_cwd| async {
+//!     Ok::<_, AcpError>(Agent::new(EchoModel))
+//! });
+//! server.run().await
+//! # }
 //! ```
 //!
-//! ### Protocol Flow
+//! # Error Handling
 //!
-//! 1. Editor launches agent process with ACP flag
-//! 2. Editor sends `initialize` request with capabilities
-//! 3. Agent responds with its capabilities
-//! 4. Editor sends `session/new` to create a conversation
-//! 5. Editor sends `session/prompt` requests for user messages
-//! 6. Agent streams `session/update` notifications with responses
-//! 7. Agent returns `PromptResult` when turn is complete
-//!
-//! ## Session Updates
-//!
-//! During prompt processing, the agent sends various update notifications:
-//!
-//! - `AgentThoughtChunk`: Internal reasoning (extended thinking)
-//! - `AgentMessageChunk`: Response text being generated
-//! - `Plan`: Task list updates (from `TodoWrite`)
-//! - `ToolCall`: Tool execution started
-//! - `ToolCallUpdate`: Tool execution progress/completion
-//!
-//! ## Architecture
-//!
-//! ```text
-//! ┌─────────────────┐         JSON-RPC/stdio         ┌──────────────────┐
-//! │   Code Editor   │  ──────────────────────────▶  │  aither-acp      │
-//! │   (Zed, etc.)   │  ◀──────────────────────────  │  (ACP Server)    │
-//! └─────────────────┘                               └────────┬─────────┘
-//!                                                            │
-//!                                                            ▼
-//!                                                   ┌──────────────────┐
-//!                                                   │  aither-agent    │
-//!                                                   │  Agent<A,B,F,H>  │
-//!                                                   └──────────────────┘
-//! ```
+//! [`ClientError`] distinguishes a closed transport (with the agent's exit
+//! status when it ran as a child process), a JSON-RPC error returned by the
+//! agent, and a protocol violation. When the connection closes, every pending
+//! request fails rather than hanging.
 
 mod adapter;
-pub mod protocol;
+mod client;
+mod protocol;
 mod server;
 mod session;
 
 pub use adapter::{agent_event_to_session_update, todos_to_plan};
-pub use protocol::{AcpError, Result};
+pub use client::{AcpClient, ClientError, ClientHandler};
+pub use protocol::*;
 pub use server::AcpServer;
 pub use session::AcpSession;

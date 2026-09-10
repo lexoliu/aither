@@ -2,13 +2,15 @@
 //!
 //! This transport spawns a subprocess and communicates with it via stdio pipes.
 
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use async_process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use futures_lite::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::debug;
+use futures_lite::io::{AsyncWriteExt, BufReader};
+use tracing::{debug, warn};
 
-use super::traits::{Result, Transport};
+use super::lines::read_message;
+use super::traits::{BidirectionalTransport, Result, Transport};
 use crate::protocol::{
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError, RequestId,
 };
@@ -24,6 +26,13 @@ pub struct ChildProcessTransport {
     stdin: ChildStdin,
     /// Child's stdout for reading.
     stdout: BufReader<ChildStdout>,
+    /// Bytes already consumed from stdout that do not yet form a complete
+    /// message.
+    ///
+    /// Keeping the buffer in the transport rather than in the read future
+    /// makes `recv` cancellation-safe: dropping the future mid-line loses
+    /// nothing.
+    read_buf: Vec<u8>,
     /// Next request ID.
     next_id: AtomicI64,
     /// Whether the transport is closed.
@@ -52,30 +61,28 @@ impl ChildProcessTransport {
     pub fn spawn(program: &str, args: &[&str]) -> Result<Self> {
         debug!("Spawning MCP server: {} {:?}", program, args);
 
-        let mut child = Command::new(program)
-            .args(args)
+        Self::from_command(Command::new(program).args(args))
+    }
+
+    /// Spawn a child process transport from a prepared [`Command`].
+    ///
+    /// Stdin and stdout are piped for JSON-RPC traffic; stderr is inherited so
+    /// diagnostics from the child reach the parent's stderr. Use this instead
+    /// of [`spawn`](Self::spawn) when the child needs a custom environment or
+    /// working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process cannot be spawned or its pipes cannot
+    /// be captured.
+    pub fn from_command(command: &mut Command) -> Result<Self> {
+        let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| McpError::Transport("Failed to capture child stdin".to_string()))?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| McpError::Transport("Failed to capture child stdout".to_string()))?;
-
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            next_id: AtomicI64::new(1),
-            closed: false,
-        })
+        Self::from_child(child)
     }
 
     /// Create a transport from an existing child process.
@@ -102,6 +109,7 @@ impl ChildProcessTransport {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            read_buf: Vec::new(),
             next_id: AtomicI64::new(1),
             closed: false,
         })
@@ -125,20 +133,7 @@ impl ChildProcessTransport {
 
     /// Read a message from the child's stdout.
     async fn read_message(&mut self) -> Result<Option<JsonRpcMessage>> {
-        let mut line = String::new();
-        match self.stdout.read_line(&mut line).await {
-            Ok(0) => Ok(None), // EOF
-            Ok(_) => {
-                let line = line.trim();
-                if line.is_empty() {
-                    return Ok(None);
-                }
-                debug!("MCP RX: {}", line);
-                let msg: JsonRpcMessage = serde_json::from_str(line)?;
-                Ok(Some(msg))
-            }
-            Err(e) => Err(McpError::Io(e)),
-        }
+        read_message(&mut self.stdout, &mut self.read_buf).await
     }
 }
 
@@ -181,5 +176,46 @@ impl Transport for ChildProcessTransport {
         let _ = self.child.kill();
         let _ = self.child.status().await;
         Ok(())
+    }
+
+    async fn exit_status(&mut self) -> Option<ExitStatus> {
+        if let Ok(Some(status)) = self.child.try_status() {
+            Some(status)
+        } else {
+            // The pipe is gone but the child is still running; it can no
+            // longer be reached, so collect a real status by reaping it.
+            let _ = self.child.kill();
+            self.child.status().await.ok()
+        }
+    }
+}
+
+impl BidirectionalTransport for ChildProcessTransport {
+    async fn recv(&mut self) -> Result<Option<JsonRpcMessage>> {
+        if self.closed {
+            return Ok(None);
+        }
+        loop {
+            match self.read_message().await {
+                Err(McpError::Serialization(error)) => {
+                    warn!(%error, "ignoring invalid JSON-RPC input");
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn respond(&mut self, response: JsonRpcResponse) -> Result<()> {
+        if self.closed {
+            return Err(McpError::ConnectionClosed);
+        }
+        self.write_message(serde_json::to_string(&response)?).await
+    }
+
+    async fn send_request(&mut self, req: JsonRpcRequest) -> Result<()> {
+        if self.closed {
+            return Err(McpError::ConnectionClosed);
+        }
+        self.write_message(serde_json::to_string(&req)?).await
     }
 }
