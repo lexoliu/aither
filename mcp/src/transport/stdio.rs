@@ -163,9 +163,81 @@ impl BidirectionalTransport for StdioTransport {
 
 #[cfg(test)]
 mod tests {
-    use futures_lite::io::{BufReader, Cursor};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use futures_lite::io::{AsyncRead, BufReader, Cursor};
 
     use super::read_message;
+
+    /// A reader that behaves like `Unblock<Stdin>` at EOF: the first poll
+    /// after the data reports EOF, every later poll goes `Pending` because a
+    /// fresh read has been handed to the blocking pool. `futures-lite`'s
+    /// `fill_buf` polls twice and panics on that second `Pending`.
+    struct PendingAfterEof {
+        data: Cursor<&'static [u8]>,
+        eof_reported: bool,
+    }
+
+    impl AsyncRead for PendingAfterEof {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.eof_reported {
+                return Poll::Pending;
+            }
+            let read = futures_lite::ready!(Pin::new(&mut self.data).poll_read(cx, buf))?;
+            if read == 0 {
+                self.eof_reported = true;
+            }
+            Poll::Ready(Ok(read))
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_after_the_last_message_closes_the_transport() {
+        let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+        let mut reader = BufReader::new(PendingAfterEof {
+            data: Cursor::new(input),
+            eof_reported: false,
+        });
+        let mut read_buf = Vec::new();
+
+        assert!(
+            read_message(&mut reader, &mut read_buf)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            read_message(&mut reader, &mut read_buf)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_final_line_is_still_a_message() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+        let mut reader = BufReader::new(Cursor::new(input));
+        let mut read_buf = Vec::new();
+
+        assert!(
+            read_message(&mut reader, &mut read_buf)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            read_message(&mut reader, &mut read_buf)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn blank_lines_do_not_close_the_transport() {
