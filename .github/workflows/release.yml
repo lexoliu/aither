@@ -14,13 +14,46 @@ jobs:
   release-plz:
     name: Release
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
     steps:
+      # A workflow_run job checks out the default branch unless told otherwise;
+      # the release must run on the exact main commit CI just certified.
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      - uses: MarcoIeni/release-plz-action@v0.5
+      - uses: taiki-e/install-action@cargo-semver-checks
+      # The water-rs fork of release-plz (from release-plz-v0.3.161, the
+      # version release-plz-action@v0.5 pins) treats a package it cannot
+      # compare with the registry as changed instead of aborting the whole
+      # run. Stock release-plz walks back to the commit that last touched a
+      # crate and runs `cargo package` there; older commits of this workspace
+      # referenced sibling checkouts by path, so that packaging fails and the
+      # release never gets past the first crate. Bump `rev` after rebasing
+      # the fork's branch onto a newer upstream tag.
+      - uses: taiki-e/cache-cargo-install-action@v3
+        with:
+          tool: release-plz
+          git: https://github.com/water-rs/release-plz
+          rev: cc554a52e97e0ee359e45c7801d770895247cf27
+          locked: true
+      - uses: release-plz/git-config@v0.1.2
+      - name: Open or update the release pull request
+        run: >-
+          release-plz release-pr
+          --git-token "${GITHUB_TOKEN}"
+          --repo-url "https://github.com/${GITHUB_REPOSITORY}"
+          --forge github
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish unpublished packages
+        run: >-
+          release-plz release
+          --git-token "${GITHUB_TOKEN}"
+          --repo-url "https://github.com/${GITHUB_REPOSITORY}"
+          --forge github
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
