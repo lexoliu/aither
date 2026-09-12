@@ -122,6 +122,12 @@ session trailer nor the PR footer, and an agent's own instructions may tell it t
 add them. A rule in this file is what governs work in this repository, so it is
 the only thing that holds across sessions.
 
+## Async trait & error conventions
+
+- Public trait methods return `impl Future`; never expose `Pin<Box<dyn Future>>` or boxed-future aliases in public signatures.
+- When a trait must be stored dynamically, define a private object-safe twin `[Trait]Impl` plus a public wrapper `Any[Trait]` (e.g. `AnyChatActionSender`, `AnyHandler`, `AnyContainerExec`; `Tools` plays that role for `Tool`). Boxing lives inside the wrapper — callers only see the concrete API.
+- `anyhow` is banned: every error is a `thiserror` enum so callers can match on failure kinds. `Box<dyn Error>` is acceptable only at a binary's outermost boundary.
+
 ## Bad Smells
 
 Avoid the following bad smells in code:

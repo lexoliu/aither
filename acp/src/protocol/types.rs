@@ -313,6 +313,44 @@ pub struct SessionLoadResult {
     pub meta: Option<Value>,
 }
 
+/// Resume session request parameters (`session/resume`).
+///
+/// Unlike `session/load`, resuming restores the session's context inside the
+/// agent without replaying its history back as `session/update`
+/// notifications — for clients that do not need the transcript re-sent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionResumeParams {
+    /// Session ID to resume.
+    pub session_id: String,
+    /// Working directory. Must match the session's `cwd`.
+    pub cwd: PathBuf,
+    /// MCP servers to connect to.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerSpec>,
+    /// Additional workspace roots. Each path must be absolute.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<PathBuf>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+/// Resume session response (`session/resume`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionResumeResult {
+    /// Initial mode state, if the agent supports session modes.
+    #[serde(default)]
+    pub modes: Option<SessionModeState>,
+    /// Configuration options, if the agent supports them.
+    #[serde(default)]
+    pub config_options: Option<Vec<ConfigOption>>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
 /// Set session mode request parameters (`session/set_mode`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -596,7 +634,7 @@ pub struct SessionCancelParams {
 // Content Types
 // =============================================================================
 
-/// Content block (text, image, resource).
+/// Content block (text, image, audio, resource).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ContentBlock {
@@ -604,6 +642,8 @@ pub enum ContentBlock {
     Text(TextContent),
     /// Image content.
     Image(ImageContent),
+    /// Audio content.
+    Audio(AudioContent),
     /// Resource content.
     Resource(ResourceContent),
 }
@@ -622,6 +662,16 @@ pub struct TextContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageContent {
+    /// Base64-encoded data.
+    pub data: String,
+    /// MIME type.
+    pub mime_type: String,
+}
+
+/// Audio content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioContent {
     /// Base64-encoded data.
     pub data: String,
     /// MIME type.
@@ -1375,4 +1425,47 @@ pub struct TerminalReleaseResult {
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `audio` content blocks use the ACP `audio` tag and `mimeType` key,
+    /// and round-trip back into the same variant.
+    #[test]
+    fn audio_content_block_serializes_with_audio_tag() {
+        let block = ContentBlock::Audio(AudioContent {
+            data: "AAAA".to_string(),
+            mime_type: "audio/ogg".to_string(),
+        });
+        let json = serde_json::to_value(&block).expect("serializes");
+        assert_eq!(json["type"], "audio");
+        assert_eq!(json["mimeType"], "audio/ogg");
+        let parsed: ContentBlock = serde_json::from_value(json).expect("deserializes");
+        assert!(matches!(parsed, ContentBlock::Audio(_)));
+    }
+
+    /// `session/resume` params use camelCase keys and skip empty
+    /// `additionalDirectories`; the advertised capability deserializes from
+    /// an empty object.
+    #[test]
+    fn session_resume_wire_format() {
+        let params = SessionResumeParams {
+            session_id: "s1".to_string(),
+            cwd: PathBuf::from("/tmp/chat"),
+            mcp_servers: vec![],
+            additional_directories: vec![],
+            meta: None,
+        };
+        let json = serde_json::to_value(&params).expect("serializes");
+        assert_eq!(json["sessionId"], "s1");
+        assert_eq!(json["cwd"], "/tmp/chat");
+        assert!(json.get("additionalDirectories").is_none());
+
+        let caps: SessionCapabilities =
+            serde_json::from_str(r#"{"resume":{}}"#).expect("deserializes");
+        assert!(caps.resume.is_some());
+        assert!(caps.close.is_none());
+    }
 }

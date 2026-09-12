@@ -93,7 +93,7 @@ pub use network_policy::{
 pub use output::{Content, MediaResolution, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{PermissionHandler, TerminalMode};
 pub use shell_session::{
-    ContainerExec, ContainerExecHandle, ContainerExecOutcome, ContainerShellRuntime, ShellBackend,
+    AnyContainerExec, ContainerExec, ContainerExecOutcome, ContainerShellRuntime, ShellBackend,
     ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile, SshServer,
     SshSessionAuthorizer, bootstrap_ssh_runtime,
 };

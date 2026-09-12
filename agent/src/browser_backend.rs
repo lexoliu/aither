@@ -1,8 +1,5 @@
 //! Browser backend abstraction for interactive browser automation.
 
-use std::future::Future;
-use std::pin::Pin;
-
 /// Error returned by browser backend operations.
 #[derive(Debug, Clone)]
 pub struct BrowserBackendError {
@@ -33,9 +30,7 @@ impl std::error::Error for BrowserBackendError {}
 /// cloud browser providers.
 pub trait BrowserBackend: Send + Sync {
     /// Returns a CDP endpoint URL for Playwright/browser clients.
-    fn cdp_endpoint(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<String, BrowserBackendError>> + Send + '_>>;
+    fn cdp_endpoint(&self) -> impl Future<Output = Result<String, BrowserBackendError>> + Send;
 }
 
 /// Fixed CDP backend backed by a static endpoint string.
@@ -55,9 +50,7 @@ impl StaticCdpBrowser {
 }
 
 impl BrowserBackend for StaticCdpBrowser {
-    fn cdp_endpoint(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<String, BrowserBackendError>> + Send + '_>> {
-        Box::pin(async move { Ok(self.endpoint.clone()) })
+    fn cdp_endpoint(&self) -> impl Future<Output = Result<String, BrowserBackendError>> {
+        std::future::ready(Ok(self.endpoint.clone()))
     }
 }
