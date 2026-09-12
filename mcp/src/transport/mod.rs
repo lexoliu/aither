@@ -10,6 +10,7 @@ mod duplex;
 mod http;
 mod lines;
 mod stdio;
+mod stream;
 mod traits;
 
 #[cfg(feature = "client")]
@@ -18,4 +19,5 @@ pub use duplex::DuplexTransport;
 #[cfg(feature = "http")]
 pub use http::HttpTransport;
 pub use stdio::StdioTransport;
+pub use stream::StreamTransport;
 pub use traits::{BidirectionalTransport, Transport};

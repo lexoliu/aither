@@ -36,8 +36,9 @@ pub trait ContainerExec: Send + Sync {
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
 }
 
-/// Object-safe container execution trait.
-pub trait ContainerExecObject: Send + Sync {
+/// Object-safe twin of [`ContainerExec`], used only through
+/// [`AnyContainerExec`].
+pub trait ContainerExecImpl: Send + Sync {
     /// Execute a command inside a container through a boxed future.
     fn exec_boxed<'a>(
         &'a self,
@@ -56,18 +57,17 @@ pub trait ContainerExecObject: Send + Sync {
 /// type that can be passed around without exposing runtime-specific concrete
 /// executor types.
 #[derive(Clone)]
-pub struct ContainerExecHandle {
-    inner: Arc<dyn ContainerExecObject>,
+pub struct AnyContainerExec {
+    inner: Arc<dyn ContainerExecImpl>,
 }
 
-impl std::fmt::Debug for ContainerExecHandle {
+impl std::fmt::Debug for AnyContainerExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ContainerExecHandle")
-            .finish_non_exhaustive()
+        f.debug_struct("AnyContainerExec").finish_non_exhaustive()
     }
 }
 
-impl ContainerExecHandle {
+impl AnyContainerExec {
     /// Creates a new handle from a concrete container executor implementation.
     #[must_use]
     pub fn new<T>(inner: Arc<T>) -> Self
@@ -78,7 +78,7 @@ impl ContainerExecHandle {
     }
 }
 
-impl ContainerExec for ContainerExecHandle {
+impl ContainerExec for AnyContainerExec {
     fn exec(
         &self,
         container_id: &str,
@@ -111,7 +111,7 @@ impl ContainerExec for ContainerExecHandle {
 /// Container runtime session metadata.
 #[derive(Clone)]
 pub struct ContainerShellRuntime {
-    exec: Arc<dyn ContainerExecObject>,
+    exec: Arc<dyn ContainerExecImpl>,
     container_id: String,
     ipc_host: String,
 }
@@ -134,7 +134,7 @@ impl ContainerShellRuntime {
     pub fn new(
         container_id: impl Into<String>,
         ipc_host: impl Into<String>,
-        exec: ContainerExecHandle,
+        exec: AnyContainerExec,
     ) -> Self {
         let container_id = container_id.into();
         let ipc_host = ipc_host.into();
@@ -165,12 +165,12 @@ impl ContainerShellRuntime {
         &self.ipc_host
     }
 
-    pub(crate) fn exec(&self) -> Arc<dyn ContainerExecObject> {
+    pub(crate) fn exec(&self) -> Arc<dyn ContainerExecImpl> {
         Arc::clone(&self.exec)
     }
 }
 
-impl<T: ContainerExec> ContainerExecObject for T {
+impl<T: ContainerExec> ContainerExecImpl for T {
     fn exec_boxed<'a>(
         &'a self,
         container_id: &'a str,
