@@ -16,12 +16,19 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
+    # release-plz/git-config reads GITHUB_TOKEN to name the bot committer, and
+    # both release-plz commands take it, so it is a job-level variable.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      # A workflow_run job checks out the default branch unless told otherwise;
-      # the release must run on the exact main commit CI just certified.
+      # A workflow_run job checks out the default branch unless told otherwise.
+      # release-plz needs a branch with an upstream (it runs `git rev-parse
+      # @{upstream}`), so this is the branch, not the certified sha; the job is
+      # gated on that branch being main and nothing lands there between CI and
+      # this run except by a merge that starts its own CI.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: main
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-semver-checks
@@ -52,7 +59,6 @@ jobs:
           --repo-url "https://github.com/${GITHUB_REPOSITORY}"
           --forge github
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
       - name: Publish unpublished packages
         run: >-
@@ -61,5 +67,4 @@ jobs:
           --repo-url "https://github.com/${GITHUB_REPOSITORY}"
           --forge github
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
