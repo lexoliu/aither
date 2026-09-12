@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Local llama.cpp provider integration for aither"
 readme = "../README.md"
-keywords = ["ai", "llm", "llama", "llama.cpp", "embedding"]
+keywords = ["ai", "llm", "llama", "llama-cpp", "embedding"]
 categories = ["api-bindings"]
 
 [dependencies]
