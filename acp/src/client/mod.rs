@@ -36,8 +36,8 @@ use crate::protocol::{
     ConfigOption, ContentBlock, Implementation, InitializeParams, InitializeResult, McpServerSpec,
     PROTOCOL_VERSION, PromptParams, PromptResult, SessionCancelParams, SessionConfigValue,
     SessionLoadParams, SessionLoadResult, SessionNewParams, SessionNewResult, SessionNotification,
-    SessionSetConfigOptionParams, SessionSetConfigOptionResult, SessionSetModeParams,
-    SessionSetModeResult,
+    SessionResumeParams, SessionResumeResult, SessionSetConfigOptionParams,
+    SessionSetConfigOptionResult, SessionSetModeParams, SessionSetModeResult,
 };
 
 /// An outbound message plus, for requests, the channel that receives the
@@ -233,6 +233,36 @@ impl<H: ClientHandler> AcpClient<H> {
         self.call(
             "session/load",
             &SessionLoadParams {
+                session_id: session_id.to_string(),
+                cwd: cwd.into(),
+                mcp_servers,
+                additional_directories: Vec::new(),
+                meta: None,
+            },
+        )
+        .await
+    }
+
+    /// `session/resume` request.
+    ///
+    /// Only valid when the agent advertised
+    /// [`SessionCapabilities::resume`](crate::protocol::SessionCapabilities::resume).
+    /// Restores the session's context inside the agent without replaying its
+    /// history as `session/update` notifications.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed or the agent replies with
+    /// an error or a malformed result.
+    pub async fn resume_session(
+        &self,
+        session_id: &str,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServerSpec>,
+    ) -> Result<SessionResumeResult, ClientError> {
+        self.call(
+            "session/resume",
+            &SessionResumeParams {
                 session_id: session_id.to_string(),
                 cwd: cwd.into(),
                 mcp_servers,
