@@ -71,22 +71,25 @@ jobs:
         run: |
           set -euo pipefail
           deadline=$(( $(date +%s) + 5400 ))
+          # Outside the checkout: `cargo publish` refuses a dirty package dir,
+          # and the root crate's package dir is the repository root.
+          checks_file="${RUNNER_TEMP}/checks.tsv"
           while :; do
             gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100" \
               --jq '.check_runs[] | select(.name != "Release") | [.name, (.conclusion // "pending")] | @tsv' \
-              > checks.tsv || true
-            if [ ! -s checks.tsv ]; then
+              > "${checks_file}" || true
+            if [ ! -s "${checks_file}" ]; then
               echo "no check runs on ${GITHUB_SHA} yet"
-            elif grep -E '\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' checks.tsv; then
+            elif grep -E '\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' "${checks_file}"; then
               echo "::error::a check on ${GITHUB_SHA} did not pass (see list above)"
               exit 1
-            elif ! grep -q $'\tpending$' checks.tsv; then
+            elif ! grep -q $'\tpending$' "${checks_file}"; then
               echo "all checks on ${GITHUB_SHA} passed"
               exit 0
             fi
             if [ "$(date +%s)" -gt "${deadline}" ]; then
               echo "::error::timed out waiting for checks on ${GITHUB_SHA}"
-              cat checks.tsv
+              cat "${checks_file}"
               exit 1
             fi
             sleep 30
