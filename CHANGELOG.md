@@ -1,0 +1,197 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.3.0](https://github.com/lexoliu/aither/compare/v0.2.0...v0.3.0) - 2026-09-11
+
+### Added
+
+- *(acp)* add the client side of the Agent Client Protocol
+- *(llm)* [**breaking**] adaptive thinking, wider effort ladder, reasoning-state round-trip
+- provider-native tools, sandbox network audit, and handoff file index
+- structured terminal errors + BackgroundReason with timer grace window
+- add Event::ToolCallDelta for streaming tool call progress
+- *(agent)* expose rolling KV-cache statistics on Agent
+- *(agent)* add TerminalAgentBuilder::system_text
+- *(agent)* add AgentBuilder::system_text for raw prose blocks
+- *(agent)* add raw-text system blocks and prefix fingerprint
+- apply local workspace changes
+- add pdf-to-xml crate with in-process Paddle OCR backend
+- add local mistral and llama providers
+- add support for file attachments in OpenAI API
+- *(openai)* enable parallel tool calls
+- *(openai)* add Responses API streaming and subagent feedback
+- *(cli)* add interactive CLI for testing agents
+- *(core)* add ToolChoice enum for tool calling policy
+- *(mcp)* add MCP client and server support
+- *(webfetch)* add web fetching tool for agents
+- *(core)* add Event-based streaming API for LanguageModel
+- *(skills)* add aither-skills crate for dynamic workflow plugins
+- *(ort)* add local ONNX Runtime embedding model support
+- *(websearch)* add real web search providers using zenwave
+- *(rag)* redesign crate with modular production-ready architecture
+- remove obsolete documentation job and update release configuration
+- streamline test workflow by removing redundant build and documentation test steps
+- refactor CI/CD workflows by removing obsolete release management and enhancing test configurations
+- enhance CI/CD workflows and add skip-check logic for release management
+- Implement memory extraction and management tools
+- enhance provider integrations and add convenience features in Cargo.toml files
+- update error handling to use BoxHttpError across multiple modules
+- add aither-llama integration with initial implementation and dependencies
+- add Mem0 extraction/update demo and core library implementation for long-term memory management
+- implement Coder and DeepResearchAgent for enhanced coding workflows and research capabilities
+- enhance aither-rag with new indexing capabilities, async processing, and improved README examples
+- enhance filesystem interface with async read, write, append, and directory operations
+- add initial implementation of aither-rag with README, Cargo.toml, and example
+- add thinking configuration and reasoning capabilities to moderation and content generation
+- update CI workflows, add tests for multiple OS, and remove deprecated release-plz workflow
+- enhance agent framework with memory management, planning, and execution capabilities
+- implement conversation memory management with compression strategies
+- Implement agent framework with planning and execution capabilities, add sub-agent and todo list management
+- Add Gemini backend integration with audio, image, and moderation capabilities
+- Add OpenRouter support and update API base URLs for Deepseek and OpenRouter
+- Add OpenAI integration with support for various models and functionalities
+
+### Fixed
+
+- *(release)* drop config keys release-plz does not define
+- normalise line endings to LF so templates render identically
+- *(mcp)* drive stdio over blocking threads so Windows builds
+- *(openai)* stop sending Chat-Completions-only params to the Responses API
+- *(llama)* restore the thinking toggle and model-side tool-call parsing
+- fix sandbox background terminal stdin and task tracking
+- *(agent)* improve subagent display hook with detailed feedback
+- *(openai)* improve Gemini compatibility and tool calling
+- *(mem0)* wrap embedder in Mutex for interior mutability
+- correct formatting of URL in Mem0 extraction/update demo documentation
+- run Formatter
+
+### Other
+
+- describe how CRLF actually damages the wrapper script
+- ignore the paste unmaintained advisory
+- clear five advisories, and stop building two copies of Arrow
+- state that commits carry no tool attribution
+- drop the dependencies nothing uses, and fix a real typo
+- collapse nested conditionals into let-chains
+- *(sandbox)* depend on heel from crates.io instead of a sibling checkout
+- release every workspace member, and let aither-browser be packaged
+- declare the Rust 1.88 the code already requires
+- make the workspace clippy-clean under -D warnings
+- *(sandbox)* [**breaking**] follow heel's IpcCommand onto per-instance naming
+- Merge production-readiness work into dev
+- *(skills)* drop prompt-trigger auto-activation
+- *(sandbox)* enable tokio macros feature
+- *(browser)* extract browser tool protocol into aither workspace
+- *(search)* extract search tool into aither workspace crate
+- checkpoint current workspace changes
+- Finish tool result and terminal refactors
+- Improve terminal stdin wait detection
+- Actorize mem0 runtime
+- Run ORT inference on a worker thread
+- Store HNSW index state as snapshots
+- Collapse mem0 runtime locks
+- Store CLI domain approvals as snapshots
+- Store request approver state as snapshots
+- Store virtual filesystem state as snapshots
+- Drop unused container IPC socket field
+- Refine MCP tool service loop
+- Read Claude attachments asynchronously
+- Read Gemini attachments asynchronously
+- Read Copilot attachments asynchronously
+- Read OpenAI attachments asynchronously
+- Fetch model cache asynchronously
+- Stop blocking inside mem0 async paths
+- Simplify CLI domain approval state
+- Load llama model listings asynchronously
+- Drop synchronous subagent file loaders
+- Remove mutex from mistral model cache
+- Store todo list as snapshots
+- Simplify aither string assembly
+- Advertise skill resource catalogs
+- Test terminal first tool exposure
+- Remove mutex from request approver
+- Advertise skill resource catalogs
+- Cover skill allowlist enforcement
+- Cover skill checkpoint restoration
+- Emit permission pause lifecycle from bash
+- Normalize aither runtime formatting
+- Structure subagent tool results
+- Emit pause lifecycle for interactive tools
+- Avoid duplicate skill prompt entries
+- Bind ask-user requests to session context
+- Persist active skills in checkpoints
+- Wire skill registries into runtime activation
+- Activate skills during agent runs
+- Preserve turn accounting after background continuation
+- Emit background terminal lifecycle events
+- Include tool surface details in checkpoints
+- Bind workspace requests to session context
+- Unify container IPC argument decoding
+- Add checkpoint export API
+- Version subagent schemas and emit run lifecycle events
+- Emit turn-boundary checkpoints from agent runtime
+- Structure compaction handoff documents
+- Serialize ask context as XML
+- Remove bash agent format string helpers
+- Remove direct command format strings
+- Type bash agent prompt sections
+- Template command CLI error surfaces
+- Type container shell runtime for IPC
+- Reassemble context after idle gaps
+- Make IPC CLI argument flattening deterministic
+- Template container IPC wrapper generation
+- Add typed cloud embedding provider
+- Support sandboxed bash execution mode
+- Remove sandbox permission compatibility alias
+- Make IPC tool responses typed and fail-fast
+- Track tasks diffs in aither agent context
+- Reassemble context before compaction
+- Infer default SSH targets for bash runtimes
+- Preserve seeded system blocks on context restore
+- Add turn-boundary hooks to aither-agent
+- Serialize tool error reminders structurally
+- Serialize agent XML context structurally
+- Template agent reminder prompts
+- Prefer handoff over automatic compaction
+- Track assembled context windows in aither-agent
+- Expose serializable agent context snapshots
+- Rename agent working docs and sandbox mounts
+- Tighten native terminal tools for bash agents
+- Introduce Context and container/terminal support
+- Rename Task tool to SubagentTool
+- Enhance RAG and sandbox with semantic processing
+- Add wasm32 compatibility to aither-gemini
+- Add wasm32 target compatibility for aither-openai
+- Refactor and improve code quality across multiple modules
+- remove pdf_process crate and switch to CLI document tools (Docling/Marker)
+- make pdf bundle export async with strict Pdfium and typed OCR config
+- improve code formatting and readability across multiple files
+- Add shell session management, multi-question ask_user, and transcript
+- Add UI tool request infrastructure and tools
+- Merge fix-code-smells
+- Integrate new features
+- Derive tool descriptions from args rustdoc comments
+- Add ask command and YAML frontmatter for subagents
+- Add sandboxed bash tool and bash-first agent
+- Add WebFetch tool and improve tool handling
+- Add model registry and tiered model groups
+- Add permission prompts and filesystem delete support
+- *(mcp)* add Context7 example and fix HTTP transport
+- format code with cargo fmt
+- remove llama crate and update release config
+- *(examples)* update for Event-based streaming API
+- add skills and webfetch to workspace
+- *(agent)* redesign with minimal core and hook system
+- *(providers)* update to Event-based streaming API
+- add aither-ort to workspace dependencies
+- *(rag)* update to use &mut self for embedding operations
+- *(core)* change EmbeddingModel::embed to take &mut self
+- Update OpenAI Responses integration
+- Add repository guidelines, integrate Claude and OpenAI modules, and update workspace configuration
+- Update rust-version in Cargo.toml to 1.87 and optimize methods in ModerationResult to const
