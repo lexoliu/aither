@@ -1,10 +1,9 @@
 name: Release
 
 on:
-  workflow_run:
-    workflows: ["CI"]
+  push:
     branches: [main]
-    types: [completed]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,17 +14,13 @@ jobs:
   release-plz:
     name: Release
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
     # release-plz/git-config reads GITHUB_TOKEN to name the bot committer, and
     # both release-plz commands take it, so it is a job-level variable.
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      # A workflow_run job checks out the default branch unless told otherwise.
-      # release-plz needs a branch with an upstream (it runs `git rev-parse
-      # @{upstream}`), so this is the branch, not the certified sha; the job is
-      # gated on that branch being main and nothing lands there between CI and
-      # this run except by a merge that starts its own CI.
+      # Check out the branch rather than the pushed commit: release-plz runs
+      # `git rev-parse @{upstream}`, which needs a branch with an upstream.
       - uses: actions/checkout@v4
         with:
           ref: main
@@ -50,6 +45,8 @@ jobs:
       # Every crate in this workspace has a Trusted Publishing configuration
       # pointing at this workflow, so crates.io mints a short-lived token from
       # the GitHub OIDC token and no CARGO_REGISTRY_TOKEN secret is needed.
+      # crates.io refuses to mint tokens for `workflow_run` runs, which is why
+      # this workflow fires on the main push itself.
       - uses: rust-lang/crates-io-auth-action@v1
         id: crates-io-auth
       - name: Open or update the release pull request
@@ -60,6 +57,37 @@ jobs:
           --forge github
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+      # main only accepts merges from dev whose CI went green, but publishing
+      # still waits for this exact commit's own checks: the ruleset is the
+      # gate, this wait is what makes the release follow the tested commit
+      # rather than whatever push happened to land. This job's own check run
+      # is excluded so it cannot wait on itself.
+      - name: Wait for CI on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 5400 ))
+          while :; do
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100" \
+              --jq '.check_runs[] | select(.name != "Release") | [.name, (.conclusion // "pending")] | @tsv' \
+              > checks.tsv || true
+            if [ ! -s checks.tsv ]; then
+              echo "no check runs on ${GITHUB_SHA} yet"
+            elif grep -E '\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' checks.tsv; then
+              echo "::error::a check on ${GITHUB_SHA} did not pass (see list above)"
+              exit 1
+            elif ! grep -q $'\tpending$' checks.tsv; then
+              echo "all checks on ${GITHUB_SHA} passed"
+              exit 0
+            fi
+            if [ "$(date +%s)" -gt "${deadline}" ]; then
+              echo "::error::timed out waiting for checks on ${GITHUB_SHA}"
+              cat checks.tsv
+              exit 1
+            fi
+            sleep 30
+          done
       - name: Publish unpublished packages
         run: >-
           release-plz release
