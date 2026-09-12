@@ -27,6 +27,9 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-semver-checks
+      # `cargo publish` verifies each tarball by compiling it; aither-search
+      # builds lance/prost, which needs protoc. CI installs it too.
+      - uses: arduino/setup-protoc@v3
       # The water-rs fork of release-plz (from release-plz-v0.3.161, the
       # version release-plz-action@v0.5 pins) treats a package it cannot
       # compare with the registry as changed instead of aborting the whole
