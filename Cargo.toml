@@ -30,7 +30,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Lexo Liu <me@lexo.cool>"]
 license = "MIT"
@@ -55,30 +55,30 @@ clippy.multiple_crate_versions = { level = "allow", priority = 1}
 [workspace.dependencies]
 tracing = "0.1.44"
 zenwave = "0.5"
-aither-core = { path = "./core", version = "0.2.0" }
-aither-derive = { path = "./derive", version = "0.2.0" }
-aither-ort = { path = "./ort", version = "0.2.0" }
-aither-skills = { path = "./skills", version = "0.2.0" }
-aither-attachments = { path = "./attachments", version = "0.2.0" }
-aither-browser = { path = "./tools/browser", version = "0.2.0" }
-aither-websearch = { path = "./tools/websearch", version = "0.2.0" }
-aither-webfetch = { path = "./tools/webfetch", version = "0.2.0" }
-aither-search = { path = "./tools/search", version = "0.2.0" }
-aither-fs = { path = "./tools/fs", version = "0.2.0" }
-aither-command = { path = "./tools/command", version = "0.2.0" }
-aither-mcp = { path = "./mcp", version = "0.2.0" }
-aither-acp = { path = "./acp", version = "0.2.0" }
-aither-sandbox = { path = "./sandbox", version = "0.2.0" }
-aither-agent = { path = "./agent", version = "0.2.0" }
-aither-openai = { path = "./openai", version = "0.2.0" }
-aither-claude = { path = "./claude", version = "0.2.0" }
-aither-cloud = { path = "./cloud", version = "0.2.0" }
-aither-gemini = { path = "./gemini", version = "0.2.0" }
-aither-llama = { path = "./llama", version = "0.2.0" }
-aither-copilot = { path = "./copilot", version = "0.2.0" }
-aither-models = { path = "./models", version = "0.2.0" }
-aither-rag = { path = "./rag", version = "0.2.0" }
-aither-mem0 = { path = "./mem0", version = "0.2.0" }
+aither-core = { path = "./core", version = "0.3.0" }
+aither-derive = { path = "./derive", version = "0.3.0" }
+aither-ort = { path = "./ort", version = "0.3.0" }
+aither-skills = { path = "./skills", version = "0.3.0" }
+aither-attachments = { path = "./attachments", version = "0.3.0" }
+aither-browser = { path = "./tools/browser", version = "0.3.0" }
+aither-websearch = { path = "./tools/websearch", version = "0.3.0" }
+aither-webfetch = { path = "./tools/webfetch", version = "0.3.0" }
+aither-search = { path = "./tools/search", version = "0.3.0" }
+aither-fs = { path = "./tools/fs", version = "0.3.0" }
+aither-command = { path = "./tools/command", version = "0.3.0" }
+aither-mcp = { path = "./mcp", version = "0.3.0" }
+aither-acp = { path = "./acp", version = "0.3.0" }
+aither-sandbox = { path = "./sandbox", version = "0.3.0" }
+aither-agent = { path = "./agent", version = "0.3.0" }
+aither-openai = { path = "./openai", version = "0.3.0" }
+aither-claude = { path = "./claude", version = "0.3.0" }
+aither-cloud = { path = "./cloud", version = "0.3.0" }
+aither-gemini = { path = "./gemini", version = "0.3.0" }
+aither-llama = { path = "./llama", version = "0.3.0" }
+aither-copilot = { path = "./copilot", version = "0.3.0" }
+aither-models = { path = "./models", version = "0.3.0" }
+aither-rag = { path = "./rag", version = "0.3.0" }
+aither-mem0 = { path = "./mem0", version = "0.3.0" }
 
 [dependencies]
 aither-core.workspace = true
