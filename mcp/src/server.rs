@@ -3,17 +3,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aither_core::llm::tool::Tools;
+use aither_core::llm::tool::{ToolResult, Tools};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_lite::future;
 use futures_util::future::{AbortHandle, Abortable, Aborted, BoxFuture};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tracing::debug;
 
 use crate::protocol::{
-    CallToolParams, CallToolResult, CancelledParams, InitializeParams, InitializeResult,
-    JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    ListToolsResult, McpError, McpToolDefinition, PROTOCOL_VERSION, RequestId, ServerCapabilities,
-    ServerInfo, TextContent, ToolsCapability,
+    CallToolParams, CallToolResult, CancelledParams, Content, ImageContent, InitializeParams,
+    InitializeResult, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, ListToolsResult, McpError, McpToolDefinition, PROTOCOL_VERSION, RequestId,
+    ServerCapabilities, ServerInfo, TextContent, ToolsCapability,
 };
 use crate::transport::{BidirectionalTransport, StdioTransport};
 
@@ -342,8 +343,8 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
 
         match tools.call(&params.name, &args_str).await {
             Ok(output) => {
-                let text = match output.render_for_model() {
-                    Ok(text) => text,
+                let content = match content_for(&output) {
+                    Ok(content) => content,
                     Err(error) => {
                         return JsonRpcResponse::error(
                             req.id,
@@ -352,17 +353,14 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
                     }
                 };
                 let result = CallToolResult {
-                    content: vec![crate::protocol::Content::Text(TextContent {
-                        text,
-                        annotations: None,
-                    })],
+                    content: vec![content],
                     is_error: output.is_error(),
                 };
                 JsonRpcResponse::success(req.id, result)
             }
             Err(e) => {
                 let result = CallToolResult {
-                    content: vec![crate::protocol::Content::Text(TextContent {
+                    content: vec![Content::Text(TextContent {
                         text: e.to_string(),
                         annotations: None,
                     })],
@@ -372,6 +370,29 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
             }
         }
     }
+}
+
+/// Map a tool output to the MCP content item the client receives.
+///
+/// A binary result whose MIME type's top-level type is `image` is delivered
+/// as [`Content::Image`] carrying the standard-base64 bytes and the MIME
+/// essence; every other result keeps the text representation
+/// [`ToolResult::render_for_model`] produces.
+fn content_for(output: &ToolResult) -> aither_core::Result<Content> {
+    if let Some(mime) = output.mime()
+        && mime.type_() == mime::IMAGE
+        && let Some(content) = output.content()
+    {
+        return Ok(Content::Image(ImageContent {
+            data: BASE64.encode(content),
+            mime_type: mime.essence_str().to_string(),
+            annotations: None,
+        }));
+    }
+    Ok(Content::Text(TextContent {
+        text: output.render_for_model()?,
+        annotations: None,
+    }))
 }
 
 #[cfg(test)]
@@ -545,6 +566,48 @@ mod tests {
 
         // And no response for it was ever written, though the gate was opened.
         assert!(future::poll_once(client.recv()).await.is_none());
+
+        client.close().await.expect("close");
+        server_task.await.expect("join").expect("run");
+    }
+
+    /// An image `ToolResult` arrives at the client as `Content::Image` with
+    /// the bytes standard-base64-encoded, not as a text placeholder.
+    #[tokio::test]
+    async fn image_tool_result_is_image_content() {
+        let bytes = vec![0x89, b'P', b'N', b'G', 1, 2, 3];
+
+        let mut tools = Tools::new();
+        let image_bytes = bytes.clone();
+        register(
+            &mut tools,
+            "png",
+            Box::new(move |_args| {
+                let image_bytes = image_bytes.clone();
+                Box::pin(async move { Ok(ToolResult::image(image_bytes, "image/png")) })
+            }),
+        );
+
+        let (mut client, transport) = DuplexTransport::pair();
+        let mut server = McpServer::new(transport, tools, "test-server", "0.0.0");
+        let server_task = tokio::spawn(async move { server.run().await });
+
+        client.send_request(call(1, "png")).await.expect("send");
+        let response = next_response(&mut client).await;
+        assert_eq!(response.id, RequestId::Number(1));
+
+        let result: CallToolResult =
+            serde_json::from_value(response.result.expect("result")).expect("call tool result");
+        assert!(!result.is_error);
+        let [Content::Image(image)] = result.content.as_slice() else {
+            panic!(
+                "expected exactly one image content item, got {:?}",
+                result.content
+            );
+        };
+        assert_eq!(image.mime_type, "image/png");
+        let decoded = BASE64.decode(&image.data).expect("base64 decodes");
+        assert_eq!(decoded, bytes);
 
         client.close().await.expect("close");
         server_task.await.expect("join").expect("run");
