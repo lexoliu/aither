@@ -45,21 +45,12 @@ jobs:
           rev: cc554a52e97e0ee359e45c7801d770895247cf27
           locked: true
       - uses: release-plz/git-config@v0.1.2
-      # Every crate in this workspace has a Trusted Publishing configuration
-      # pointing at this workflow, so crates.io mints a short-lived token from
-      # the GitHub OIDC token and no CARGO_REGISTRY_TOKEN secret is needed.
-      # crates.io refuses to mint tokens for `workflow_run` runs, which is why
-      # this workflow fires on the main push itself.
-      - uses: rust-lang/crates-io-auth-action@v1
-        id: crates-io-auth
       - name: Open or update the release pull request
         run: >-
           release-plz release-pr
           --git-token "${GITHUB_TOKEN}"
           --repo-url "https://github.com/${GITHUB_REPOSITORY}"
           --forge github
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
       # main only accepts merges from dev whose CI went green, but publishing
       # still waits for this exact commit's own checks: the ruleset is the
       # gate, this wait is what makes the release follow the tested commit
@@ -94,6 +85,15 @@ jobs:
             fi
             sleep 30
           done
+      # Every crate in this workspace has a Trusted Publishing configuration
+      # pointing at this workflow, so crates.io mints a short-lived token from
+      # the GitHub OIDC token and no CARGO_REGISTRY_TOKEN secret is needed.
+      # crates.io refuses to mint tokens for `workflow_run` runs, which is why
+      # this workflow fires on the main push itself. The token expires ~30
+      # minutes after minting, so it is minted here — after the CI wait —
+      # rather than at the top of the job, or the wait would burn its TTL.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: crates-io-auth
       - name: Publish unpublished packages
         run: >-
           release-plz release
