@@ -55,4 +55,8 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo test ${{ inputs.flags }}
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run ${{ inputs.flags }}
+      # cargo test never ran proc-macro doctests; keep aither-derive excluded so
+      # this step covers exactly the doctests the previous job did.
+      - run: cargo test --doc ${{ inputs.flags }} --exclude aither-derive
