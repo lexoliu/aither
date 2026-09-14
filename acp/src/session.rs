@@ -12,8 +12,8 @@ use futures_lite::StreamExt;
 use uuid::Uuid;
 
 use crate::protocol::{
-    ContentBlock, ContentChunk, McpServerSpec, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    ContentBlock, ContentChunk, McpServer, SessionUpdate, TextContent, ToolCall, ToolCallContent,
+    ToolCallStatus, ToolCallUpdate,
 };
 
 /// An active ACP session.
@@ -23,14 +23,14 @@ use crate::protocol::{
 pub struct AcpSession<LLM: LanguageModel> {
     id: String,
     cwd: PathBuf,
-    mcp_servers: Vec<McpServerSpec>,
+    mcp_servers: Vec<McpServer>,
     cancelled: Arc<AtomicBool>,
     agent: Agent<LLM, LLM, LLM>,
 }
 
 impl<LLM: LanguageModel> AcpSession<LLM> {
     /// Create a new session that drives the given agent.
-    pub fn new(cwd: PathBuf, mcp_servers: Vec<McpServerSpec>, agent: Agent<LLM, LLM, LLM>) -> Self {
+    pub fn new(cwd: PathBuf, mcp_servers: Vec<McpServer>, agent: Agent<LLM, LLM, LLM>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             cwd,
@@ -54,7 +54,7 @@ impl<LLM: LanguageModel> AcpSession<LLM> {
 
     /// Get MCP server specifications.
     #[must_use]
-    pub fn mcp_servers(&self) -> &[McpServerSpec] {
+    pub fn mcp_servers(&self) -> &[McpServer] {
         &self.mcp_servers
     }
 
@@ -72,6 +72,15 @@ impl<LLM: LanguageModel> AcpSession<LLM> {
     /// Reset cancellation flag.
     pub fn reset(&self) {
         self.cancelled.store(false, Ordering::SeqCst);
+    }
+
+    /// The shared cancellation flag for this session.
+    ///
+    /// The server tracks one per session so a `session/cancel` notification
+    /// can reach a session even while its prompt turn holds it out of the
+    /// session map.
+    pub(crate) fn cancellation(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
     }
 
     /// Run the agent over `prompt`, reporting progress through `on_update`.
@@ -139,6 +148,7 @@ impl<LLM: LanguageModel> AcpSession<LLM> {
                             content: ContentBlock::Text(TextContent {
                                 text,
                                 annotations: None,
+                                meta: None,
                             }),
                         }]),
                         title: None,
@@ -164,7 +174,9 @@ const fn text_chunk(text: String) -> ContentChunk {
         content: ContentBlock::Text(TextContent {
             text,
             annotations: None,
+            meta: None,
         }),
         message_id: None,
+        meta: None,
     }
 }

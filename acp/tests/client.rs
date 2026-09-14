@@ -1,12 +1,17 @@
 //! Tests for `AcpClient` against an in-process fake ACP agent.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use aither_acp::{
     AcpClient, ClientError, ClientHandler, ConfigOptionValue, ContentBlock, CurrentModeUpdate,
-    PROTOCOL_VERSION, ReadTextFileParams, ReadTextFileResult, RequestPermissionOutcome,
-    RequestPermissionParams, RequestPermissionResult, SessionNotification, SessionUpdate,
-    StopReason, TextContent,
+    ElicitationCompleteParams, ElicitationCreateParams, ElicitationCreateResult, ExtMethod,
+    PROTOCOL_VERSION, PromptParams, ReadTextFileParams, ReadTextFileResult,
+    RequestPermissionOutcome, RequestPermissionParams, RequestPermissionResult,
+    SessionCancelParams, SessionCloseParams, SessionDeleteParams, SessionListParams,
+    SessionLoadParams, SessionNewParams, SessionNotification, SessionResumeParams,
+    SessionSetConfigOptionParams, SessionSetModeParams, SessionUpdate, StopReason, TextContent,
+    ext, vendor,
 };
 use aither_mcp::protocol::{
     JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId,
@@ -34,6 +39,9 @@ struct FakeAgent {
     pending_prompt: Option<RequestId>,
     permission_id: Option<RequestId>,
     fs_id: Option<RequestId>,
+    elicit_id: Option<RequestId>,
+    elicit_url: bool,
+    ext_id: Option<RequestId>,
     next_id: i64,
 }
 
@@ -46,6 +54,9 @@ impl FakeAgent {
             pending_prompt: None,
             permission_id: None,
             fs_id: None,
+            elicit_id: None,
+            elicit_url: false,
+            ext_id: None,
             next_id: 1,
         };
         let log = agent.log.clone();
@@ -71,8 +82,50 @@ impl FakeAgent {
         let params = request.params.clone().unwrap_or_default();
         match request.method.as_str() {
             "initialize" => self.on_initialize(request.id).await,
+            "authenticate" => {
+                self.log(format!("authenticate:{}", params["methodId"]));
+                self.respond(request.id, json!({})).await;
+            }
+            "logout" => {
+                self.log("logout".to_string());
+                self.respond(request.id, json!({})).await;
+            }
             "session/new" => self.on_session_new(request.id).await,
             "session/load" => self.on_session_load(request.id, &params).await,
+            "session/resume" => {
+                self.log(format!("resume:{}", params["sessionId"]));
+                self.respond(request.id, json!({})).await;
+            }
+            "session/list" => {
+                self.respond(
+                    request.id,
+                    json!({
+                        "sessions": [{
+                            "sessionId": "sess-old",
+                            "cwd": "/tmp",
+                            "title": "Old session",
+                            "updatedAt": "2025-01-01T00:00:00Z",
+                        }],
+                        "nextCursor": "page-2",
+                    }),
+                )
+                .await;
+            }
+            "session/delete" => {
+                self.log(format!("delete:{}", params["sessionId"]));
+                self.respond(request.id, json!({})).await;
+            }
+            "session/close" => {
+                self.log(format!("close:{}", params["sessionId"]));
+                self.respond(request.id, json!({})).await;
+            }
+            "_session/goal" => {
+                self.log(format!("goal:{}", params["action"]));
+                self.respond(request.id, json!({})).await;
+            }
+            "_acme/ping" => {
+                self.respond(request.id, json!({"pong": true})).await;
+            }
             "session/set_mode" => {
                 self.log(format!("set_mode:{}", params["modeId"]));
                 self.respond(request.id, json!({})).await;
@@ -120,6 +173,15 @@ impl FakeAgent {
                 },
                 "agentInfo": {"name": "fake-agent", "version": "0.1.0"},
                 "authMethods": [{"id": "none", "name": "No auth"}],
+                "_meta": {
+                    "goal": {
+                        "version": 1,
+                        "controlMethod": "_session/goal",
+                        "actions": ["set", "pause", "resume", "clear"],
+                    },
+                    "steering": {"supported": true},
+                    "jetbrains": {"air": {"version": 1, "capabilities": ["sessionFailure"]}},
+                },
             }),
         )
         .await;
@@ -165,6 +227,103 @@ impl FakeAgent {
         self.respond(id, json!({})).await;
     }
 
+    /// The update burst every non-die prompt emits.
+    async fn send_turn_updates(&mut self, session_id: &str) {
+        self.send_text_chunk(session_id, "Hello ").await;
+        self.send_update(
+            session_id,
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1", "title": "fake-tool", "status": "pending",
+            }),
+        )
+        .await;
+        self.send_update(
+            session_id,
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1", "status": "in_progress",
+            }),
+        )
+        .await;
+        self.send_update(
+            session_id,
+            json!({"sessionUpdate": "acme.vendor_update", "payload": 1}),
+        )
+        .await;
+    }
+
+    /// Stream one `agent_message_chunk` carrying `text`.
+    async fn send_text_chunk(&mut self, session_id: &str, text: &str) {
+        self.send_update(
+            session_id,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text},
+            }),
+        )
+        .await;
+    }
+
+    /// Start the form- or url-mode elicitation selected by `text`.
+    async fn start_elicitation(&mut self, session_id: &str, text: &str) {
+        let elicit_params = if text == "elicit" {
+            json!({
+                "mode": "form",
+                "sessionId": session_id,
+                "message": "Who are you?",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                },
+            })
+        } else {
+            json!({
+                "mode": "url",
+                "sessionId": session_id,
+                "message": "Sign in",
+                "elicitationId": "elic-1",
+                "url": "http://localhost:8787/auth",
+            })
+        };
+        self.elicit_url = text == "elicit_url";
+        self.elicit_id = Some(self.send_request("elicitation/create", elicit_params).await);
+    }
+
+    /// Ask permission, then keep streaming while it is outstanding.
+    async fn request_permission(&mut self, session_id: &str) {
+        self.permission_id = Some(
+            self.send_request(
+                "session/request_permission",
+                json!({
+                    "sessionId": session_id,
+                    "toolCall": {
+                        "toolCallId": "tc-1",
+                        "title": "fake-tool",
+                        "status": "in_progress",
+                    },
+                    "options": [
+                        {"optionId": "allow-1", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "deny-1", "name": "Deny", "kind": "reject_once"},
+                    ],
+                }),
+            )
+            .await,
+        );
+        // Two more chunks stream while the permission request is still
+        // outstanding, then a second agent-to-client request lands.
+        self.send_text_chunk(session_id, "a").await;
+        self.send_text_chunk(session_id, "b").await;
+        self.fs_id = Some(
+            self.send_request(
+                "fs/read_text_file",
+                json!({"sessionId": session_id, "path": "/etc/hostname"}),
+            )
+            .await,
+        );
+    }
+
     async fn on_prompt(&mut self, id: RequestId, params: &Value) {
         let session_id = params["sessionId"].as_str().unwrap_or_default().to_string();
         self.session_id.clone_from(&session_id);
@@ -175,83 +334,32 @@ impl FakeAgent {
             return;
         }
         self.pending_prompt = Some(id);
-        self.send_update(
-            &session_id,
-            json!({
-                "sessionUpdate": "agent_message_chunk",
-                "content": {"type": "text", "text": "Hello "},
-            }),
-        )
-        .await;
-        self.send_update(
-            &session_id,
-            json!({
-                "sessionUpdate": "tool_call",
-                "toolCallId": "tc-1", "title": "fake-tool", "status": "pending",
-            }),
-        )
-        .await;
-        self.send_update(
-            &session_id,
-            json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "tc-1", "status": "in_progress",
-            }),
-        )
-        .await;
-        self.send_update(
-            &session_id,
-            json!({"sessionUpdate": "acme.vendor_update", "payload": 1}),
-        )
-        .await;
+        self.send_turn_updates(&session_id).await;
+        if text == "elicit" || text == "elicit_url" {
+            self.start_elicitation(&session_id, text).await;
+            return;
+        }
+        if text == "ext" {
+            self.ext_id = Some(self.send_request("_acme/custom", json!({"x": 1})).await);
+            // Also send a vendor-style notification the handler should see.
+            self.transport
+                .notify(JsonRpcNotification::with_params(
+                    "_acme/pinged",
+                    json!({"n": 1}),
+                ))
+                .await
+                .expect("fake agent notify failed");
+            return;
+        }
         if text != "wait" {
-            self.permission_id = Some(
-                self.send_request(
-                    "session/request_permission",
-                    json!({
-                        "sessionId": session_id,
-                        "toolCall": {
-                            "toolCallId": "tc-1",
-                            "title": "fake-tool",
-                            "status": "in_progress",
-                        },
-                        "options": [
-                            {"optionId": "allow-1", "name": "Allow once", "kind": "allow_once"},
-                            {"optionId": "deny-1", "name": "Deny", "kind": "reject_once"},
-                        ],
-                    }),
-                )
-                .await,
-            );
-            // Two more chunks stream while the permission request is still
-            // outstanding, then a second agent-to-client request lands.
-            self.send_update(
-                &session_id,
-                json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "a"},
-                }),
-            )
-            .await;
-            self.send_update(
-                &session_id,
-                json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "b"},
-                }),
-            )
-            .await;
-            self.fs_id = Some(
-                self.send_request(
-                    "fs/read_text_file",
-                    json!({"sessionId": session_id, "path": "/etc/hostname"}),
-                )
-                .await,
-            );
+            self.request_permission(&session_id).await;
         }
     }
 
     async fn on_notification(&mut self, notification: JsonRpcNotification) {
+        if notification.method.starts_with('_') {
+            self.log(format!("notify:{}", notification.method));
+        }
         if notification.method == "session/cancel" {
             if self.permission_id.is_some() {
                 self.log("cancel_pending_perm".to_string());
@@ -282,9 +390,42 @@ impl FakeAgent {
                     .error
                     .map_or_else(|| "ok".to_string(), |e| e.code.0.to_string())
             ));
+        } else if Some(&response.id) == self.elicit_id.as_ref() {
+            self.elicit_id = None;
+            self.log(format!(
+                "elicit:{}",
+                response
+                    .result
+                    .as_ref()
+                    .map_or_else(|| "error".to_string(), |r| r["action"].to_string())
+            ));
+            if self.elicit_url {
+                self.elicit_url = false;
+                self.transport
+                    .notify(JsonRpcNotification::with_params(
+                        "elicitation/complete",
+                        json!({"elicitationId": "elic-1"}),
+                    ))
+                    .await
+                    .expect("fake agent notify failed");
+            }
+        } else if Some(&response.id) == self.ext_id.as_ref() {
+            self.ext_id = None;
+            self.log(format!(
+                "ext:{}",
+                response
+                    .result
+                    .as_ref()
+                    .map_or_else(|| "error".to_string(), |r| r["handled"].to_string())
+            ));
         }
-        // Finish the prompt once both agent-initiated requests were answered.
-        if self.pending_prompt.is_some() && self.permission_id.is_none() && self.fs_id.is_none() {
+        // Finish the prompt once all agent-initiated requests were answered.
+        if self.pending_prompt.is_some()
+            && self.permission_id.is_none()
+            && self.fs_id.is_none()
+            && self.elicit_id.is_none()
+            && self.ext_id.is_none()
+        {
             let session_id = self.session_id.clone();
             self.send_update(
                 &session_id,
@@ -345,6 +486,10 @@ impl FakeAgent {
 struct TestHandler {
     updates: Mutex<Vec<SessionNotification>>,
     permission_calls: Mutex<Vec<RequestPermissionParams>>,
+    elicitations: Mutex<Vec<ElicitationCreateParams>>,
+    completions: Mutex<Vec<String>>,
+    ext_calls: Mutex<Vec<String>>,
+    notifications: Mutex<Vec<String>>,
 }
 
 impl ClientHandler for TestHandler {
@@ -378,6 +523,55 @@ impl ClientHandler for TestHandler {
                 meta: None,
             })
         }
+    }
+
+    fn elicitation_create(
+        &self,
+        params: ElicitationCreateParams,
+    ) -> impl std::future::Future<Output = Result<ElicitationCreateResult, JsonRpcError>> + Send
+    {
+        self.elicitations
+            .lock()
+            .expect("elicitations poisoned")
+            .push(params);
+        std::future::ready(Ok(ElicitationCreateResult::accept(BTreeMap::from([(
+            "name".to_string(),
+            "ada".into(),
+        )]))))
+    }
+
+    fn elicitation_complete(
+        &self,
+        params: ElicitationCompleteParams,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        self.completions
+            .lock()
+            .expect("completions poisoned")
+            .push(params.elicitation_id);
+        std::future::ready(())
+    }
+
+    fn ext_request(
+        &self,
+        method: ExtMethod,
+        _params: Option<Value>,
+    ) -> impl std::future::Future<Output = Result<Value, JsonRpcError>> + Send {
+        self.ext_calls
+            .lock()
+            .expect("ext_calls poisoned")
+            .push(method.as_str().to_string());
+        std::future::ready(Ok(json!({"handled": true})))
+    }
+
+    fn notification(
+        &self,
+        notification: JsonRpcNotification,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        self.notifications
+            .lock()
+            .expect("notifications poisoned")
+            .push(notification.method);
+        std::future::ready(())
     }
 }
 
@@ -471,6 +665,7 @@ fn text(message: &str) -> ContentBlock {
     ContentBlock::Text(TextContent {
         text: message.to_string(),
         annotations: None,
+        meta: None,
     })
 }
 
@@ -535,10 +730,10 @@ async fn initialize_and_new_session() {
         init.agent_info.as_ref().map(|i| i.name.as_str()),
         Some("fake-agent")
     );
-    assert_eq!(init.auth_methods[0].id, "none");
+    assert_eq!(init.auth_methods[0].id(), "none");
 
     let session = client
-        .new_session("/tmp", vec![])
+        .new_session(SessionNewParams::new("/tmp"))
         .await
         .expect("session/new failed");
     assert_eq!(session.session_id, "sess-1");
@@ -550,11 +745,15 @@ async fn initialize_and_new_session() {
     assert_eq!(options[0].kind.as_deref(), Some("select"));
 
     client
-        .set_mode(&session.session_id, "bypass")
+        .set_mode(SessionSetModeParams::new(&session.session_id, "bypass"))
         .await
         .unwrap();
     let options = client
-        .set_config_option(&session.session_id, "model", "b")
+        .set_config_option(SessionSetConfigOptionParams::new(
+            &session.session_id,
+            "model",
+            "b",
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -574,10 +773,13 @@ async fn initialize_and_new_session() {
 async fn prompt_streams_updates_and_returns_end_turn() {
     let (client, log, connection, _agent) = connect();
     client.initialize().await.unwrap();
-    let session = client.new_session("/tmp", vec![]).await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
 
     let result = client
-        .prompt(&session.session_id, vec![text("hello")])
+        .prompt(PromptParams::new(&session.session_id, vec![text("hello")]))
         .await
         .expect("prompt failed");
     assert_eq!(result.stop_reason, StopReason::EndTurn);
@@ -629,11 +831,14 @@ async fn prompt_streams_updates_and_returns_end_turn() {
 async fn follow_up_prompt_on_same_session() {
     let (client, _log, connection, _agent) = connect();
     client.initialize().await.unwrap();
-    let session = client.new_session("/tmp", vec![]).await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
 
     for _ in 0..2 {
         let result = client
-            .prompt(&session.session_id, vec![text("again")])
+            .prompt(PromptParams::new(&session.session_id, vec![text("again")]))
             .await
             .expect("prompt failed");
         assert_eq!(result.stop_reason, StopReason::EndTurn);
@@ -647,18 +852,28 @@ async fn follow_up_prompt_on_same_session() {
 async fn cancel_mid_turn() {
     let (client, log, connection, _agent) = connect();
     client.initialize().await.unwrap();
-    let session = client.new_session("/tmp", vec![]).await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
     let session_id = session.session_id.clone();
 
     let prompt = {
         let client = client.clone();
         let session_id = session_id.clone();
-        tokio::spawn(async move { client.prompt(&session_id, vec![text("wait")]).await })
+        tokio::spawn(async move {
+            client
+                .prompt(PromptParams::new(&session_id, vec![text("wait")]))
+                .await
+        })
     };
 
     // Wait for the first streamed update, proving the turn is in flight.
     wait_until(|| !client.handler().updates.lock().unwrap().is_empty()).await;
-    client.cancel(&session_id).await.unwrap();
+    client
+        .cancel(SessionCancelParams::new(&session_id))
+        .await
+        .unwrap();
 
     let result = prompt.await.expect("prompt task panicked").unwrap();
     assert_eq!(result.stop_reason, StopReason::Cancelled);
@@ -674,7 +889,7 @@ async fn load_session_replays_history() {
     client.initialize().await.unwrap();
 
     client
-        .load_session("sess-old", "/tmp", vec![])
+        .load_session(SessionLoadParams::new("sess-old", "/tmp"))
         .await
         .expect("session/load failed");
 
@@ -694,9 +909,14 @@ async fn load_session_replays_history() {
 async fn agent_exit_fails_pending_requests() {
     let (client, _log, connection, agent) = connect();
     client.initialize().await.unwrap();
-    let session = client.new_session("/tmp", vec![]).await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
 
-    let result = client.prompt(&session.session_id, vec![text("die")]).await;
+    let result = client
+        .prompt(PromptParams::new(&session.session_id, vec![text("die")]))
+        .await;
     assert!(
         matches!(result, Err(ClientError::Closed { .. })),
         "expected Closed, got {result:?}"
@@ -740,13 +960,16 @@ async fn unknown_session_update_tag_parses_as_other() {
 async fn permission_does_not_block_the_connection() {
     let (client, log, release, connection, _agent) = connect_gated(true);
     client.initialize().await.unwrap();
-    let session = client.new_session("/tmp", vec![]).await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
     // Arm the release; the progress gate still delays the permission answer
     // until the handler has observed both extra chunks and the fs answer.
     release.send(()).await.unwrap();
 
     let result = client
-        .prompt(&session.session_id, vec![text("hello")])
+        .prompt(PromptParams::new(&session.session_id, vec![text("hello")]))
         .await
         .expect("prompt failed");
     assert_eq!(result.stop_reason, StopReason::EndTurn);
@@ -781,18 +1004,28 @@ async fn permission_does_not_block_the_connection() {
 async fn cancel_goes_out_while_permission_pending() {
     let (client, log, release, connection, _agent) = connect_gated(false);
     client.initialize().await.unwrap();
-    let session = client.new_session("/tmp", vec![]).await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
     let session_id = session.session_id.clone();
 
     let prompt = {
         let client = client.clone();
         let session_id = session_id.clone();
-        tokio::spawn(async move { client.prompt(&session_id, vec![text("hello")]).await })
+        tokio::spawn(async move {
+            client
+                .prompt(PromptParams::new(&session_id, vec![text("hello")]))
+                .await
+        })
     };
 
     // The permission request is dispatched but its answer is not released.
     wait_until(|| !client.handler().permission_calls.lock().unwrap().is_empty()).await;
-    client.cancel(&session_id).await.unwrap();
+    client
+        .cancel(SessionCancelParams::new(&session_id))
+        .await
+        .unwrap();
 
     // The cancel reached the wire while the permission was still outstanding.
     wait_until(|| {
@@ -815,6 +1048,239 @@ async fn cancel_goes_out_while_permission_pending() {
             .any(|e| e == "permission:\"allow-1\"")
     })
     .await;
+
+    client.close();
+    connection.await.expect("connection task panicked");
+}
+
+#[tokio::test]
+async fn authenticate_logout_and_session_lifecycle() {
+    let (client, log, connection, _agent) = connect();
+    let init = client.initialize().await.unwrap();
+    assert!(init.agent_capabilities.auth.is_none());
+
+    client
+        .authenticate("none")
+        .await
+        .expect("authenticate failed");
+    client
+        .logout(aither_acp::LogoutParams::new())
+        .await
+        .expect("logout failed");
+
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
+
+    let list = client
+        .list_sessions(SessionListParams::new())
+        .await
+        .expect("session/list failed");
+    assert_eq!(list.sessions.len(), 1);
+    assert_eq!(list.sessions[0].session_id, "sess-old");
+    assert_eq!(list.sessions[0].title.as_deref(), Some("Old session"));
+    assert_eq!(list.next_cursor.as_deref(), Some("page-2"));
+
+    client
+        .resume_session(SessionResumeParams::new("sess-old", "/tmp"))
+        .await
+        .expect("session/resume failed");
+    client
+        .delete_session(SessionDeleteParams::new("sess-old"))
+        .await
+        .expect("session/delete failed");
+    client
+        .close_session(SessionCloseParams::new(&session.session_id))
+        .await
+        .expect("session/close failed");
+
+    let log = log.lock().unwrap().clone();
+    for expected in [
+        "authenticate:\"none\"",
+        "logout",
+        "resume:\"sess-old\"",
+        "delete:\"sess-old\"",
+        "close:\"sess-1\"",
+    ] {
+        assert!(log.iter().any(|e| e == expected), "missing {expected}");
+    }
+
+    client.close();
+    connection.await.expect("connection task panicked");
+}
+
+#[tokio::test]
+async fn outbound_extension_requests_and_notifications() {
+    let (client, log, connection, _agent) = connect();
+    client.initialize().await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
+
+    // A known extension method round-trips typed.
+    let pong: Value = client
+        .ext_request(&ExtMethod::new("_acme/ping"), &json!({}))
+        .await
+        .expect("ext request failed");
+    assert_eq!(pong["pong"], true);
+
+    // An unhandled extension method surfaces the agent's error.
+    let err = client
+        .ext_request::<_, Value>(&ExtMethod::new("_acme/nope"), &json!({}))
+        .await
+        .expect_err("expected method-not-found");
+    assert!(matches!(err, ClientError::JsonRpc(_)));
+
+    // The shared goal extension drives `_session/goal`.
+    ext::goal::set(&client, &session.session_id, "ship it")
+        .await
+        .expect("goal set failed");
+    ext::goal::pause(&client, &session.session_id)
+        .await
+        .expect("goal pause failed");
+
+    // Extension notifications reach the agent.
+    client
+        .ext_notify(&ExtMethod::new("_acme/notify"), &json!({"n": 1}))
+        .await
+        .expect("ext notify failed");
+    wait_until(|| {
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|e| e == "notify:_acme/notify")
+    })
+    .await;
+
+    let log = log.lock().unwrap().clone();
+    assert!(log.iter().any(|e| e == "goal:\"set\""));
+    assert!(log.iter().any(|e| e == "goal:\"pause\""));
+
+    client.close();
+    connection.await.expect("connection task panicked");
+}
+
+#[tokio::test]
+async fn shared_extension_capability_probes() {
+    let (client, _log, connection, _agent) = connect();
+    let init = client.initialize().await.unwrap();
+
+    // The fake agent advertised the goal capability under `_meta.goal`.
+    let cap = ext::goal::capability(&init).expect("goal capability advertised");
+    assert_eq!(cap.version, ext::goal::VERSION);
+    assert_eq!(cap.control_method, "_session/goal");
+    assert!(ext::goal::accepts(&init, &ext::goal::GoalAction::Set));
+    assert!(!ext::goal::accepts(
+        &init,
+        &ext::goal::GoalAction::from_wire("fly".to_string())
+    ));
+
+    // Steering and the JetBrains AIR namespace are probed the same way.
+    assert!(ext::steering::advertised(&init));
+    assert!(vendor::jetbrains::supports(
+        init.meta.as_ref(),
+        vendor::jetbrains::capability::SESSION_FAILURE
+    ));
+    assert!(!vendor::jetbrains::supports(
+        init.meta.as_ref(),
+        vendor::jetbrains::capability::ASYNC_TASKS
+    ));
+
+    client.close();
+    connection.await.expect("connection task panicked");
+}
+
+#[tokio::test]
+async fn inbound_extension_request_and_unknown_notification() {
+    let (client, log, connection, _agent) = connect();
+    client.initialize().await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
+
+    let result = client
+        .prompt(PromptParams::new(&session.session_id, vec![text("ext")]))
+        .await
+        .expect("prompt failed");
+    assert_eq!(result.stop_reason, StopReason::EndTurn);
+
+    // The handler answered the `_acme/custom` extension request and saw the
+    // `_acme/pinged` notification.
+    assert_eq!(
+        client.handler().ext_calls.lock().unwrap().as_slice(),
+        ["_acme/custom"]
+    );
+    assert_eq!(
+        client.handler().notifications.lock().unwrap().as_slice(),
+        ["_acme/pinged"]
+    );
+    assert!(log.lock().unwrap().iter().any(|e| e == "ext:true"));
+
+    client.close();
+    connection.await.expect("connection task panicked");
+}
+
+#[tokio::test]
+async fn elicitation_form_flow() {
+    let (client, log, connection, _agent) = connect();
+    client.initialize().await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
+
+    let result = client
+        .prompt(PromptParams::new(&session.session_id, vec![text("elicit")]))
+        .await
+        .expect("prompt failed");
+    assert_eq!(result.stop_reason, StopReason::EndTurn);
+
+    let elicitations = client.handler().elicitations.lock().unwrap().clone();
+    assert_eq!(elicitations.len(), 1);
+    let params = &elicitations[0];
+    assert_eq!(params.message, "Who are you?");
+    let aither_acp::ElicitationMode::Form(form) = &params.mode else {
+        panic!("expected form mode, got {:?}", params.mode);
+    };
+    assert!(form.requested_schema.properties.contains_key("name"));
+
+    assert!(log.lock().unwrap().iter().any(|e| e == "elicit:\"accept\""));
+
+    client.close();
+    connection.await.expect("connection task panicked");
+}
+
+#[tokio::test]
+async fn elicitation_url_flow_completes() {
+    let (client, _log, connection, _agent) = connect();
+    client.initialize().await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
+
+    let result = client
+        .prompt(PromptParams::new(
+            &session.session_id,
+            vec![text("elicit_url")],
+        ))
+        .await
+        .expect("prompt failed");
+    assert_eq!(result.stop_reason, StopReason::EndTurn);
+
+    let elicitations = client.handler().elicitations.lock().unwrap().clone();
+    let aither_acp::ElicitationMode::Url(url) = &elicitations[0].mode else {
+        panic!("expected url mode");
+    };
+    assert_eq!(url.elicitation_id, "elic-1");
+    // The agent followed up with `elicitation/complete`.
+    assert_eq!(
+        client.handler().completions.lock().unwrap().as_slice(),
+        ["elic-1"]
+    );
 
     client.close();
     connection.await.expect("connection task panicked");

@@ -2,14 +2,17 @@
 
 use std::future::Future;
 
-use aither_mcp::protocol::JsonRpcError;
+use aither_mcp::protocol::{JsonRpcError, JsonRpcNotification};
+use serde_json::Value;
+use tracing::debug;
 
 use crate::protocol::{
-    ClientCapabilities, ReadTextFileParams, ReadTextFileResult, RequestPermissionParams,
-    RequestPermissionResult, SessionNotification, TerminalCreateParams, TerminalCreateResult,
-    TerminalExitStatus, TerminalKillParams, TerminalKillResult, TerminalOutputParams,
-    TerminalOutputResult, TerminalReleaseParams, TerminalReleaseResult, TerminalWaitForExitParams,
-    WriteTextFileParams, WriteTextFileResult,
+    ClientCapabilities, ElicitationCompleteParams, ElicitationCreateParams,
+    ElicitationCreateResult, ExtMethod, ReadTextFileParams, ReadTextFileResult,
+    RequestPermissionParams, RequestPermissionResult, SessionNotification, TerminalCreateParams,
+    TerminalCreateResult, TerminalExitStatus, TerminalKillParams, TerminalKillResult,
+    TerminalOutputParams, TerminalOutputResult, TerminalReleaseParams, TerminalReleaseResult,
+    TerminalWaitForExitParams, WriteTextFileParams, WriteTextFileResult,
 };
 
 /// Handles traffic the agent initiates toward the client.
@@ -20,14 +23,15 @@ use crate::protocol::{
 /// executor context; a long-running method (such as a permission dialog)
 /// stalls further inbound processing until it resolves.
 ///
-/// The file-system and terminal methods have default implementations that
-/// report the method as not found; a handler that supports any of them must
-/// also advertise the matching flag from [`capabilities`](Self::capabilities).
+/// The file-system, terminal, elicitation, and extension methods have
+/// default implementations that report the method as not found (or, for
+/// notifications, ignore it); a handler that supports any of them must also
+/// advertise the matching capability from [`capabilities`](Self::capabilities).
 pub trait ClientHandler: Send + Sync + 'static {
     /// Capabilities advertised to the agent in the `initialize` request.
     ///
-    /// The default is [`ClientCapabilities::default`]: no file-system access
-    /// and no terminal support.
+    /// The default is [`ClientCapabilities::default`]: no file-system access,
+    /// no terminal, auth, or elicitation support.
     fn capabilities(&self) -> ClientCapabilities {
         ClientCapabilities::default()
     }
@@ -46,6 +50,55 @@ pub trait ClientHandler: Send + Sync + 'static {
         &self,
         params: RequestPermissionParams,
     ) -> impl Future<Output = Result<RequestPermissionResult, JsonRpcError>> + Send;
+
+    /// Handle an `elicitation/create` request: the agent asks for structured
+    /// input, either a form (`mode: "form"`) or a URL visit (`mode: "url"`).
+    ///
+    /// The default responds with a JSON-RPC method-not-found error; a handler
+    /// that overrides it should advertise
+    /// [`ClientCapabilities::elicitation`].
+    fn elicitation_create(
+        &self,
+        _params: ElicitationCreateParams,
+    ) -> impl Future<Output = Result<ElicitationCreateResult, JsonRpcError>> + Send {
+        async { Err(JsonRpcError::method_not_found("elicitation/create")) }
+    }
+
+    /// Handle an `elicitation/complete` notification: a URL-mode elicitation
+    /// the agent asked for is finished.
+    ///
+    /// The default ignores the notification.
+    fn elicitation_complete(
+        &self,
+        _params: ElicitationCompleteParams,
+    ) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+
+    /// Handle an agent-to-client request for a custom `_`-prefixed
+    /// extension method.
+    ///
+    /// `method` is the extension's name and `params` its raw JSON payload;
+    /// the returned [`Value`] becomes the JSON-RPC result. The default
+    /// responds with a method-not-found error, as ACP requires for
+    /// unrecognized extension requests.
+    fn ext_request(
+        &self,
+        method: ExtMethod,
+        _params: Option<Value>,
+    ) -> impl Future<Output = Result<Value, JsonRpcError>> + Send {
+        async move { Err(JsonRpcError::method_not_found(method.as_str())) }
+    }
+
+    /// Handle any agent-to-client notification this crate does not model —
+    /// typically a `_`-prefixed extension notification.
+    ///
+    /// The default ignores the notification, as ACP requires for
+    /// unrecognized extension notifications.
+    fn notification(&self, notification: JsonRpcNotification) -> impl Future<Output = ()> + Send {
+        debug!(method = %notification.method, "ignoring agent notification");
+        std::future::ready(())
+    }
 
     /// Handle an `fs/read_text_file` request.
     ///
