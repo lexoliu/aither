@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/lexoliu/aither/compare/browser-v0.4.0...browser-v0.4.2) - 2026-09-14
+
+### Other
+
+- release v0.4.1
+
 ## [0.3.0](https://github.com/lexoliu/aither/compare/browser-v0.2.0...browser-v0.3.0) - 2026-09-11
 
 ### Added
