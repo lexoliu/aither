@@ -1017,7 +1017,8 @@ pub enum PlanEntryPriority {
 pub struct ToolCall {
     /// Unique tool call ID.
     pub tool_call_id: String,
-    /// Human-readable title.
+    /// Human-readable title; agents in the wild omit it, so tolerate absence.
+    #[serde(default)]
     pub title: String,
     /// Tool kind.
     #[serde(skip_serializing_if = "Option::is_none")]
