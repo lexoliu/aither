@@ -3671,16 +3671,19 @@ mod tests {
 
         let mut child_pid = None;
         for _ in 0..100 {
-            match async_fs::read_to_string(&child_pid_path).await {
-                Ok(value) => {
-                    child_pid = Some(value.trim().parse::<i32>().expect("child pid should parse"));
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    async_io::Timer::after(std::time::Duration::from_millis(20)).await;
-                }
+            // `echo $! > child.pid` creates the file before writing to it,
+            // so a successful read can still yield empty or partial
+            // content — poll until the pid actually parses.
+            let parsed = match async_fs::read_to_string(&child_pid_path).await {
+                Ok(value) => value.trim().parse::<i32>().ok(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => panic!("failed to read child pid: {error}"),
+            };
+            if let Some(pid) = parsed {
+                child_pid = Some(pid);
+                break;
             }
+            async_io::Timer::after(std::time::Duration::from_millis(20)).await;
         }
         let child_pid = child_pid.expect("descendant pid should be written before timeout");
 
