@@ -15,7 +15,7 @@ aither-core.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-fs = { version = "2", optional = true }
-zenwave = { workspace = true, optional = true }
+zenwave = { workspace = true, optional = true, features = ["default"] }
 
 [build-dependencies]
 serde = { version = "1.0", features = ["derive"] }
