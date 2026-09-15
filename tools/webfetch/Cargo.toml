@@ -18,7 +18,7 @@ dom_smoothie = "0.18"
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 url = "2.5.8"
-zenwave.workspace = true
+zenwave = { workspace = true, features = ["default"] }
 tracing.workspace = true
 regex = "1.13"
 html-escape = "0.2"
