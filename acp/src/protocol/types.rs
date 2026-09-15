@@ -292,10 +292,16 @@ pub struct McpServerStdio {
     /// Command to run.
     pub command: String,
     /// Command arguments.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Always written, even when empty: `args` is required by the schema's
+    /// stdio variant, and agents that deserialize `McpServer` as a strict
+    /// untagged enum — Devin's does — refuse the object without it.
+    #[serde(default)]
     pub args: Vec<String>,
     /// Environment variables.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Required by the schema for the same reason `args` is.
+    #[serde(default)]
     pub env: Vec<EnvVar>,
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
