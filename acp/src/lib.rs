@@ -135,7 +135,7 @@ mod session;
 pub mod vendor;
 
 pub use adapter::{agent_event_to_session_update, todos_to_plan};
-pub use client::{AcpClient, ClientError, ClientHandler};
+pub use client::{AcpClient, ClientError, ClientHandler, ResponseFuture};
 pub use protocol::*;
 pub use server::AcpServer;
 pub use session::AcpSession;

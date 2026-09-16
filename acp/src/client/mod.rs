@@ -15,10 +15,12 @@ pub use handler::ClientHandler;
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::task::{Context, Poll, ready};
 
 use aither_mcp::protocol::{
     JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError,
@@ -27,6 +29,7 @@ use aither_mcp::protocol::{
 use aither_mcp::transport::{BidirectionalTransport, ChildProcessTransport};
 use async_channel::{Receiver, Sender};
 use futures_lite::future::or;
+use futures_lite::stream::Stream;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -360,7 +363,25 @@ impl<H: ClientHandler> AcpClient<H> {
     /// Returns an error if the connection is closed or the agent replies with
     /// an error or a malformed result.
     pub async fn prompt(&self, params: PromptParams) -> Result<PromptResult, ClientError> {
-        self.call("session/prompt", &params).await
+        self.start_prompt(&params).await?.await
+    }
+
+    /// `session/prompt` request whose response half is returned separately.
+    ///
+    /// Unlike [`prompt`](Self::prompt), this resolves as soon as the request
+    /// is on the connection, so a later write (such as `session/cancel`)
+    /// cannot overtake it on the wire. Awaiting the [`ResponseFuture`]
+    /// yields the turn's [`PromptResult`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed before the request is
+    /// sent.
+    pub async fn start_prompt(
+        &self,
+        params: &PromptParams,
+    ) -> Result<ResponseFuture<PromptResult>, ClientError> {
+        self.start_request("session/prompt", params).await
     }
 
     /// `session/cancel` notification.
@@ -447,8 +468,23 @@ impl<H: ClientHandler> AcpClient<H> {
         self.outbound.close();
     }
 
-    /// Send a request through the connection task and await the response.
-    async fn call<P, R>(&self, method: &str, params: &P) -> Result<R, ClientError>
+    /// Send a JSON-RPC request for an arbitrary method and return a future
+    /// resolving with its deserialized result.
+    ///
+    /// The request is on the connection when this returns, so messages sent
+    /// afterwards cannot overtake it on the wire. Awaiting the
+    /// [`ResponseFuture`] yields the same result [`request`](Self::request)
+    /// would.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed before the request is
+    /// sent.
+    pub async fn start_request<P, R>(
+        &self,
+        method: &str,
+        params: &P,
+    ) -> Result<ResponseFuture<R>, ClientError>
     where
         P: Serialize + Sync,
         R: DeserializeOwned,
@@ -465,14 +501,57 @@ impl<H: ClientHandler> AcpClient<H> {
             .await
             .map_err(|_| ClientError::Closed { status: None })?;
 
-        let response = reply_rx
-            .recv()
-            .await
-            .map_err(|_| ClientError::Closed { status: None })??;
+        Ok(ResponseFuture {
+            method: method.to_string(),
+            reply: Box::pin(reply_rx),
+            marker: PhantomData,
+        })
+    }
 
-        let value = response.into_result()?;
-        serde_json::from_value(value)
-            .map_err(|error| ClientError::Protocol(format!("malformed {method} result: {error}")))
+    /// Send a request through the connection task and await the response.
+    async fn call<P, R>(&self, method: &str, params: &P) -> Result<R, ClientError>
+    where
+        P: Serialize + Sync,
+        R: DeserializeOwned,
+    {
+        self.start_request(method, params).await?.await
+    }
+}
+
+/// The response half of a request sent with [`AcpClient::start_request`].
+///
+/// Awaiting it yields the deserialized result, an agent-reported error, or
+/// [`ClientError::Closed`] when the connection drops first. Dropping it
+/// leaves the request outstanding — the agent still sees and answers it.
+#[derive(Debug)]
+pub struct ResponseFuture<R> {
+    /// Method name, for error context.
+    method: String,
+    /// Receives the matching response from the connection task.
+    reply: Pin<Box<Receiver<Result<JsonRpcResponse, ClientError>>>>,
+    /// Result type without owning a value.
+    marker: PhantomData<fn() -> R>,
+}
+
+impl<R: DeserializeOwned> Future for ResponseFuture<R> {
+    type Output = Result<R, ClientError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let response = match ready!(this.reply.as_mut().poll_next(cx)) {
+            Some(response) => response?,
+            None => return Poll::Ready(Err(ClientError::Closed { status: None })),
+        };
+        Poll::Ready(
+            response
+                .into_result()
+                .map_err(ClientError::from)
+                .and_then(|value| {
+                    serde_json::from_value(value).map_err(|error| {
+                        ClientError::Protocol(format!("malformed {} result: {error}", this.method))
+                    })
+                }),
+        )
     }
 }
 
