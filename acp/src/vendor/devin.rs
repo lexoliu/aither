@@ -52,6 +52,13 @@ pub mod capability {
     pub const MEGAPLAN: &str = "cognition.ai/megaplan";
     /// The client resolves rule-file mentions.
     pub const RULE_MENTIONS: &str = "cognition.ai/ruleMentions";
+    /// The `_cognition.ai/revert/*` surface (history steps, session
+    /// revert, session fork).
+    ///
+    /// Unlike the other flags, this one is advertised by the *client* in
+    /// `clientCapabilities._meta`; devin echoes it back in
+    /// `agentCapabilities._meta` when the surface is enabled.
+    pub const REVERT: &str = "cognition.ai/revert";
 }
 
 /// Whether `agentCapabilities._meta` carries `key` with a `true` value.
@@ -134,6 +141,100 @@ pub fn notification(notification: &JsonRpcNotification) -> Option<DevinNotificat
     }
 }
 
+/// Session revert/fork surface.
+///
+/// Enabled by advertising [`capability::REVERT`] in
+/// `clientCapabilities._meta` at `initialize`; devin echoes the flag back
+/// in `agentCapabilities._meta` when the methods below are callable.
+pub mod revert {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+
+    /// `_cognition.ai/revert/listSteps` — list the session's history steps
+    /// with their revert/fork anchor node ids.
+    pub const LIST_STEPS_METHOD: &str = "_cognition.ai/revert/listSteps";
+
+    /// `_cognition.ai/revert/forkFromStep` — clone the session into a new
+    /// session at a step's [`StepInfo::fork_target_node_id`].
+    pub const FORK_FROM_STEP_METHOD: &str = "_cognition.ai/revert/forkFromStep";
+
+    /// Params of [`LIST_STEPS_METHOD`].
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ListStepsParams {
+        /// Session to inspect.
+        pub session_id: String,
+    }
+
+    /// Result of [`LIST_STEPS_METHOD`].
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ListStepsResult {
+        /// History steps, oldest first.
+        pub steps: Vec<StepInfo>,
+        /// Fields this crate does not model, preserved verbatim.
+        #[serde(flatten)]
+        pub extra: BTreeMap<String, Value>,
+    }
+
+    /// One history step from [`ListStepsResult`].
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct StepInfo {
+        /// Stable step identifier.
+        pub step_id: String,
+        /// 1-based position in the session.
+        pub step_number: u64,
+        /// Step kind (`prompt`, `question`, …).
+        pub kind: String,
+        /// Short human-readable summary of the step.
+        #[serde(default)]
+        pub summary: Option<String>,
+        /// Message id for `prompt` steps.
+        #[serde(default)]
+        pub user_message_id: Option<String>,
+        /// Tool call id for tool steps.
+        #[serde(default)]
+        pub tool_call_id: Option<String>,
+        /// Anchor node for question steps.
+        #[serde(default)]
+        pub question_node_id: Option<u64>,
+        /// Node id a revert would rewind to.
+        #[serde(default)]
+        pub revert_target_node_id: Option<u64>,
+        /// Node id a fork clones up to.
+        #[serde(default)]
+        pub fork_target_node_id: Option<u64>,
+        /// Fields this crate does not model, preserved verbatim.
+        #[serde(flatten)]
+        pub extra: BTreeMap<String, Value>,
+    }
+
+    /// Params of [`FORK_FROM_STEP_METHOD`].
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ForkFromStepParams {
+        /// Session to fork.
+        pub session_id: String,
+        /// The target step's [`StepInfo::fork_target_node_id`].
+        pub target_node_id: u64,
+    }
+
+    /// Result of [`FORK_FROM_STEP_METHOD`].
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ForkFromStepResult {
+        /// The new session's id; load it with `session/load` (or resume it)
+        /// on any connection.
+        pub forked_session_id: String,
+        /// Fields this crate does not model, preserved verbatim.
+        #[serde(flatten)]
+        pub extra: BTreeMap<String, Value>,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -207,5 +308,61 @@ mod tests {
 
         let foreign = JsonRpcNotification::new("_acme/ping");
         assert!(notification(&foreign).is_none());
+    }
+
+    /// Revert wire types round-trip the shapes `devin acp` actually sends.
+    #[test]
+    fn revert_types() {
+        let params = serde_json::to_value(revert::ListStepsParams {
+            session_id: "s1".to_string(),
+        })
+        .expect("serializes");
+        assert_eq!(params, json!({"sessionId": "s1"}));
+
+        let result: revert::ListStepsResult = serde_json::from_value(json!({
+            "steps": [
+                {
+                    "stepId": "abc",
+                    "stepNumber": 1,
+                    "kind": "prompt",
+                    "summary": "do a thing",
+                    "userMessageId": "abc",
+                    "revertTargetNodeId": 23,
+                    "forkTargetNodeId": 27,
+                    "futureField": true,
+                },
+                {
+                    "stepId": "def",
+                    "stepNumber": 2,
+                    "kind": "question",
+                    "questionNodeId": 40,
+                },
+            ],
+            "nextCursor": null,
+        }))
+        .expect("deserializes");
+        assert_eq!(result.steps.len(), 2);
+        let step = &result.steps[0];
+        assert_eq!(step.step_id, "abc");
+        assert_eq!(step.step_number, 1);
+        assert_eq!(step.fork_target_node_id, Some(27));
+        assert_eq!(result.steps[1].fork_target_node_id, None);
+
+        let params = serde_json::to_value(revert::ForkFromStepParams {
+            session_id: "s1".to_string(),
+            target_node_id: 27,
+        })
+        .expect("serializes");
+        assert_eq!(params, json!({"sessionId": "s1", "targetNodeId": 27}));
+
+        let result: revert::ForkFromStepResult =
+            serde_json::from_value(json!({"forkedSessionId": "s2"})).expect("deserializes");
+        assert_eq!(result.forked_session_id, "s2");
+
+        // A missing required field fails rather than defaulting.
+        assert!(
+            serde_json::from_value::<revert::ForkFromStepResult>(json!({})).is_err(),
+            "missing forkedSessionId must not deserialize"
+        );
     }
 }
