@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/lexoliu/aither/compare/mcp-v0.4.1...mcp-v0.5.0) - 2026-09-17
+
+### Other
+
+- release v0.4.1 ([#73](https://github.com/lexoliu/aither/pull/73))
+- add ToolResult::Parts for multi-content tool results ([#71](https://github.com/lexoliu/aither/pull/71))
+- pin zenwave to hyper-rustls — default features drag in openssl-sys ([#67](https://github.com/lexoliu/aither/pull/67))
+
 ## [0.4.1](https://github.com/lexoliu/aither/compare/mcp-v0.4.0...mcp-v0.4.1) - 2026-09-13
 
 ### Other

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/lexoliu/aither/compare/acp-v0.4.1...acp-v0.5.0) - 2026-09-17
+
+### Other
+
+- split request send from response await; add Devin revert wire types ([#69](https://github.com/lexoliu/aither/pull/69))
+- always emit stdio MCP server's required args/env ([#66](https://github.com/lexoliu/aither/pull/66))
+- model shared extensions and vendor-private surface ([#63](https://github.com/lexoliu/aither/pull/63))
+- default ToolCall.title when absent
+
 ## [0.4.0](https://github.com/lexoliu/aither/compare/acp-v0.3.0...acp-v0.4.0) - 2026-09-13
 
 ### Other
