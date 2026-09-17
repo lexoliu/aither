@@ -201,13 +201,14 @@ jobs:
         with:
           shared-key: ci-coverage
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       # `full` would re-enable llama and ort, and --exclude only skips testing
       # a package, not building it as a dependency. So the set is spelled out.
       - run: >
-          cargo llvm-cov --workspace --lcov --output-path lcov.info
+          cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
           --no-default-features
           --features derive,serde,openai,claude,gemini,agent,rag,mem0,skills,mcp,browser,websearch,webfetch,search,fs,command
           --exclude aither-llama --exclude aither-ort

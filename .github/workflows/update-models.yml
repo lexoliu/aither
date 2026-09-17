@@ -45,9 +45,13 @@ jobs:
         with:
           shared-key: update-models
 
+      - name: Install nextest
+        if: steps.snapshot.outputs.changed == 'true'
+        uses: taiki-e/install-action@nextest
+
       - name: Validate models crate
         if: steps.snapshot.outputs.changed == 'true'
-        run: cargo test --package aither-models --all-features
+        run: cargo nextest run --package aither-models --all-features
 
       - name: Create pull request
         if: steps.snapshot.outputs.changed == 'true'

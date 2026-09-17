@@ -13,11 +13,11 @@
 use std::sync::Mutex;
 
 use aither_acp::{
-    AcpClient, ClientError, ClientHandler, ContentBlock, RequestPermissionOutcome,
-    RequestPermissionParams, RequestPermissionResult, SessionNotification, SessionUpdate,
-    TextContent,
+    AcpClient, ClientError, ClientHandler, ContentBlock, PromptParams, RequestPermissionOutcome,
+    RequestPermissionParams, RequestPermissionResult, SessionNewParams, SessionNotification,
+    SessionSetConfigOptionParams, SessionSetModeParams, SessionUpdate, TextContent, vendor,
 };
-use aither_mcp::protocol::JsonRpcError;
+use aither_mcp::protocol::{JsonRpcError, JsonRpcNotification};
 
 /// Handler that prints streamed text and auto-approves permission requests.
 #[derive(Default)]
@@ -60,6 +60,26 @@ impl ClientHandler for SmokeHandler {
             })
         }
     }
+
+    fn notification(
+        &self,
+        notification: JsonRpcNotification,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        // Decode devin's private `_cognition.ai/*` notifications.
+        match vendor::devin::notification(&notification) {
+            Some(vendor::devin::DevinNotification::Output(output)) => {
+                eprintln!("[devin:{}] {}", output.channel, output.message);
+            }
+            Some(vendor::devin::DevinNotification::McpServersChanged(_)) => {
+                eprintln!("[devin] MCP servers changed");
+            }
+            Some(vendor::devin::DevinNotification::Other { method, .. }) => {
+                eprintln!("[devin] {method}");
+            }
+            None => eprintln!("[notification] {}", notification.method),
+        }
+        std::future::ready(())
+    }
 }
 
 #[tokio::main]
@@ -81,24 +101,34 @@ async fn main() -> Result<(), ClientError> {
         init.protocol_version,
         init.agent_capabilities.load_session,
     );
+    if let Some(path) = vendor::devin::mcp_config_path(&init) {
+        eprintln!("[initialize] mcpConfigPath={path}");
+    }
 
-    let session = client.new_session("/tmp", vec![]).await?;
+    let session = client.new_session(SessionNewParams::new("/tmp")).await?;
     eprintln!("[session] {}", session.session_id);
 
-    client.set_mode(&session.session_id, "bypass").await?;
     client
-        .set_config_option(&session.session_id, "model", "swe-2-max")
+        .set_mode(SessionSetModeParams::new(&session.session_id, "bypass"))
+        .await?;
+    client
+        .set_config_option(SessionSetConfigOptionParams::new(
+            &session.session_id,
+            "model",
+            "swe-2-max",
+        ))
         .await?;
 
     eprintln!("[prompt] streaming response:");
     let result = client
-        .prompt(
+        .prompt(PromptParams::new(
             &session.session_id,
             vec![ContentBlock::Text(TextContent {
                 text: "Reply with the single word pong.".to_string(),
                 annotations: None,
+                meta: None,
             })],
-        )
+        ))
         .await?;
 
     eprintln!("\n[done] stop_reason={:?}", result.stop_reason);

@@ -20,7 +20,10 @@ http = ["client", "dep:zenwave"]
 [dependencies]
 aither-core.workspace = true
 aither-sandbox = { workspace = true, optional = true }
-zenwave = { workspace = true, optional = true }
+# `hyper-rustls` rather than the workspace default: `default-backend` also
+# enables `native-tls`, and a crate consumed by a cross-compiled daemon must
+# not drag openssl-sys into its feature-unified graph.
+zenwave = { workspace = true, optional = true, default-features = false, features = ["hyper-rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.23"

@@ -7,12 +7,14 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aither_core::llm::tool::ToolDefinition;
+use aither_core::llm::tool::{ToolDefinition, ToolResult, ToolResultPart};
 use aither_sandbox::{CommandPayload, ToolRegistryBuilder};
 use async_lock::Mutex;
+use async_process::Command;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
 
-use crate::protocol::{CallToolResult, McpError, McpToolDefinition};
+use crate::protocol::{CallToolResult, Content, EmbeddedResource, McpError, McpToolDefinition};
 #[cfg(feature = "http")]
 use crate::transport::HttpTransport;
 use crate::transport::{ChildProcessTransport, StdioTransport};
@@ -162,12 +164,9 @@ impl McpConnection {
         }
         if let Some(ref command) = config.command {
             // Process-based server
-            let args: Vec<&str> = config
-                .args
-                .iter()
-                .map(std::string::String::as_str)
-                .collect();
-            Self::spawn(command, &args).await
+            let mut cmd = Command::new(command);
+            cmd.args(&config.args).envs(&config.env);
+            Self::spawn_command(&mut cmd).await
         } else {
             Err(McpError::InvalidConfig(
                 "Config must have either 'command' or 'url'".to_string(),
@@ -221,7 +220,23 @@ impl McpConnection {
     ///
     /// Returns an error if the process cannot be spawned or connection fails.
     pub async fn spawn(program: &str, args: &[&str]) -> Result<Self, McpError> {
-        let transport = ChildProcessTransport::spawn(program, args)?;
+        Self::from_transport(ChildProcessTransport::spawn(program, args)?).await
+    }
+
+    /// Connect to an MCP server launched from a prepared [`Command`].
+    ///
+    /// Use this when the child needs a custom environment or working
+    /// directory; stdin and stdout are piped for JSON-RPC and stderr is
+    /// inherited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process cannot be spawned or connection fails.
+    pub async fn spawn_command(command: &mut Command) -> Result<Self, McpError> {
+        Self::from_transport(ChildProcessTransport::from_command(command)?).await
+    }
+
+    async fn from_transport(transport: ChildProcessTransport) -> Result<Self, McpError> {
         let mut client = McpClient::connect(transport).await?;
         let tools = client.list_tools().await?;
         let server_name = client.server_info().map(|i| i.name.clone());
@@ -399,6 +414,81 @@ fn call_result_to_terminal_payload(
     }
 }
 
+/// Converts an MCP `tools/call` result into a [`ToolResult`].
+///
+/// Content blocks are preserved one-to-one: text stays text, images decode
+/// from base64 into binary parts, and embedded resources keep their text or
+/// blob. A multi-block result becomes [`ToolResult::Parts`], while a lone
+/// block collapses to its single-payload variant. An `is_error` result maps
+/// to [`ToolResult::Error`] with the text content joined.
+///
+/// # Errors
+///
+/// Returns [`McpError::Transport`] when an image or resource blob carries
+/// invalid base64, or [`McpError::Serialization`] when a resource cannot be
+/// re-encoded.
+pub fn call_result_to_tool_result(result: CallToolResult) -> Result<ToolResult, McpError> {
+    let CallToolResult { content, is_error } = result;
+    if is_error {
+        return Ok(ToolResult::error(error_message_text(&content)));
+    }
+    let mut parts = Vec::with_capacity(content.len());
+    for item in content {
+        parts.push(content_to_part(item)?);
+    }
+    Ok(ToolResult::parts(parts))
+}
+
+fn content_to_part(item: Content) -> Result<ToolResultPart, McpError> {
+    match item {
+        Content::Text(text) => Ok(ToolResultPart::Text { text: text.text }),
+        Content::Image(image) => Ok(ToolResultPart::Binary {
+            mime: image.mime_type,
+            content: decode_base64(&image.data)?,
+        }),
+        Content::Resource(resource) => resource_to_part(resource.resource),
+    }
+}
+
+fn resource_to_part(resource: EmbeddedResource) -> Result<ToolResultPart, McpError> {
+    if let Some(blob) = resource.blob {
+        Ok(ToolResultPart::Binary {
+            mime: resource
+                .mime_type
+                .unwrap_or_else(|| mime::APPLICATION_OCTET_STREAM.essence_str().to_string()),
+            content: decode_base64(&blob)?,
+        })
+    } else if let Some(text) = resource.text {
+        Ok(ToolResultPart::Text { text })
+    } else {
+        Ok(ToolResultPart::Json {
+            value: serde_json::to_value(&resource)?,
+        })
+    }
+}
+
+fn decode_base64(data: &str) -> Result<Vec<u8>, McpError> {
+    BASE64
+        .decode(data)
+        .map_err(|error| McpError::Transport(format!("invalid base64 content block: {error}")))
+}
+
+fn error_message_text(content: &[Content]) -> String {
+    let text = content
+        .iter()
+        .filter_map(|item| match item {
+            Content::Text(text) => Some(text.text.as_str()),
+            Content::Image(_) | Content::Resource(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        serde_json::to_string(content).unwrap_or_else(|_| "MCP tool error".to_string())
+    } else {
+        text
+    }
+}
+
 /// Registers all tools from an MCP connection as schema-driven terminal commands.
 ///
 /// Each command derives its help text, positional arguments, and validation
@@ -476,6 +566,15 @@ impl McpToolService {
         let mut conn = self.conn.lock().await;
         conn.call(name, arguments).await
     }
+
+    /// Close the underlying connection, terminating the child process if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if closing the transport fails.
+    pub async fn close(&self) -> Result<(), McpError> {
+        self.conn.lock().await.close().await
+    }
 }
 
 /// Converts the server's tool list into aither definitions.
@@ -498,4 +597,101 @@ fn convert_definitions(defs: &[McpToolDefinition]) -> Vec<ToolDefinition> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ImageContent, ResourceContent, TextContent};
+
+    fn text_item(text: &str) -> Content {
+        Content::Text(TextContent {
+            text: text.to_string(),
+            annotations: None,
+        })
+    }
+
+    fn image_item(data: &[u8], mime_type: &str) -> Content {
+        Content::Image(ImageContent {
+            data: BASE64.encode(data),
+            mime_type: mime_type.to_string(),
+            annotations: None,
+        })
+    }
+
+    #[test]
+    fn single_text_result_stays_plain_text() {
+        let result = call_result_to_tool_result(CallToolResult {
+            content: vec![text_item("done")],
+            is_error: false,
+        })
+        .expect("converts");
+        assert_eq!(result, ToolResult::text("done"));
+    }
+
+    #[test]
+    fn mixed_text_and_image_become_parts() {
+        let result = call_result_to_tool_result(CallToolResult {
+            content: vec![
+                text_item("see below"),
+                image_item(&[0x89, 0x50], "image/png"),
+            ],
+            is_error: false,
+        })
+        .expect("converts");
+        let ToolResult::Parts { parts } = result else {
+            panic!("mixed content must become Parts");
+        };
+        assert_eq!(
+            parts,
+            vec![
+                ToolResultPart::text("see below"),
+                ToolResultPart::image(vec![0x89, 0x50], "image/png"),
+            ]
+        );
+    }
+
+    #[test]
+    fn error_result_joins_text_into_tool_error() {
+        let result = call_result_to_tool_result(CallToolResult {
+            content: vec![text_item("first"), text_item("second")],
+            is_error: true,
+        })
+        .expect("converts");
+        assert_eq!(result.error_message(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn resource_blob_decodes_into_binary_part() {
+        let result = call_result_to_tool_result(CallToolResult {
+            content: vec![Content::Resource(ResourceContent {
+                resource: EmbeddedResource {
+                    uri: "file:///shot.png".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                    text: None,
+                    blob: Some(BASE64.encode([7u8, 8])),
+                },
+                annotations: None,
+            })],
+            is_error: false,
+        })
+        .expect("converts");
+        assert_eq!(result.mime().unwrap().essence_str(), "image/png");
+        assert_eq!(result.content().unwrap(), &[7, 8]);
+    }
+
+    #[test]
+    fn invalid_base64_is_an_error_not_a_silent_drop() {
+        let mut bad = image_item(&[1], "image/png");
+        if let Content::Image(image) = &mut bad {
+            image.data = "not base64!!".to_string();
+        }
+        assert!(
+            call_result_to_tool_result(CallToolResult {
+                content: vec![bad],
+                is_error: false,
+            })
+            .is_err()
+        );
+    }
 }

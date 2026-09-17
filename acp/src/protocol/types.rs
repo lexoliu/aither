@@ -2,10 +2,13 @@
 //!
 //! Defines all message types for the Agent Client Protocol.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+
+use super::{AgentAuthCapabilities, AuthMethod, ClientAuthCapabilities, ElicitationCapabilities};
 
 /// ACP protocol version implemented by this crate.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -26,6 +29,9 @@ pub struct InitializeParams {
     /// Client information.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_info: Option<Implementation>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Initialize response result.
@@ -69,9 +75,18 @@ pub struct ClientCapabilities {
     /// Whether terminal is supported.
     #[serde(default)]
     pub terminal: bool,
+    /// What the client offers for `authenticate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<ClientAuthCapabilities>,
+    /// What the client offers for `elicitation/create`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elicitation: Option<ElicitationCapabilities>,
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+    /// Capability keys this crate does not model, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// File system capability.
@@ -84,6 +99,9 @@ pub struct FileSystemCapability {
     /// Can write text files.
     #[serde(default)]
     pub write_text_file: bool,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Agent capabilities.
@@ -102,9 +120,15 @@ pub struct AgentCapabilities {
     /// Session capabilities.
     #[serde(default)]
     pub session_capabilities: SessionCapabilities,
+    /// What the agent offers for `authenticate`/`logout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AgentAuthCapabilities>,
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+    /// Capability keys this crate does not model, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// Prompt capabilities.
@@ -159,6 +183,10 @@ pub struct SessionCapabilities {
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+    /// Session capability keys this crate does not model (e.g. `fork`,
+    /// `subagents`), preserved verbatim.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// Capabilities for the `session/list` method.
@@ -202,38 +230,201 @@ pub struct SessionCloseCapabilities {
     pub meta: Option<Value>,
 }
 
-/// Authentication method.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthMethod {
-    /// Unique ID.
-    pub id: String,
-    /// Display name.
-    pub name: String,
-    /// Description.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
 // =============================================================================
 // Session Management
 // =============================================================================
 
-/// MCP server specification for session setup (stdio transport).
+/// An MCP server offered to the agent in `session/new`, `session/load`, or
+/// `session/resume`.
+///
+/// Local stdio servers carry no `type` field; remote servers are tagged
+/// `"type": "http"` or `"type": "sse"`. Whether an agent accepts remote
+/// servers is negotiated through [`McpCapabilities`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpServerSpec {
+#[serde(tag = "type")]
+pub enum McpServer {
+    /// A remote server reached over streamable HTTP.
+    #[serde(rename = "http")]
+    Http(McpServerHttp),
+    /// A remote server reached over SSE.
+    #[serde(rename = "sse")]
+    Sse(McpServerSse),
+    /// A local process the agent spawns; sent with no `type` field.
+    #[serde(untagged)]
+    Stdio(McpServerStdio),
+}
+
+impl McpServer {
+    /// The server name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Http(server) => &server.name,
+            Self::Sse(server) => &server.name,
+            Self::Stdio(server) => &server.name,
+        }
+    }
+}
+
+impl From<McpServerStdio> for McpServer {
+    fn from(server: McpServerStdio) -> Self {
+        Self::Stdio(server)
+    }
+}
+
+impl From<McpServerHttp> for McpServer {
+    fn from(server: McpServerHttp) -> Self {
+        Self::Http(server)
+    }
+}
+
+impl From<McpServerSse> for McpServer {
+    fn from(server: McpServerSse) -> Self {
+        Self::Sse(server)
+    }
+}
+
+/// A local MCP server the agent spawns as a child process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerStdio {
     /// Server name.
     pub name: String,
     /// Command to run.
     pub command: String,
     /// Command arguments.
+    ///
+    /// Always written, even when empty: `args` is required by the schema's
+    /// stdio variant, and agents that deserialize `McpServer` as a strict
+    /// untagged enum — Devin's does — refuse the object without it.
     #[serde(default)]
     pub args: Vec<String>,
     /// Environment variables.
+    ///
+    /// Required by the schema for the same reason `args` is.
     #[serde(default)]
     pub env: Vec<EnvVar>,
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+}
+
+impl McpServerStdio {
+    /// Build a stdio server spec.
+    #[must_use]
+    pub fn new(name: impl Into<String>, command: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            command: command.into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            meta: None,
+        }
+    }
+
+    /// Set command arguments.
+    #[must_use]
+    pub fn args(mut self, args: Vec<String>) -> Self {
+        self.args = args;
+        self
+    }
+
+    /// Set environment variables.
+    #[must_use]
+    pub fn env(mut self, env: Vec<EnvVar>) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// Set extension metadata.
+    #[must_use]
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+}
+
+/// A remote MCP server reached over streamable HTTP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerHttp {
+    /// Server name.
+    pub name: String,
+    /// Endpoint URL.
+    pub url: String,
+    /// HTTP headers to send with requests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<HttpHeader>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+impl McpServerHttp {
+    /// Build an HTTP server spec.
+    #[must_use]
+    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            url: url.into(),
+            headers: Vec::new(),
+            meta: None,
+        }
+    }
+
+    /// Set request headers.
+    #[must_use]
+    pub fn headers(mut self, headers: Vec<HttpHeader>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Set extension metadata.
+    #[must_use]
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+}
+
+/// A remote MCP server reached over SSE.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerSse {
+    /// Server name.
+    pub name: String,
+    /// Endpoint URL.
+    pub url: String,
+    /// HTTP headers to send with requests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<HttpHeader>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+impl McpServerSse {
+    /// Build an SSE server spec.
+    #[must_use]
+    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            url: url.into(),
+            headers: Vec::new(),
+            meta: None,
+        }
+    }
+
+    /// Set request headers.
+    #[must_use]
+    pub fn headers(mut self, headers: Vec<HttpHeader>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Set extension metadata.
+    #[must_use]
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
 }
 
 /// Environment variable.
@@ -245,6 +436,26 @@ pub struct EnvVar {
     pub value: String,
 }
 
+/// HTTP header on a remote MCP server request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpHeader {
+    /// Header name.
+    pub name: String,
+    /// Header value.
+    pub value: String,
+}
+
+impl HttpHeader {
+    /// Build a header.
+    #[must_use]
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
 /// Create new session request parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -253,13 +464,49 @@ pub struct SessionNewParams {
     pub cwd: PathBuf,
     /// MCP servers to connect to.
     #[serde(default)]
-    pub mcp_servers: Vec<McpServerSpec>,
-    /// Additional workspace roots. Each path must be absolute.
+    pub mcp_servers: Vec<McpServer>,
+    /// Additional workspace roots. Each path must be absolute and is only
+    /// honoured when the agent advertises
+    /// [`SessionCapabilities::additional_directories`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_directories: Vec<PathBuf>,
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+}
+
+impl SessionNewParams {
+    /// Build params for a session rooted at `cwd`.
+    #[must_use]
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            mcp_servers: Vec::new(),
+            additional_directories: Vec::new(),
+            meta: None,
+        }
+    }
+
+    /// Set the MCP servers to connect.
+    #[must_use]
+    pub fn mcp_servers(mut self, mcp_servers: Vec<McpServer>) -> Self {
+        self.mcp_servers = mcp_servers;
+        self
+    }
+
+    /// Set additional workspace roots.
+    #[must_use]
+    pub fn additional_directories(mut self, additional_directories: Vec<PathBuf>) -> Self {
+        self.additional_directories = additional_directories;
+        self
+    }
+
+    /// Set extension metadata.
+    #[must_use]
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
 }
 
 /// Create new session response.
@@ -277,6 +524,9 @@ pub struct SessionNewResult {
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+    /// Vendor fields this crate does not model, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// Load session request parameters (`session/load`).
@@ -289,13 +539,49 @@ pub struct SessionLoadParams {
     pub cwd: PathBuf,
     /// MCP servers to connect to.
     #[serde(default)]
-    pub mcp_servers: Vec<McpServerSpec>,
-    /// Additional workspace roots. Each path must be absolute.
+    pub mcp_servers: Vec<McpServer>,
+    /// Additional workspace roots. Each path must be absolute and must be
+    /// re-sent here — the agent does not restore them implicitly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_directories: Vec<PathBuf>,
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+}
+
+impl SessionLoadParams {
+    /// Build params loading `session_id` rooted at `cwd`.
+    #[must_use]
+    pub fn new(session_id: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            cwd: cwd.into(),
+            mcp_servers: Vec::new(),
+            additional_directories: Vec::new(),
+            meta: None,
+        }
+    }
+
+    /// Set the MCP servers to connect.
+    #[must_use]
+    pub fn mcp_servers(mut self, mcp_servers: Vec<McpServer>) -> Self {
+        self.mcp_servers = mcp_servers;
+        self
+    }
+
+    /// Set additional workspace roots.
+    #[must_use]
+    pub fn additional_directories(mut self, additional_directories: Vec<PathBuf>) -> Self {
+        self.additional_directories = additional_directories;
+        self
+    }
+
+    /// Set extension metadata.
+    #[must_use]
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
 }
 
 /// Load session response (`session/load`).
@@ -311,6 +597,9 @@ pub struct SessionLoadResult {
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+    /// Vendor fields this crate does not model, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// Resume session request parameters (`session/resume`).
@@ -327,13 +616,49 @@ pub struct SessionResumeParams {
     pub cwd: PathBuf,
     /// MCP servers to connect to.
     #[serde(default)]
-    pub mcp_servers: Vec<McpServerSpec>,
-    /// Additional workspace roots. Each path must be absolute.
+    pub mcp_servers: Vec<McpServer>,
+    /// Additional workspace roots. Each path must be absolute and must be
+    /// re-sent here — the agent does not restore them implicitly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_directories: Vec<PathBuf>,
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+}
+
+impl SessionResumeParams {
+    /// Build params resuming `session_id` rooted at `cwd`.
+    #[must_use]
+    pub fn new(session_id: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            cwd: cwd.into(),
+            mcp_servers: Vec::new(),
+            additional_directories: Vec::new(),
+            meta: None,
+        }
+    }
+
+    /// Set the MCP servers to connect.
+    #[must_use]
+    pub fn mcp_servers(mut self, mcp_servers: Vec<McpServer>) -> Self {
+        self.mcp_servers = mcp_servers;
+        self
+    }
+
+    /// Set additional workspace roots.
+    #[must_use]
+    pub fn additional_directories(mut self, additional_directories: Vec<PathBuf>) -> Self {
+        self.additional_directories = additional_directories;
+        self
+    }
+
+    /// Set extension metadata.
+    #[must_use]
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
 }
 
 /// Resume session response (`session/resume`).
@@ -349,6 +674,9 @@ pub struct SessionResumeResult {
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+    /// Vendor fields this crate does not model, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// Set session mode request parameters (`session/set_mode`).
@@ -362,6 +690,25 @@ pub struct SessionSetModeParams {
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+}
+
+impl SessionSetModeParams {
+    /// Build params activating `mode_id` on `session_id`.
+    #[must_use]
+    pub fn new(session_id: impl Into<String>, mode_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            mode_id: mode_id.into(),
+            meta: None,
+        }
+    }
+
+    /// Set extension metadata.
+    #[must_use]
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
 }
 
 /// Set session mode response (`session/set_mode`).
@@ -390,6 +737,31 @@ pub struct SessionSetConfigOptionParams {
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+}
+
+impl SessionSetConfigOptionParams {
+    /// Build params setting `config_id` on `session_id`. `value` accepts
+    /// `&str`/`String` for `select` options and `bool` for `boolean` options.
+    #[must_use]
+    pub fn new(
+        session_id: impl Into<String>,
+        config_id: impl Into<String>,
+        value: impl Into<SessionConfigValue>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            config_id: config_id.into(),
+            value: value.into(),
+            meta: None,
+        }
+    }
+
+    /// Set extension metadata.
+    #[must_use]
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
 }
 
 /// Set config option response (`session/set_config_option`).
@@ -582,6 +954,25 @@ pub struct PromptParams {
     pub meta: Option<Value>,
 }
 
+impl PromptParams {
+    /// Build params prompting `session_id` with `prompt`.
+    #[must_use]
+    pub fn new(session_id: impl Into<String>, prompt: Vec<ContentBlock>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            prompt,
+            meta: None,
+        }
+    }
+
+    /// Set extension metadata.
+    #[must_use]
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+}
+
 /// Prompt response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -611,14 +1002,6 @@ pub enum StopReason {
     Refusal,
 }
 
-/// Stop session request parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionStopParams {
-    /// Session ID.
-    pub session_id: String,
-}
-
 /// Cancel notification parameters (`session/cancel`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -630,11 +1013,41 @@ pub struct SessionCancelParams {
     pub meta: Option<Value>,
 }
 
+impl SessionCancelParams {
+    /// Build params cancelling `session_id`'s current turn.
+    #[must_use]
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            meta: None,
+        }
+    }
+
+    /// Set extension metadata.
+    #[must_use]
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+}
+
+impl From<&str> for SessionCancelParams {
+    fn from(session_id: &str) -> Self {
+        Self::new(session_id)
+    }
+}
+
+impl From<String> for SessionCancelParams {
+    fn from(session_id: String) -> Self {
+        Self::new(session_id)
+    }
+}
+
 // =============================================================================
 // Content Types
 // =============================================================================
 
-/// Content block (text, image, audio, resource).
+/// Content block (text, image, audio, resource, resource link).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ContentBlock {
@@ -646,6 +1059,9 @@ pub enum ContentBlock {
     Audio(AudioContent),
     /// Resource content.
     Resource(ResourceContent),
+    /// A link to a resource without embedding its contents.
+    #[serde(rename = "resource_link")]
+    ResourceLink(ResourceLink),
 }
 
 /// Text content.
@@ -654,18 +1070,31 @@ pub struct TextContent {
     /// Text value.
     pub text: String,
     /// Annotations.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Value>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Image content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageContent {
-    /// Base64-encoded data.
-    pub data: String,
+    /// Base64-encoded data. Absent when `uri` carries the image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// URI carrying the image instead of inline `data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
     /// MIME type.
     pub mime_type: String,
+    /// Annotations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Audio content.
@@ -676,6 +1105,12 @@ pub struct AudioContent {
     pub data: String,
     /// MIME type.
     pub mime_type: String,
+    /// Annotations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Resource content.
@@ -683,20 +1118,77 @@ pub struct AudioContent {
 pub struct ResourceContent {
     /// Resource data.
     pub resource: EmbeddedResource,
+    /// Annotations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
-/// Embedded resource.
+/// Embedded resource: carries either `text` or base64 `blob` contents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmbeddedResource {
     /// Resource URI.
     pub uri: String,
     /// MIME type.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
-    /// Text content.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Text contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Base64-encoded binary contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+/// A link to a resource without embedding its contents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceLink {
+    /// Resource URI.
+    pub uri: String,
+    /// Resource name.
+    pub name: String,
+    /// Human-readable title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// MIME type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    /// Annotations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+impl ResourceLink {
+    /// Build a resource link.
+    #[must_use]
+    pub fn new(uri: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            name: name.into(),
+            title: None,
+            description: None,
+            mime_type: None,
+            size: None,
+            annotations: None,
+            meta: None,
+        }
+    }
 }
 
 /// Content chunk for streaming.
@@ -706,8 +1198,11 @@ pub struct ContentChunk {
     /// Content.
     pub content: ContentBlock,
     /// Optional identifier correlating chunks that belong to one message.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 // =============================================================================
@@ -725,6 +1220,9 @@ pub struct SessionNotification {
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+    /// Vendor fields this crate does not model, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// A session update streamed from the agent in a `session/update`
@@ -1017,7 +1515,8 @@ pub enum PlanEntryPriority {
 pub struct ToolCall {
     /// Unique tool call ID.
     pub tool_call_id: String,
-    /// Human-readable title.
+    /// Human-readable title; agents in the wild omit it, so tolerate absence.
+    #[serde(default)]
     pub title: String,
     /// Tool kind.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1438,6 +1937,8 @@ mod tests {
         let block = ContentBlock::Audio(AudioContent {
             data: "AAAA".to_string(),
             mime_type: "audio/ogg".to_string(),
+            annotations: None,
+            meta: None,
         });
         let json = serde_json::to_value(&block).expect("serializes");
         assert_eq!(json["type"], "audio");
