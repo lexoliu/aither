@@ -7,7 +7,8 @@
 mod toolset;
 
 pub use toolset::{
-    McpConnection, McpServerConfig, McpServersConfig, McpToolService, register_terminal_commands,
+    McpConnection, McpServerConfig, McpServersConfig, McpToolService, call_result_to_tool_result,
+    register_terminal_commands,
 };
 
 use tracing::debug;

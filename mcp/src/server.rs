@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aither_core::llm::tool::{ToolResult, Tools};
+use aither_core::llm::tool::{ToolResult, ToolResultPart, Tools};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_lite::future;
 use futures_util::future::{AbortHandle, Abortable, Aborted, BoxFuture};
@@ -343,7 +343,7 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
 
         match tools.call(&params.name, &args_str).await {
             Ok(output) => {
-                let content = match content_for(&output) {
+                let content = match contents_for(&output) {
                     Ok(content) => content,
                     Err(error) => {
                         return JsonRpcResponse::error(
@@ -353,7 +353,7 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
                     }
                 };
                 let result = CallToolResult {
-                    content: vec![content],
+                    content,
                     is_error: output.is_error(),
                 };
                 JsonRpcResponse::success(req.id, result)
@@ -372,27 +372,55 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
     }
 }
 
-/// Map a tool output to the MCP content item the client receives.
+/// Map a tool output to the MCP content items the client receives.
 ///
-/// A binary result whose MIME type's top-level type is `image` is delivered
+/// [`ToolResult::Parts`] emits one content item per part so a call that
+/// returns text alongside a screenshot keeps both; every other result maps
+/// to a single item.
+fn contents_for(output: &ToolResult) -> aither_core::Result<Vec<Content>> {
+    match output {
+        ToolResult::Parts { parts } => parts.iter().map(content_for_part).collect(),
+        output => Ok(vec![content_for(output)?]),
+    }
+}
+
+/// A binary payload whose MIME type's top-level type is `image` is delivered
 /// as [`Content::Image`] carrying the standard-base64 bytes and the MIME
-/// essence; every other result keeps the text representation
-/// [`ToolResult::render_for_model`] produces.
+/// essence; every other payload keeps the text representation
+/// `render_for_model` produces.
 fn content_for(output: &ToolResult) -> aither_core::Result<Content> {
-    if let Some(mime) = output.mime()
-        && mime.type_() == mime::IMAGE
-        && let Some(content) = output.content()
+    if let ToolResult::Binary { mime, content } = output
+        && let Some(image) = image_content(mime, content)
     {
-        return Ok(Content::Image(ImageContent {
-            data: BASE64.encode(content),
-            mime_type: mime.essence_str().to_string(),
-            annotations: None,
-        }));
+        return Ok(image);
     }
     Ok(Content::Text(TextContent {
         text: output.render_for_model()?,
         annotations: None,
     }))
+}
+
+fn content_for_part(part: &ToolResultPart) -> aither_core::Result<Content> {
+    if let ToolResultPart::Binary { mime, content } = part
+        && let Some(image) = image_content(mime, content)
+    {
+        return Ok(image);
+    }
+    Ok(Content::Text(TextContent {
+        text: part.render_for_model()?,
+        annotations: None,
+    }))
+}
+
+fn image_content(mime: &str, content: &[u8]) -> Option<Content> {
+    let mime: mime::Mime = mime.parse().ok()?;
+    (mime.type_() == mime::IMAGE).then(|| {
+        Content::Image(ImageContent {
+            data: BASE64.encode(content),
+            mime_type: mime.essence_str().to_string(),
+            annotations: None,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -608,6 +636,53 @@ mod tests {
         assert_eq!(image.mime_type, "image/png");
         let decoded = BASE64.decode(&image.data).expect("base64 decodes");
         assert_eq!(decoded, bytes);
+
+        client.close().await.expect("close");
+        server_task.await.expect("join").expect("run");
+    }
+
+    /// A `Parts` result arrives as one content item per part — the text stays
+    /// `Content::Text` and the image stays `Content::Image`, in order.
+    #[tokio::test]
+    async fn parts_tool_result_becomes_multiple_content_items() {
+        let bytes = vec![0x89, b'P', b'N', b'G'];
+
+        let mut tools = Tools::new();
+        let image_bytes = bytes.clone();
+        register(
+            &mut tools,
+            "snapshot",
+            Box::new(move |_args| {
+                let image_bytes = image_bytes.clone();
+                Box::pin(async move {
+                    Ok(ToolResult::parts(vec![
+                        ToolResultPart::text("screen state"),
+                        ToolResultPart::image(image_bytes, "image/png"),
+                    ]))
+                })
+            }),
+        );
+
+        let (mut client, transport) = DuplexTransport::pair();
+        let mut server = McpServer::new(transport, tools, "test-server", "0.0.0");
+        let server_task = tokio::spawn(async move { server.run().await });
+
+        client
+            .send_request(call(1, "snapshot"))
+            .await
+            .expect("send");
+        let response = next_response(&mut client).await;
+
+        let result: CallToolResult =
+            serde_json::from_value(response.result.expect("result")).expect("call tool result");
+        let [Content::Text(text), Content::Image(image)] = result.content.as_slice() else {
+            panic!(
+                "expected [text, image] content items, got {:?}",
+                result.content
+            );
+        };
+        assert_eq!(text.text, "screen state");
+        assert_eq!(BASE64.decode(&image.data).expect("base64 decodes"), bytes);
 
         client.close().await.expect("close");
         server_task.await.expect("join").expect("run");
