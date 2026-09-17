@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/lexoliu/aither/compare/webfetch-v0.4.1...webfetch-v0.5.0) - 2026-09-17
+
+### Other
+
+- pin zenwave to hyper-rustls — default features drag in openssl-sys ([#67](https://github.com/lexoliu/aither/pull/67))
+
 ## [0.3.0](https://github.com/lexoliu/aither/compare/webfetch-v0.2.0...webfetch-v0.3.0) - 2026-09-11
 
 ### Added

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/lexoliu/aither/compare/sandbox-v0.4.1...sandbox-v0.5.0) - 2026-09-17
+
+### Other
+
+- add ToolResult::Parts for multi-content tool results ([#71](https://github.com/lexoliu/aither/pull/71))
+- poll child.pid until it parses in descendant-kill test ([#65](https://github.com/lexoliu/aither/pull/65))
+
 ## [0.4.0](https://github.com/lexoliu/aither/compare/sandbox-v0.3.0...sandbox-v0.4.0) - 2026-09-13
 
 ### Other
