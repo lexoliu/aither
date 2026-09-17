@@ -149,6 +149,6 @@ pub use client::{
     McpClient, McpConnection, McpServerConfig, McpServersConfig, McpToolService,
     call_result_to_tool_result, register_terminal_commands,
 };
-pub use protocol::{CallToolResult, Content, McpError};
+pub use protocol::{CallToolResult, Content, McpError, McpToolDefinition};
 #[cfg(feature = "server")]
 pub use server::McpServer;
