@@ -322,6 +322,26 @@ fn tool_output_to_payload(output: impl IntoToolResult) -> Result<Option<CommandP
             mime,
             data_base64: base64::engine::general_purpose::STANDARD.encode(content),
         })),
+        ToolResult::Parts { parts } => {
+            let mut rendered = String::new();
+            for part in &parts {
+                let text = part
+                    .render_for_model()
+                    .map_err(|error| prefix_error("failed to render tool result part: ", &error))?;
+                if text.is_empty() {
+                    continue;
+                }
+                if !rendered.is_empty() {
+                    rendered.push('\n');
+                }
+                rendered.push_str(&text);
+            }
+            if rendered.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(CommandPayload::Text { content: rendered }))
+            }
+        }
         ToolResult::Error { message } => Err(message),
     }
 }

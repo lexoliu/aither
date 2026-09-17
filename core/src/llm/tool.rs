@@ -223,6 +223,52 @@ pub enum ToolResult {
         /// Tool-level error message.
         message: String,
     },
+
+    /// Several content items produced by one tool call.
+    ///
+    /// A single call can legitimately yield more than one payload — for
+    /// example a relayed MCP tool result that pairs explanatory text with a
+    /// screenshot. Parts never nest and never carry errors: tool-level
+    /// failures stay on [`ToolResult::Error`].
+    Parts {
+        /// Ordered content items.
+        parts: Vec<ToolResultPart>,
+    },
+}
+
+/// One content item inside [`ToolResult::Parts`].
+///
+/// Mirrors the payload-carrying [`ToolResult`] variants. `Done` and `Error`
+/// have no part equivalent: they describe the call as a whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "snake_case"))]
+pub enum ToolResultPart {
+    /// UTF-8 plain text output.
+    Text {
+        /// Plain text content.
+        text: String,
+    },
+
+    /// Tab-separated tabular output.
+    Tsv {
+        /// TSV content.
+        text: String,
+    },
+
+    /// Structured JSON output.
+    Json {
+        /// JSON content.
+        value: Value,
+    },
+
+    /// Binary or media payload.
+    Binary {
+        /// MIME type of the payload (for example `image/png`).
+        mime: String,
+        /// Raw content bytes.
+        content: Vec<u8>,
+    },
 }
 
 impl ToolResult {
@@ -281,6 +327,20 @@ impl ToolResult {
         }
     }
 
+    /// Creates a multi-part result.
+    ///
+    /// An empty part list collapses to [`ToolResult::Done`] and a single part
+    /// collapses to the matching single-payload variant, so callers that
+    /// conditionally accumulate parts never produce a degenerate `Parts`.
+    #[must_use]
+    pub fn parts(parts: Vec<ToolResultPart>) -> Self {
+        match <[ToolResultPart; 1]>::try_from(parts) {
+            Ok([part]) => part.into_result(),
+            Err(parts) if parts.is_empty() => Self::Done,
+            Err(parts) => Self::Parts { parts },
+        }
+    }
+
     /// Returns `true` if this is a `Done` variant.
     #[must_use]
     pub const fn is_done(&self) -> bool {
@@ -293,13 +353,13 @@ impl ToolResult {
         matches!(self, Self::Error { .. })
     }
 
-    /// Returns plain textual content for text-like variants.
+    /// Returns plain textual content when every payload this result carries is text-like.
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text { text } | Self::Tsv { text } => Some(text),
             Self::Error { message } => Some(message),
-            Self::Done | Self::Json { .. } | Self::Binary { .. } => None,
+            Self::Done | Self::Json { .. } | Self::Binary { .. } | Self::Parts { .. } => None,
         }
     }
 
@@ -312,7 +372,8 @@ impl ToolResult {
             | Self::Text { .. }
             | Self::Tsv { .. }
             | Self::Json { .. }
-            | Self::Binary { .. } => None,
+            | Self::Binary { .. }
+            | Self::Parts { .. } => None,
         }
     }
 
@@ -326,16 +387,9 @@ impl ToolResult {
             Self::Done => Ok(String::new()),
             Self::Text { text } | Self::Tsv { text } => Ok(text.clone()),
             Self::Json { value } => Ok(serde_json::to_string(value)?),
-            Self::Binary { mime, content } => {
-                let mut rendered = String::new();
-                rendered.push_str("[binary tool result: ");
-                rendered.push_str(mime);
-                rendered.push_str(", ");
-                rendered.push_str(content.len().to_string().as_str());
-                rendered.push_str(" bytes]");
-                Ok(rendered)
-            }
+            Self::Binary { mime, content } => Ok(render_binary_placeholder(mime, content)),
             Self::Error { message } => Ok(message.clone()),
+            Self::Parts { parts } => join_part_renders(parts, false),
         }
     }
 
@@ -349,24 +403,24 @@ impl ToolResult {
             Self::Done => Ok(String::new()),
             Self::Text { text } | Self::Tsv { text } => Ok(text.clone()),
             Self::Json { value } => Ok(serde_json::to_string_pretty(value)?),
-            Self::Binary { mime, content } => {
-                let mut rendered = String::new();
-                rendered.push_str("[binary tool result: ");
-                rendered.push_str(mime);
-                rendered.push_str(", ");
-                rendered.push_str(content.len().to_string().as_str());
-                rendered.push_str(" bytes]");
-                Ok(rendered)
-            }
+            Self::Binary { mime, content } => Ok(render_binary_placeholder(mime, content)),
             Self::Error { message } => Ok(message.clone()),
+            Self::Parts { parts } => join_part_renders(parts, true),
         }
     }
 
     /// Parses and returns the MIME type when this result carries binary content.
+    ///
+    /// A multi-part result yields a MIME type only when it holds exactly one
+    /// binary part; mixed content has no single type to report.
     #[must_use]
     pub fn mime(&self) -> Option<Mime> {
         match self {
             Self::Binary { mime, .. } => mime.parse().ok(),
+            Self::Parts { parts } => match parts.as_slice() {
+                [ToolResultPart::Binary { mime, .. }] => mime.parse().ok(),
+                _ => None,
+            },
             Self::Done
             | Self::Text { .. }
             | Self::Tsv { .. }
@@ -375,11 +429,17 @@ impl ToolResult {
         }
     }
 
-    /// Returns raw bytes for binary results.
+    /// Returns raw bytes when this result carries binary content.
+    ///
+    /// Follows the same single-binary rule as [`Self::mime`].
     #[must_use]
     pub fn content(&self) -> Option<&[u8]> {
         match self {
             Self::Binary { content, .. } => Some(content),
+            Self::Parts { parts } => match parts.as_slice() {
+                [ToolResultPart::Binary { content, .. }] => Some(content),
+                _ => None,
+            },
             Self::Done
             | Self::Text { .. }
             | Self::Tsv { .. }
@@ -387,6 +447,151 @@ impl ToolResult {
             | Self::Error { .. } => None,
         }
     }
+}
+
+impl ToolResultPart {
+    /// Creates a plain text part.
+    #[must_use]
+    pub fn text(s: impl Into<String>) -> Self {
+        Self::Text { text: s.into() }
+    }
+
+    /// Creates a TSV part.
+    #[must_use]
+    pub fn tsv(s: impl Into<String>) -> Self {
+        Self::Tsv { text: s.into() }
+    }
+
+    /// Creates a JSON part from a serializable value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
+    pub fn json<T: Serialize>(value: &T) -> Result<Self> {
+        Ok(Self::Json {
+            value: serde_json::to_value(value)?,
+        })
+    }
+
+    /// Creates a JSON part from an already-materialized JSON value.
+    #[must_use]
+    pub const fn json_value(value: Value) -> Self {
+        Self::Json { value }
+    }
+
+    /// Creates an image part.
+    #[must_use]
+    pub fn image(data: Vec<u8>, media_type: &str) -> Self {
+        Self::Binary {
+            mime: parse_media_type_or_octet_stream(media_type),
+            content: data,
+        }
+    }
+
+    /// Creates a binary part.
+    #[must_use]
+    pub fn binary(data: Vec<u8>) -> Self {
+        Self::Binary {
+            mime: mime::APPLICATION_OCTET_STREAM.essence_str().to_string(),
+            content: data,
+        }
+    }
+
+    /// Returns plain textual content for text-like parts.
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text { text } | Self::Tsv { text } => Some(text),
+            Self::Json { .. } | Self::Binary { .. } => None,
+        }
+    }
+
+    /// Projects the part into a textual representation safe to re-inject into model context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if JSON serialization fails.
+    pub fn render_for_model(&self) -> Result<String> {
+        self.render(false)
+    }
+
+    /// Renders the part for CLI display.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if JSON serialization fails.
+    pub fn render_for_cli(&self) -> Result<String> {
+        self.render(true)
+    }
+
+    fn render(&self, pretty: bool) -> Result<String> {
+        match self {
+            Self::Text { text } | Self::Tsv { text } => Ok(text.clone()),
+            Self::Json { value } => Ok(if pretty {
+                serde_json::to_string_pretty(value)?
+            } else {
+                serde_json::to_string(value)?
+            }),
+            Self::Binary { mime, content } => Ok(render_binary_placeholder(mime, content)),
+        }
+    }
+
+    /// Parses and returns the MIME type when this part carries binary content.
+    #[must_use]
+    pub fn mime(&self) -> Option<Mime> {
+        match self {
+            Self::Binary { mime, .. } => mime.parse().ok(),
+            Self::Text { .. } | Self::Tsv { .. } | Self::Json { .. } => None,
+        }
+    }
+
+    /// Returns raw bytes for binary parts.
+    #[must_use]
+    pub fn content(&self) -> Option<&[u8]> {
+        match self {
+            Self::Binary { content, .. } => Some(content),
+            Self::Text { .. } | Self::Tsv { .. } | Self::Json { .. } => None,
+        }
+    }
+
+    /// Lifts the part into its single-payload [`ToolResult`] equivalent.
+    #[must_use]
+    pub fn into_result(self) -> ToolResult {
+        match self {
+            Self::Text { text } | Self::Tsv { text } => ToolResult::Text { text },
+            Self::Json { value } => ToolResult::Json { value },
+            Self::Binary { mime, content } => ToolResult::Binary { mime, content },
+        }
+    }
+}
+
+fn render_binary_placeholder(mime: &str, content: &[u8]) -> String {
+    let mut rendered = String::new();
+    rendered.push_str("[binary tool result: ");
+    rendered.push_str(mime);
+    rendered.push_str(", ");
+    rendered.push_str(content.len().to_string().as_str());
+    rendered.push_str(" bytes]");
+    rendered
+}
+
+fn join_part_renders(parts: &[ToolResultPart], pretty: bool) -> Result<String> {
+    let mut rendered = String::new();
+    for part in parts {
+        let text = if pretty {
+            part.render_for_cli()?
+        } else {
+            part.render_for_model()?
+        };
+        if text.is_empty() {
+            continue;
+        }
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str(&text);
+    }
+    Ok(rendered)
 }
 
 /// Conversion trait for values returned by [`Tool::call`].
@@ -445,6 +650,12 @@ where
 {
     fn into_tool_result(self) -> Result<ToolResult> {
         self.map_or_else(|| Ok(ToolResult::Done), IntoToolResult::into_tool_result)
+    }
+}
+
+impl IntoToolResult for Vec<ToolResultPart> {
+    fn into_tool_result(self) -> Result<ToolResult> {
+        Ok(ToolResult::parts(self))
     }
 }
 
@@ -1938,5 +2149,59 @@ mod tests {
             "Nested status should have enum. Full schema: {}",
             serde_json::to_string_pretty(&schema).unwrap()
         );
+    }
+
+    #[test]
+    fn parts_collapses_degenerate_inputs() {
+        assert_eq!(ToolResult::parts(vec![]), ToolResult::Done);
+        assert_eq!(
+            ToolResult::parts(vec![ToolResultPart::text("only")]),
+            ToolResult::text("only")
+        );
+        let multi = ToolResult::parts(vec![
+            ToolResultPart::text("a"),
+            ToolResultPart::image(vec![1, 2], "image/png"),
+        ]);
+        let ToolResult::Parts { parts } = &multi else {
+            panic!("two parts must stay a Parts result");
+        };
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn parts_render_joins_text_and_marks_binary() {
+        let result = ToolResult::parts(vec![
+            ToolResultPart::text("header"),
+            ToolResultPart::json_value(serde_json::json!({"n": 1})),
+            ToolResultPart::image(vec![0x89], "image/png"),
+        ]);
+        assert_eq!(
+            result.render_for_model().unwrap(),
+            "header\n{\"n\":1}\n[binary tool result: image/png, 1 bytes]"
+        );
+        assert!(result.mime().is_none() && result.content().is_none());
+    }
+
+    #[test]
+    fn parts_with_one_binary_expose_mime_and_content() {
+        let result = ToolResult::Parts {
+            parts: vec![ToolResultPart::image(vec![9, 9], "image/png")],
+        };
+        assert_eq!(result.mime().unwrap().essence_str(), "image/png");
+        assert_eq!(result.content().unwrap(), &[9, 9]);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn parts_serde_roundtrip_uses_kind_tag() {
+        let result = ToolResult::parts(vec![
+            ToolResultPart::text("note"),
+            ToolResultPart::json_value(serde_json::json!({"k": true})),
+        ]);
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["kind"], "parts");
+        assert_eq!(value["parts"][0]["kind"], "text");
+        let back: ToolResult = serde_json::from_value(value).unwrap();
+        assert_eq!(back, result);
     }
 }

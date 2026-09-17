@@ -15,10 +15,12 @@ pub use handler::ClientHandler;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::marker::PhantomData;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::task::{Context, Poll, ready};
 
 use aither_mcp::protocol::{
     JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError,
@@ -27,16 +29,19 @@ use aither_mcp::protocol::{
 use aither_mcp::transport::{BidirectionalTransport, ChildProcessTransport};
 use async_channel::{Receiver, Sender};
 use futures_lite::future::or;
+use futures_lite::stream::Stream;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::{debug, warn};
 
 use crate::protocol::{
-    ConfigOption, ContentBlock, Implementation, InitializeParams, InitializeResult, McpServerSpec,
-    PROTOCOL_VERSION, PromptParams, PromptResult, SessionCancelParams, SessionConfigValue,
-    SessionLoadParams, SessionLoadResult, SessionNewParams, SessionNewResult, SessionNotification,
-    SessionResumeParams, SessionResumeResult, SessionSetConfigOptionParams,
+    AuthenticateParams, AuthenticateResult, ConfigOption, ElicitationCompleteParams, ExtMethod,
+    Implementation, InitializeParams, InitializeResult, LogoutParams, LogoutResult,
+    PROTOCOL_VERSION, PromptParams, PromptResult, SessionCancelParams, SessionCloseParams,
+    SessionCloseResult, SessionDeleteParams, SessionDeleteResult, SessionListParams,
+    SessionListResult, SessionLoadParams, SessionLoadResult, SessionNewParams, SessionNewResult,
+    SessionNotification, SessionResumeParams, SessionResumeResult, SessionSetConfigOptionParams,
     SessionSetConfigOptionResult, SessionSetModeParams, SessionSetModeResult,
 };
 
@@ -185,9 +190,39 @@ impl<H: ClientHandler> AcpClient<H> {
                 protocol_version: PROTOCOL_VERSION,
                 client_capabilities: self.handler.capabilities(),
                 client_info: Some(self.info.clone()),
+                meta: None,
             },
         )
         .await
+    }
+
+    /// `authenticate` request: runs one of the [`AuthMethod`]s the agent
+    /// advertised in [`InitializeResult::auth_methods`].
+    ///
+    /// [`AuthMethod`]: crate::protocol::AuthMethod
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed or the agent replies with
+    /// an error or a malformed result.
+    pub async fn authenticate(
+        &self,
+        params: impl Into<AuthenticateParams>,
+    ) -> Result<AuthenticateResult, ClientError> {
+        self.call("authenticate", &params.into()).await
+    }
+
+    /// `logout` request.
+    ///
+    /// Only valid when the agent advertised
+    /// [`AgentCapabilities::auth.logout`](crate::protocol::AgentAuthCapabilities::logout).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed or the agent replies with
+    /// an error or a malformed result.
+    pub async fn logout(&self, params: LogoutParams) -> Result<LogoutResult, ClientError> {
+        self.call("logout", &params).await
     }
 
     /// `session/new` request.
@@ -198,19 +233,9 @@ impl<H: ClientHandler> AcpClient<H> {
     /// an error or a malformed result.
     pub async fn new_session(
         &self,
-        cwd: impl Into<PathBuf>,
-        mcp_servers: Vec<McpServerSpec>,
+        params: SessionNewParams,
     ) -> Result<SessionNewResult, ClientError> {
-        self.call(
-            "session/new",
-            &SessionNewParams {
-                cwd: cwd.into(),
-                mcp_servers,
-                additional_directories: Vec::new(),
-                meta: None,
-            },
-        )
-        .await
+        self.call("session/new", &params).await
     }
 
     /// `session/load` request.
@@ -226,21 +251,9 @@ impl<H: ClientHandler> AcpClient<H> {
     /// an error or a malformed result.
     pub async fn load_session(
         &self,
-        session_id: &str,
-        cwd: impl Into<PathBuf>,
-        mcp_servers: Vec<McpServerSpec>,
+        params: SessionLoadParams,
     ) -> Result<SessionLoadResult, ClientError> {
-        self.call(
-            "session/load",
-            &SessionLoadParams {
-                session_id: session_id.to_string(),
-                cwd: cwd.into(),
-                mcp_servers,
-                additional_directories: Vec::new(),
-                meta: None,
-            },
-        )
-        .await
+        self.call("session/load", &params).await
     }
 
     /// `session/resume` request.
@@ -256,21 +269,59 @@ impl<H: ClientHandler> AcpClient<H> {
     /// an error or a malformed result.
     pub async fn resume_session(
         &self,
-        session_id: &str,
-        cwd: impl Into<PathBuf>,
-        mcp_servers: Vec<McpServerSpec>,
+        params: SessionResumeParams,
     ) -> Result<SessionResumeResult, ClientError> {
-        self.call(
-            "session/resume",
-            &SessionResumeParams {
-                session_id: session_id.to_string(),
-                cwd: cwd.into(),
-                mcp_servers,
-                additional_directories: Vec::new(),
-                meta: None,
-            },
-        )
-        .await
+        self.call("session/resume", &params).await
+    }
+
+    /// `session/list` request.
+    ///
+    /// Only valid when the agent advertised
+    /// [`SessionCapabilities::list`](crate::protocol::SessionCapabilities::list).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed or the agent replies with
+    /// an error or a malformed result.
+    pub async fn list_sessions(
+        &self,
+        params: SessionListParams,
+    ) -> Result<SessionListResult, ClientError> {
+        self.call("session/list", &params).await
+    }
+
+    /// `session/delete` request: removes the session from the agent's
+    /// history.
+    ///
+    /// Only valid when the agent advertised
+    /// [`SessionCapabilities::delete`](crate::protocol::SessionCapabilities::delete).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed or the agent replies with
+    /// an error or a malformed result.
+    pub async fn delete_session(
+        &self,
+        params: impl Into<SessionDeleteParams>,
+    ) -> Result<SessionDeleteResult, ClientError> {
+        self.call("session/delete", &params.into()).await
+    }
+
+    /// `session/close` request: ends a live session without deleting its
+    /// history.
+    ///
+    /// Only valid when the agent advertised
+    /// [`SessionCapabilities::close`](crate::protocol::SessionCapabilities::close).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed or the agent replies with
+    /// an error or a malformed result.
+    pub async fn close_session(
+        &self,
+        params: impl Into<SessionCloseParams>,
+    ) -> Result<SessionCloseResult, ClientError> {
+        self.call("session/close", &params.into()).await
     }
 
     /// `session/set_mode` request.
@@ -279,23 +330,14 @@ impl<H: ClientHandler> AcpClient<H> {
     ///
     /// Returns an error if the connection is closed or the agent replies with
     /// an error or a malformed result.
-    pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<(), ClientError> {
-        self.call::<_, SessionSetModeResult>(
-            "session/set_mode",
-            &SessionSetModeParams {
-                session_id: session_id.to_string(),
-                mode_id: mode_id.to_string(),
-                meta: None,
-            },
-        )
-        .await?;
+    pub async fn set_mode(&self, params: SessionSetModeParams) -> Result<(), ClientError> {
+        self.call::<_, SessionSetModeResult>("session/set_mode", &params)
+            .await?;
         Ok(())
     }
 
-    /// `session/set_config_option` request.
-    ///
-    /// `value` accepts `&str`/`String` for `select` options and `bool` for
-    /// `boolean` options. Returns the full updated option list.
+    /// `session/set_config_option` request. Returns the full updated option
+    /// list.
     ///
     /// # Errors
     ///
@@ -303,21 +345,10 @@ impl<H: ClientHandler> AcpClient<H> {
     /// an error or a malformed result.
     pub async fn set_config_option(
         &self,
-        session_id: &str,
-        config_id: &str,
-        value: impl Into<SessionConfigValue>,
+        params: SessionSetConfigOptionParams,
     ) -> Result<Vec<ConfigOption>, ClientError> {
-        let result: SessionSetConfigOptionResult = self
-            .call(
-                "session/set_config_option",
-                &SessionSetConfigOptionParams {
-                    session_id: session_id.to_string(),
-                    config_id: config_id.to_string(),
-                    value: value.into(),
-                    meta: None,
-                },
-            )
-            .await?;
+        let result: SessionSetConfigOptionResult =
+            self.call("session/set_config_option", &params).await?;
         Ok(result.config_options)
     }
 
@@ -331,43 +362,99 @@ impl<H: ClientHandler> AcpClient<H> {
     ///
     /// Returns an error if the connection is closed or the agent replies with
     /// an error or a malformed result.
-    pub async fn prompt(
+    pub async fn prompt(&self, params: PromptParams) -> Result<PromptResult, ClientError> {
+        self.start_prompt(&params).await?.await
+    }
+
+    /// `session/prompt` request whose response half is returned separately.
+    ///
+    /// Unlike [`prompt`](Self::prompt), this resolves as soon as the request
+    /// is on the connection, so a later write (such as `session/cancel`)
+    /// cannot overtake it on the wire. Awaiting the [`ResponseFuture`]
+    /// yields the turn's [`PromptResult`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed before the request is
+    /// sent.
+    pub async fn start_prompt(
         &self,
-        session_id: &str,
-        prompt: Vec<ContentBlock>,
-    ) -> Result<PromptResult, ClientError> {
-        self.call(
-            "session/prompt",
-            &PromptParams {
-                session_id: session_id.to_string(),
-                prompt,
-                meta: None,
-            },
-        )
-        .await
+        params: &PromptParams,
+    ) -> Result<ResponseFuture<PromptResult>, ClientError> {
+        self.start_request("session/prompt", params).await
     }
 
     /// `session/cancel` notification.
     ///
-    /// Asks the agent to cancel the current prompt turn on `session_id`.
-    /// Per the protocol the agent must respond `cancelled` to the pending
-    /// `session/prompt` and to any pending permission requests.
+    /// Asks the agent to cancel the current prompt turn on
+    /// `params.session_id`. Per the protocol the agent must respond
+    /// `cancelled` to the pending `session/prompt` and to any pending
+    /// permission requests.
     ///
     /// # Errors
     ///
     /// Returns an error if the connection is closed.
-    pub async fn cancel(&self, session_id: &str) -> Result<(), ClientError> {
-        let notification = JsonRpcNotification::with_params(
-            "session/cancel",
-            SessionCancelParams {
-                session_id: session_id.to_string(),
-                meta: None,
-            },
-        );
+    pub async fn cancel(&self, params: impl Into<SessionCancelParams>) -> Result<(), ClientError> {
+        let notification = JsonRpcNotification::with_params("session/cancel", params.into());
         self.outbound
             .send(Outbound::Notification(notification))
             .await
             .map_err(|_| ClientError::Closed { status: None })
+    }
+
+    /// Send a `_`-prefixed extension request and deserialize its result.
+    ///
+    /// This is the channel for provider-neutral extensions modelled under
+    /// [`crate::ext`] and vendor-specific methods under [`crate::vendor`].
+    /// The [`ExtMethod`] type enforces the protocol rule that custom method
+    /// names begin with `_`; for legacy vendor methods that predate that
+    /// rule, use [`request`](Self::request).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed or the agent replies with
+    /// an error or a malformed result.
+    pub async fn ext_request<P, R>(&self, method: &ExtMethod, params: &P) -> Result<R, ClientError>
+    where
+        P: Serialize + Sync,
+        R: DeserializeOwned,
+    {
+        self.call(method.as_str(), params).await
+    }
+
+    /// Send a `_`-prefixed extension notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed.
+    pub async fn ext_notify<P>(&self, method: &ExtMethod, params: &P) -> Result<(), ClientError>
+    where
+        P: Serialize + Sync,
+    {
+        let notification = JsonRpcNotification::with_params(method.as_str(), params);
+        self.outbound
+            .send(Outbound::Notification(notification))
+            .await
+            .map_err(|_| ClientError::Closed { status: None })
+    }
+
+    /// Send a JSON-RPC request for an arbitrary method and deserialize its
+    /// result.
+    ///
+    /// Prefer the typed methods and [`ext_request`](Self::ext_request); this
+    /// exists for vendor methods that predate the `_` naming rule (see
+    /// [`crate::vendor::codex`]) and for methods this crate does not model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed or the agent replies with
+    /// an error or a malformed result.
+    pub async fn request<P, R>(&self, method: &str, params: &P) -> Result<R, ClientError>
+    where
+        P: Serialize + Sync,
+        R: DeserializeOwned,
+    {
+        self.call(method, params).await
     }
 
     /// Close the connection.
@@ -381,8 +468,23 @@ impl<H: ClientHandler> AcpClient<H> {
         self.outbound.close();
     }
 
-    /// Send a request through the connection task and await the response.
-    async fn call<P, R>(&self, method: &str, params: &P) -> Result<R, ClientError>
+    /// Send a JSON-RPC request for an arbitrary method and return a future
+    /// resolving with its deserialized result.
+    ///
+    /// The request is on the connection when this returns, so messages sent
+    /// afterwards cannot overtake it on the wire. Awaiting the
+    /// [`ResponseFuture`] yields the same result [`request`](Self::request)
+    /// would.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed before the request is
+    /// sent.
+    pub async fn start_request<P, R>(
+        &self,
+        method: &str,
+        params: &P,
+    ) -> Result<ResponseFuture<R>, ClientError>
     where
         P: Serialize + Sync,
         R: DeserializeOwned,
@@ -399,14 +501,57 @@ impl<H: ClientHandler> AcpClient<H> {
             .await
             .map_err(|_| ClientError::Closed { status: None })?;
 
-        let response = reply_rx
-            .recv()
-            .await
-            .map_err(|_| ClientError::Closed { status: None })??;
+        Ok(ResponseFuture {
+            method: method.to_string(),
+            reply: Box::pin(reply_rx),
+            marker: PhantomData,
+        })
+    }
 
-        let value = response.into_result()?;
-        serde_json::from_value(value)
-            .map_err(|error| ClientError::Protocol(format!("malformed {method} result: {error}")))
+    /// Send a request through the connection task and await the response.
+    async fn call<P, R>(&self, method: &str, params: &P) -> Result<R, ClientError>
+    where
+        P: Serialize + Sync,
+        R: DeserializeOwned,
+    {
+        self.start_request(method, params).await?.await
+    }
+}
+
+/// The response half of a request sent with [`AcpClient::start_request`].
+///
+/// Awaiting it yields the deserialized result, an agent-reported error, or
+/// [`ClientError::Closed`] when the connection drops first. Dropping it
+/// leaves the request outstanding — the agent still sees and answers it.
+#[derive(Debug)]
+pub struct ResponseFuture<R> {
+    /// Method name, for error context.
+    method: String,
+    /// Receives the matching response from the connection task.
+    reply: Pin<Box<Receiver<Result<JsonRpcResponse, ClientError>>>>,
+    /// Result type without owning a value.
+    marker: PhantomData<fn() -> R>,
+}
+
+impl<R: DeserializeOwned> Future for ResponseFuture<R> {
+    type Output = Result<R, ClientError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let response = match ready!(this.reply.as_mut().poll_next(cx)) {
+            Some(response) => response?,
+            None => return Poll::Ready(Err(ClientError::Closed { status: None })),
+        };
+        Poll::Ready(
+            response
+                .into_result()
+                .map_err(ClientError::from)
+                .and_then(|value| {
+                    serde_json::from_value(value).map_err(|error| {
+                        ClientError::Protocol(format!("malformed {} result: {error}", this.method))
+                    })
+                }),
+        )
     }
 }
 
@@ -542,6 +687,17 @@ async fn handle_agent_request<H: ClientHandler>(
         }
         "terminal/kill" => dispatch(&request, |params| handler.terminal_kill(params)).await,
         "terminal/release" => dispatch(&request, |params| handler.terminal_release(params)).await,
+        "elicitation/create" => {
+            dispatch(&request, |params| handler.elicitation_create(params)).await
+        }
+        method if method.starts_with('_') => {
+            let method = ExtMethod::try_new(request.method.clone())
+                .expect("extension method name starts with `_`");
+            match handler.ext_request(method, request.params.clone()).await {
+                Ok(result) => JsonRpcResponse::success(request.id, result),
+                Err(error) => JsonRpcResponse::error(request.id, error),
+            }
+        }
         method => JsonRpcResponse::error(request.id, JsonRpcError::method_not_found(method)),
     }
 }
@@ -581,16 +737,23 @@ async fn handle_agent_notification<H: ClientHandler>(
     handler: &H,
     notification: JsonRpcNotification,
 ) {
-    if notification.method == "session/update" {
-        match notification.params.map(serde_json::from_value) {
+    match notification.method.as_str() {
+        "session/update" => match notification.params.clone().map(serde_json::from_value) {
             Some(Ok(update)) => {
                 let update: SessionNotification = update;
                 handler.session_update(update).await;
             }
             Some(Err(error)) => warn!(%error, "malformed session/update notification"),
             None => warn!("session/update notification without params"),
-        }
-    } else {
-        debug!(method = %notification.method, "ignoring unknown agent notification");
+        },
+        "elicitation/complete" => match notification.params.clone().map(serde_json::from_value) {
+            Some(Ok(params)) => {
+                let params: ElicitationCompleteParams = params;
+                handler.elicitation_complete(params).await;
+            }
+            Some(Err(error)) => warn!(%error, "malformed elicitation/complete notification"),
+            None => warn!("elicitation/complete notification without params"),
+        },
+        _ => handler.notification(notification).await,
     }
 }

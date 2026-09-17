@@ -4,8 +4,9 @@
 use std::sync::Mutex;
 
 use aither_acp::{
-    AcpClient, ClientError, ClientHandler, ContentBlock, RequestPermissionOutcome,
-    RequestPermissionParams, RequestPermissionResult, SessionNotification, SessionUpdate,
+    AcpClient, ClientError, ClientHandler, ContentBlock, PromptParams, RequestPermissionOutcome,
+    RequestPermissionParams, RequestPermissionResult, SessionCancelParams, SessionNewParams,
+    SessionNotification, SessionSetConfigOptionParams, SessionSetModeParams, SessionUpdate,
     StopReason, TextContent,
 };
 use aither_mcp::protocol::JsonRpcError;
@@ -53,6 +54,7 @@ fn text(message: &str) -> ContentBlock {
     ContentBlock::Text(TextContent {
         text: message.to_string(),
         annotations: None,
+        meta: None,
     })
 }
 
@@ -79,19 +81,26 @@ async fn child_agent_streams_and_responds() {
     assert_eq!(init.protocol_version, 1);
     assert!(init.agent_capabilities.load_session);
 
-    let session = client.new_session("/tmp", vec![]).await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
     assert_eq!(session.session_id, "sess-1");
     client
-        .set_mode(&session.session_id, "bypass")
+        .set_mode(SessionSetModeParams::new(&session.session_id, "bypass"))
         .await
         .unwrap();
     client
-        .set_config_option(&session.session_id, "model", "b")
+        .set_config_option(SessionSetConfigOptionParams::new(
+            &session.session_id,
+            "model",
+            "b",
+        ))
         .await
         .unwrap();
 
     let result = client
-        .prompt(&session.session_id, vec![text("hello")])
+        .prompt(PromptParams::new(&session.session_id, vec![text("hello")]))
         .await
         .expect("prompt failed");
     assert_eq!(result.stop_reason, StopReason::EndTurn);
@@ -125,12 +134,19 @@ async fn child_agent_cancel() {
         return;
     };
     client.initialize().await.unwrap();
-    let session = client.new_session("/tmp", vec![]).await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
 
     let prompt = {
         let client = client.clone();
         let session_id = session.session_id.clone();
-        tokio::spawn(async move { client.prompt(&session_id, vec![text("wait")]).await })
+        tokio::spawn(async move {
+            client
+                .prompt(PromptParams::new(&session_id, vec![text("wait")]))
+                .await
+        })
     };
     for _ in 0..10_000 {
         if !client.handler().updates.lock().unwrap().is_empty() {
@@ -138,7 +154,10 @@ async fn child_agent_cancel() {
         }
         tokio::task::yield_now().await;
     }
-    client.cancel(&session.session_id).await.unwrap();
+    client
+        .cancel(SessionCancelParams::new(&session.session_id))
+        .await
+        .unwrap();
     let result = prompt.await.expect("prompt task panicked").unwrap();
     assert_eq!(result.stop_reason, StopReason::Cancelled);
 
@@ -152,9 +171,14 @@ async fn child_agent_exit_fails_pending_request_with_status() {
         return;
     };
     client.initialize().await.unwrap();
-    let session = client.new_session("/tmp", vec![]).await.unwrap();
+    let session = client
+        .new_session(SessionNewParams::new("/tmp"))
+        .await
+        .unwrap();
 
-    let result = client.prompt(&session.session_id, vec![text("die")]).await;
+    let result = client
+        .prompt(PromptParams::new(&session.session_id, vec![text("die")]))
+        .await;
     match result {
         Err(ClientError::Closed {
             status: Some(status),

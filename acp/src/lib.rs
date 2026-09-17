@@ -6,15 +6,21 @@
 //!
 //! - [`AcpServer`] runs an aither [`LanguageModel`](aither_core::LanguageModel)
 //!   as an ACP agent over stdio, answering `initialize`, `session/new`,
-//!   `session/prompt`, and `session/stop` while streaming [`SessionUpdate`]
-//!   notifications.
+//!   `session/prompt`, `session/list`, `session/close`, and `session/delete`
+//!   while streaming [`SessionUpdate`] notifications and honouring
+//!   `session/cancel` mid-turn.
 //! - [`AcpClient`] connects to a spawned or piped ACP agent (such as
 //!   `devin acp`) over any
 //!   [`BidirectionalTransport`](aither_mcp::transport::BidirectionalTransport),
-//!   driving sessions,
-//!   prompts, modes, and config options while a [`ClientHandler`] receives
-//!   streamed updates and answers permission, file-system, and terminal
-//!   requests from the agent.
+//!   driving sessions, prompts, modes, config options, authentication, and
+//!   session lifecycle while a [`ClientHandler`] receives streamed updates
+//!   and answers permission, file-system, terminal, and elicitation requests
+//!   from the agent.
+//!
+//! Extensions follow ACP's `_`-prefixed method convention: provider-neutral
+//! conventions live under [`ext`], vendor-specific surface under [`vendor`],
+//! and [`AcpClient::ext_request`]/[`AcpClient::ext_notify`] carry any
+//! [`ExtMethod`] a provider defines.
 //!
 //! # Protocol Overview
 //!
@@ -25,7 +31,7 @@
 //! # Client
 //!
 //! ```no_run
-//! use aither_acp::{AcpClient, ContentBlock, TextContent};
+//! use aither_acp::{AcpClient, ContentBlock, PromptParams, SessionNewParams, TextContent};
 //! # use aither_acp::{ClientCapabilities, ClientHandler, SessionNotification};
 //! # use aither_acp::{RequestPermissionParams, RequestPermissionResult, RequestPermissionOutcome};
 //! # use aither_mcp::protocol::JsonRpcError;
@@ -53,12 +59,18 @@
 //! tokio::spawn(connection);
 //!
 //! let init = client.initialize().await?;
-//! let session = client.new_session("/tmp", vec![]).await?;
+//! let session = client
+//!     .new_session(SessionNewParams::new("/tmp"))
+//!     .await?;
 //! let result = client
-//!     .prompt(&session.session_id, vec![ContentBlock::Text(TextContent {
-//!         text: "hi".to_string(),
-//!         annotations: None,
-//!     })])
+//!     .prompt(PromptParams::new(
+//!         &session.session_id,
+//!         vec![ContentBlock::Text(TextContent {
+//!             text: "hi".to_string(),
+//!             annotations: None,
+//!             meta: None,
+//!         })],
+//!     ))
 //!     .await?;
 //! # Ok(())
 //! # }
@@ -115,12 +127,15 @@
 
 mod adapter;
 mod client;
+pub mod ext;
+mod macros;
 pub mod protocol;
 mod server;
 mod session;
+pub mod vendor;
 
 pub use adapter::{agent_event_to_session_update, todos_to_plan};
-pub use client::{AcpClient, ClientError, ClientHandler};
+pub use client::{AcpClient, ClientError, ClientHandler, ResponseFuture};
 pub use protocol::*;
 pub use server::AcpServer;
 pub use session::AcpSession;

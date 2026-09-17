@@ -19,16 +19,20 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
             content: ContentBlock::Text(TextContent {
                 text: text.clone(),
                 annotations: None,
+                meta: None,
             }),
             message_id: None,
+            meta: None,
         })),
 
         AgentEvent::Reasoning(text) => Some(SessionUpdate::AgentThoughtChunk(ContentChunk {
             content: ContentBlock::Text(TextContent {
                 text: text.clone(),
                 annotations: None,
+                meta: None,
             }),
             message_id: None,
+            meta: None,
         })),
 
         AgentEvent::ToolCallStart {
