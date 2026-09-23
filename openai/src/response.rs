@@ -183,6 +183,11 @@ pub enum ResponsesOutputItem {
         id: Option<String>,
         #[serde(default)]
         summary: Vec<ResponsesReasoningSummary>,
+        /// Encrypted chain of thought, present when the request asked for
+        /// `reasoning.encrypted_content`. Replayed into the next request's
+        /// `input` so reasoning survives a tool-call round trip.
+        #[serde(default)]
+        encrypted_content: Option<String>,
     },
     /// Catch-all
     #[serde(other)]

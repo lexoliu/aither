@@ -78,7 +78,7 @@ Model Context Protocol client/server implementation for tool discovery and execu
 
 ## Rust Version
 
-Requires Rust 1.87+ (edition 2024).
+Requires Rust 1.88+ (edition 2024).
 
 ## Agent development guide
 - Appending is cheap, since it utilizes input cache of LLM.

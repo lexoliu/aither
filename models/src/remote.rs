@@ -68,14 +68,13 @@ impl From<std::io::Error> for FetchError {
 
 async fn fetch_with_cache(url: &str, cache_path: Option<&Path>) -> Result<Vec<u8>, FetchError> {
     // Check cache freshness
-    if let Some(path) = cache_path {
-        if let Ok(meta) = async_fs::metadata(path).await {
-            if let Ok(modified) = meta.modified() {
-                let age = modified.elapsed().unwrap_or_default();
-                if age.as_secs() < CACHE_MAX_AGE_SECS {
-                    return Ok(async_fs::read(path).await?);
-                }
-            }
+    if let Some(path) = cache_path
+        && let Ok(meta) = async_fs::metadata(path).await
+        && let Ok(modified) = meta.modified()
+    {
+        let age = modified.elapsed().unwrap_or_default();
+        if age.as_secs() < CACHE_MAX_AGE_SECS {
+            return Ok(async_fs::read(path).await?);
         }
     }
 

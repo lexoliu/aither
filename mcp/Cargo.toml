@@ -27,7 +27,7 @@ futures-lite = "2"
 thiserror = "2"
 async-io = "2"
 async-process = "2"
-async-channel = "2"
+async-lock = "3"
 tracing = "0.1"
 
 [dev-dependencies]

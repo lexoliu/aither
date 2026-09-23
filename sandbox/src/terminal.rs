@@ -129,7 +129,7 @@ struct PermissionNetworkPolicy<P> {
 impl<P: PermissionHandler + 'static> NetworkPolicy for PermissionNetworkPolicy<P> {
     async fn check(&self, request: &DomainRequest) -> bool {
         self.permission_handler
-            .check_domain(request.target(), request.port())
+            .check_domain(request.host(), request.port())
             .await
     }
 }
@@ -2069,13 +2069,11 @@ async fn compressed_stdout_data<'a>(
         None
     };
 
-    if let Some(ref compressed) = compressed {
-        if let Some(ref raw_text) = compressed.raw_for_file {
-            if let Err(err) = crate::output::save_raw_to_file(store_dir, raw_text.as_bytes()).await
-            {
-                warn!(error = %err, "failed to save raw source code output");
-            }
-        }
+    if let Some(ref compressed) = compressed
+        && let Some(ref raw_text) = compressed.raw_for_file
+        && let Err(err) = crate::output::save_raw_to_file(store_dir, raw_text.as_bytes()).await
+    {
+        warn!(error = %err, "failed to save raw source code output");
     }
 
     compressed.map_or(Cow::Borrowed(stdout), |compressed| {
@@ -2127,9 +2125,7 @@ where
     if let Some(router) = create_ipc_router(context.registry) {
         config_builder = config_builder.ipc(router);
     }
-    let config = config_builder
-        .build()
-        .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
+    let config = config_builder.build();
 
     let sandbox = Sandbox::with_config_and_executor(config, context.executor.clone())
         .await
@@ -2194,9 +2190,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     if let Some(router) = create_ipc_gateway_router(context.registry) {
         config_builder = config_builder.ipc(router);
     }
-    let config = config_builder
-        .build()
-        .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
+    let config = config_builder.build();
 
     let sandbox = Sandbox::with_config_and_executor(config, context.executor.clone())
         .await
@@ -2839,7 +2833,7 @@ async fn handle_container_ipc_connection(
 #[cfg(unix)]
 fn decode_container_ipc_args(params: &[u8]) -> Result<Vec<String>, String> {
     let parsed: serde_json::Value =
-        heel::rmp_serde::from_slice(params).map_err(|e| format!("invalid IPC params: {e}"))?;
+        rmp_serde::from_slice(params).map_err(|e| format!("invalid IPC params: {e}"))?;
     let args = parsed
         .as_object()
         .ok_or_else(|| "container IPC params must be a map".to_string())?;
@@ -2855,7 +2849,7 @@ async fn write_container_ipc_success(
     stream: &mut Async<StdTcpStream>,
     response: &crate::command::CommandEnvelope,
 ) -> Result<(), String> {
-    let payload = heel::rmp_serde::to_vec(response)
+    let payload = rmp_serde::to_vec(response)
         .map_err(|e| format!("failed to encode IPC success payload: {e}"))?;
     write_container_ipc_response(stream, true, &payload).await
 }
@@ -2865,7 +2859,7 @@ async fn write_container_ipc_error(
     stream: &mut Async<StdTcpStream>,
     message: &str,
 ) -> Result<(), String> {
-    let payload = heel::rmp_serde::to_vec(&message.to_string())
+    let payload = rmp_serde::to_vec(&message.to_string())
         .map_err(|e| format!("failed to encode IPC error payload: {e}"))?;
     write_container_ipc_response(stream, false, &payload).await
 }
@@ -3088,8 +3082,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
 
-    use heel::ConnectionDirection;
-
     use super::*;
     use crate::ToolRegistryBuilder;
     use crate::builtin::{InputTerminalArgs, InputTerminalTool};
@@ -3184,17 +3176,25 @@ mod tests {
     }
 
     impl PermissionHandler for TestPermissionHandler {
-        async fn check(&self, mode: TerminalMode, _script: &str) -> Result<bool, PermissionError> {
+        fn check(
+            &self,
+            mode: TerminalMode,
+            _script: &str,
+        ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
             self.mode_checks.fetch_add(1, AtomicOrdering::Relaxed);
-            Ok(match mode {
+            std::future::ready(Ok(match mode {
                 TerminalMode::Sandboxed => true,
                 TerminalMode::Unsafe => false,
-            })
+            }))
         }
 
-        async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
+        fn check_domain(
+            &self,
+            _domain: &str,
+            _port: u16,
+        ) -> impl std::future::Future<Output = bool> + Send {
             self.domain_checks.fetch_add(1, AtomicOrdering::Relaxed);
-            self.allow_domain
+            std::future::ready(self.allow_domain)
         }
     }
 
@@ -3379,12 +3379,7 @@ mod tests {
         let policy = PermissionNetworkPolicy {
             permission_handler: handler.clone(),
         };
-        let request = DomainRequest::new(
-            "example.com".to_string(),
-            443,
-            ConnectionDirection::Outbound,
-            1234,
-        );
+        let request = DomainRequest::new("example.com", 443);
         assert!(policy.check(&request).await);
         assert_eq!(handler.domain_checks.load(AtomicOrdering::Relaxed), 1);
     }
@@ -3447,8 +3442,7 @@ mod tests {
             .network(DenyAll)
             .working_dir(dir.path())
             .security(SecurityConfig::interactive())
-            .build()
-            .expect("sandbox config should build");
+            .build();
         let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
             .await
             .expect("sandbox should initialize");

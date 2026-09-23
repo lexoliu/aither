@@ -219,10 +219,8 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
 
         match builder.json().await {
             Ok(res) => {
-                if debug {
-                    if let Ok(json) = serde_json::to_string_pretty(&res) {
-                        tracing::debug!("Gemini response from {endpoint}:\n{json}");
-                    }
+                if debug && let Ok(json) = serde_json::to_string_pretty(&res) {
+                    tracing::debug!("Gemini response from {endpoint}:\n{json}");
                 }
                 return Ok(res);
             }

@@ -141,10 +141,10 @@ async fn run_loop(gemini: Backend, mem0: MemoryManager, rag: Store) -> Result<()
         let mem0_for_task = mem0.clone();
         // Fire-and-forget: a failed memory write must not stall the chat.
         drop(tokio::spawn(async move {
-            if let Err(err) = mem0_for_task.add(&mem_msgs).await {
-                if !should_quiet_mem0_error(&err) {
-                    eprintln!("Mem0 update failed: {err}");
-                }
+            if let Err(err) = mem0_for_task.add(&mem_msgs).await
+                && !should_quiet_mem0_error(&err)
+            {
+                eprintln!("Mem0 update failed: {err}");
             }
         }));
     }

@@ -3,6 +3,7 @@
 //! This transport uses stdin/stdout for communication, which is the standard
 //! method for MCP servers that run as subprocesses (e.g., Claude Desktop integration).
 
+use std::future::Future;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use async_io::Async;
@@ -128,9 +129,9 @@ impl Transport for StdioTransport {
         self.write_message(serde_json::to_string(&notif)?).await
     }
 
-    async fn close(&mut self) -> Result<()> {
+    fn close(&mut self) -> impl Future<Output = Result<()>> + Send {
         self.closed = true;
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 
@@ -163,26 +164,26 @@ mod tests {
 
     use super::read_message;
 
-    #[test]
-    fn blank_lines_do_not_close_the_transport() {
-        futures_lite::future::block_on(async {
+    #[tokio::test]
+    async fn blank_lines_do_not_close_the_transport() {
+        {
             let input = b"\n  \r\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
             let mut reader = BufReader::new(Cursor::new(input));
 
             assert!(read_message(&mut reader).await.unwrap().is_some());
             assert!(read_message(&mut reader).await.unwrap().is_none());
-        });
+        }
     }
 
-    #[test]
-    fn invalid_json_does_not_consume_the_following_message() {
-        futures_lite::future::block_on(async {
+    #[tokio::test]
+    async fn invalid_json_does_not_consume_the_following_message() {
+        {
             let input =
                 b"not json\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
             let mut reader = BufReader::new(Cursor::new(input));
 
             assert!(read_message(&mut reader).await.is_err());
             assert!(read_message(&mut reader).await.unwrap().is_some());
-        });
+        }
     }
 }

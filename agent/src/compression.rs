@@ -204,25 +204,22 @@ impl SmartCompressionConfig {
             }
 
             // Track file reads that may be superseded
-            if content.contains("read_file") || content.contains("Read") {
-                if let Some(path) = extract_single_path(content) {
-                    if let Some(&later_idx) = file_versions.get(&path) {
-                        if later_idx > idx {
-                            stale.insert(idx);
-                        }
-                    }
-                }
+            if (content.contains("read_file") || content.contains("Read"))
+                && let Some(path) = extract_single_path(content)
+                && let Some(&later_idx) = file_versions.get(&path)
+                && later_idx > idx
+            {
+                stale.insert(idx);
             }
 
             // Track file modifications
-            if content.contains("write_file")
+            if (content.contains("write_file")
                 || content.contains("edit_file")
                 || content.contains("Write")
-                || content.contains("Edit")
+                || content.contains("Edit"))
+                && let Some(path) = extract_single_path(content)
             {
-                if let Some(path) = extract_single_path(content) {
-                    file_versions.insert(path, idx);
-                }
+                file_versions.insert(path, idx);
             }
         }
 

@@ -318,9 +318,12 @@ mod tests {
     }
 
     impl Hook for CountingHook {
-        async fn pre_tool_use(&self, _ctx: &ToolUseContext<'_>) -> PreToolAction {
+        fn pre_tool_use(
+            &self,
+            _ctx: &ToolUseContext<'_>,
+        ) -> impl std::future::Future<Output = PreToolAction> + Send {
             self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            PreToolAction::Allow
+            std::future::ready(PreToolAction::Allow)
         }
     }
 

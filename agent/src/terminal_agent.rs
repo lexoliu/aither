@@ -1102,8 +1102,14 @@ mod tests {
             futures_lite::stream::empty()
         }
 
-        async fn profile(&self) -> ModelProfile {
-            ModelProfile::new("mock", "test", "mock-model", "mock model", 100_000)
+        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
+            std::future::ready(ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                100_000,
+            ))
         }
     }
 
@@ -1120,8 +1126,11 @@ mod tests {
         type Arguments = MockArgs;
         type Res = aither_core::llm::ToolResult;
 
-        async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
-            Ok(aither_core::llm::ToolResult::text("ok"))
+        fn call(
+            &self,
+            _args: Self::Arguments,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(aither_core::llm::ToolResult::text("ok")))
         }
     }
 

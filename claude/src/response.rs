@@ -1,6 +1,8 @@
 //! SSE response parsing for the Claude API.
 
-use aither_core::llm::{Event as LLMEvent, Usage as TokenUsage};
+use aither_core::llm::{Event as LLMEvent, ReasoningState, Usage as TokenUsage};
+
+use crate::PROVIDER_NAME;
 use serde::Deserialize;
 use serde_json::Value;
 use zenwave::sse::Event;
@@ -80,8 +82,17 @@ pub enum ContentBlockType {
     /// Thinking/reasoning content block.
     #[serde(rename = "thinking")]
     Thinking {
-        /// Initial thinking text.
+        /// Initial thinking text. Empty when `display` is `omitted`.
         thinking: String,
+        /// Encrypted copy of the full reasoning, replayed back unmodified.
+        #[serde(default)]
+        signature: String,
+    },
+    /// Safety-redacted thinking. Carries no readable text, only ciphertext.
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        /// Opaque encrypted thinking, replayed back unmodified.
+        data: String,
     },
     /// Tool use content block.
     #[serde(rename = "tool_use")]
@@ -121,6 +132,12 @@ pub enum DeltaType {
     ThinkingDelta {
         /// Thinking fragment to append.
         thinking: String,
+    },
+    /// Signature delta, arriving once just before the thinking block closes.
+    #[serde(rename = "signature_delta")]
+    SignatureDelta {
+        /// The block's signature.
+        signature: String,
     },
     /// Input JSON delta for tool use.
     #[serde(rename = "input_json_delta")]
@@ -238,8 +255,15 @@ pub struct StreamState {
 pub enum BlockState {
     /// Text block with accumulated text.
     Text(String),
-    /// Thinking block with accumulated reasoning.
-    Thinking(String),
+    /// Thinking block with accumulated reasoning and its signature.
+    Thinking {
+        /// Accumulated thinking text; empty when `display` is `omitted`.
+        text: String,
+        /// Signature, which arrives as a single delta before the block closes.
+        signature: String,
+    },
+    /// Safety-redacted thinking block.
+    RedactedThinking(String),
     /// Tool use block with accumulated JSON.
     ToolUse {
         /// Tool use ID.
@@ -327,8 +351,7 @@ pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEven
                 index: usize,
             }
             let ev: StopEvent = serde_json::from_str(data)?;
-            state.finish_block(ev.index);
-            Ok(Vec::new())
+            Ok(state.finish_block(ev.index))
         }
         "message_delta" => {
             state.apply_message_delta(serde_json::from_str(data)?);
@@ -390,13 +413,25 @@ impl StreamState {
                     vec![LLMEvent::Text(text)]
                 }
             }
-            ContentBlockType::Thinking { thinking } => {
-                self.blocks[ev.index] = BlockState::Thinking(thinking.clone());
+            ContentBlockType::Thinking {
+                thinking,
+                signature,
+            } => {
+                self.blocks[ev.index] = BlockState::Thinking {
+                    text: thinking.clone(),
+                    signature,
+                };
                 if thinking.is_empty() {
                     Vec::new()
                 } else {
                     vec![LLMEvent::Reasoning(thinking)]
                 }
+            }
+            // Redacted thinking has no readable text, so it produces no
+            // Reasoning event — only state, emitted when the block closes.
+            ContentBlockType::RedactedThinking { data } => {
+                self.blocks[ev.index] = BlockState::RedactedThinking(data);
+                Vec::new()
             }
             ContentBlockType::ToolUse { id, name, .. } => {
                 // Emit an initial delta so a UI can show the tool name before
@@ -430,9 +465,20 @@ impl StreamState {
                 text.push_str(&delta);
                 vec![LLMEvent::Text(delta)]
             }
-            (BlockState::Thinking(thinking), DeltaType::ThinkingDelta { thinking: delta }) => {
-                thinking.push_str(&delta);
+            (BlockState::Thinking { text, .. }, DeltaType::ThinkingDelta { thinking: delta }) => {
+                text.push_str(&delta);
                 vec![LLMEvent::Reasoning(delta)]
+            }
+            // Arrives once, just before content_block_stop. With
+            // `display: "omitted"` it is the only delta the block produces.
+            (
+                BlockState::Thinking { signature, .. },
+                DeltaType::SignatureDelta {
+                    signature: delta, ..
+                },
+            ) => {
+                signature.push_str(&delta);
+                Vec::new()
             }
             (
                 BlockState::ToolUse {
@@ -458,23 +504,55 @@ impl StreamState {
     /// Arguments that did not parse become an empty object rather than failing
     /// the stream: the tool reports the mismatch far more usefully than a
     /// truncated JSON error would.
-    fn finish_block(&mut self, index: usize) {
-        let Some(BlockState::ToolUse {
-            id,
-            name,
-            input_json,
-        }) = self.blocks.get(index)
-        else {
-            return;
-        };
-
-        let input = serde_json::from_str(input_json)
-            .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
-        self.tool_calls.push(ToolCall {
-            id: id.clone(),
-            name: name.clone(),
-            input,
-        });
+    /// A closed thinking block emits its state here rather than at block start,
+    /// because the signature arrives last: only now is the block complete
+    /// enough to be replayed. The payload is the whole block re-serialized, so
+    /// that `thinking` and `redacted_thinking` — which have different shapes —
+    /// both round-trip without core knowing either.
+    fn finish_block(&mut self, index: usize) -> Vec<LLMEvent> {
+        match self.blocks.get(index) {
+            Some(BlockState::ToolUse {
+                id,
+                name,
+                input_json,
+            }) => {
+                let input = serde_json::from_str(input_json)
+                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+                self.tool_calls.push(ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input,
+                });
+                Vec::new()
+            }
+            Some(BlockState::Thinking { text, signature }) => {
+                // An unsigned block cannot be verified on replay, so there is
+                // nothing worth preserving.
+                if signature.is_empty() {
+                    return Vec::new();
+                }
+                let block = serde_json::json!({
+                    "type": "thinking",
+                    "thinking": text,
+                    "signature": signature,
+                });
+                vec![LLMEvent::ReasoningState(ReasoningState::new(
+                    PROVIDER_NAME,
+                    block.to_string(),
+                ))]
+            }
+            Some(BlockState::RedactedThinking(data)) => {
+                let block = serde_json::json!({
+                    "type": "redacted_thinking",
+                    "data": data,
+                });
+                vec![LLMEvent::ReasoningState(ReasoningState::new(
+                    PROVIDER_NAME,
+                    block.to_string(),
+                ))]
+            }
+            Some(BlockState::Text(_)) | None => Vec::new(),
+        }
     }
 
     /// Folds in the running usage figures the API reports as it generates.

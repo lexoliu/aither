@@ -512,9 +512,7 @@ where
             (agent_builder, None)
         };
 
-        let mut agent = agent_builder
-            .build()
-            .map_err(|err| anyhow::anyhow!("subagent '{subagent_id}' is misconfigured: {err}"))?;
+        let mut agent = agent_builder.build();
 
         // Run the subagent with the prompt
         let query_result = agent.query(&args.prompt).await;
@@ -619,7 +617,7 @@ mod tests {
 
         let tool = SubagentTool::new(()).with_file_mounts([
             SubagentFileMount::new(".", root.join("workspace")),
-            SubagentFileMount::new("skills", skills_root.clone()),
+            SubagentFileMount::new(".skills", skills_root.clone()),
         ]);
         let resolved = SubagentTool::<()>::resolve_subagent_path(
             &tool.effective_mounts(),

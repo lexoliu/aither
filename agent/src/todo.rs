@@ -168,10 +168,10 @@ impl TodoList {
         let total = items.len();
 
         let mut summary = format!("Progress: {completed}/{total} completed");
-        if in_progress > 0 {
-            if let Some(current) = items.iter().find(|i| i.status == TodoStatus::InProgress) {
-                let _ = write!(summary, " | Current: {}", current.active_form);
-            }
+        if in_progress > 0
+            && let Some(current) = items.iter().find(|i| i.status == TodoStatus::InProgress)
+        {
+            let _ = write!(summary, " | Current: {}", current.active_form);
         }
         if pending > 0 {
             let _ = write!(summary, " | {pending} pending");
@@ -242,23 +242,28 @@ impl Tool for TodoTool {
     type Arguments = TodoWriteArgs;
     type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
-        // Validate: at most one task should be in_progress
-        let in_progress_count = arguments
-            .todos
-            .iter()
-            .filter(|t| t.status == TodoStatus::InProgress)
-            .count();
+    fn call(
+        &self,
+        arguments: Self::Arguments,
+    ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+        std::future::ready((|| {
+            // Validate: at most one task should be in_progress
+            let in_progress_count = arguments
+                .todos
+                .iter()
+                .filter(|t| t.status == TodoStatus::InProgress)
+                .count();
 
-        if in_progress_count > 1 {
-            return Err(anyhow::anyhow!(
-                "Only one task should be in_progress at a time, found {in_progress_count}"
-            ));
-        }
+            if in_progress_count > 1 {
+                return Err(anyhow::anyhow!(
+                    "Only one task should be in_progress at a time, found {in_progress_count}"
+                ));
+            }
 
-        self.list.write(arguments.todos);
+            self.list.write(arguments.todos);
 
-        // TodoWrite succeeds with no output - the UI shows the todo list separately
-        Ok(ToolResult::Done)
+            // TodoWrite succeeds with no output - the UI shows the todo list separately
+            Ok(ToolResult::Done)
+        })())
     }
 }

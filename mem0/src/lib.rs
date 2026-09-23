@@ -55,7 +55,7 @@ where
             .inner
             .retrieve_formatted(&arguments, 50)
             .await
-            .context("Fail to retrive memory")?;
+            .context("Failed to retrieve memory")?;
         Ok(ToolResult::text(result))
     }
 }

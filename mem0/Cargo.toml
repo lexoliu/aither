@@ -22,7 +22,6 @@ thiserror = "2.0"
 uuid = { version = "1.24", features = ["v4", "serde"] }
 tracing.workspace = true
 async-channel = "2.5"
-futures-lite = "2.6"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros"] }

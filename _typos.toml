@@ -1,0 +1,5 @@
+# `paht` is a deliberate transposition in a sandbox test that asserts the
+# "Did you mean --path?" suggestion fires. Correcting it would delete the case
+# the test exists to cover.
+[default.extend-words]
+paht = "paht"

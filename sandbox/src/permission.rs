@@ -111,18 +111,26 @@ pub enum PermissionError {
 pub struct DenyUnsafe;
 
 impl PermissionHandler for DenyUnsafe {
-    async fn check(&self, mode: TerminalMode, _script: &str) -> Result<bool, PermissionError> {
-        match mode {
+    fn check(
+        &self,
+        mode: TerminalMode,
+        _script: &str,
+    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
+        std::future::ready(match mode {
             TerminalMode::Sandboxed => Ok(true),
             TerminalMode::Unsafe => Err(PermissionError::Denied(format!(
                 "sandbox blocked {} execution; approval is required to escalate this command, but no interactive approval handler is configured",
                 mode.description()
             ))),
-        }
+        })
     }
 
-    async fn will_wait_for_approval(&self, _mode: TerminalMode, _script: &str) -> bool {
-        false
+    fn will_wait_for_approval(
+        &self,
+        _mode: TerminalMode,
+        _script: &str,
+    ) -> impl Future<Output = bool> + Send {
+        std::future::ready(false)
     }
 }
 
@@ -131,16 +139,24 @@ impl PermissionHandler for DenyUnsafe {
 pub struct NoopPermissionHandler;
 
 impl PermissionHandler for NoopPermissionHandler {
-    async fn check(&self, _mode: TerminalMode, _script: &str) -> Result<bool, PermissionError> {
-        Ok(true)
+    fn check(
+        &self,
+        _mode: TerminalMode,
+        _script: &str,
+    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
+        std::future::ready(Ok(true))
     }
 
-    async fn will_wait_for_approval(&self, _mode: TerminalMode, _script: &str) -> bool {
-        false
+    fn will_wait_for_approval(
+        &self,
+        _mode: TerminalMode,
+        _script: &str,
+    ) -> impl Future<Output = bool> + Send {
+        std::future::ready(false)
     }
 
-    async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
-        true
+    fn check_domain(&self, _domain: &str, _port: u16) -> impl Future<Output = bool> + Send {
+        std::future::ready(true)
     }
 }
 

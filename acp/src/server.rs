@@ -156,7 +156,7 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
     async fn handle_message(&mut self, msg: JsonRpcMessage) -> Result<()> {
         match msg {
             JsonRpcMessage::Request(req) => {
-                let response = self.handle_request(req);
+                let response = self.handle_request(req).await;
                 self.respond(response).await?;
             }
             JsonRpcMessage::Notification(notif) => {
@@ -175,7 +175,7 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
     }
 
     /// Handle an incoming request.
-    fn handle_request(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
+    async fn handle_request(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
         debug!("Handling request: {}", req.method);
 
         match req.method.as_str() {
@@ -225,7 +225,7 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
     }
 
     /// Handle session/new request.
-    fn handle_session_new(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
+    async fn handle_session_new(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
         let params: SessionNewParams = match req.params.map(serde_json::from_value).transpose() {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -258,7 +258,7 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
     }
 
     /// Handle session/prompt request.
-    fn handle_session_prompt(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
+    async fn handle_session_prompt(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
         let params: PromptParams = match req.params.map(serde_json::from_value).transpose() {
             Ok(Some(p)) => p,
             Ok(None) => {

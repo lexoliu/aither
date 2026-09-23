@@ -65,13 +65,13 @@ async fn synthesize_audio(cfg: &GeminiConfig, text: String) -> Result<Vec<u8>, G
         cached_content: None,
     };
     let response = call_generate(cfg, &model, request).await?;
-    if let Some(candidate) = response.primary_candidate() {
-        if let Some(content) = &candidate.content {
-            for part in &content.parts {
-                if let Some(inline) = &part.inline_data {
-                    let bytes = inline.decode()?;
-                    return Ok(bytes);
-                }
+    if let Some(candidate) = response.primary_candidate()
+        && let Some(content) = &candidate.content
+    {
+        for part in &content.parts {
+            if let Some(inline) = &part.inline_data {
+                let bytes = inline.decode()?;
+                return Ok(bytes);
             }
         }
     }
@@ -101,11 +101,11 @@ async fn transcribe_audio(cfg: &GeminiConfig, audio: Vec<u8>) -> Result<String, 
         cached_content: None,
     };
     let response = call_generate(cfg, &cfg.text_model, request).await?;
-    if let Some(candidate) = response.primary_candidate() {
-        if let Some(content) = &candidate.content {
-            let text = content.text_chunks().join("");
-            return Ok(text);
-        }
+    if let Some(candidate) = response.primary_candidate()
+        && let Some(content) = &candidate.content
+    {
+        let text = content.text_chunks().join("");
+        return Ok(text);
     }
     Err(GeminiError::Api(
         "Gemini did not return transcription text".into(),

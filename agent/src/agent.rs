@@ -4,14 +4,16 @@
 //! It manages conversation memory, applies context compression, and
 //! handles tool execution in an agent-controlled loop.
 
-use std::fmt::Write as _;
+use num_traits::ToPrimitive as _;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use aither_core::{
     LanguageModel,
-    llm::{Attachment, Event, LLMRequest, Message, ToolCall, model::Profile as ModelProfile},
+    llm::{
+        Attachment, Event, LLMRequest, Message, ReasoningState, ToolCall,
+        model::Profile as ModelProfile,
+    },
 };
 #[cfg(feature = "skills")]
 use aither_skills::Skill;
@@ -63,6 +65,11 @@ enum ExecutionSignal<T> {
 struct ModelTurn {
     response_text: String,
     tool_calls: Vec<ToolCall>,
+    /// Opaque provider reasoning produced this turn, in the order it arrived.
+    ///
+    /// Replayed on the next request: providers that verify their own reasoning
+    /// reject a turn whose blocks were reordered or partially dropped.
+    reasoning: Vec<ReasoningState>,
     malformed_function_call: bool,
 }
 
@@ -111,7 +118,7 @@ type ToolExecutionResult = Result<(String, String, aither_core::llm::ToolResult)
 type ToolExecutionSignal = ExecutionSignal<ToolExecutionResult>;
 
 macro_rules! drain_model_stream {
-    ($stream:expr, $hooks:expr, $cache_stats:expr, $events:expr, $text_chunks:expr, $tool_calls:expr, $malformed:expr) => {{
+    ($stream:expr, $hooks:expr, $cache_stats:expr, $events:expr, $text_chunks:expr, $tool_calls:expr, $reasoning:expr, $malformed:expr) => {{
         let stream = $stream;
         futures_lite::pin!(stream);
         while let Some(event) = stream.next().await {
@@ -121,6 +128,7 @@ macro_rules! drain_model_stream {
                 event.map_err(|error| error.to_string()),
                 $text_chunks,
                 $tool_calls,
+                $reasoning,
             )
             .await?
             {
@@ -141,6 +149,7 @@ async fn handle_model_event<H: Hook>(
     event: Result<Event, String>,
     text_chunks: &mut Vec<String>,
     tool_calls: &mut Vec<ToolCall>,
+    reasoning: &mut Vec<ReasoningState>,
 ) -> Result<ModelEventAction, AgentError> {
     match event {
         Ok(Event::Text(text)) => {
@@ -162,6 +171,12 @@ async fn handle_model_event<H: Hook>(
         })),
         Ok(Event::ToolCall(call)) => {
             tool_calls.push(call);
+            Ok(ModelEventAction::Continue)
+        }
+        // State, unlike Reasoning, is not for the reader: it is collected so
+        // the next request can hand it back to the provider.
+        Ok(Event::ReasoningState(state)) => {
+            reasoning.push(state);
             Ok(ModelEventAction::Continue)
         }
         Ok(Event::BuiltInToolResult { tool, result }) => {
@@ -481,82 +496,6 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     pub(crate) active_allowed_tools: Option<HashSet<String>>,
 }
 
-/// A finished tool call: its id, the tool's name, and either its output or the
-/// error text it failed with.
-type ToolOutcome = (String, String, Result<String, String>);
-
-/// What one provider event asks the run loop to do.
-enum TurnStep {
-    /// The event only advanced accumulated state; nothing to emit.
-    Continue,
-    /// Model text: tell the hooks, then emit it.
-    EmitText(String),
-    /// Emit this event as-is.
-    Emit(AgentEvent),
-    /// Stop consuming this turn's stream.
-    Stop,
-}
-
-/// What one turn accumulates from the model's stream.
-///
-/// Kept outside the `run` stream so the per-tier arms are the same short loop
-/// rather than three copies of the same event handling.
-#[derive(Default)]
-struct Turn {
-    text_chunks: Vec<String>,
-    tool_calls: Vec<aither_core::llm::ToolCall>,
-    /// The model emitted a tool call the provider could not parse.
-    malformed_function_call: bool,
-    /// The provider failed outright.
-    error: Option<String>,
-}
-
-impl Turn {
-    /// Folds one provider event into the turn.
-    fn apply<E: core::fmt::Display>(&mut self, event: Result<Event, E>) -> TurnStep {
-        let event = match event {
-            Ok(event) => event,
-            Err(e) => {
-                let error_msg = e.to_string();
-                // A malformed call is worth another attempt; anything else is
-                // the provider telling us the turn is over.
-                if error_msg.contains("malformed function call") {
-                    tracing::warn!("Model generated malformed function call, retrying...");
-                    self.malformed_function_call = true;
-                } else {
-                    self.error = Some(error_msg);
-                }
-                return TurnStep::Stop;
-            }
-        };
-
-        match event {
-            Event::Text(text) => {
-                self.text_chunks.push(text.clone());
-                TurnStep::EmitText(text)
-            }
-            Event::Reasoning(r) => TurnStep::Emit(AgentEvent::Reasoning(r)),
-            Event::ToolCall(call) => {
-                self.tool_calls.push(call);
-                TurnStep::Continue
-            }
-            // Built-in results are the provider's own tools reporting back, so
-            // they read as model output rather than as a tool call of ours.
-            Event::BuiltInToolResult { tool, result } => {
-                let formatted = format!("[{tool}] {result}");
-                self.text_chunks.push(formatted.clone());
-                TurnStep::Emit(AgentEvent::Text(formatted))
-            }
-            Event::Usage(u) => TurnStep::Emit(AgentEvent::Usage(u)),
-        }
-    }
-}
-
-/// How long to wait for outstanding background bash tasks before giving up.
-const MAX_WAIT: Duration = Duration::from_secs(300);
-/// How often to check whether a background task has finished.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
 impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
     /// Creates a new agent with default configuration.
     ///
@@ -624,6 +563,7 @@ where
     ) -> Result<ModelTurn, AgentError> {
         let mut text_chunks = Vec::new();
         let mut tool_calls = Vec::new();
+        let mut reasoning = Vec::new();
         let mut malformed_function_call = false;
 
         match self.tier {
@@ -635,6 +575,7 @@ where
                     events,
                     &mut text_chunks,
                     &mut tool_calls,
+                    &mut reasoning,
                     malformed_function_call
                 );
             }
@@ -646,6 +587,7 @@ where
                     events,
                     &mut text_chunks,
                     &mut tool_calls,
+                    &mut reasoning,
                     malformed_function_call
                 );
             }
@@ -657,6 +599,7 @@ where
                     events,
                     &mut text_chunks,
                     &mut tool_calls,
+                    &mut reasoning,
                     malformed_function_call
                 );
             }
@@ -665,6 +608,7 @@ where
         Ok(ModelTurn {
             response_text: text_chunks.join(""),
             tool_calls,
+            reasoning,
             malformed_function_call,
         })
     }
@@ -759,9 +703,12 @@ where
             return self.finish_no_tool_turn(response_text, turn, events).await;
         }
 
-        self.context.push(Message::assistant_with_tool_calls(
+        // The reasoning has to travel with the turn that produced these calls,
+        // or the model receives their results without the thinking behind them.
+        self.context.push(Message::assistant_with_reasoning(
             &response_text,
             tool_calls.clone(),
+            model_turn.reasoning,
         ));
         let old_todo_items = self
             .todo_list
@@ -952,9 +899,7 @@ where
         for result in results {
             let (call_id, call_name, tool_result) = result?;
             let is_terminal_call = call_name == "terminal";
-            if !known_tools.iter().any(|name| *name == call_name)
-                && !unknown_tools.contains(&call_name)
-            {
+            if !known_tools.contains(&call_name) && !unknown_tools.contains(&call_name) {
                 unknown_tools.push(call_name.clone());
             }
             if let Some(transcript) = &self.transcript {
@@ -1273,7 +1218,6 @@ where
                     RunStep::Event(None) => outcome = Some((&mut run).await),
                     RunStep::Finished(result) => outcome = Some(result),
                 }
-                return;
             }
             // Deliver events that raced with run completion.
             while let Ok(event) = receiver.try_recv() {
@@ -1283,269 +1227,6 @@ where
                 yield Err(error);
             }
         }
-    }
-
-    /// Streams a response from whichever tier is active.
-    ///
-    /// The tier picks the model at run time, so the three streams are boxed to
-    /// a common type rather than driving three copies of the caller's loop.
-    /// Their errors only ever get displayed, so they collapse to a string at
-    /// the same boundary.
-    fn respond_on_tier(
-        &self,
-        request: LLMRequest,
-    ) -> Pin<Box<dyn Stream<Item = Result<Event, String>> + Send + '_>> {
-        match self.tier {
-            ModelTier::Advanced => Box::pin(
-                self.advanced
-                    .respond(request)
-                    .map(|event| event.map_err(|e| e.to_string())),
-            ),
-            ModelTier::Balanced => Box::pin(
-                self.balanced
-                    .respond(request)
-                    .map(|event| event.map_err(|e| e.to_string())),
-            ),
-            ModelTier::Fast => Box::pin(
-                self.fast
-                    .respond(request)
-                    .map(|event| event.map_err(|e| e.to_string())),
-            ),
-        }
-    }
-
-    /// Runs one turn's tool calls and returns the events the caller should emit.
-    ///
-    /// Every call runs concurrently; results are folded back into the context in
-    /// call order so the transcript stays deterministic regardless of which
-    /// finished first.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AgentError::HookRejected`] if a hook aborts the turn.
-    async fn run_tool_calls(
-        &mut self,
-        tool_calls: &[aither_core::llm::ToolCall],
-        iteration: usize,
-    ) -> Result<Vec<AgentEvent>, AgentError> {
-        // Snapshot todo state BEFORE executing tool calls
-        let old_todo_items: Vec<TodoItem> = self
-            .todo_list
-            .as_ref()
-            .map(super::todo::TodoList::items)
-            .unwrap_or_default();
-        let todo_tool_called = tool_calls.iter().any(|call| call.name == "todo");
-
-        let mut events = Vec::with_capacity(tool_calls.len() * 2);
-        for call in tool_calls {
-            let args = call.arguments.to_string();
-            if let Some(transcript) = &self.transcript {
-                transcript.write_tool_call(&call.name, &args).await;
-            }
-            events.push(AgentEvent::ToolCallStart {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                arguments: args,
-            });
-        }
-
-        let results = self.dispatch_tool_calls(tool_calls, iteration).await;
-
-        let mut has_tool_error = false;
-        for result in results {
-            let (call_id, call_name, tool_result) = result?;
-
-            if let Some(transcript) = &self.transcript {
-                transcript.write_tool_result(&call_name, &tool_result).await;
-            }
-            events.push(AgentEvent::ToolCallEnd {
-                id: call_id.clone(),
-                name: call_name.clone(),
-                result: tool_result.clone(),
-            });
-
-            let content = match &tool_result {
-                Ok(content) | Err(content) => content,
-            };
-            if Self::is_tool_failure(&tool_result, content) {
-                has_tool_error = true;
-            }
-
-            self.context.push(Message::tool(
-                &call_id,
-                Self::process_reload_marker(content),
-            ));
-            if call_name == "bash"
-                && tool_result.is_ok()
-                && let Some(reminder) = Self::format_background_started_reminder(content)
-            {
-                self.context.push(Message::system(reminder));
-            }
-        }
-
-        if has_tool_error {
-            self.context.push(Message::system(include_str!(
-                "prompts/tool_error_reminder.txt"
-            )));
-        }
-        if todo_tool_called {
-            self.inject_todo_reminder(&old_todo_items);
-        }
-
-        // Poll for completed background tasks
-        if let Some(ref receiver) = self.background_receiver {
-            for task in receiver.take_completed() {
-                tracing::info!(task_id = %task.task_id, "background task completed");
-                let result_msg = Self::format_background_task_result(&task);
-                self.context.push(Message::system(&result_msg));
-            }
-        }
-
-        Ok(events)
-    }
-
-    /// Runs every tool call concurrently, applying the hooks around each one.
-    async fn dispatch_tool_calls(
-        &self,
-        tool_calls: &[aither_core::llm::ToolCall],
-        iteration: usize,
-    ) -> Vec<Result<ToolOutcome, AgentError>> {
-        let tools = &self.tools;
-        let hooks = &self.hooks;
-        let message_count = self.context.len_recent();
-
-        let tool_futures = tool_calls.iter().map(|call| {
-            let args_json = call.arguments.to_string();
-
-            async move {
-                let tool_ctx = ToolUseContext {
-                    tool_name: &call.name,
-                    arguments: &args_json,
-                    turn: iteration,
-                    message_count,
-                };
-
-                let (result, duration) = match hooks.pre_tool_use(&tool_ctx).await {
-                    PreToolAction::Abort(reason) => {
-                        return Err(AgentError::HookRejected {
-                            hook: "pre_tool_use",
-                            reason,
-                        });
-                    }
-                    PreToolAction::Deny(reason) => (Err(anyhow::anyhow!(reason)), Duration::ZERO),
-                    PreToolAction::Allow => {
-                        let start = Instant::now();
-                        let result = tools.call(&call.name, &args_json).await;
-                        let result = result.map(|output| output.as_str().unwrap_or("").to_string());
-                        (result, start.elapsed())
-                    }
-                };
-
-                let result_ref = result
-                    .as_ref()
-                    .map(String::as_str)
-                    .map_err(ToString::to_string);
-                let result_ctx = ToolResultContext {
-                    tool_name: &call.name,
-                    arguments: &args_json,
-                    result: result_ref.as_ref().map(|s| *s).map_err(String::as_str),
-                    duration,
-                };
-
-                let tool_result = match hooks.post_tool_use(&result_ctx).await {
-                    PostToolAction::Abort(reason) => {
-                        return Err(AgentError::HookRejected {
-                            hook: "post_tool_use",
-                            reason,
-                        });
-                    }
-                    PostToolAction::Replace(replacement) => {
-                        if result.is_ok() {
-                            Ok(replacement)
-                        } else {
-                            Err(replacement)
-                        }
-                    }
-                    PostToolAction::Keep => result.map_err(|e| format!("Error: {e}")),
-                };
-
-                Ok((call.id.clone(), call.name.clone(), tool_result))
-            }
-        });
-
-        futures::future::join_all(tool_futures).await
-    }
-
-    /// Whether a tool result should count as a failure worth reminding about.
-    ///
-    /// Some tools report their own misuse in an `Ok` string rather than an
-    /// error, so the text is checked as well as the result.
-    fn is_tool_failure(tool_result: &Result<String, String>, content: &str) -> bool {
-        tool_result.is_err()
-            || content.contains("ssh_server_id is required")
-            || content.contains("unknown ssh_server_id")
-            || content.contains("not found")
-            || content.contains("Invalid arguments")
-    }
-
-    /// Reminds the model what to do next after it edited the todo list.
-    ///
-    /// Finishing a task earns a pointer at the next one; anything else gets the
-    /// list back, so the model always sees the state it just wrote.
-    fn inject_todo_reminder(&mut self, old_todo_items: &[TodoItem]) {
-        let new_items = self
-            .todo_list
-            .as_ref()
-            .map(super::todo::TodoList::items)
-            .unwrap_or_default();
-
-        let newly_completed = new_items.iter().find(|new_item| {
-            new_item.status == TodoStatus::Completed
-                && old_todo_items.iter().any(|old| {
-                    old.content == new_item.content && old.status != TodoStatus::Completed
-                })
-        });
-
-        let reminder = newly_completed.map_or_else(
-            || self.format_todo_reminder(),
-            |completed| self.format_next_task_reminder(&completed.content),
-        );
-        if let Some(reminder) = reminder {
-            self.context.push(Message::system(&reminder));
-        }
-    }
-
-    /// Collects background tasks that finished during the run, waiting briefly
-    /// for any still running.
-    ///
-    /// Returns whether anything completed, which tells the caller whether the
-    /// model needs another turn to react to the results.
-    async fn drain_background_tasks(&mut self) -> bool {
-        let Some(receiver) = self.background_receiver.clone() else {
-            return false;
-        };
-
-        let completed_tasks = receiver.take_completed();
-        let mut had_completed = !completed_tasks.is_empty();
-        for task in completed_tasks {
-            tracing::info!(task_id = %task.task_id, "background task completed (final check)");
-            let result_msg = Self::format_background_task_result(&task);
-            self.context.push(Message::system(&result_msg));
-        }
-
-        let start = Instant::now();
-        while start.elapsed() < MAX_WAIT {
-            if let Some(task) = receiver.recv_timeout(POLL_INTERVAL).await {
-                tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
-                let result_msg = Self::format_background_task_result(&task);
-                self.context.push(Message::system(&result_msg));
-                had_completed = true;
-            } else if !receiver.has_running() {
-                break;
-            }
-        }
-
-        had_completed
     }
 
     /// Registers a tool for the agent to use.
@@ -1993,14 +1674,13 @@ where
 
         if !metrics.has_handoff
             && metrics.usage_fraction >= self.config.context_assembler.handoff_threshold
+            && let Some(handoff_ctx) = self.format_handoff_context(metrics.usage_fraction)
         {
-            if let Some(handoff_ctx) = self.format_handoff_context(metrics.usage_fraction) {
-                self.context.insert_reminder(&SystemReminder {
-                    content: handoff_ctx,
-                });
-                messages = self.context.build_messages();
-                metrics = self.estimate_context_window_metrics(&messages);
-            }
+            self.context.insert_reminder(&SystemReminder {
+                content: handoff_ctx,
+            });
+            messages = self.context.build_messages();
+            metrics = self.estimate_context_window_metrics(&messages);
         }
 
         ContextWindowSnapshot {
@@ -2163,7 +1843,6 @@ where
                 // the window to leave the danger zone; a marginal saving is
                 // not worth the cache invalidation on top of a compaction
                 // that would follow anyway.
-                use num_traits::ToPrimitive as _;
                 let window = self.effective_context_window();
                 let savings_tokens = self.context.estimate_reassembly_savings() / 4;
                 let savings_fraction =
@@ -2570,14 +2249,14 @@ mod tests {
             futures_lite::stream::empty()
         }
 
-        async fn profile(&self) -> ModelProfile {
-            ModelProfile::new(
+        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
+            std::future::ready(ModelProfile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "mock model",
                 self.context_length,
-            )
+            ))
         }
     }
 

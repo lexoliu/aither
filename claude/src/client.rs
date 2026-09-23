@@ -19,8 +19,9 @@ use crate::{
     constant::{ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL},
     error::ClaudeError,
     request::{
-        MessagesRequest, ParameterSnapshot, apply_cache_strategy, convert_native_tools,
-        convert_tools, filter_tool_definitions, to_claude_messages, tool_choice_payload,
+        MessagesRequest, ParameterSnapshot, apply_cache_strategy, build_output_config,
+        build_thinking, convert_native_tools, convert_tools, filter_tool_definitions,
+        to_claude_messages, tool_choice_payload,
     },
     response::{StreamState, parse_event, should_skip_event},
 };
@@ -160,6 +161,15 @@ impl LanguageModel for Claude {
                 None
             };
 
+            let thinking = build_thinking(&snapshot);
+            let output_config = match build_output_config(&snapshot) {
+                Ok(config) => config,
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            };
+
             // Build and send request
             let request_body = MessagesRequest {
                 model: cfg.model.clone(),
@@ -173,6 +183,8 @@ impl LanguageModel for Claude {
                 stop_sequences: snapshot.stop_sequences.clone(),
                 tools: claude_tools,
                 tool_choice: claude_tool_choice,
+                thinking,
+                output_config,
                 cache_control: top_level_cache_control,
             };
 
@@ -234,10 +246,13 @@ impl LanguageModel for Claude {
 
             // Tool calls are reported, never executed: the consumer decides.
             for call in state.tool_calls {
+                // Claude scopes thinking to the turn, not to the individual
+                // call, so the state rides on the assistant message instead.
                 yield Ok(Event::ToolCall(aither_core::llm::ToolCall {
                     id: call.id,
                     name: call.name,
                     arguments: call.input,
+                    reasoning_state: None,
                 }));
             }
 
@@ -349,10 +364,10 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, ClaudeError> {
     let response: ModelsResponse = req.json().await.map_err(ClaudeError::Http)?;
 
     for model in response.data {
-        if model.id == cfg.model {
-            if let Some(ctx) = model.context_length {
-                return Ok(ctx);
-            }
+        if model.id == cfg.model
+            && let Some(ctx) = model.context_length
+        {
+            return Ok(ctx);
         }
     }
 

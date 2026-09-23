@@ -136,40 +136,40 @@ fn format_tool_title(name: &str, arguments: &str) -> String {
     // Try to extract relevant info from arguments for better titles
     match name {
         "terminal" => {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-                if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                    // Truncate long commands
-                    let truncated = if cmd.len() > 50 {
-                        format!("{}...", &cmd[..47])
-                    } else {
-                        cmd.to_string()
-                    };
-                    return format!("Running: {truncated}");
-                }
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
+                && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
+            {
+                // Truncate long commands
+                let truncated = if cmd.len() > 50 {
+                    format!("{}...", &cmd[..47])
+                } else {
+                    cmd.to_string()
+                };
+                return format!("Running: {truncated}");
             }
             "Running command".to_string()
         }
         "read" | "Read" => {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-                if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
-                    return format!("Reading {path}");
-                }
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
+                && let Some(path) = args.get("file_path").and_then(|v| v.as_str())
+            {
+                return format!("Reading {path}");
             }
             "Reading file".to_string()
         }
         "write" | "Write" => {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-                if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
-                    return format!("Writing {path}");
-                }
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
+                && let Some(path) = args.get("file_path").and_then(|v| v.as_str())
+            {
+                return format!("Writing {path}");
             }
             "Writing file".to_string()
         }
         "edit" | "Edit" => {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-                if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
-                    return format!("Editing {path}");
-                }
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
+                && let Some(path) = args.get("file_path").and_then(|v| v.as_str())
+            {
+                return format!("Editing {path}");
             }
             "Editing file".to_string()
         }

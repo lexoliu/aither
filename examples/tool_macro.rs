@@ -34,8 +34,8 @@ pub async fn search(keywords: Vec<String>, max_results: u32) -> Result<Vec<Searc
         .into_iter()
         .take(max_results as usize)
         .map(|keyword| SearchResult {
-            title: format!("Result for {keyword}",),
-            url: format!("https://example.com/search?q={keyword}",),
+            title: format!("Result for {keyword}"),
+            url: format!("https://example.com/search?q={keyword}"),
         })
         .collect();
     Ok(results)

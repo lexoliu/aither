@@ -1,18 +1,19 @@
 use aither_core::{
     LanguageModel,
     llm::{
-        Attachment, Event, GenerateError, LLMRequest, Message, Role, Usage,
+        Attachment, Event, GenerateError, LLMRequest, Message, ReasoningState, Role, Usage,
         model::{Ability, Parameters, Profile, ToolChoice},
         tool::ToolDefinition,
     },
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_core::Stream;
 use futures_lite::StreamExt;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use tracing::debug;
 
+use crate::PROVIDER_NAME;
 use crate::{
     client::stream_generate,
     config::Gemini,
@@ -185,7 +186,7 @@ async fn build_generate_request(
     Ok(GenerateContentRequest {
         system_instruction,
         contents,
-        generation_config: build_generation_config(&parameters, None),
+        generation_config: build_generation_config(&parameters, None)?,
         tools,
         tool_config: build_tool_config(&parameters, has_function_tools),
         safety_settings: Vec::new(),
@@ -232,10 +233,14 @@ fn events_from_content(content: &GeminiContent) -> Vec<Event> {
             .function_call_parts()
             .into_iter()
             .map(|(call, signature)| {
+                // Gemini signs each function call rather than the turn, so the
+                // signature rides on the call it belongs to.
                 Event::ToolCall(aither_core::llm::ToolCall {
-                    id: tool_call_id(signature.as_deref()),
+                    id: tool_call_id(),
                     name: call.name,
                     arguments: call.args,
+                    reasoning_state: signature
+                        .map(|value| ReasoningState::new(PROVIDER_NAME, value)),
                 })
             }),
     );
@@ -333,17 +338,8 @@ fn uuid_v4() -> String {
     format!("{timestamp:032x}")
 }
 
-const TOOL_SIGNATURE_SEPARATOR: &str = "|ts|";
-
-fn tool_call_id(signature: Option<&str>) -> String {
-    let base = format!("gemini_{}", uuid_v4());
-    match signature {
-        Some(value) => {
-            let encoded = URL_SAFE_NO_PAD.encode(value.as_bytes());
-            format!("{base}{TOOL_SIGNATURE_SEPARATOR}{encoded}")
-        }
-        None => base,
-    }
+fn tool_call_id() -> String {
+    format!("gemini_{}", uuid_v4())
 }
 
 fn parse_tool_response(content: &str) -> Option<(String, serde_json::Value, Option<String>)> {
@@ -358,7 +354,8 @@ fn parse_tool_response(content: &str) -> Option<(String, serde_json::Value, Opti
     let name = header_split.next()?.trim().to_string();
     let rest = &content[end + 1..];
     let output = rest.strip_prefix(' ').unwrap_or(rest);
-    let (_, signature) = parse_tool_signature(id);
+    let _ = id;
+    let signature = None;
     let response_value = match serde_json::from_str::<serde_json::Value>(output) {
         Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
         Ok(other) => {
@@ -378,17 +375,6 @@ fn parse_tool_response(content: &str) -> Option<(String, serde_json::Value, Opti
     Some((name, response_value, signature))
 }
 
-fn parse_tool_signature(id: &str) -> (String, Option<String>) {
-    if let Some((base, encoded)) = id.split_once(TOOL_SIGNATURE_SEPARATOR) {
-        if let Ok(bytes) = URL_SAFE_NO_PAD.decode(encoded) {
-            if let Ok(signature) = String::from_utf8(bytes) {
-                return (base.to_string(), Some(signature));
-            }
-        }
-    }
-    (id.to_string(), None)
-}
-
 const fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
     Usage {
         prompt_tokens: meta.prompt_token_count,
@@ -402,21 +388,36 @@ const fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
     }
 }
 
+/// Indexes every tool call by id, yielding its function name and, where the
+/// model signed it, its thought signature.
+///
+/// A tool *result* has to look both up: Gemini scopes the signature to the call
+/// rather than the result, so the result cannot carry it.
+fn index_tool_calls(messages: &[Message]) -> (HashMap<&str, &str>, HashMap<&str, &str>) {
+    let mut names = HashMap::new();
+    let mut signatures = HashMap::new();
+    for message in messages {
+        for tc in message.tool_calls() {
+            names.insert(tc.id.as_str(), tc.name.as_str());
+            if let Some(signature) = tc
+                .reasoning_state
+                .as_ref()
+                .and_then(|state| state.payload_for(PROVIDER_NAME))
+            {
+                signatures.insert(tc.id.as_str(), signature);
+            }
+        }
+    }
+    (names, signatures)
+}
+
 async fn messages_to_gemini(
     messages: &[Message],
 ) -> Result<(Option<GeminiContent>, Vec<GeminiContent>), GeminiError> {
-    use std::collections::HashMap;
-
     let mut system_parts = Vec::new();
     let mut contents = Vec::new();
 
-    // Build a map from tool_call_id to function name for resolving Tool messages
-    let mut tool_call_names: HashMap<&str, &str> = HashMap::new();
-    for message in messages {
-        for tc in message.tool_calls() {
-            tool_call_names.insert(&tc.id, &tc.name);
-        }
-    }
+    let (tool_call_names, tool_call_signatures) = index_tool_calls(messages);
 
     for message in messages {
         match message.role() {
@@ -445,7 +446,10 @@ async fn messages_to_gemini(
             Role::Tool => {
                 // Get the function name from the tool_call_id
                 let tool_call_id = message.tool_call_id().unwrap_or("");
-                let (base_id, signature) = parse_tool_signature(tool_call_id);
+                let base_id = tool_call_id.to_string();
+                let signature = tool_call_signatures
+                    .get(tool_call_id)
+                    .map(|value| (*value).to_string());
 
                 if let Some(&function_name) = tool_call_names.get(tool_call_id) {
                     // Parse the content as JSON, or wrap it as a string result
@@ -500,7 +504,11 @@ async fn messages_to_gemini(
 
                     // Add function call parts with thought signatures extracted from IDs
                     for tc in tool_calls {
-                        let (_, signature) = parse_tool_signature(&tc.id);
+                        let signature = tc
+                            .reasoning_state
+                            .as_ref()
+                            .and_then(|state| state.payload_for(PROVIDER_NAME))
+                            .map(String::from);
                         parts.push(Part::function_call_with_signature(
                             tc.name.clone(),
                             tc.arguments.clone(),
@@ -550,11 +558,15 @@ fn format_safety_rating(rating: &SafetyRating) -> String {
     format!("{} ({status}, probability: {probability})", rating.category)
 }
 
+/// # Errors
+///
+/// Returns [`GeminiError`] when the requested reasoning effort has no Gemini
+/// equivalent.
 fn build_generation_config(
     parameters: &Parameters,
     modalities: Option<Vec<String>>,
-) -> Option<GenerationConfig> {
-    let thinking_config = build_thinking_config(parameters);
+) -> Result<Option<GenerationConfig>, GeminiError> {
+    let thinking_config = build_thinking_config(parameters)?;
     let mut config = GenerationConfig {
         temperature: parameters.temperature,
         top_p: parameters.top_p,
@@ -583,9 +595,9 @@ fn build_generation_config(
         config.response_mime_type = Some("application/json".into());
     }
     if config.is_meaningful() {
-        Some(config)
+        Ok(Some(config))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -612,15 +624,21 @@ fn build_tool_config(parameters: &Parameters, has_tools: bool) -> Option<ToolCon
 /// Depth (`reasoning_effort`) and visibility (`include_reasoning`) are separate
 /// controls: asking for a deeper think does not require the thoughts to be
 /// returned, and vice versa. Either one alone is enough to emit the config.
-fn build_thinking_config(parameters: &Parameters) -> Option<ThinkingConfig> {
-    let thinking_level = parameters.reasoning_effort.map(ThinkingLevel::from);
+/// # Errors
+///
+/// Returns [`GeminiError`] when the requested effort has no Gemini equivalent.
+fn build_thinking_config(parameters: &Parameters) -> Result<Option<ThinkingConfig>, GeminiError> {
+    let thinking_level = parameters
+        .reasoning_effort
+        .map(ThinkingLevel::try_from)
+        .transpose()?;
     if !parameters.include_reasoning && thinking_level.is_none() {
-        return None;
+        return Ok(None);
     }
-    Some(ThinkingConfig {
+    Ok(Some(ThinkingConfig {
         include_thoughts: parameters.include_reasoning.then_some(true),
         thinking_level,
-    })
+    }))
 }
 
 fn convert_tool_definitions(defs: Vec<ToolDefinition>) -> Vec<FunctionDeclaration> {
@@ -734,7 +752,9 @@ mod tests {
     }
 
     fn thinking_json(params: &Parameters) -> serde_json::Value {
-        let config = build_thinking_config(params).expect("thinking config");
+        let config = build_thinking_config(params)
+            .expect("effort supported by Gemini")
+            .expect("thinking config");
         serde_json::to_value(config).expect("serialize thinking config")
     }
 
@@ -753,7 +773,7 @@ mod tests {
     #[test]
     fn thinking_config_never_pairs_a_budget_with_a_level() {
         for effort in [
-            ReasoningEffort::Minimum,
+            ReasoningEffort::Minimal,
             ReasoningEffort::Low,
             ReasoningEffort::Medium,
             ReasoningEffort::High,
@@ -769,10 +789,67 @@ mod tests {
     }
 
     #[test]
-    fn minimum_effort_maps_to_the_minimal_level() {
+    fn minimal_effort_maps_to_the_minimal_level() {
         let value =
-            thinking_json(&Parameters::default().reasoning_effort(ReasoningEffort::Minimum));
+            thinking_json(&Parameters::default().reasoning_effort(ReasoningEffort::Minimal));
         assert_eq!(value["thinkingLevel"], "minimal");
+    }
+
+    /// Gemini's ladder stops at High. Clamping `XHigh` or `Max` down to High would
+    /// hand back less reasoning than the caller asked for, silently.
+    #[test]
+    fn efforts_above_gemini_ceiling_are_rejected() {
+        for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {
+            let error = build_thinking_config(&Parameters::default().reasoning_effort(effort))
+                .expect_err("effort above the Gemini ceiling must fail");
+            assert!(
+                error.to_string().contains("tops out at High"),
+                "unexpected error for {effort:?}: {error}"
+            );
+        }
+    }
+
+    /// The signature used to be base64'd into the tool-call id behind a `|ts|`
+    /// separator, because core had nowhere to put it. It now rides on the call,
+    /// and the id is a plain identifier again.
+    #[tokio::test]
+    async fn thought_signature_round_trips_without_mangling_the_id() {
+        let call = aither_core::llm::ToolCall::new("gemini_abc", "lookup", serde_json::json!({}))
+            .with_reasoning_state(ReasoningState::new(PROVIDER_NAME, "sig-xyz"));
+        let message = Message::assistant_with_tool_calls("", vec![call]);
+
+        let (_, contents) = messages_to_gemini(&[message]).await.expect("convert");
+        let value = serde_json::to_value(&contents).expect("serialize contents");
+        let part = &value[0]["parts"][0];
+
+        assert_eq!(part["thoughtSignature"], "sig-xyz");
+        assert_eq!(part["functionCall"]["name"], "lookup");
+    }
+
+    #[tokio::test]
+    async fn generated_tool_call_ids_carry_no_smuggled_signature() {
+        assert!(!tool_call_id().contains("|ts|"));
+    }
+
+    /// Signatures are Gemini's; another provider's state must not be replayed.
+    #[tokio::test]
+    async fn foreign_reasoning_state_is_not_sent_as_a_signature() {
+        let call = aither_core::llm::ToolCall::new("gemini_abc", "lookup", serde_json::json!({}))
+            .with_reasoning_state(ReasoningState::new("anthropic", "sig-from-claude"));
+        let message = Message::assistant_with_tool_calls("", vec![call]);
+
+        let (_, contents) = messages_to_gemini(&[message]).await.expect("convert");
+        let value = serde_json::to_value(&contents).expect("serialize contents");
+        assert_eq!(value[0]["parts"][0].get("thoughtSignature"), None);
+    }
+
+    /// Gemini has no "no thinking" level; the caller should omit effort instead.
+    #[test]
+    fn none_effort_is_rejected() {
+        let error =
+            build_thinking_config(&Parameters::default().reasoning_effort(ReasoningEffort::None))
+                .expect_err("None effort must fail");
+        assert!(error.to_string().contains("no 'none' thinking level"));
     }
 
     /// Depth and visibility are independent: asking for effort alone must still
@@ -788,7 +865,11 @@ mod tests {
         assert_eq!(thoughts_only["includeThoughts"], true);
         assert_eq!(thoughts_only.get("thinkingLevel"), None);
 
-        assert!(build_thinking_config(&Parameters::default()).is_none());
+        assert!(
+            build_thinking_config(&Parameters::default())
+                .expect("no effort requested")
+                .is_none()
+        );
     }
 
     /// These reached the wire only if `build_generation_config` populates them;
@@ -801,7 +882,9 @@ mod tests {
             .frequency_penalty(0.25)
             .logprobs(true)
             .top_logprobs(3);
-        let config = build_generation_config(&params, None).expect("generation config");
+        let config = build_generation_config(&params, None)
+            .expect("effort supported by Gemini")
+            .expect("generation config");
         let value = serde_json::to_value(config).expect("serialize generation config");
         assert_eq!(value["seed"], 42);
         assert_eq!(value["presencePenalty"], 0.5);

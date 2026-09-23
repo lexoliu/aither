@@ -191,8 +191,16 @@ where
     /// Registers an eager (always-loaded) tool.
     ///
     /// Eager tools are included in every LLM request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
     pub fn tool<T: Tool + 'static>(mut self, tool: T) -> Self {
-        self.tools.register(tool);
+        self.tools
+            .register(tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self
     }
 
@@ -402,6 +410,12 @@ where
     ///     .terminal(terminal_tool)
     ///     .build();
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
     pub fn terminal<P, E, State>(
         mut self,
         terminal_tool: aither_sandbox::TerminalTool<P, E, State>,
@@ -416,7 +430,9 @@ where
         let permission_receiver = terminal_tool.permission_receiver();
         let job_registry = terminal_tool.job_registry();
         self.sandbox_dir = Some(terminal_tool.working_dir().clone());
-        self.tools.register(terminal_tool);
+        self.tools
+            .register(terminal_tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self.background_receiver = Some(background_receiver);
         self.permission_receiver = Some(permission_receiver);
         self.job_registry = Some(job_registry);
@@ -442,10 +458,18 @@ where
     ///     .todo()
     ///     .build();
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
     pub fn todo(mut self) -> Self {
         let list = TodoList::new();
         let tool = TodoTool::with_list(list.clone());
-        self.tools.register(tool);
+        self.tools
+            .register(tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self.todo_list = Some(list);
         self
     }
@@ -454,9 +478,17 @@ where
     ///
     /// Use this when you want to share a todo list between multiple agents
     /// or access the list externally.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
     pub fn todo_with_list(mut self, list: TodoList) -> Self {
         let tool = TodoTool::with_list(list.clone());
-        self.tools.register(tool);
+        self.tools
+            .register(tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self.todo_list = Some(list);
         self
     }
@@ -533,20 +565,23 @@ mod tests {
             futures_lite::stream::empty()
         }
 
-        async fn profile(&self) -> aither_core::llm::model::Profile {
-            aither_core::llm::model::Profile::new(
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = aither_core::llm::model::Profile> + Send {
+            std::future::ready(aither_core::llm::model::Profile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "A mock model for testing",
                 100_000,
-            )
+            ))
         }
     }
 
     // Mock tool
     struct MockTool;
 
+    /// Does nothing, for tests that only care that a tool was registered.
     #[derive(Debug, JsonSchema, Deserialize)]
     struct MockArgs;
 
@@ -558,8 +593,11 @@ mod tests {
         type Arguments = MockArgs;
         type Res = aither_core::llm::ToolResult;
 
-        async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
-            Ok(aither_core::llm::ToolResult::text("ok"))
+        fn call(
+            &self,
+            _args: Self::Arguments,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(aither_core::llm::ToolResult::text("ok")))
         }
     }
 

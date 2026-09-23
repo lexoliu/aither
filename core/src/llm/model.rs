@@ -916,32 +916,38 @@ pub enum ToolChoice {
 }
 
 /// Effort levels available for reasoning-focused models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The ladder is ordered from least to most reasoning, and spans the union of
+/// what the providers accept. **No provider accepts every level**, and the
+/// supported set varies by model within a provider, so each provider crate maps
+/// this to its own wire vocabulary and rejects a level its API does not have —
+/// rather than silently clamping to the nearest one, which would bill the
+/// caller for a depth they did not ask for.
+///
+/// Deliberately carries no `as_str`: the wire spelling is not shared. `Minimal`
+/// is `"minimal"` on `OpenAI` and Gemini and does not exist on Claude; `XHigh`
+/// and `Max` exist on Claude and `OpenAI` but not Gemini.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum ReasoningEffort {
-    /// Minimum reasoning effort.
-    Minimum,
-
-    /// Compute-intensive reasoning.
+    /// No reasoning at all: answer directly.
+    ///
+    /// On Claude this disables thinking, which the API rejects on models whose
+    /// thinking is always on.
+    None,
+    /// The least reasoning a model will do while still reasoning.
+    Minimal,
+    /// Shallow reasoning, for latency-sensitive work.
     Low,
     /// Balanced reasoning depth.
     Medium,
-    /// Maximum reasoning depth and accuracy.
+    /// Thorough reasoning. The default on current Claude models.
     High,
-}
-
-impl ReasoningEffort {
-    /// Returns the string representation expected by providers.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Minimum => "minimum",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-        }
-    }
+    /// Beyond `High`, where the extra depth pays for itself.
+    XHigh,
+    /// The most reasoning available, for quality-first workloads.
+    Max,
 }
 
 /// Provider-specific prompt cache controls.

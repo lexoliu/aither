@@ -15,7 +15,19 @@ pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 // 1. GPT-5 FAMILY (Latest, reasoning-enhanced large models)
 // ============================================================
 
-/// Latest flagship GPT-5.2 model.
+/// Latest flagship model. The `gpt-5.6` alias routes to `gpt-5.6-sol`.
+pub const GPT5_6: &str = "gpt-5.6";
+
+/// Frontier-capability GPT-5.6 variant, the target of the `gpt-5.6` alias.
+pub const GPT5_6_SOL: &str = "gpt-5.6-sol";
+
+/// GPT-5.6 variant offering strong performance at lower cost.
+pub const GPT5_6_TERRA: &str = "gpt-5.6-terra";
+
+/// GPT-5.6 variant tuned for efficient, high-volume workloads.
+pub const GPT5_6_LUNA: &str = "gpt-5.6-luna";
+
+/// GPT-5.2 model (kept for compatibility).
 pub const GPT5_2: &str = "gpt-5.2";
 
 /// Dynamic alias pointing to the latest GPT-5.2 chat model.

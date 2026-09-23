@@ -21,6 +21,7 @@
 //! - Clean separation between LLM communication and agent logic
 //! - Proper context management between tool calls
 
+use crate::llm::reasoning::ReasoningState;
 use alloc::string::{String, ToString};
 use serde_json::Value;
 
@@ -195,6 +196,17 @@ pub enum Event {
     /// 3. Continue the conversation with the model
     ToolCall(ToolCall),
 
+    /// Opaque reasoning state that must be replayed to the provider.
+    ///
+    /// Distinct from [`Event::Reasoning`], which is display text: state carries
+    /// no meaning for the reader and text carries none for the model. They are
+    /// emitted independently, and a provider may emit either alone — Claude
+    /// with `display: "omitted"` produces state with no text at all.
+    ///
+    /// Consumers assembling the next request must collect these into the
+    /// assistant message they build; dropping them degrades multi-turn tool use.
+    ReasoningState(ReasoningState),
+
     /// Result from a provider's built-in tool.
     ///
     /// Some providers have native tools that are executed server-side:
@@ -251,6 +263,7 @@ impl Event {
             id: id.into(),
             name: name.into(),
             arguments,
+            reasoning_state: None,
         })
     }
 
@@ -348,6 +361,19 @@ pub struct ToolCall {
     ///
     /// The structure depends on the tool's schema.
     pub arguments: Value,
+
+    /// Provider reasoning state bound to this specific call.
+    ///
+    /// Gemini attaches a thought signature to each function call rather than to
+    /// the turn, so it lives here; providers that scope reasoning to the whole
+    /// turn use [`Message::assistant_with_reasoning`] instead.
+    ///
+    /// [`Message::assistant_with_reasoning`]: crate::llm::Message::assistant_with_reasoning
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub reasoning_state: Option<ReasoningState>,
 }
 
 impl ToolCall {
@@ -358,7 +384,18 @@ impl ToolCall {
             id: id.into(),
             name: name.into(),
             arguments,
+            reasoning_state: None,
         }
+    }
+
+    /// Binds provider reasoning state to this call.
+    ///
+    /// Used by providers that sign each function call individually, so the
+    /// signature travels with the call it belongs to instead of the turn.
+    #[must_use]
+    pub fn with_reasoning_state(mut self, state: ReasoningState) -> Self {
+        self.reasoning_state = Some(state);
+        self
     }
 
     /// Returns the arguments as a JSON string.

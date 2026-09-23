@@ -68,3 +68,10 @@ pub use client::{Builder, Claude};
 pub use constant::*;
 pub use error::ClaudeError;
 pub use provider::ClaudeProvider;
+
+/// Provider tag stamped on reasoning state produced by this crate.
+///
+/// Reasoning state is only ever replayed to the provider that signed it, so
+/// this string must stay stable across releases; changing it silently
+/// invalidates state stored in existing transcripts.
+pub const PROVIDER_NAME: &str = "anthropic";

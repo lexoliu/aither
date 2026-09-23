@@ -4,10 +4,13 @@ use aither_core::llm::model::Ability;
 pub const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 pub const USER_AGENT: &str = "aither-gemini/0.1";
-pub const DEFAULT_MODEL: &str = "gemini-2.0-flash";
+/// Google's latest and most capable Flash model, built for coding and agentic
+/// workflows. Thinking depth is steered with `thinkingLevel`, not a token budget.
+pub const DEFAULT_MODEL: &str = "gemini-3.7-flash";
 pub const DEFAULT_EMBEDDING_MODEL: &str = "gemini-embedding-001";
-pub const DEFAULT_IMAGE_MODEL: &str = "gemini-2.5-flash-image";
-pub const DEFAULT_TTS_MODEL: &str = "gemini-2.5-flash-preview-tts";
+/// Nano Banana 2.
+pub const DEFAULT_IMAGE_MODEL: &str = "gemini-3.1-flash-image";
+pub const DEFAULT_TTS_MODEL: &str = "gemini-3.1-flash-tts-preview";
 pub const DEFAULT_TTS_VOICE: &str = "Kore";
 
 /// Authentication strategy supported by the Gemini backend.

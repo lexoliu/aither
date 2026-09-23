@@ -4,11 +4,14 @@ use aither_core::llm::{
     Attachment, Message, Role,
     model::{
         ClaudeCacheBreakpointTarget, ClaudeExplicitCacheBreakpoints, ClaudeNativeTools,
-        ClaudePromptCache, ClaudePromptCacheStrategy, ClaudePromptCacheTtl, Parameters, ToolChoice,
+        ClaudePromptCache, ClaudePromptCacheStrategy, ClaudePromptCacheTtl, Parameters,
+        ReasoningEffort, ToolChoice,
     },
     tool::ToolDefinition,
 };
 // Only the native file:// reader encodes anything here.
+use crate::PROVIDER_NAME;
+use crate::error::ClaudeError;
 #[cfg(not(target_arch = "wasm32"))]
 use base64::Engine;
 use serde::Serialize;
@@ -30,12 +33,33 @@ pub struct MessagesRequest {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub stream: bool,
     /// Sampling temperature.
+    ///
+    /// # Deprecated by Anthropic
+    ///
+    /// Anthropic marks `temperature` deprecated. Models newer than the Claude 4
+    /// generation accept only `1.0`, for backwards compatibility; other values
+    /// are rejected with a 400. It is still sent when set, because callers
+    /// pointing at legacy models legitimately need it — steer newer models with
+    /// [`crate::request::MessagesRequest::output_config`] effort instead.
+    ///
+    /// See <https://platform.claude.com/docs/en/api/messages>.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     /// Nucleus sampling probability.
+    ///
+    /// # Deprecated by Anthropic
+    ///
+    /// Deprecated alongside [`Self::temperature`]. Newer models accept only
+    /// values `>= 0.99`. Kept for legacy models; see [`Self::temperature`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
     /// Top-k sampling.
+    ///
+    /// # Deprecated by Anthropic
+    ///
+    /// The most restricted of the three: newer models reject `top_k` outright
+    /// rather than accepting a compatibility value. Kept for legacy models; see
+    /// [`Self::temperature`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
     /// Stop sequences.
@@ -47,9 +71,121 @@ pub struct MessagesRequest {
     /// Tool choice policy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoicePayload>,
+    /// Thinking configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingPayload>,
+    /// Output shaping, including reasoning effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfigPayload>,
     /// Prompt cache control.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControlPayload>,
+}
+
+/// Claude thinking configuration.
+///
+/// Only adaptive thinking is modelled. The manual
+/// `{"type": "enabled", "budget_tokens": N}` mode is deprecated on the 4.6
+/// generation and returns a 400 on every model after it, so aither does not
+/// offer a way to construct it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingPayload {
+    /// Let Claude decide when and how deeply to think, steered by effort.
+    Adaptive {
+        /// Whether thinking text is returned. Omitted uses the model default,
+        /// which is `omitted` on the newest models.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<ThinkingDisplay>,
+    },
+    /// Turn thinking off.
+    ///
+    /// Rejected at `xhigh` and `max` effort, and on models whose thinking is
+    /// always on.
+    Disabled,
+}
+
+/// Whether Claude returns its thinking text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    /// Return a summary of the thinking.
+    Summarized,
+    /// Return thinking blocks with empty text, carrying only the signature.
+    Omitted,
+}
+
+/// Claude output configuration.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputConfigPayload {
+    /// How much effort Claude puts into the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<&'static str>,
+}
+
+/// Maps the portable effort ladder onto Claude's `output_config.effort`.
+///
+/// [`ReasoningEffort::None`] is absent here on purpose: Claude expresses "do not
+/// think" as `thinking: {"type": "disabled"}`, not as an effort level, so
+/// [`build_thinking`] handles it and this returns `None` for it.
+///
+/// # Errors
+///
+/// Returns [`ClaudeError`] for [`ReasoningEffort::Minimal`], which Claude's
+/// effort scale does not have. Rounding it up to `low` would silently buy the
+/// caller more reasoning than they asked for.
+pub fn claude_effort(effort: ReasoningEffort) -> Result<Option<&'static str>, ClaudeError> {
+    match effort {
+        ReasoningEffort::None => Ok(None),
+        ReasoningEffort::Low => Ok(Some("low")),
+        ReasoningEffort::Medium => Ok(Some("medium")),
+        ReasoningEffort::High => Ok(Some("high")),
+        ReasoningEffort::XHigh => Ok(Some("xhigh")),
+        ReasoningEffort::Max => Ok(Some("max")),
+        ReasoningEffort::Minimal => Err(ClaudeError::Api(
+            "Claude effort has no 'minimal' level; the lowest is Low".to_string(),
+        )),
+    }
+}
+
+/// Builds the `thinking` field.
+///
+/// Returns `None` when the caller expressed no preference, leaving the model's
+/// own default in force — which is thinking-on for the Claude 5 generation and
+/// thinking-off for 4.6 through 4.8.
+#[must_use]
+pub const fn build_thinking(params: &ParameterSnapshot) -> Option<ThinkingPayload> {
+    match (params.reasoning_effort, params.include_reasoning) {
+        (Some(ReasoningEffort::None), _) => Some(ThinkingPayload::Disabled),
+        // The caller wants to read the thinking.
+        (_, true) => Some(ThinkingPayload::Adaptive {
+            display: Some(ThinkingDisplay::Summarized),
+        }),
+        // An effort was set but the text is unwanted: ask for thinking without
+        // it, which also lets the server skip streaming thinking tokens.
+        (Some(_), false) => Some(ThinkingPayload::Adaptive {
+            display: Some(ThinkingDisplay::Omitted),
+        }),
+        // No preference at all: leave the model's own default in force.
+        (None, false) => None,
+    }
+}
+
+/// Builds the `output_config` field.
+///
+/// # Errors
+///
+/// Returns [`ClaudeError`] when the requested effort has no Claude equivalent.
+pub fn build_output_config(
+    params: &ParameterSnapshot,
+) -> Result<Option<OutputConfigPayload>, ClaudeError> {
+    let Some(effort) = params.reasoning_effort else {
+        return Ok(None);
+    };
+    let effort = claude_effort(effort)?;
+    Ok(effort.map(|effort| OutputConfigPayload {
+        effort: Some(effort),
+    }))
 }
 
 /// Individual message in Claude format.
@@ -124,6 +260,23 @@ pub enum ContentBlock {
         /// Optional explicit cache control for this block.
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControlPayload>,
+    },
+    /// Thinking block replayed from a previous turn.
+    ///
+    /// Anthropic requires these back "complete and unmodified", so the text and
+    /// signature are the ones Claude produced, never regenerated.
+    #[serde(rename = "thinking")]
+    Thinking {
+        /// The thinking text, empty when the turn used `display: "omitted"`.
+        thinking: String,
+        /// The signature Claude issued for this block.
+        signature: String,
+    },
+    /// Safety-redacted thinking block replayed from a previous turn.
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        /// Opaque encrypted thinking.
+        data: String,
     },
     /// Tool use block (in assistant responses).
     #[serde(rename = "tool_use")]
@@ -278,6 +431,8 @@ pub struct ParameterSnapshot {
     pub include_reasoning: bool,
     /// Whether Claude may request several tools per turn. `None` keeps Anthropic's default.
     pub parallel_tool_calls: Option<bool>,
+    /// Requested reasoning effort.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Tool choice policy.
     pub tool_choice: ToolChoice,
     /// Claude-specific cache controls.
@@ -296,6 +451,7 @@ impl From<&Parameters> for ParameterSnapshot {
             stop_sequences: params.stop.clone(),
             include_reasoning: params.include_reasoning,
             parallel_tool_calls: params.parallel_tool_calls,
+            reasoning_effort: params.reasoning_effort,
             tool_choice: params.tool_choice.clone(),
             cache: params.cache.claude,
             native_tools: params.native_tools.claude.clone(),
@@ -407,13 +563,64 @@ async fn build_user_content(message: &Message) -> Result<ContentPayload, String>
     Ok(ContentPayload::Blocks(blocks))
 }
 
+/// Decodes reasoning this crate previously emitted back into content blocks.
+///
+/// The payload is this crate's own encoding, so decoding it here keeps core
+/// ignorant of Claude's block taxonomy while still round-tripping both
+/// `thinking` and `redacted_thinking`. State from another provider, and state
+/// that no longer parses, is dropped: Anthropic documents stripping foreign
+/// thinking rather than rejecting the turn.
+fn replayed_thinking_blocks(message: &Message) -> Vec<ContentBlock> {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type")]
+    enum Replayed {
+        #[serde(rename = "thinking")]
+        Thinking { thinking: String, signature: String },
+        #[serde(rename = "redacted_thinking")]
+        RedactedThinking { data: String },
+    }
+
+    message
+        .reasoning()
+        .iter()
+        .filter_map(|state| {
+            let payload = state.payload_for(PROVIDER_NAME).or_else(|| {
+                tracing::debug!(
+                    provider = state.provider(),
+                    "dropping reasoning state from another provider"
+                );
+                None
+            })?;
+            match serde_json::from_str::<Replayed>(payload) {
+                Ok(Replayed::Thinking {
+                    thinking,
+                    signature,
+                }) => Some(ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                }),
+                Ok(Replayed::RedactedThinking { data }) => {
+                    Some(ContentBlock::RedactedThinking { data })
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "dropping unparsable Claude reasoning state");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 fn build_assistant_content(message: &Message) -> ContentPayload {
     let tool_calls = message.tool_calls();
-    if tool_calls.is_empty() {
+    // Thinking must lead the turn, so its presence alone forces block form even
+    // when there are no tool calls to report.
+    let thinking = replayed_thinking_blocks(message);
+    if tool_calls.is_empty() && thinking.is_empty() {
         return ContentPayload::Text(flatten_content(message));
     }
 
-    let mut blocks = Vec::new();
+    let mut blocks = thinking;
     let text = flatten_content(message);
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
@@ -576,13 +783,13 @@ fn maybe_automatic_cache_control(
         );
     }
 
-    if let Some(explicit_breakpoints) = explicit_breakpoints {
-        if explicit_breakpoints.is_full() {
-            return Err(
-                "Claude supports at most 4 cache breakpoints; automatic caching needs one free slot"
-                    .to_string(),
-            );
-        }
+    if let Some(explicit_breakpoints) = explicit_breakpoints
+        && explicit_breakpoints.is_full()
+    {
+        return Err(
+            "Claude supports at most 4 cache breakpoints; automatic caching needs one free slot"
+                .to_string(),
+        );
     }
 
     let cache_control = cache_control_payload_for_ttl(ttl);
@@ -632,15 +839,14 @@ fn find_last_cacheable_block(
         }
     }
 
-    if let Some(tools) = tools {
-        if let Some((tool_index, tool)) = tools
+    if let Some(tools) = tools
+        && let Some((tool_index, tool)) = tools
             .iter()
             .enumerate()
             .rev()
             .find_map(|(index, tool)| custom_tool(tool).map(|custom| (index, custom)))
-        {
-            return Some((PromptPosition::tool(tool_index), tool.cache_control.clone()));
-        }
+    {
+        return Some((PromptPosition::tool(tool_index), tool.cache_control.clone()));
     }
 
     None
@@ -844,9 +1050,13 @@ fn mark_last_message_cache_control(
                 return Ok(PromptPosition::message(message_index, 0));
             }
             ContentPayload::Blocks(blocks) => {
-                if let Some(index) = last_cacheable_block_index(blocks) {
+                // last_cacheable_block_index already excluded thinking blocks,
+                // so this slot is always present.
+                if let Some(index) = last_cacheable_block_index(blocks)
+                    && let Some(slot) = block_cache_control_mut(&mut blocks[index])
+                {
                     set_cache_control(
-                        block_cache_control_mut(&mut blocks[index]),
+                        slot,
                         cache_control,
                         "message breakpoint already has conflicting cache_control",
                     )?;
@@ -899,8 +1109,13 @@ fn mark_message_cache_control(
             "Claude explicit message breakpoint targets a non-cacheable block at message index {message_index}, block index {block_index}"
         ));
     }
+    let slot = block_cache_control_mut(block).ok_or_else(|| {
+        format!(
+            "Claude explicit message breakpoint targets a thinking block at message index {message_index}, block index {block_index}, which cannot carry cache_control"
+        )
+    })?;
     set_cache_control(
-        block_cache_control_mut(block),
+        slot,
         cache_control,
         "message breakpoint already has conflicting cache_control",
     )?;
@@ -914,6 +1129,8 @@ fn last_cacheable_block_index(blocks: &[ContentBlock]) -> Option<usize> {
         | ContentBlock::Document { .. }
         | ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. } => true,
+        // Anthropic defines no cache_control on thinking blocks.
+        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => false,
     })
 }
 
@@ -924,16 +1141,24 @@ const fn is_cacheable_block(block: &ContentBlock) -> bool {
         | ContentBlock::Document { .. }
         | ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. } => true,
+        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => false,
     }
 }
 
-const fn block_cache_control_mut(block: &mut ContentBlock) -> &mut Option<CacheControlPayload> {
+/// Returns `None` for blocks that have no `cache_control` field at all.
+///
+/// Callers reach this only after [`is_cacheable_block`], so a `None` here means
+/// a caller skipped that check rather than a user error.
+const fn block_cache_control_mut(
+    block: &mut ContentBlock,
+) -> Option<&mut Option<CacheControlPayload>> {
     match block {
         ContentBlock::Text { cache_control, .. }
         | ContentBlock::Image { cache_control, .. }
         | ContentBlock::Document { cache_control, .. }
         | ContentBlock::ToolUse { cache_control, .. }
-        | ContentBlock::ToolResult { cache_control, .. } => cache_control,
+        | ContentBlock::ToolResult { cache_control, .. } => Some(cache_control),
+        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
     }
 }
 
@@ -944,6 +1169,7 @@ const fn block_cache_control(block: &ContentBlock) -> Option<&CacheControlPayloa
         | ContentBlock::Document { cache_control, .. }
         | ContentBlock::ToolUse { cache_control, .. }
         | ContentBlock::ToolResult { cache_control, .. } => cache_control.as_ref(),
+        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
     }
 }
 
@@ -1134,7 +1360,7 @@ pub fn tool_choice_payload(
 mod tests {
     use super::*;
     use aither_core::llm::{
-        Attachment, ToolCall,
+        Attachment, ReasoningState, ToolCall,
         model::{
             ClaudeCacheBreakpointTarget, ClaudeExplicitCacheBreakpoint,
             ClaudeExplicitCacheBreakpoints, ClaudePromptCache, ClaudePromptCacheStrategy,
@@ -1146,6 +1372,7 @@ mod tests {
         let messages = vec![Message::assistant_with_tool_calls(
             "Working on it",
             vec![ToolCall {
+                reasoning_state: None,
                 id: "call_1".to_string(),
                 name: "lookup".to_string(),
                 arguments: serde_json::json!({"q":"rust"}),
@@ -1301,9 +1528,154 @@ mod tests {
         assert_eq!(serialized.get("disable_parallel_tool_use"), None);
     }
 
+    /// The round trip that CLA-2 made impossible: state out of the response
+    /// parser must come back as a replayable block, signature intact.
+    #[test]
+    fn thinking_state_round_trips_into_the_assistant_turn() {
+        let state = ReasoningState::new(
+            PROVIDER_NAME,
+            serde_json::json!({
+                "type": "thinking",
+                "thinking": "step one",
+                "signature": "sig-abc",
+            })
+            .to_string(),
+        );
+        let message = Message::assistant_with_reasoning(
+            "answer",
+            vec![ToolCall::new("call_1", "search", serde_json::json!({}))],
+            vec![state],
+        );
+
+        let value = serde_json::to_value(build_assistant_content(&message))
+            .expect("serialize assistant content");
+        let blocks = value.as_array().expect("block form");
+
+        // Anthropic requires the turn to begin with its thinking blocks.
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "step one");
+        assert_eq!(blocks[0]["signature"], "sig-abc");
+        assert!(blocks.iter().any(|block| block["type"] == "tool_use"));
+    }
+
+    #[test]
+    fn redacted_thinking_round_trips() {
+        let state = ReasoningState::new(
+            PROVIDER_NAME,
+            serde_json::json!({"type": "redacted_thinking", "data": "cipher"}).to_string(),
+        );
+        let message = Message::assistant_with_reasoning("", Vec::new(), vec![state]);
+        let value = serde_json::to_value(build_assistant_content(&message))
+            .expect("serialize assistant content");
+        assert_eq!(value[0]["type"], "redacted_thinking");
+        assert_eq!(value[0]["data"], "cipher");
+    }
+
+    /// Thinking blocks are tied to the model that produced them, so state from
+    /// another provider is stripped rather than replayed.
+    #[test]
+    fn foreign_reasoning_state_is_dropped() {
+        let message = Message::assistant_with_reasoning(
+            "answer",
+            Vec::new(),
+            vec![ReasoningState::new(
+                "openai",
+                serde_json::json!({"type": "reasoning", "id": "rs_1"}).to_string(),
+            )],
+        );
+        assert!(replayed_thinking_blocks(&message).is_empty());
+    }
+
     #[test]
     fn tool_choice_is_absent_without_tools() {
         assert!(tool_choice_payload(&ToolChoice::Auto, false, Some(false)).is_none());
+    }
+
+    fn snapshot(params: &Parameters) -> ParameterSnapshot {
+        ParameterSnapshot::from(params)
+    }
+
+    /// Anthropic's effort ladder, verbatim. `minimal` is absent from it.
+    #[test]
+    fn effort_maps_onto_the_anthropic_ladder() {
+        for (effort, expected) in [
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::XHigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+        ] {
+            let config =
+                build_output_config(&snapshot(&Parameters::default().reasoning_effort(effort)))
+                    .expect("effort supported by Claude")
+                    .expect("output config");
+            let value = serde_json::to_value(config).expect("serialize output config");
+            assert_eq!(value["effort"], expected);
+        }
+    }
+
+    #[test]
+    fn minimal_effort_is_rejected() {
+        let error = build_output_config(&snapshot(
+            &Parameters::default().reasoning_effort(ReasoningEffort::Minimal),
+        ))
+        .expect_err("Claude has no minimal effort");
+        assert!(error.to_string().contains("no 'minimal' level"));
+    }
+
+    /// `None` is a thinking mode on Claude, not an effort level, so it must
+    /// produce `thinking: {"type":"disabled"}` and no `output_config`.
+    #[test]
+    fn none_effort_disables_thinking_rather_than_setting_an_effort() {
+        let snap = snapshot(&Parameters::default().reasoning_effort(ReasoningEffort::None));
+
+        let thinking = build_thinking(&snap).expect("thinking payload");
+        let value = serde_json::to_value(thinking).expect("serialize thinking");
+        assert_eq!(value["type"], "disabled");
+
+        assert!(
+            build_output_config(&snap)
+                .expect("None is supported")
+                .is_none()
+        );
+    }
+
+    /// Adaptive is already the model's own mode, so the only reason to send a
+    /// thinking config is to ask for the text — otherwise stay off the wire.
+    #[test]
+    fn thinking_is_only_sent_when_the_caller_wants_the_text() {
+        assert!(build_thinking(&snapshot(&Parameters::default())).is_none());
+
+        let thinking = build_thinking(&snapshot(&Parameters::default().include_reasoning(true)))
+            .expect("thinking payload");
+        let value = serde_json::to_value(thinking).expect("serialize thinking");
+        assert_eq!(value["type"], "adaptive");
+        assert_eq!(value["display"], "summarized");
+    }
+
+    /// An effort without a request for the text means "think harder, don't show
+    /// me" — which is `display: "omitted"`, and also lets the server skip
+    /// streaming thinking tokens.
+    #[test]
+    fn effort_without_visible_text_asks_for_omitted_display() {
+        let thinking = build_thinking(&snapshot(
+            &Parameters::default().reasoning_effort(ReasoningEffort::High),
+        ))
+        .expect("thinking payload");
+        let value = serde_json::to_value(thinking).expect("serialize thinking");
+        assert_eq!(value["type"], "adaptive");
+        assert_eq!(value["display"], "omitted");
+    }
+
+    /// The deprecated manual mode must be unrepresentable, not merely unused:
+    /// it returns a 400 on every model after the 4.6 generation.
+    #[test]
+    fn thinking_never_serializes_a_token_budget() {
+        let thinking = build_thinking(&snapshot(&Parameters::default().include_reasoning(true)))
+            .expect("thinking payload");
+        let value = serde_json::to_value(thinking).expect("serialize thinking");
+        assert_ne!(value["type"], "enabled");
+        assert_eq!(value.get("budget_tokens"), None);
     }
 
     #[test]

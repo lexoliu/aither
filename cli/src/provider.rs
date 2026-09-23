@@ -131,10 +131,10 @@ impl std::str::FromStr for Provider {
 /// the detected provider cannot be constructed.
 pub fn auto_detect(model: Option<&str>, base_url: Option<&str>) -> Result<(CloudProvider, String)> {
     // Try to detect from model name
-    if let Some(model) = model {
-        if let Some(provider) = Provider::from_model(model) {
-            return Ok((provider.create(model, base_url)?, model.to_string()));
-        }
+    if let Some(model) = model
+        && let Some(provider) = Provider::from_model(model)
+    {
+        return Ok((provider.create(model, base_url)?, model.to_string()));
     }
 
     // Auto-detect from available API keys

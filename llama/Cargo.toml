@@ -29,5 +29,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
 
+# Pinned to force the matching sys version; nothing references it directly.
+[package.metadata.cargo-machete]
+ignored = ["llama-cpp-sys-2"]
+
 [lints]
 workspace = true

@@ -1,3 +1,4 @@
+use crate::error::GeminiError;
 use aither_core::llm::model::ReasoningEffort;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
@@ -265,12 +266,11 @@ impl Part {
     }
 
     fn collect_thoughts(&self, output: &mut Vec<String>) {
-        if self.is_thought() {
-            if let Some(text) = &self.text {
-                if !text.is_empty() {
-                    output.push(text.clone());
-                }
-            }
+        if self.is_thought()
+            && let Some(text) = &self.text
+            && !text.is_empty()
+        {
+            output.push(text.clone());
         }
     }
 
@@ -657,13 +657,29 @@ pub enum ThinkingLevel {
     High,
 }
 
-impl From<ReasoningEffort> for ThinkingLevel {
-    fn from(effort: ReasoningEffort) -> Self {
+impl TryFrom<ReasoningEffort> for ThinkingLevel {
+    type Error = GeminiError;
+
+    /// Maps the portable effort ladder onto Gemini's `thinkingLevel`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeminiError::Api`] for a level Gemini has no equivalent of.
+    /// Clamping `Max` down to `High` would quietly deliver less reasoning than
+    /// the caller paid for, so the mismatch is surfaced instead.
+    fn try_from(effort: ReasoningEffort) -> Result<Self, Self::Error> {
         match effort {
-            ReasoningEffort::Minimum => Self::Minimal,
-            ReasoningEffort::Low => Self::Low,
-            ReasoningEffort::Medium => Self::Medium,
-            ReasoningEffort::High => Self::High,
+            ReasoningEffort::Minimal => Ok(Self::Minimal),
+            ReasoningEffort::Low => Ok(Self::Low),
+            ReasoningEffort::Medium => Ok(Self::Medium),
+            ReasoningEffort::High => Ok(Self::High),
+            ReasoningEffort::None => Err(GeminiError::Api(
+                "Gemini has no 'none' thinking level; omit reasoning_effort, or use Minimal"
+                    .to_string(),
+            )),
+            other @ (ReasoningEffort::XHigh | ReasoningEffort::Max) => Err(GeminiError::Api(
+                format!("Gemini thinkingLevel tops out at High; {other:?} is not available"),
+            )),
         }
     }
 }

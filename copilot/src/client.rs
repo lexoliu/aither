@@ -762,6 +762,8 @@ fn accumulated_tool_call_events(tool_calls: HashMap<usize, ToolCallAccumulator>)
                 id,
                 name,
                 arguments,
+                // Chat Completions carries no reasoning signature to round-trip.
+                reasoning_state: None,
             }))
         })
         .collect()

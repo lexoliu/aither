@@ -1119,7 +1119,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut data = String::new();
         for i in 0..2000 {
-            data.push_str(&format!("line number {i} with some padding text\n"));
+            data.extend([format!("line number {i} with some padding text\n")]);
         }
         assert!(data.len() > INLINE_OUTPUT_LIMIT);
 

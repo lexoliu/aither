@@ -3,7 +3,7 @@
 //! All registered tools are always loaded into the LLM context.
 
 use aither_core::llm::tool::{
-    IntoToolResult, Tool, ToolDefinition, ToolResult, Tools as CoreTools,
+    IntoToolResult, RegisterError, Tool, ToolDefinition, ToolResult, Tools as CoreTools,
 };
 #[cfg(feature = "mcp")]
 use aither_mcp::{McpConnection, McpToolService};
@@ -62,6 +62,12 @@ impl AgentTools {
     ///
     /// This is used for child terminal tools in subagents where the concrete type
     /// is not known at compile time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
     pub fn register_dyn_terminal(&mut self, dyn_tool: aither_sandbox::DynTerminalTool) {
         use futures_core::Future;
         use std::pin::Pin;
@@ -79,7 +85,8 @@ impl AgentTools {
                     handler(&args).await.into_tool_result()
                 })
                 },
-            );
+            )
+            .expect("dynamic terminal tool registration must succeed: duplicate name or missing description");
         }
     }
 
@@ -219,8 +226,11 @@ mod tests {
 
         type Res = ToolResult;
 
-        async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
-            Ok(ToolResult::text("ok"))
+        fn call(
+            &self,
+            _args: Self::Arguments,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(ToolResult::text("ok")))
         }
     }
 

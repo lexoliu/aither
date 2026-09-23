@@ -8,6 +8,7 @@ use mime::Mime;
 use url::Url;
 
 use super::event::ToolCall;
+use super::reasoning::ReasoningState;
 
 /// A typed media attachment supplied with a user message.
 ///
@@ -124,6 +125,16 @@ pub enum Message {
             serde(default, skip_serializing_if = "Vec::is_empty")
         )]
         tool_calls: Vec<ToolCall>,
+        /// Opaque reasoning state produced with this turn.
+        ///
+        /// Replayed to the provider on the next request. Order is significant —
+        /// Anthropic rejects a turn whose thinking blocks were reordered or
+        /// partially dropped — so append rather than rebuild.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        reasoning: Vec<ReasoningState>,
     },
     /// System message with instructions/context.
     System {
@@ -202,6 +213,7 @@ impl Message {
         Self::Assistant {
             content: content.into(),
             tool_calls: Vec::new(),
+            reasoning: Vec::new(),
         }
     }
 
@@ -213,6 +225,35 @@ impl Message {
         Self::Assistant {
             content: content.into(),
             tool_calls,
+            reasoning: Vec::new(),
+        }
+    }
+
+    /// Creates an assistant message carrying the reasoning state of its turn.
+    ///
+    /// Use this when rebuilding a conversation for another request: without the
+    /// reasoning, providers that verify their own thinking see a turn that has
+    /// lost the reasoning behind its tool calls.
+    pub fn assistant_with_reasoning(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+        reasoning: Vec<ReasoningState>,
+    ) -> Self {
+        Self::Assistant {
+            content: content.into(),
+            tool_calls,
+            reasoning,
+        }
+    }
+
+    /// Reasoning state recorded on this message, if any.
+    ///
+    /// Only assistant turns carry reasoning; every other role returns empty.
+    #[must_use]
+    pub fn reasoning(&self) -> &[ReasoningState] {
+        match self {
+            Self::Assistant { reasoning, .. } => reasoning,
+            _ => &[],
         }
     }
 

@@ -261,7 +261,7 @@ const MIN_FOLD_LINES: usize = 4;
 /// Try to detect source code via magika and fold it with tree-sitter.
 ///
 /// Without the `code-folding` feature there is no content detector, so output
-/// is passed through uncompressed rather than mis-folded.
+/// is passed through uncompressed rather than folded incorrectly.
 #[cfg(not(feature = "code-folding"))]
 const fn try_fold_source_code(_text: &str) -> Option<FoldedCode> {
     None
@@ -377,11 +377,11 @@ fn collect_foldable_ranges(node: tree_sitter::Node, ranges: &mut Vec<(usize, usi
 fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for &(start, end) in ranges {
-        if let Some(last) = merged.last_mut() {
-            if start <= last.1 + 1 {
-                last.1 = last.1.max(end);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && start <= last.1 + 1
+        {
+            last.1 = last.1.max(end);
+            continue;
         }
         merged.push((start, end));
     }

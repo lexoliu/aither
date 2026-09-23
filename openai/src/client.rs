@@ -1,3 +1,4 @@
+use crate::PROVIDER_NAME;
 use crate::{
     DEEPSEEK_BASE_URL, DEFAULT_AUDIO_FORMAT, DEFAULT_AUDIO_MODEL, DEFAULT_AUDIO_VOICE,
     DEFAULT_BASE_URL, DEFAULT_EMBEDDING_DIM, DEFAULT_EMBEDDING_MODEL, DEFAULT_IMAGE_MODEL,
@@ -16,7 +17,7 @@ use crate::{
 use aither_core::{
     LanguageModel,
     llm::{
-        Event, LLMRequest, ToolCall, Usage,
+        Event, LLMRequest, ReasoningState, ToolCall, Usage,
         model::{Ability, Profile as ModelProfile, ToolChoice},
         oneshot,
     },
@@ -694,15 +695,14 @@ fn chat_completions_stream_inner(
                     tracing::debug!(sse_event = %data, "Received SSE event");
 
                     // Check for API error response
-                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(error) = error_obj.get("error") {
+                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data)
+                        && let Some(error) = error_obj.get("error") {
                             let msg = error.get("message")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("Unknown API error");
                             yield Err(OpenAIError::Api(msg.to_string()));
                             return;
                         }
-                    }
 
                     match serde_json::from_str::<ChatCompletionChunk>(data) {
                         Ok(chunk) => {
@@ -712,26 +712,22 @@ fn chat_completions_stream_inner(
                             // Emit text events
                             for choice in &chunk.choices {
                                 // Check for malformed function call
-                                if let Some(ref reason) = choice.finish_reason {
-                                    if reason.contains("malformed_function_call") {
+                                if let Some(ref reason) = choice.finish_reason
+                                    && reason.contains("malformed_function_call") {
                                         yield Err(OpenAIError::Api("malformed function call".to_string()));
                                         return;
                                     }
-                                }
 
-                                if let Some(content) = &choice.delta.content {
-                                    if !content.is_empty() {
+                                if let Some(content) = &choice.delta.content
+                                    && !content.is_empty() {
                                         yield Ok(Event::Text(content.clone()));
                                     }
-                                }
                                 // Emit reasoning if enabled
-                                if include_reasoning {
-                                    if let Some(reasoning) = &choice.delta.reasoning_content {
-                                        if !reasoning.is_empty() {
+                                if include_reasoning
+                                    && let Some(reasoning) = &choice.delta.reasoning_content
+                                        && !reasoning.is_empty() {
                                             yield Ok(Event::Reasoning(reasoning.clone()));
                                         }
-                                    }
-                                }
                                 // Accumulate tool calls and emit deltas
                                 if let Some(calls) = &choice.delta.tool_calls {
                                     for call in calls {
@@ -789,6 +785,7 @@ fn chat_completions_stream_inner(
                     id,
                     name,
                     arguments,
+                    reasoning_state: None,
                 }));
             }
         }
@@ -906,6 +903,7 @@ fn mark_and_emit_done_function_call(
         id: resolved_call_id,
         name,
         arguments: parse_tool_call_arguments(arguments),
+        reasoning_state: None,
     }
 }
 
@@ -926,6 +924,7 @@ fn drain_pending_function_calls(
                 id: call_id,
                 name,
                 arguments: parse_tool_call_arguments(&acc.arguments),
+                reasoning_state: None,
             })
         })
         .collect()
@@ -1108,8 +1107,8 @@ fn responses_stream_inner(
                     tracing::trace!(sse_event = %data, "Received Responses API SSE event");
 
                     // Check for API error response
-                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(error) = error_obj.get("error") {
+                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data)
+                        && let Some(error) = error_obj.get("error") {
                             let msg = error.get("message")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("Unknown API error");
@@ -1122,7 +1121,6 @@ fn responses_stream_inner(
                             }
                             return;
                         }
-                    }
 
                     match serde_json::from_str::<ResponsesStreamEvent>(data) {
                         Ok(stream_event) => {
@@ -1193,6 +1191,23 @@ fn responses_stream_inner(
                                             &arguments,
                                         );
                                         yield Ok(Event::ToolCall(tool_call));
+                                    } else if let ResponsesOutputItem::Reasoning {
+                                        id, encrypted_content, ..
+                                    } = item
+                                    {
+                                        // Only encrypted reasoning is replayable;
+                                        // a summary alone cannot be verified.
+                                        if let Some(encrypted) = encrypted_content {
+                                            let payload = serde_json::json!({
+                                                "type": "reasoning",
+                                                "id": id,
+                                                "encrypted_content": encrypted,
+                                            });
+                                            yield Ok(Event::ReasoningState(ReasoningState::new(
+                                                PROVIDER_NAME,
+                                                payload.to_string(),
+                                            )));
+                                        }
                                     }
                                 }
                                 ResponsesStreamEvent::ResponseCompleted { response } => {

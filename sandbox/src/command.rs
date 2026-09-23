@@ -611,10 +611,10 @@ fn detect_positional_args(schema: &Value) -> Vec<String> {
         .into_iter()
         .filter(|name| {
             // Exclude array-typed fields -- they require repeated --flag syntax
-            if let Some(props) = properties {
-                if let Some(prop_schema) = props.get(name) {
-                    return get_instance_type(prop_schema, prop_schema) != Some("array");
-                }
+            if let Some(props) = properties
+                && let Some(prop_schema) = props.get(name)
+            {
+                return get_instance_type(prop_schema, prop_schema) != Some("array");
             }
             true
         })
@@ -705,17 +705,15 @@ impl ToolRegistry {
 ///
 /// The `tool_name` comes from the IPC method name, and args are flattened
 /// from the key-value pairs sent by `heel ipc`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ToolCallCommand {
     /// Shared tool registry.
-    #[serde(skip)]
     pub registry: Arc<ToolRegistry>,
-    /// Name of the tool to invoke (from IPC method name, not serialized).
-    #[serde(skip)]
+    /// Name of the tool this instance invokes.
+    ///
+    /// One instance is registered per tool, so the name is fixed at
+    /// construction rather than set per request.
     pub tool_name: String,
-    /// Tool arguments as key-value pairs (flattened from IPC params).
-    #[serde(flatten)]
-    pub args: std::collections::HashMap<String, Value>,
 }
 
 impl ToolCallCommand {
@@ -725,13 +723,7 @@ impl ToolCallCommand {
         Self {
             registry,
             tool_name: tool_name.into(),
-            args: std::collections::HashMap::new(),
         }
-    }
-
-    /// Convert args `HashMap` to CLI-style Vec<String> for the handler.
-    fn args_to_cli(&self) -> Vec<String> {
-        flatten_args_to_cli(&self.args)
     }
 }
 
@@ -797,10 +789,11 @@ fn flatten_named_arg_to_cli(cli_args: &mut Vec<String>, key: &str, value: &Value
 }
 
 impl IpcCommand for ToolCallCommand {
+    type Args = std::collections::HashMap<String, Value>;
     type Response = CommandEnvelope;
 
-    fn name(&self) -> String {
-        self.tool_name.clone()
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Owned(self.tool_name.clone())
     }
 
     fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
@@ -818,19 +811,8 @@ impl IpcCommand for ToolCallCommand {
             .map(Cow::Owned)
     }
 
-    fn set_method_name(&mut self, name: &str) {
-        self.tool_name = name.to_string();
-    }
-
-    fn apply_args(&mut self, params: &[u8]) -> Result<(), heel::rmp_serde::decode::Error> {
-        // Params are a flattened HashMap that maps directly to args.
-        // tool_name is set via set_method_name and preserved here.
-        self.args = heel::rmp_serde::from_slice(params)?;
-        Ok(())
-    }
-
-    async fn handle(&mut self) -> CommandEnvelope {
-        let cli_args = self.args_to_cli();
+    async fn handle(&self, args: Self::Args) -> CommandEnvelope {
+        let cli_args = flatten_args_to_cli(&args);
         tracing::info!(tool = %self.tool_name, args = ?cli_args, "ToolCallCommand::handle invoked");
 
         // Handle help flags
@@ -873,40 +855,28 @@ pub fn register_tool_command(
     router.register(ToolCallCommand::new(tool_name, registry))
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct IpcGatewayCommand {
-    #[serde(skip)]
     pub registry: Arc<ToolRegistry>,
-    #[serde(flatten)]
-    pub args: std::collections::HashMap<String, Value>,
 }
 
 impl IpcGatewayCommand {
     #[must_use]
-    pub fn new(registry: Arc<ToolRegistry>) -> Self {
-        Self {
-            registry,
-            args: std::collections::HashMap::new(),
-        }
+    pub const fn new(registry: Arc<ToolRegistry>) -> Self {
+        Self { registry }
     }
 }
 
 impl IpcCommand for IpcGatewayCommand {
+    type Args = std::collections::HashMap<String, Value>;
     type Response = CommandEnvelope;
 
-    fn name(&self) -> String {
-        "ipc".to_string()
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("ipc")
     }
 
-    fn set_method_name(&mut self, _name: &str) {}
-
-    fn apply_args(&mut self, params: &[u8]) -> Result<(), heel::rmp_serde::decode::Error> {
-        self.args = heel::rmp_serde::from_slice(params)?;
-        Ok(())
-    }
-
-    async fn handle(&mut self) -> CommandEnvelope {
-        let cli_args = flatten_args_to_cli(&self.args);
+    async fn handle(&self, args: Self::Args) -> CommandEnvelope {
+        let cli_args = flatten_args_to_cli(&args);
         if cli_args.is_empty() {
             return CommandEnvelope::failure("usage: ipc <tool> [args ...]");
         }
@@ -1012,8 +982,6 @@ pub struct IpcToolCommand<T: Tool> {
     positional_args: Vec<String>,
     stdin_arg: Option<String>,
     help: String,
-    /// Arguments received from IPC call.
-    args: HashMap<String, Value>,
 }
 
 impl<T: Tool + std::fmt::Debug> std::fmt::Debug for IpcToolCommand<T> {
@@ -1034,7 +1002,6 @@ impl<T: Tool + Clone> Clone for IpcToolCommand<T> {
             positional_args: self.positional_args.clone(),
             stdin_arg: self.stdin_arg.clone(),
             help: self.help.clone(),
-            args: HashMap::new(),
         }
     }
 }
@@ -1063,12 +1030,7 @@ where
             positional_args,
             stdin_arg,
             help,
-            args: HashMap::new(),
         }
-    }
-
-    fn args_to_cli(&self) -> Vec<String> {
-        flatten_args_to_cli(&self.args)
     }
 }
 
@@ -1077,10 +1039,11 @@ where
     T: Tool + Clone + Send + Sync + 'static,
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
+    type Args = HashMap<String, Value>;
     type Response = CommandEnvelope;
 
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Owned(self.name.clone())
     }
 
     fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
@@ -1100,18 +1063,8 @@ where
         self.stdin_arg.clone().map(Cow::Owned)
     }
 
-    fn set_method_name(&mut self, name: &str) {
-        self.name = name.to_string();
-    }
-
-    fn apply_args(&mut self, params: &[u8]) -> Result<(), heel::rmp_serde::decode::Error> {
-        // Only update args, preserve the tool instance with its state
-        self.args = heel::rmp_serde::from_slice(params)?;
-        Ok(())
-    }
-
-    async fn handle(&mut self) -> CommandEnvelope {
-        let cli_args = self.args_to_cli();
+    async fn handle(&self, args: Self::Args) -> CommandEnvelope {
+        let cli_args = flatten_args_to_cli(&args);
 
         // Handle help flags
         if has_help_flag(&cli_args) {
@@ -1152,18 +1105,6 @@ where
             },
             Err(e) => CommandEnvelope::failure(e.to_string()),
         }
-    }
-}
-
-impl<T> Serialize for IpcToolCommand<T>
-where
-    T: Tool,
-{
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.args.serialize(serializer)
     }
 }
 
@@ -1218,22 +1159,21 @@ pub fn cli_to_json(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
 /// Finds the serde tag field name from schema extensions.
 fn find_serde_tag(schema: &Value) -> Option<String> {
     // Check for discriminator property (OpenAPI style)
-    if let Some(disc) = schema.get("discriminator") {
-        if let Some(prop) = disc.get("propertyName").and_then(Value::as_str) {
-            return Some(prop.to_string());
-        }
+    if let Some(disc) = schema.get("discriminator")
+        && let Some(prop) = disc.get("propertyName").and_then(Value::as_str)
+    {
+        return Some(prop.to_string());
     }
 
     // Check oneOf variants for common const field (serde tag pattern)
-    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
-        if let Some(first) = variants.first() {
-            if let Some(props) = first.get("properties").and_then(Value::as_object) {
-                for (name, prop) in props {
-                    // If this property has a const value, it's likely the tag
-                    if prop.get("const").is_some() || prop.get("enum").is_some() {
-                        return Some(name.clone());
-                    }
-                }
+    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array)
+        && let Some(first) = variants.first()
+        && let Some(props) = first.get("properties").and_then(Value::as_object)
+    {
+        for (name, prop) in props {
+            // If this property has a const value, it's likely the tag
+            if prop.get("const").is_some() || prop.get("enum").is_some() {
+                return Some(name.clone());
             }
         }
     }
@@ -1267,20 +1207,20 @@ fn parse_tagged_enum(
 
     // Find matching variant
     for variant in variants {
-        if let Some(name) = get_variant_name(variant, tag) {
-            if name.eq_ignore_ascii_case(subcommand) {
-                let mut variant_schema = variant.clone();
-                remove_required_field(&mut variant_schema, tag);
-                // Parse the variant's fields
-                let mut result = parse_object(root_schema, &variant_schema, remaining)?;
+        if let Some(name) = get_variant_name(variant, tag)
+            && name.eq_ignore_ascii_case(subcommand)
+        {
+            let mut variant_schema = variant.clone();
+            remove_required_field(&mut variant_schema, tag);
+            // Parse the variant's fields
+            let mut result = parse_object(root_schema, &variant_schema, remaining)?;
 
-                // Add the tag field
-                if let Value::Object(ref mut map) = result {
-                    map.insert(tag.to_string(), Value::String(name));
-                }
-
-                return Ok(result);
+            // Add the tag field
+            if let Value::Object(ref mut map) = result {
+                map.insert(tag.to_string(), Value::String(name));
             }
+
+            return Ok(result);
         }
     }
 
@@ -1304,17 +1244,17 @@ fn remove_required_field(schema: &mut Value, field: &str) {
 /// Gets the variant name from a schema object.
 fn get_variant_name(schema: &Value, tag: &str) -> Option<String> {
     // Look for const value in tag property
-    if let Some(props) = schema.get("properties").and_then(Value::as_object) {
-        if let Some(prop) = props.get(tag) {
-            if let Some(const_val) = prop.get("const").and_then(Value::as_str) {
-                return Some(const_val.to_string());
-            }
-            // Also check enum with single value
-            if let Some(enum_vals) = prop.get("enum").and_then(Value::as_array) {
-                if enum_vals.len() == 1 {
-                    return enum_vals[0].as_str().map(String::from);
-                }
-            }
+    if let Some(props) = schema.get("properties").and_then(Value::as_object)
+        && let Some(prop) = props.get(tag)
+    {
+        if let Some(const_val) = prop.get("const").and_then(Value::as_str) {
+            return Some(const_val.to_string());
+        }
+        // Also check enum with single value
+        if let Some(enum_vals) = prop.get("enum").and_then(Value::as_array)
+            && enum_vals.len() == 1
+        {
+            return enum_vals[0].as_str().map(String::from);
         }
     }
 
@@ -1737,10 +1677,10 @@ fn get_instance_type<'a>(root_schema: &'a Value, schema: &'a Value) -> Option<&'
         Some(Value::Array(types)) => {
             // Find the non-null type
             for t in types {
-                if let Some(s) = t.as_str() {
-                    if s != "null" {
-                        return Some(s);
-                    }
+                if let Some(s) = t.as_str()
+                    && s != "null"
+                {
+                    return Some(s);
                 }
             }
             None
@@ -1754,10 +1694,10 @@ fn get_instance_type<'a>(root_schema: &'a Value, schema: &'a Value) -> Option<&'
                 .and_then(Value::as_array)?;
 
             for variant in variants {
-                if let Some(t) = variant.get("type").and_then(Value::as_str) {
-                    if t != "null" {
-                        return Some(t);
-                    }
+                if let Some(t) = variant.get("type").and_then(Value::as_str)
+                    && t != "null"
+                {
+                    return Some(t);
                 }
             }
             None
@@ -1836,25 +1776,25 @@ pub fn schema_to_help(schema: &Value) -> String {
     help.push_str("\nUsage:\n");
 
     // Check for tagged enum (subcommands)
-    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
-        if let Some(tag) = find_serde_tag(schema) {
-            help.push_str("  <subcommand> [options]\n\n");
-            help.push_str("Subcommands:\n");
+    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array)
+        && let Some(tag) = find_serde_tag(schema)
+    {
+        help.push_str("  <subcommand> [options]\n\n");
+        help.push_str("Subcommands:\n");
 
-            for variant in variants {
-                if let Some(name) = get_variant_name(variant, &tag) {
-                    help.push_str("  ");
-                    help.push_str(name.as_str());
-                    if let Some(desc) = variant.get("description").and_then(Value::as_str) {
-                        help.push_str(" - ");
-                        help.push_str(desc);
-                    }
-                    help.push('\n');
+        for variant in variants {
+            if let Some(name) = get_variant_name(variant, &tag) {
+                help.push_str("  ");
+                help.push_str(name.as_str());
+                if let Some(desc) = variant.get("description").and_then(Value::as_str) {
+                    help.push_str(" - ");
+                    help.push_str(desc);
                 }
+                help.push('\n');
             }
-            help.push_str("\nOptions:\n  -h, --help  Show help\n");
-            return help;
         }
+        help.push_str("\nOptions:\n  -h, --help  Show help\n");
+        return help;
     }
 
     // Simple object
@@ -2152,7 +2092,7 @@ mod tests {
         let schema = schemars::schema_for!(SimpleArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
-        // Typo in flag name
+        // Typo in flag name -- deliberate, it is what the suggestion is for.
         let err = cli_to_json(&schema, &["--paht".to_string(), "foo.txt".to_string()]).unwrap_err();
         assert!(err.to_string().contains("Did you mean --path?"));
     }
@@ -2176,16 +2116,16 @@ mod tests {
         let json = r#"{"query": "rust async", "max": 5}"#;
         let tmp = tempfile::tempdir().unwrap();
         let registry = ToolRegistryBuilder::new().build(tmp.path());
-        let mut cmd = ToolCallCommand::new("websearch", Arc::new(registry));
-        cmd.args = serde_json::from_str(json).unwrap();
+        let cmd = ToolCallCommand::new("websearch", Arc::new(registry));
+        let args: std::collections::HashMap<String, Value> = serde_json::from_str(json).unwrap();
 
-        // tool_name is not in JSON (skipped), args are flattened
-        assert_eq!(cmd.args.len(), 2);
-        assert_eq!(cmd.args.get("query").unwrap(), "rust async");
-        assert_eq!(cmd.args.get("max").unwrap(), 5);
+        // the tool name rides on the command, the wire carries only arguments
+        assert_eq!(cmd.name(), "websearch");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args.get("query").unwrap(), "rust async");
+        assert_eq!(args.get("max").unwrap(), 5);
 
-        // Test args_to_cli conversion
-        let cli_args = cmd.args_to_cli();
+        let cli_args = flatten_args_to_cli(&args);
         assert!(cli_args.contains(&"--query".to_string()));
         assert!(cli_args.contains(&"rust async".to_string()));
     }
@@ -2468,14 +2408,15 @@ mod tests {
     fn test_tool_call_command_args_to_cli_with_array() {
         let tmp = tempfile::tempdir().unwrap();
         let registry = ToolRegistryBuilder::new().build(tmp.path());
-        let mut cmd = ToolCallCommand::new("ask_user", Arc::new(registry));
-        cmd.args = serde_json::from_value(serde_json::json!({
-            "question": "Pick one",
-            "options": ["A", "B", "C"]
-        }))
-        .unwrap();
+        let _cmd = ToolCallCommand::new("ask_user", Arc::new(registry));
+        let args: std::collections::HashMap<String, Value> =
+            serde_json::from_value(serde_json::json!({
+                "question": "Pick one",
+                "options": ["A", "B", "C"]
+            }))
+            .unwrap();
 
-        let cli = cmd.args_to_cli();
+        let cli = flatten_args_to_cli(&args);
         // Should produce repeated --options flags
         let options_count = cli.iter().filter(|a| *a == "--options").count();
         assert_eq!(options_count, 3, "expected 3 --options flags, got: {cli:?}");
@@ -2488,14 +2429,15 @@ mod tests {
     fn test_tool_call_command_raw_args_passthrough() {
         let tmp = tempfile::tempdir().unwrap();
         let registry = ToolRegistryBuilder::new().build(tmp.path());
-        let mut cmd = ToolCallCommand::new("ask_user", Arc::new(registry));
+        let _cmd = ToolCallCommand::new("ask_user", Arc::new(registry));
         // Simulates what `heel ipc` sends
-        cmd.args = serde_json::from_value(serde_json::json!({
-            "args": ["--question", "Pick one", "--options", "A", "--options", "B"]
-        }))
-        .unwrap();
+        let args: std::collections::HashMap<String, Value> =
+            serde_json::from_value(serde_json::json!({
+                "args": ["--question", "Pick one", "--options", "A", "--options", "B"]
+            }))
+            .unwrap();
 
-        let cli = cmd.args_to_cli();
+        let cli = flatten_args_to_cli(&args);
         assert_eq!(
             cli,
             vec!["--question", "Pick one", "--options", "A", "--options", "B"]
@@ -2585,14 +2527,18 @@ mod tests {
             type Arguments = AskUserArgs;
             type Res = ToolResult;
 
-            async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+            fn call(
+                &self,
+                args: Self::Arguments,
+            ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send
+            {
                 // Return the parsed args as JSON so we can inspect
-                ToolResult::json(&serde_json::json!({
+                std::future::ready(ToolResult::json(&serde_json::json!({
                     "question": args.question,
                     "option": args.option,
                     "multi_select": args.multi_select,
                     "questions": args.questions,
-                }))
+                })))
             }
         }
 
@@ -2602,8 +2548,8 @@ mod tests {
         let registry = std::sync::Arc::new(builder.build(tmp.path()));
 
         // Simulate what `heel ipc` sends: all args in an "args" array
-        let mut cmd = ToolCallCommand::new("ask_user", registry);
-        cmd.args = serde_json::from_value(serde_json::json!({
+        let cmd = ToolCallCommand::new("ask_user", registry);
+        let args = serde_json::from_value(serde_json::json!({
             "args": [
                 "--", "--question", "你喜欢哪种薯条？",
                 "--option", "原味", "--option", "番茄味", "--option", "芝士味"
@@ -2611,7 +2557,7 @@ mod tests {
         }))
         .unwrap();
 
-        let result = cmd.handle().await;
+        let result = cmd.handle(args).await;
         tracing::debug!("result: {}", serde_json::to_string_pretty(&result).unwrap());
         assert!(result.ok, "command should succeed: {result:?}");
 

@@ -112,8 +112,12 @@ impl InteractivePermissionHandler {
 }
 
 impl PermissionHandler for InteractivePermissionHandler {
-    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
-        match mode {
+    fn check(
+        &self,
+        mode: TerminalMode,
+        script: &str,
+    ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
+        std::future::ready(match mode {
             TerminalMode::Sandboxed => Ok(true), // Always allow
             TerminalMode::Unsafe => {
                 // Display script and ask for permission (show full script, no truncation)
@@ -134,10 +138,29 @@ impl PermissionHandler for InteractivePermissionHandler {
                     Err(PermissionError::Denied("user declined".to_string()))
                 }
             }
-        }
+        })
     }
 
-    async fn check_domain(&self, domain: &str, _port: u16) -> bool {
+    fn check_domain(
+        &self,
+        domain: &str,
+        _port: u16,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        std::future::ready(self.prompt_for_domain(domain))
+    }
+
+    fn will_wait_for_approval(
+        &self,
+        _mode: TerminalMode,
+        _script: &str,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        std::future::ready(true)
+    }
+}
+
+impl InteractivePermissionHandler {
+    /// Prompts once per new domain, remembering the answer.
+    fn prompt_for_domain(&self, domain: &str) -> bool {
         // Check default whitelist
         if DEFAULT_DOMAIN_WHITELIST.contains(&domain) {
             return true;
@@ -172,10 +195,10 @@ impl PermissionHandler for InteractivePermissionHandler {
 
 /// Expand ~ to home directory in a path.
 fn expand_tilde(path: &std::path::Path) -> PathBuf {
-    if let Ok(stripped) = path.strip_prefix("~") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
-        }
+    if let Ok(stripped) = path.strip_prefix("~")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped);
     }
     path.to_path_buf()
 }
@@ -436,14 +459,15 @@ async fn acp_session_agent(
             .await
             .map_err(|err| to_acp(err.into()))?;
 
-    TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
+    let agent = TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
         .tool(aither_agent::websearch::WebSearchTool::default())
         .tool(aither_agent::webfetch::WebFetchTool::new())
         .tool(aither_agent::TodoTool::new())
         .tool(aither_agent::sandbox::builtin::AskCommand::new(cloud))
         .with_default_prompt()
-        .build()
-        .map_err(|err| to_acp(anyhow::anyhow!("{err}")))
+        .build();
+
+    Ok(agent)
 }
 
 async fn build_agent(

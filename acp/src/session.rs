@@ -121,10 +121,16 @@ impl<LLM: LanguageModel> AcpSession<LLM> {
                     }));
                 }
                 AgentEvent::ToolCallEnd { id, result, .. } => {
-                    let (status, text) = match result {
-                        Ok(output) => (ToolCallStatus::Completed, output),
-                        Err(err) => (ToolCallStatus::Error, err),
+                    // The agent reports a typed ToolResult; ACP wants a status
+                    // and the text a reader should see.
+                    let status = if result.is_error() {
+                        ToolCallStatus::Error
+                    } else {
+                        ToolCallStatus::Completed
                     };
+                    let text = result
+                        .render_for_model()
+                        .unwrap_or_else(|error| error.to_string());
                     on_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                         tool_call_id: id,
                         status: Some(status),

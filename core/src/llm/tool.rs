@@ -1014,10 +1014,10 @@ fn clean_schema(value: &mut Value) {
 
 /// Extracts `$defs` or `definitions` from the root schema.
 fn extract_defs(value: &Value) -> serde_json::Map<String, Value> {
-    if let Value::Object(map) = value {
-        if let Some(Value::Object(defs)) = map.get("$defs").or_else(|| map.get("definitions")) {
-            return defs.clone();
-        }
+    if let Value::Object(map) = value
+        && let Some(Value::Object(defs)) = map.get("$defs").or_else(|| map.get("definitions"))
+    {
+        return defs.clone();
     }
     serde_json::Map::new()
 }
@@ -1038,18 +1038,18 @@ fn resolve_and_clean_inner(
     match value {
         Value::Object(map) => {
             // Handle $ref - inline the referenced definition, preserving sibling properties
-            if let Some(Value::String(ref_path)) = map.remove("$ref") {
-                if let Some(Value::Object(resolved_map)) = resolve_ref(&ref_path, defs) {
-                    // Merge resolved definition with any existing properties (like description)
-                    // Resolved definition takes precedence for conflicts except description
-                    let existing_description = map.remove("description");
-                    for (k, v) in resolved_map {
-                        map.entry(k).or_insert(v);
-                    }
-                    // Preserve the field-level description if it exists
-                    if let Some(desc) = existing_description {
-                        map.insert("description".to_string(), desc);
-                    }
+            if let Some(Value::String(ref_path)) = map.remove("$ref")
+                && let Some(Value::Object(resolved_map)) = resolve_ref(&ref_path, defs)
+            {
+                // Merge resolved definition with any existing properties (like description)
+                // Resolved definition takes precedence for conflicts except description
+                let existing_description = map.remove("description");
+                for (k, v) in resolved_map {
+                    map.entry(k).or_insert(v);
+                }
+                // Preserve the field-level description if it exists
+                if let Some(desc) = existing_description {
+                    map.insert("description".to_string(), desc);
                 }
             }
 
@@ -1079,10 +1079,10 @@ fn resolve_and_clean_inner(
 
                     for variant in &variants {
                         if let Value::Object(vm) = variant {
-                            if let Some(const_val) = vm.get("const") {
-                                if !enum_values.contains(const_val) {
-                                    enum_values.push(const_val.clone());
-                                }
+                            if let Some(const_val) = vm.get("const")
+                                && !enum_values.contains(const_val)
+                            {
+                                enum_values.push(const_val.clone());
                             }
                             if let Some(Value::Array(arr)) = vm.get("enum") {
                                 for val in arr {
@@ -1091,10 +1091,10 @@ fn resolve_and_clean_inner(
                                     }
                                 }
                             }
-                            if variant_type.is_none() {
-                                if let Some(Value::String(t)) = vm.get("type") {
-                                    variant_type = Some(t.clone());
-                                }
+                            if variant_type.is_none()
+                                && let Some(Value::String(t)) = vm.get("type")
+                            {
+                                variant_type = Some(t.clone());
                             }
                         }
                     }
@@ -1110,53 +1110,50 @@ fn resolve_and_clean_inner(
                     let mut all_properties = serde_json::Map::new();
 
                     for variant in variants {
-                        if let Value::Object(variant_map) = variant {
-                            if let Some(Value::Object(props)) = variant_map.get("properties") {
-                                for (key, val) in props {
-                                    // Extract enum value - handle both "enum" and "const"
-                                    let new_values: Option<alloc::vec::Vec<Value>> =
-                                        if let Value::Object(val_obj) = val {
-                                            if let Some(Value::Array(arr)) = val_obj.get("enum") {
-                                                Some(arr.clone())
-                                            } else {
-                                                val_obj
-                                                    .get("const")
-                                                    .map(|const_val| alloc::vec![const_val.clone()])
-                                            }
+                        if let Value::Object(variant_map) = variant
+                            && let Some(Value::Object(props)) = variant_map.get("properties")
+                        {
+                            for (key, val) in props {
+                                // Extract enum value - handle both "enum" and "const"
+                                let new_values: Option<alloc::vec::Vec<Value>> =
+                                    if let Value::Object(val_obj) = val {
+                                        if let Some(Value::Array(arr)) = val_obj.get("enum") {
+                                            Some(arr.clone())
                                         } else {
-                                            None
-                                        };
-
-                                    if all_properties.contains_key(key) {
-                                        // Merge enum/const values into existing
-                                        if let Some(values) = new_values {
-                                            if let Some(Value::Object(existing_obj)) =
-                                                all_properties.get_mut(key)
-                                            {
-                                                if let Some(Value::Array(existing_enum)) =
-                                                    existing_obj.get_mut("enum")
-                                                {
-                                                    for e in values {
-                                                        if !existing_enum.contains(&e) {
-                                                            existing_enum.push(e);
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                            val_obj
+                                                .get("const")
+                                                .map(|const_val| alloc::vec![const_val.clone()])
                                         }
                                     } else {
-                                        // First time seeing this property - convert const to enum
-                                        let mut val_clone = val.clone();
-                                        if let Value::Object(obj) = &mut val_clone {
-                                            if let Some(const_val) = obj.remove("const") {
-                                                obj.insert(
-                                                    "enum".to_string(),
-                                                    Value::Array(alloc::vec![const_val]),
-                                                );
+                                        None
+                                    };
+
+                                if all_properties.contains_key(key) {
+                                    // Merge enum/const values into existing
+                                    if let Some(values) = new_values
+                                        && let Some(Value::Object(existing_obj)) =
+                                            all_properties.get_mut(key)
+                                        && let Some(Value::Array(existing_enum)) =
+                                            existing_obj.get_mut("enum")
+                                    {
+                                        for e in values {
+                                            if !existing_enum.contains(&e) {
+                                                existing_enum.push(e);
                                             }
                                         }
-                                        all_properties.insert(key.clone(), val_clone);
                                     }
+                                } else {
+                                    // First time seeing this property - convert const to enum
+                                    let mut val_clone = val.clone();
+                                    if let Value::Object(obj) = &mut val_clone
+                                        && let Some(const_val) = obj.remove("const")
+                                    {
+                                        obj.insert(
+                                            "enum".to_string(),
+                                            Value::Array(alloc::vec![const_val]),
+                                        );
+                                    }
+                                    all_properties.insert(key.clone(), val_clone);
                                 }
                             }
                         }

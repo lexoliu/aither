@@ -28,8 +28,6 @@ quick-xml = { version = "0.41", features = ["serialize"] }
 tracing = "0.1"
 async-fs = "2"
 async-channel = "2"
-crossbeam-skiplist = "0.1"
-dashmap = "6"
 arc-swap = "1"
 event-listener = "5"
 aither-websearch = { workspace = true, optional = true }
@@ -42,7 +40,6 @@ async-stream = "0.3.6"
 futures = "0.3"
 futures-core = "0.3.34"
 futures-lite = "2.6"
-url = "2"
 sha2 = "0.10"
 similar = "2"
 uuid = { version = "1", features = ["v4"] }

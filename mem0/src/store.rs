@@ -165,15 +165,15 @@ impl MemoryStore for InMemoryStore {
         let mut scored_memories: Vec<SearchResult> = memories
             .iter()
             .filter(|m| {
-                if let Some(uid) = &filters.user_id {
-                    if m.user_id.as_ref() != Some(uid) {
-                        return false;
-                    }
+                if let Some(uid) = &filters.user_id
+                    && m.user_id.as_ref() != Some(uid)
+                {
+                    return false;
                 }
-                if let Some(aid) = &filters.agent_id {
-                    if m.agent_id.as_ref() != Some(aid) {
-                        return false;
-                    }
+                if let Some(aid) = &filters.agent_id
+                    && m.agent_id.as_ref() != Some(aid)
+                {
+                    return false;
                 }
                 true
             })

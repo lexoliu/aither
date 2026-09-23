@@ -12,7 +12,10 @@ use aither_core::llm::ToolResult;
 pub struct DebugHook;
 
 impl Hook for DebugHook {
-    async fn pre_tool_use(&self, ctx: &ToolUseContext<'_>) -> PreToolAction {
+    fn pre_tool_use(
+        &self,
+        ctx: &ToolUseContext<'_>,
+    ) -> impl std::future::Future<Output = PreToolAction> + Send {
         // Terminal is the primary tool; show the command directly.
         if ctx.tool_name == "terminal" {
             if let Some((script, mode)) = parse_terminal_args(ctx.arguments) {
@@ -31,21 +34,24 @@ impl Hook for DebugHook {
                 "\x1b[36m[tool]\x1b[0m {} \x1b[90m(turn {})\x1b[0m",
                 ctx.tool_name, ctx.turn
             );
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ctx.arguments) {
-                if let Ok(pretty) = serde_json::to_string_pretty(&parsed) {
-                    for line in pretty.lines() {
-                        println!("  \x1b[90m{line}\x1b[0m");
-                    }
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ctx.arguments)
+                && let Ok(pretty) = serde_json::to_string_pretty(&parsed)
+            {
+                for line in pretty.lines() {
+                    println!("  \x1b[90m{line}\x1b[0m");
                 }
             }
         }
 
         // Permission is handled by TerminalTool's InteractivePermissionHandler
         // No need to check here - would cause duplicate prompts
-        PreToolAction::Allow
+        std::future::ready(PreToolAction::Allow)
     }
 
-    async fn post_tool_use(&self, ctx: &ToolResultContext<'_>) -> PostToolAction {
+    fn post_tool_use(
+        &self,
+        ctx: &ToolResultContext<'_>,
+    ) -> impl std::future::Future<Output = PostToolAction> + Send {
         let duration_ms = ctx.duration.as_millis();
 
         if ctx.tool_name == "terminal" {
@@ -90,15 +96,18 @@ impl Hook for DebugHook {
             }
         }
 
-        PostToolAction::Keep
+        std::future::ready(PostToolAction::Keep)
     }
 
-    async fn on_stop(&self, ctx: &StopContext<'_>) -> Option<String> {
+    fn on_stop(
+        &self,
+        ctx: &StopContext<'_>,
+    ) -> impl std::future::Future<Output = Option<String>> + Send {
         println!(
             "\n\x1b[90m[completed in {} turn(s), reason: {:?}]\x1b[0m",
             ctx.turns, ctx.reason
         );
-        None
+        std::future::ready(None)
     }
 }
 
@@ -156,7 +165,6 @@ fn parse_terminal_result(result: &str) -> Option<TerminalOutput> {
     let exit_code = parsed
         .get("exit_code")
         .and_then(serde_json::Value::as_i64)
-        .and_then(|code| i32::try_from(code).ok())
         .unwrap_or(0);
     let task_id = parsed
         .get("task_id")
@@ -179,11 +187,11 @@ fn parse_terminal_result(result: &str) -> Option<TerminalOutput> {
 /// Print terminal output in human-friendly format.
 fn print_terminal_output(output: &TerminalOutput, duration_ms: u128) {
     // Background task
-    if let Some(ref task_id) = output.task_id {
-        if output.status.as_deref() == Some("running") {
-            println!("\x1b[33m⏳ Background task started:\x1b[0m {task_id}");
-            return;
-        }
+    if let Some(ref task_id) = output.task_id
+        && output.status.as_deref() == Some("running")
+    {
+        println!("\x1b[33m⏳ Background task started:\x1b[0m {task_id}");
+        return;
     }
 
     // Success indicator

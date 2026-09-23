@@ -45,7 +45,14 @@ pub use provider::OpenAIProvider;
 mod constant;
 pub use constant::*;
 
-pub(crate) const DEFAULT_MODEL: &str = GPT5_2;
+/// Provider tag stamped on reasoning state produced by this crate.
+///
+/// Reasoning state is only ever replayed to the provider that signed it, so
+/// this string must stay stable across releases; changing it silently
+/// invalidates state stored in existing transcripts.
+pub const PROVIDER_NAME: &str = "openai";
+
+pub(crate) const DEFAULT_MODEL: &str = GPT5_6;
 pub(crate) const DEFAULT_BASE_URL: &str = OPENAI_BASE_URL;
 pub(crate) const DEFAULT_EMBEDDING_MODEL: &str = EMBEDDING_SMALL;
 pub(crate) const DEFAULT_EMBEDDING_DIM: usize = 1536;

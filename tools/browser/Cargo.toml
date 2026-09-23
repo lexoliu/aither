@@ -12,7 +12,7 @@ keywords = ["ai", "agent", "tool", "browser"]
 categories = ["api-bindings"]
 
 [dependencies]
-aither-agent = { path = "../../agent", default-features = false }
+aither-agent = { path = "../../agent", version = "0.2.0", default-features = false }
 aither-core.workspace = true
 schemars = { version = "1.0", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }

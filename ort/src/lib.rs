@@ -329,13 +329,13 @@ fn find_model_file(dir: &Path) -> Result<PathBuf, OrtError> {
 
     // Check onnx subdirectory
     let onnx_dir = dir.join("onnx");
-    if onnx_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&onnx_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "onnx") {
-                    return Ok(path);
-                }
+    if onnx_dir.exists()
+        && let Ok(entries) = std::fs::read_dir(&onnx_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "onnx") {
+                return Ok(path);
             }
         }
     }
@@ -365,11 +365,11 @@ fn detect_embedding_dimension(session: &Session) -> Result<usize, OrtError> {
             // Expect shape [batch, seq_len, hidden_dim] or [batch, hidden_dim]
             if shape.len() >= 2 {
                 // Last dimension is typically the hidden dimension
-                if let Some(&dim) = shape.last() {
-                    if dim > 0 {
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        return Ok(dim as usize);
-                    }
+                if let Some(&dim) = shape.last()
+                    && dim > 0
+                {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    return Ok(dim as usize);
                 }
             }
         }

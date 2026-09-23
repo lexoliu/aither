@@ -192,10 +192,10 @@ impl<M> ModelGroup<M> {
                 return false;
             }
 
-            if let Some(model) = self.models.get(idx) {
-                if !model.is_exhausted() {
-                    return true;
-                }
+            if let Some(model) = self.models.get(idx)
+                && !model.is_exhausted()
+            {
+                return true;
             }
 
             // Try to advance
@@ -215,10 +215,10 @@ impl<M> ModelGroup<M> {
             }
 
             // Check if the new model is available
-            if let Some(model) = self.models.get(next) {
-                if !model.is_exhausted() {
-                    return true;
-                }
+            if let Some(model) = self.models.get(next)
+                && !model.is_exhausted()
+            {
+                return true;
             }
         }
     }
@@ -451,10 +451,10 @@ where
         match inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(event))) => {
                 // Track usage
-                if let Event::Usage(ref usage) = event {
-                    if let Some(model) = self.group.current() {
-                        model.record_usage(usage);
-                    }
+                if let Event::Usage(ref usage) = event
+                    && let Some(model) = self.group.current()
+                {
+                    model.record_usage(usage);
                 }
                 Poll::Ready(Some(Ok(event)))
             }
@@ -509,8 +509,8 @@ mod tests {
             stream::iter([Ok(Event::Text(self.name.to_string()))])
         }
 
-        async fn profile(&self) -> Profile {
-            Profile::new("dummy", self.name, "test", "dummy", 0)
+        fn profile(&self) -> impl std::future::Future<Output = Profile> + Send {
+            std::future::ready(Profile::new("dummy", self.name, "test", "dummy", 0))
         }
     }
 

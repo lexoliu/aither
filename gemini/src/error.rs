@@ -120,27 +120,25 @@ impl ApiErrorResponse {
         // Check for quota violations
         if let Some(details) = &error.details {
             for detail in details {
-                if let ApiErrorInfo::QuotaFailure(quota) = detail {
-                    if quota
+                if let ApiErrorInfo::QuotaFailure(quota) = detail
+                    && quota
                         .type_url
                         .as_deref()
                         .is_some_and(|t| t.contains("QuotaFailure"))
-                    {
-                        if let Some(violations) = &quota.violations {
-                            if let Some(v) = violations.first() {
-                                let quota_id = v.quota_id.as_deref().unwrap_or("unknown");
-                                let quota_value = v.quota_value.as_deref().unwrap_or("?");
-                                return format!(
-                                    "Rate limit exceeded: {} requests/min (limit: {})",
-                                    quota_id.split('-').next().unwrap_or(quota_id).replace(
-                                        "GenerateRequestsPerMinutePerProjectPerModel",
-                                        "requests"
-                                    ),
-                                    quota_value
-                                );
-                            }
-                        }
-                    }
+                    && let Some(violations) = &quota.violations
+                    && let Some(v) = violations.first()
+                {
+                    let quota_id = v.quota_id.as_deref().unwrap_or("unknown");
+                    let quota_value = v.quota_value.as_deref().unwrap_or("?");
+                    return format!(
+                        "Rate limit exceeded: {} requests/min (limit: {})",
+                        quota_id
+                            .split('-')
+                            .next()
+                            .unwrap_or(quota_id)
+                            .replace("GenerateRequestsPerMinutePerProjectPerModel", "requests"),
+                        quota_value
+                    );
                 }
             }
         }
@@ -153,11 +151,11 @@ impl ApiErrorResponse {
     pub fn retry_delay_secs(&self) -> Option<u64> {
         let details = self.error.as_ref()?.details.as_ref()?;
         for detail in details {
-            if let ApiErrorInfo::RetryInfo(info) = detail {
-                if let Some(delay) = &info.retry_delay {
-                    // Parse "20s" format
-                    return delay.trim_end_matches('s').parse().ok();
-                }
+            if let ApiErrorInfo::RetryInfo(info) = detail
+                && let Some(delay) = &info.retry_delay
+            {
+                // Parse "20s" format
+                return delay.trim_end_matches('s').parse().ok();
             }
         }
         None
@@ -196,10 +194,10 @@ impl fmt::Display for GeminiError {
 /// Parse HTTP error to extract a user-friendly message.
 fn parse_http_error_message(err: &ZenwaveError) -> String {
     // Try to parse as Gemini API error response
-    if let Some(body) = err.response_body() {
-        if let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body) {
-            return api_error.friendly_message();
-        }
+    if let Some(body) = err.response_body()
+        && let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body)
+    {
+        return api_error.friendly_message();
     }
 
     // Fall back to status-based messages
@@ -257,10 +255,10 @@ impl GeminiError {
             } => *retry_after_secs,
             Self::Http(err) => {
                 // Try to parse from response body
-                if let Some(body) = err.response_body() {
-                    if let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body) {
-                        return api_error.retry_delay_secs();
-                    }
+                if let Some(body) = err.response_body()
+                    && let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body)
+                {
+                    return api_error.retry_delay_secs();
                 }
                 None
             }
@@ -271,21 +269,21 @@ impl GeminiError {
     /// Convert a zenwave error to a `GeminiError`, detecting rate limits.
     pub(crate) fn from_http(err: ZenwaveError) -> Self {
         // Check if it's a rate limit error
-        if let zenwave::Error::Http { status, .. } = &err {
-            if status.as_u16() == 429 {
-                if let Some(body) = err.response_body() {
-                    if let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body) {
-                        return Self::RateLimit {
-                            message: api_error.friendly_message(),
-                            retry_after_secs: api_error.retry_delay_secs(),
-                        };
-                    }
-                }
+        if let zenwave::Error::Http { status, .. } = &err
+            && status.as_u16() == 429
+        {
+            if let Some(body) = err.response_body()
+                && let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body)
+            {
                 return Self::RateLimit {
-                    message: "Rate limit exceeded".to_string(),
-                    retry_after_secs: None,
+                    message: api_error.friendly_message(),
+                    retry_after_secs: api_error.retry_delay_secs(),
                 };
             }
+            return Self::RateLimit {
+                message: "Rate limit exceeded".to_string(),
+                retry_after_secs: None,
+            };
         }
         Self::Http(err)
     }
