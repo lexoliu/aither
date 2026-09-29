@@ -16,13 +16,14 @@
 //! ## Core Components
 //!
 //! - [`Tool`] - Trait for defining executable tools
-//! - [`Tools`] - Registry for managing multiple tools  
+//! - [`Tools`] - Registry for managing multiple tools
+//! - [`ToolContext`] - Per-call context through which a tool reports progress
 //! - [`tool::ToolDefinition`] - Metadata and schema for LLM consumption
 //!
 //! ## Quick Start
 //!
 //! ```rust
-//! use aither_core::llm::{Tool, ToolResult};
+//! use aither_core::llm::{Tool, ToolContext, ToolResult};
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //! use std::borrow::Cow;
@@ -48,7 +49,11 @@
 //!     type Arguments = MathArgs;
 //!     type Res = ToolResult;
 //!
-//!     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+//!     async fn call(
+//!         &self,
+//!         args: Self::Arguments,
+//!         _cx: ToolContext,
+//!     ) -> aither_core::Result<Self::Res> {
 //!         let result = match args.operation.as_str() {
 //!             "add" => args.a + args.b,
 //!             "subtract" => args.a - args.b,
@@ -58,6 +63,55 @@
 //!             _ => return Err(anyhow::Error::msg("Unknown operation")),
 //!         };
 //!         Ok(ToolResult::text(result.to_string()))
+//!     }
+//! }
+//! ```
+//!
+//! ## Reporting progress
+//!
+//! A long-running tool reports how far it has got through the [`ToolContext`]
+//! its call receives. Whether anyone listens is the caller's business: an MCP
+//! server turns each report into a `notifications/progress` for the request's
+//! progress token, and a caller that does not listen passes
+//! [`ToolContext::new`], which drops the reports.
+//!
+//! ```rust
+//! use aither_core::llm::{Tool, ToolContext, ToolResult};
+//! use aither_core::llm::tool::Progress;
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//! use std::borrow::Cow;
+//!
+//! /// Copies the given files.
+//! #[derive(JsonSchema, Deserialize)]
+//! struct CopyArgs {
+//!     files: Vec<String>,
+//! }
+//!
+//! struct Copy;
+//!
+//! impl Tool for Copy {
+//!     fn name(&self) -> Cow<'static, str> {
+//!         "copy".into()
+//!     }
+//!
+//!     type Arguments = CopyArgs;
+//!     type Res = ToolResult;
+//!
+//!     async fn call(
+//!         &self,
+//!         args: Self::Arguments,
+//!         mut cx: ToolContext,
+//!     ) -> aither_core::Result<Self::Res> {
+//!         let total = args.files.len() as f64;
+//!         for (done, file) in args.files.iter().enumerate() {
+//!             // ... copy `file` ...
+//!             let progress = Progress::new(done as f64 + 1.0)
+//!                 .with_total(total)
+//!                 .with_message(format!("copied {file}"));
+//!             cx.report_progress(progress).await?;
+//!         }
+//!         Ok(ToolResult::text("done"))
 //!     }
 //! }
 //! ```
@@ -166,6 +220,10 @@ use core::{future::Future, pin::Pin};
 pub use mime::Mime;
 use schemars::{JsonSchema, Schema, schema_for};
 use serde::{Serialize, de::DeserializeOwned};
+
+mod context;
+
+pub use context::{Progress, ProgressError, ProgressSink, ToolContext};
 
 /// Final structured result from a tool execution.
 ///
@@ -794,7 +852,7 @@ fn escape_tsv_field(value: &str) -> String {
 /// # Example
 ///
 /// ```rust,ignore
-/// use aither::llm::{Tool, ToolResult};
+/// use aither::llm::{Tool, ToolContext, ToolResult};
 /// use schemars::JsonSchema;
 /// use serde::Deserialize;
 ///
@@ -811,7 +869,7 @@ fn escape_tsv_field(value: &str) -> String {
 ///     type Arguments = CalculatorArgs;
 ///     type Res = ToolResult;
 ///
-///     async fn call(&mut self, args: Self::Arguments) -> aither::Result<Self::Res> {
+///     async fn call(&self, args: Self::Arguments, _cx: ToolContext) -> aither::Result<Self::Res> {
 ///         match args.operation.as_str() {
 ///             "add" => Ok(ToolResult::text((args.a + args.b).to_string())),
 ///             "subtract" => Ok(ToolResult::text((args.a - args.b).to_string())),
@@ -854,10 +912,19 @@ pub trait Tool: Send + Sync {
 
     /// Executes the tool with the provided arguments.
     ///
+    /// `cx` is this call's own context: report progress through
+    /// [`ToolContext::report_progress`], which reaches the caller when it
+    /// listens and is a no-op when it does not. It is owned, so the tool may
+    /// move it into whatever part of the work reports.
+    ///
     /// Returns a value that can be converted into a final [`ToolResult`].
     ///
     /// Tools that need mutable state should use interior mutability (e.g., `Mutex`).
-    fn call(&self, arguments: Self::Arguments) -> impl Future<Output = Result<Self::Res>> + Send;
+    fn call(
+        &self,
+        arguments: Self::Arguments,
+        cx: ToolContext,
+    ) -> impl Future<Output = Result<Self::Res>> + Send;
 }
 
 /// Utility to convert a serializable value to a pretty-printed JSON string.
@@ -892,7 +959,11 @@ pub fn json<T: Serialize>(value: &T) -> Result<String> {
 }
 
 trait ToolImpl: Send + Sync + Any {
-    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>>;
+    fn call(
+        &self,
+        args: &str,
+        cx: ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>>;
 
     /// The cached definition. Borrowed, so registering a tool does not have to
     /// clone its argument schema.
@@ -911,7 +982,9 @@ trait ToolImpl: Send + Sync + Any {
 /// Dynamic tool implementation for type-erased tools.
 struct DynToolImpl<F>
 where
-    F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>> + Send + Sync,
+    F: Fn(&str, ToolContext) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>>
+        + Send
+        + Sync,
 {
     definition: ToolDefinition,
     handler: F,
@@ -919,10 +992,17 @@ where
 
 impl<F> ToolImpl for DynToolImpl<F>
 where
-    F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>> + Send + Sync + 'static,
+    F: Fn(&str, ToolContext) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>>
+        + Send
+        + Sync
+        + 'static,
 {
-    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>> {
-        (self.handler)(args)
+    fn call(
+        &self,
+        args: &str,
+        cx: ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>> {
+        (self.handler)(args, cx)
     }
 
     fn definition(&self) -> &ToolDefinition {
@@ -996,7 +1076,11 @@ impl<T: Tool> RegisteredTool<T> {
 }
 
 impl<T: Tool + 'static> ToolImpl for RegisteredTool<T> {
-    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>> {
+    fn call(
+        &self,
+        args: &str,
+        cx: ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>> {
         let result = if self.args_are_object {
             serde_json::from_str::<T::Arguments>(args)
         } else {
@@ -1017,7 +1101,11 @@ impl<T: Tool + 'static> ToolImpl for RegisteredTool<T> {
             });
         };
 
-        Box::pin(async move { Tool::call(&self.tool, arguments).await?.into_tool_result() })
+        Box::pin(async move {
+            Tool::call(&self.tool, arguments, cx)
+                .await?
+                .into_tool_result()
+        })
     }
 
     fn definition(&self) -> &ToolDefinition {
@@ -1106,7 +1194,9 @@ impl core::error::Error for RegisterError {}
 /// let mut tools = Tools::new();
 /// // tools.register(Calculator);
 /// let definitions = tools.definitions();
-/// // let result = tools.call("calculator", r#"{"operation": "add", "a": 5, "b": 3}"#).await;
+/// // let result = tools
+/// //     .call("calculator", r#"{"operation": "add", "a": 5, "b": 3}"#, ToolContext::new())
+/// //     .await;
 /// ```
 pub struct Tools {
     tools: BTreeMap<Cow<'static, str>, Box<dyn ToolImpl>>,
@@ -1501,7 +1591,8 @@ impl Tools {
     /// Registers a dynamic tool with a pre-made definition and handler.
     ///
     /// This is useful for type-erased tools (e.g., child terminal tools for subagents)
-    /// where the concrete type isn't known at compile time.
+    /// where the concrete type isn't known at compile time. The handler
+    /// receives the JSON arguments and the call's [`ToolContext`].
     ///
     /// # Errors
     ///
@@ -1512,7 +1603,7 @@ impl Tools {
         handler: F,
     ) -> core::result::Result<(), RegisterError>
     where
-        F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>>
+        F: Fn(&str, ToolContext) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>>
             + Send
             + Sync
             + 'static,
@@ -1540,15 +1631,16 @@ impl Tools {
         self.tools.remove(name);
     }
 
-    /// Calls a tool by name with JSON arguments.
+    /// Calls a tool by name with JSON arguments, running it with `cx` as its
+    /// [`ToolContext`].
     ///
     /// # Errors
     ///
     /// Returns an error if the tool is not found, arguments cannot be parsed,
     /// or tool execution fails.
-    pub async fn call(&self, name: &str, args: &str) -> Result<ToolResult> {
+    pub async fn call(&self, name: &str, args: &str, cx: ToolContext) -> Result<ToolResult> {
         if let Some(tool) = self.tools.get(name) {
-            tool.call(args).await
+            tool.call(args, cx).await
         } else {
             Err(anyhow::Error::msg(format!("Tool '{name}' not found")))
         }
@@ -1579,7 +1671,11 @@ mod tests {
         type Arguments = CalculatorArgs;
         type Res = ToolResult;
 
-        fn call(&self, args: Self::Arguments) -> impl Future<Output = Result<Self::Res>> + Send {
+        fn call(
+            &self,
+            args: Self::Arguments,
+            _cx: ToolContext,
+        ) -> impl Future<Output = Result<Self::Res>> + Send {
             core::future::ready(match args.operation.as_str() {
                 "add" => Ok(ToolResult::text((args.a + args.b).to_string())),
                 "subtract" => Ok(ToolResult::text((args.a - args.b).to_string())),
@@ -1614,7 +1710,11 @@ mod tests {
         type Arguments = GreetArgs;
         type Res = ToolResult;
 
-        fn call(&self, args: Self::Arguments) -> impl Future<Output = Result<Self::Res>> + Send {
+        fn call(
+            &self,
+            args: Self::Arguments,
+            _cx: ToolContext,
+        ) -> impl Future<Output = Result<Self::Res>> + Send {
             core::future::ready(Ok(ToolResult::text(format!("Hello, {}!", args.name))))
         }
     }
@@ -1700,7 +1800,11 @@ mod tests {
         assert_eq!(definitions[0].name, "calculator");
 
         let result = tools
-            .call("calculator", r#"{"operation": "add", "a": 5, "b": 3}"#)
+            .call(
+                "calculator",
+                r#"{"operation": "add", "a": 5, "b": 3}"#,
+                ToolContext::new(),
+            )
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().as_text(), Some("8"));
@@ -1713,7 +1817,11 @@ mod tests {
 
         // Test addition
         let result = tools
-            .call("calculator", r#"{"operation": "add", "a": 10, "b": 5}"#)
+            .call(
+                "calculator",
+                r#"{"operation": "add", "a": 10, "b": 5}"#,
+                ToolContext::new(),
+            )
             .await;
         assert_eq!(result.unwrap().as_text(), Some("15"));
 
@@ -1722,19 +1830,28 @@ mod tests {
             .call(
                 "calculator",
                 r#"{"operation": "subtract", "a": 10, "b": 3}"#,
+                ToolContext::new(),
             )
             .await;
         assert_eq!(result.unwrap().as_text(), Some("7"));
 
         // Test multiplication
         let result = tools
-            .call("calculator", r#"{"operation": "multiply", "a": 4, "b": 3}"#)
+            .call(
+                "calculator",
+                r#"{"operation": "multiply", "a": 4, "b": 3}"#,
+                ToolContext::new(),
+            )
             .await;
         assert_eq!(result.unwrap().as_text(), Some("12"));
 
         // Test division
         let result = tools
-            .call("calculator", r#"{"operation": "divide", "a": 15, "b": 3}"#)
+            .call(
+                "calculator",
+                r#"{"operation": "divide", "a": 15, "b": 3}"#,
+                ToolContext::new(),
+            )
             .await;
         assert_eq!(result.unwrap().as_text(), Some("5"));
     }
@@ -1745,7 +1862,11 @@ mod tests {
         tools.register(Calculator).expect("calculator registers");
 
         let result = tools
-            .call("calculator", r#"{"operation": "divide", "a": 10, "b": 0}"#)
+            .call(
+                "calculator",
+                r#"{"operation": "divide", "a": 10, "b": 0}"#,
+                ToolContext::new(),
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Division by zero"));
@@ -1757,7 +1878,11 @@ mod tests {
         tools.register(Calculator).expect("calculator registers");
 
         let result = tools
-            .call("calculator", r#"{"operation": "modulo", "a": 10, "b": 3}"#)
+            .call(
+                "calculator",
+                r#"{"operation": "modulo", "a": 10, "b": 3}"#,
+                ToolContext::new(),
+            )
             .await;
         assert!(result.is_err());
         assert!(
@@ -1789,11 +1914,17 @@ mod tests {
 
         // Test both tools
         let calc_result = tools
-            .call("calculator", r#"{"operation": "add", "a": 2, "b": 3}"#)
+            .call(
+                "calculator",
+                r#"{"operation": "add", "a": 2, "b": 3}"#,
+                ToolContext::new(),
+            )
             .await;
         assert_eq!(calc_result.unwrap().as_text(), Some("5"));
 
-        let greet_result = tools.call("greeter", r#"{"name": "Alice"}"#).await;
+        let greet_result = tools
+            .call("greeter", r#"{"name": "Alice"}"#, ToolContext::new())
+            .await;
         assert_eq!(greet_result.unwrap().as_text(), Some("Hello, Alice!"));
     }
 
@@ -1925,7 +2056,7 @@ mod tests {
     async fn tool_not_found() {
         let tools = Tools::new();
 
-        let result = tools.call("nonexistent", "{}").await;
+        let result = tools.call("nonexistent", "{}", ToolContext::new()).await;
         assert!(result.is_err());
         assert!(
             result
@@ -1940,7 +2071,9 @@ mod tests {
         let mut tools = Tools::new();
         tools.register(Calculator).expect("calculator registers");
 
-        let result = tools.call("calculator", "invalid json").await;
+        let result = tools
+            .call("calculator", "invalid json", ToolContext::new())
+            .await;
         assert!(result.is_err());
     }
 
@@ -2029,6 +2162,7 @@ mod tests {
             fn call(
                 &self,
                 _args: Self::Arguments,
+                _cx: ToolContext,
             ) -> impl Future<Output = Result<Self::Res>> + Send {
                 core::future::ready(Ok(ToolResult::text("ok")))
             }

@@ -596,6 +596,7 @@ mod tests {
         fn call(
             &self,
             _args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
         ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
             std::future::ready(Ok(aither_core::llm::ToolResult::text("ok")))
         }

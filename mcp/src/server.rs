@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aither_core::llm::tool::{ToolResult, ToolResultPart, Tools};
+use aither_core::llm::tool::{ToolContext, ToolResult, ToolResultPart, Tools};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_lite::future;
 use futures_util::future::{AbortHandle, Abortable, Aborted, BoxFuture};
@@ -341,7 +341,11 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
 
         let args_str = serde_json::to_string(&params.arguments).unwrap_or_default();
 
-        match tools.call(&params.name, &args_str).await {
+        // This server does not read progress tokens, so nobody listens.
+        match tools
+            .call(&params.name, &args_str, ToolContext::new())
+            .await
+        {
             Ok(output) => {
                 let content = match contents_for(&output) {
                     Ok(content) => content,
@@ -436,7 +440,10 @@ mod tests {
     use crate::transport::{DuplexTransport, Transport};
 
     /// The handler signature accepted by [`Tools::register_dyn`].
-    type ToolHandler = dyn Fn(&str) -> Pin<Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send>>
+    type ToolHandler = dyn Fn(
+            &str,
+            ToolContext,
+        ) -> Pin<Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send>>
         + Send
         + Sync;
 
@@ -491,7 +498,7 @@ mod tests {
         register(
             &mut tools,
             "wait",
-            Box::new(move |_args| {
+            Box::new(move |_args, _cx| {
                 let gate_rx = gate_rx.clone();
                 Box::pin(async move {
                     gate_rx.recv().await.expect("gate open");
@@ -502,7 +509,7 @@ mod tests {
         register(
             &mut tools,
             "release",
-            Box::new(move |_args| {
+            Box::new(move |_args, _cx| {
                 let gate_tx = gate_tx.clone();
                 Box::pin(async move {
                     gate_tx.send(()).await.expect("gate send");
@@ -538,7 +545,7 @@ mod tests {
         register(
             &mut tools,
             "wait",
-            Box::new(move |_args| {
+            Box::new(move |_args, _cx| {
                 let gate_rx = gate_rx.clone();
                 let started_tx = started_tx.clone();
                 let dropped_tx = dropped_tx.clone();
@@ -553,7 +560,7 @@ mod tests {
         register(
             &mut tools,
             "release",
-            Box::new(move |_args| {
+            Box::new(move |_args, _cx| {
                 let gate_tx = gate_tx.clone();
                 Box::pin(async move {
                     gate_tx.send(()).await.expect("gate send");
@@ -610,7 +617,7 @@ mod tests {
         register(
             &mut tools,
             "png",
-            Box::new(move |_args| {
+            Box::new(move |_args, _cx| {
                 let image_bytes = image_bytes.clone();
                 Box::pin(async move { Ok(ToolResult::image(image_bytes, "image/png")) })
             }),
@@ -652,7 +659,7 @@ mod tests {
         register(
             &mut tools,
             "snapshot",
-            Box::new(move |_args| {
+            Box::new(move |_args, _cx| {
                 let image_bytes = image_bytes.clone();
                 Box::pin(async move {
                     Ok(ToolResult::parts(vec![

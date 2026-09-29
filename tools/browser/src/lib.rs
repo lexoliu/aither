@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use aither_agent::tool_request::{
     ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
+use aither_core::llm::ToolContext;
 use aither_core::llm::{IntoToolResult, Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -397,7 +398,11 @@ impl Tool for BrowserTool {
     type Arguments = BrowserArgs;
     type Res = BrowserToolOutput;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let Some(broker) = self.broker.as_ref() else {
             return Ok(BrowserToolOutput::from(Err(
                 BrowserToolError::UnavailableInRuntime,

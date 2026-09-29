@@ -72,7 +72,7 @@ Model Context Protocol client/server implementation for tool discovery and execu
 
 **Builders over constructors**: Prefer the `LLMRequest::new([...]).with_tool(&...)` pattern.
 
-**Tool definition**: Implement the `Tool` trait (`name()`, an `Arguments` type implementing `schemars::JsonSchema`, and `call(&self, args)` returning `Result<ToolOutput>`), or use the `#[tool]` attribute macro on a free function. A tool's description defaults to the rustdoc on its `Arguments` type; override `Tool::description()` to set it directly. Registration rejects a tool with no description.
+**Tool definition**: Implement the `Tool` trait (`name()`, an `Arguments` type implementing `schemars::JsonSchema`, a `Res` type implementing `IntoToolResult`, and `call(&self, args, cx: ToolContext)`; `cx` is the call's own context, through which a long-running tool reports progress), or use the `#[tool]` attribute macro on a free function (a parameter of type `ToolContext` receives the context and stays out of the argument schema). A tool's description defaults to the rustdoc on its `Arguments` type; override `Tool::description()` to set it directly. Registration rejects a tool with no description.
 
 **Feature flags**: Provider crates are optional (`openai`, `gemini`, `claude`). Use `full` feature for everything.
 

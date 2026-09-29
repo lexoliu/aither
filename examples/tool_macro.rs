@@ -9,6 +9,8 @@
 #![allow(missing_docs)]
 #![allow(clippy::unused_async)]
 use aither::Result;
+use aither::llm::ToolContext;
+use aither::llm::tool::Progress;
 use aither_derive::tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -64,6 +66,23 @@ pub async fn generate_image(args: GenerateImageArgs) -> aither::Result<String> {
     ))
 }
 
+// Long-running tool that reports progress through its call context. The
+// `ToolContext` parameter is not part of the argument schema; reporting is a
+// no-op when the caller does not listen for progress.
+/// Fetch every URL, reporting each one as it completes.
+#[tool]
+pub async fn crawl(urls: Vec<String>, mut cx: ToolContext) -> Result<u32> {
+    let total = u32::try_from(urls.len())?;
+    for (done, url) in (1..=total).zip(&urls) {
+        // Simulate fetching `url`
+        let progress = Progress::new(f64::from(done))
+            .with_total(f64::from(total))
+            .with_message(format!("fetched {url}"));
+        cx.report_progress(progress).await?;
+    }
+    Ok(total)
+}
+
 fn main() {
     // Every generated tool carries a description and registers cleanly.
     let mut tools = aither::llm::tool::Tools::new();
@@ -72,4 +91,5 @@ fn main() {
     tools
         .register(GenerateImage)
         .expect("generate_image registers");
+    tools.register(Crawl).expect("crawl registers");
 }

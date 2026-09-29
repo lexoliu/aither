@@ -83,6 +83,34 @@
 //! }
 //! ```
 //!
+//! ### Reporting Progress
+//!
+//! A parameter of type `ToolContext` receives the call's context instead of a
+//! model-supplied argument; it is left out of the argument schema. Report
+//! progress through it — a no-op when the caller does not listen.
+//!
+//! ```rust
+//! use aither::Result;
+//! use aither::llm::ToolContext;
+//! use aither::llm::tool::Progress;
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//!
+//! /// Index the given documents.
+//! #[derive(JsonSchema, Deserialize)]
+//! pub struct IndexArgs {
+//!     pub documents: Vec<String>,
+//! }
+//!
+//! #[tool]
+//! pub async fn index(args: IndexArgs, mut cx: ToolContext) -> Result<usize> {
+//!     for (done, _document) in args.documents.iter().enumerate() {
+//!         cx.report_progress(Progress::new(done as f64 + 1.0)).await?;
+//!     }
+//!     Ok(args.documents.len())
+//! }
+//! ```
+//!
 //! ## Requirements
 //!
 //! - Functions must be `async`
@@ -264,12 +292,15 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
         }
     });
 
+    // The context parameter, if any, is not an argument the model fills in.
+    let (context_position, data_inputs) = split_context_parameter(&input_fn.sig.inputs)?;
+
     // Analyze function signature
     let AnalyzedArgs {
         args_type,
         params,
         stream,
-    } = analyze_function_args(fn_vis, &tool_struct_name, &input_fn.sig.inputs)?;
+    } = analyze_function_args(fn_vis, &tool_struct_name, &data_inputs)?;
 
     if input_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
@@ -278,19 +309,30 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
         ));
     }
 
-    let call_expr = if params.is_empty() {
-        // No parameters, call the function directly
-        quote! { #fn_name().await }
-    } else {
-        // Call the function with extracted parameters
-        let args_tuple = quote! { #(#params),* };
-        quote! { #fn_name(#args_tuple).await }
-    };
+    // Call the function with its parameters in declaration order, the
+    // context in the position the function declared it.
+    let mut call_args: Vec<proc_macro2::TokenStream> =
+        params.iter().map(|param| quote! { #param }).collect();
+    if let Some(position) = context_position {
+        call_args.insert(position, quote! { cx });
+    }
+    let call_expr = quote! { #fn_name(#(#call_args),*).await };
 
     let extractor = if params.len() <= 1 {
         quote! {}
     } else {
         quote! { let Self::Arguments { #(#params),* } = args; }
+    };
+
+    let args_binding = if params.is_empty() {
+        quote! { _args }
+    } else {
+        quote! { args }
+    };
+    let context_binding = if context_position.is_some() {
+        quote! { cx }
+    } else {
+        quote! { _cx }
     };
 
     let expanded = quote! {
@@ -310,7 +352,11 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
             type Arguments = #args_type;
             type Res = ::aither::llm::ToolResult;
 
-            async fn call(&self, args: Self::Arguments) -> ::aither::Result<Self::Res> {
+            async fn call(
+                &self,
+                #args_binding: Self::Arguments,
+                #context_binding: ::aither::llm::ToolContext,
+            ) -> ::aither::Result<Self::Res> {
                 #extractor
                 ::aither::llm::IntoToolResult::into_tool_result(#call_expr)
             }
@@ -345,6 +391,51 @@ fn doc_text(attrs: &[syn::Attribute]) -> Option<String> {
     let text = lines.join("\n");
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// Separates the call's `ToolContext` parameter from the model-facing ones.
+///
+/// A parameter is the context when its type is a path ending in
+/// `ToolContext`; a proc macro sees tokens, not resolved types, so the name is
+/// what identifies it. Returns the context's position among all parameters
+/// and the remaining parameters. More than one context parameter is an error.
+fn split_context_parameter(
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::Token![,]>,
+) -> syn::Result<(
+    Option<usize>,
+    syn::punctuated::Punctuated<FnArg, syn::Token![,]>,
+)> {
+    let mut position = None;
+    let mut data = syn::punctuated::Punctuated::new();
+    for (index, input) in inputs.iter().enumerate() {
+        if is_context_parameter(input) {
+            if position.is_some() {
+                return Err(syn::Error::new_spanned(
+                    input,
+                    "a tool function takes at most one `ToolContext` parameter",
+                ));
+            }
+            position = Some(index);
+        } else {
+            data.push(input.clone());
+        }
+    }
+    Ok((position, data))
+}
+
+fn is_context_parameter(input: &FnArg) -> bool {
+    let FnArg::Typed(pat_type) = input else {
+        return false;
+    };
+    let Type::Path(path) = pat_type.ty.as_ref() else {
+        return false;
+    };
+    path.qself.is_none()
+        && path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "ToolContext")
 }
 
 /// Container for analyzed function arguments and generated types.

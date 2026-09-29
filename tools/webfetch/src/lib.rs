@@ -54,6 +54,7 @@ use std::fmt::Write as _;
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 
+use aither_core::llm::ToolContext;
 use aither_core::llm::{Tool, ToolResult};
 use anyhow::{Result, anyhow};
 use regex::Regex;
@@ -1368,7 +1369,11 @@ impl Tool for WebFetchTool {
     type Arguments = WebFetchArgs;
     type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let WebFetchArgs {
             url,
             jina_api_key,

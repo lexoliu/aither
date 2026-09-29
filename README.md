@@ -122,7 +122,7 @@ async fn inspect_reasoning(model: impl LanguageModel) -> anyhow::Result<()> {
 ### Function Calling
 
 ```rust
-use aither::llm::{LLMRequest, Message, Tool, ToolOutput};
+use aither::llm::{LLMRequest, Message, Tool, ToolContext, ToolResult};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -142,9 +142,10 @@ impl Tool for WeatherTool {
     }
 
     type Arguments = WeatherQuery;
+    type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither::Result<ToolOutput> {
-        Ok(ToolOutput::text(format!("Weather in {}: 22°C, sunny", args.location)))
+    async fn call(&self, args: Self::Arguments, _cx: ToolContext) -> aither::Result<ToolResult> {
+        Ok(ToolResult::text(format!("Weather in {}: 22°C, sunny", args.location)))
     }
 }
 
@@ -158,6 +159,12 @@ let request = LLMRequest::new([Message::user("What is the weather in Tokyo?")])
 The tool's description defaults to the rustdoc on its `Arguments` type. Override
 `Tool::description()` to set it explicitly — a tool with neither is rejected at
 registration rather than reaching the model unexplained.
+
+Every call also receives its own `ToolContext`. A long-running tool reports how
+far it has got with `cx.report_progress(Progress::new(done).with_total(total))`;
+served over MCP, each report becomes a `notifications/progress` for the
+request's progress token, and when the caller asked for no progress the report
+goes nowhere.
 
 ### Semantic Search & Multimodal
 

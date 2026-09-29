@@ -1,6 +1,9 @@
 //! Basic RAG flow using the HNSW index and a toy embedder.
 
-use aither_core::{EmbeddingModel, Result, llm::Tool};
+use aither_core::{
+    EmbeddingModel, Result,
+    llm::{Tool, ToolContext},
+};
 use aither_rag::{IndexStage, Rag, RagToolArgs};
 use std::{env, fs, path::PathBuf};
 
@@ -74,10 +77,13 @@ async fn main() -> Result<()> {
 
     // Use the RAG as a tool
     let response = rag
-        .call(RagToolArgs {
-            query: "How do I prep documents for RAG?".into(),
-            top_k: 2,
-        })
+        .call(
+            RagToolArgs {
+                query: "How do I prep documents for RAG?".into(),
+                top_k: 2,
+            },
+            ToolContext::new(),
+        )
         .await?;
     println!("\nTool response:\n{}", response.render_for_cli()?);
 
