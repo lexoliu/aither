@@ -26,9 +26,10 @@ pub use registry::ModelRegistry;
 pub use tier::ModelTier;
 pub use types::{ModelEntry, ModelMode, Pricing, Provider};
 
-/// Look up a model by ID or alias.
+/// Look up a model by `LiteLLM` ID or a dated/versioned alias.
 ///
-/// Delegates to the bundled [`ModelRegistry`].
+/// Returns `None` when the ID is unknown to the registry — see
+/// [`ModelRegistry::lookup`] for the normalization rules.
 #[must_use]
 pub fn lookup(model_id: &str) -> Option<&'static ModelEntry> {
     ModelRegistry::bundled().lookup(model_id)
@@ -77,15 +78,38 @@ mod tests {
 
     #[test]
     fn test_lookup_claude() {
-        let entry = lookup("claude-sonnet-4-20250514").expect("claude-sonnet-4 should exist");
+        // Canary ID: must name a model the committed snapshot really
+        // publishes — a retired ID is a lookup miss, not a fallback.
+        let entry = lookup("claude-sonnet-5-5").expect("claude-sonnet-5-5 should exist");
         assert!(entry.max_input_tokens().unwrap_or(0) >= 200_000);
         assert!(entry.has_ability(Ability::ToolUse));
+    }
+
+    #[test]
+    fn test_lookup_retired_id_returns_none() {
+        // `claude-sonnet-4-20250514` and bare `claude-sonnet-4` were pruned
+        // by LiteLLM upstream; the only remaining `claude-sonnet-4` record
+        // is GitHub Copilot's, and a bare query must not bind it.
+        assert!(lookup("claude-sonnet-4-20250514").is_none());
+        assert!(lookup("claude-sonnet-4").is_none());
+        // Provider-scoped queries still normalize inside their own namespace.
+        let entry = lookup("github_copilot/claude-sonnet-4-20250514")
+            .expect("provider-scoped dated alias should resolve");
+        assert_eq!(entry.litellm_id(), "github_copilot/claude-sonnet-4");
+    }
+
+    #[test]
+    fn test_lookup_unknown_id_returns_none() {
+        assert!(lookup("no-such-model-xyz").is_none());
     }
 
     #[test]
     fn test_lookup_gemini() {
         let entry = lookup("gemini/gemini-2.5-flash").expect("gemini-2.5-flash should exist");
         assert!(entry.max_input_tokens().unwrap_or(0) >= 1_000_000);
+        // `gemini/` is Google's own namespace, so bare IDs resolve to
+        // first-party records there too.
+        assert!(lookup("gemini-robotics-er-2-preview").is_some());
     }
 
     #[test]
@@ -95,10 +119,12 @@ mod tests {
     }
 
     #[test]
-    fn test_lookup_prefix_match() {
-        // A dated variant should match the base model via prefix
-        let entry = lookup("gpt-4o-2024-05-13");
-        assert!(entry.is_some());
+    fn test_lookup_dated_alias() {
+        // A dated snapshot ID exact-matches its own record, while a date
+        // suffix with no dedicated record normalizes to the base model.
+        assert!(lookup("gpt-4o-2024-05-13").is_some());
+        let entry = lookup("gpt-4o-21000101").expect("dated alias should resolve");
+        assert_eq!(entry.id(), "gpt-4o");
     }
 
     #[test]
