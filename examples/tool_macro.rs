@@ -13,7 +13,9 @@ use aither_derive::tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-// Basic tool example - no parameters needed
+// Basic tool example - no parameters needed. The function's rustdoc is the
+// tool description.
+/// Get the current UTC time.
 #[tool]
 pub async fn time() -> Result<&'static str> {
     Ok("2023-10-01T12:00:00Z")
@@ -27,6 +29,7 @@ pub struct SearchResult {
 }
 
 // Tool with multiple simple parameters
+/// Search the web for the given keywords.
 #[tool]
 pub async fn search(keywords: Vec<String>, max_results: u32) -> Result<Vec<SearchResult>> {
     // Simulate a search result
@@ -61,4 +64,12 @@ pub async fn generate_image(args: GenerateImageArgs) -> aither::Result<String> {
     ))
 }
 
-fn main() {}
+fn main() {
+    // Every generated tool carries a description and registers cleanly.
+    let mut tools = aither::llm::tool::Tools::new();
+    tools.register(Time).expect("time registers");
+    tools.register(Search).expect("search registers");
+    tools
+        .register(GenerateImage)
+        .expect("generate_image registers");
+}

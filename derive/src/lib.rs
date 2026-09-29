@@ -8,7 +8,8 @@
 //! ## Quick Start
 //!
 //! Transform any async function into an AI tool by adding the `#[tool]` attribute.
-//! Tool description comes from rustdoc on the Args struct:
+//! The tool description is the function's rustdoc, or, when the function has
+//! none, the rustdoc on its single Args struct:
 //!
 //! ```rust
 //! use aither::Result;
@@ -141,7 +142,9 @@ impl Parse for ToolArgs {
 /// This procedural macro generates the necessary boilerplate code to make your function
 /// callable through the `aither::llm::Tool` trait.
 ///
-/// Tool description is extracted from rustdoc on the Args struct via `schemars::JsonSchema`.
+/// The tool description is the function's rustdoc. A function without one
+/// falls back to the rustdoc on its single Args struct, which
+/// `schemars::JsonSchema` records.
 ///
 /// # Arguments
 ///
@@ -250,6 +253,17 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
 
     let tool_struct_name = format_ident!("{}", fn_name.to_string().to_case(Case::Pascal));
 
+    // The function's rustdoc describes the tool. Without it the description
+    // falls back to the rustdoc on the arguments type, which only a
+    // single-parameter tool has.
+    let description = doc_text(&input_fn.attrs).map(|text| {
+        quote! {
+            fn description(&self) -> ::aither::__hidden::CowStr {
+                #text.into()
+            }
+        }
+    });
+
     // Analyze function signature
     let AnalyzedArgs {
         args_type,
@@ -292,6 +306,7 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
             fn name(&self) -> ::aither::__hidden::CowStr {
                 #tool_name.into()
             }
+            #description
             type Arguments = #args_type;
             type Res = ::aither::llm::ToolResult;
 
@@ -303,6 +318,33 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
     };
 
     Ok(expanded)
+}
+
+/// The text of the `///` comments in `attrs`, one line per attribute with the
+/// single leading space rustdoc strips removed, or `None` when there are none.
+fn doc_text(attrs: &[syn::Attribute]) -> Option<String> {
+    let lines: Vec<String> = attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("doc"))
+        .filter_map(|attr| match &attr.meta {
+            syn::Meta::NameValue(syn::MetaNameValue {
+                value:
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(text),
+                        ..
+                    }),
+                ..
+            }) => Some(text.value()),
+            _ => None,
+        })
+        .map(|line| {
+            line.strip_prefix(' ')
+                .map_or_else(|| line.clone(), str::to_owned)
+        })
+        .collect();
+    let text = lines.join("\n");
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 /// Container for analyzed function arguments and generated types.
