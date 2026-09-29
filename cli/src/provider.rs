@@ -57,7 +57,7 @@ impl Provider {
     pub const fn default_model(self) -> &'static str {
         match self {
             Self::OpenAI => "gpt-4o-mini",
-            Self::Claude => "claude-sonnet-4-20250514",
+            Self::Claude => "claude-sonnet-5-5",
             Self::Gemini => "gemini-2.5-flash",
         }
     }
