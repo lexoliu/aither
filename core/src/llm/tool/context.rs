@@ -166,6 +166,17 @@ impl ToolContext {
         }
     }
 
+    /// Whether the caller listens for progress.
+    ///
+    /// A tool whose work can outlast its caller's idle limit decides from
+    /// this whether reporting progress keeps the call alive: without a
+    /// listener, reports go nowhere and the caller sees nothing until the
+    /// call returns.
+    #[must_use]
+    pub const fn is_listening(&self) -> bool {
+        self.sink.is_some()
+    }
+
     /// Reports how far the call has got.
     ///
     /// Delivered to the caller when it listens for progress, and a no-op when
@@ -233,6 +244,12 @@ mod tests {
     fn listening() -> (ToolContext, mpsc::Receiver<Progress>) {
         let (tx, rx) = mpsc::channel();
         (ToolContext::with_progress(Collect(tx)), rx)
+    }
+
+    #[test]
+    fn reports_whether_the_caller_listens() {
+        assert!(!ToolContext::new().is_listening());
+        assert!(listening().0.is_listening());
     }
 
     #[tokio::test]
