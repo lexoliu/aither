@@ -1,6 +1,6 @@
 //! Regression tests for the tool registry's type recovery and description handling.
 
-use aither_core::llm::tool::{RegisterError, Tool, ToolResult, Tools};
+use aither_core::llm::tool::{RegisterError, Tool, ToolContext, ToolResult, Tools};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -24,6 +24,7 @@ impl Tool for Calc {
     fn call(
         &self,
         args: Self::Arguments,
+        _cx: ToolContext,
     ) -> impl Future<Output = aither_core::Result<Self::Res>> + Send {
         ready(Ok(ToolResult::text((args.a + args.b).to_string())))
     }
@@ -46,6 +47,7 @@ impl Tool for NoDoc {
     fn call(
         &self,
         _args: Self::Arguments,
+        _cx: ToolContext,
     ) -> impl Future<Output = aither_core::Result<Self::Res>> + Send {
         ready(Ok(ToolResult::Done))
     }
@@ -65,6 +67,7 @@ impl Tool for Described {
     fn call(
         &self,
         _args: Self::Arguments,
+        _cx: ToolContext,
     ) -> impl Future<Output = aither_core::Result<Self::Res>> + Send {
         ready(Ok(ToolResult::Done))
     }
@@ -136,7 +139,10 @@ fn duplicate_names_are_rejected_without_panicking() {
 async fn registered_tool_executes() {
     let mut tools = Tools::new();
     tools.register(Calc).unwrap();
-    let out = tools.call("calc", r#"{"a":2,"b":3}"#).await.unwrap();
+    let out = tools
+        .call("calc", r#"{"a":2,"b":3}"#, ToolContext::new())
+        .await
+        .unwrap();
     assert_eq!(
         out,
         ToolResult::Text {

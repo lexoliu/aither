@@ -24,6 +24,7 @@ use std::{
     time::Duration,
 };
 
+use aither_core::llm::ToolContext;
 use aither_core::llm::{IntoToolResult, Tool, ToolResult};
 use askama::Template;
 use async_channel::{Receiver, Sender};
@@ -68,7 +69,7 @@ where
 
     let definition = ToolDefinition::new(&tool);
     let tool = Arc::new(tool);
-    let handler: DynToolHandler = Arc::new(move |args: &str| {
+    let handler: DynToolHandler = Arc::new(move |args: &str, cx: ToolContext| {
         let tool = tool.clone();
         let args = args.to_string();
         Box::pin(async move {
@@ -76,7 +77,7 @@ where
                 Ok(parsed) => parsed,
                 Err(error) => return ToolResult::error(format!("Parse error: {error}")),
             };
-            match tool.call(parsed).await {
+            match tool.call(parsed, cx).await {
                 Ok(output) => output
                     .into_tool_result()
                     .unwrap_or_else(|error| ToolResult::error(format!("Error: {error}"))),
@@ -1340,7 +1341,11 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
     type Arguments = TerminalArgs;
     type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         if arguments.description.trim().is_empty() {
             return Err(anyhow::anyhow!("terminal description must not be empty"));
         }
@@ -3536,17 +3541,20 @@ mod tests {
         let tool = tool.with_registry(registry);
 
         let result = tool
-            .call(TerminalArgs {
-                description: "exit with non-zero status".to_string(),
-                script: "exit 42".to_string(),
-                mode: TerminalExecutionMode::Sandboxed,
-                ssh_server_id: None,
-                expect: OutputFormat::Text,
-                resolution: MediaResolution::Auto,
-                timeout: 30,
-                max_lines: 50,
-                raw: false,
-            })
+            .call(
+                TerminalArgs {
+                    description: "exit with non-zero status".to_string(),
+                    script: "exit 42".to_string(),
+                    mode: TerminalExecutionMode::Sandboxed,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    timeout: 30,
+                    max_lines: 50,
+                    raw: false,
+                },
+                ToolContext::new(),
+            )
             .await
             .expect("terminal call should not be promoted to transport error on non-zero exit");
 
@@ -3589,17 +3597,21 @@ mod tests {
         let input_tool = InputTerminalTool::new(tool.job_registry());
 
         let result = tool
-            .call(TerminalArgs {
-                description: "wait for terminal input and echo it back".to_string(),
-                script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"".to_string(),
-                mode: TerminalExecutionMode::Sandboxed,
-                ssh_server_id: None,
-                expect: OutputFormat::Text,
-                resolution: MediaResolution::Auto,
-                timeout: 0,
-                max_lines: 50,
-                raw: false,
-            })
+            .call(
+                TerminalArgs {
+                    description: "wait for terminal input and echo it back".to_string(),
+                    script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\""
+                        .to_string(),
+                    mode: TerminalExecutionMode::Sandboxed,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    timeout: 0,
+                    max_lines: 50,
+                    raw: false,
+                },
+                ToolContext::new(),
+            )
             .await
             .expect("terminal call should succeed");
 
@@ -3611,11 +3623,14 @@ mod tests {
             .expect("timeout=0 should return a background task id");
 
         input_tool
-            .call(InputTerminalArgs {
-                task_id: task_id.clone(),
-                input: "lexo".to_string(),
-                append_newline: true,
-            })
+            .call(
+                InputTerminalArgs {
+                    task_id: task_id.clone(),
+                    input: "lexo".to_string(),
+                    append_newline: true,
+                },
+                ToolContext::new(),
+            )
             .await
             .expect("terminal_input should succeed");
 
@@ -3653,17 +3668,20 @@ mod tests {
         let child_pid_path = dir.path().join("child.pid");
 
         let result = tool
-            .call(TerminalArgs {
-                description: "start a descendant process".to_string(),
-                script: "sleep 30 & echo $! > child.pid; wait".to_string(),
-                mode: TerminalExecutionMode::Sandboxed,
-                ssh_server_id: None,
-                expect: OutputFormat::Text,
-                resolution: MediaResolution::Auto,
-                timeout: 0,
-                max_lines: 50,
-                raw: false,
-            })
+            .call(
+                TerminalArgs {
+                    description: "start a descendant process".to_string(),
+                    script: "sleep 30 & echo $! > child.pid; wait".to_string(),
+                    mode: TerminalExecutionMode::Sandboxed,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    timeout: 0,
+                    max_lines: 50,
+                    raw: false,
+                },
+                ToolContext::new(),
+            )
             .await
             .expect("terminal call should succeed");
         let payload = parse_terminal_tool_result(&result);
@@ -3722,17 +3740,21 @@ mod tests {
         let input_tool = InputTerminalTool::new(tool.job_registry());
 
         let result = tool
-            .call(TerminalArgs {
-                description: "wait for terminal input and echo it back".to_string(),
-                script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"".to_string(),
-                mode: TerminalExecutionMode::Sandboxed,
-                ssh_server_id: None,
-                expect: OutputFormat::Text,
-                resolution: MediaResolution::Auto,
-                timeout: 30,
-                max_lines: 50,
-                raw: false,
-            })
+            .call(
+                TerminalArgs {
+                    description: "wait for terminal input and echo it back".to_string(),
+                    script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\""
+                        .to_string(),
+                    mode: TerminalExecutionMode::Sandboxed,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    timeout: 30,
+                    max_lines: 50,
+                    raw: false,
+                },
+                ToolContext::new(),
+            )
             .await
             .expect("terminal call should succeed");
 
@@ -3749,11 +3771,14 @@ mod tests {
         );
 
         input_tool
-            .call(InputTerminalArgs {
-                task_id: task_id.clone(),
-                input: "lexo".to_string(),
-                append_newline: true,
-            })
+            .call(
+                InputTerminalArgs {
+                    task_id: task_id.clone(),
+                    input: "lexo".to_string(),
+                    append_newline: true,
+                },
+                ToolContext::new(),
+            )
             .await
             .expect("terminal_input should succeed");
 

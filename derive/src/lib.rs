@@ -8,7 +8,8 @@
 //! ## Quick Start
 //!
 //! Transform any async function into an AI tool by adding the `#[tool]` attribute.
-//! Tool description comes from rustdoc on the Args struct:
+//! The tool description is the function's rustdoc, or, when the function has
+//! none, the rustdoc on its single Args struct:
 //!
 //! ```rust
 //! use aither::Result;
@@ -82,6 +83,34 @@
 //! }
 //! ```
 //!
+//! ### Reporting Progress
+//!
+//! A parameter of type `ToolContext` receives the call's context instead of a
+//! model-supplied argument; it is left out of the argument schema. Report
+//! progress through it — a no-op when the caller does not listen.
+//!
+//! ```rust
+//! use aither::Result;
+//! use aither::llm::ToolContext;
+//! use aither::llm::tool::Progress;
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//!
+//! /// Index the given documents.
+//! #[derive(JsonSchema, Deserialize)]
+//! pub struct IndexArgs {
+//!     pub documents: Vec<String>,
+//! }
+//!
+//! #[tool]
+//! pub async fn index(args: IndexArgs, mut cx: ToolContext) -> Result<usize> {
+//!     for (done, _document) in args.documents.iter().enumerate() {
+//!         cx.report_progress(Progress::new(done as f64 + 1.0)).await?;
+//!     }
+//!     Ok(args.documents.len())
+//! }
+//! ```
+//!
 //! ## Requirements
 //!
 //! - Functions must be `async`
@@ -141,7 +170,9 @@ impl Parse for ToolArgs {
 /// This procedural macro generates the necessary boilerplate code to make your function
 /// callable through the `aither::llm::Tool` trait.
 ///
-/// Tool description is extracted from rustdoc on the Args struct via `schemars::JsonSchema`.
+/// The tool description is the function's rustdoc. A function without one
+/// falls back to the rustdoc on its single Args struct, which
+/// `schemars::JsonSchema` records.
 ///
 /// # Arguments
 ///
@@ -250,12 +281,26 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
 
     let tool_struct_name = format_ident!("{}", fn_name.to_string().to_case(Case::Pascal));
 
+    // The function's rustdoc describes the tool. Without it the description
+    // falls back to the rustdoc on the arguments type, which only a
+    // single-parameter tool has.
+    let description = doc_text(&input_fn.attrs).map(|text| {
+        quote! {
+            fn description(&self) -> ::aither::__hidden::CowStr {
+                #text.into()
+            }
+        }
+    });
+
+    // The context parameter, if any, is not an argument the model fills in.
+    let (context_position, data_inputs) = split_context_parameter(&input_fn.sig.inputs)?;
+
     // Analyze function signature
     let AnalyzedArgs {
         args_type,
         params,
         stream,
-    } = analyze_function_args(fn_vis, &tool_struct_name, &input_fn.sig.inputs)?;
+    } = analyze_function_args(fn_vis, &tool_struct_name, &data_inputs)?;
 
     if input_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
@@ -264,19 +309,30 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
         ));
     }
 
-    let call_expr = if params.is_empty() {
-        // No parameters, call the function directly
-        quote! { #fn_name().await }
-    } else {
-        // Call the function with extracted parameters
-        let args_tuple = quote! { #(#params),* };
-        quote! { #fn_name(#args_tuple).await }
-    };
+    // Call the function with its parameters in declaration order, the
+    // context in the position the function declared it.
+    let mut call_args: Vec<proc_macro2::TokenStream> =
+        params.iter().map(|param| quote! { #param }).collect();
+    if let Some(position) = context_position {
+        call_args.insert(position, quote! { cx });
+    }
+    let call_expr = quote! { #fn_name(#(#call_args),*).await };
 
     let extractor = if params.len() <= 1 {
         quote! {}
     } else {
         quote! { let Self::Arguments { #(#params),* } = args; }
+    };
+
+    let args_binding = if params.is_empty() {
+        quote! { _args }
+    } else {
+        quote! { args }
+    };
+    let context_binding = if context_position.is_some() {
+        quote! { cx }
+    } else {
+        quote! { _cx }
     };
 
     let expanded = quote! {
@@ -292,10 +348,15 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
             fn name(&self) -> ::aither::__hidden::CowStr {
                 #tool_name.into()
             }
+            #description
             type Arguments = #args_type;
             type Res = ::aither::llm::ToolResult;
 
-            async fn call(&self, args: Self::Arguments) -> ::aither::Result<Self::Res> {
+            async fn call(
+                &self,
+                #args_binding: Self::Arguments,
+                #context_binding: ::aither::llm::ToolContext,
+            ) -> ::aither::Result<Self::Res> {
                 #extractor
                 ::aither::llm::IntoToolResult::into_tool_result(#call_expr)
             }
@@ -303,6 +364,78 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
     };
 
     Ok(expanded)
+}
+
+/// The text of the `///` comments in `attrs`, one line per attribute with the
+/// single leading space rustdoc strips removed, or `None` when there are none.
+fn doc_text(attrs: &[syn::Attribute]) -> Option<String> {
+    let lines: Vec<String> = attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("doc"))
+        .filter_map(|attr| match &attr.meta {
+            syn::Meta::NameValue(syn::MetaNameValue {
+                value:
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(text),
+                        ..
+                    }),
+                ..
+            }) => Some(text.value()),
+            _ => None,
+        })
+        .map(|line| {
+            line.strip_prefix(' ')
+                .map_or_else(|| line.clone(), str::to_owned)
+        })
+        .collect();
+    let text = lines.join("\n");
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// Separates the call's `ToolContext` parameter from the model-facing ones.
+///
+/// A parameter is the context when its type is a path ending in
+/// `ToolContext`; a proc macro sees tokens, not resolved types, so the name is
+/// what identifies it. Returns the context's position among all parameters
+/// and the remaining parameters. More than one context parameter is an error.
+fn split_context_parameter(
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::Token![,]>,
+) -> syn::Result<(
+    Option<usize>,
+    syn::punctuated::Punctuated<FnArg, syn::Token![,]>,
+)> {
+    let mut position = None;
+    let mut data = syn::punctuated::Punctuated::new();
+    for (index, input) in inputs.iter().enumerate() {
+        if is_context_parameter(input) {
+            if position.is_some() {
+                return Err(syn::Error::new_spanned(
+                    input,
+                    "a tool function takes at most one `ToolContext` parameter",
+                ));
+            }
+            position = Some(index);
+        } else {
+            data.push(input.clone());
+        }
+    }
+    Ok((position, data))
+}
+
+fn is_context_parameter(input: &FnArg) -> bool {
+    let FnArg::Typed(pat_type) = input else {
+        return false;
+    };
+    let Type::Path(path) = pat_type.ty.as_ref() else {
+        return false;
+    };
+    path.qself.is_none()
+        && path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "ToolContext")
 }
 
 /// Container for analyzed function arguments and generated types.

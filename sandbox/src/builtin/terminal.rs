@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 
+use aither_core::llm::ToolContext;
 use aither_core::llm::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -37,7 +38,11 @@ impl Tool for KillTerminalTool {
     type Arguments = KillTerminalArgs;
     type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let task_id = args.task_id.trim();
         if task_id.is_empty() {
             return Err(anyhow::anyhow!("task_id must not be empty"));
@@ -95,7 +100,11 @@ impl Tool for InputTerminalTool {
     type Arguments = InputTerminalArgs;
     type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let task_id = args.task_id.trim();
         if task_id.is_empty() {
             return Err(anyhow::anyhow!("task_id must not be empty"));
@@ -170,7 +179,11 @@ impl Tool for ReadTerminalDeltaTool {
     type Arguments = ReadTerminalDeltaArgs;
     type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let task_id = args.task_id.trim();
         if task_id.is_empty() {
             return Err(anyhow::anyhow!("task_id must not be empty"));

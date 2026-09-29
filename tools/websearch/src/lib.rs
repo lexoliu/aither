@@ -41,6 +41,7 @@ pub use providers::*;
 
 use std::borrow::Cow;
 
+use aither_core::llm::ToolContext;
 use aither_core::llm::tool::json;
 use aither_core::llm::{Tool, ToolResult};
 use anyhow::Result;
@@ -138,7 +139,11 @@ where
     type Arguments = WebSearchArgs;
     type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let limit = arguments.limit.clamp(1, 10);
 
         // Retry on empty results (search engines may temporarily fail)

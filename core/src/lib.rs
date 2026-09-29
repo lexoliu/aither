@@ -63,7 +63,7 @@
 //! ### Structured Output with Tools
 //!
 //! ```rust
-//! use aither_core::llm::{LLMRequest, Message, Tool, ToolResult};
+//! use aither_core::llm::{LLMRequest, Message, Tool, ToolContext, ToolResult};
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
 //! use std::borrow::Cow;
@@ -85,7 +85,11 @@
 //!     type Arguments = WeatherQuery;
 //!     type Res = ToolResult;
 //!
-//!     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+//!     async fn call(
+//!         &self,
+//!         args: Self::Arguments,
+//!         _cx: ToolContext,
+//!     ) -> aither_core::Result<Self::Res> {
 //!         Ok(ToolResult::text(format!("Weather in {}: 22°C, sunny", args.location)))
 //!     }
 //! }

@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use aither_core::llm::ToolContext;
 use aither_core::llm::{Tool, ToolResult, tool::json};
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwap;
@@ -178,7 +179,11 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
     type Arguments = FsOperation;
     type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         match arguments {
             FsOperation::Read { path } => {
                 let content = self

@@ -131,6 +131,7 @@ impl<T: Transport> McpClient<T> {
         let params = CallToolParams {
             name: name.to_string(),
             arguments,
+            meta: None,
         };
         let request = JsonRpcRequest::with_params(0i64, "tools/call", params);
 

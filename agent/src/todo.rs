@@ -245,6 +245,7 @@ impl Tool for TodoTool {
     fn call(
         &self,
         arguments: Self::Arguments,
+        _cx: aither_core::llm::ToolContext,
     ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
         std::future::ready((|| {
             // Validate: at most one task should be in_progress

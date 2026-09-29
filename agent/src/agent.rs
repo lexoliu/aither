@@ -852,9 +852,10 @@ where
             }
             PreToolAction::Allow => {
                 let start = Instant::now();
+                // The agent loop has nowhere to show a tool's progress.
                 let result = self
                     .tools
-                    .call(&call.name, args_json)
+                    .call(&call.name, args_json, aither_core::llm::ToolContext::new())
                     .await
                     .unwrap_or_else(|error| {
                         let mut message = String::from("Error: ");

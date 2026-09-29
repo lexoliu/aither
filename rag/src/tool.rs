@@ -1,6 +1,7 @@
 //! Tool trait implementation for RAG.
 
 use aither_core::embedding::EmbeddingModel;
+use aither_core::llm::ToolContext;
 use aither_core::llm::tool::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -47,7 +48,11 @@ where
     type Arguments = RagToolArgs;
     type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let results = self
             .store()
             .search_with_k(&arguments.query, arguments.top_k)
@@ -131,7 +136,7 @@ mod tests {
             top_k: 5,
         };
 
-        let result = rag.call(args).await.unwrap();
+        let result = rag.call(args, ToolContext::new()).await.unwrap();
         assert!(result.render_for_model().unwrap().contains("Rust"));
     }
 }

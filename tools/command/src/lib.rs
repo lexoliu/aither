@@ -1,5 +1,6 @@
 use std::{borrow::Cow, path::PathBuf};
 
+use aither_core::llm::ToolContext;
 use aither_core::llm::{Tool, ToolResult, tool::json};
 use anyhow::{Context, Result, bail};
 use async_process::Command;
@@ -98,7 +99,11 @@ impl Tool for CommandTool {
     type Arguments = CommandArgs;
     type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         self.ensure_allowed(&arguments.program)?;
 
         let working_dir = arguments.cwd.unwrap_or_else(|| self.default_cwd.clone());

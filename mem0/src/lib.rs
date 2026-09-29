@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aither_core::embedding::EmbeddingModel;
+use aither_core::llm::ToolContext;
 use aither_core::llm::{LLMRequest, LanguageModel, Message, Tool, ToolResult};
 use anyhow::Context;
 use async_channel::Sender;
@@ -50,7 +51,11 @@ where
         "search_memories".into()
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let result = self
             .inner
             .retrieve_formatted(&arguments, 50)
@@ -85,7 +90,11 @@ where
         "add_fact".into()
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         self.inner
             .add_fact(arguments)
             .await
