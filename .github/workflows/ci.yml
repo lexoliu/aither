@@ -129,9 +129,36 @@ jobs:
         --workspace
         --exclude aither-llama --exclude aither-ort
         --exclude aither-rag --exclude aither-search
+        --exclude aither-apple
         --no-default-features --features derive,serde,agent,mcp,skills
       cache-key: portable
       os: '["ubuntu-latest", "windows-latest", "macos-latest"]'
+
+  # aither-apple compiles a Swift bridge against the Foundation Models
+  # framework, so it gets its own lane on a runner with the Foundation Models
+  # SDK rather than sharing the portability matrix. Xcode 27 supplies the
+  # public context-size query back-deployed to OS 26. The SDK 27 / OS 27 image
+  # runs deterministic native tests while deployment targets remain OS 26.
+  test-apple:
+    name: Apple Intelligence (native)
+    runs-on: xcode-27
+    timeout-minutes: 30
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "26.0"
+      IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-apple
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --locked -p aither-apple --features test --run-ignored all
+      - run: cargo clippy -p aither-apple --all-targets --features test -- -D warnings
+      - run: cargo test --doc -p aither-apple
 
   test-full:
     name: Test (all features)

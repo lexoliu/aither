@@ -28,6 +28,10 @@ name = "aither-agent"
 git_tag_name = "agent-v{{ version }}"
 
 [[package]]
+name = "aither-apple"
+git_tag_name = "apple-v{{ version }}"
+
+[[package]]
 name = "aither-attachments"
 git_tag_name = "attachments-v{{ version }}"
 
