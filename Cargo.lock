@@ -37,6 +37,7 @@ name = "aither"
 version = "0.4.1"
 dependencies = [
  "aither-agent",
+ "aither-apple",
  "aither-browser",
  "aither-claude",
  "aither-command",
@@ -124,6 +125,26 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aither-apple"
+version = "0.4.1"
+dependencies = [
+ "aither-core",
+ "async-channel",
+ "async-fs",
+ "data-url",
+ "futures-lite",
+ "futures-util",
+ "mime",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "url",
+ "zenwave",
 ]
 
 [[package]]
@@ -2259,6 +2280,12 @@ name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
+name = "data-url"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "datafusion"
@@ -7765,7 +7792,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
