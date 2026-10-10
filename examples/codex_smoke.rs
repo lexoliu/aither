@@ -1,4 +1,4 @@
-//! Smoke test for the ChatGPT Codex subscription backend.
+//! Smoke test for the `ChatGPT` Codex subscription backend.
 //!
 //! Reads credentials from `~/.codex/auth.json` (written by `codex login`),
 //! lists the backend's model catalog, and runs one Responses request.
