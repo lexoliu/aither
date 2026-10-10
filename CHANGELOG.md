@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/lexoliu/aither/compare/v0.4.1...v0.5.0) - 2026-09-17
+
+### Other
+
+- release v0.4.1 ([#73](https://github.com/lexoliu/aither/pull/73))
+- pin zenwave to hyper-rustls — default features drag in openssl-sys ([#67](https://github.com/lexoliu/aither/pull/67))
+- model shared extensions and vendor-private surface ([#63](https://github.com/lexoliu/aither/pull/63))
+
 ## [0.4.0](https://github.com/lexoliu/aither/compare/v0.3.0...v0.4.0) - 2026-09-13
 
 ### Other
