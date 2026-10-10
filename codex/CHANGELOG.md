@@ -7,29 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.0](https://github.com/lexoliu/aither/compare/webfetch-v0.5.0...webfetch-v0.6.0) - 2026-10-10
+## [0.6.0](https://github.com/lexoliu/aither/compare/codex-v0.0.0...codex-v0.6.0) - 2026-10-10
 
 ### Added
 
-- add Apple Intelligence provider
+- add aither-codex provider and gate local web tools on hosted capabilities
 - [**breaking**] tools report progress during a call; aither-mcp forwards it as notifications/progress ([#79](https://github.com/lexoliu/aither/pull/79))
-
-### Other
-
-- Merge branch 'main' into dev
-
-## [0.5.0](https://github.com/lexoliu/aither/compare/webfetch-v0.4.1...webfetch-v0.5.0) - 2026-09-17
-
-### Other
-
-- pin zenwave to hyper-rustls — default features drag in openssl-sys ([#67](https://github.com/lexoliu/aither/pull/67))
-
-## [0.3.0](https://github.com/lexoliu/aither/compare/webfetch-v0.2.0...webfetch-v0.3.0) - 2026-09-11
-
-### Added
-
 - implement the ACP server and remove the last placeholders
-- *(webfetch)* add web fetching tool for agents
 - add aither-llama integration with initial implementation and dependencies
 - implement Coder and DeepResearchAgent for enhanced coding workflows and research capabilities
 - add thinking configuration and reasoning capabilities to moderation and content generation
@@ -37,22 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add OpenAI integration with support for various models and functionalities
 - add ai-types-derive crate for procedural macros
 
-### Fixed
-
-- repair silently-broken tool APIs and give structured output a typed error
-
 ### Other
 
-- clear five advisories, and stop building two copies of Arrow
-- Merge production-readiness work into dev
-- continue clearing the lint backlog and make the test suite green
-- make the workspace buildable from a clean clone
-- Enhance RAG and sandbox with semantic processing
-- Refactor and improve code quality across multiple modules
-- Integrate new features
-- Derive tool descriptions from args rustdoc comments
-- Add sandboxed bash tool and bash-first agent
-- Add WebFetch tool and improve tool handling
+- Merge remote-tracking branch 'origin/dev' into codex-provider
 - Add repository guidelines, integrate Claude and OpenAI modules, and update workspace configuration
 - Rename `ai-types` to aither
 - Release v0.0.1
