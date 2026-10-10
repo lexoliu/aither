@@ -11,6 +11,7 @@ pub use message::{
 pub use types::{
     CallToolParams, CallToolResult, CancelledParams, ClientCapabilities, Content, EmbeddedResource,
     ImageContent, InitializeParams, InitializeResult, ListToolsResult, McpToolDefinition,
-    PROTOCOL_VERSION, PromptMessage, Resource, ResourceContent, ResourceContents,
-    ServerCapabilities, ServerInfo, TextContent, ToolsCapability,
+    PROTOCOL_VERSION, ProgressNotificationParams, ProgressToken, PromptMessage, RequestMeta,
+    Resource, ResourceContent, ResourceContents, ServerCapabilities, ServerInfo, TextContent,
+    ToolsCapability,
 };

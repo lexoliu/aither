@@ -3,7 +3,8 @@
 //! All registered tools are always loaded into the LLM context.
 
 use aither_core::llm::tool::{
-    IntoToolResult, RegisterError, Tool, ToolDefinition, ToolResult, Tools as CoreTools,
+    IntoToolResult, RegisterError, Tool, ToolContext, ToolDefinition, ToolResult,
+    Tools as CoreTools,
 };
 #[cfg(feature = "mcp")]
 use aither_mcp::{McpConnection, McpToolService};
@@ -76,13 +77,13 @@ impl AgentTools {
             let handler = entry.handler;
             self.eager.register_dyn(
                 entry.definition,
-                move |args: &str| -> Pin<
+                move |args: &str, cx: ToolContext| -> Pin<
                     Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send>,
                 > {
                 let handler = handler.clone();
                 let args = args.to_string();
                 Box::pin(async move {
-                    handler(&args).await.into_tool_result()
+                    handler(&args, cx).await.into_tool_result()
                 })
                 },
             )
@@ -116,14 +117,22 @@ impl AgentTools {
 
     /// Calls a tool by name with JSON arguments.
     ///
-    /// Searches eager tools first, then MCP tools.
+    /// Searches eager tools first, then MCP tools. An eager tool runs with
+    /// `cx` as its [`ToolContext`]; an MCP tool runs in its server, which
+    /// reports to nobody here because no progress token is sent with the
+    /// request.
     ///
     /// # Errors
     ///
     /// Returns an error if the tool is not found or execution fails.
-    pub async fn call(&self, name: &str, args: &str) -> aither_core::Result<ToolResult> {
+    pub async fn call(
+        &self,
+        name: &str,
+        args: &str,
+        cx: ToolContext,
+    ) -> aither_core::Result<ToolResult> {
         if self.eager.definitions().iter().any(|d| d.name() == name) {
-            return self.eager.call(name, args).await;
+            return self.eager.call(name, args, cx).await;
         }
 
         #[cfg(feature = "mcp")]
@@ -229,6 +238,7 @@ mod tests {
         fn call(
             &self,
             _args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
         ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
             std::future::ready(Ok(ToolResult::text("ok")))
         }

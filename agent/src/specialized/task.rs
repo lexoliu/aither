@@ -12,6 +12,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aither_core::llm::ToolContext;
 use aither_core::{
     LanguageModel,
     llm::{Tool, ToolResult},
@@ -448,7 +449,11 @@ where
     type Arguments = SubagentArgs;
     type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         // Determine if subagent is a file path or a registered type name
         // File paths contain '/' or end with '.md'
         let is_file_path = args.subagent.contains('/')

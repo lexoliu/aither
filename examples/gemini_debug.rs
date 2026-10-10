@@ -91,6 +91,7 @@ impl Tool for EchoTool {
     fn call(
         &self,
         arguments: Self::Arguments,
+        _cx: aither_core::llm::ToolContext,
     ) -> impl core::future::Future<Output = aither_core::Result<Self::Res>> + Send {
         let text = arguments.text;
         async move { Ok(aither_core::llm::ToolResult::text(format!("echo: {text}"))) }

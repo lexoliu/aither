@@ -12,6 +12,7 @@
 use std::borrow::Cow;
 
 use aither_core::LanguageModel;
+use aither_core::llm::ToolContext;
 use aither_core::llm::{Event, LLMRequest, Message, Tool, ToolResult};
 use futures_lite::StreamExt;
 use schemars::JsonSchema;
@@ -120,7 +121,11 @@ impl<LLM: LanguageModel> Tool for AskCommand<LLM> {
     type Arguments = AskArgs;
     type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         if args.input.is_empty() {
             return Ok(ToolResult::text("No input provided. Pipe content to ask."));
         }

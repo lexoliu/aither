@@ -173,6 +173,49 @@ pub struct CallToolParams {
     /// Tool arguments.
     #[serde(default)]
     pub arguments: Value,
+    /// Request metadata, carrying the progress token when the caller wants
+    /// progress notifications for this call.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
+}
+
+/// The `_meta` object of a request's parameters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestMeta {
+    /// Token the receiver quotes in `notifications/progress` for this
+    /// request. Absent when the caller does not want progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_token: Option<ProgressToken>,
+}
+
+/// Identifies the request a `notifications/progress` notification is about.
+///
+/// Chosen by the requester, unique across its active requests, and either a
+/// string or an integer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProgressToken {
+    /// String token.
+    String(String),
+    /// Integer token.
+    Number(i64),
+}
+
+/// Parameters of a `notifications/progress` notification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgressNotificationParams {
+    /// The token from the request this progress is about.
+    pub progress_token: ProgressToken,
+    /// Work done so far; increases with every notification.
+    pub progress: f64,
+    /// Total work, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<f64>,
+    /// Human-readable description of the current state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Tool call result.

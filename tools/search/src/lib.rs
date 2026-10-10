@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use aither_core::llm::ToolContext;
 use aither_core::{
     EmbeddingModel,
     llm::{Tool, ToolResult},
@@ -447,7 +448,11 @@ where
     type Arguments = SearchArgs;
     type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let result = async {
             let mut args = Self::normalize_args(arguments)?;
             if let Some(path) = args.path.as_deref() {

@@ -61,6 +61,7 @@ use aither_sandbox::{
 /// System prompt template for terminal-first agents.
 #[derive(Template)]
 #[template(path = "system.txt", escape = "none")]
+#[allow(clippy::struct_excessive_bools)]
 struct SystemPrompt {
     os: String,
     os_version: String,
@@ -75,6 +76,7 @@ struct SystemPrompt {
     subagents: String,
     has_subagents: bool,
     is_macos: bool,
+    has_websearch_command: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -632,6 +634,7 @@ where
             subagents,
             has_subagents,
             is_macos,
+            has_websearch_command: self.has_command("websearch"),
         };
 
         let prompt = template
@@ -838,6 +841,11 @@ where
         &self.tool_descriptions
     }
 
+    /// Whether a CLI command with `name` is registered in the terminal registry.
+    fn has_command(&self, name: &str) -> bool {
+        self.tool_descriptions.iter().any(|(n, _)| n == name)
+    }
+
     /// Returns a factory for spawning child terminal tools (for subagents).
     #[must_use]
     pub fn terminal_tool_factory(&self) -> TerminalToolFactory {
@@ -858,7 +866,15 @@ where
     ///
     /// The returned agent exposes `terminal` plus native terminal control tools.
     /// All registered IPC tools are accessible as terminal commands.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `knowledge_and_time` prompt template fails to render.
     pub fn build(self) -> Agent<LLM, LLM, LLM, H> {
+        // Render knowledge/time guidance against the actual command registry so
+        // it never references a command that was not registered.
+        let websearch_command = self.has_command("websearch");
+
         // Build registry
         let registry = std::sync::Arc::new(
             self.registry_builder
@@ -873,7 +889,17 @@ where
             terminal_tool.start_factory_service(receiver);
         }
 
-        let inner = self.inner.terminal(terminal_tool);
+        let inner = if self.inner.has_system_named("knowledge_and_time") {
+            self.inner
+        } else {
+            self.inner.system_named(
+                "knowledge_and_time",
+                crate::agent::KnowledgeAndTimeTemplate { websearch_command }
+                    .render()
+                    .expect("failed to render knowledge_and_time template"),
+            )
+        };
+        let inner = inner.terminal(terminal_tool);
         #[cfg(feature = "skills")]
         let inner = if let Some(registry) = self.skill_registry {
             inner.skill_registry(Arc::new(registry))
@@ -1127,6 +1153,7 @@ mod tests {
         fn call(
             &self,
             _args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
         ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
             std::future::ready(Ok(aither_core::llm::ToolResult::text("ok")))
         }
@@ -1143,8 +1170,8 @@ mod tests {
     #[test]
     fn test_get_os_info() {
         let (os_name, os_version) = get_os_info();
-        assert!(!os_name.is_empty());
-        assert!(!os_version.is_empty());
+        assert_ne!(os_name, "");
+        assert_ne!(os_version, "");
         // On macOS, should return "macOS" and a version like "14.0"
         #[cfg(target_os = "macos")]
         assert_eq!(os_name, "macOS");
@@ -1166,6 +1193,7 @@ mod tests {
             subagents: String::new(),
             has_subagents: false,
             is_macos: true,
+            has_websearch_command: true,
         }
         .render()
         .expect("failed to render container prompt");
@@ -1192,6 +1220,7 @@ mod tests {
             subagents: String::new(),
             has_subagents: false,
             is_macos: true,
+            has_websearch_command: true,
         }
         .render()
         .expect("failed to render heel prompt");

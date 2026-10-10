@@ -401,6 +401,7 @@ async fn main() -> Result<()> {
             CloudProvider::Claude(_) => "Claude",
             CloudProvider::Gemini(_) => "Gemini",
             CloudProvider::Copilot(_) => "Copilot",
+            CloudProvider::Codex(_) => "ChatGPT",
         };
         (cloud, model, provider_name.to_string())
     };

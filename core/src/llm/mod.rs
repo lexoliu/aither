@@ -112,7 +112,7 @@ pub use researcher::{
 };
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
-pub use tool::{IntoToolResult, Tool, ToolResult};
+pub use tool::{IntoToolResult, Tool, ToolContext, ToolResult};
 
 use crate::llm::model::Profile;
 
@@ -281,12 +281,18 @@ impl<'tools> LLMRequestWithTools<'tools> {
         (self.inner, self.tools)
     }
 
-    /// Invokes a registered tool by name.
+    /// Invokes a registered tool by name, running it with `cx` as its
+    /// [`ToolContext`].
     ///
     /// # Errors
     /// Returns an error if tool is not found or the tool call fails.
-    pub async fn call_tool(&mut self, name: &str, args_json: &str) -> crate::Result<ToolResult> {
-        self.tools.call(name, args_json).await
+    pub async fn call_tool(
+        &mut self,
+        name: &str,
+        args_json: &str,
+        cx: ToolContext,
+    ) -> crate::Result<ToolResult> {
+        self.tools.call(name, args_json, cx).await
     }
 }
 

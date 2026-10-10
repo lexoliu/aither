@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aither_core::llm::{IntoToolResult, Tool, ToolResult};
+use aither_core::llm::{IntoToolResult, Tool, ToolContext, ToolResult};
 use askama::Template;
 use base64::Engine as _;
 use heel::IpcCommand;
@@ -352,15 +352,18 @@ fn tool_output_to_payload(output: impl IntoToolResult) -> Result<Option<CommandP
 
 use aither_core::llm::tool::ToolDefinition;
 
-/// A type-erased handler function for terminal tools.
-pub type DynToolHandler =
-    Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = ToolResult> + Send>> + Send + Sync>;
+/// A type-erased handler function for terminal tools: JSON arguments and the
+/// call's [`ToolContext`] in, result out.
+pub type DynToolHandler = Arc<
+    dyn Fn(&str, ToolContext) -> Pin<Box<dyn Future<Output = ToolResult> + Send>> + Send + Sync,
+>;
 
 /// One type-erased tool in a terminal capability bundle.
 pub struct DynTerminalToolEntry {
     /// Tool definition exposed to the model.
     pub definition: ToolDefinition,
-    /// Handler that takes JSON arguments and returns a result.
+    /// Handler that takes JSON arguments and the call's context and returns a
+    /// result.
     pub handler: DynToolHandler,
 }
 
@@ -379,6 +382,7 @@ pub struct DynTerminalTool {
     pub(crate) permission_receiver: crate::terminal::PermissionEventReceiver,
     pub(crate) job_registry: crate::job_registry::JobRegistry,
     pub(crate) working_dir: PathBuf,
+    pub(crate) command_names: Vec<String>,
 }
 
 impl DynTerminalTool {
@@ -404,6 +408,12 @@ impl DynTerminalTool {
     #[must_use]
     pub const fn working_dir(&self) -> &PathBuf {
         &self.working_dir
+    }
+
+    /// Whether a CLI command with `name` is registered in the shared registry.
+    #[must_use]
+    pub fn has_command(&self, name: &str) -> bool {
+        self.command_names.iter().any(|n| n == name)
     }
 
     /// Consumes the bundle and returns every native terminal tool entry.
@@ -485,7 +495,11 @@ impl ToolRegistryBuilder {
                         return Err(tool_usage_error(message.as_str(), name.as_str()));
                     }
                 };
-                let output = tool.call(parsed).await.map_err(|error| error.to_string())?;
+                // A shell invocation has nowhere to show progress.
+                let output = tool
+                    .call(parsed, ToolContext::new())
+                    .await
+                    .map_err(|error| error.to_string())?;
                 tool_output_to_payload(output)
             })
         });
@@ -982,7 +996,8 @@ where
     pub async fn execute(&self, args: &[String]) -> anyhow::Result<String> {
         let json_args = cli_to_json(&self.schema, args)?;
         let parsed: T::Arguments = serde_json::from_value(json_args)?;
-        let output = self.tool.call(parsed).await?;
+        // A CLI invocation has nowhere to show progress.
+        let output = self.tool.call(parsed, ToolContext::new()).await?;
         let payload = tool_output_to_payload(output).map_err(anyhow::Error::msg)?;
         payload.map_or_else(
             || Ok(String::new()),
@@ -1117,7 +1132,8 @@ where
             }
         };
 
-        match self.tool.call(parsed).await {
+        // A shell invocation has nowhere to show progress.
+        match self.tool.call(parsed, ToolContext::new()).await {
             Ok(output) => match tool_output_to_payload(output) {
                 Ok(Some(payload)) => CommandEnvelope::success(payload),
                 Ok(None) => CommandEnvelope::success_empty(),
@@ -2550,6 +2566,7 @@ mod tests {
             fn call(
                 &self,
                 args: Self::Arguments,
+                _cx: aither_core::llm::ToolContext,
             ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send
             {
                 // Return the parsed args as JSON so we can inspect

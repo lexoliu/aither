@@ -44,10 +44,22 @@ impl ModelRegistry {
 
     fn from_entries(entries: Vec<ModelEntry>) -> Self {
         let mut index = HashMap::with_capacity(entries.len() * 2);
+        // Canonical IDs index first-party records only. Unprefixed keys
+        // (`claude-sonnet-4-5`) come first so a bare query resolves the
+        // vendor's own record rather than whichever hosted variant
+        // (`github_copilot/claude-sonnet-4`, `bedrock/…`) appears first.
         for (i, entry) in entries.iter().enumerate() {
-            // Index by canonical ID (lowercase)
-            index.entry(entry.id().to_lowercase()).or_insert(i);
-            // Index by litellm ID (lowercase)
+            if entry.litellm_id() == entry.id() {
+                index.entry(entry.id().to_lowercase()).or_insert(i);
+            }
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            if is_first_party(entry) {
+                index.entry(entry.id().to_lowercase()).or_insert(i);
+            }
+        }
+        // Every entry stays reachable by its full `LiteLLM` key.
+        for (i, entry) in entries.iter().enumerate() {
             index.entry(entry.litellm_id().to_lowercase()).or_insert(i);
         }
         let chat_price_breakpoints = ChatPriceBreakpoints::compute(entries.iter());
@@ -73,21 +85,24 @@ impl ModelRegistry {
         classify_entry(entry, self.chat_price_breakpoints)
     }
 
-    /// Exact match by canonical ID or `LiteLLM` ID, then prefix match.
+    /// Exact match on the `LiteLLM` key, then version-suffix normalization.
+    ///
+    /// Normalization strips trailing `-vN[:M]`, `-YYYYMMDD`, `-YYYY-MM-DD`,
+    /// and `@YYYYMMDD` suffixes, so dated or versioned aliases resolve to
+    /// the base model's record. It never binds a bare query to a
+    /// provider-scoped key (`github_copilot/claude-sonnet-4` only answers
+    /// `github_copilot/` lookups) and never changes the model family: an
+    /// unknown or retired ID returns `None`.
     #[must_use]
     pub fn lookup(&self, model_id: &str) -> Option<&ModelEntry> {
-        let lower = model_id.to_lowercase();
-
-        // Exact match
-        if let Some(&idx) = self.index.get(&lower) {
-            return Some(&self.entries[idx]);
+        let mut id = model_id.to_lowercase();
+        loop {
+            if let Some(&idx) = self.index.get(id.as_str()) {
+                return Some(&self.entries[idx]);
+            }
+            let stripped = strip_version_suffix(&id)?;
+            id = stripped.to_owned();
         }
-
-        // Prefix match: find the longest canonical ID that is a prefix of the query
-        self.entries
-            .iter()
-            .filter(|e| lower.starts_with(&e.id().to_lowercase()))
-            .max_by_key(|e| e.id().len())
     }
 
     /// All models from a given provider.
@@ -124,6 +139,64 @@ impl ModelRegistry {
     pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// `LiteLLM` prefixes under which a vendor publishes its own models
+/// (`gemini/gemini-2.5-flash` is Google's record for its own model).
+/// Hosted variants — `azure/`, `bedrock/`, `github_copilot/`, … — are
+/// reachable by their full key but do not claim the bare canonical ID.
+const FIRST_PARTY_PREFIXES: &[&str] = &[
+    "anthropic/",
+    "cohere/",
+    "cohere_chat/",
+    "dashscope/",
+    "deepseek/",
+    "gemini/",
+    "meta-llama/",
+    "mistral/",
+    "openai/",
+    "xai/",
+];
+
+/// Whether an entry is a first-party record allowed to claim the bare
+/// canonical ID: either its key carries no provider prefix at all, or the
+/// prefix is the vendor's own namespace.
+fn is_first_party(entry: &ModelEntry) -> bool {
+    entry.litellm_id() == entry.id()
+        || FIRST_PARTY_PREFIXES
+            .iter()
+            .any(|prefix| entry.litellm_id().starts_with(prefix))
+}
+
+/// Strip one trailing version suffix from a model ID: `-vN` / `-vN:M`
+/// (Bedrock), `-YYYYMMDD` / `-YYYY-MM-DD` (dated snapshots), or `@YYYYMMDD`
+/// (Vertex). Returns the base ID, or `None` when no suffix is recognized.
+fn strip_version_suffix(id: &str) -> Option<&str> {
+    let bytes = id.as_bytes();
+    let n = bytes.len();
+    if let Some((base, suffix)) = id.rsplit_once('-')
+        && let Some(rest) = suffix.strip_prefix('v')
+        && rest
+            .split(':')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Some(base);
+    }
+    if n > 9 && matches!(bytes[n - 9], b'-' | b'@') && bytes[n - 8..].iter().all(u8::is_ascii_digit)
+    {
+        return Some(&id[..n - 9]);
+    }
+    if n > 11
+        && bytes[n - 11] == b'-'
+        && bytes[n - 6] == b'-'
+        && bytes[n - 3] == b'-'
+        && bytes[n - 10..n - 6].iter().all(u8::is_ascii_digit)
+        && bytes[n - 5..n - 3].iter().all(u8::is_ascii_digit)
+        && bytes[n - 2..].iter().all(u8::is_ascii_digit)
+    {
+        return Some(&id[..n - 11]);
+    }
+    None
 }
 
 /// Convert a `ConvertedEntry` from the shared convert module into a `ModelEntry`.

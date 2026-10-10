@@ -39,6 +39,8 @@ There is no persistent shell lifecycle. Every `terminal` call is independent.
 
 ## Available Commands
 
+Commands are registered per agent; the set below is an example. The registered list is authoritative.
+
 ```text
 websearch "query"               # Search the web (local runtime only)
 webfetch "url"                  # Fetch URL content (local runtime only)

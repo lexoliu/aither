@@ -10,6 +10,7 @@ use aither_core::{LanguageModel, llm::Tool};
 use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, PermissionEventReceiver};
 #[cfg(feature = "skills")]
 use aither_skills::SkillRegistry;
+use askama::Template;
 
 use crate::{
     agent::Agent,
@@ -208,7 +209,23 @@ where
     ///
     /// This is used for child terminal capability bundles in subagents where the
     /// concrete terminal type is not known at compile time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `knowledge_and_time` prompt template fails to render.
     pub fn dyn_terminal(mut self, dyn_tool: aither_sandbox::DynTerminalTool) -> Self {
+        // Seed knowledge/time guidance against the shared command registry so
+        // subagents are not told to run commands that were never registered
+        // (e.g. `websearch` when a provider-hosted search tool is active).
+        if !self.context.has_system_block("knowledge_and_time") {
+            let websearch_command = dyn_tool.has_command("websearch");
+            self.context.insert_system_named(
+                "knowledge_and_time",
+                crate::agent::KnowledgeAndTimeTemplate { websearch_command }
+                    .render()
+                    .expect("failed to render knowledge_and_time template"),
+            );
+        }
         self.background_receiver = Some(dyn_tool.background_receiver());
         self.permission_receiver = Some(dyn_tool.permission_receiver());
         self.job_registry = Some(dyn_tool.job_registry());
@@ -322,6 +339,11 @@ where
     pub fn system_named(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
         self.context.insert_system_named(tag, content);
         self
+    }
+
+    /// Whether a persistent system block with `tag` is already set.
+    pub(crate) fn has_system_named(&self, tag: &str) -> bool {
+        self.context.has_system_block(tag)
     }
 
     /// Inserts or replaces a persistent system block with raw text.
@@ -596,6 +618,7 @@ mod tests {
         fn call(
             &self,
             _args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
         ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
             std::future::ready(Ok(aither_core::llm::ToolResult::text("ok")))
         }
@@ -609,7 +632,7 @@ mod tests {
     #[test]
     fn test_builder_basic() {
         let agent = AgentBuilder::new(MockLlm).build();
-        assert!(agent.tools.definitions().is_empty());
+        assert_eq!(agent.tools.definitions(), []);
     }
 
     #[test]

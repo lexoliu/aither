@@ -2,9 +2,11 @@
 resolver = "2"
 
 members = [
+    "apple",
     "attachments",
     "claude",
     "cloud",
+    "codex",
     "copilot",
     "derive",
     "openai",
@@ -54,8 +56,9 @@ clippy.multiple_crate_versions = { level = "allow", priority = 1}
 
 [workspace.dependencies]
 tracing = "0.1.44"
-zenwave = { version = "0.5", default-features = false }
+zenwave = { version = "0.7", default-features = false }
 aither-core = { path = "./core", version = "0.5.0" }
+aither-apple = { path = "./apple", version = "0.5.0" }
 aither-derive = { path = "./derive", version = "0.5.0" }
 aither-ort = { path = "./ort", version = "0.5.0" }
 aither-skills = { path = "./skills", version = "0.5.0" }
@@ -76,6 +79,7 @@ aither-cloud = { path = "./cloud", version = "0.5.0" }
 aither-gemini = { path = "./gemini", version = "0.5.0" }
 aither-llama = { path = "./llama", version = "0.5.0" }
 aither-copilot = { path = "./copilot", version = "0.5.0" }
+aither-codex = { path = "./codex", version = "0.5.0" }
 aither-models = { path = "./models", version = "0.5.0" }
 aither-rag = { path = "./rag", version = "0.5.0" }
 aither-mem0 = { path = "./mem0", version = "0.5.0" }
@@ -114,8 +118,15 @@ aither-command = { workspace = true, optional = true }
 # MCP
 aither-mcp = { workspace = true, optional = true }
 
+# Apple Intelligence only exists on macOS/iOS; the crate itself compiles
+# elsewhere but the facade must not pretend the provider is wired up. Keep
+# this table after the full dependency list so nothing else is scoped.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+aither-apple = { workspace = true, optional = true }
+
 
 [dev-dependencies]
+aither-codex.workspace = true
 aither-openai.workspace = true
 aither-gemini.workspace = true
 aither-mem0.workspace = true
@@ -171,6 +182,7 @@ claude = ["aither-claude"]
 gemini = ["aither-gemini"]
 llama = ["aither-llama"]
 ort = ["aither-ort"]
+apple = ["dep:aither-apple"]
 
 # High-level features
 agent = ["aither-agent"]
@@ -190,7 +202,7 @@ command = ["aither-command"]
 mcp = ["aither-mcp"]
 
 # Convenience feature to enable all providers
-all-providers = ["openai", "claude", "gemini", "llama", "ort"]
+all-providers = ["openai", "claude", "gemini", "llama", "ort", "apple"]
 
 # Convenience feature to enable all tools
 all-tools = ["browser", "websearch", "webfetch", "search", "fs", "command"]

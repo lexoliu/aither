@@ -7,6 +7,7 @@
 //! allowing unified model listing and instantiation across providers.
 
 pub use aither_claude::{self as claude, Claude, ClaudeProvider};
+pub use aither_codex::{self as codex, Codex, CodexProvider};
 pub use aither_copilot::{self as copilot, Copilot, CopilotProvider};
 pub use aither_gemini::{self as gemini, Gemini, GeminiProvider};
 pub use aither_openai::{self as openai, OpenAI, OpenAIProvider};
@@ -32,6 +33,8 @@ pub enum CloudProvider {
     Gemini(Gemini),
     /// GitHub Copilot models.
     Copilot(Copilot),
+    /// ChatGPT Codex subscription models.
+    Codex(Codex),
 }
 
 /// Unified embedding-capable cloud provider.
@@ -72,6 +75,7 @@ impl TryFrom<CloudProvider> for CloudEmbedder {
             CloudProvider::Gemini(client) => Ok(Self::Gemini(client)),
             CloudProvider::Claude(_) => Err(CloudEmbedderError::UnsupportedProvider("claude")),
             CloudProvider::Copilot(_) => Err(CloudEmbedderError::UnsupportedProvider("copilot")),
+            CloudProvider::Codex(_) => Err(CloudEmbedderError::UnsupportedProvider("codex")),
         }
     }
 }
@@ -153,6 +157,12 @@ impl From<Copilot> for CloudProvider {
     }
 }
 
+impl From<Codex> for CloudProvider {
+    fn from(client: Codex) -> Self {
+        Self::Codex(client)
+    }
+}
+
 impl std::fmt::Debug for CloudProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -160,6 +170,7 @@ impl std::fmt::Debug for CloudProvider {
             Self::Claude(_) => f.debug_tuple("CloudProvider::Claude").finish(),
             Self::Gemini(_) => f.debug_tuple("CloudProvider::Gemini").finish(),
             Self::Copilot(_) => f.debug_tuple("CloudProvider::Copilot").finish(),
+            Self::Codex(_) => f.debug_tuple("CloudProvider::Codex").finish(),
         }
     }
 }
@@ -179,6 +190,9 @@ pub enum CloudError {
     /// GitHub Copilot API error.
     #[error("Copilot error: {0}")]
     Copilot(#[from] aither_copilot::CopilotError),
+    /// ChatGPT Codex API error.
+    #[error("Codex error: {0}")]
+    Codex(#[from] aither_codex::CodexError),
 }
 
 impl LanguageModel for CloudProvider {
@@ -193,6 +207,7 @@ impl LanguageModel for CloudProvider {
             Self::Claude(inner) => ProviderInner::Claude(inner.clone()),
             Self::Gemini(inner) => ProviderInner::Gemini(inner.clone()),
             Self::Copilot(inner) => ProviderInner::Copilot(inner.clone()),
+            Self::Codex(inner) => ProviderInner::Codex(inner.clone()),
         };
 
         async_stream::stream! {
@@ -221,6 +236,12 @@ impl LanguageModel for CloudProvider {
                         yield result.map_err(CloudError::from);
                     }
                 }
+                ProviderInner::Codex(inner) => {
+                    let mut stream = std::pin::pin!(inner.respond(request));
+                    while let Some(result) = stream.next().await {
+                        yield result.map_err(CloudError::from);
+                    }
+                }
             }
         }
     }
@@ -231,6 +252,7 @@ impl LanguageModel for CloudProvider {
             Self::Claude(inner) => inner.profile().await,
             Self::Gemini(inner) => inner.profile().await,
             Self::Copilot(inner) => inner.profile().await,
+            Self::Codex(inner) => inner.profile().await,
         }
     }
 }
@@ -241,6 +263,7 @@ enum ProviderInner {
     Claude(Claude),
     Gemini(Gemini),
     Copilot(Copilot),
+    Codex(Codex),
 }
 
 /// Unified model provider wrapping `OpenAI`, Claude, Gemini, and Copilot providers.
@@ -256,6 +279,8 @@ pub enum CloudModelProvider {
     Gemini(GeminiProvider),
     /// GitHub Copilot provider.
     Copilot(CopilotProvider),
+    /// ChatGPT Codex provider.
+    Codex(CodexProvider),
 }
 
 impl From<OpenAIProvider> for CloudModelProvider {
@@ -282,6 +307,12 @@ impl From<CopilotProvider> for CloudModelProvider {
     }
 }
 
+impl From<CodexProvider> for CloudModelProvider {
+    fn from(provider: CodexProvider) -> Self {
+        Self::Codex(provider)
+    }
+}
+
 impl LanguageModelProvider for CloudModelProvider {
     type Model = CloudProvider;
     type Error = CloudError;
@@ -296,6 +327,7 @@ impl LanguageModelProvider for CloudModelProvider {
                 Self::Claude(p) => p.list_models().await.map_err(CloudError::from),
                 Self::Gemini(p) => p.list_models().await.map_err(CloudError::from),
                 Self::Copilot(p) => p.list_models().await.map_err(CloudError::from),
+                Self::Codex(p) => p.list_models().await.map_err(CloudError::from),
             }
         }
     }
@@ -324,6 +356,11 @@ impl LanguageModelProvider for CloudModelProvider {
                     .map(CloudProvider::from)
                     .map_err(CloudError::from),
                 Self::Copilot(p) => p
+                    .get_model(&name)
+                    .await
+                    .map(CloudProvider::from)
+                    .map_err(CloudError::from),
+                Self::Codex(p) => p
                     .get_model(&name)
                     .await
                     .map(CloudProvider::from)
