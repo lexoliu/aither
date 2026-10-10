@@ -62,6 +62,12 @@ pub use aither_llama as llama;
 #[cfg(feature = "ort")]
 pub use aither_ort as ort;
 
+/// Apple Intelligence on-device model provider.
+///
+/// Only exists on macOS/iOS — the `apple` feature is a no-op elsewhere.
+#[cfg(all(feature = "apple", any(target_os = "macos", target_os = "ios")))]
+pub use aither_apple as apple;
+
 // High-level features
 #[cfg(feature = "agent")]
 pub use aither_agent as agent;
