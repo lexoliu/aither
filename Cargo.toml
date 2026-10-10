@@ -56,7 +56,7 @@ clippy.multiple_crate_versions = { level = "allow", priority = 1}
 
 [workspace.dependencies]
 tracing = "0.1.44"
-zenwave = { version = "0.5", default-features = false }
+zenwave = { version = "0.7", default-features = false }
 aither-core = { path = "./core", version = "0.4.1" }
 aither-apple = { path = "./apple", version = "0.4.1" }
 aither-derive = { path = "./derive", version = "0.4.1" }
