@@ -39,6 +39,7 @@ dependencies = [
  "aither-agent",
  "aither-browser",
  "aither-claude",
+ "aither-codex",
  "aither-command",
  "aither-core",
  "aither-derive",
@@ -195,6 +196,7 @@ name = "aither-cloud"
 version = "0.4.1"
 dependencies = [
  "aither-claude",
+ "aither-codex",
  "aither-copilot",
  "aither-core",
  "aither-gemini",
@@ -203,6 +205,29 @@ dependencies = [
  "futures-core",
  "futures-lite",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "aither-codex"
+version = "0.4.1"
+dependencies = [
+ "aither-core",
+ "aither-models",
+ "aither-openai",
+ "async-io",
+ "async-lock",
+ "async-stream",
+ "base64 0.23.1",
+ "futures-core",
+ "futures-lite",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tracing",
+ "url",
+ "zenwave",
 ]
 
 [[package]]

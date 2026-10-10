@@ -279,6 +279,15 @@ struct AllTasksCompleteReminderTemplate<'a> {
     completed_task: &'a str,
 }
 
+/// `knowledge_and_time` system block. `websearch_command` selects whether the
+/// verification hint names the `websearch` CLI command or a provider-native
+/// web search capability.
+#[derive(Template)]
+#[template(path = "knowledge_and_time.txt", escape = "none")]
+pub struct KnowledgeAndTimeTemplate {
+    pub websearch_command: bool,
+}
+
 #[derive(serde::Serialize)]
 struct BackgroundTerminalResultXml {
     #[serde(rename = "@task_id")]
@@ -1571,10 +1580,18 @@ where
             );
         }
 
-        self.context.insert_system_named(
-            "knowledge_and_time",
-            include_str!("prompts/knowledge_and_time.txt"),
-        );
+        // TerminalAgentBuilder pre-seeds this block rendered against the
+        // command registry; keep that version when present.
+        if !self.context.has_system_block("knowledge_and_time") {
+            self.context.insert_system_named(
+                "knowledge_and_time",
+                KnowledgeAndTimeTemplate {
+                    websearch_command: true,
+                }
+                .render()
+                .expect("failed to render knowledge_and_time template"),
+            );
+        }
 
         self.context
             .insert_system_named("permissions", include_str!("prompts/permissions.txt"));

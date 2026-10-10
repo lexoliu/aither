@@ -656,7 +656,7 @@ mod tests {
         let stdout = b"Linux\naarch64\n__NO_HEEL__\n";
         let remote = parse_remote_probe_output(stdout).expect("probe output should parse");
         assert!(!remote.heel_found);
-        assert!(remote.heel_path.is_empty());
+        assert_eq!(remote.heel_path, "");
     }
 
     #[test]

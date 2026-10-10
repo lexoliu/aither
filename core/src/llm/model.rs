@@ -246,6 +246,29 @@ impl Parameters {
         self
     }
 
+    /// Whether a provider-hosted web search tool is enabled for the request.
+    ///
+    /// Checks the portable [`Self::websearch`] flag plus every provider-native
+    /// equivalent (`OpenAI` `web_search`, Gemini `google_search`, Claude
+    /// `web_search`), so callers can decide whether a client-side search tool
+    /// is redundant regardless of which provider serves the request.
+    #[must_use]
+    pub const fn hosted_web_search(&self) -> bool {
+        self.websearch
+            || self.native_tools.openai.web_search.is_some()
+            || self.native_tools.gemini.google_search
+            || self.native_tools.claude.web_search
+    }
+
+    /// Whether a provider-hosted URL fetch tool is enabled for the request.
+    ///
+    /// Covers Claude `web_fetch` and Gemini `url_context`; `OpenAI` has no
+    /// standalone fetch tool (its `web_search` reads pages internally).
+    #[must_use]
+    pub const fn hosted_web_fetch(&self) -> bool {
+        self.native_tools.claude.web_fetch || self.native_tools.gemini.url_context
+    }
+
     /// Sets `OpenAI` Responses-native tools.
     #[must_use]
     pub fn openai_tools(mut self, tools: OpenAINativeTools) -> Self {

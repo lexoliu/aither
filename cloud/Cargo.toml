@@ -15,6 +15,7 @@ categories = ["api-bindings"]
 aither-core.workspace = true
 aither-claude.workspace = true
 aither-copilot.workspace = true
+aither-codex.workspace = true
 aither-gemini.workspace = true
 aither-openai.workspace = true
 async-stream = "0.3"

@@ -5,6 +5,7 @@ members = [
     "attachments",
     "claude",
     "cloud",
+    "codex",
     "copilot",
     "derive",
     "openai",
@@ -76,6 +77,7 @@ aither-cloud = { path = "./cloud", version = "0.4.1" }
 aither-gemini = { path = "./gemini", version = "0.4.1" }
 aither-llama = { path = "./llama", version = "0.4.1" }
 aither-copilot = { path = "./copilot", version = "0.4.1" }
+aither-codex = { path = "./codex", version = "0.4.1" }
 aither-models = { path = "./models", version = "0.4.1" }
 aither-rag = { path = "./rag", version = "0.4.1" }
 aither-mem0 = { path = "./mem0", version = "0.4.1" }
@@ -116,6 +118,7 @@ aither-mcp = { workspace = true, optional = true }
 
 
 [dev-dependencies]
+aither-codex.workspace = true
 aither-openai.workspace = true
 aither-gemini.workspace = true
 aither-mem0.workspace = true

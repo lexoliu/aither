@@ -59,3 +59,18 @@ pub enum CopilotError {
     #[error("Request timed out")]
     Timeout,
 }
+
+impl CopilotError {
+    /// HTTP status code carried by transport-level errors, if any.
+    ///
+    /// Keeps status-code inspection inside this crate so callers do not need
+    /// to name the underlying HTTP client's error type.
+    #[must_use]
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Http(zenwave::Error::Http { status, .. }) => Some(status.as_u16()),
+            Self::ServerError { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+}

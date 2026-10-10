@@ -881,7 +881,7 @@ mod tests {
         context.clear_history();
 
         assert_eq!(context.system_block_count(), 1);
-        assert!(context.reminders().is_empty());
+        assert_eq!(context.reminders(), Vec::<&str>::new());
         assert!(context.handoff().is_none());
         assert_eq!(context.len_recent(), 0);
     }

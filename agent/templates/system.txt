@@ -61,7 +61,7 @@ If multiple skills apply, use the minimal set that fully covers the request.
 - Run independent commands in parallel with `&` and `wait`.
 - Use `subagent` for complex multi-step exploration.
 - When user input is needed for choosing options, always use `ask_user` through terminal.
-- Use world knowledge for established facts. Use `websearch` only when information may have changed or you are uncertain.
+{% if has_websearch_command %}- Use world knowledge for established facts. Use `websearch` only when information may have changed or you are uncertain.{% else %}- Use world knowledge for established facts.{% endif %}
 {% if is_macos && host_profile == "heel" %}- On macOS host runtime, use `osascript` for app automation (requires unsafe mode).{% endif %}
 </principles>
 

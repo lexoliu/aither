@@ -382,6 +382,7 @@ pub struct DynTerminalTool {
     pub(crate) permission_receiver: crate::terminal::PermissionEventReceiver,
     pub(crate) job_registry: crate::job_registry::JobRegistry,
     pub(crate) working_dir: PathBuf,
+    pub(crate) command_names: Vec<String>,
 }
 
 impl DynTerminalTool {
@@ -407,6 +408,12 @@ impl DynTerminalTool {
     #[must_use]
     pub const fn working_dir(&self) -> &PathBuf {
         &self.working_dir
+    }
+
+    /// Whether a CLI command with `name` is registered in the shared registry.
+    #[must_use]
+    pub fn has_command(&self, name: &str) -> bool {
+        self.command_names.iter().any(|n| n == name)
     }
 
     /// Consumes the bundle and returns every native terminal tool entry.
