@@ -33,10 +33,8 @@ fn load_credentials() -> Result<CodexCredentials> {
         .join(".codex/auth.json");
     let raw = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
     let auth: CodexCliAuth = serde_json::from_str(&raw)?;
-    let mut credentials = CodexCredentials::new(
-        auth.tokens.access_token,
-        auth.tokens.refresh_token,
-    );
+    let mut credentials =
+        CodexCredentials::new(auth.tokens.access_token, auth.tokens.refresh_token);
     if let Some(id_token) = auth.tokens.id_token {
         credentials = credentials.with_id_token(id_token);
     }
@@ -70,9 +68,7 @@ async fn main() -> Result<()> {
     println!("\n=== respond() on {slug} ===");
 
     let model = provider.get_model(&slug).await?;
-    let request = LLMRequest::new(vec![Message::user(
-        "Reply with exactly one word: pong",
-    )]);
+    let request = LLMRequest::new(vec![Message::user("Reply with exactly one word: pong")]);
     let mut stream = std::pin::pin!(model.respond(request));
     while let Some(event) = stream.next().await {
         match event? {
