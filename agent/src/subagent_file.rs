@@ -210,8 +210,8 @@ You are a test agent. Do test things.
         let explore = defs.iter().find(|d| d.id == "explore");
         assert!(explore.is_some(), "should have explore subagent");
         let explore = explore.unwrap();
-        assert!(!explore.description.is_empty());
-        assert!(!explore.system_prompt.is_empty());
+        assert_ne!(explore.description, "");
+        assert_ne!(explore.system_prompt, "");
 
         // Check that plan is present
         let plan = defs.iter().find(|d| d.id == "plan");

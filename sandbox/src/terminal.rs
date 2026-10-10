@@ -1077,6 +1077,7 @@ where
         let permission_receiver = self.permission_receiver();
         let job_registry = self.job_registry();
         let working_dir = self.working_dir().clone();
+        let command_names = self.registry().registered_tool_names();
         let entries = vec![
             erase_terminal_tool(self),
             erase_terminal_tool(KillTerminalTool::new(job_registry.clone())),
@@ -1090,6 +1091,7 @@ where
             permission_receiver,
             job_registry,
             working_dir,
+            command_names,
         }
     }
 

@@ -106,7 +106,7 @@ mod tests {
     fn collect_files_empty_directory() {
         let dir = tempdir().unwrap();
         let files = collect_files(dir.path()).unwrap();
-        assert!(files.is_empty());
+        assert_eq!(files, [] as [std::path::PathBuf; 0]);
     }
 
     #[test]

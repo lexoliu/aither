@@ -56,6 +56,10 @@ name = "aither-command"
 git_tag_name = "command-v{{ version }}"
 
 [[package]]
+name = "aither-codex"
+git_tag_name = "codex-v{{ version }}"
+
+[[package]]
 name = "aither-copilot"
 git_tag_name = "copilot-v{{ version }}"
 

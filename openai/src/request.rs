@@ -763,6 +763,10 @@ pub struct ResponsesRequest {
     prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_retention: Option<&'static str>,
+    /// `store: false` disables server-side response persistence. Required by
+    /// the `ChatGPT` Codex backend; `None` omits the field for the public API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) store: Option<bool>,
 }
 
 impl ResponsesRequest {
@@ -791,6 +795,7 @@ impl ResponsesRequest {
             include: responses_include(params),
             prompt_cache_key: params.prompt_cache_key.clone(),
             prompt_cache_retention: prompt_cache_retention(params),
+            store: None,
         }
     }
 }

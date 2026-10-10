@@ -553,19 +553,21 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, OpenAIError> {
 
     let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
     let mut backend = client();
-    let response: ModelsListResponse = request_with_timeout(
-        cfg.request_timeout,
-        backend
-            .get(&url)
-            .map_err(OpenAIError::Http)?
-            .header(
-                header::AUTHORIZATION.as_str(),
-                format!("Bearer {}", cfg.api_key),
-            )
-            .map_err(OpenAIError::Http)?
-            .json(),
-    )
-    .await?;
+    let mut builder = backend
+        .get(&url)
+        .map_err(OpenAIError::Http)?
+        .header(
+            header::AUTHORIZATION.as_str(),
+            format!("Bearer {}", cfg.api_key),
+        )
+        .map_err(OpenAIError::Http)?;
+    for (name, value) in &cfg.extra_headers {
+        builder = builder
+            .header(name.clone(), value.clone())
+            .map_err(OpenAIError::Http)?;
+    }
+    let response: ModelsListResponse =
+        request_with_timeout(cfg.request_timeout, builder.json()).await?;
 
     // Find matching model
     let mut model_found = false;
@@ -638,6 +640,11 @@ async fn chat_completions_request(
     if let Some(org) = &cfg.organization {
         builder = builder
             .header("OpenAI-Organization", org.clone())
+            .map_err(OpenAIError::Http)?;
+    }
+    for (name, value) in &cfg.extra_headers {
+        builder = builder
+            .header(name.clone(), value.clone())
             .map_err(OpenAIError::Http)?;
     }
 
@@ -1004,6 +1011,11 @@ async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStrea
             .header("OpenAI-Organization", org.clone())
             .map_err(OpenAIError::Http)?;
     }
+    for (name, value) in &cfg.extra_headers {
+        builder = builder
+            .header(name.clone(), value.clone())
+            .map_err(OpenAIError::Http)?;
+    }
 
     match request_with_timeout(
         cfg.request_timeout,
@@ -1066,7 +1078,7 @@ fn responses_stream_inner(
         let has_tools = response_tools.is_some();
         let tool_choice = responses_tool_choice(&snapshot, has_tools);
 
-        let request = ResponsesRequest::new(
+        let mut request = ResponsesRequest::new(
             cfg.chat_model.clone(),
             input,
             &snapshot,
@@ -1074,6 +1086,7 @@ fn responses_stream_inner(
             tool_choice,
             true, // stream: true
         );
+        request.store = cfg.store;
         let serialized_request = serde_json::to_string(&request).unwrap_or_default();
 
         tracing::debug!(request = %serde_json::to_string_pretty(&request).unwrap_or_default(), "Sending responses request");
@@ -1508,6 +1521,8 @@ pub struct Builder {
     native_abilities: Vec<Ability>,
     retry: RetryConfig,
     request_timeout: Duration,
+    extra_headers: Vec<(String, String)>,
+    store: Option<bool>,
 }
 
 /// Default request timeout (5 minutes - generous for long completions).
@@ -1533,6 +1548,8 @@ impl Builder {
             native_abilities: Vec::new(),
             retry: RetryConfig::default(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            extra_headers: Vec::new(),
+            store: None,
         }
     }
 
@@ -1640,6 +1657,28 @@ impl Builder {
         self
     }
 
+    /// Attach an extra header sent with every request.
+    ///
+    /// Used by endpoints that authenticate or route on custom headers (for
+    /// example the `ChatGPT` Codex backend's `ChatGPT-Account-Id`). Headers set
+    /// here are sent alongside the built-in `Authorization` header.
+    #[must_use]
+    pub fn extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Set the Responses API `store` field.
+    ///
+    /// `store: false` disables server-side response persistence. Some
+    /// backends (the `ChatGPT` Codex endpoint) require it to be present and
+    /// false; the default `None` omits the field entirely.
+    #[must_use]
+    pub const fn store(mut self, store: bool) -> Self {
+        self.store = Some(store);
+        self
+    }
+
     /// Declare extra native capabilities (e.g., web search, PDF understanding) supported by the upstream model.
     #[must_use]
     pub fn native_capabilities(mut self, abilities: impl IntoIterator<Item = Ability>) -> Self {
@@ -1719,6 +1758,8 @@ impl Builder {
                 native_abilities: self.native_abilities,
                 retry: self.retry,
                 request_timeout: self.request_timeout,
+                extra_headers: self.extra_headers,
+                store: self.store,
             }),
         }
     }
@@ -1743,6 +1784,8 @@ pub struct Config {
     pub(crate) native_abilities: Vec<Ability>,
     pub(crate) retry: RetryConfig,
     pub(crate) request_timeout: Duration,
+    pub(crate) extra_headers: Vec<(String, String)>,
+    pub(crate) store: Option<bool>,
 }
 
 impl Config {

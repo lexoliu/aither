@@ -1109,7 +1109,7 @@ mod tests {
         // Each '界' is 3 bytes; a 500-byte budget must cut on a char boundary.
         let text = "界".repeat(400);
         let preview = head_preview(&text, usize::MAX, 500);
-        assert!(!preview.is_empty());
+        assert_ne!(preview, "");
         assert!(preview.len() <= 500);
         assert!(preview.chars().all(|c| c == '界'));
     }

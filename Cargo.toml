@@ -6,6 +6,7 @@ members = [
     "attachments",
     "claude",
     "cloud",
+    "codex",
     "copilot",
     "derive",
     "openai",
@@ -55,7 +56,7 @@ clippy.multiple_crate_versions = { level = "allow", priority = 1}
 
 [workspace.dependencies]
 tracing = "0.1.44"
-zenwave = { version = "0.5", default-features = false }
+zenwave = { version = "0.7", default-features = false }
 aither-core = { path = "./core", version = "0.4.1" }
 aither-apple = { path = "./apple", version = "0.4.1" }
 aither-derive = { path = "./derive", version = "0.4.1" }
@@ -78,6 +79,7 @@ aither-cloud = { path = "./cloud", version = "0.4.1" }
 aither-gemini = { path = "./gemini", version = "0.4.1" }
 aither-llama = { path = "./llama", version = "0.4.1" }
 aither-copilot = { path = "./copilot", version = "0.4.1" }
+aither-codex = { path = "./codex", version = "0.4.1" }
 aither-models = { path = "./models", version = "0.4.1" }
 aither-rag = { path = "./rag", version = "0.4.1" }
 aither-mem0 = { path = "./mem0", version = "0.4.1" }
@@ -124,6 +126,7 @@ aither-apple = { workspace = true, optional = true }
 
 
 [dev-dependencies]
+aither-codex.workspace = true
 aither-openai.workspace = true
 aither-gemini.workspace = true
 aither-mem0.workspace = true
