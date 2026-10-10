@@ -30,20 +30,37 @@ jobs:
       # `cargo publish` verifies each tarball by compiling it; aither-search
       # builds lance/prost, which needs protoc. CI installs it too.
       - uses: arduino/setup-protoc@v3
+      # Our own builds — release-pr's semver-check rustdoc and every crate's
+      # publish verification — share the ci-ubuntu cache: CI keeps it warm
+      # between releases, a release-scoped key would go cold and never hit.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu
       # The water-rs fork of release-plz (from release-plz-v0.3.161, the
       # version release-plz-action@v0.5 pins) treats a package it cannot
       # compare with the registry as changed instead of aborting the whole
       # run. Stock release-plz walks back to the commit that last touched a
       # crate and runs `cargo package` there; older commits of this workspace
       # referenced sibling checkouts by path, so that packaging fails and the
-      # release never gets past the first crate. Bump `rev` after rebasing
-      # the fork's branch onto a newer upstream tag.
-      - uses: taiki-e/cache-cargo-install-action@v3
-        with:
-          tool: release-plz
-          git: https://github.com/water-rs/release-plz
-          rev: cc554a52e97e0ee359e45c7801d770895247cf27
-          locked: true
+      # release never gets past the first crate.
+      # The fork ships no binaries, so build-release-tools.yml compiles each
+      # revision once and hosts the tarball on the `devtools` release — the
+      # Actions cache cannot hold it across the weeks between releases.
+      # After a fork rebase, run that workflow with the new rev, then bump it
+      # here.
+      - name: Install release-plz (prebuilt)
+        env:
+          REV: cc554a52e97e0ee359e45c7801d770895247cf27
+        run: |
+          set -euo pipefail
+          asset="release-plz-${REV}-x86_64-unknown-linux-gnu.tar.gz"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/devtools"
+          curl -fsSL "${base}/${asset}" -o "${RUNNER_TEMP}/${asset}"
+          curl -fsSL "${base}/${asset}.sha256" -o "${RUNNER_TEMP}/${asset}.sha256"
+          cd "${RUNNER_TEMP}"
+          sha256sum -c "${asset}.sha256"
+          tar -xzf "${asset}" -C "${CARGO_HOME}/bin"
+          release-plz --version
       - uses: release-plz/git-config@v0.1.2
       - name: Open or update the release pull request
         run: >-
