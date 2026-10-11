@@ -692,16 +692,15 @@ pub mod tests {
                 bundle.binary(tool).bytes.as_ref()
             );
         }
-        let path = first
-            .prepend_path(Some(OsStr::new("/usr/bin:/bin")))
-            .unwrap();
-        assert_eq!(
-            std::env::split_paths(&path).next().unwrap(),
-            *first.bin_dir()
-        );
-        assert!(
-            std::env::split_paths(&path).any(|entry| entry == std::path::Path::new("/usr/bin"))
-        );
+        let existing = [
+            cache.path().join("system tools"),
+            cache.path().join("project tools"),
+        ];
+        let original_path = std::env::join_paths(&existing).unwrap();
+        let path = first.prepend_path(Some(&original_path)).unwrap();
+        let entries = std::env::split_paths(&path).collect::<Vec<_>>();
+        assert_eq!(entries[0], *first.bin_dir());
+        assert_eq!(entries[1..], existing);
     }
 
     #[tokio::test]
@@ -796,13 +795,18 @@ pub mod tests {
 
     struct RuntimeProbe;
 
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct RuntimeProbeArgs {}
+
     impl heel::IpcCommand for RuntimeProbe {
         fn name(&self) -> std::borrow::Cow<'static, str> {
             "runtime_probe".into()
         }
-        type Args = ();
-        type Response = ();
-        async fn handle(&self, (): ()) {}
+        type Args = RuntimeProbeArgs;
+        type Response = String;
+        fn handle(&self, _args: RuntimeProbeArgs) -> impl Future<Output = String> {
+            std::future::ready("runtime_probe_ok".into())
+        }
     }
 
     #[tokio::test]
@@ -824,9 +828,13 @@ pub mod tests {
             heel::Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
                 .await
                 .unwrap();
-        let output = sandbox
-            .command("sh")
-            .args(["-c", "command -v runtime_probe"])
+        #[cfg(not(windows))]
+        let command = sandbox.command("sh").args(["-c", "runtime_probe"]);
+        #[cfg(windows)]
+        let command = sandbox
+            .command("cmd.exe")
+            .args(["/D", "/S", "/C", "runtime_probe"]);
+        let output = command
             .env("PATH", path.to_str().unwrap())
             .output()
             .await
@@ -836,6 +844,7 @@ pub mod tests {
             "prepared PATH removed IPC commands: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("runtime_probe_ok"));
     }
 
     #[test]
