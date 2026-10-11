@@ -1,0 +1,1 @@
+[... line {{ first }} repeated {{ count }} times (lines {{ first }}-{{ last }}) ...]

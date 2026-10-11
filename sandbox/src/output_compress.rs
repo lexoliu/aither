@@ -1,580 +1,281 @@
-//! Output compression pipeline for terminal tool results.
+//! Output cleaning pipeline for terminal tool results.
 //!
-//! Applies semantics-preserving transformations to reduce output size:
-//! 1. JSON arrays/objects -> TSV with dot-notation flattened headers (if smaller)
-//! 2. Strip empty lines and invisible characters
-//! 3. Programming language source -> tree-sitter folded code with line numbers (raw saved separately)
+//! The pipeline is a sequence of stages, each in its own module:
 //!
-//! Stripping is done before code folding so that tree-sitter line numbers
-//! reference the cleaned text -- which is also what gets saved as the raw file.
+//! 1. [`render`] renders the byte stream the way a terminal would display it,
+//!    consuming escape sequences and resolving `\r` to the last frame of each
+//!    line.
+//! 2. [`collapse`] collapses runs of blank lines to a single blank line.
+//! 3. [`json_tsv`] turns a JSON table into TSV.
+//! 4. [`fold`] folds the bodies of blocks in output that is source code.
+//! 5. [`preview`] reduces stored text to a head+tail preview for the model.
+//!
+//! Stages 1 and 2 are the only ones applied unconditionally: together they
+//! are what a terminal would have shown, so output delivered inline -- where
+//! no copy is kept -- keeps every character the command actually produced.
+//!
+//! Stages 3 and 4 are lossy. They run only when the text they replace can be
+//! written to disk, and the text the model reads names that file, so nothing
+//! is lost. Stage 5 belongs to the stored path in [`crate::output`], which
+//! owns the inline budget.
 
-use serde_json::Value;
-use tracing::debug;
+mod collapse;
+mod fold;
+mod json_tsv;
+mod preview;
+mod render;
 
-/// Result of the compression pipeline.
-pub struct CompressedOutput {
-    /// The (possibly compressed) text to show inline.
-    pub text: String,
-    /// If the output was detected as source code, the original raw text
-    /// should be saved to a file. This field holds that raw content.
-    pub raw_for_file: Option<String>,
+use std::path::Path;
+
+use askama::Template;
+
+pub use preview::stored_preview;
+
+#[derive(Template)]
+#[template(path = "json_tsv_output.txt", escape = "none")]
+struct JsonTsvOutput<'a> {
+    tsv: &'a str,
+    url: &'a str,
+    path: &'a str,
 }
 
-/// Run the full compression pipeline on text output.
+#[derive(Template)]
+#[template(path = "folded_code_output.txt", escape = "none")]
+struct FoldedCodeOutput<'a> {
+    folded: &'a str,
+    url: &'a str,
+    path: &'a str,
+}
+
+/// Cleans foreground terminal text for the model.
 ///
-/// Returns `None` if the input is empty.
-pub fn compress_text(text: &str) -> Option<CompressedOutput> {
+/// Returns `None` when the text is already what a terminal would show and no
+/// stage applied, so the caller can keep the original bytes.
+///
+/// `store_dir` receives the original of any lossy stage; the returned text
+/// names that file. The returned text is **not** yet split between inline and
+/// stored delivery -- that is [`crate::output`]'s job, and the text handed to
+/// it is what gets stored, so the line numbers in a preview marker refer to
+/// it exactly.
+///
+/// # Errors
+///
+/// Returns an error when a lossy stage applied but its original could not be
+/// written to `store_dir`.
+pub async fn compress_text(store_dir: &Path, text: &str) -> std::io::Result<Option<String>> {
     if text.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    // Step 1: Try JSON -> TSV conversion (no raw file needed)
-    if let Some(tsv) = try_json_to_tsv(text) {
-        let cleaned = strip_noise(&tsv);
-        return Some(CompressedOutput {
-            text: cleaned,
-            raw_for_file: None,
-        });
-    }
+    let cleaned = collapse::collapse_blank_runs(&render::render_terminal(text));
 
-    // Step 2: Strip noise (empty lines, invisible chars).
-    // Done before code folding so tree-sitter line numbers match the
-    // cleaned text, which is also what we save as the raw file.
-    let cleaned = strip_noise(text);
-
-    // Step 3: Try magika detection + tree-sitter folding on the cleaned text.
-    // The raw file saved is the cleaned version (same line numbers as the fold markers).
-    if let Some(folded) = try_fold_source_code(&cleaned) {
-        return Some(CompressedOutput {
-            text: folded.folded,
-            raw_for_file: Some(cleaned),
-        });
-    }
-
-    // No code folding applied -- return cleaned text if it's smaller
-    if cleaned.len() < text.len() {
-        Some(CompressedOutput {
-            text: cleaned,
-            raw_for_file: None,
-        })
-    } else {
-        None
-    }
-}
-
-// ---------------------------------------------------------------------------
-// JSON -> TSV
-// ---------------------------------------------------------------------------
-
-/// Try to parse `text` as JSON and convert to TSV if it's an array of objects
-/// or a single object. Returns TSV string only if it's smaller than the original.
-fn try_json_to_tsv(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    let val: Value = serde_json::from_str(trimmed).ok()?;
-
-    let rows = match &val {
-        Value::Array(arr) if !arr.is_empty() => {
-            // Array of objects (or mixed) -- flatten each element
-            arr.iter().map(|v| flatten_value(v, "")).collect::<Vec<_>>()
+    if let Some(tsv) = json_tsv::to_tsv(&cleaned) {
+        let (url, path) = crate::output::save_raw_to_file(store_dir, cleaned.as_bytes()).await?;
+        let path = path.display().to_string();
+        let rendered = JsonTsvOutput {
+            tsv: tsv.trim_end_matches('\n'),
+            url: &url,
+            path: &path,
         }
-        Value::Object(_) => {
-            // Single object -- treat as one-row table
-            vec![flatten_value(&val, "")]
-        }
-        _ => return None, // Scalars, empty arrays -- not useful as TSV
-    };
-
-    if rows.is_empty() {
-        return None;
+        .render()
+        .expect("json tsv output template must render");
+        return Ok(Some(rendered));
     }
 
-    // Collect all unique column headers in insertion order
-    let mut columns: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for row in &rows {
-        for (key, _) in row {
-            if seen.insert(key.clone()) {
-                columns.push(key.clone());
-            }
+    if let Some(folded) = fold::fold_source_code(&cleaned) {
+        let (url, path) = crate::output::save_raw_to_file(store_dir, cleaned.as_bytes()).await?;
+        let path = path.display().to_string();
+        let rendered = FoldedCodeOutput {
+            folded: folded.trim_end_matches('\n'),
+            url: &url,
+            path: &path,
         }
+        .render()
+        .expect("folded code output template must render");
+        return Ok(Some(rendered));
     }
 
-    if columns.is_empty() {
-        return None;
-    }
-
-    // Build TSV
-    let mut tsv = String::new();
-
-    // Header row
-    for (i, col) in columns.iter().enumerate() {
-        if i > 0 {
-            tsv.push('\t');
-        }
-        tsv.push_str(&escape_tsv_field(col));
-    }
-    tsv.push('\n');
-
-    // Data rows
-    for row in &rows {
-        let row_map: std::collections::HashMap<&str, &str> =
-            row.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        for (i, col) in columns.iter().enumerate() {
-            if i > 0 {
-                tsv.push('\t');
-            }
-            if let Some(val) = row_map.get(col.as_str()) {
-                tsv.push_str(&escape_tsv_field(val));
-            }
-        }
-        tsv.push('\n');
-    }
-
-    // Only use TSV if it's actually smaller
-    if tsv.len() < trimmed.len() {
-        debug!(
-            json_len = trimmed.len(),
-            tsv_len = tsv.len(),
-            "compressed JSON to TSV"
-        );
-        Some(tsv)
-    } else {
-        None
-    }
-}
-
-/// Flatten a JSON value into a list of (`dotted_key`, `string_value`) pairs.
-fn flatten_value(val: &Value, prefix: &str) -> Vec<(String, String)> {
-    let mut result = Vec::new();
-    match val {
-        Value::Object(map) => {
-            for (key, child) in map {
-                let full_key = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                result.extend(flatten_value(child, &full_key));
-            }
-        }
-        Value::Array(arr) => {
-            // For arrays inside objects, serialize as JSON string
-            let s = serde_json::to_string(val).unwrap_or_default();
-            result.push((prefix.to_owned(), s));
-            let _ = arr; // suppress unused warning
-        }
-        Value::String(s) => {
-            result.push((prefix.to_owned(), s.clone()));
-        }
-        Value::Number(n) => {
-            result.push((prefix.to_owned(), n.to_string()));
-        }
-        Value::Bool(b) => {
-            result.push((prefix.to_owned(), b.to_string()));
-        }
-        Value::Null => {
-            result.push((prefix.to_owned(), String::new()));
-        }
-    }
-    result
-}
-
-/// Escape a TSV field: replace tabs and newlines with spaces.
-fn escape_tsv_field(s: &str) -> String {
-    s.replace(['\t', '\n', '\r'], " ")
-}
-
-// ---------------------------------------------------------------------------
-// Source code detection (magika) + tree-sitter folding
-// ---------------------------------------------------------------------------
-
-struct FoldedCode {
-    folded: String,
-}
-
-/// Mapping from magika `ContentType` label to tree-sitter language module.
-#[cfg(feature = "code-folding")]
-fn magika_label_to_ts_language(label: &str) -> Option<tree_sitter::Language> {
-    match label {
-        "terminal" | "shell" => Some(rs_tree_sitter_languages::bash::language()),
-        "c" => Some(rs_tree_sitter_languages::c::language()),
-        "cpp" => Some(rs_tree_sitter_languages::cpp::language()),
-        "css" => Some(rs_tree_sitter_languages::css::language()),
-        "elixir" => Some(rs_tree_sitter_languages::elixir::language()),
-        "erlang" => Some(rs_tree_sitter_languages::erlang::language()),
-        "go" => Some(rs_tree_sitter_languages::go::language()),
-        "haskell" => Some(rs_tree_sitter_languages::haskell::language()),
-        "html" => Some(rs_tree_sitter_languages::html::language()),
-        "java" => Some(rs_tree_sitter_languages::java::language()),
-        "javascript" => Some(rs_tree_sitter_languages::javascript::language()),
-        "json" => Some(rs_tree_sitter_languages::json::language()),
-        "lua" => Some(rs_tree_sitter_languages::lua::language()),
-        "markdown" => Some(rs_tree_sitter_languages::markdown::language()),
-        "perl" => Some(rs_tree_sitter_languages::perl::language()),
-        "python" => Some(rs_tree_sitter_languages::python::language()),
-        "ruby" => Some(rs_tree_sitter_languages::ruby::language()),
-        "rust" => Some(rs_tree_sitter_languages::rust::language()),
-        "toml" => Some(rs_tree_sitter_languages::toml::language()),
-        "tsx" => Some(rs_tree_sitter_languages::tsx::language()),
-        "typescript" => Some(rs_tree_sitter_languages::typescript::language()),
-        "yaml" => Some(rs_tree_sitter_languages::yaml::language()),
-        _ => None,
-    }
-}
-
-/// Set of tree-sitter node types considered "foldable blocks".
-/// These are compound statements whose body can be collapsed.
-#[cfg(feature = "code-folding")]
-fn is_foldable_node(kind: &str) -> bool {
-    matches!(
-        kind,
-        "function_definition"
-            | "function_item"
-            | "function_declaration"
-            | "method_definition"
-            | "method_declaration"
-            | "class_definition"
-            | "class_declaration"
-            | "class_body"
-            | "impl_item"
-            | "trait_item"
-            | "module"
-            | "block"
-            | "compound_statement"
-            | "if_statement"
-            | "if_expression"
-            | "for_statement"
-            | "for_expression"
-            | "while_statement"
-            | "while_expression"
-            | "match_expression"
-            | "switch_statement"
-            | "try_statement"
-            | "do_statement"
-    )
-}
-
-/// Minimum number of lines a foldable block must span to be worth folding.
-#[cfg(feature = "code-folding")]
-const MIN_FOLD_LINES: usize = 4;
-
-/// Try to detect source code via magika and fold it with tree-sitter.
-///
-/// Without the `code-folding` feature there is no content detector, so output
-/// is passed through uncompressed rather than folded incorrectly.
-#[cfg(not(feature = "code-folding"))]
-const fn try_fold_source_code(_text: &str) -> Option<FoldedCode> {
-    None
-}
-
-/// Try to detect source code via magika and fold it with tree-sitter.
-#[cfg(feature = "code-folding")]
-fn try_fold_source_code(text: &str) -> Option<FoldedCode> {
-    // Use magika to identify content type
-    let mut session = magika::Session::new().ok()?;
-    let result = session.identify_content_sync(text.as_bytes()).ok()?;
-    let label = result.info().label;
-
-    let ts_lang = magika_label_to_ts_language(label)?;
-
-    debug!(label = %label, "detected source code via magika, applying tree-sitter folding");
-
-    // Parse with tree-sitter
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&ts_lang).ok()?;
-    let tree = parser.parse(text, None)?;
-    let root = tree.root_node();
-
-    // Collect foldable ranges (line-based, 0-indexed)
-    let mut fold_ranges: Vec<(usize, usize)> = Vec::new();
-    collect_foldable_ranges(root, &mut fold_ranges);
-
-    if fold_ranges.is_empty() {
-        // No foldable blocks found, skip
-        return None;
-    }
-
-    // Sort by start line and merge overlapping ranges
-    fold_ranges.sort_by_key(|r| r.0);
-    let merged = merge_ranges(&fold_ranges);
-
-    // Build folded output
-    let lines: Vec<&str> = text.lines().collect();
-    let total_lines = lines.len();
-    let line_num_width = digit_count(total_lines);
-
-    let mut output = String::new();
-    let mut i = 0;
-
-    for (fold_start, fold_end) in &merged {
-        let fold_start = *fold_start;
-        let fold_end = (*fold_end).min(total_lines.saturating_sub(1));
-
-        // Emit lines before this fold region
-        while i < fold_start && i < total_lines {
-            append_numbered_line(&mut output, i + 1, lines[i], line_num_width);
-            i += 1;
-        }
-
-        // Emit the first line of the fold region (the signature/declaration)
-        if i < total_lines {
-            append_numbered_line(&mut output, i + 1, lines[i], line_num_width);
-            i += 1;
-        }
-
-        // Calculate how many inner lines we're folding
-        let inner_end = fold_end + 1; // exclusive
-        let folded_count = inner_end.saturating_sub(i);
-
-        if folded_count > 0 {
-            // Emit fold marker
-            let marker = format!(
-                "{:>width$}  ... ({folded_count} lines folded, lines {}-{}) ...",
-                "",
-                i + 1,
-                inner_end,
-                width = line_num_width,
-            );
-            output.push_str(&marker);
-            output.push('\n');
-            i = inner_end;
-        }
-    }
-
-    // Emit remaining lines after last fold
-    while i < total_lines {
-        append_numbered_line(&mut output, i + 1, lines[i], line_num_width);
-        i += 1;
-    }
-
-    // Only use folded version if it actually reduced size
-    if output.len() < text.len() {
-        Some(FoldedCode { folded: output })
-    } else {
-        None
-    }
-}
-
-/// Recursively collect foldable ranges from the tree-sitter AST.
-#[cfg(feature = "code-folding")]
-fn collect_foldable_ranges(node: tree_sitter::Node, ranges: &mut Vec<(usize, usize)>) {
-    if is_foldable_node(node.kind()) {
-        let start_line = node.start_position().row;
-        let end_line = node.end_position().row;
-        if end_line - start_line >= MIN_FOLD_LINES {
-            ranges.push((start_line, end_line));
-        }
-    }
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            collect_foldable_ranges(child, ranges);
-        }
-    }
-}
-
-/// Merge overlapping or adjacent ranges.
-#[cfg(feature = "code-folding")]
-fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for &(start, end) in ranges {
-        if let Some(last) = merged.last_mut()
-            && start <= last.1 + 1
-        {
-            last.1 = last.1.max(end);
-            continue;
-        }
-        merged.push((start, end));
-    }
-    merged
-}
-
-#[cfg(feature = "code-folding")]
-fn append_numbered_line(out: &mut String, line_num: usize, line: &str, width: usize) {
-    use std::fmt::Write;
-    let _ = writeln!(out, "{line_num:>width$}  {line}");
-}
-
-#[cfg(feature = "code-folding")]
-const fn digit_count(n: usize) -> usize {
-    // Counting digits by repeated division avoids a float round-trip, and so
-    // cannot be thrown off by rounding near a power of ten.
-    let mut count = 1;
-    let mut remaining = n;
-    while remaining >= 10 {
-        remaining /= 10;
-        count += 1;
-    }
-    count
-}
-
-// ---------------------------------------------------------------------------
-// Noise stripping
-// ---------------------------------------------------------------------------
-
-/// Remove empty lines and invisible/control characters while preserving semantics.
-fn strip_noise(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    for line in text.lines() {
-        // Strip invisible/control characters (keep printable + tab + standard whitespace)
-        let cleaned: String = line
-            .chars()
-            .filter(|c| {
-                // Keep printable characters, tab, and regular space
-                !c.is_control() || *c == '\t'
-            })
-            .collect();
-
-        // Skip fully empty lines (after stripping)
-        let trimmed = cleaned.trim_end();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        result.push_str(trimmed);
-        result.push('\n');
-    }
-    result
+    Ok((cleaned != text).then_some(cleaned))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_json_array_to_tsv() {
-        let json = r#"[
-            {"name": "Alice", "age": 30, "address": {"city": "NYC", "zip": "10001"}},
-            {"name": "Bob", "age": 25, "address": {"city": "LA", "zip": "90001"}}
-        ]"#;
-        let tsv = try_json_to_tsv(json).unwrap();
-        eprintln!("TSV output:\n{tsv}");
-        // Column order depends on JSON map iteration order; check individual fields
-        let lines: Vec<&str> = tsv.lines().collect();
-        let header = lines[0];
-        assert!(header.contains("name"), "header missing 'name': {header}");
-        assert!(header.contains("age"), "header missing 'age': {header}");
-        assert!(
-            header.contains("address.city"),
-            "header missing 'address.city': {header}"
+    async fn compress(text: &str) -> Option<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        compress_text(dir.path(), text)
+            .await
+            .expect("compression succeeds")
+    }
+
+    #[tokio::test]
+    async fn empty_output_is_left_alone() {
+        assert!(compress("").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn coloured_cargo_output_has_no_escape_residue() {
+        let coloured = "\u{1b}[1m\u{1b}[32m   Compiling\u{1b}[0m\u{1b}[1m aither-sandbox\u{1b}[0m v0.1.0 (/src)\n\u{1b}[1m\u{1b}[31merror\u{1b}[0m\u{1b}[1m: expected `;`\u{1b}[0m\n";
+        let cleaned = compress(coloured).await.expect("escapes are stripped");
+        assert_eq!(
+            cleaned,
+            "   Compiling aither-sandbox v0.1.0 (/src)\nerror: expected `;`\n"
         );
-        assert!(
-            header.contains("address.zip"),
-            "header missing 'address.zip': {header}"
+        for residue in ['\u{1b}', '\u{7}'] {
+            assert!(!cleaned.contains(residue), "{cleaned:?}");
+        }
+        assert!(!cleaned.contains("[0m"), "{cleaned:?}");
+        assert!(!cleaned.contains("[1m"), "{cleaned:?}");
+    }
+
+    #[tokio::test]
+    async fn coloured_git_status_has_no_escape_residue() {
+        let coloured = "On branch \u{1b}[1;36moutput-cleaning\u{1b}[m\nChanges not staged for commit:\n\t\u{1b}[31mmodified:   sandbox/src/output.rs\u{1b}[m\n";
+        let cleaned = compress(coloured).await.expect("escapes are stripped");
+        assert_eq!(
+            cleaned,
+            "On branch output-cleaning\nChanges not staged for commit:\n\tmodified:   sandbox/src/output.rs\n"
         );
-        assert!(tsv.contains("Alice"));
-        assert!(tsv.contains("Bob"));
-        assert!(tsv.contains("NYC"));
-        assert!(tsv.contains("LA"));
     }
 
-    #[test]
-    fn test_json_single_object_to_tsv() {
-        let json = r#"{"name": "Alice", "nested": {"x": 1}}"#;
-        let result = try_json_to_tsv(json);
-        // Single object with 2 fields -> TSV might not be smaller, depends on overhead
-        // But the flattening should work
-        if let Some(tsv) = result {
-            assert!(tsv.contains("name\tnested.x"));
-        }
+    #[tokio::test]
+    async fn progress_line_keeps_only_its_last_frame() {
+        let progress =
+            "\u{1b}[2K\rFetching 10/90\u{1b}[2K\rFetching 50/90\u{1b}[2K\rFetching 90/90\ndone\n";
+        let cleaned = compress(progress).await.expect("frames are resolved");
+        assert_eq!(cleaned, "Fetching 90/90\ndone\n");
     }
 
-    #[test]
-    fn test_json_scalar_not_converted() {
-        assert!(try_json_to_tsv("42").is_none());
-        assert!(try_json_to_tsv("\"hello\"").is_none());
-        assert!(try_json_to_tsv("true").is_none());
+    #[tokio::test]
+    async fn blank_runs_collapse_but_single_blank_lines_survive() {
+        let cleaned = compress("alpha\n\n\n\nbeta\n\ngamma\n")
+            .await
+            .expect("blank runs collapse");
+        assert_eq!(cleaned, "alpha\n\nbeta\n\ngamma\n");
     }
 
-    #[test]
-    fn test_strip_noise() {
-        let input = "hello\n\n\nworld\n\n";
-        let result = strip_noise(input);
-        assert_eq!(result, "hello\nworld\n");
-    }
-
-    #[test]
-    fn test_strip_invisible_chars() {
-        let input = "hello\x00world\x01test\n";
-        let result = strip_noise(input);
-        assert_eq!(result, "helloworldtest\n");
-    }
-
-    #[test]
-    fn test_flatten_nested() {
-        let val: Value = serde_json::from_str(r#"{"a": {"b": {"c": 1}}, "d": "hello"}"#).unwrap();
-        let flat = flatten_value(&val, "");
-        let map: std::collections::HashMap<String, String> = flat.into_iter().collect();
-        assert_eq!(map.get("a.b.c").unwrap(), "1");
-        assert_eq!(map.get("d").unwrap(), "hello");
-    }
-
-    #[test]
-    fn test_escape_tsv() {
-        assert_eq!(escape_tsv_field("hello\tworld"), "hello world");
-        assert_eq!(escape_tsv_field("line1\nline2"), "line1 line2");
-    }
-
-    #[test]
-    fn test_fold_python_code() {
-        let code = r#"
-def hello():
-    print("hello")
-    print("world")
-    print("foo")
-    print("bar")
-    return True
-
-def goodbye():
-    print("bye")
-    print("see ya")
-    print("later")
-    print("adios")
-    return False
-"#;
-        let result = try_fold_source_code(code.trim());
-        // If magika + tree-sitter work, we should get folded output
-        if let Some(folded) = result {
-            assert!(
-                folded.folded.contains("folded"),
-                "expected fold markers: {}",
-                folded.folded
-            );
-            assert!(folded.folded.len() < code.len(), "folded should be smaller");
-        }
-        // If magika can't identify it (e.g., too short), that's OK for the test
-    }
-
-    #[test]
-    fn test_compress_text_json() {
-        // Large enough JSON array that TSV is smaller
+    #[tokio::test]
+    async fn json_table_becomes_tsv_naming_a_readable_original() {
         let json = r#"[
-            {"id": 1, "name": "Alice", "email": "alice@example.com", "role": "admin"},
-            {"id": 2, "name": "Bob", "email": "bob@example.com", "role": "user"},
-            {"id": 3, "name": "Charlie", "email": "charlie@example.com", "role": "user"},
-            {"id": 4, "name": "Diana", "email": "diana@example.com", "role": "admin"},
-            {"id": 5, "name": "Eve", "email": "eve@example.com", "role": "viewer"}
+            {"id": 1, "name": "Alice", "email": "alice@aither.test", "role": "admin"},
+            {"id": 2, "name": "Bob", "email": "bob@aither.test", "role": "user"},
+            {"id": 3, "name": "Charlie", "email": "charlie@aither.test", "role": "user"},
+            {"id": 4, "name": "Diana", "email": "diana@aither.test", "role": "admin"}
         ]"#;
-        let result = compress_text(json);
-        if let Some(c) = result {
-            assert!(
-                c.raw_for_file.is_none(),
-                "JSON->TSV should not save raw file"
-            );
-            assert!(c.text.contains('\t'), "should be TSV format");
-            assert!(c.text.len() < json.len(), "TSV should be smaller");
-        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cleaned = compress_text(dir.path(), json)
+            .await
+            .expect("compression succeeds")
+            .expect("json becomes tsv");
+
+        assert!(cleaned.contains('\t'), "{cleaned}");
+        assert!(cleaned.contains("Original JSON saved to"), "{cleaned}");
+
+        // The text names a file that holds JSON parsing back to the input.
+        let named = cleaned
+            .rsplit_once(" (")
+            .and_then(|(_, tail)| tail.strip_suffix(").]"))
+            .expect("absolute path in the reference");
+        let stored = std::fs::read_to_string(named).expect("named original is readable");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored).expect("stored original is JSON"),
+            serde_json::from_str::<serde_json::Value>(json).expect("input is JSON"),
+            "stored original must round-trip"
+        );
     }
 
-    #[test]
-    fn test_compress_text_strips_noise() {
-        let noisy = "hello\n\n\n\nworld\n\n\n";
-        let result = compress_text(noisy).unwrap();
-        assert_eq!(result.text, "hello\nworld\n");
-        assert!(result.raw_for_file.is_none());
+    #[tokio::test]
+    async fn plain_text_that_needs_no_cleaning_is_left_alone() {
+        assert!(compress("all good\n").await.is_none());
     }
 
-    #[test]
-    fn test_compress_text_empty() {
-        assert!(compress_text("").is_none());
+    #[tokio::test]
+    async fn output_cut_off_mid_escape_leaks_no_brackets() {
+        // A killed process can stop in the middle of a sequence; the last
+        // frame still has to be readable and free of bracket noise.
+        let cleaned = compress("partial output\u{1b}[32")
+            .await
+            .expect("truncated sequence is consumed");
+        assert_eq!(cleaned, "partial output\n");
+    }
+
+    #[tokio::test]
+    async fn unified_diff_still_applies_after_cleaning() {
+        // A blank line inside the hunk reaches the diff as a single space, so
+        // the patch exercises blank-run collapsing as well as colour.
+        let original =
+            "fn main() {\n    let a = 1;\n\n\n    let b = 2;\n    println!(\"{a}{b}\");\n}\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        run_git(repo, &["init", "--quiet"]);
+        std::fs::write(repo.join("main.rs"), original).expect("write original");
+        run_git(repo, &["add", "main.rs"]);
+        run_git(repo, &["commit", "--quiet", "-m", "seed"]);
+
+        std::fs::write(
+            repo.join("main.rs"),
+            original.replace("let b = 2;", "let b = 20;"),
+        )
+        .expect("write patched");
+        let diff = git_output(repo, &["diff", "--color=always", "--", "main.rs"]);
+        assert!(diff.contains('\u{1b}'), "git diff should be coloured");
+
+        let cleaned = compress_text(repo, &diff)
+            .await
+            .expect("compression succeeds")
+            .expect("coloured diff is cleaned");
+        assert!(!cleaned.contains('\u{1b}'), "{cleaned}");
+
+        // Restore the original, then check the cleaned patch still applies.
+        run_git(repo, &["checkout", "--", "main.rs"]);
+        std::fs::write(repo.join("cleaned.patch"), &cleaned).expect("write patch");
+        let check = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["apply", "--check", "cleaned.patch"])
+            .output()
+            .expect("run git apply");
+        assert!(
+            check.status.success(),
+            "git apply --check failed: {}\npatch:\n{cleaned}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+
+    /// Runs `git` in `repo` with identity and signing pinned, so the test does
+    /// not depend on the developer's global configuration.
+    fn git(repo: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .current_dir(repo)
+            .args([
+                "-c",
+                "user.name=aither test",
+                "-c",
+                "user.email=test@aither.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("run git")
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = git(repo, args);
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(repo: &Path, args: &[&str]) -> String {
+        let output = git(repo, args);
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("git output is utf-8")
     }
 }

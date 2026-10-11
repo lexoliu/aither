@@ -112,7 +112,7 @@ fn output_saved_text(
     line_count: usize,
     byte_count: usize,
 ) -> String {
-    let preview = crate::output::head_preview(rendered, usize::MAX, INLINE_OUTPUT_LIMIT);
+    let preview = crate::output_compress::stored_preview(rendered, usize::MAX, INLINE_OUTPUT_LIMIT);
     CommandOutputSavedTemplate {
         preview: preview.trim_end_matches('\n'),
         filename,
