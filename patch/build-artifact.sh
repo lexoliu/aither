@@ -29,7 +29,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 out_dir="${2:-$root/target/apply-patch-artifacts}"
 nightly="${APPLY_PATCH_NIGHTLY:-nightly-2026-10-01}"
 abort="${APPLY_PATCH_ABORT:-immediate}"
-version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)"
+version="$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "$root/Cargo.toml" | jq -r '.packages[] | select(.name == "aither-patch") | .version')"
 
 case "$abort" in
     immediate) flags=(-Zunstable-options -Cpanic=immediate-abort) ;;
@@ -38,7 +38,12 @@ case "$abort" in
 esac
 
 export CARGO_PROFILE_APPLY_PATCH_PANIC=abort
-export RUSTFLAGS="${flags[*]-} -Clinker=rust-lld"
+case "$target" in
+    *-apple-darwin) linker_flags=() ;;
+    *-unknown-linux-*) linker_flags=(-Clinker=rust-lld) ;;
+    *) echo "unsupported artifact target: $target" >&2; exit 2 ;;
+esac
+export RUSTFLAGS="${flags[*]-} ${linker_flags[*]-}"
 export CARGO_TARGET_DIR="$out_dir/build"
 
 cargo +"$nightly" build -p aither-patch --profile apply-patch \
@@ -51,11 +56,13 @@ bin="$CARGO_TARGET_DIR/$target/apply-patch/apply_patch"
 name="apply_patch-${version}-${target}"
 mkdir -p "$out_dir"
 tar -czf "$out_dir/$name.tar.gz" -C "$(dirname "$bin")" "$(basename "$bin")"
-(cd "$out_dir" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
-bytes="$(stat -c %s "$bin")"
+(cd "$out_dir" && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+bytes="$(wc -c < "$bin" | tr -d '[:space:]')"
 sha="$(cut -d' ' -f1 "$out_dir/$name.tar.gz.sha256")"
 
-cat > "$out_dir/$name.json" <<EOF
-{"name":"apply_patch","version":"$version","target":"$target","abort":"$abort","toolchain":"$nightly","file":"$name.tar.gz","sha256":"$sha","executable_bytes":$bytes}
-EOF
+jq -n --arg name apply_patch --arg version "$version" --arg target "$target" \
+    --arg abort "$abort" --arg toolchain "$nightly" --arg file "$name.tar.gz" \
+    --arg sha256 "$sha" --argjson executable_bytes "$bytes" \
+    '{name: $name, version: $version, target: $target, abort: $abort, toolchain: $toolchain, file: $file, sha256: $sha256, executable_bytes: $executable_bytes}' \
+    > "$out_dir/$name.json"
 cat "$out_dir/$name.json"; echo

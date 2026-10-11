@@ -10,9 +10,14 @@ use std::{
 
 use tempfile::tempdir;
 
+fn executable() -> std::ffi::OsString {
+    std::env::var_os("APPLY_PATCH_TEST_BIN")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_apply_patch").into())
+}
+
 /// Runs `apply_patch` inside `cwd`, feeding `stdin` on its standard input.
 fn run_apply_patch(cwd: &Path, stdin: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_apply_patch"))
+    let mut child = Command::new(executable())
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -30,7 +35,7 @@ fn run_apply_patch(cwd: &Path, stdin: &str) -> Output {
 
 /// Runs `apply_patch` with arguments and no stdin content.
 fn run_with_args(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_apply_patch"))
+    Command::new(executable())
         .current_dir(cwd)
         .args(args)
         .stdin(Stdio::null())
