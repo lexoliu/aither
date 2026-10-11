@@ -70,6 +70,13 @@ jobs:
           APPLY_PATCH_TEST_BIN: ${{ runner.temp }}/patch-artifacts/build/${{ matrix.target }}/apply-patch/apply_patch${{ matrix.suffix }}
         run: cargo +stable test --locked -p aither-patch --test e2e
       - uses: ./.github/actions/install-heel
+      - name: Verify Windows native sandbox launch
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          & "$env:HEEL_BIN" run --network deny --keep-working-dir --working-dir "$env:RUNNER_TEMP" -- cmd.exe /D /S /C "echo native-sandbox-ready"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify sandbox file permissions
         timeout-minutes: 5
         run: bash patch/verify-sandbox.sh "${{ runner.temp }}/patch-artifacts/build/${{ matrix.target }}/apply-patch/apply_patch${{ matrix.suffix }}"
