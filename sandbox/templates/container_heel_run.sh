@@ -1,0 +1,1 @@
+{{ heel_bin }} run --isolation permissive --working-dir {{ escaped_working_dir }} --env-passthrough PATH --env-passthrough HOME{% if ipc %} --env-passthrough HEEL_IPC_ENDPOINT --grant "$MAY_IPC_DIR=rwx"{% endif %}{% if let Some(level) = nice %} --nice {{ level }}{% endif %}{% if let Some(io) = io_priority %} --io-priority {{ io }}{% endif %} -- sh -c {{ escaped_script }}
