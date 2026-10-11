@@ -935,7 +935,7 @@ where
             // reach for them as tools. Redirect immediately instead of letting
             // the model retry the same wrong call.
             for name in &unknown_tools {
-                self.push_system_alert(&format!(
+                self.push_system_alert(format!(
                     "There is no native tool named '{name}'. This runtime is terminal-first: the only native tools are terminal, terminal_kill, terminal_input, and terminal_read; every other capability is a CLI command executed through the `terminal` tool. If '{name}' is a capability, run it as a command (check with `{name} --help`)."
                 ));
             }
@@ -1460,9 +1460,9 @@ where
     /// alert pushed here stays in `runtime_items` until reassembly or
     /// compaction prunes it — this is the only channel that survives to the
     /// next request.
-    fn push_system_alert(&mut self, content: &str) {
+    fn push_system_alert(&mut self, content: impl Into<String>) {
         self.context.push_alert(&SystemReminder {
-            content: content.to_string(),
+            content: content.into(),
         });
     }
 
