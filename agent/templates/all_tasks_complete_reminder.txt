@@ -1,3 +1,0 @@
-<system-reminder>
-Task "{{ completed_task }}" completed. All tasks in the todo list are now complete!
-</system-reminder>

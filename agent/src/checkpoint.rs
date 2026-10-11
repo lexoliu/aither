@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ContextCheckpoint, ContextWindowSnapshot, TodoItem};
+use crate::{ContextCheckpoint, ContextWindowSnapshot};
 
 /// Checkpoint payload exported by the agent runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,8 +10,6 @@ use crate::{ContextCheckpoint, ContextWindowSnapshot, TodoItem};
 pub struct AgentCheckpoint {
     /// Non-persistent runtime context managed by the agent.
     pub context: ContextCheckpoint,
-    /// Current todo list state.
-    pub todo_items: Vec<TodoItem>,
     /// Hash of the active tool surface for compatibility checks.
     pub tool_surface_hash: String,
     /// Structured snapshot of the current context window.

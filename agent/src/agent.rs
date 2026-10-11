@@ -38,7 +38,6 @@ use crate::{
         StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
     },
     model_group::ModelTier,
-    todo::{TodoItem, TodoList, TodoStatus},
     tools::AgentTools,
     transcript::Transcript,
     working_docs,
@@ -239,18 +238,6 @@ struct TasksDiffReminder {
     diff: String,
 }
 
-#[derive(Template)]
-#[template(path = "todo_reminder.txt", escape = "none")]
-struct TodoReminderTemplate<'a> {
-    items_json: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "todo_context.txt", escape = "none")]
-struct TodoContextTemplate<'a> {
-    items_json: &'a str,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct EmittedCheckpoint {
     phase: ContextWindowPhase,
@@ -263,20 +250,6 @@ struct BackgroundStartedReminderTemplate<'a> {
     task_id: &'a str,
     output_preview: &'a str,
     output_file: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "next_task_reminder.txt", escape = "none")]
-struct NextTaskReminderTemplate<'a> {
-    completed_task: &'a str,
-    next_task: &'a str,
-    active_form: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "all_tasks_complete_reminder.txt", escape = "none")]
-struct AllTasksCompleteReminderTemplate<'a> {
-    completed_task: &'a str,
 }
 
 /// `knowledge_and_time` system block. `websearch_command` selects whether the
@@ -457,9 +430,6 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Whether tools have been bootstrapped.
     pub(crate) initialized: bool,
 
-    /// Todo list for tracking long tasks.
-    pub(crate) todo_list: Option<TodoList>,
-
     /// Receiver for completed background terminal tasks.
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
     /// Receiver for permission wait/resume events emitted by terminal execution.
@@ -483,7 +453,6 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     ///
     /// These participate in prompt assembly for the current turn but are not
     /// stored in the persistent context or checkpoints.
-    pub(crate) transient_system_messages: Vec<String>,
 
     /// Rolling KV-cache statistics accumulated from emitted `Usage` events.
     ///
@@ -531,7 +500,6 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             profile: None,
             fast_profile: None,
             initialized: false,
-            todo_list: None,
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
@@ -539,7 +507,6 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             sandbox_dir: None,
             last_working_docs: None,
             last_request_started_at: None,
-            transient_system_messages: Vec::new(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -719,20 +686,9 @@ where
             tool_calls.clone(),
             model_turn.reasoning,
         ));
-        let old_todo_items = self
-            .todo_list
-            .as_ref()
-            .map(super::todo::TodoList::items)
-            .unwrap_or_default();
-        let tool_names = tool_calls
-            .iter()
-            .map(|call| call.name.clone())
-            .collect::<Vec<_>>();
-
         self.push_tool_start_events(&tool_calls, events).await;
         let results = self.execute_tool_calls(&tool_calls, turn, events).await;
-        self.apply_tool_results(results, &tool_names, &old_todo_items, events)
-            .await?;
+        self.apply_tool_results(results, events).await?;
         self.push_turn_boundary_events(run_id, turn, &response_text, events)
             .await
     }
@@ -894,8 +850,6 @@ where
     async fn apply_tool_results(
         &mut self,
         results: Vec<Result<(String, String, aither_core::llm::ToolResult), AgentError>>,
-        tool_names: &[String],
-        old_todo_items: &[TodoItem],
         events: &EventSink,
     ) -> Result<(), AgentError> {
         let mut has_tool_error = false;
@@ -946,7 +900,6 @@ where
                 content: "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain terminal, terminal_kill, terminal_input, and terminal_read.".to_string(),
             });
         }
-        self.push_todo_followup(tool_names, old_todo_items);
         self.push_completed_background_events(events);
         Ok(())
     }
@@ -975,29 +928,6 @@ where
                 waiting.task_id,
                 waiting.notice,
             ));
-        }
-    }
-
-    fn push_todo_followup(&mut self, tool_names: &[String], old_todo_items: &[TodoItem]) {
-        if !tool_names.iter().any(|name| name == "todo") {
-            return;
-        }
-        let new_items = self
-            .todo_list
-            .as_ref()
-            .map(super::todo::TodoList::items)
-            .unwrap_or_default();
-        let newly_completed = new_items.iter().find(|new_item| {
-            new_item.status == TodoStatus::Completed
-                && old_todo_items.iter().any(|old| {
-                    old.content == new_item.content && old.status != TodoStatus::Completed
-                })
-        });
-        let reminder = newly_completed
-            .and_then(|completed| self.format_next_task_reminder(&completed.content))
-            .or_else(|| self.format_todo_reminder());
-        if let Some(reminder) = reminder {
-            self.context.push(Message::system(&reminder));
         }
     }
 
@@ -1270,20 +1200,6 @@ where
         self.context.push(message);
     }
 
-    /// Replaces transient per-turn system messages.
-    pub fn set_transient_system_messages(&mut self, messages: impl IntoIterator<Item = String>) {
-        self.transient_system_messages = messages
-            .into_iter()
-            .map(|message| message.trim().to_string())
-            .filter(|message| !message.is_empty())
-            .collect();
-    }
-
-    /// Clears transient per-turn system messages.
-    pub fn clear_transient_system_messages(&mut self) {
-        self.transient_system_messages.clear();
-    }
-
     /// Returns the rolling KV-cache statistics for this agent session.
     ///
     /// The stats are updated every time the underlying provider emits a
@@ -1485,14 +1401,8 @@ where
     pub async fn export_checkpoint(&mut self) -> Result<AgentCheckpoint, AgentError> {
         self.ensure_initialized().await;
         let context_window = self.snapshot_context_window().await;
-        let todo_items = self
-            .todo_list
-            .as_ref()
-            .map(super::todo::TodoList::items)
-            .unwrap_or_default();
         Ok(AgentCheckpoint {
             context: self.context.checkpoint(),
-            todo_items,
             tool_surface_hash: self.tool_surface_hash(),
             context_window,
             has_background_tasks: self
@@ -1509,12 +1419,6 @@ where
     /// Returns an error when the checkpoint cannot be restored into this agent.
     pub fn restore_checkpoint(&mut self, checkpoint: AgentCheckpoint) -> Result<(), AgentError> {
         self.context.restore(checkpoint.context);
-        if !checkpoint.todo_items.is_empty() {
-            let list = self.todo_list.get_or_insert_with(TodoList::new);
-            list.write(checkpoint.todo_items);
-        } else if let Some(list) = &self.todo_list {
-            list.clear();
-        }
         #[cfg(feature = "skills")]
         {
             self.active_skills.clear();
@@ -1608,11 +1512,6 @@ where
         #[cfg(feature = "skills")]
         self.populate_skill_reminders();
 
-        if let Some(todo_ctx) = self.format_todo_context() {
-            self.context
-                .insert_reminder(&SystemReminder { content: todo_ctx });
-        }
-
         if let Some(sandbox_dir) = self.sandbox_dir.as_deref() {
             let docs = working_docs::read_snapshot(sandbox_dir).await;
             if let Some(previous) = self.last_working_docs.as_ref()
@@ -1641,7 +1540,7 @@ where
     /// Builds the message list for an LLM request.
     ///
     /// Uses `context.build_messages()` for the stable system prefix + conversation,
-    /// then prepends per-turn ephemeral context (todo, working docs, background
+    /// then prepends per-turn ephemeral context (working docs, background
     /// jobs, context usage) as system messages inserted before conversation messages.
     async fn build_request_messages(&mut self) -> Vec<Message> {
         self.assemble_context_window().await.messages
@@ -1685,9 +1584,7 @@ where
     async fn assemble_context_window(&mut self) -> ContextWindowSnapshot {
         self.populate_dynamic_reminders().await;
 
-        let mut messages = self
-            .context
-            .build_messages_with_transient_system(&self.transient_system_messages);
+        let mut messages = self.context.build_messages();
         let mut metrics = self.estimate_context_window_metrics(&messages);
 
         if !metrics.has_handoff
@@ -1914,11 +1811,6 @@ where
         turn: usize,
     ) -> Result<EmittedCheckpoint, AgentError> {
         let context = self.context.checkpoint();
-        let todo_items = self
-            .todo_list
-            .as_ref()
-            .map(super::todo::TodoList::items)
-            .unwrap_or_default();
         let tool_surface_hash = self.tool_surface_hash();
         let window = self.assemble_context_window().await;
         let checkpoint_ctx = CheckpointContext {
@@ -1927,7 +1819,6 @@ where
             turn,
             message_count: self.context.len_recent(),
             context: &context,
-            todo_items: &todo_items,
             tool_surface_hash: &tool_surface_hash,
             has_background_tasks: self
                 .background_receiver
@@ -1945,39 +1836,6 @@ where
             phase: window.phase,
             message_count: self.context.len_recent(),
         })
-    }
-
-    /// Formats the todo list as a system reminder.
-    ///
-    /// Returns None if there's no todo list or it's empty.
-    fn format_todo_reminder(&self) -> Option<String> {
-        let list = self.todo_list.as_ref()?;
-        let items = list.items();
-        if items.is_empty() {
-            return None;
-        }
-        let items_json = format_todo_items_json(&items);
-        TodoReminderTemplate {
-            items_json: &items_json,
-        }
-        .render()
-        .ok()
-    }
-
-    /// Formats the current todo list for context injection before each request.
-    fn format_todo_context(&self) -> Option<String> {
-        let list = self.todo_list.as_ref()?;
-        let items = list.items();
-        if items.is_empty() {
-            return None;
-        }
-
-        let items_json = format_todo_items_json(&items);
-        TodoContextTemplate {
-            items_json: &items_json,
-        }
-        .render()
-        .ok()
     }
 
     /// Formats a reminder and event payload when `terminal` has been auto-promoted to background.
@@ -2089,47 +1947,7 @@ where
 
         serialize_xml("background-terminal-result", &xml)
     }
-
-    /// Generates a reminder about the next task after a task was completed.
-    fn format_next_task_reminder(&self, completed_task: &str) -> Option<String> {
-        let list = self.todo_list.as_ref()?;
-        let items = list.items();
-
-        // Find the next pending or in_progress task
-        let next_task = items
-            .iter()
-            .find(|item| matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress));
-
-        next_task.map_or_else(
-            || {
-                items
-                    .iter()
-                    .all(|i| i.status == TodoStatus::Completed)
-                    .then(|| {
-                        AllTasksCompleteReminderTemplate { completed_task }
-                            .render()
-                            .ok()
-                    })
-                    .flatten()
-            },
-            |task| {
-                NextTaskReminderTemplate {
-                    completed_task,
-                    next_task: &task.content,
-                    active_form: &task.active_form,
-                }
-                .render()
-                .ok()
-            },
-        )
-    }
 }
-
-/// Formats todo items into the JSON-ish list used in system reminders.
-fn format_todo_items_json(items: &[TodoItem]) -> String {
-    serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
-}
-
 fn format_builtin_tool_result(tool: &str, result: &str) -> String {
     let mut text = String::from("[");
     text.push_str(tool);
@@ -2526,7 +2344,6 @@ mod tests {
     fn empty_checkpoint() -> AgentCheckpoint {
         AgentCheckpoint {
             context: crate::Context::default().checkpoint(),
-            todo_items: Vec::new(),
             tool_surface_hash: "tool-surface".to_string(),
             context_window: ContextWindowSnapshot {
                 phase: ContextWindowPhase::Stable,
