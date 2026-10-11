@@ -60,6 +60,7 @@ magika = { version = "1.1", optional = true }
 # compiling 22 tree-sitter grammars from C, so they follow the feature too.
 tree-sitter = { version = "0.22.6", optional = true }
 rs-tree-sitter-languages = { version = "0.0.2", optional = true }
+vte = { version = "0.15", default-features = false, features = ["std"] }
 
 [features]
 default = []

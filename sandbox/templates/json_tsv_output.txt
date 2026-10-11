@@ -1,0 +1,2 @@
+{{ tsv }}
+[TSV of a JSON payload: value types and array nesting are flattened. Original JSON saved to {{ url }} ({{ path }}).]

@@ -1527,8 +1527,7 @@ async fn start_background_output_redirect(
     max_lines: usize,
     promotion_reason: Option<&BackgroundReason>,
 ) -> Result<OutputEntry, anyhow::Error> {
-    let url = save_raw_to_file(store_dir, &[]).await?;
-    let output_path = store_dir.join(url.strip_prefix("outputs/").unwrap_or(&url));
+    let (url, output_path) = save_raw_to_file(store_dir, &[]).await?;
     let output_path_string = output_path.display().to_string();
     let snapshot = job_registry
         .start_output_redirect(task_id, output_path)
@@ -2042,7 +2041,7 @@ async fn save_completed_stdout(
     let data_to_save = if format.background_output {
         Cow::Borrowed(stdout)
     } else {
-        compressed_stdout_data(format.store_dir, stdout, format.expect, format.raw).await
+        compressed_stdout_data(format.store_dir, stdout, format.expect, format.raw).await?
     };
 
     match crate::output::save_text_with_line_limit(
@@ -2063,29 +2062,30 @@ async fn save_completed_stdout(
     }
 }
 
+/// Runs the output cleaning pipeline over a completed command's stdout.
+///
+/// `raw: true` bypasses it entirely, as do non-text formats and output that
+/// is not valid UTF-8, so the model sees exactly the bytes the command wrote.
 async fn compressed_stdout_data<'a>(
     store_dir: &Path,
     stdout: &'a [u8],
     expect: OutputFormat,
     raw: bool,
-) -> Cow<'a, [u8]> {
+) -> Result<Cow<'a, [u8]>, TerminalError> {
     let is_text = matches!(expect, OutputFormat::Text | OutputFormat::Auto);
-    let compressed = if !raw && is_text && !stdout.is_empty() {
-        std::str::from_utf8(stdout).map_or(None, crate::output_compress::compress_text)
-    } else {
-        None
+    if raw || !is_text || stdout.is_empty() {
+        return Ok(Cow::Borrowed(stdout));
+    }
+    let Ok(text) = std::str::from_utf8(stdout) else {
+        return Ok(Cow::Borrowed(stdout));
     };
 
-    if let Some(ref compressed) = compressed
-        && let Some(ref raw_text) = compressed.raw_for_file
-        && let Err(err) = crate::output::save_raw_to_file(store_dir, raw_text.as_bytes()).await
-    {
-        warn!(error = %err, "failed to save raw source code output");
-    }
-
-    compressed.map_or(Cow::Borrowed(stdout), |compressed| {
-        Cow::Owned(compressed.text.into_bytes())
-    })
+    let cleaned = crate::output_compress::compress_text(store_dir, text)
+        .await
+        .map_err(TerminalError::Io)?;
+    Ok(cleaned.map_or(Cow::Borrowed(stdout), |cleaned| {
+        Cow::Owned(cleaned.into_bytes())
+    }))
 }
 
 async fn save_completed_stderr(
