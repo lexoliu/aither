@@ -38,9 +38,12 @@ case "$abort" in
 esac
 
 export CARGO_PROFILE_APPLY_PATCH_PANIC=abort
+suffix=""
+checksum=(shasum -a 256)
 case "$target" in
     *-apple-darwin) linker_flags=() ;;
     *-unknown-linux-*) linker_flags=(-Clinker=rust-lld) ;;
+    *-pc-windows-msvc) linker_flags=(); suffix=".exe"; checksum=(sha256sum) ;;
     *) echo "unsupported artifact target: $target" >&2; exit 2 ;;
 esac
 export RUSTFLAGS="${flags[*]-} ${linker_flags[*]-}"
@@ -50,13 +53,13 @@ cargo +"$nightly" build -p aither-patch --profile apply-patch \
     --target "$target" -Zbuild-std=std,panic_abort \
     --manifest-path "$root/Cargo.toml"
 
-bin="$CARGO_TARGET_DIR/$target/apply-patch/apply_patch"
+bin="$CARGO_TARGET_DIR/$target/apply-patch/apply_patch${suffix}"
 [ -x "$bin" ] || { echo "artifact build produced no executable at $bin" >&2; exit 1; }
 
 name="apply_patch-${version}-${target}"
 mkdir -p "$out_dir"
 tar -czf "$out_dir/$name.tar.gz" -C "$(dirname "$bin")" "$(basename "$bin")"
-(cd "$out_dir" && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+(cd "$out_dir" && "${checksum[@]}" "$name.tar.gz" > "$name.tar.gz.sha256")
 bytes="$(wc -c < "$bin" | tr -d '[:space:]')"
 sha="$(cut -d' ' -f1 "$out_dir/$name.tar.gz.sha256")"
 
