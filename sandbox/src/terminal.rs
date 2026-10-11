@@ -967,11 +967,11 @@ where
     ///
     /// The priority is applied to every sandbox the tool creates — one-shot
     /// commands, persistent shell sessions and background jobs — and is
-    /// inherited by everything they spawn. Container executions receive it
-    /// through `nice`/`ionice` on the wrapped script, so the container image
-    /// needs those tools when a non-normal priority is configured. SSH
-    /// executions are not affected: the remote host runs its own `heel`,
-    /// managed outside this configuration.
+    /// inherited by everything they spawn. Container executions run the script
+    /// through the image's own `heel run`, so the image needs a `heel` binary
+    /// when a non-normal priority is configured. SSH executions are not
+    /// affected: the remote host runs its own `heel`, managed outside this
+    /// configuration.
     #[must_use]
     pub const fn with_process_priority(mut self, priority: ProcessPriority) -> Self {
         self.priority = priority;
@@ -2677,35 +2677,75 @@ struct ContainerIpcEndpoint<'a> {
     port: u16,
 }
 
-/// Renders the command line that runs `script` at the configured scheduling
-/// priority inside the container, or the script itself when the priority is
+/// Renders the command that runs `script` inside the container at the
+/// configured scheduling priority, or the script itself when the priority is
 /// normal.
 ///
-/// `heel run` cannot take this role inside the container: its Landlock and
-/// seccomp layers deny the raw TCP transport the generated `heel ipc` command
-/// shims use to reach the host bridge, so `nice`/`ionice` set the priority on
-/// the script's process and every shim it spawns inherits it, matching what
-/// heel applies to local sandboxes.
+/// The priority goes through heel's own sandbox configuration: the container
+/// image's `heel` binary runs the script under `heel run`, so the settings are
+/// the same flags the CLI takes everywhere — `nice`/`ionice` are never
+/// reimplemented here. `heel_bin` is the shell expression that resolves the
+/// image's `heel` (`$MAY_IPC_BIN` once the IPC wrapper has resolved it).
+///
+/// The container is already the isolation boundary, so the invocation asks for
+/// `permissive` isolation: the script keeps the filesystem permissions it had
+/// as the container caller. `PATH` and `HOME` are forwarded so the generated
+/// `heel ipc` shims still resolve and the script sees its usual environment;
+/// `HEEL_IPC_ENDPOINT` is forwarded too when `ipc` is set. Networking keeps
+/// heel's deny-all default — no rule is bent to pass the IPC transport, and
+/// `heel ipc` inside a sandbox can only reach a local socket anyway: a
+/// `tcp://` endpoint requires a heel-side endpoint grant and transport before
+/// it can connect from inside `heel run`.
+fn heel_run_container_command(
+    script: &str,
+    priority: ProcessPriority,
+    heel_bin: &str,
+    ipc: bool,
+) -> String {
+    let mut command = format!(
+        "{heel_bin} run --isolation permissive --working-dir /workspace \
+         --env-passthrough PATH --env-passthrough HOME"
+    );
+    if ipc {
+        command.push_str(" --env-passthrough HEEL_IPC_ENDPOINT");
+        // The generated shims are written under the shared temp directory,
+        // which stays execute-denied even at `permissive` isolation: they need
+        // the deliberate write-and-execute grant heel documents for such a
+        // directory to keep resolving on the sandboxed `PATH`.
+        command.push_str(" --grant \"$MAY_IPC_DIR=rwx\"");
+    }
+    if let CpuPriority::Nice(level) = priority.cpu() {
+        command.push_str(" --nice ");
+        command.push_str(&level.get().to_string());
+    }
+    match priority.io() {
+        IoPriority::Utility => command.push_str(" --io-priority utility"),
+        IoPriority::Background => command.push_str(" --io-priority background"),
+        IoPriority::Normal => {}
+    }
+    command.push_str(" -- sh -c ");
+    command.push_str(&shell_escape(script));
+    command
+}
+
 fn prioritized_container_script(script: &str, priority: ProcessPriority) -> String {
     if priority.is_normal() {
         return script.to_string();
     }
-    let mut command = String::new();
-    if let CpuPriority::Nice(level) = priority.cpu() {
-        command.push_str("nice -n ");
-        command.push_str(&level.get().to_string());
-        command.push(' ');
-    }
-    match priority.io() {
-        // Best effort at its lowest level, as heel maps `Utility` on Linux.
-        IoPriority::Utility => command.push_str("ionice -c 2 -n 7 "),
-        // The idle class, as heel maps `Background` on Linux.
-        IoPriority::Background => command.push_str("ionice -c 3 "),
-        IoPriority::Normal => {}
-    }
-    command.push_str("sh -c ");
-    command.push_str(&shell_escape(script));
-    command
+    // Outside the IPC wrapper no `heel` binary has been resolved yet; resolve
+    // it the same way the wrapper does and fail when the image lacks one.
+    let mut rendered = String::from(
+        "MAY_HEEL_BIN=\"$(command -v heel || true)\"; \
+         if [ -z \"$MAY_HEEL_BIN\" ]; then echo \"heel command not found in container\" >&2; \
+         exit 127; fi; ",
+    );
+    rendered.push_str(&heel_run_container_command(
+        script,
+        priority,
+        "\"$MAY_HEEL_BIN\"",
+        false,
+    ));
+    rendered
 }
 
 fn wrap_container_script(
@@ -2740,7 +2780,11 @@ fn wrap_container_script(
         .map(|name| shell_escape(name))
         .collect::<Vec<_>>()
         .join(" ");
-    let script = prioritized_container_script(script, priority);
+    let script = if priority.is_normal() {
+        script.to_string()
+    } else {
+        heel_run_container_command(script, priority, "\"$MAY_IPC_BIN\"", true)
+    };
     ContainerIpcWrapperTemplate {
         escaped_commands: &escaped_commands,
         ipc_host: endpoint.host,
@@ -4065,11 +4109,21 @@ mod tests {
             priority,
         )
         .expect("wrap script");
-        assert!(wrapped.contains("nice -n 5 ionice -c 3 sh -c 'echo ok'"));
+        assert!(wrapped.contains(
+            "\"$MAY_IPC_BIN\" run --isolation permissive --working-dir /workspace \
+             --env-passthrough PATH --env-passthrough HOME \
+             --env-passthrough HEEL_IPC_ENDPOINT --grant \"$MAY_IPC_DIR=rwx\" \
+             --nice 5 --io-priority background -- sh -c 'echo ok'"
+        ));
         assert!(wrapped.contains("HEEL_IPC_ENDPOINT"));
 
         let bare = wrap_container_script("echo ok", &[], None, priority).expect("wrap script");
-        assert_eq!(bare, "nice -n 5 ionice -c 3 sh -c 'echo ok'");
+        assert!(bare.contains("MAY_HEEL_BIN=\"$(command -v heel || true)\""));
+        assert!(bare.contains(
+            "\"$MAY_HEEL_BIN\" run --isolation permissive --working-dir /workspace \
+             --env-passthrough PATH --env-passthrough HOME \
+             --nice 5 --io-priority background -- sh -c 'echo ok'"
+        ));
     }
 
     #[test]
@@ -4081,7 +4135,8 @@ mod tests {
             ProcessPriority::new(CpuPriority::Normal, IoPriority::Utility),
         )
         .expect("wrap script");
-        assert_eq!(io_only, "ionice -c 2 -n 7 sh -c 'echo ok'");
+        assert!(io_only.contains(" --io-priority utility -- sh -c 'echo ok'"));
+        assert!(!io_only.contains("--nice"));
 
         let cpu_only = wrap_container_script(
             "echo ok",
@@ -4093,6 +4148,7 @@ mod tests {
             ),
         )
         .expect("wrap script");
-        assert_eq!(cpu_only, "nice -n 9 sh -c 'echo ok'");
+        assert!(cpu_only.contains(" --nice 9 -- sh -c 'echo ok'"));
+        assert!(!cpu_only.contains("--io-priority"));
     }
 }
