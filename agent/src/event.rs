@@ -16,6 +16,14 @@ pub enum RunPauseReason {
     AskUser,
     /// Waiting for a `request_workspace` response.
     WorkspaceRequest,
+    /// The context window is full and the run cannot continue.
+    ///
+    /// Emitted when usage reaches
+    /// [`ContextPolicy::pause_at`](crate::ContextPolicy::pause_at) and no
+    /// compaction can relieve it: either none was in flight, or the one that
+    /// was failed. Sending the request anyway would have the provider reject
+    /// it for length, so the run stops with the reason named instead.
+    ContextExhausted,
 }
 
 /// Events emitted during agent execution.
