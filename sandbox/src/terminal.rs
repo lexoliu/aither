@@ -34,8 +34,9 @@ use executor_core::{Executor, Task};
 #[cfg(unix)]
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use heel::{
-    AllowAll, Audited, DomainRequest, IpcRouter, NetworkAuditLog, NetworkPolicy, Sandbox,
-    SandboxConfig, SecurityConfig, StdioConfig, WorkingDir,
+    Access, AllowAll, Audited, CpuPriority, DomainRequest, Grant, IoPriority, IpcRouter,
+    NetworkAuditLog, NetworkPolicy, ProcessPriority, Sandbox, SandboxConfig, SecurityConfig,
+    StdioConfig, WorkingDir,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -723,6 +724,8 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     readable_paths: Vec<PathBuf>,
     /// Rolling audit log recording every sandboxed network policy decision.
     network_audit: Option<NetworkAuditLog>,
+    /// Scheduling priority applied to every sandboxed execution.
+    priority: ProcessPriority,
     /// Tool registry state.
     registry: State,
 }
@@ -745,6 +748,7 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             writable_paths: self.writable_paths.clone(),
             readable_paths: self.readable_paths.clone(),
             network_audit: self.network_audit.clone(),
+            priority: self.priority,
             registry: self.registry.clone(),
         }
     }
@@ -841,6 +845,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
             network_audit: None,
+            priority: ProcessPriority::default(),
             registry: Unconfigured,
         })
     }
@@ -897,6 +902,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
             network_audit: None,
+            priority: ProcessPriority::default(),
             registry: Unconfigured,
         })
     }
@@ -919,6 +925,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             writable_paths: self.writable_paths,
             readable_paths: self.readable_paths,
             network_audit: self.network_audit,
+            priority: self.priority,
             registry: Configured { registry },
         }
     }
@@ -956,6 +963,21 @@ where
         self
     }
 
+    /// Lowers the scheduling priority of the commands this tool runs.
+    ///
+    /// The priority is applied to every sandbox the tool creates — one-shot
+    /// commands, persistent shell sessions and background jobs — and is
+    /// inherited by everything they spawn. Container executions receive it
+    /// through `nice`/`ionice` on the wrapped script, so the container image
+    /// needs those tools when a non-normal priority is configured. SSH
+    /// executions are not affected: the remote host runs its own `heel`,
+    /// managed outside this configuration.
+    #[must_use]
+    pub const fn with_process_priority(mut self, priority: ProcessPriority) -> Self {
+        self.priority = priority;
+        self
+    }
+
     /// Creates a child `TerminalTool` that shares the same sandbox and permission handler
     /// but has independent background task tracking.
     ///
@@ -987,6 +1009,7 @@ where
             writable_paths: self.writable_paths.clone(),
             readable_paths: self.readable_paths.clone(),
             network_audit: self.network_audit.clone(),
+            priority: self.priority,
             registry: self.registry.clone(),
         }
     }
@@ -1321,6 +1344,7 @@ where
                 background_mode_for_completion,
                 running_tasks,
                 network_audit: self.network_audit.clone(),
+                priority: self.priority,
             }))
             .detach();
 
@@ -1580,6 +1604,7 @@ struct StandaloneExecution<P, E> {
     stdin_blocked_notice: Option<Sender<String>>,
     background_startup: BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
+    priority: ProcessPriority,
     expect: OutputFormat,
     resolution: MediaResolution,
     store_dir: PathBuf,
@@ -1606,6 +1631,7 @@ struct StandaloneStart<'a, P, E> {
     stdin_blocked_notice: Option<Sender<String>>,
     background_startup: &'a BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
+    priority: ProcessPriority,
 }
 
 struct LocalBackgroundExecution<'a, E> {
@@ -1621,6 +1647,7 @@ struct LocalBackgroundExecution<'a, E> {
     job_registry: &'a JobRegistry,
     stdin_blocked_notice: Option<Sender<String>>,
     background_startup: &'a BackgroundStartup,
+    priority: ProcessPriority,
 }
 
 struct ContainerBackgroundExecution<'a, E> {
@@ -1635,6 +1662,7 @@ struct ContainerBackgroundExecution<'a, E> {
     job_registry: &'a JobRegistry,
     stdin_blocked_notice: Option<Sender<String>>,
     background_startup: &'a BackgroundStartup,
+    priority: ProcessPriority,
 }
 
 struct SshBackgroundExecution<'a> {
@@ -1716,6 +1744,7 @@ struct SpawnedTerminalTask<P, E> {
     background_mode_for_completion: Arc<AtomicBool>,
     running_tasks: Arc<AtomicUsize>,
     network_audit: Option<NetworkAuditLog>,
+    priority: ProcessPriority,
 }
 
 async fn execute_terminal_task<P, E>(task: SpawnedTerminalTask<P, E>)
@@ -1752,6 +1781,7 @@ where
         background_mode_for_completion,
         running_tasks,
         network_audit,
+        priority,
     } = task;
     let result = execute_script_standalone(StandaloneExecution {
         working_dir,
@@ -1773,6 +1803,7 @@ where
         stdin_blocked_notice,
         background_startup,
         network_audit,
+        priority,
         expect,
         resolution,
         store_dir,
@@ -1826,6 +1857,7 @@ where
         stdin_blocked_notice,
         background_startup,
         network_audit,
+        priority,
         expect,
         resolution,
         store_dir,
@@ -1858,6 +1890,7 @@ where
         stdin_blocked_notice,
         background_startup: &background_startup,
         network_audit,
+        priority,
     })
     .await;
     let (pid, output) = match start_result {
@@ -1918,6 +1951,7 @@ where
             job_registry: request.job_registry,
             stdin_blocked_notice: request.stdin_blocked_notice,
             background_startup: request.background_startup,
+            priority: request.priority,
         })
         .await;
     }
@@ -1947,6 +1981,7 @@ where
         job_registry: request.job_registry,
         stdin_blocked_notice: request.stdin_blocked_notice,
         background_startup: request.background_startup,
+        priority: request.priority,
     };
     match request.mode {
         TerminalMode::Sandboxed => {
@@ -2114,6 +2149,22 @@ async fn save_completed_stderr(
     }
 }
 
+/// Maps the terminal's extra path lists onto heel grants: writable paths get
+/// `Access::WRITE`, readable paths `Access::READ`.
+fn path_grants<'a>(
+    writable_paths: &'a [PathBuf],
+    readable_paths: &'a [PathBuf],
+) -> impl Iterator<Item = Grant> + 'a {
+    writable_paths
+        .iter()
+        .map(|path| Grant::new(path, Access::WRITE))
+        .chain(
+            readable_paths
+                .iter()
+                .map(|path| Grant::new(path, Access::READ)),
+        )
+}
+
 async fn execute_sandboxed_background<E, N>(
     context: LocalBackgroundExecution<'_, E>,
     policy: N,
@@ -2126,9 +2177,9 @@ where
     let mut config_builder = SandboxConfig::builder()
         .network(policy)
         .working_dir(context.working_dir)
-        .writable_paths(context.writable_paths)
-        .readable_paths(context.readable_paths)
-        .security(SecurityConfig::interactive());
+        .grants(path_grants(context.writable_paths, context.readable_paths))
+        .security(SecurityConfig::interactive())
+        .priority(context.priority);
     if let Some(router) = create_ipc_router(context.registry) {
         config_builder = config_builder.ipc(router);
     }
@@ -2191,9 +2242,9 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     let mut config_builder = SandboxConfig::builder()
         .network(AllowAll)
         .working_dir(context.working_dir)
-        .writable_paths(context.writable_paths)
-        .readable_paths(context.readable_paths)
-        .security(SecurityConfig::interactive());
+        .grants(path_grants(context.writable_paths, context.readable_paths))
+        .security(SecurityConfig::interactive())
+        .priority(context.priority);
     if let Some(router) = create_ipc_gateway_router(context.registry) {
         config_builder = config_builder.ipc(router);
     }
@@ -2388,6 +2439,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             host: container_runtime.ipc_host(),
             port: bridge.port(),
         }),
+        context.priority,
     )?;
 
     let execution = exec
@@ -2625,13 +2677,45 @@ struct ContainerIpcEndpoint<'a> {
     port: u16,
 }
 
+/// Renders the command line that runs `script` at the configured scheduling
+/// priority inside the container, or the script itself when the priority is
+/// normal.
+///
+/// `heel run` cannot take this role inside the container: its Landlock and
+/// seccomp layers deny the raw TCP transport the generated `heel ipc` command
+/// shims use to reach the host bridge, so `nice`/`ionice` set the priority on
+/// the script's process and every shim it spawns inherits it, matching what
+/// heel applies to local sandboxes.
+fn prioritized_container_script(script: &str, priority: ProcessPriority) -> String {
+    if priority.is_normal() {
+        return script.to_string();
+    }
+    let mut command = String::new();
+    if let CpuPriority::Nice(level) = priority.cpu() {
+        command.push_str("nice -n ");
+        command.push_str(&level.get().to_string());
+        command.push(' ');
+    }
+    match priority.io() {
+        // Best effort at its lowest level, as heel maps `Utility` on Linux.
+        IoPriority::Utility => command.push_str("ionice -c 2 -n 7 "),
+        // The idle class, as heel maps `Background` on Linux.
+        IoPriority::Background => command.push_str("ionice -c 3 "),
+        IoPriority::Normal => {}
+    }
+    command.push_str("sh -c ");
+    command.push_str(&shell_escape(script));
+    command
+}
+
 fn wrap_container_script(
     script: &str,
     ipc_commands: &[String],
     ipc_endpoint: Option<ContainerIpcEndpoint<'_>>,
+    priority: ProcessPriority,
 ) -> Result<String, TerminalError> {
     if ipc_commands.is_empty() {
-        return Ok(script.to_string());
+        return Ok(prioritized_container_script(script, priority));
     }
 
     let endpoint = ipc_endpoint.ok_or_else(|| {
@@ -2656,11 +2740,12 @@ fn wrap_container_script(
         .map(|name| shell_escape(name))
         .collect::<Vec<_>>()
         .join(" ");
+    let script = prioritized_container_script(script, priority);
     ContainerIpcWrapperTemplate {
         escaped_commands: &escaped_commands,
         ipc_host: endpoint.host,
         ipc_port: endpoint.port,
-        script,
+        script: &script,
     }
     .render()
     .map_err(|error| {
@@ -3092,7 +3177,7 @@ mod tests {
     use super::*;
     use crate::ToolRegistryBuilder;
     use crate::builtin::{InputTerminalArgs, InputTerminalTool};
-    use heel::DenyAll;
+    use heel::{DenyAll, NiceLevel};
 
     fn parse_terminal_tool_result(result: &ToolResult) -> TerminalResult {
         serde_json::from_str(
@@ -3305,6 +3390,7 @@ mod tests {
                 host: "host.docker.internal",
                 port: 9000,
             }),
+            ProcessPriority::default(),
         )
         .expect("wrap script");
         assert!(wrapped.contains("hash -r;"));
@@ -3322,6 +3408,7 @@ mod tests {
                 host: "host.docker.internal",
                 port: 9000,
             }),
+            ProcessPriority::default(),
         )
         .expect("wrap script");
         assert!(wrapped.contains(script));
@@ -3337,6 +3424,7 @@ mod tests {
                 host: "host.docker.internal",
                 port: 9000,
             }),
+            ProcessPriority::default(),
         )
         .expect_err("invalid command name must fail");
         assert!(
@@ -3355,6 +3443,7 @@ mod tests {
                 host: "host.containers.internal",
                 port: 43123,
             }),
+            ProcessPriority::default(),
         )
         .expect("wrap script");
         assert!(wrapped.contains("tcp://host.containers.internal:43123"));
@@ -3506,6 +3595,7 @@ mod tests {
             stdin_blocked_notice: None,
             background_startup: BackgroundStartup::new(startup_tx),
             network_audit: None,
+            priority: ProcessPriority::default(),
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             store_dir: tool.outputs_dir(),
@@ -3794,5 +3884,215 @@ mod tests {
             stdout.contains("hello lexo"),
             "stdin input should reach the terminal process, got: {stdout}"
         );
+    }
+
+    /// The nice value `level` steps below this test process lands at, capped
+    /// at the kernel's lowest priority — the same computation heel applies.
+    #[cfg(unix)]
+    fn expected_lowered_nice(level: u8) -> i64 {
+        // SAFETY: reads the calling process's own nice value.
+        let current = unsafe { libc::getpriority(libc::PRIO_PROCESS as _, 0) };
+        i64::from(current + i32::from(level)).min(19)
+    }
+
+    #[cfg(unix)]
+    fn test_nice_priority() -> ProcessPriority {
+        ProcessPriority::new(
+            CpuPriority::Nice(NiceLevel::new(10).expect("nice level 10 is in range")),
+            IoPriority::Normal,
+        )
+    }
+
+    #[cfg(unix)]
+    async fn prioritized_terminal_tool(
+        dir: &Path,
+        priority: ProcessPriority,
+    ) -> TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured> {
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir,
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                local: true,
+                container: false,
+                ssh: false,
+            })
+            .with_process_priority(priority);
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        tool.with_registry(registry)
+    }
+
+    #[cfg(unix)]
+    fn print_nice_args(timeout: u64) -> TerminalArgs {
+        TerminalArgs {
+            description: "print the process nice level".to_string(),
+            script: "nice".to_string(),
+            mode: TerminalExecutionMode::Sandboxed,
+            ssh_server_id: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            timeout,
+            max_lines: 50,
+            raw: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_command_runs_with_configured_nice() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = prioritized_terminal_tool(dir.path(), test_nice_priority()).await;
+
+        let result = tool
+            .call(print_nice_args(30), ToolContext::new())
+            .await
+            .expect("terminal call should succeed");
+        let payload = parse_terminal_tool_result(&result);
+        assert_eq!(payload.exit_code, 0);
+        let stdout = output_text(&payload.stdout).expect("command should print its nice");
+        assert_eq!(
+            stdout.trim(),
+            expected_lowered_nice(10).to_string(),
+            "command should run at the configured nice level"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_session_runs_with_configured_nice() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = prioritized_terminal_tool(dir.path(), test_nice_priority()).await;
+        let background_receiver = tool.background_receiver();
+        let input_tool = InputTerminalTool::new(tool.job_registry());
+
+        let result = tool
+            .call(
+                TerminalArgs {
+                    description: "start a persistent shell".to_string(),
+                    script: "sh".to_string(),
+                    mode: TerminalExecutionMode::Sandboxed,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    timeout: 0,
+                    max_lines: 50,
+                    raw: false,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal call should succeed");
+        let payload = parse_terminal_tool_result(&result);
+        assert_eq!(payload.status.as_deref(), Some("running"));
+        let task_id = payload
+            .task_id
+            .clone()
+            .expect("timeout=0 should return a background task id");
+
+        input_tool
+            .call(
+                InputTerminalArgs {
+                    task_id: task_id.clone(),
+                    input: "nice; exit".to_string(),
+                    append_newline: true,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal_input should succeed");
+
+        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let terminal_result = completed
+            .result
+            .expect("persistent shell should exit cleanly after input");
+        let stdout =
+            output_text(&terminal_result.stdout).expect("completed session should include stdout");
+        assert_eq!(
+            stdout.trim(),
+            expected_lowered_nice(10).to_string(),
+            "persistent session should run at the configured nice level"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_runs_with_configured_nice() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = prioritized_terminal_tool(dir.path(), test_nice_priority()).await;
+        let background_receiver = tool.background_receiver();
+
+        let result = tool
+            .call(print_nice_args(0), ToolContext::new())
+            .await
+            .expect("terminal call should succeed");
+        let payload = parse_terminal_tool_result(&result);
+        assert_eq!(payload.status.as_deref(), Some("running"));
+        let task_id = payload
+            .task_id
+            .clone()
+            .expect("timeout=0 should return a background task id");
+
+        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let terminal_result = completed
+            .result
+            .expect("background job should complete successfully");
+        let stdout =
+            output_text(&terminal_result.stdout).expect("completed job should include stdout");
+        assert_eq!(
+            stdout.trim(),
+            expected_lowered_nice(10).to_string(),
+            "background job should run at the configured nice level"
+        );
+    }
+
+    #[test]
+    fn wrap_container_script_applies_configured_priority() {
+        let priority = ProcessPriority::new(
+            CpuPriority::Nice(NiceLevel::new(5).expect("nice level 5 is in range")),
+            IoPriority::Background,
+        );
+        let wrapped = wrap_container_script(
+            "echo ok",
+            &[String::from("websearch")],
+            Some(ContainerIpcEndpoint {
+                host: "host.docker.internal",
+                port: 9000,
+            }),
+            priority,
+        )
+        .expect("wrap script");
+        assert!(wrapped.contains("nice -n 5 ionice -c 3 sh -c 'echo ok'"));
+        assert!(wrapped.contains("HEEL_IPC_ENDPOINT"));
+
+        let bare = wrap_container_script("echo ok", &[], None, priority).expect("wrap script");
+        assert_eq!(bare, "nice -n 5 ionice -c 3 sh -c 'echo ok'");
+    }
+
+    #[test]
+    fn wrap_container_script_prioritizes_each_half_independently() {
+        let io_only = wrap_container_script(
+            "echo ok",
+            &[],
+            None,
+            ProcessPriority::new(CpuPriority::Normal, IoPriority::Utility),
+        )
+        .expect("wrap script");
+        assert_eq!(io_only, "ionice -c 2 -n 7 sh -c 'echo ok'");
+
+        let cpu_only = wrap_container_script(
+            "echo ok",
+            &[],
+            None,
+            ProcessPriority::new(
+                CpuPriority::Nice(NiceLevel::new(9).expect("nice level 9 is in range")),
+                IoPriority::Normal,
+            ),
+        )
+        .expect("wrap script");
+        assert_eq!(cpu_only, "nice -n 9 sh -c 'echo ok'");
     }
 }
