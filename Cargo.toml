@@ -29,6 +29,7 @@ members = [
     "acp",
     "cli",
     "sandbox",
+    "patch",
 ]
 
 [workspace.package]
@@ -38,6 +39,19 @@ authors = ["Lexo Liu <me@lexo.cool>"]
 license = "MIT"
 repository = "https://github.com/lexoliu/aither"
 rust-version = "1.88"
+
+# Artifact build profile for the `apply_patch` executable (aither-patch).
+# Only used by `cargo build --profile apply-patch`; the workspace's normal
+# `release` behavior is untouched. Size-oriented settings are measured per
+# target in patch/README.md; panic stays `unwind` here so the profile works
+# with the default build-std crates, while artifact builds pass their panic
+# strategy through the build (see patch/build-artifact.sh).
+[profile.apply-patch]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
 
 [workspace.lints]
 rust.missing_docs = "warn"

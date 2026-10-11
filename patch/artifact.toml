@@ -1,0 +1,75 @@
+# Typed artifact + usage metadata for `apply_patch` (aither #104).
+#
+# Consumed by the shared tool-runtime initializer (aither #105/#106). This
+# file is data, not provisioning code: it declares what the artifact is,
+# how it is produced, how the initializer validates it, and the typed
+# command catalog the prompt layer renders into stable cacheable context.
+#
+# Distribution prerequisite (NOT solved here): the initializer needs a
+# location from which to fetch or rebuild artifacts. There is currently no
+# published release or download URL — artifacts are produced by
+# `patch/build-artifact.sh` in this repo and their `.tar.gz` + `.sha256`
+# output is what must be staged. Until a distribution channel is assigned,
+# this dependency is reported to the coordinator rather than invented.
+
+[artifact]
+# Executable filename as installed into the managed tools directory.
+name = "apply_patch"
+# Version is the workspace package version of `aither-patch`; it is the
+# exact string printed by `apply_patch --version` after the executable name.
+version = "0.6.0"
+# No published download URL exists. Distribution is a #105/#106
+# prerequisite to satisfy with a staged tarball or a rebuild from source.
+distribution = "build-artifact.sh output; no published URL"
+# Cargo package whose [[bin]] produces the executable.
+package = "aither-patch"
+crate_dir = "patch"
+
+[artifact.targets]
+# Supported target triples for this artifact. Linux artifacts are static
+# musl executables so they run on any libc (containers, SSH hosts); the
+# musl-target rust-std component supplies the self-contained crt objects.
+linux = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+# Additional targets may be added by repeating the build on a host that has
+# that target's toolchain prerequisites (e.g. cross libc for gnu targets).
+other = []
+
+[build]
+# Reproducible artifact build; executed once per target.
+script = "patch/build-artifact.sh <target> <out-dir>"
+# Pinned nightly + rust-src; rebuilds std under the size profile.
+toolchain = "nightly-2026-10-01"
+rustup_components = ["rust-src"]
+rustup_targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+# Cargo profile (workspace Cargo.toml): opt-level=z, lto, codegen-units=1,
+# strip symbols, panic=abort. APPLY_PATCH_ABORT=immediate additionally sets
+# -Cpanic=immediate-abort (default); =panic keeps standard abort messages.
+profile = "apply-patch"
+panic = "abort (immediate-abort default; panic diagnostics still get a location but no message text)"
+# Output layout under <out-dir>:
+#   apply_patch-<version>-<target>.tar.gz        (contains `apply_patch`)
+#   apply_patch-<version>-<target>.tar.gz.sha256 ("<sha>  <file>")
+#   apply_patch-<version>-<target>.json          (machine-readable record)
+outputs = ["apply_patch-{version}-{target}.tar.gz", ".sha256", ".json"]
+
+[validation]
+# The initializer MUST run these checks before marking the tool ready.
+version_command = "apply_patch --version"
+version_stdout = "apply_patch 0.6.0"
+help_command = "apply_patch --help"        # exits 0, prints usage + format
+sha256 = "verify downloaded/staged tarball against its .sha256 sidecar"
+
+[usage]
+# Typed catalog entry rendered into the tool catalog (stable context).
+command = "apply_patch"
+summary = "Apply a contextual patch (add/update/delete/move files); reads the patch from stdin, prints one line per touched file (A/M/D/R), exits nonzero without writing on any failure."
+invocations = [
+    { example = "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\nPATCH", purpose = "create a file" },
+    { example = "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old()\n+new()\n*** End Patch\nPATCH", purpose = "edit text in place via context" },
+    { example = "apply_patch <<'PATCH'\n*** Begin Patch\n*** Delete File: old.txt\n*** End Patch\nPATCH", purpose = "delete a file" },
+]
+notes = [
+    "all parsing/matching/writes run inside the target sandbox — authority is the enclosing heel sandbox, not a host IPC service",
+    "context lines must be copied verbatim from the file; ambiguous context is rejected, not guessed",
+    "all files are validated before any write; a failed patch leaves the tree untouched (validation guarantee, not a crash-atomicity promise)",
+]

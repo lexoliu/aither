@@ -461,6 +461,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aither-patch"
+version = "0.6.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.20",
+ "zenpatch",
+]
+
+[[package]]
 name = "aither-rag"
 version = "0.6.0"
 dependencies = [
@@ -9402,6 +9411,15 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
+]
+
+[[package]]
+name = "zenpatch"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "babe562891b586c616180de552c93c07d158e3520c3d3b455a9ee30cec128ff2"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
