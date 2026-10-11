@@ -1,0 +1,20 @@
+<prepared_tools>
+These commands are already on PATH in the initialized execution environment:
+{% for tool in tools %}- {{ tool.command }} {{ tool.version }}
+{% endfor %}
+Code structure: `ast-grep run --lang rust --pattern 'fn $NAME($$$ARGS) { $$$BODY }' src`. Prefer AST patterns when looking for code constructs.
+Text: `rg -n --glob '*.rs' 'pattern' src`; filenames: `rg --files --glob '*.rs'`. Scope searches to relevant paths. Exit 1 means no matches.
+JSON: `jq '.items[] | {id, status}' data.json`; filter large JSON before reading it into context.
+Edits: submit one contextual patch for related hunks/files; apply_patch validates them before writes:
+```sh
+apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: src/main.rs
+@@
+-    old_call();
++    new_call();
+*** End Patch
+PATCH
+```
+Independent searches can run concurrently in one terminal script using `&` and `wait`; keep their outputs separate and wait for results before dependent edits. Use command help for uncommon options, not to discover these prepared capabilities.
+</prepared_tools>

@@ -1,6 +1,6 @@
 [package]
 name = "aither-sandbox"
-version.workspace = true
+version = "0.7.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -15,7 +15,7 @@ categories = ["api-bindings"]
 aither-core.workspace = true
 
 # Sandboxing
-heel = "0.2.0"
+heel = "0.3.1"
 rmp-serde = "1"
 
 # Executor for tokio integration
@@ -61,6 +61,18 @@ magika = { version = "1.1", optional = true }
 tree-sitter = { version = "0.22.6", optional = true }
 rs-tree-sitter-languages = { version = "0.0.2", optional = true }
 vte = { version = "0.15", default-features = false, features = ["std"] }
+sha2 = "0.10.9"
+blocking = "1.6.2"
+futures = "0.3.31"
+tempfile = "3.20.0"
+hex = "0.4.3"
+semver = { version = "1.0.26", features = ["serde"] }
+tar = { version = "0.4.44", default-features = false }
+flate2 = "1.1.2"
+zip = { version = "4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zenwave = { workspace = true, features = ["default"] }
+url = { version = "2.5.8", features = ["serde"] }
+procfs-core = { version = "0.18.0", default-features = false }
 
 [features]
 default = []

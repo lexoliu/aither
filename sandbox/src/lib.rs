@@ -61,6 +61,10 @@ mod output_compress;
 mod shell_session;
 mod stdin_watch;
 mod terminal;
+mod tool_distribution;
+mod tool_environment;
+mod tool_runtime;
+mod tool_transport;
 
 /// Built-in IPC commands (ask, reload).
 pub mod builtin;
@@ -86,16 +90,19 @@ pub use container::{
 };
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
 pub use heel::NetworkAuditLog;
-pub use job_registry::{JobInfo, JobRegistry, JobStatus, TerminalDelta};
+pub use job_registry::{
+    JobInfo, JobRegistry, JobRegistryService, JobStatus, TerminalDelta, job_registry_channel,
+};
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
 };
 pub use output::{Content, MediaResolution, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{PermissionHandler, TerminalMode};
 pub use shell_session::{
-    AnyContainerExec, ContainerExec, ContainerExecOutcome, ContainerShellRuntime, ShellBackend,
-    ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile, SshServer,
-    SshSessionAuthorizer, bootstrap_ssh_runtime,
+    AnyContainerExec, AnySshSessionAuthorizer, ContainerExec, ContainerExecOutcome,
+    ContainerShellRuntime, ShellBackend, ShellRuntimeAvailability, ShellSessionRegistry,
+    SshAuthorizationError, SshRuntimeProfile, SshServer, SshSessionAuthorizer,
+    bootstrap_ssh_runtime,
 };
 pub use stdin_watch::{
     STDIN_WATCH_INTERVAL, TERMINAL_STDIN_BLOCKED_NOTICE, detect_stdin_blocked_for_local_pid,
@@ -107,4 +114,14 @@ pub use terminal::{
     TerminalExecutionMode, TerminalResult, TerminalTool, TerminalToolFactory,
     TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured, open_network_audit_log,
     terminal_tool_factory_channel,
+};
+pub use tool_distribution::{
+    ToolArtifact, ToolArtifactFormat, ToolArtifactLocation, ToolDistribution,
+};
+pub use tool_runtime::{
+    ManagedTool, PreparedTools, ToolBinary, ToolBundle, ToolCatalog, ToolRuntimeError, ToolTarget,
+};
+pub use tool_transport::{
+    ContainerToolTransport, SshToolTransport, ToolEnvironmentInfo, ToolTransport,
+    probe_tool_environment,
 };
