@@ -49,7 +49,6 @@ mod model_group;
 mod stream;
 mod subagent_file;
 mod terminal_agent;
-mod todo;
 pub mod tool_request;
 mod tools;
 pub mod transcript;
@@ -96,7 +95,6 @@ pub use hook::{
 };
 pub use stream::AgentStream;
 pub use terminal_agent::TerminalAgentBuilder;
-pub use todo::{TodoItem, TodoList, TodoStatus, TodoTool, TodoWriteArgs};
 pub use tools::AgentTools;
 
 // Model groups for budget tracking and fallback

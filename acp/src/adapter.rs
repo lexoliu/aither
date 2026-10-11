@@ -1,11 +1,11 @@
 //! Adapter for converting aither agent events to ACP session updates.
 
-use aither_agent::{AgentEvent, TodoItem, TodoStatus};
+use aither_agent::AgentEvent;
 use aither_core::llm::ToolResult;
 
 use crate::protocol::{
-    ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionUpdate,
-    TextContent, ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind,
+    ContentBlock, ContentChunk, SessionUpdate, TextContent, ToolCall, ToolCallStatus,
+    ToolCallUpdate, ToolKind,
 };
 
 /// Convert an `AgentEvent` to an ACP `SessionUpdate`.
@@ -115,33 +115,6 @@ fn tool_result_raw_output(result: &ToolResult) -> serde_json::Value {
     }
 }
 
-/// Convert a todo list to an ACP Plan.
-#[must_use]
-pub fn todos_to_plan(todos: &[TodoItem]) -> Plan {
-    Plan {
-        entries: todos
-            .iter()
-            .map(|item| PlanEntry {
-                content: item.content.clone(),
-                status: todo_status_to_plan_status(item.status),
-                priority: PlanEntryPriority::Medium,
-                meta: None,
-            })
-            .collect(),
-        meta: None,
-    }
-}
-
-/// Convert `TodoStatus` to `PlanEntryStatus`.
-#[must_use]
-pub const fn todo_status_to_plan_status(status: TodoStatus) -> PlanEntryStatus {
-    match status {
-        TodoStatus::Pending => PlanEntryStatus::Pending,
-        TodoStatus::InProgress => PlanEntryStatus::InProgress,
-        TodoStatus::Completed => PlanEntryStatus::Completed,
-    }
-}
-
 /// Format a human-readable title for a tool call.
 fn format_tool_title(name: &str, arguments: &str) -> String {
     // Try to extract relevant info from arguments for better titles
@@ -241,26 +214,5 @@ mod tests {
         } else {
             panic!("Expected ToolCall");
         }
-    }
-
-    #[test]
-    fn test_todos_to_plan() {
-        let todos = vec![
-            TodoItem {
-                content: "Task 1".to_string(),
-                status: TodoStatus::Completed,
-                active_form: "Completing task 1".to_string(),
-            },
-            TodoItem {
-                content: "Task 2".to_string(),
-                status: TodoStatus::InProgress,
-                active_form: "Working on task 2".to_string(),
-            },
-        ];
-
-        let plan = todos_to_plan(&todos);
-        assert_eq!(plan.entries.len(), 2);
-        assert_eq!(plan.entries[0].status, PlanEntryStatus::Completed);
-        assert_eq!(plan.entries[1].status, PlanEntryStatus::InProgress);
     }
 }

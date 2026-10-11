@@ -19,7 +19,6 @@ use crate::{
     context::Context,
     hook::{HCons, Hook},
     model_group::ModelTier,
-    todo::{TodoList, TodoTool},
     tools::AgentTools,
     transcript::Transcript,
 };
@@ -58,7 +57,6 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     hooks: H,
     config: AgentConfig,
     context: Context,
-    todo_list: Option<TodoList>,
     background_receiver: Option<BackgroundTaskReceiver>,
     permission_receiver: Option<PermissionEventReceiver>,
     job_registry: Option<JobRegistry>,
@@ -73,7 +71,6 @@ impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Bal
         f.debug_struct("AgentBuilder")
             .field("tier", &self.tier)
             .field("config", &self.config)
-            .field("todo_enabled", &self.todo_list.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -92,7 +89,6 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             hooks: (),
             config: AgentConfig::default(),
             context: Context::default(),
-            todo_list: None,
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
@@ -128,7 +124,6 @@ where
             hooks: self.hooks,
             config: self.config,
             context: self.context,
-            todo_list: self.todo_list,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -156,7 +151,6 @@ where
             hooks: self.hooks,
             config: self.config,
             context: self.context,
-            todo_list: self.todo_list,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -258,7 +252,6 @@ where
             hooks: HCons::new(hook, self.hooks),
             config: self.config,
             context: self.context,
-            todo_list: self.todo_list,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -467,54 +460,6 @@ where
         self
     }
 
-    /// Enables todo list tracking for managing long tasks.
-    ///
-    /// When enabled, the agent will:
-    /// - Inject the current todo list into the context before each LLM request
-    /// - Generate system reminders when tasks are completed
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let agent = Agent::builder(llm)
-    ///     .todo()
-    ///     .build();
-    /// ```
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tool cannot be registered: another tool already uses
-    /// its name, or it carries no description for the model to read. Both
-    /// are mistakes in the calling program.
-    pub fn todo(mut self) -> Self {
-        let list = TodoList::new();
-        let tool = TodoTool::with_list(list.clone());
-        self.tools
-            .register(tool)
-            .expect("tool registration must succeed: duplicate name or missing description");
-        self.todo_list = Some(list);
-        self
-    }
-
-    /// Enables todo list tracking with a shared list.
-    ///
-    /// Use this when you want to share a todo list between multiple agents
-    /// or access the list externally.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tool cannot be registered: another tool already uses
-    /// its name, or it carries no description for the model to read. Both
-    /// are mistakes in the calling program.
-    pub fn todo_with_list(mut self, list: TodoList) -> Self {
-        let tool = TodoTool::with_list(list.clone());
-        self.tools
-            .register(tool)
-            .expect("tool registration must succeed: duplicate name or missing description");
-        self.todo_list = Some(list);
-        self
-    }
-
     /// Builds the agent.
     pub fn build(self) -> Agent<Advanced, Balanced, Fast, H> {
         Agent {
@@ -529,7 +474,6 @@ where
             profile: None,
             fast_profile: None,
             initialized: false,
-            todo_list: self.todo_list,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
