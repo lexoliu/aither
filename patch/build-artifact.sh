@@ -55,10 +55,11 @@ cargo +"$nightly" build -p aither-patch --profile apply-patch \
 
 bin="$CARGO_TARGET_DIR/$target/apply-patch/apply_patch${suffix}"
 [ -x "$bin" ] || { echo "artifact build produced no executable at $bin" >&2; exit 1; }
+bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
 
 name="apply_patch-${version}-${target}"
 mkdir -p "$out_dir"
-tar -czf "$out_dir/$name.tar.gz" -C "$(dirname "$bin")" "$(basename "$bin")"
+(cd "$out_dir" && tar -czf "$name.tar.gz" -C "$(dirname "$bin")" "$(basename "$bin")")
 (cd "$out_dir" && "${checksum[@]}" "$name.tar.gz" > "$name.tar.gz.sha256")
 bytes="$(wc -c < "$bin" | tr -d '[:space:]')"
 sha="$(cut -d' ' -f1 "$out_dir/$name.tar.gz.sha256")"
