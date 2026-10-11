@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn backspace_rewinds_one_column() {
-        assert_eq!(render_terminal("abc\u{8}d\n"), "abd\n");
+        assert_eq!(render_terminal("xyz\u{8}w\n"), "xyw\n");
     }
 
     #[test]
