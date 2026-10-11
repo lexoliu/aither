@@ -38,8 +38,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: dtolnay/rust-toolchain@nightly-2026-10-01
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-01
           components: rust-src
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
