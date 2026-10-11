@@ -238,6 +238,30 @@ struct TasksDiffReminder {
     diff: String,
 }
 
+#[derive(serde::Serialize)]
+struct TasksStale {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+/// Tracks tasks.md maintenance across tool turns.
+///
+/// A turn counts as stale when the model executed tool calls without the
+/// file's content changing. The counter resets on any content change, and
+/// also while the document has no unchecked items (a complete checklist is
+/// not stale). The alert fires once per stale episode.
+#[derive(Debug, Default)]
+pub struct TasksDocStaleness {
+    /// Whether a baseline observation exists yet.
+    seen: bool,
+    /// tasks.md content at the previous tool turn (None = file absent).
+    last_content: Option<String>,
+    /// Consecutive tool turns without a content change.
+    stale_turns: usize,
+    /// Whether the current episode already alerted.
+    alerted: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct EmittedCheckpoint {
     phase: ContextWindowPhase,
@@ -446,6 +470,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Last observed working-doc snapshot for diff reminders.
     pub(crate) last_working_docs: Option<working_docs::WorkingDocsSnapshot>,
 
+    /// tasks.md maintenance tracking across tool turns.
+    pub(crate) tasks_staleness: TasksDocStaleness,
+
     /// Start time of the most recent LLM request issued by this agent.
     pub(crate) last_request_started_at: Option<Instant>,
 
@@ -506,6 +533,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             transcript: None,
             sandbox_dir: None,
             last_working_docs: None,
+            tasks_staleness: TasksDocStaleness::default(),
             last_request_started_at: None,
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
@@ -689,6 +717,7 @@ where
         self.push_tool_start_events(&tool_calls, events).await;
         let results = self.execute_tool_calls(&tool_calls, turn, events).await;
         self.apply_tool_results(results, events).await?;
+        self.check_tasks_doc_staleness().await;
         self.push_turn_boundary_events(run_id, turn, &response_text, events)
             .await
     }
@@ -1369,6 +1398,65 @@ where
             content: "tasks.md still has unchecked items. Continue working through the checklist. If user input is required, call ask_user and then proceed.".to_string(),
         });
         true
+    }
+
+    /// Nags the model when tool turns keep passing without tasks.md updates.
+    ///
+    /// Runs after a tool turn: the turn itself is the tool-activity signal,
+    /// so no separate bookkeeping of tool calls is needed. The alert goes in
+    /// as a durable system message — `insert_reminder` would be cleared by
+    /// the next request's reminder repopulation before ever being sent.
+    async fn check_tasks_doc_staleness(&mut self) {
+        let Some(sandbox_dir) = self.sandbox_dir.as_deref() else {
+            return;
+        };
+        let docs = working_docs::read_snapshot(sandbox_dir).await;
+        let threshold = self.config.tasks_stale_after_turns;
+
+        let state = &mut self.tasks_staleness;
+        if !state.seen {
+            state.seen = true;
+            state.last_content = docs.tasks_md;
+            return;
+        }
+        if state.last_content != docs.tasks_md {
+            state.last_content = docs.tasks_md;
+            state.stale_turns = 0;
+            state.alerted = false;
+            return;
+        }
+
+        let stale_kind = match &docs.tasks_md {
+            Some(content) if working_docs::has_unchecked_markdown_tasks(content) => {
+                Some("unchecked")
+            }
+            Some(_) => {
+                state.stale_turns = 0;
+                state.alerted = false;
+                None
+            }
+            None => Some("missing"),
+        };
+        let Some(stale_kind) = stale_kind else {
+            return;
+        };
+
+        state.stale_turns += 1;
+        if state.stale_turns < threshold || state.alerted {
+            return;
+        }
+        state.alerted = true;
+        let content = if stale_kind == "missing" {
+            format!(
+                "{threshold} tool turns have run without a tasks.md. For multi-step work, create tasks.md in the sandbox root with a checklist of the plan — it is the canonical task document and survives context compaction."
+            )
+        } else {
+            format!(
+                "tasks.md has unchecked items but has not been updated for {threshold} tool turns. Mark finished items and keep the checklist in sync with actual progress."
+            )
+        };
+        let xml = serialize_xml("tasks_stale", &TasksStale { content });
+        self.context.push(Message::system(xml));
     }
 
     /// Returns the current conversation history.
@@ -2449,5 +2537,89 @@ mod tests {
                 .all(|message| !message.content().contains("templates/review.md")),
             "skill resource catalog must not be injected automatically"
         );
+    }
+
+    fn tasks_stale_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+        Agent::builder(MockLlm {
+            context_length: 1_000,
+        })
+        .sandbox_dir(dir)
+        .config(AgentConfig {
+            tasks_stale_after_turns: 2,
+            ..AgentConfig::default()
+        })
+        .build()
+    }
+
+    fn stale_alert_count(agent: &Agent<MockLlm, MockLlm, MockLlm, ()>) -> usize {
+        agent
+            .context()
+            .conversation_messages()
+            .iter()
+            .filter(|message| message.content().contains("<tasks_stale>"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn tasks_stale_fires_once_after_threshold_with_unchecked_items() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] pending\n").expect("write tasks.md");
+        let mut agent = tasks_stale_agent(dir.path());
+
+        agent.check_tasks_doc_staleness().await; // baseline
+        agent.check_tasks_doc_staleness().await; // stale turn 1
+        assert_eq!(stale_alert_count(&agent), 0);
+        agent.check_tasks_doc_staleness().await; // stale turn 2 -> alert
+        assert_eq!(stale_alert_count(&agent), 1);
+        agent.check_tasks_doc_staleness().await; // still stale, no re-alert
+        assert_eq!(stale_alert_count(&agent), 1);
+    }
+
+    #[tokio::test]
+    async fn tasks_stale_suggests_creating_missing_doc() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir should exist");
+        let mut agent = tasks_stale_agent(dir.path());
+
+        for _ in 0..3 {
+            agent.check_tasks_doc_staleness().await;
+        }
+
+        let messages = agent.context().conversation_messages();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content().contains("without a tasks.md")),
+            "missing tasks.md should earn a create-the-doc alert"
+        );
+    }
+
+    #[tokio::test]
+    async fn tasks_stale_resets_when_doc_is_updated_or_complete() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir should exist");
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(&tasks_path, "- [ ] pending\n").expect("write tasks.md");
+        let mut agent = tasks_stale_agent(dir.path());
+
+        agent.check_tasks_doc_staleness().await; // baseline
+        agent.check_tasks_doc_staleness().await; // stale turn 1
+
+        // Model updates the doc: counter resets.
+        std::fs::write(&tasks_path, "- [x] done\n- [ ] next\n").expect("update tasks.md");
+        agent.check_tasks_doc_staleness().await;
+        assert_eq!(agent.tasks_staleness.stale_turns, 0);
+
+        // All-checked doc is not stale: counter stays reset.
+        std::fs::write(&tasks_path, "- [x] done\n- [x] next\n").expect("complete tasks.md");
+        for _ in 0..4 {
+            agent.check_tasks_doc_staleness().await;
+        }
+        assert_eq!(agent.tasks_staleness.stale_turns, 0);
+        assert_eq!(stale_alert_count(&agent), 0);
     }
 }
