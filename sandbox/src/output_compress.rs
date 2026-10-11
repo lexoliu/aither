@@ -6,13 +6,14 @@
 //!    consuming escape sequences and resolving `\r` to the last frame of each
 //!    line.
 //! 2. [`collapse`] collapses runs of blank lines to a single blank line.
-//! 3. [`json_tsv`] turns a JSON table into TSV.
+//! 3. [`json_tsv`] turns a JSON array of records into TSV.
 //! 4. [`fold`] folds the bodies of blocks in output that is source code.
 //! 5. [`preview`] reduces stored text to a head+tail preview for the model.
 //!
 //! Stages 1 and 2 are the only ones applied unconditionally: together they
 //! are what a terminal would have shown, so output delivered inline -- where
-//! no copy is kept -- keeps every character the command actually produced.
+//! no copy is kept -- keeps every character the command actually produced,
+//! down to whether it ended with a line terminator.
 //!
 //! Stages 3 and 4 are lossy. They run only when the text they replace can be
 //! written to disk, and the text the model reads names that file, so nothing
@@ -193,11 +194,27 @@ mod tests {
     #[tokio::test]
     async fn output_cut_off_mid_escape_leaks_no_brackets() {
         // A killed process can stop in the middle of a sequence; the last
-        // frame still has to be readable and free of bracket noise.
+        // frame still has to be readable and free of bracket noise, and the
+        // newline the process never wrote is not invented.
         let cleaned = compress("partial output\u{1b}[32")
             .await
             .expect("truncated sequence is consumed");
-        assert_eq!(cleaned, "partial output\n");
+        assert_eq!(cleaned, "partial output");
+    }
+
+    #[tokio::test]
+    async fn output_without_a_final_newline_is_left_alone() {
+        // `printf abc` is already what a terminal shows, so the pipeline has
+        // nothing to change and must not append a terminator.
+        assert!(compress("abc").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unterminated_progress_line_renders_as_its_last_frame() {
+        let cleaned = compress("abc\r\u{1b}[2Kxyz")
+            .await
+            .expect("the frame is resolved");
+        assert_eq!(cleaned, "xyz");
     }
 
     #[tokio::test]

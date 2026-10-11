@@ -1,4 +1,4 @@
-//! Structure transform stage: JSON table to TSV.
+//! Structure transform stage: a JSON array of records to TSV.
 //!
 //! This stage is lossy -- the TSV form drops the distinction between strings,
 //! numbers, booleans and null, and flattens how arrays nest -- so the
@@ -10,29 +10,38 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 use tracing::debug;
 
-/// Converts `text` to TSV when it is a JSON array of records or a single JSON
-/// object, and when the TSV form is actually smaller.
+/// Smallest number of records that makes a table worth building.
 ///
-/// Returns `None` for anything else: scalars, empty arrays, non-JSON text, or
-/// a table whose TSV encoding would not save anything.
+/// A table earns its header row by amortising it over the rows beneath. One
+/// record -- `gh api repos/owner/name`, say -- becomes a single row of dozens
+/// of dotted columns whose header is as long as the data, which is harder to
+/// read than the JSON it replaced and saves almost nothing, so it is left as
+/// JSON.
+const MIN_RECORDS: usize = 2;
+
+/// Converts `text` to TSV when it is a JSON array of at least two records and
+/// the TSV form is actually smaller.
+///
+/// Returns `None` for anything else: scalars, non-JSON text, a single object,
+/// an array shorter than [`MIN_RECORDS`], an array whose elements are not all
+/// objects, or a table whose TSV encoding would not save anything.
 #[must_use]
 pub fn to_tsv(text: &str) -> Option<String> {
     let trimmed = text.trim();
     let value: Value = serde_json::from_str(trimmed).ok()?;
 
-    let rows = match &value {
-        Value::Array(array) if !array.is_empty() => array
-            .iter()
-            .map(|element| flatten_value(element, ""))
-            .collect::<Vec<_>>(),
-        Value::Object(_) => vec![flatten_value(&value, "")],
-        // Scalars and empty arrays gain nothing from a table.
-        _ => return None,
+    let Value::Array(array) = &value else {
+        return None;
     };
-
-    if rows.is_empty() {
+    // Records only: an array of scalars has no field names to make columns
+    // from, and a table of one unnamed column is not a table.
+    if array.len() < MIN_RECORDS || !array.iter().all(Value::is_object) {
         return None;
     }
+    let rows: Vec<Vec<(String, String)>> = array
+        .iter()
+        .map(|element| flatten_value(element, ""))
+        .collect();
 
     // Column headers in first-seen order, so the table keeps the document's
     // field order rather than an arbitrary one.
@@ -147,10 +156,17 @@ mod tests {
     }
 
     #[test]
-    fn flattens_a_single_object() {
+    fn rejects_a_single_object() {
+        // One record's header is as long as its data, and a reader loses the
+        // field-per-line shape that makes an API response legible.
         let json = r#"{"name": "Alice Example Jones", "nested": {"x": 1}}"#;
-        let tsv = to_tsv(json).expect("single object converts");
-        assert!(tsv.contains("name\tnested.x"), "{tsv}");
+        assert!(to_tsv(json).is_none());
+    }
+
+    #[test]
+    fn rejects_a_one_element_array() {
+        let json = r#"[{"name": "Alice Example Jones", "nested": {"x": 1}}]"#;
+        assert!(to_tsv(json).is_none());
     }
 
     #[test]
@@ -159,6 +175,10 @@ mod tests {
         assert!(to_tsv("\"hello\"").is_none());
         assert!(to_tsv("true").is_none());
         assert!(to_tsv("[]").is_none());
+        assert!(
+            to_tsv("[1, 2, 3]").is_none(),
+            "scalar elements have no columns"
+        );
     }
 
     #[test]

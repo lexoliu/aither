@@ -22,8 +22,9 @@ use vte::{Params, Parser, Perform};
 /// whitespace, is preserved byte for byte, so the result is lossless for
 /// output that contains no escapes.
 ///
-/// The result always ends with a newline when it is non-empty, matching the
-/// line-oriented shape the rest of the pipeline works on.
+/// A line terminator is never invented: output that ends without one --
+/// `printf abc`, `base64 -w0`, a file with no final newline, a stream cut off
+/// mid-escape -- renders without one too.
 #[must_use]
 pub fn render_terminal(text: &str) -> String {
     let mut screen = LineRenderer::with_capacity(text.len());
@@ -49,13 +50,14 @@ impl LineRenderer {
         }
     }
 
-    /// Flushes the current line and returns the rendered text.
+    /// Flushes the unterminated last line, if any, and returns the rendered
+    /// text.
+    ///
+    /// A stream that ends without a newline -- a lone `\r` at the end of a
+    /// progress line, or a shell prompt -- still has a last frame to show,
+    /// but it is emitted without a terminator the stream never carried.
     fn finish(mut self) -> String {
-        // A stream that ends without a newline -- a lone `\r` at the end of a
-        // progress line, or a prompt -- still has a last frame to show.
-        if !self.line.is_empty() {
-            self.end_line();
-        }
+        self.rendered.extend(self.line.drain(..));
         self.rendered
     }
 
@@ -179,7 +181,20 @@ mod tests {
 
     #[test]
     fn lone_carriage_return_at_end_keeps_the_frame() {
-        assert_eq!(render_terminal("progress 99%\r"), "progress 99%\n");
+        assert_eq!(render_terminal("progress 99%\r"), "progress 99%");
+    }
+
+    #[test]
+    fn carriage_return_at_end_still_rewinds_for_what_follows() {
+        assert_eq!(render_terminal("abc\r\u{1b}[2Kxyz"), "xyz");
+    }
+
+    #[test]
+    fn output_without_a_final_newline_gains_none() {
+        // `printf abc`, `base64 -w0` and files with no final newline must
+        // come through byte for byte.
+        assert_eq!(render_terminal("abc"), "abc");
+        assert_eq!(render_terminal("first\nsecond"), "first\nsecond");
     }
 
     #[test]
@@ -225,7 +240,7 @@ mod tests {
 
     #[test]
     fn trailing_escape_at_end_of_stream_is_dropped() {
-        assert_eq!(render_terminal("tail\u{1b}["), "tail\n");
+        assert_eq!(render_terminal("tail\u{1b}["), "tail");
     }
 
     #[test]

@@ -13,14 +13,15 @@ const fn is_blank(line: &str) -> bool {
 /// Collapses every run of two or more blank lines into a single blank line.
 ///
 /// A lone blank line is always kept, so paragraphs, hunk separators and the
-/// blank context lines of a patch survive. The result ends with a newline
-/// when it is non-empty.
+/// blank context lines of a patch survive. Whether the text ends with a line
+/// terminator is preserved: lines keep the newline they arrived with, and
+/// none is added to a last line that had none.
 #[must_use]
 pub fn collapse_blank_runs(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_blank_run = false;
-    for line in text.lines() {
-        if is_blank(line) {
+    for line in text.split_inclusive('\n') {
+        if is_blank(line.strip_suffix('\n').unwrap_or(line)) {
             if in_blank_run {
                 continue;
             }
@@ -29,7 +30,6 @@ pub fn collapse_blank_runs(text: &str) -> String {
             in_blank_run = false;
         }
         out.push_str(line);
-        out.push('\n');
     }
     out
 }
@@ -65,5 +65,11 @@ mod tests {
     #[test]
     fn empty_input_stays_empty() {
         assert_eq!(collapse_blank_runs(""), "");
+    }
+
+    #[test]
+    fn keeps_a_missing_final_newline() {
+        assert_eq!(collapse_blank_runs("alpha\n\n\nbeta"), "alpha\n\nbeta");
+        assert_eq!(collapse_blank_runs("abc"), "abc");
     }
 }
