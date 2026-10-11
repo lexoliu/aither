@@ -480,6 +480,7 @@ where
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
             last_working_docs: None,
+            tasks_staleness: crate::agent::TasksDocStaleness::default(),
             last_request_started_at: None,
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
