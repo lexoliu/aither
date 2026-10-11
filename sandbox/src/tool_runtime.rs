@@ -369,7 +369,9 @@ impl PreparedTools {
         futures::stream::iter(self.catalog.tools.clone())
             .map(|info| {
                 let sandbox = sandbox.clone();
-                let program = directory.join(info.command);
+                let program = directory
+                    .join(info.command)
+                    .with_extension(std::env::consts::EXE_EXTENSION);
                 async move {
                     let program = program
                         .to_str()

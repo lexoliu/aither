@@ -1274,9 +1274,29 @@ mod tests {
 
         let source = tempdir().unwrap();
         let cache = tempdir().unwrap();
-        let binary = include_bytes!("../templates/test_baseline_tool.sh");
-        let path = source.path().join("baseline-tool");
-        async_fs::write(&path, binary).await.unwrap();
+        let fixture = source.path().join("baseline_tool.rs");
+        async_fs::write(
+            &fixture,
+            include_bytes!("../templates/test_baseline_tool.rs"),
+        )
+        .await
+        .unwrap();
+        let path = source
+            .path()
+            .join("baseline-tool")
+            .with_extension(std::env::consts::EXE_EXTENSION);
+        let compiled = async_process::Command::new("rustc")
+            .arg("--crate-name")
+            .arg("baseline_tool")
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&path)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(compiled.status.success(), "{compiled:?}");
+        let binary = async_fs::read(&path).await.unwrap();
         let artifacts = ManagedTool::ALL
             .into_iter()
             .map(|tool| ToolArtifact {
@@ -1286,7 +1306,7 @@ mod tests {
                 url: aither_sandbox::ToolArtifactLocation::Download(
                     url::Url::from_file_path(&path).unwrap(),
                 ),
-                sha256: format!("{:x}", sha2::Sha256::digest(binary)),
+                sha256: format!("{:x}", sha2::Sha256::digest(&binary)),
                 encoding: ToolArtifactFormat::Executable,
             })
             .collect();
