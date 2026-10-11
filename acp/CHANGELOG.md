@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/lexoliu/aither/compare/acp-v0.5.0...acp-v0.6.0) - 2026-10-10
+
+### Added
+
+- add Apple Intelligence provider
+- [**breaking**] tools report progress during a call; aither-mcp forwards it as notifications/progress ([#79](https://github.com/lexoliu/aither/pull/79))
+
+### Other
+
+- Merge branch 'main' into dev
+
 ## [0.5.0](https://github.com/lexoliu/aither/compare/acp-v0.4.1...acp-v0.5.0) - 2026-09-17
 
 ### Other
