@@ -1454,7 +1454,7 @@ mod tests {
             FetchRequest::new("https://example.com").with_deadline(Duration::from_secs(12));
         let result = fetch_with_request(request).await.unwrap();
         assert!(result.title.is_some());
-        assert!(!result.content.is_empty());
+        assert_ne!(result.content, "");
     }
 
     #[tokio::test]
@@ -1466,7 +1466,7 @@ mod tests {
         assert!(result.is_ok(), "Wikipedia fetch failed: {:?}", result.err());
         let result = result.unwrap();
         assert!(result.title.is_some());
-        assert!(!result.content.is_empty());
+        assert_ne!(result.content, "");
         assert!(
             result.content.contains("Rust") || result.content.contains("programming"),
             "Content should mention Rust or programming"
@@ -1480,7 +1480,7 @@ mod tests {
         // SVG might not be supported, so we just check it doesn't panic
         if let Ok((data, mime)) = result {
             assert_eq!(mime, "image/jpeg");
-            assert!(!data.is_empty());
+            assert_ne!(data.len(), 0);
         }
     }
 
@@ -1669,7 +1669,7 @@ mod headless_tests {
         assert!(result.is_ok(), "Headless fetch failed: {:?}", result.err());
         let result = result.unwrap();
         assert!(result.title.is_some());
-        assert!(!result.content.is_empty());
+        assert_ne!(result.content, "");
     }
 
     #[tokio::test]

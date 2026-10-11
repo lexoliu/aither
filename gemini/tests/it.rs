@@ -25,7 +25,7 @@ fn api_key() -> String {
 async fn test_provider_list_models() {
     let provider = GeminiProvider::new(api_key());
     let models = provider.list_models().await.expect("Failed to list models");
-    assert!(!models.is_empty());
+    assert_ne!(models.len(), 0);
 
     println!("Available models:");
     for model in &models {
@@ -69,7 +69,7 @@ async fn test_structured_generate() {
         .expect("Failed to generate structured output");
 
     assert_eq!(result.answer, 25);
-    assert!(!result.explanation.is_empty());
+    assert_ne!(result.explanation, "");
 }
 
 #[tokio::test]
@@ -78,7 +78,7 @@ async fn test_embedding() {
     let backend = Gemini::new(api_key());
     let vec = backend.embed("Hello world").await.expect("Failed to embed");
     assert_eq!(vec.len(), backend.dim());
-    assert!(!vec.is_empty());
+    assert_ne!(vec.len(), 0);
 }
 
 #[tokio::test]
@@ -132,7 +132,7 @@ async fn test_image_generate() {
         image_data = result.expect("Failed to generate image");
     }
 
-    assert!(!image_data.is_empty());
+    assert_ne!(image_data.len(), 0);
     // Basic check for PNG/JPEG header?
     // Gemini usually returns JPEG or PNG.
 }

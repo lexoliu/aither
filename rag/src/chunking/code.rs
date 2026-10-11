@@ -158,7 +158,7 @@ mod tests {
         );
 
         let chunks = chunker.chunk(&doc).unwrap();
-        assert!(!chunks.is_empty());
+        assert_ne!(chunks.len(), 0);
         assert!(chunks.iter().any(|c| c.text.contains("fn hello")));
     }
 }

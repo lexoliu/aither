@@ -130,14 +130,14 @@ mod tests {
     #[test]
     fn test_models_with_ability() {
         let vision_models: Vec<_> = models_with_ability(Ability::Vision).collect();
-        assert!(!vision_models.is_empty());
+        assert_ne!(vision_models.len(), 0);
         assert!(vision_models.iter().all(|m| m.has_ability(Ability::Vision)));
     }
 
     #[test]
     fn test_models_by_mode() {
         let chat_models: Vec<_> = models_by_mode(ModelMode::Chat).collect();
-        assert!(!chat_models.is_empty());
+        assert_ne!(chat_models.len(), 0);
         assert!(chat_models.iter().all(|m| m.mode() == ModelMode::Chat));
     }
 
