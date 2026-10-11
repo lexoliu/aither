@@ -56,6 +56,7 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/install-heel
       - run: cargo nextest run ${{ inputs.flags }}
       # cargo test never ran proc-macro doctests; keep aither-derive excluded so
       # this step covers exactly the doctests the previous job did.
