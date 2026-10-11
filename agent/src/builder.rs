@@ -481,7 +481,6 @@ where
             sandbox_dir: self.sandbox_dir,
             last_working_docs: None,
             last_request_started_at: None,
-            transient_system_messages: Vec::new(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,

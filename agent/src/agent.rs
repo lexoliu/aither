@@ -453,7 +453,6 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     ///
     /// These participate in prompt assembly for the current turn but are not
     /// stored in the persistent context or checkpoints.
-    pub(crate) transient_system_messages: Vec<String>,
 
     /// Rolling KV-cache statistics accumulated from emitted `Usage` events.
     ///
@@ -508,7 +507,6 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             sandbox_dir: None,
             last_working_docs: None,
             last_request_started_at: None,
-            transient_system_messages: Vec::new(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -1202,20 +1200,6 @@ where
         self.context.push(message);
     }
 
-    /// Replaces transient per-turn system messages.
-    pub fn set_transient_system_messages(&mut self, messages: impl IntoIterator<Item = String>) {
-        self.transient_system_messages = messages
-            .into_iter()
-            .map(|message| message.trim().to_string())
-            .filter(|message| !message.is_empty())
-            .collect();
-    }
-
-    /// Clears transient per-turn system messages.
-    pub fn clear_transient_system_messages(&mut self) {
-        self.transient_system_messages.clear();
-    }
-
     /// Returns the rolling KV-cache statistics for this agent session.
     ///
     /// The stats are updated every time the underlying provider emits a
@@ -1600,9 +1584,7 @@ where
     async fn assemble_context_window(&mut self) -> ContextWindowSnapshot {
         self.populate_dynamic_reminders().await;
 
-        let mut messages = self
-            .context
-            .build_messages_with_transient_system(&self.transient_system_messages);
+        let mut messages = self.context.build_messages();
         let mut metrics = self.estimate_context_window_metrics(&messages);
 
         if !metrics.has_handoff
@@ -1965,7 +1947,6 @@ where
 
         serialize_xml("background-terminal-result", &xml)
     }
-
 }
 fn format_builtin_tool_result(tool: &str, result: &str) -> String {
     let mut text = String::from("[");
