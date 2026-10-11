@@ -1,0 +1,15 @@
+name: Install Heel Runtime
+description: Prepare the released heel executable required by sandbox IPC tests.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        cargo install heel --version 0.3.1 --locked --debug --root "${RUNNER_TEMP}/heel-runtime" --target-dir target/heel-runtime-build
+        executable="${RUNNER_TEMP}/heel-runtime/bin/heel"
+        if [[ "${RUNNER_OS}" == Windows ]]; then
+          executable="${executable}.exe"
+        fi
+        "${executable}" --version
+        echo "HEEL_BIN=${executable}" >> "${GITHUB_ENV}"
