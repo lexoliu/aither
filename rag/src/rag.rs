@@ -468,7 +468,7 @@ mod tests {
         assert_eq!(rag.len(), 2);
 
         let results = rag.search("hello").await.unwrap();
-        assert!(!results.is_empty());
+        assert_ne!(results.len(), 0);
     }
 
     #[tokio::test]

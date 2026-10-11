@@ -33,7 +33,7 @@ pub enum CloudProvider {
     Gemini(Gemini),
     /// GitHub Copilot models.
     Copilot(Copilot),
-    /// ChatGPT Codex subscription models.
+    /// `ChatGPT` Codex subscription models.
     Codex(Codex),
 }
 
@@ -190,7 +190,7 @@ pub enum CloudError {
     /// GitHub Copilot API error.
     #[error("Copilot error: {0}")]
     Copilot(#[from] aither_copilot::CopilotError),
-    /// ChatGPT Codex API error.
+    /// `ChatGPT` Codex API error.
     #[error("Codex error: {0}")]
     Codex(#[from] aither_codex::CodexError),
 }
@@ -279,7 +279,7 @@ pub enum CloudModelProvider {
     Gemini(GeminiProvider),
     /// GitHub Copilot provider.
     Copilot(CopilotProvider),
-    /// ChatGPT Codex provider.
+    /// `ChatGPT` Codex provider.
     Codex(CodexProvider),
 }
 
