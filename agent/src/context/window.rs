@@ -921,13 +921,13 @@ mod tests {
             vec![tool_call("a", "read", serde_json::json!({"path": "x"}))],
         ));
         // Only results larger than the tombstone are worth replacing.
-        context.push(Message::tool("a", &"first read ".repeat(32)));
+        context.push(Message::tool("a", "first read ".repeat(32)));
         context.push(Message::system("<alert>something happened</alert>"));
         context.push(Message::assistant_with_tool_calls(
             "",
             vec![tool_call("b", "read", serde_json::json!({"path": "x"}))],
         ));
-        context.push(Message::tool("b", &"second read ".repeat(32)));
+        context.push(Message::tool("b", "second read ".repeat(32)));
 
         let estimate = context.estimate_reassembly_savings();
         let report = context.reassemble();
