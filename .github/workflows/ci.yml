@@ -174,8 +174,11 @@ jobs:
   # one job's timeout — every run was being cancelled at 45 minutes.
   # `--partition k/8` slices the generated command list into eighths, so the
   # same two invocations run in eight parallel jobs with identical coverage.
+  # Feature-pair coverage is a release-grade gate: it runs only on pull
+  # requests bound for main, not on routine dev pushes and PRs.
   feature-checks:
     name: Features (${{ matrix.part }}/8)
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
