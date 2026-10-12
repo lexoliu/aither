@@ -2650,8 +2650,9 @@ async fn prepare_session_runtime_environment(
         ))
     })?;
 
+    let sandbox_path = heel::default_sandbox_path();
     let path = tools
-        .prepend_path(Some(std::ffi::OsStr::new(heel::DEFAULT_SANDBOX_PATH)))?
+        .prepend_path(Some(std::ffi::OsStr::new(&sandbox_path)))?
         .into_string()
         .map_err(|_| ToolRuntimeError::InvalidCache(tools.bin_dir().clone()))?;
     Ok(vec![

@@ -814,9 +814,8 @@ pub mod tests {
         let cache = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let ready = bundle().prepare_local(cache.path()).await.unwrap();
-        let path = ready
-            .prepend_path(Some(OsStr::new(heel::DEFAULT_SANDBOX_PATH)))
-            .unwrap();
+        let sandbox_path = heel::default_sandbox_path();
+        let path = ready.prepend_path(Some(OsStr::new(&sandbox_path))).unwrap();
         let config = heel::SandboxConfig::builder()
             .network(heel::DenyAll)
             .working_dir(workspace.path())
