@@ -2908,7 +2908,11 @@ fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
     executor: E,
     registry: Arc<ToolRegistry>,
 ) -> Result<ContainerIpcBridge, TerminalError> {
-    let listener = StdTcpListener::bind("127.0.0.1:0").map_err(|e| {
+    // Containers reach the bridge through their gateway address
+    // (`host.docker.internal` and friends resolve to the gateway IP, not to
+    // the host's loopback), so the listener must accept on every interface —
+    // a loopback bind would refuse every connection the container attempts.
+    let listener = StdTcpListener::bind("0.0.0.0:0").map_err(|e| {
         TerminalError::Execution(format!("failed to bind container IPC tcp port: {e}"))
     })?;
     let local_addr = listener.local_addr().map_err(|e| {
