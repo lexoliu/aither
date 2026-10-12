@@ -2,6 +2,13 @@
 set -euo pipefail
 bin_dir="${1:?usage: verify_container_readonly.sh <prepared-bin-directory>}"
 test "$(id -u)" -eq 0
+readonly_mount=false
+while read -r _id _parent _device _root mountpoint options _rest; do
+  if [ "$mountpoint" = "${bin_dir%/*}" ]; then
+    case ",$options," in *,ro,*) readonly_mount=true ;; esac
+  fi
+done < /proc/self/mountinfo
+test "$readonly_mount" = true
 before="$(sha256sum "$bin_dir/rg")"
 if printf 'tampered\n' > "$bin_dir/rg"; then exit 1; fi
 if chmod u+w "$bin_dir/rg"; then exit 1; fi
