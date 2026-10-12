@@ -11,7 +11,7 @@
 //! directory, but each execution gets a fresh sandbox (new TTY/process).
 
 #[cfg(unix)]
-use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream};
 use std::{
     borrow::Cow,
     io::{Read, Write},
@@ -54,8 +54,8 @@ use crate::{
     },
     permission::{PermissionError, PermissionHandler, TerminalMode},
     shell_session::{
-        ContainerShellRuntime, ShellBackend, ShellRuntimeAvailability, ShellSessionRegistry,
-        SshRuntimeProfile,
+        BridgeAddress, ContainerShellRuntime, ShellBackend, ShellRuntimeAvailability,
+        ShellSessionRegistry, SshRuntimeProfile,
     },
     stdin_watch::{
         STDIN_WATCH_INTERVAL, TERMINAL_STDIN_BLOCKED_NOTICE, detect_stdin_blocked_for_local_pid,
@@ -2473,6 +2473,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         Some(start_container_ipc_bridge(
             context.executor,
             Arc::clone(context.registry),
+            container_runtime.ipc_route().bind(),
         )?)
     };
     let script = context.prepared_tools.wrap_script(context.script)?;
@@ -2480,7 +2481,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         &script,
         context.ipc_commands,
         ipc_bridge.as_ref().map(|bridge| ContainerIpcEndpoint {
-            host: container_runtime.ipc_host(),
+            host: container_runtime.ipc_route().host(),
             port: bridge.port(),
         }),
         context.priority,
@@ -2907,12 +2908,11 @@ impl ContainerIpcBridge {
 fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
     executor: E,
     registry: Arc<ToolRegistry>,
+    bind: BridgeAddress,
 ) -> Result<ContainerIpcBridge, TerminalError> {
-    // Containers reach the bridge through their gateway address
-    // (`host.docker.internal` and friends resolve to the gateway IP, not to
-    // the host's loopback), so the listener must accept on every interface —
-    // a loopback bind would refuse every connection the container attempts.
-    let listener = StdTcpListener::bind("0.0.0.0:0").map_err(|e| {
+    // The bridge executes host IPC commands for whoever connects, so it binds
+    // only the address the container route names — never a wildcard.
+    let listener = StdTcpListener::bind(SocketAddr::new(bind.ip(), 0)).map_err(|e| {
         TerminalError::Execution(format!("failed to bind container IPC tcp port: {e}"))
     })?;
     let local_addr = listener.local_addr().map_err(|e| {
@@ -2957,6 +2957,7 @@ fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
 fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
     _executor: E,
     _registry: Arc<ToolRegistry>,
+    _bind: BridgeAddress,
 ) -> Result<ContainerIpcBridge, TerminalError> {
     Err(TerminalError::Execution(
         "container IPC bridge is only supported on unix hosts".to_string(),
@@ -4471,6 +4472,32 @@ mod tests {
         }
     }
 
+    /// The docker `bridge` network's gateway as the host owns it — the
+    /// address `host.docker.internal` resolves to inside the container via
+    /// `--add-host …:host-gateway`, so it is the address the IPC bridge binds.
+    #[cfg(all(unix, aither_container_acceptance))]
+    async fn container_bridge_address(
+        client: &bollard::Docker,
+        container_id: &str,
+    ) -> BridgeAddress {
+        client
+            .inspect_container(
+                container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .expect("container acceptance should inspect the container")
+            .network_settings
+            .and_then(|settings| settings.networks)
+            .and_then(|mut networks| networks.remove("bridge"))
+            .and_then(|endpoint| endpoint.gateway)
+            .expect("container acceptance requires the bridge network gateway")
+            .parse::<std::net::IpAddr>()
+            .expect("the bridge gateway should parse as an IP address")
+            .try_into()
+            .expect("the bridge gateway should be a usable bridge address")
+    }
+
     /// A Linux `heel` binary for the container under test: `HEEL_BIN` wins,
     /// then a `heel` already on `PATH`.
     #[cfg(all(unix, aither_container_acceptance))]
@@ -4519,12 +4546,21 @@ mod tests {
         let container = TestDockerContainer::start(&heel_bin)
             .expect("container acceptance could not start ubuntu:24.04");
 
-        let client =
-            bollard::Docker::connect_with_local_defaults().expect("docker client should connect");
-        let exec = crate::AnyContainerExec::new(Arc::new(crate::BollardContainerExec::new(
-            Arc::new(client),
-        )));
-        let runtime = ContainerShellRuntime::new(container.0.clone(), "host.docker.internal", exec);
+        let client = Arc::new(
+            bollard::Docker::connect_with_local_defaults().expect("docker client should connect"),
+        );
+        // The bridge binds the container network's gateway as the host owns
+        // it (docker0), because native Linux Docker resolves
+        // `host.docker.internal` (via `--add-host …:host-gateway`) to exactly
+        // that address.
+        let bind = container_bridge_address(&client, &container.0).await;
+        println!("ipc bridge bind: {}", bind.ip());
+        let exec = crate::AnyContainerExec::new(Arc::new(crate::BollardContainerExec::new(client)));
+        let runtime = ContainerShellRuntime::new(
+            container.0.clone(),
+            crate::ContainerIpcRoute::new("host.docker.internal", bind),
+            exec,
+        );
 
         // The container backend needs its own prepared tools: the registry
         // entry names the container and its `/opt/aither/tools` bin dir, which
