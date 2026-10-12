@@ -188,7 +188,7 @@ jobs:
           RUSTFLAGS="--cfg aither_container_acceptance"
           cargo test -p aither-sandbox --all-features
           terminal::tests::container_command_runs_with_configured_nice_and_reaches_ipc
-          -- --exact
+          -- --exact --nocapture
 
   # `cargo hack` expands both flags into one `cargo check` per feature
   # combination, and over a 25-crate workspace that list cannot finish inside

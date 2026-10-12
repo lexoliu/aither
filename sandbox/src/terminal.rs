@@ -4596,6 +4596,10 @@ mod tests {
         let payload = parse_terminal_tool_result(&result);
         assert_eq!(payload.exit_code, 0);
         let stdout = output_text(&payload.stdout).unwrap_or_default();
+        // The CI job runs the test with --nocapture so the container's output
+        // — the applied nice level and the live probe reply — lands in the
+        // job log.
+        println!("container script output:\n{stdout}");
         assert!(
             stdout.contains("nice=5"),
             "container command should run at the configured nice level; stdout: {stdout}"
