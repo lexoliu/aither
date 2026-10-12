@@ -6,7 +6,7 @@ runs:
     - shell: bash
       run: |
         set -euo pipefail
-        cargo install heel --version 0.3.1 --locked --debug --root "${RUNNER_TEMP}/heel-runtime" --target-dir target/heel-runtime-build
+        cargo install heel --version 0.4.0 --locked --debug --root "${RUNNER_TEMP}/heel-runtime" --target-dir target/heel-runtime-build
         executable="${RUNNER_TEMP}/heel-runtime/bin/heel"
         if [[ "${RUNNER_OS}" == Windows ]]; then
           executable="${executable}.exe"

@@ -34,8 +34,8 @@ use executor_core::{Executor, Task};
 #[cfg(unix)]
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use heel::{
-    AllowAll, Audited, DomainRequest, IpcRouter, NetworkAuditLog, NetworkPolicy, Sandbox,
-    SandboxConfig, SecurityConfig, StdioConfig, WorkingDir,
+    Access, AllowAll, Audited, DomainRequest, Grant, IpcRouter, NetworkAuditLog, NetworkPolicy,
+    Sandbox, SandboxConfig, SecurityConfig, StdioConfig, WorkingDir,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -2123,16 +2123,27 @@ where
     N: NetworkPolicy + 'static,
 {
     let runtime_environment = prepare_session_runtime_environment(context.working_dir).await?;
-    let mut config_builder = SandboxConfig::builder()
+    let config_builder = SandboxConfig::builder()
         .network(policy)
         .working_dir(context.working_dir)
-        .writable_paths(context.writable_paths)
-        .readable_paths(context.readable_paths)
+        .grants(
+            context
+                .writable_paths
+                .iter()
+                .map(|path| Grant::new(path, Access::WRITE))
+                .chain(
+                    context
+                        .readable_paths
+                        .iter()
+                        .map(|path| Grant::new(path, Access::READ)),
+                ),
+        )
         .security(SecurityConfig::interactive());
-    if let Some(router) = create_ipc_router(context.registry) {
-        config_builder = config_builder.ipc(router);
-    }
-    let config = config_builder.build();
+    // `ipc` changes the builder's type, so both arms build where they are.
+    let config = match create_ipc_router(context.registry) {
+        Some(router) => config_builder.ipc(router).build(),
+        None => config_builder.build(),
+    };
 
     let sandbox = Sandbox::with_config_and_executor(config, context.executor.clone())
         .await
@@ -2188,16 +2199,27 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
     let runtime_environment = prepare_session_runtime_environment(context.working_dir).await?;
-    let mut config_builder = SandboxConfig::builder()
+    let config_builder = SandboxConfig::builder()
         .network(AllowAll)
         .working_dir(context.working_dir)
-        .writable_paths(context.writable_paths)
-        .readable_paths(context.readable_paths)
+        .grants(
+            context
+                .writable_paths
+                .iter()
+                .map(|path| Grant::new(path, Access::WRITE))
+                .chain(
+                    context
+                        .readable_paths
+                        .iter()
+                        .map(|path| Grant::new(path, Access::READ)),
+                ),
+        )
         .security(SecurityConfig::interactive());
-    if let Some(router) = create_ipc_gateway_router(context.registry) {
-        config_builder = config_builder.ipc(router);
-    }
-    let config = config_builder.build();
+    // `ipc` changes the builder's type, so both arms build where they are.
+    let config = match create_ipc_gateway_router(context.registry) {
+        Some(router) => config_builder.ipc(router).build(),
+        None => config_builder.build(),
+    };
 
     let sandbox = Sandbox::with_config_and_executor(config, context.executor.clone())
         .await
