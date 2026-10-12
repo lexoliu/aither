@@ -2726,6 +2726,7 @@ struct ContainerIpcWrapperTemplate<'a> {
     script: &'a str,
 }
 
+#[derive(Clone, Copy)]
 struct ContainerIpcEndpoint<'a> {
     host: &'a str,
     port: u16,
@@ -2738,8 +2739,9 @@ const CONTAINER_EXEC_WORKING_DIR: &str = "/workspace";
 #[template(path = "container_heel_run.sh", escape = "none")]
 struct ContainerHeelRunTemplate<'a> {
     heel_bin: &'a str,
+    resolve_heel: bool,
     escaped_working_dir: &'a str,
-    ipc: bool,
+    escaped_ipc_endpoint: Option<String>,
     nice: Option<u8>,
     io_priority: Option<&'static str>,
     escaped_script: &'a str,
@@ -2752,24 +2754,25 @@ struct ContainerHeelRunTemplate<'a> {
 /// image's `heel` binary runs the script under `heel run`, so the settings are
 /// the same flags the CLI takes everywhere — `nice`/`ionice` are never
 /// reimplemented here. `heel_bin` is the shell expression that resolves the
-/// image's `heel` (`$MAY_IPC_BIN` once the IPC wrapper has resolved it) and
-/// `working_dir` is the exact directory the execution runs in, matching the
-/// directory the container exec applies.
+/// image's `heel` (`$MAY_IPC_BIN` once the IPC wrapper has resolved it, or
+/// `$MAY_HEEL_BIN` the template resolves itself when `resolve_heel` is set)
+/// and `working_dir` is the exact directory the execution runs in, matching
+/// the directory the container exec applies.
 ///
 /// The container is already the isolation boundary, so the invocation asks for
 /// `permissive` isolation: the script keeps the filesystem permissions it had
 /// as the container caller. `PATH` and `HOME` are forwarded so the generated
-/// `heel ipc` shims still resolve and the script sees its usual environment;
-/// `HEEL_IPC_ENDPOINT` is forwarded too when `ipc` is set. Networking keeps
-/// heel's deny-all default — no rule is bent to pass the IPC transport, and
-/// `heel ipc` inside a sandbox can only reach a local socket anyway: a
-/// `tcp://` endpoint requires a heel-side endpoint grant and transport before
-/// it can connect from inside `heel run`.
+/// `heel ipc` shims still resolve and the script sees its usual environment.
+/// Networking keeps heel's deny-all default, and no rule is bent to pass the
+/// IPC transport: `--ipc-endpoint` has heel relay the sandbox's local IPC
+/// socket to the bridge endpoint from outside the sandbox, so the sandboxed
+/// `heel ipc` never needs TCP access of its own.
 fn heel_run_container_command(
     script: &str,
     priority: ProcessPriority,
     heel_bin: &str,
-    ipc: bool,
+    resolve_heel: bool,
+    ipc_endpoint: Option<ContainerIpcEndpoint<'_>>,
     working_dir: &str,
 ) -> Result<String, TerminalError> {
     let nice = match priority.cpu() {
@@ -2782,20 +2785,22 @@ fn heel_run_container_command(
         IoPriority::Normal => None,
     };
     let escaped_working_dir = shell_escape(working_dir);
+    let escaped_ipc_endpoint = ipc_endpoint
+        .map(|endpoint| format!("tcp://{}:{}", endpoint.host, endpoint.port))
+        .map(|endpoint| shell_escape(&endpoint));
     let escaped_script = shell_escape(script);
     ContainerHeelRunTemplate {
         heel_bin,
+        resolve_heel,
         escaped_working_dir: &escaped_working_dir,
-        ipc,
+        escaped_ipc_endpoint,
         nice,
         io_priority,
         escaped_script: &escaped_script,
     }
     .render()
     .map_err(|error| {
-        let mut message = String::from("failed to render container heel command: ");
-        message.push_str(&error.to_string());
-        TerminalError::Execution(message)
+        TerminalError::Execution(format!("failed to render container heel command: {error}"))
     })
 }
 
@@ -2807,21 +2812,17 @@ fn prioritized_container_script(
     if priority.is_normal() {
         return Ok(script.to_string());
     }
-    // Outside the IPC wrapper no `heel` binary has been resolved yet; resolve
-    // it the same way the wrapper does and fail when the image lacks one.
-    let mut rendered = String::from(
-        "MAY_HEEL_BIN=\"$(command -v heel || true)\"; \
-         if [ -z \"$MAY_HEEL_BIN\" ]; then echo \"heel command not found in container\" >&2; \
-         exit 127; fi; ",
-    );
-    rendered.push_str(&heel_run_container_command(
+    // Outside the IPC wrapper no `heel` binary has been resolved yet; the
+    // template resolves it the same way the wrapper does and fails when the
+    // image lacks one.
+    heel_run_container_command(
         script,
         priority,
         "\"$MAY_HEEL_BIN\"",
-        false,
+        true,
+        None,
         working_dir,
-    )?);
-    Ok(rendered)
+    )
 }
 
 fn wrap_container_script(
@@ -2846,9 +2847,9 @@ fn wrap_container_script(
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
-            let mut message = String::from("invalid ipc command name for container wrapper: ");
-            message.push_str(name);
-            return Err(TerminalError::Execution(message));
+            return Err(TerminalError::Execution(format!(
+                "invalid ipc command name for container wrapper: {name}"
+            )));
         }
     }
 
@@ -2862,10 +2863,17 @@ fn wrap_container_script(
     } else {
         // The generated shims are written under the shared temp directory,
         // which stays execute-denied even at `permissive` isolation: the
-        // render below grants them the deliberate write-and-execute
-        // permission heel documents for such a directory to keep resolving
-        // on the sandboxed `PATH`.
-        heel_run_container_command(script, priority, "\"$MAY_IPC_BIN\"", true, working_dir)?
+        // render below grants them read-and-execute so the sandboxed `PATH`
+        // resolves them — the wrapper writes them before `heel run`, so the
+        // sandbox itself never writes the directory.
+        heel_run_container_command(
+            script,
+            priority,
+            "\"$MAY_IPC_BIN\"",
+            false,
+            Some(endpoint),
+            working_dir,
+        )?
     };
     ContainerIpcWrapperTemplate {
         escaped_commands: &escaped_commands,
@@ -2875,10 +2883,7 @@ fn wrap_container_script(
     }
     .render()
     .map_err(|error| {
-        let error_text = error.to_string();
-        let mut message = String::from("failed to render container IPC wrapper: ");
-        message.push_str(error_text.as_str());
-        TerminalError::Execution(message)
+        TerminalError::Execution(format!("failed to render container IPC wrapper: {error}"))
     })
 }
 
@@ -4115,11 +4120,18 @@ mod tests {
         )
     }
 
+    /// A terminal tool with prepared local tools and `priority` applied. The
+    /// returned `TempDir` owns the prepared tools' cache; it must outlive the
+    /// tool.
     #[cfg(unix)]
     async fn prioritized_terminal_tool(
         dir: &Path,
         priority: ProcessPriority,
-    ) -> TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured> {
+    ) -> (
+        tempfile::TempDir,
+        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+    ) {
+        let (cache, shell_sessions) = prepared_test_registry().await;
         let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
             TerminalTool::new_exact(
                 dir,
@@ -4128,21 +4140,25 @@ mod tests {
             )
             .await
             .expect("terminal tool should initialize")
-            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                local: true,
-                container: false,
-                ssh: false,
-            })
+            .with_shell_sessions(shell_sessions)
             .with_process_priority(priority);
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
-        tool.with_registry(registry)
+        (cache, tool.with_registry(registry))
     }
 
+    /// A probe script made only of `sh` builtins: a strict sandbox executes
+    /// nothing but the launched shell, the prepared tools and granted paths,
+    /// so it reports its own `$$` into `pid` and waits for the host's `go`
+    /// marker instead of running `nice`.
     #[cfg(unix)]
-    fn print_nice_args(timeout: u64) -> TerminalArgs {
+    fn pid_probe_args(timeout: u64) -> TerminalArgs {
         TerminalArgs {
-            description: "print the process nice level".to_string(),
-            script: "nice".to_string(),
+            description: "report the process pid and wait".to_string(),
+            script: concat!(
+                "printf '%s\\n' $$ > \"$PWD/pid\"; ",
+                "while [ ! -f \"$PWD/go\" ]; do :; done"
+            )
+            .to_string(),
             mode: TerminalExecutionMode::Sandboxed,
             ssh_server_id: None,
             expect: OutputFormat::Text,
@@ -4153,39 +4169,73 @@ mod tests {
         }
     }
 
+    /// Reads the pid the sandboxed probe wrote, retrying while the sandbox
+    /// starts.
+    #[cfg(unix)]
+    async fn probe_pid(dir: &Path) -> u32 {
+        let path = dir.join("pid");
+        for _ in 0..150 {
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the sandboxed probe did not write {}", path.display());
+    }
+
+    /// The `pid`'s nice level, read from the host while the probe is alive.
+    #[cfg(unix)]
+    fn probe_nice(pid: u32) -> i64 {
+        // SAFETY: queries the kernel for the named process's priority.
+        i64::from(unsafe { libc::getpriority(libc::PRIO_PROCESS as _, pid as _) })
+    }
+
+    /// Releases the sandboxed probe by creating the `go` marker it polls for.
+    #[cfg(unix)]
+    fn release_probe(dir: &Path) {
+        std::fs::File::create(dir.join("go")).expect("create the probe marker");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn foreground_command_runs_with_configured_nice() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let tool = prioritized_terminal_tool(dir.path(), test_nice_priority()).await;
+        let (_tools_cache, tool) =
+            prioritized_terminal_tool(dir.path(), test_nice_priority()).await;
 
-        let result = tool
-            .call(print_nice_args(30), ToolContext::new())
-            .await
-            .expect("terminal call should succeed");
-        let payload = parse_terminal_tool_result(&result);
+        let call = tool.call(pid_probe_args(30), ToolContext::new());
+        let probe = async {
+            let pid = probe_pid(dir.path()).await;
+            assert_eq!(
+                probe_nice(pid),
+                expected_lowered_nice(10),
+                "foreground command should run at the configured nice level"
+            );
+            release_probe(dir.path());
+        };
+        let (result, ()) = futures::join!(call, probe);
+        let payload = parse_terminal_tool_result(&result.expect("terminal call should succeed"));
         assert_eq!(payload.exit_code, 0);
-        let stdout = output_text(&payload.stdout).expect("command should print its nice");
-        assert_eq!(
-            stdout.trim(),
-            expected_lowered_nice(10).to_string(),
-            "command should run at the configured nice level"
-        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn persistent_session_runs_with_configured_nice() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let tool = prioritized_terminal_tool(dir.path(), test_nice_priority()).await;
+        let (_tools_cache, tool) =
+            prioritized_terminal_tool(dir.path(), test_nice_priority()).await;
         let background_receiver = tool.background_receiver();
         let input_tool = InputTerminalTool::new(tool.job_registry());
 
+        // `exec` keeps `$$` — the pid the probe wrote — on the interactive
+        // shell the session then drives.
         let result = tool
             .call(
                 TerminalArgs {
                     description: "start a persistent shell".to_string(),
-                    script: "sh".to_string(),
+                    script: "printf '%s\\n' $$ > \"$PWD/pid\"; exec sh".to_string(),
                     mode: TerminalExecutionMode::Sandboxed,
                     ssh_server_id: None,
                     expect: OutputFormat::Text,
@@ -4205,11 +4255,18 @@ mod tests {
             .clone()
             .expect("timeout=0 should return a background task id");
 
+        let pid = probe_pid(dir.path()).await;
+        assert_eq!(
+            probe_nice(pid),
+            expected_lowered_nice(10),
+            "persistent session should run at the configured nice level"
+        );
+
         input_tool
             .call(
                 InputTerminalArgs {
                     task_id: task_id.clone(),
-                    input: "nice; exit".to_string(),
+                    input: "exit".to_string(),
                     append_newline: true,
                 },
                 ToolContext::new(),
@@ -4221,24 +4278,19 @@ mod tests {
         let terminal_result = completed
             .result
             .expect("persistent shell should exit cleanly after input");
-        let stdout =
-            output_text(&terminal_result.stdout).expect("completed session should include stdout");
-        assert_eq!(
-            stdout.trim(),
-            expected_lowered_nice(10).to_string(),
-            "persistent session should run at the configured nice level"
-        );
+        assert_eq!(terminal_result.exit_code, 0);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn background_job_runs_with_configured_nice() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let tool = prioritized_terminal_tool(dir.path(), test_nice_priority()).await;
+        let (_tools_cache, tool) =
+            prioritized_terminal_tool(dir.path(), test_nice_priority()).await;
         let background_receiver = tool.background_receiver();
 
         let result = tool
-            .call(print_nice_args(0), ToolContext::new())
+            .call(pid_probe_args(0), ToolContext::new())
             .await
             .expect("terminal call should succeed");
         let payload = parse_terminal_tool_result(&result);
@@ -4248,17 +4300,19 @@ mod tests {
             .clone()
             .expect("timeout=0 should return a background task id");
 
+        let pid = probe_pid(dir.path()).await;
+        assert_eq!(
+            probe_nice(pid),
+            expected_lowered_nice(10),
+            "background job should run at the configured nice level"
+        );
+        release_probe(dir.path());
+
         let completed = wait_for_completed_task(&background_receiver, &task_id).await;
         let terminal_result = completed
             .result
             .expect("background job should complete successfully");
-        let stdout =
-            output_text(&terminal_result.stdout).expect("completed job should include stdout");
-        assert_eq!(
-            stdout.trim(),
-            expected_lowered_nice(10).to_string(),
-            "background job should run at the configured nice level"
-        );
+        assert_eq!(terminal_result.exit_code, 0);
     }
 
     #[test]
@@ -4281,7 +4335,7 @@ mod tests {
         assert!(wrapped.contains(
             "\"$MAY_IPC_BIN\" run --isolation permissive --working-dir '/workspace' \
              --env-passthrough PATH --env-passthrough HOME \
-             --env-passthrough HEEL_IPC_ENDPOINT --grant \"$MAY_IPC_DIR=rwx\" \
+             --ipc-endpoint 'tcp://host.docker.internal:9000' --grant \"$MAY_IPC_DIR=rx\" \
              --nice 5 --io-priority background -- sh -c 'echo ok'"
         ));
         assert!(wrapped.contains("HEEL_IPC_ENDPOINT"));
@@ -4327,17 +4381,17 @@ mod tests {
     /// Probe tool for the container acceptance test: it answers an IPC call
     /// with the marker it was invoked with, so a request that actually reached
     /// the live handler is unmistakable.
-    #[cfg(unix)]
+    #[cfg(all(unix, aither_container_acceptance))]
     #[derive(Debug, Deserialize, JsonSchema)]
     struct ProbeEchoArgs {
         /// Marker echoed back to the caller.
         marker: String,
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, aither_container_acceptance))]
     struct ProbeEchoTool;
 
-    #[cfg(unix)]
+    #[cfg(all(unix, aither_container_acceptance))]
     impl Tool for ProbeEchoTool {
         fn name(&self) -> Cow<'static, str> {
             "probe_echo".into()
@@ -4359,10 +4413,10 @@ mod tests {
 
     /// Scratch `ubuntu:24.04` container used by the acceptance test; removed
     /// on drop.
-    #[cfg(unix)]
+    #[cfg(all(unix, aither_container_acceptance))]
     struct TestDockerContainer(String);
 
-    #[cfg(unix)]
+    #[cfg(all(unix, aither_container_acceptance))]
     impl TestDockerContainer {
         /// Starts a container with `heel_bin` mounted at `/usr/local/bin/heel`
         /// and `host.docker.internal` resolving to the docker host gateway,
@@ -4404,7 +4458,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, aither_container_acceptance))]
     impl Drop for TestDockerContainer {
         fn drop(&mut self) {
             let _ = std::process::Command::new("docker")
@@ -4415,7 +4469,7 @@ mod tests {
 
     /// A Linux `heel` binary for the container under test: `HEEL_BIN` wins,
     /// then a `heel` already on `PATH`.
-    #[cfg(unix)]
+    #[cfg(all(unix, aither_container_acceptance))]
     fn container_test_heel_binary() -> Option<PathBuf> {
         std::env::var_os("HEEL_BIN")
             .map(PathBuf::from)
@@ -4436,33 +4490,30 @@ mod tests {
     /// real container through `BollardContainerExec`, and the script fires a
     /// real `heel ipc` request at the live host bridge.
     ///
-    /// The wrapped `heel run` must carry the configured priority through
-    /// heel's own sandbox configuration, and the IPC request must fail at the
-    /// transport with the precise published-heel limitation: `heel ipc` only
-    /// connects unix-socket endpoints, so the `tcp://` bridge address surfaces
-    /// as a unix `ENOENT` before any request leaves the sandbox. This is the
-    /// documented heel API gap (`heel run --ipc-endpoint` / `SandboxConfig::
-    /// ipc_endpoint` plus a tcp-capable `IpcClient`) — shim launch is *not* a
-    /// passing IPC, and this test asserts the failure, not a reach.
-    #[cfg(unix)]
+    /// The wrapped `heel run` carries the configured priority through heel's
+    /// own sandbox configuration, and `--ipc-endpoint` relays the nested
+    /// sandbox's local IPC socket to the host bridge, so `probe_echo` answers
+    /// from the live handler rather than failing at the transport.
+    ///
+    /// Compiled only with `--cfg aither_container_acceptance`: the test needs
+    /// a real docker daemon and a Linux `heel` binary, which the dedicated CI
+    /// job provides and the feature matrices do not. A missing daemon or
+    /// binary fails the test — it is never skipped silently.
+    #[cfg(all(unix, aither_container_acceptance))]
     #[tokio::test]
-    async fn container_command_runs_with_configured_nice_and_ipc_fails_at_transport() {
+    async fn container_command_runs_with_configured_nice_and_reaches_ipc() {
         let docker_ready = std::process::Command::new("docker")
             .arg("info")
             .output()
             .is_ok_and(|output| output.status.success());
-        let Some(heel_bin) = container_test_heel_binary() else {
-            eprintln!("skipping container acceptance: no heel binary (set HEEL_BIN)");
-            return;
-        };
-        if !docker_ready {
-            eprintln!("skipping container acceptance: docker is unavailable");
-            return;
-        }
-        let Some(container) = TestDockerContainer::start(&heel_bin) else {
-            eprintln!("skipping container acceptance: could not start ubuntu:24.04");
-            return;
-        };
+        assert!(
+            docker_ready,
+            "container acceptance requires a docker daemon"
+        );
+        let heel_bin = container_test_heel_binary()
+            .expect("container acceptance requires a Linux heel binary (set HEEL_BIN)");
+        let container = TestDockerContainer::start(&heel_bin)
+            .expect("container acceptance could not start ubuntu:24.04");
 
         let client =
             bollard::Docker::connect_with_local_defaults().expect("docker client should connect");
@@ -4470,6 +4521,32 @@ mod tests {
             Arc::new(client),
         )));
         let runtime = ContainerShellRuntime::new(container.0.clone(), "host.docker.internal", exec);
+
+        // The container backend needs its own prepared tools: the registry
+        // entry names the container and its `/opt/aither/tools` bin dir, which
+        // the wrapped script puts on `PATH`. Nothing in this test invokes a
+        // prepared command, so preparing the catalog on the host and pointing
+        // the bin dir at the container path is enough.
+        let tools_cache = tempfile::tempdir().expect("tools cache should be created");
+        let bundle = crate::tool_runtime::tests::bundle();
+        let prepared = bundle
+            .prepare_local(tools_cache.path())
+            .await
+            .expect("test tools should prepare");
+        let container_tools = crate::tool_runtime::PreparedTools {
+            bin_dir: bundle
+                .container_directory()
+                .expect("the bundle has a container directory")
+                .join("bin"),
+            catalog: prepared.catalog().clone(),
+        };
+        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: false,
+            container: true,
+            ssh: false,
+        })
+        .with_container_runtime(runtime)
+        .with_test_container_tools(container_tools, container.0.clone());
 
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
@@ -4480,12 +4557,7 @@ mod tests {
             )
             .await
             .expect("terminal tool should initialize")
-            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                local: false,
-                container: true,
-                ssh: false,
-            })
-            .with_container_runtime(runtime)
+            .with_shell_sessions(shell_sessions)
             .with_process_priority(ProcessPriority::new(
                 CpuPriority::Nice(NiceLevel::new(5).expect("nice level 5 is in range")),
                 IoPriority::Normal,
@@ -4525,18 +4597,12 @@ mod tests {
             "container command should run at the configured nice level; stdout: {stdout}"
         );
         assert!(
-            stdout.contains("probe_exit=1"),
-            "heel ipc should exit nonzero; stdout: {stdout}"
+            stdout.contains("pong"),
+            "probe_echo should answer from the live handler; stdout: {stdout}"
         );
-        let stderr = payload
-            .stderr
-            .as_ref()
-            .and_then(output_text)
-            .unwrap_or_default();
         assert!(
-            stderr.contains("IPC error") && stderr.contains("No such file or directory"),
-            "heel ipc should fail at the tcp transport before reaching the live \
-             handler; stderr: {stderr}"
+            stdout.contains("probe_exit=0"),
+            "heel ipc should exit 0 through the relayed endpoint; stdout: {stdout}"
         );
     }
 }

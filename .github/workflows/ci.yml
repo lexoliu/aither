@@ -169,6 +169,27 @@ jobs:
       os: '["ubuntu-latest"]'
       free-disk: true
 
+  # The container acceptance test runs a real `ubuntu:24.04` container through
+  # docker and needs a Linux heel binary inside it. It is compiled only with
+  # `--cfg aither_container_acceptance` — a cargo feature would be turned on
+  # by `--all-features` in test-full, where no docker daemon exists.
+  container-acceptance:
+    name: Container Acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-container-acceptance
+      - uses: ./.github/actions/install-heel
+      - run: >
+          RUSTFLAGS="--cfg aither_container_acceptance"
+          cargo test -p aither-sandbox --all-features
+          terminal::tests::container_command_runs_with_configured_nice_and_reaches_ipc
+          -- --exact
+
   # `cargo hack` expands both flags into one `cargo check` per feature
   # combination, and over a 25-crate workspace that list cannot finish inside
   # one job's timeout — every run was being cancelled at 45 minutes.
