@@ -1,0 +1,98 @@
+name: Patch Artifacts
+
+on:
+  pull_request:
+    paths:
+      - patch/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/patch-artifacts.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  artifact:
+    name: ${{ matrix.target }} / ${{ matrix.abort }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x86_64, linux-aarch64, macos-aarch64, macos-x86_64, windows-x86_64, windows-aarch64]
+        abort: [immediate, panic]
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - platform: macos-aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - platform: windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            suffix: .exe
+          - platform: windows-aarch64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            suffix: .exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-01
+          components: rust-src
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: patch-${{ matrix.target }}-${{ matrix.abort }}
+      - name: Build rebuilt-std executable
+        timeout-minutes: 20
+        env:
+          APPLY_PATCH_ABORT: ${{ matrix.abort }}
+          APPLY_PATCH_NIGHTLY: nightly-2026-10-01
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: patch/build-artifact.sh "${{ matrix.target }}" "${{ runner.temp }}/patch-artifacts"
+      - name: Verify the exact artifact
+        timeout-minutes: 5
+        env:
+          APPLY_PATCH_TEST_BIN: ${{ runner.temp }}/patch-artifacts/build/${{ matrix.target }}/apply-patch/apply_patch${{ matrix.suffix }}
+        run: cargo +stable test --locked -p aither-patch --test e2e
+      - uses: ./.github/actions/install-heel
+      - name: Verify Windows native sandbox launch
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          & "$env:HEEL_BIN" run --network deny --keep-working-dir --working-dir "$env:RUNNER_TEMP" -- cmd.exe /D /S /C "echo native-sandbox-ready"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify sandbox file permissions
+        timeout-minutes: 5
+        run: bash patch/verify-sandbox.sh "${{ runner.temp }}/patch-artifacts/build/${{ matrix.target }}/apply-patch/apply_patch${{ matrix.suffix }}"
+      - name: Verify archive checksum
+        working-directory: ${{ runner.temp }}/patch-artifacts
+        run: |
+          if [[ "${RUNNER_OS}" == Windows ]]; then
+            sha256sum -c ./*.sha256
+          else
+            shasum -a 256 -c ./*.sha256
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apply-patch-${{ matrix.target }}-${{ matrix.abort }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/patch-artifacts/*.tar.gz
+            ${{ runner.temp }}/patch-artifacts/*.sha256
+            ${{ runner.temp }}/patch-artifacts/*.json
