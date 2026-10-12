@@ -90,6 +90,8 @@ pub use container::{
 };
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
 pub use heel::NetworkAuditLog;
+/// Re-export of heel's scheduling priority types for terminal-tool configuration.
+pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use job_registry::{
     JobInfo, JobRegistry, JobRegistryService, JobStatus, TerminalDelta, job_registry_channel,
 };
