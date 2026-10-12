@@ -85,8 +85,8 @@ aither-fs = { path = "./tools/fs", version = "0.6.0" }
 aither-command = { path = "./tools/command", version = "0.6.0" }
 aither-mcp = { path = "./mcp", version = "0.6.0" }
 aither-acp = { path = "./acp", version = "0.6.0" }
-aither-sandbox = { path = "./sandbox", version = "0.6.0" }
-aither-agent = { path = "./agent", version = "0.6.0" }
+aither-sandbox = { path = "./sandbox", version = "0.7.0" }
+aither-agent = { path = "./agent", version = "0.7.0" }
 aither-openai = { path = "./openai", version = "0.6.0" }
 aither-claude = { path = "./claude", version = "0.6.0" }
 aither-cloud = { path = "./cloud", version = "0.6.0" }

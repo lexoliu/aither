@@ -208,6 +208,13 @@ where
     ///
     /// Panics if the `knowledge_and_time` prompt template fails to render.
     pub fn dyn_terminal(mut self, dyn_tool: aither_sandbox::DynTerminalTool) -> Self {
+        self.context.insert_system_text(
+            "prepared_tools",
+            dyn_tool
+                .prepared_tools()
+                .render()
+                .expect("prepared tool catalog must render"),
+        );
         // Seed knowledge/time guidance against the shared command registry so
         // subagents are not told to run commands that were never registered
         // (e.g. `websearch` when a provider-hosted search tool is active).
@@ -441,6 +448,12 @@ where
         State: Clone + 'static,
         aither_sandbox::TerminalTool<P, E, State>: Tool + 'static,
     {
+        self.context.insert_system_text(
+            "prepared_tools",
+            terminal_tool
+                .prepared_tools_context()
+                .expect("terminal tools must be initialized before agent construction"),
+        );
         let background_receiver = terminal_tool.background_receiver();
         let permission_receiver = terminal_tool.permission_receiver();
         let job_registry = terminal_tool.job_registry();
