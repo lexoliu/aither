@@ -262,16 +262,87 @@ pub trait SshSessionAuthorizer: Send + Sync {
     fn authorize_connect(
         &self,
         target: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
+    ) -> impl Future<Output = Result<bool, SshAuthorizationError>> + Send;
 
-    /// Asks whether the agent may install the `heel` runtime on `target`.
+    /// Asks whether the harness may prepare runtime components on `target`.
     ///
-    /// `details` describes the remote host so the user can judge the request.
-    fn authorize_heel_install(
+    /// `details` describes the remote host and components so the user can judge the request.
+    fn authorize_runtime_install(
         &self,
         target: &str,
         details: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
+    ) -> impl Future<Output = Result<bool, SshAuthorizationError>> + Send;
+}
+
+trait SshSessionAuthorizerImpl: Send + Sync {
+    fn connect<'a>(
+        &'a self,
+        target: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SshAuthorizationError>> + Send + 'a>>;
+    fn install<'a>(
+        &'a self,
+        target: &'a str,
+        details: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SshAuthorizationError>> + Send + 'a>>;
+}
+
+impl<T: SshSessionAuthorizer> SshSessionAuthorizerImpl for T {
+    fn connect<'a>(
+        &'a self,
+        target: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SshAuthorizationError>> + Send + 'a>> {
+        Box::pin(self.authorize_connect(target))
+    }
+    fn install<'a>(
+        &'a self,
+        target: &'a str,
+        details: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SshAuthorizationError>> + Send + 'a>> {
+        Box::pin(self.authorize_runtime_install(target, details))
+    }
+}
+
+/// Shared authorizer with boxing confined to the private implementation boundary.
+#[derive(Clone)]
+pub struct AnySshSessionAuthorizer {
+    inner: Arc<dyn SshSessionAuthorizerImpl>,
+}
+
+impl std::fmt::Debug for AnySshSessionAuthorizer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnySshSessionAuthorizer")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnySshSessionAuthorizer {
+    /// Wraps a shared application authorizer.
+    #[must_use]
+    pub fn new<T: SshSessionAuthorizer + 'static>(authorizer: Arc<T>) -> Self {
+        Self { inner: authorizer }
+    }
+}
+
+impl SshSessionAuthorizer for AnySshSessionAuthorizer {
+    async fn authorize_connect(&self, target: &str) -> Result<bool, SshAuthorizationError> {
+        self.inner.connect(target).await
+    }
+    async fn authorize_runtime_install(
+        &self,
+        target: &str,
+        details: &str,
+    ) -> Result<bool, SshAuthorizationError> {
+        self.inner.install(target, details).await
+    }
+}
+
+/// Failure to obtain an application-level SSH authorization decision.
+#[derive(Debug, thiserror::Error)]
+pub enum SshAuthorizationError {
+    /// The application's permission prompt failed.
+    #[error("SSH permission prompt failed: {0}")]
+    Prompt(String),
 }
 
 /// Tracks which shell backends are configured and how to reach them.
@@ -282,8 +353,9 @@ pub trait SshSessionAuthorizer: Send + Sync {
 pub struct ShellSessionRegistry {
     availability: ShellRuntimeAvailability,
     ssh_servers: Vec<SshServer>,
-    ssh_authorizer: Option<Arc<dyn SshSessionAuthorizer>>,
+    ssh_authorizer: Option<AnySshSessionAuthorizer>,
     container_runtime: Option<ContainerShellRuntime>,
+    pub(crate) prepared_tools: Option<crate::tool_environment::PreparedToolEnvironments>,
 }
 
 impl std::fmt::Debug for ShellSessionRegistry {
@@ -296,12 +368,13 @@ impl std::fmt::Debug for ShellSessionRegistry {
 impl ShellSessionRegistry {
     /// Creates a registry advertising the given backends.
     #[must_use]
-    pub fn new(availability: ShellRuntimeAvailability) -> Self {
+    pub const fn new(availability: ShellRuntimeAvailability) -> Self {
         Self {
             availability,
             ssh_servers: Vec::new(),
             ssh_authorizer: None,
             container_runtime: None,
+            prepared_tools: None,
         }
     }
 
@@ -314,8 +387,11 @@ impl ShellSessionRegistry {
 
     /// The currently advertised backends.
     #[must_use]
-    pub fn with_ssh_authorizer(mut self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
-        self.ssh_authorizer = Some(authorizer);
+    pub fn with_ssh_authorizer<T: SshSessionAuthorizer + 'static>(
+        mut self,
+        authorizer: Arc<T>,
+    ) -> Self {
+        self.ssh_authorizer = Some(AnySshSessionAuthorizer::new(authorizer));
         self
     }
 
@@ -432,7 +508,7 @@ impl ShellSessionRegistry {
 
     #[must_use]
     /// Returns the SSH authorizer when configured.
-    pub fn ssh_authorizer(&self) -> Option<Arc<dyn SshSessionAuthorizer>> {
+    pub fn ssh_authorizer(&self) -> Option<AnySshSessionAuthorizer> {
         self.ssh_authorizer.clone()
     }
 }
@@ -449,7 +525,7 @@ impl ShellSessionRegistry {
 /// succeed.
 pub async fn bootstrap_ssh_runtime(
     target: &str,
-    authorizer: &Option<Arc<dyn SshSessionAuthorizer>>,
+    authorizer: &Option<AnySshSessionAuthorizer>,
 ) -> Result<SshRuntimeProfile, anyhow::Error> {
     if let Some(auth) = authorizer {
         let allowed = auth
@@ -474,7 +550,7 @@ pub async fn bootstrap_ssh_runtime(
             remote.os, remote.arch
         );
         let approve_install = auth
-            .authorize_heel_install(target, &details)
+            .authorize_runtime_install(target, &details)
             .await
             .map_err(anyhow::Error::msg)?;
         if approve_install && install_heel(target, &remote).await? {

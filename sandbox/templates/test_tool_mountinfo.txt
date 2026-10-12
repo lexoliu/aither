@@ -1,0 +1,3 @@
+36 25 0:32 / {{ directory }} {{ options }} - ext4 /dev/root rw
+{% if nested %}37 36 0:33 / {{ directory }}/bin {{ nested_options }} - ext4 /dev/root rw
+{% endif %}

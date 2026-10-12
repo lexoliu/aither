@@ -194,13 +194,13 @@ where
 {
     /// Creates a new terminal-first agent builder.
     ///
-    /// Creates the agent with native tools (`terminal_kill`, `terminal_input`,
-    /// `terminal_read`, `terminal`) and IPC commands accessible through
+    /// Creates the agent with only the native `terminal` tool; terminal controls
+    /// and other registered capabilities are IPC commands accessible through
     /// `terminal` (registered via `.tool()`).
     pub fn new(llm: LLM, mut terminal_tool: TerminalTool<P, E, Unconfigured>) -> Self {
         let (terminal_tool_factory, terminal_tool_factory_receiver) =
             terminal_tool_factory_channel();
-        let registry_builder = ToolRegistryBuilder::new();
+        let mut registry_builder = ToolRegistryBuilder::new();
         let mut tool_descriptions = Vec::new();
 
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
@@ -231,10 +231,10 @@ where
             short_description(read_delta_def.description()),
         ));
 
-        let inner = AgentBuilder::new(llm)
-            .tool(kill_terminal_tool)
-            .tool(input_terminal_tool)
-            .tool(read_terminal_delta_tool);
+        registry_builder.configure_tool(kill_terminal_tool);
+        registry_builder.configure_tool(input_terminal_tool);
+        registry_builder.configure_tool(read_terminal_delta_tool);
+        let inner = AgentBuilder::new(llm);
 
         Self {
             inner,
@@ -386,7 +386,7 @@ where
 
     /// Sets the SSH session authorizer for interactive connect/install consent prompts.
     #[must_use]
-    pub fn ssh_authorizer(mut self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
+    pub fn ssh_authorizer<T: SshSessionAuthorizer + 'static>(mut self, authorizer: Arc<T>) -> Self {
         self.shell_sessions = self.shell_sessions.with_ssh_authorizer(authorizer);
         self.terminal_tool = self
             .terminal_tool
@@ -857,6 +857,23 @@ where
         &mut self.registry_builder
     }
 
+    /// Prepares baseline tools for configured backends before building the agent.
+    ///
+    /// # Errors
+    /// Fails if provisioning, integrity validation or sandbox protection fails.
+    pub async fn initialize_tools(
+        mut self,
+        distribution: &aither_sandbox::ToolDistribution,
+        cache_root: &std::path::Path,
+    ) -> Result<Self, aither_sandbox::ToolRuntimeError> {
+        self.terminal_tool = self
+            .terminal_tool
+            .initialize_tools(distribution, cache_root)
+            .await?;
+        self.shell_sessions = self.terminal_tool.shell_sessions().clone();
+        Ok(self)
+    }
+
     /// Returns the sandbox working directory path.
     pub fn sandbox_dir(&self) -> Cow<'_, str> {
         self.terminal_tool.working_dir().to_string_lossy()
@@ -1114,15 +1131,20 @@ mod tests {
     impl std::error::Error for MockError {}
 
     #[derive(Clone)]
-    struct MockLlm;
+    struct MockLlm {
+        requests: async_channel::Sender<LLMRequest>,
+    }
 
     impl LanguageModel for MockLlm {
         type Error = MockError;
 
         fn respond(
             &self,
-            _request: LLMRequest,
+            request: LLMRequest,
         ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.requests
+                .try_send(request)
+                .expect("record model request");
             futures_lite::stream::empty()
         }
 
@@ -1232,6 +1254,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn terminal_agent_builder_keeps_ipc_tools_out_of_llm_tool_surface() {
+        use aither_sandbox::{
+            ManagedTool, ToolArtifact, ToolArtifactFormat, ToolDistribution, ToolTarget,
+        };
+        use sha2::Digest as _;
+        #[derive(serde::Serialize)]
+        struct Manifest {
+            artifacts: Vec<ToolArtifact>,
+        }
         let dir = tempdir().expect("tempdir should exist");
         let terminal_tool =
             aither_sandbox::TerminalTool::<NoopPermissionHandler, TokioGlobal>::new_exact(
@@ -1242,9 +1272,55 @@ mod tests {
             .await
             .expect("terminal tool should initialize");
 
-        let agent = TerminalAgentBuilder::new(MockLlm, terminal_tool)
+        let source = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let fixture = source.path().join("baseline_tool.rs");
+        async_fs::write(
+            &fixture,
+            include_bytes!("../templates/test_baseline_tool.rs"),
+        )
+        .await
+        .unwrap();
+        let path = source
+            .path()
+            .join("baseline-tool")
+            .with_extension(std::env::consts::EXE_EXTENSION);
+        let compiled = async_process::Command::new("rustc")
+            .arg("--crate-name")
+            .arg("baseline_tool")
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&path)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(compiled.status.success(), "{compiled:?}");
+        let binary = async_fs::read(&path).await.unwrap();
+        let artifacts = ManagedTool::ALL
+            .into_iter()
+            .map(|tool| ToolArtifact {
+                tool,
+                version: "1.0.0".into(),
+                target: ToolTarget::native().unwrap(),
+                url: aither_sandbox::ToolArtifactLocation::Download(
+                    url::Url::from_file_path(&path).unwrap(),
+                ),
+                sha256: format!("{:x}", sha2::Sha256::digest(&binary)),
+                encoding: ToolArtifactFormat::Executable,
+            })
+            .collect();
+        let distribution =
+            ToolDistribution::from_json(&serde_json::to_vec(&Manifest { artifacts }).unwrap())
+                .unwrap();
+        let (requests, captured) = async_channel::bounded(4);
+        let mut agent = TerminalAgentBuilder::new(MockLlm { requests }, terminal_tool)
+            .max_iterations(1)
             .tool(MockTool)
             .with_default_prompt()
+            .initialize_tools(&distribution, cache.path())
+            .await
+            .unwrap()
             .build();
 
         let mut tool_names = agent
@@ -1255,14 +1331,29 @@ mod tests {
             .collect::<Vec<_>>();
         tool_names.sort();
 
+        assert_eq!(tool_names, vec!["terminal".to_string()]);
+        let events = agent.run("Inspect the repository", []);
+        futures_lite::pin!(events);
+        while futures_lite::StreamExt::next(&mut events).await.is_some() {}
+        let request = captured
+            .try_recv()
+            .expect("first model request was recorded");
         assert_eq!(
-            tool_names,
-            vec![
-                "terminal".to_string(),
-                "terminal_input".to_string(),
-                "terminal_kill".to_string(),
-                "terminal_read".to_string(),
-            ]
+            request
+                .tool_definitions()
+                .iter()
+                .map(ToolDefinition::name)
+                .collect::<Vec<_>>(),
+            vec!["terminal"]
         );
+        let catalog = request
+            .messages()
+            .iter()
+            .find(|message| message.content().contains("<prepared_tools>"))
+            .expect("first request contains prepared catalog")
+            .content();
+        for command in ["apply_patch", "rg -n", "ast-grep run", "jq"] {
+            assert!(catalog.contains(command));
+        }
     }
 }

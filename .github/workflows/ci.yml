@@ -232,6 +232,7 @@ jobs:
           shared-key: ci-coverage
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/install-heel
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
