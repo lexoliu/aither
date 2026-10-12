@@ -2171,7 +2171,7 @@ where
 {
     let runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
-    let mut config_builder = SandboxConfig::builder()
+    let config_builder = SandboxConfig::builder()
         .network(policy)
         .working_dir(context.working_dir)
         .grants(local_path_grants(
@@ -2180,10 +2180,11 @@ where
             context.prepared_tools,
         ))
         .security(SecurityConfig::interactive());
-    if let Some(router) = create_ipc_router(context.registry) {
-        config_builder = config_builder.ipc(router);
-    }
-    let config = config_builder.build();
+    // `ipc` changes the builder's type, so both arms build where they are.
+    let config = match create_ipc_router(context.registry) {
+        Some(router) => config_builder.ipc(router).build(),
+        None => config_builder.build(),
+    };
 
     let sandbox = Sandbox::with_config_and_executor(config, context.executor.clone())
         .await
@@ -2240,7 +2241,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
 ) -> Result<(u32, std::process::Output), TerminalError> {
     let runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
-    let mut config_builder = SandboxConfig::builder()
+    let config_builder = SandboxConfig::builder()
         .network(AllowAll)
         .working_dir(context.working_dir)
         .grants(local_path_grants(
@@ -2249,10 +2250,11 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
             context.prepared_tools,
         ))
         .security(SecurityConfig::interactive());
-    if let Some(router) = create_ipc_gateway_router(context.registry) {
-        config_builder = config_builder.ipc(router);
-    }
-    let config = config_builder.build();
+    // `ipc` changes the builder's type, so both arms build where they are.
+    let config = match create_ipc_gateway_router(context.registry) {
+        Some(router) => config_builder.ipc(router).build(),
+        None => config_builder.build(),
+    };
 
     let sandbox = Sandbox::with_config_and_executor(config, context.executor.clone())
         .await

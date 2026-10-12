@@ -15,7 +15,7 @@ categories = ["api-bindings"]
 aither-core.workspace = true
 
 # Sandboxing
-heel = "0.3.1"
+heel = "0.4.0"
 rmp-serde = "1"
 
 # Executor for tokio integration
