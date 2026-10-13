@@ -61,7 +61,7 @@ magika = { version = "1.1", optional = true }
 tree-sitter = { version = "0.22.6", optional = true }
 rs-tree-sitter-languages = { version = "0.0.2", optional = true }
 vte = { version = "0.15", default-features = false, features = ["std"] }
-sha2 = "0.10.9"
+sha2 = "0.11"
 blocking = "1.6.2"
 futures = "0.3.31"
 tempfile = "3.20.0"
