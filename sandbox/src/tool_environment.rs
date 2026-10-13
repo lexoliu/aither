@@ -177,12 +177,31 @@ impl ShellSessionRegistry {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_test_tools(mut self, tools: PreparedTools) -> Self {
+    pub(crate) fn with_test_tools(self, tools: PreparedTools) -> Self {
+        self.with_test_home(ShellBackend::Local, None, tools)
+    }
+
+    #[cfg(all(test, aither_container_acceptance))]
+    pub(crate) fn with_test_container_tools(
+        self,
+        tools: PreparedTools,
+        container_id: String,
+    ) -> Self {
+        self.with_test_home(ShellBackend::Container, Some(container_id), tools)
+    }
+
+    #[cfg(test)]
+    fn with_test_home(
+        mut self,
+        backend: ShellBackend,
+        container_id: Option<String>,
+        tools: PreparedTools,
+    ) -> Self {
         let catalog = tools.catalog().clone();
         self.prepared_tools = Some(PreparedToolEnvironments {
             home: Some(PreparedHome {
-                backend: ShellBackend::Local,
-                container_id: None,
+                backend,
+                container_id,
                 tools,
             }),
             ssh: Vec::new(),
