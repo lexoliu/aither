@@ -9,7 +9,6 @@
 //!
 //! - `websearch "query"` - Search the web
 //! - `webfetch "url"` - Fetch and read web pages
-//! - `todo ...` - Track tasks
 //!
 //! Standard shell commands (ls, cat, grep, find, etc.) work normally.
 //!
@@ -463,7 +462,6 @@ async fn acp_session_agent(
     let agent = TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
         .tool(aither_agent::websearch::WebSearchTool::default())
         .tool(aither_agent::webfetch::WebFetchTool::new())
-        .tool(aither_agent::TodoTool::new())
         .tool(aither_agent::sandbox::builtin::AskCommand::new(cloud))
         .with_default_prompt()
         .build();
@@ -495,7 +493,6 @@ async fn build_agent(
     let mut builder = TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
         .tool(aither_agent::websearch::WebSearchTool::default())
         .tool(aither_agent::webfetch::WebFetchTool::new())
-        .tool(aither_agent::TodoTool::new())
         .tool(aither_agent::sandbox::builtin::AskCommand::new(
             cloud.clone(),
         ));
@@ -655,7 +652,7 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
                     continue;
                 }
                 "/compact" => {
-                    match agent.compact(None).await {
+                    match Box::pin(agent.compact(None)).await {
                         Ok(Some(result)) => {
                             println!(
                                 "\x1b[2mCompacted {} messages into summary, starting fresh session\x1b[22m",

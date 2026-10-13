@@ -250,9 +250,9 @@ pub struct OutputRef {
 }
 
 /// Maximum output size (in bytes) delivered inline to the model.
-/// Outputs exceeding this are saved to file; the model still receives a head
-/// preview capped at this budget together with the file reference, so it can
-/// always make progress without an extra read round-trip.
+/// Outputs exceeding this are saved to file; the model still receives a
+/// head+tail preview capped at this budget together with the file reference,
+/// so it can always make progress without an extra read round-trip.
 /// This is the single source of truth for output size limits.
 pub const INLINE_OUTPUT_LIMIT: usize = 16_000;
 
@@ -266,8 +266,12 @@ struct StoredOutputPreviewTemplate<'a> {
     url: &'a str,
 }
 
-/// Renders the model-facing content for a stored text output: a head preview
-/// within the caller's budget plus the file reference and read guidance.
+/// Renders the model-facing content for a stored text output: a head+tail
+/// preview within the caller's budget plus the file reference and read
+/// guidance.
+///
+/// `text` must be exactly what was written to `url`, because the preview's
+/// omitted-range marker reports line numbers of that file.
 fn stored_text_content(
     text: &str,
     reason: &str,
@@ -277,7 +281,7 @@ fn stored_text_content(
     max_lines: usize,
     byte_budget: usize,
 ) -> Content {
-    let preview = head_preview(text, max_lines, byte_budget);
+    let preview = crate::output_compress::stored_preview(text, max_lines, byte_budget);
     let rendered = StoredOutputPreviewTemplate {
         preview: preview.trim_end_matches('\n'),
         reason,
@@ -291,30 +295,6 @@ fn stored_text_content(
         text: rendered,
         truncated: true,
     }
-}
-
-/// Returns the longest prefix of `text` spanning at most `max_lines` lines and
-/// `byte_budget` bytes, cutting at a line boundary when possible and never
-/// splitting a UTF-8 character.
-pub fn head_preview(text: &str, max_lines: usize, byte_budget: usize) -> &str {
-    let mut end = 0;
-    for (index, line) in text.split_inclusive('\n').enumerate() {
-        if index == max_lines || end + line.len() > byte_budget {
-            break;
-        }
-        end += line.len();
-    }
-    if end == 0 {
-        // The first line alone exceeds the byte budget: cut inside it at a
-        // character boundary.
-        let mut cut = byte_budget.min(text.len());
-        while cut > 0 && !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        end = cut;
-    }
-    text.get(..end)
-        .expect("prefix end is aligned to a line or char boundary")
 }
 
 /// A pending URL allocation that hasn't been written to disk yet.
@@ -614,23 +594,25 @@ impl OutputStore {
     }
 }
 
-/// Saves raw data to a file without any processing, returning the URL.
+/// Saves raw data to a file without any processing, returning its URL and
+/// absolute path.
 ///
-/// Used to preserve the original uncompressed output alongside a compressed version.
+/// Used to preserve the original of a lossy compression stage alongside the
+/// reduced version the model reads.
 ///
 /// # Errors
 ///
 /// Returns an error if file creation fails.
-pub async fn save_raw_to_file(dir: &Path, data: &[u8]) -> std::io::Result<String> {
-    let (url, _) = create_file(dir, data, OutputFormat::Text).await?;
+pub async fn save_raw_to_file(dir: &Path, data: &[u8]) -> std::io::Result<(String, PathBuf)> {
+    let (url, path) = create_file(dir, data, OutputFormat::Text).await?;
     debug!(url = %url, size = data.len(), "saved raw output");
-    Ok(url)
+    Ok((url, path))
 }
 
 /// Saves text output with simple size-based classification.
 ///
 /// - Below `INLINE_OUTPUT_LIMIT` → show inline
-/// - Above `INLINE_OUTPUT_LIMIT` → save to file, return head preview plus file reference
+/// - Above `INLINE_OUTPUT_LIMIT` → save to file, return a head+tail preview plus file reference
 async fn save_text_output(
     dir: &Path,
     data: &[u8],
@@ -650,8 +632,8 @@ async fn save_text_output(
 /// Saves text output with a line-count limit.
 ///
 /// When the output exceeds `max_lines` (or the byte limit), the full content
-/// is saved to a file and the returned content carries a head preview within
-/// the caller's budget plus the file reference and read guidance.
+/// is saved to a file and the returned content carries a head+tail preview
+/// within the caller's budget plus the file reference and read guidance.
 pub async fn save_text_with_line_limit(
     dir: &Path,
     data: &[u8],
@@ -691,7 +673,7 @@ pub async fn save_text_with_line_limit(
         return Ok(OutputEntry::Inline { content });
     }
 
-    // Save full output to file, but still hand the model a head preview
+    // Save full output to file, but still hand the model a head+tail preview
     // within its requested budget so it never has to re-read blind.
     let (url, path) = create_file(dir, data, format).await?;
 
@@ -718,8 +700,8 @@ pub async fn save_text_with_line_limit(
     })
 }
 
-/// Saves output that exceeds limit - stores full content, returning a head
-/// preview plus the file reference for text formats.
+/// Saves output that exceeds limit - stores full content, returning a
+/// head+tail preview plus the file reference for text formats.
 async fn save_large_output(
     dir: &Path,
     data: &[u8],
@@ -928,7 +910,7 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::{fmt::Write, io::Cursor};
 
     use base64::Engine;
     use image::{DynamicImage, ImageBuffer, Rgba};
@@ -1090,30 +1072,6 @@ mod tests {
         cursor.into_inner()
     }
 
-    #[test]
-    fn head_preview_respects_line_budget() {
-        let text = "one\ntwo\nthree\n";
-        assert_eq!(head_preview(text, 2, usize::MAX), "one\ntwo\n");
-        assert_eq!(head_preview(text, 10, usize::MAX), text);
-    }
-
-    #[test]
-    fn head_preview_cuts_at_line_boundary_within_byte_budget() {
-        let text = "aaaa\nbbbb\ncccc\n";
-        // Budget of 12 fits "aaaa\n" + "bbbb\n" (10 bytes) but not the next line.
-        assert_eq!(head_preview(text, usize::MAX, 12), "aaaa\nbbbb\n");
-    }
-
-    #[test]
-    fn head_preview_never_splits_multibyte_chars() {
-        // Each '界' is 3 bytes; a 500-byte budget must cut on a char boundary.
-        let text = "界".repeat(400);
-        let preview = head_preview(&text, usize::MAX, 500);
-        assert_ne!(preview, "");
-        assert!(preview.len() <= 500);
-        assert!(preview.chars().all(|c| c == '界'));
-    }
-
     #[tokio::test]
     async fn stored_text_output_includes_head_preview_and_guidance() {
         let dir = tempfile::tempdir().unwrap();
@@ -1177,9 +1135,81 @@ mod tests {
         else {
             panic!("expected stored entry with text content");
         };
+        // Eight lines, a budget of three: one for the head, two for the tail.
         assert!(
-            text.starts_with("alpha\nbeta\ngamma\n[Preview only:"),
+            text.starts_with("alpha\n[... lines 2-6 of 8 omitted"),
             "preview must stop at max_lines: {text}"
         );
+        assert!(
+            text.contains("gamma\ndelta\n[Preview only:"),
+            "tail must close the preview: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_preview_shows_the_failure_at_the_tail_with_matching_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut data = String::new();
+        for index in 0..4000 {
+            writeln!(data, "test suite::case_{index} ... ok").expect("write to String");
+        }
+        data.push_str("test suite::case_4000 ... FAILED\n");
+        data.push_str("thread 'suite::case_4000' panicked at sandbox/src/lib.rs:42:5:\n");
+        data.push_str("assertion `left == right` failed\n");
+        data.push_str("error: test failed\n");
+        let total_lines = data.lines().count();
+
+        let entry = save_text_with_line_limit(
+            dir.path(),
+            data.as_bytes(),
+            OutputFormat::Text,
+            MediaResolution::Auto,
+            usize::MAX,
+            Some(INLINE_OUTPUT_LIMIT),
+        )
+        .await
+        .unwrap();
+
+        let OutputEntry::Stored {
+            content: Some(Content::Text { text, .. }),
+            path,
+            ..
+        } = entry
+        else {
+            panic!("expected stored entry with text content");
+        };
+
+        // The failure is in the preview, at its end.
+        assert!(text.contains("error: test failed"), "{text}");
+        assert!(text.contains("FAILED"), "{text}");
+
+        // The omitted-range marker's line numbers address the stored file.
+        let marker = text
+            .lines()
+            .find(|line| line.starts_with("[... lines"))
+            .expect("omitted range marker");
+        let range = marker.split_whitespace().nth(2).expect("range");
+        let (first, last) = range.split_once('-').expect("range bounds");
+        let first: usize = first.parse().expect("first line number");
+        let last: usize = last.parse().expect("last line number");
+        assert!(
+            marker.contains(&format!("of {total_lines} omitted")),
+            "{marker}"
+        );
+
+        let stored = std::fs::read_to_string(&path).expect("stored file is readable");
+        let stored_lines: Vec<&str> = stored.lines().collect();
+        assert_eq!(stored_lines.len(), total_lines);
+
+        let preview_lines: Vec<&str> = text.lines().collect();
+        let marker_index = preview_lines
+            .iter()
+            .position(|line| line.starts_with("[... lines"))
+            .expect("marker index");
+        // Line `first - 1` of the stored file is the last head line, and line
+        // `last + 1` is the first tail line.
+        assert_eq!(stored_lines[first - 2], preview_lines[marker_index - 1]);
+        assert_eq!(stored_lines[last], preview_lines[marker_index + 1]);
+        assert_eq!(stored_lines[total_lines - 1], "error: test failed");
     }
 }

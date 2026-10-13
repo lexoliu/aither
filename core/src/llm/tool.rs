@@ -2241,27 +2241,27 @@ mod tests {
 
     #[test]
     fn schema_nested_ref_in_array() {
-        // Test nested $ref inside array items (like TodoWriteArgs)
+        // Test nested $ref inside array items (like BatchWriteArgs)
         let raw_schema = serde_json::json!({
             "type": "object",
             "properties": {
-                "todos": {
+                "entries": {
                     "type": "array",
                     "items": {
-                        "$ref": "#/$defs/TodoItem"
+                        "$ref": "#/$defs/BatchItem"
                     }
                 }
             },
             "$defs": {
-                "TodoItem": {
+                "BatchItem": {
                     "type": "object",
                     "properties": {
                         "content": { "type": "string" },
-                        "status": { "$ref": "#/$defs/TodoStatus" }
+                        "status": { "$ref": "#/$defs/BatchStatus" }
                     },
                     "required": ["content", "status"]
                 },
-                "TodoStatus": {
+                "BatchStatus": {
                     "type": "string",
                     "enum": ["pending", "in_progress", "completed"]
                 }
@@ -2273,7 +2273,7 @@ mod tests {
 
         // Navigate to status
         let props = schema.get("properties").unwrap().as_object().unwrap();
-        let todos = props.get("todos").unwrap().as_object().unwrap();
+        let todos = props.get("entries").unwrap().as_object().unwrap();
         let items = todos.get("items").unwrap().as_object().unwrap();
         let item_props = items.get("properties").unwrap().as_object().unwrap();
         let status = item_props.get("status").unwrap().as_object().unwrap();

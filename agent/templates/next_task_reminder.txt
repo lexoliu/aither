@@ -1,3 +1,0 @@
-<system-reminder>
-Task "{{ completed_task }}" completed. Next task: {{ next_task }} ({{ active_form }})
-</system-reminder>

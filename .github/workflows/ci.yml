@@ -60,6 +60,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  workflow-gates:
+    name: Workflow Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --with PyYAML==6.0.3 python .github/tests/test_ci_waiters.py
+
   unused-deps:
     name: Unused Dependencies
     runs-on: ubuntu-latest
@@ -169,13 +178,37 @@ jobs:
       os: '["ubuntu-latest"]'
       free-disk: true
 
+  # The container acceptance test runs a real `ubuntu:24.04` container through
+  # docker and needs a Linux heel binary inside it. It is compiled only with
+  # `--cfg aither_container_acceptance` — a cargo feature would be turned on
+  # by `--all-features` in test-full, where no docker daemon exists.
+  container-acceptance:
+    name: Container Acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-container-acceptance
+      - uses: ./.github/actions/install-heel
+      - run: >
+          RUSTFLAGS="--cfg aither_container_acceptance"
+          cargo test -p aither-sandbox --all-features
+          terminal::tests::container_command_runs_with_configured_nice_and_reaches_ipc
+          -- --exact --nocapture
+
   # `cargo hack` expands both flags into one `cargo check` per feature
   # combination, and over a 25-crate workspace that list cannot finish inside
   # one job's timeout — every run was being cancelled at 45 minutes.
   # `--partition k/8` slices the generated command list into eighths, so the
   # same two invocations run in eight parallel jobs with identical coverage.
+  # Feature-pair coverage is a release-grade gate: it runs only on pull
+  # requests bound for main, not on routine dev pushes and PRs.
   feature-checks:
     name: Features (${{ matrix.part }}/8)
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -229,6 +262,7 @@ jobs:
           shared-key: ci-coverage
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/install-heel
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}

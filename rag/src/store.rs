@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(store.len(), 1);
 
         let results = store.search("hello").await.unwrap();
-        assert!(!results.is_empty());
+        assert_ne!(results.len(), 0);
     }
 
     #[tokio::test]

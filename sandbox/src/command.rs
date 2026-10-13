@@ -112,7 +112,7 @@ fn output_saved_text(
     line_count: usize,
     byte_count: usize,
 ) -> String {
-    let preview = crate::output::head_preview(rendered, usize::MAX, INLINE_OUTPUT_LIMIT);
+    let preview = crate::output_compress::stored_preview(rendered, usize::MAX, INLINE_OUTPUT_LIMIT);
     CommandOutputSavedTemplate {
         preview: preview.trim_end_matches('\n'),
         filename,
@@ -383,6 +383,7 @@ pub struct DynTerminalTool {
     pub(crate) job_registry: crate::job_registry::JobRegistry,
     pub(crate) working_dir: PathBuf,
     pub(crate) command_names: Vec<String>,
+    pub(crate) prepared_tools: crate::ToolCatalog,
 }
 
 impl DynTerminalTool {
@@ -396,6 +397,12 @@ impl DynTerminalTool {
     #[must_use]
     pub fn permission_receiver(&self) -> crate::terminal::PermissionEventReceiver {
         self.permission_receiver.clone()
+    }
+
+    /// Operational catalog inherited from the initialized parent environment.
+    #[must_use]
+    pub const fn prepared_tools(&self) -> &crate::ToolCatalog {
+        &self.prepared_tools
     }
 
     /// Returns the child terminal job registry.
@@ -610,16 +617,20 @@ impl ToolRegistryBuilder {
     #[must_use]
     pub fn build(self, output_dir: impl Into<PathBuf>) -> ToolRegistry {
         ToolRegistry {
-            entries: self.entries,
+            entries: self
+                .entries
+                .into_iter()
+                .map(|(name, entry)| (name, Arc::new(entry)))
+                .collect(),
             output_dir: output_dir.into(),
         }
     }
 }
 
 /// Immutable registry of tool handlers.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ToolRegistry {
-    entries: HashMap<String, ToolEntry>,
+    entries: HashMap<String, Arc<ToolEntry>>,
     output_dir: PathBuf,
 }
 
@@ -681,6 +692,25 @@ fn detect_stdin_arg(schema: &Value) -> Option<String> {
 }
 
 impl ToolRegistry {
+    pub(crate) fn with_terminal_controls(
+        mut self,
+        jobs: crate::JobRegistry,
+        output_dir: PathBuf,
+    ) -> Self {
+        let mut controls = ToolRegistryBuilder::new();
+        controls.configure_tool(crate::builtin::KillTerminalTool::new(jobs.clone()));
+        controls.configure_tool(crate::builtin::InputTerminalTool::new(jobs.clone()));
+        controls.configure_tool(crate::builtin::ReadTerminalDeltaTool::new(jobs));
+        self.entries.extend(
+            controls
+                .entries
+                .into_iter()
+                .map(|(name, entry)| (name, Arc::new(entry))),
+        );
+        self.output_dir = output_dir;
+        self
+    }
+
     /// Queries a tool handler by name.
     ///
     /// Large outputs (> 4000 chars) are automatically saved to file.

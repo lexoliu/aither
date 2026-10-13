@@ -1890,7 +1890,7 @@ mod tests {
         assert!(cache.is_empty());
 
         cache.openai = Some(OpenAIPromptCache::default());
-        assert!(!cache.is_empty());
+        assert_ne!(cache, CacheOptions::default());
     }
 
     #[test]

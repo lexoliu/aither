@@ -64,6 +64,14 @@ pub struct AgentConfig {
     /// Context assembly behavior.
     pub context_assembler: ContextAssemblerConfig,
 
+    /// Tool turns tolerated before an unmaintained `tasks.md` earns a
+    /// staleness alert.
+    ///
+    /// A turn counts toward the limit when it ran tool calls but left
+    /// `tasks.md` byte-identical — either still holding unchecked items or
+    /// missing entirely. Set to `usize::MAX` to disable the alert.
+    pub tasks_stale_after_turns: usize,
+
     /// Request-level model parameters applied to each LLM call.
     pub request_parameters: Parameters,
 }
@@ -78,6 +86,7 @@ impl Default for AgentConfig {
             agent_kind: AgentKind::default(),
             transcript_path: None,
             context_assembler: ContextAssemblerConfig::default(),
+            tasks_stale_after_turns: 4,
             request_parameters: Parameters::default(),
         }
     }

@@ -1,0 +1,45 @@
+name: Build release tools
+
+# One-off builder for tools that ship no prebuilt binary. release.yml downloads
+# the `devtools` release assets this produces instead of compiling on every
+# release run (the Actions cache would go cold between monthly releases anyway).
+# Re-run with the new rev whenever a pin in release.yml changes; this workflow
+# has no push or scheduled triggers on purpose.
+on:
+  workflow_dispatch:
+    inputs:
+      release_plz_rev:
+        description: water-rs/release-plz git revision to build
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release-plz:
+    name: release-plz
+    runs-on: ubuntu-latest
+    env:
+      REV: ${{ inputs.release_plz_rev }}
+      ASSET: release-plz-${{ inputs.release_plz_rev }}-x86_64-unknown-linux-gnu.tar.gz
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release-plz
+        run: |
+          cargo install --locked \
+            --git https://github.com/water-rs/release-plz \
+            --rev "${REV}" \
+            --root "${RUNNER_TEMP}/install" \
+            release-plz
+          tar -czf "${RUNNER_TEMP}/${ASSET}" -C "${RUNNER_TEMP}/install/bin" release-plz
+          cd "${RUNNER_TEMP}" && sha256sum "${ASSET}" > "${ASSET}.sha256"
+      - name: Publish to devtools release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view devtools --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || \
+            gh release create devtools --repo "${GITHUB_REPOSITORY}" \
+              --title "Developer tools" \
+              --notes "Prebuilt CI tool binaries; not a crate release."
+          gh release upload devtools --repo "${GITHUB_REPOSITORY}" --clobber \
+            "${RUNNER_TEMP}/${ASSET}" "${RUNNER_TEMP}/${ASSET}.sha256"

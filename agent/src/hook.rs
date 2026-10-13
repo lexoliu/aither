@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use aither_core::llm::ToolResult;
 
-use crate::{ContextCheckpoint, TodoItem, context_window::ContextWindowSnapshot};
+use crate::{ContextCheckpoint, context_window::ContextWindowSnapshot};
 
 /// Context provided to hooks before a tool is called.
 #[derive(Debug)]
@@ -102,8 +102,6 @@ pub struct CheckpointContext<'a> {
     pub message_count: usize,
     /// Structured runtime context after the latest turn mutations.
     pub context: &'a ContextCheckpoint,
-    /// Current todo list state.
-    pub todo_items: &'a [TodoItem],
     /// Hash of the currently exposed tool surface.
     pub tool_surface_hash: &'a str,
     /// Whether background work is still active.

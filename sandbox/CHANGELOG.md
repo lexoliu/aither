@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/lexoliu/aither/compare/sandbox-v0.6.0...sandbox-v0.7.0) - 2026-10-13
+
+### Added
+
+- baseline tool runtime: `ToolDistribution` and `initialize_tools` prepare verified tools for local, container and SSH execution ([#107](https://github.com/lexoliu/aither/pull/107))
+- `TerminalTool::with_process_priority` — typed `ProcessPriority` (`CpuPriority`/`IoPriority`/`NiceLevel`) threaded through one-shot, persistent, background, and container executions ([#112](https://github.com/lexoliu/aither/pull/112))
+- `ContainerIpcRoute`/`BridgeAddress` — container IPC binds an explicit host-side address instead of a wildcard ([#112](https://github.com/lexoliu/aither/pull/112))
+- `aither-patch`: a sandbox-executed `apply_patch` utility ([#108](https://github.com/lexoliu/aither/pull/108))
+
+### Changed
+
+- [**breaking**] terminal execution requires a prepared tool environment
+- [**breaking**] `ContainerShellRuntime::new` takes a `ContainerIpcRoute` instead of an IPC hostname
+- upgrade the sandbox backend to heel 0.4.1
+- nested-container sandboxes relay IPC through `heel run --ipc-endpoint` instead of environment passthrough
+
+### Fixed
+
+- container IPC uses the runtime's host-side route instead of assuming that containers can reach host loopback
+
 ## [0.6.0](https://github.com/lexoliu/aither/compare/sandbox-v0.5.0...sandbox-v0.6.0) - 2026-10-10
 
 ### Added

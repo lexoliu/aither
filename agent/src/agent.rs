@@ -38,7 +38,6 @@ use crate::{
         StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
     },
     model_group::ModelTier,
-    todo::{TodoItem, TodoList, TodoStatus},
     tools::AgentTools,
     transcript::Transcript,
     working_docs,
@@ -239,16 +238,28 @@ struct TasksDiffReminder {
     diff: String,
 }
 
-#[derive(Template)]
-#[template(path = "todo_reminder.txt", escape = "none")]
-struct TodoReminderTemplate<'a> {
-    items_json: &'a str,
+#[derive(serde::Serialize)]
+struct TasksStale {
+    #[serde(rename = "$text")]
+    content: String,
 }
 
-#[derive(Template)]
-#[template(path = "todo_context.txt", escape = "none")]
-struct TodoContextTemplate<'a> {
-    items_json: &'a str,
+/// Tracks tasks.md maintenance across tool turns.
+///
+/// A turn counts as stale when the model executed tool calls without the
+/// file's content changing. The counter resets on any content change, and
+/// also while the document has no unchecked items (a complete checklist is
+/// not stale). The alert fires once per stale episode.
+#[derive(Debug, Default)]
+pub struct TasksDocStaleness {
+    /// Whether a baseline observation exists yet.
+    seen: bool,
+    /// tasks.md content at the previous tool turn (None = file absent).
+    last_content: Option<String>,
+    /// Consecutive tool turns without a content change.
+    stale_turns: usize,
+    /// Whether the current episode already alerted.
+    alerted: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -263,20 +274,6 @@ struct BackgroundStartedReminderTemplate<'a> {
     task_id: &'a str,
     output_preview: &'a str,
     output_file: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "next_task_reminder.txt", escape = "none")]
-struct NextTaskReminderTemplate<'a> {
-    completed_task: &'a str,
-    next_task: &'a str,
-    active_form: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "all_tasks_complete_reminder.txt", escape = "none")]
-struct AllTasksCompleteReminderTemplate<'a> {
-    completed_task: &'a str,
 }
 
 /// `knowledge_and_time` system block. `websearch_command` selects whether the
@@ -457,9 +454,6 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Whether tools have been bootstrapped.
     pub(crate) initialized: bool,
 
-    /// Todo list for tracking long tasks.
-    pub(crate) todo_list: Option<TodoList>,
-
     /// Receiver for completed background terminal tasks.
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
     /// Receiver for permission wait/resume events emitted by terminal execution.
@@ -476,6 +470,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Last observed working-doc snapshot for diff reminders.
     pub(crate) last_working_docs: Option<working_docs::WorkingDocsSnapshot>,
 
+    /// tasks.md maintenance tracking across tool turns.
+    pub(crate) tasks_staleness: TasksDocStaleness,
+
     /// Start time of the most recent LLM request issued by this agent.
     pub(crate) last_request_started_at: Option<Instant>,
 
@@ -483,7 +480,6 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     ///
     /// These participate in prompt assembly for the current turn but are not
     /// stored in the persistent context or checkpoints.
-    pub(crate) transient_system_messages: Vec<String>,
 
     /// Rolling KV-cache statistics accumulated from emitted `Usage` events.
     ///
@@ -531,15 +527,14 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             profile: None,
             fast_profile: None,
             initialized: false,
-            todo_list: None,
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
             transcript: None,
             sandbox_dir: None,
             last_working_docs: None,
+            tasks_staleness: TasksDocStaleness::default(),
             last_request_started_at: None,
-            transient_system_messages: Vec::new(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -719,20 +714,10 @@ where
             tool_calls.clone(),
             model_turn.reasoning,
         ));
-        let old_todo_items = self
-            .todo_list
-            .as_ref()
-            .map(super::todo::TodoList::items)
-            .unwrap_or_default();
-        let tool_names = tool_calls
-            .iter()
-            .map(|call| call.name.clone())
-            .collect::<Vec<_>>();
-
         self.push_tool_start_events(&tool_calls, events).await;
         let results = self.execute_tool_calls(&tool_calls, turn, events).await;
-        self.apply_tool_results(results, &tool_names, &old_todo_items, events)
-            .await?;
+        self.apply_tool_results(results, events).await?;
+        self.check_tasks_doc_staleness().await;
         self.push_turn_boundary_events(run_id, turn, &response_text, events)
             .await
     }
@@ -894,8 +879,6 @@ where
     async fn apply_tool_results(
         &mut self,
         results: Vec<Result<(String, String, aither_core::llm::ToolResult), AgentError>>,
-        tool_names: &[String],
-        old_todo_items: &[TodoItem],
         events: &EventSink,
     ) -> Result<(), AgentError> {
         let mut has_tool_error = false;
@@ -935,18 +918,15 @@ where
             // reach for them as tools. Redirect immediately instead of letting
             // the model retry the same wrong call.
             for name in &unknown_tools {
-                self.context.insert_reminder(&SystemReminder {
-                    content: format!(
-                        "There is no native tool named '{name}'. This runtime is terminal-first: the only native tools are terminal, terminal_kill, terminal_input, and terminal_read; every other capability is a CLI command executed through the `terminal` tool. If '{name}' is a capability, run it as a command (check with `{name} --help`)."
-                    ),
-                });
+                self.push_system_alert(format!(
+                    "There is no native tool named '{name}'. This runtime is terminal-first: the only native tools are terminal, terminal_kill, terminal_input, and terminal_read; every other capability is a CLI command executed through the `terminal` tool. If '{name}' is a capability, run it as a command (check with `{name} --help`)."
+                ));
             }
         } else if has_tool_error {
-            self.context.insert_reminder(&SystemReminder {
-                content: "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain terminal, terminal_kill, terminal_input, and terminal_read.".to_string(),
-            });
+            self.push_system_alert(
+                "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain terminal, terminal_kill, terminal_input, and terminal_read.",
+            );
         }
-        self.push_todo_followup(tool_names, old_todo_items);
         self.push_completed_background_events(events);
         Ok(())
     }
@@ -978,29 +958,6 @@ where
         }
     }
 
-    fn push_todo_followup(&mut self, tool_names: &[String], old_todo_items: &[TodoItem]) {
-        if !tool_names.iter().any(|name| name == "todo") {
-            return;
-        }
-        let new_items = self
-            .todo_list
-            .as_ref()
-            .map(super::todo::TodoList::items)
-            .unwrap_or_default();
-        let newly_completed = new_items.iter().find(|new_item| {
-            new_item.status == TodoStatus::Completed
-                && old_todo_items.iter().any(|old| {
-                    old.content == new_item.content && old.status != TodoStatus::Completed
-                })
-        });
-        let reminder = newly_completed
-            .and_then(|completed| self.format_next_task_reminder(&completed.content))
-            .or_else(|| self.format_todo_reminder());
-        if let Some(reminder) = reminder {
-            self.context.push(Message::system(&reminder));
-        }
-    }
-
     fn push_completed_background_events(&mut self, events: &EventSink) {
         if let Some(ref receiver) = self.background_receiver {
             for task in receiver.take_completed() {
@@ -1016,7 +973,7 @@ where
     }
 
     async fn push_turn_boundary_events(
-        &mut self,
+        &self,
         run_id: &str,
         turn: usize,
         response_text: &str,
@@ -1108,7 +1065,7 @@ where
     }
 
     async fn push_stop_events(
-        &mut self,
+        &self,
         run_id: &str,
         outcome: RunLoopOutcome,
         events: &EventSink,
@@ -1268,20 +1225,6 @@ where
     /// Adds a message to the conversation history.
     pub fn push_message(&mut self, message: Message) {
         self.context.push(message);
-    }
-
-    /// Replaces transient per-turn system messages.
-    pub fn set_transient_system_messages(&mut self, messages: impl IntoIterator<Item = String>) {
-        self.transient_system_messages = messages
-            .into_iter()
-            .map(|message| message.trim().to_string())
-            .filter(|message| !message.is_empty())
-            .collect();
-    }
-
-    /// Clears transient per-turn system messages.
-    pub fn clear_transient_system_messages(&mut self) {
-        self.transient_system_messages.clear();
     }
 
     /// Returns the rolling KV-cache statistics for this agent session.
@@ -1449,10 +1392,81 @@ where
             return false;
         }
 
-        self.context.insert_reminder(&SystemReminder {
-            content: "tasks.md still has unchecked items. Continue working through the checklist. If user input is required, call ask_user and then proceed.".to_string(),
-        });
+        self.push_system_alert(
+            "tasks.md still has unchecked items. Continue working through the checklist. If user input is required, call ask_user and then proceed.",
+        );
         true
+    }
+
+    /// Pushes a one-shot system alert into the conversation stream.
+    ///
+    /// Unlike [`Context::insert_reminder`], which is reserved for content
+    /// regenerated by `populate_dynamic_reminders` on every request build, an
+    /// alert pushed here stays in `runtime_items` until reassembly or
+    /// compaction prunes it — this is the only channel that survives to the
+    /// next request.
+    fn push_system_alert(&mut self, content: impl Into<String>) {
+        self.context.push_alert(&SystemReminder {
+            content: content.into(),
+        });
+    }
+
+    /// Nags the model when tool turns keep passing without tasks.md updates.
+    ///
+    /// Runs after a tool turn: the turn itself is the tool-activity signal,
+    /// so no separate bookkeeping of tool calls is needed. The alert goes in
+    /// as a durable system message — `insert_reminder` would be cleared by
+    /// the next request's reminder repopulation before ever being sent.
+    async fn check_tasks_doc_staleness(&mut self) {
+        let Some(sandbox_dir) = self.sandbox_dir.as_deref() else {
+            return;
+        };
+        let docs = working_docs::read_snapshot(sandbox_dir).await;
+        let threshold = self.config.tasks_stale_after_turns;
+
+        let state = &mut self.tasks_staleness;
+        if !state.seen {
+            state.seen = true;
+            state.last_content = docs.tasks_md;
+            return;
+        }
+        if state.last_content != docs.tasks_md {
+            state.last_content = docs.tasks_md;
+            state.stale_turns = 0;
+            state.alerted = false;
+            return;
+        }
+
+        let stale_kind = match &docs.tasks_md {
+            Some(content) if working_docs::has_unchecked_markdown_tasks(content) => {
+                Some("unchecked")
+            }
+            Some(_) => {
+                state.stale_turns = 0;
+                state.alerted = false;
+                None
+            }
+            None => Some("missing"),
+        };
+        let Some(stale_kind) = stale_kind else {
+            return;
+        };
+
+        state.stale_turns += 1;
+        if state.stale_turns < threshold || state.alerted {
+            return;
+        }
+        state.alerted = true;
+        let content = if stale_kind == "missing" {
+            format!(
+                "{threshold} tool turns have run without a tasks.md. For multi-step work, create tasks.md in the sandbox root with a checklist of the plan — it is the canonical task document and survives context compaction."
+            )
+        } else {
+            format!(
+                "tasks.md has unchecked items but has not been updated for {threshold} tool turns. Mark finished items and keep the checklist in sync with actual progress."
+            )
+        };
+        self.context.push_alert(&TasksStale { content });
     }
 
     /// Returns the current conversation history.
@@ -1485,14 +1499,8 @@ where
     pub async fn export_checkpoint(&mut self) -> Result<AgentCheckpoint, AgentError> {
         self.ensure_initialized().await;
         let context_window = self.snapshot_context_window().await;
-        let todo_items = self
-            .todo_list
-            .as_ref()
-            .map(super::todo::TodoList::items)
-            .unwrap_or_default();
         Ok(AgentCheckpoint {
             context: self.context.checkpoint(),
-            todo_items,
             tool_surface_hash: self.tool_surface_hash(),
             context_window,
             has_background_tasks: self
@@ -1509,12 +1517,6 @@ where
     /// Returns an error when the checkpoint cannot be restored into this agent.
     pub fn restore_checkpoint(&mut self, checkpoint: AgentCheckpoint) -> Result<(), AgentError> {
         self.context.restore(checkpoint.context);
-        if !checkpoint.todo_items.is_empty() {
-            let list = self.todo_list.get_or_insert_with(TodoList::new);
-            list.write(checkpoint.todo_items);
-        } else if let Some(list) = &self.todo_list {
-            list.clear();
-        }
         #[cfg(feature = "skills")]
         {
             self.active_skills.clear();
@@ -1523,10 +1525,13 @@ where
         Ok(())
     }
 
-    /// Returns a structured snapshot of the currently assembled context window.
+    /// Returns a structured snapshot of the current context window.
+    ///
+    /// This is a pure measurement: it does not repopulate reminders or
+    /// otherwise mutate the context.
     pub async fn snapshot_context_window(&mut self) -> ContextWindowSnapshot {
         self.ensure_initialized().await;
-        self.assemble_context_window().await
+        self.context_window_snapshot()
     }
 
     /// Returns the model profile if available.
@@ -1608,11 +1613,6 @@ where
         #[cfg(feature = "skills")]
         self.populate_skill_reminders();
 
-        if let Some(todo_ctx) = self.format_todo_context() {
-            self.context
-                .insert_reminder(&SystemReminder { content: todo_ctx });
-        }
-
         if let Some(sandbox_dir) = self.sandbox_dir.as_deref() {
             let docs = working_docs::read_snapshot(sandbox_dir).await;
             if let Some(previous) = self.last_working_docs.as_ref()
@@ -1641,7 +1641,7 @@ where
     /// Builds the message list for an LLM request.
     ///
     /// Uses `context.build_messages()` for the stable system prefix + conversation,
-    /// then prepends per-turn ephemeral context (todo, working docs, background
+    /// then prepends per-turn ephemeral context (working docs, background
     /// jobs, context usage) as system messages inserted before conversation messages.
     async fn build_request_messages(&mut self) -> Vec<Message> {
         self.assemble_context_window().await.messages
@@ -1682,12 +1682,27 @@ where
         }
     }
 
+    /// Measures the context window exactly as it stands: no reminder
+    /// repopulation, no alert insertion, no working-doc baseline updates.
+    ///
+    /// Metrics-only callers (checkpoints, compression gating, status
+    /// snapshots) must use this — running the full assemble path there would
+    /// wipe ad-hoc alerts queued for the next request and consume the
+    /// tasks.md diff baseline before the model ever sees it.
+    fn context_window_snapshot(&self) -> ContextWindowSnapshot {
+        let messages = self.context.build_messages();
+        let metrics = self.estimate_context_window_metrics(&messages);
+        ContextWindowSnapshot {
+            phase: self.classify_context_window_phase(&metrics),
+            metrics,
+            messages,
+        }
+    }
+
     async fn assemble_context_window(&mut self) -> ContextWindowSnapshot {
         self.populate_dynamic_reminders().await;
 
-        let mut messages = self
-            .context
-            .build_messages_with_transient_system(&self.transient_system_messages);
+        let mut messages = self.context.build_messages();
         let mut metrics = self.estimate_context_window_metrics(&messages);
 
         if !metrics.has_handoff
@@ -1791,10 +1806,15 @@ where
         self.ensure_initialized().await;
         // Fork context, add the user message, build messages
         let checkpoint = self.context.checkpoint();
+        // `populate_dynamic_reminders` also advances the working-docs diff
+        // baseline, which lives outside the context checkpoint — preserve it
+        // so a preview cannot consume a diff the real request should surface.
+        let working_docs_baseline = self.last_working_docs.clone();
         self.context
             .push(Message::user(prompt).with_attachments(attachments));
         let messages = self.build_request_messages().await;
         self.context.restore(checkpoint);
+        self.last_working_docs = working_docs_baseline;
         messages
     }
 
@@ -1844,7 +1864,7 @@ where
     ///
     async fn maybe_compress(&mut self) -> Result<(), AgentError> {
         self.ensure_initialized().await;
-        let snapshot = self.assemble_context_window().await;
+        let snapshot = self.context_window_snapshot();
         let context_strategy = self.config.context.clone();
 
         match context_strategy {
@@ -1908,26 +1928,20 @@ where
     }
 
     async fn emit_checkpoint(
-        &mut self,
+        &self,
         reason: CheckpointReason,
         assistant_text: &str,
         turn: usize,
     ) -> Result<EmittedCheckpoint, AgentError> {
         let context = self.context.checkpoint();
-        let todo_items = self
-            .todo_list
-            .as_ref()
-            .map(super::todo::TodoList::items)
-            .unwrap_or_default();
         let tool_surface_hash = self.tool_surface_hash();
-        let window = self.assemble_context_window().await;
+        let window = self.context_window_snapshot();
         let checkpoint_ctx = CheckpointContext {
             reason,
             assistant_text,
             turn,
             message_count: self.context.len_recent(),
             context: &context,
-            todo_items: &todo_items,
             tool_surface_hash: &tool_surface_hash,
             has_background_tasks: self
                 .background_receiver
@@ -1945,39 +1959,6 @@ where
             phase: window.phase,
             message_count: self.context.len_recent(),
         })
-    }
-
-    /// Formats the todo list as a system reminder.
-    ///
-    /// Returns None if there's no todo list or it's empty.
-    fn format_todo_reminder(&self) -> Option<String> {
-        let list = self.todo_list.as_ref()?;
-        let items = list.items();
-        if items.is_empty() {
-            return None;
-        }
-        let items_json = format_todo_items_json(&items);
-        TodoReminderTemplate {
-            items_json: &items_json,
-        }
-        .render()
-        .ok()
-    }
-
-    /// Formats the current todo list for context injection before each request.
-    fn format_todo_context(&self) -> Option<String> {
-        let list = self.todo_list.as_ref()?;
-        let items = list.items();
-        if items.is_empty() {
-            return None;
-        }
-
-        let items_json = format_todo_items_json(&items);
-        TodoContextTemplate {
-            items_json: &items_json,
-        }
-        .render()
-        .ok()
     }
 
     /// Formats a reminder and event payload when `terminal` has been auto-promoted to background.
@@ -2089,47 +2070,7 @@ where
 
         serialize_xml("background-terminal-result", &xml)
     }
-
-    /// Generates a reminder about the next task after a task was completed.
-    fn format_next_task_reminder(&self, completed_task: &str) -> Option<String> {
-        let list = self.todo_list.as_ref()?;
-        let items = list.items();
-
-        // Find the next pending or in_progress task
-        let next_task = items
-            .iter()
-            .find(|item| matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress));
-
-        next_task.map_or_else(
-            || {
-                items
-                    .iter()
-                    .all(|i| i.status == TodoStatus::Completed)
-                    .then(|| {
-                        AllTasksCompleteReminderTemplate { completed_task }
-                            .render()
-                            .ok()
-                    })
-                    .flatten()
-            },
-            |task| {
-                NextTaskReminderTemplate {
-                    completed_task,
-                    next_task: &task.content,
-                    active_form: &task.active_form,
-                }
-                .render()
-                .ok()
-            },
-        )
-    }
 }
-
-/// Formats todo items into the JSON-ish list used in system reminders.
-fn format_todo_items_json(items: &[TodoItem]) -> String {
-    serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
-}
-
 fn format_builtin_tool_result(tool: &str, result: &str) -> String {
     let mut text = String::from("[");
     text.push_str(tool);
@@ -2526,7 +2467,6 @@ mod tests {
     fn empty_checkpoint() -> AgentCheckpoint {
         AgentCheckpoint {
             context: crate::Context::default().checkpoint(),
-            todo_items: Vec::new(),
             tool_surface_hash: "tool-surface".to_string(),
             context_window: ContextWindowSnapshot {
                 phase: ContextWindowPhase::Stable,
@@ -2631,6 +2571,167 @@ mod tests {
                 .iter()
                 .all(|message| !message.content().contains("templates/review.md")),
             "skill resource catalog must not be injected automatically"
+        );
+    }
+
+    fn tasks_stale_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+        Agent::builder(MockLlm {
+            context_length: 1_000,
+        })
+        .sandbox_dir(dir)
+        .config(AgentConfig {
+            tasks_stale_after_turns: 2,
+            ..AgentConfig::default()
+        })
+        .build()
+    }
+
+    fn stale_alert_count(agent: &Agent<MockLlm, MockLlm, MockLlm, ()>) -> usize {
+        agent
+            .context()
+            .conversation_messages()
+            .iter()
+            .filter(|message| message.content().contains("<tasks_stale>"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn tasks_stale_fires_once_after_threshold_with_unchecked_items() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] pending\n").expect("write tasks.md");
+        let mut agent = tasks_stale_agent(dir.path());
+
+        agent.check_tasks_doc_staleness().await; // baseline
+        agent.check_tasks_doc_staleness().await; // stale turn 1
+        assert_eq!(stale_alert_count(&agent), 0);
+        agent.check_tasks_doc_staleness().await; // stale turn 2 -> alert
+        assert_eq!(stale_alert_count(&agent), 1);
+        agent.check_tasks_doc_staleness().await; // still stale, no re-alert
+        assert_eq!(stale_alert_count(&agent), 1);
+    }
+
+    #[tokio::test]
+    async fn tasks_stale_suggests_creating_missing_doc() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir should exist");
+        let mut agent = tasks_stale_agent(dir.path());
+
+        for _ in 0..3 {
+            agent.check_tasks_doc_staleness().await;
+        }
+
+        let messages = agent.context().conversation_messages();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content().contains("without a tasks.md")),
+            "missing tasks.md should earn a create-the-doc alert"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_preserves_reminders_and_working_docs_baseline() {
+        let mut agent = Agent::new(MockLlm {
+            context_length: 1_000,
+        });
+        agent.context_mut().insert_reminder(&SystemReminder {
+            content: "queued".to_string(),
+        });
+        agent.last_working_docs = Some(working_docs::WorkingDocsSnapshot {
+            tasks_md: Some("- [ ] pending".to_string()),
+        });
+
+        let _ = agent.snapshot_context_window().await;
+        agent
+            .maybe_compress()
+            .await
+            .expect("maybe_compress should succeed");
+
+        assert_eq!(agent.context().reminders().len(), 1);
+        assert!(
+            agent.last_working_docs.is_some(),
+            "metrics-only reads must not consume the diff baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn tasks_stale_resets_when_doc_is_updated_or_complete() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir should exist");
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(&tasks_path, "- [ ] pending\n").expect("write tasks.md");
+        let mut agent = tasks_stale_agent(dir.path());
+
+        agent.check_tasks_doc_staleness().await; // baseline
+        agent.check_tasks_doc_staleness().await; // stale turn 1
+
+        // Model updates the doc: counter resets.
+        std::fs::write(&tasks_path, "- [x] done\n- [ ] next\n").expect("update tasks.md");
+        agent.check_tasks_doc_staleness().await;
+        assert_eq!(agent.tasks_staleness.stale_turns, 0);
+
+        // All-checked doc is not stale: counter stays reset.
+        std::fs::write(&tasks_path, "- [x] done\n- [x] next\n").expect("complete tasks.md");
+        for _ in 0..4 {
+            agent.check_tasks_doc_staleness().await;
+        }
+        assert_eq!(agent.tasks_staleness.stale_turns, 0);
+        assert_eq!(stale_alert_count(&agent), 0);
+    }
+
+    #[tokio::test]
+    async fn system_alerts_survive_reminder_repopulation() {
+        use aither_core::llm::Role;
+
+        let mut agent = Agent::new(MockLlm {
+            context_length: 1_000,
+        });
+        agent.context_mut().insert_reminder(&SystemReminder {
+            content: "stale reminder".to_string(),
+        });
+        agent.push_system_alert("no native tool named foo");
+
+        let snapshot = agent.assemble_context_window().await;
+
+        assert!(
+            snapshot.messages.iter().any(|message| {
+                message.role() == Role::System
+                    && message.content().contains("no native tool named foo")
+            }),
+            "ad-hoc alerts must reach the next request"
+        );
+        assert!(
+            snapshot
+                .messages
+                .iter()
+                .all(|message| !message.content().contains("stale reminder")),
+            "populate still clears managed reminders"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_does_not_consume_working_docs_baseline() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] pending\n").expect("write tasks.md");
+        let mut agent = Agent::builder(MockLlm {
+            context_length: 1_000,
+        })
+        .sandbox_dir(dir.path())
+        .build();
+
+        let _ = agent
+            .preview_request_messages("hi", std::iter::empty())
+            .await;
+
+        assert!(
+            agent.last_working_docs.is_none(),
+            "preview must restore the working-docs baseline"
         );
     }
 }
