@@ -312,6 +312,7 @@ impl ToolBundle {
     }
 }
 
+/// Computes the SHA-256 digest used to validate artifact bytes.
 pub fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
@@ -644,6 +645,14 @@ pub enum ToolRuntimeError {
 pub mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn artifact_digest_matches_known_sha256_vector() {
+        assert_eq!(
+            hex::encode(digest(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     pub fn bundle() -> ToolBundle {
         let binaries = ManagedTool::ALL
