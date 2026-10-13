@@ -45,28 +45,31 @@ jobs:
         run: |
           set -euo pipefail
           deadline=$(( $(date +%s) + 3300 ))
+          checks_file="${RUNNER_TEMP}/checks.tsv"
           while :; do
             {
-              gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100" \
-                --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv'
+              gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100" \
+                --jq '.check_runs[] | select(.name != "PR source gate") | [.name, (.conclusion // "pending")] | @tsv'
               if [ -n "${MERGE_SHA:-}" ] && [ "${MERGE_SHA}" != "null" ]; then
-                gh api "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs?per_page=100" \
-                  --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv'
+                gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs?per_page=100" \
+                  --jq '.check_runs[] | select(.name != "PR source gate") | [.name, (.conclusion // "pending")] | @tsv'
               fi
-            } 2>/dev/null | grep -v '^PR source gate\b' > checks.tsv || true
+            } > "${checks_file}"
 
-            if grep -E '\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' checks.tsv; then
+            if grep -E $'\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' "${checks_file}"; then
               echo "::error::a check on this pull request did not pass (see list above)"
               exit 1
             fi
-            pending=$(grep -c $'\tpending$' checks.tsv || true)
-            if [ "${pending}" -eq 0 ]; then
+            pending=$(grep -c $'\tpending$' "${checks_file}" || true)
+            if [ ! -s "${checks_file}" ]; then
+              echo "no other check runs on this pull request yet"
+            elif [ "${pending}" -eq 0 ]; then
               echo "all checks on this pull request have passed"
               exit 0
             fi
             if [ "$(date +%s)" -gt "${deadline}" ]; then
               echo "::error::timed out after 55 minutes waiting for ${pending} check(s) to conclude"
-              grep $'\tpending$' checks.tsv
+              cat "${checks_file}"
               exit 1
             fi
             echo "waiting on ${pending} check(s)..."
