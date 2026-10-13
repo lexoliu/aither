@@ -90,6 +90,8 @@ pub use container::{
 };
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
 pub use heel::NetworkAuditLog;
+/// Re-export of heel's scheduling priority types for terminal-tool configuration.
+pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use job_registry::{
     JobInfo, JobRegistry, JobRegistryService, JobStatus, TerminalDelta, job_registry_channel,
 };
@@ -99,10 +101,10 @@ pub use network_policy::{
 pub use output::{Content, MediaResolution, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{PermissionHandler, TerminalMode};
 pub use shell_session::{
-    AnyContainerExec, AnySshSessionAuthorizer, ContainerExec, ContainerExecOutcome,
-    ContainerShellRuntime, ShellBackend, ShellRuntimeAvailability, ShellSessionRegistry,
-    SshAuthorizationError, SshRuntimeProfile, SshServer, SshSessionAuthorizer,
-    bootstrap_ssh_runtime,
+    AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
+    ContainerExecOutcome, ContainerIpcRoute, ContainerShellRuntime, ShellBackend,
+    ShellRuntimeAvailability, ShellSessionRegistry, SshAuthorizationError, SshRuntimeProfile,
+    SshServer, SshSessionAuthorizer, bootstrap_ssh_runtime,
 };
 pub use stdin_watch::{
     STDIN_WATCH_INTERVAL, TERMINAL_STDIN_BLOCKED_NOTICE, detect_stdin_blocked_for_local_pid,
