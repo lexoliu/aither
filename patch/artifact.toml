@@ -1,24 +1,22 @@
-# Typed artifact + usage metadata for `apply_patch` (aither #104).
+# Artifact build and usage reference for `apply_patch` (aither #104).
 #
-# Consumed by the shared tool-runtime initializer (aither #105/#106). This
-# file is data, not provisioning code: it declares what the artifact is,
-# how it is produced, how the initializer validates it, and the typed
-# command catalog the prompt layer renders into stable cacheable context.
+# The initializer consumes a ToolDistribution JSON manifest containing
+# pinned artifact URLs and hashes. This file documents the build contract;
+# it is not a runtime distribution manifest.
 #
 # Distribution prerequisite (NOT solved here): the initializer needs a
 # location from which to fetch or rebuild artifacts. There is currently no
 # published release or download URL — artifacts are produced by
 # `patch/build-artifact.sh` in this repo and their `.tar.gz` + `.sha256`
-# output is what must be staged. Until a distribution channel is assigned,
-# this dependency is reported to the coordinator rather than invented.
+# output is what must be staged. Stable release assets are tracked in #113.
 
 [artifact]
 # Executable filename as installed into the managed tools directory.
 name = "apply_patch"
 # Version is the workspace package version of `aither-patch`; it is the
 # exact string printed by `apply_patch --version` after the executable name.
-version = "0.6.0"
-# No published download URL exists. Distribution is a #105/#106
+version = "0.7.0"
+# No published download URL exists. Distribution is a #113
 # prerequisite to satisfy with a staged tarball or a rebuild from source.
 distribution = "build-artifact.sh output; no published URL"
 # Cargo package whose [[bin]] produces the executable.
@@ -32,7 +30,7 @@ crate_dir = "patch"
 linux = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 # Additional targets may be added by repeating the build on a host that has
 # that target's toolchain prerequisites (e.g. cross libc for gnu targets).
-other = []
+other = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc"]
 
 [build]
 # Reproducible artifact build; executed once per target.
@@ -55,7 +53,7 @@ outputs = ["apply_patch-{version}-{target}.tar.gz", ".sha256", ".json"]
 [validation]
 # The initializer MUST run these checks before marking the tool ready.
 version_command = "apply_patch --version"
-version_stdout = "apply_patch 0.6.0"
+version_stdout = "apply_patch 0.7.0"
 help_command = "apply_patch --help"        # exits 0, prints usage + format
 sha256 = "verify downloaded/staged tarball against its .sha256 sidecar"
 

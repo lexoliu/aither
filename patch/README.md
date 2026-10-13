@@ -22,7 +22,7 @@ PATCH
 - `apply_patch` — read a patch from stdin; print `A`/`M`/`D`/`R` lines for
   each touched file; exit nonzero without writing on any failure.
 - `apply_patch --help` — format documentation.
-- `apply_patch --version` — deterministic `apply_patch 0.6.0`.
+- `apply_patch --version` — deterministic `apply_patch 0.7.0`.
 
 Supported operations: `Add File`, `Update File` (with `*** Move to:`),
 `Delete File`, `*** End of File` anchors and `@@` context. Context lines
@@ -80,9 +80,9 @@ Notes from the experiment:
   cross toolchain (self-contained crt objects come from the target's
   rust-std component).
 
-Targets: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`
-(static — run on any libc, in containers and on SSH hosts). `artifact.toml`
-carries the typed metadata and usage catalog consumed by the shared
-tool-runtime initializer (#105/#106). Distribution is a #105/#106
-prerequisite: there is no published download URL; the script output is
-what must be staged.
+Targets: Linux, macOS and Windows, each on x86-64 and ARM64. The Linux
+musl artifacts are static and run on any libc, in containers and on SSH
+hosts. `artifact.toml` documents the build and usage contract; the
+initializer consumes a `ToolDistribution` JSON manifest with pinned URLs
+and hashes. Stable release assets are tracked in #113; until publication,
+the verified script output must be staged.

@@ -58,7 +58,10 @@ fn version_is_deterministic_and_identifies_the_command() {
     let dir = tempdir().expect("tempdir");
     let output = run_with_args(dir.path(), &["--version"]);
     assert!(output.status.success());
-    assert_eq!(stdout(&output), "apply_patch 0.6.0\n");
+    assert_eq!(
+        stdout(&output),
+        format!("apply_patch {}\n", env!("CARGO_PKG_VERSION"))
+    );
     let short = run_with_args(dir.path(), &["-V"]);
     assert_eq!(stdout(&short), stdout(&output));
 }

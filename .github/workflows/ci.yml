@@ -60,6 +60,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  workflow-gates:
+    name: Workflow Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --with PyYAML==6.0.3 python .github/tests/test_ci_waiters.py
+
   unused-deps:
     name: Unused Dependencies
     runs-on: ubuntu-latest

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/lexoliu/aither/compare/v0.6.0...v0.7.0) - 2026-10-13
+
+### Added
+
+- initialize a verified baseline tool distribution before terminal agents run in local, container and SSH environments ([#107](https://github.com/lexoliu/aither/pull/107))
+- `aither-patch`: a sandbox-executed `apply_patch` utility ([#108](https://github.com/lexoliu/aither/pull/108))
+- process priority for every terminal execution: `TerminalTool::with_process_priority`, typed `ContainerIpcRoute`/`BridgeAddress` container IPC ([#112](https://github.com/lexoliu/aither/pull/112))
+- alert on stale `tasks.md` during sustained tool activity ([#95](https://github.com/lexoliu/aither/pull/95))
+
+### Changed
+
+- render terminal output before compressing it; keep output that ends without a newline unterminated ([#102](https://github.com/lexoliu/aither/pull/102))
+- [**breaking**] terminal execution requires prepared tools; initialize the tool distribution before running the agent or terminal
+- [**breaking**] `ContainerShellRuntime::new` takes a `ContainerIpcRoute` instead of an IPC hostname
+- upgrade the sandbox backend to heel 0.4.1
+
+### Removed
+
+- the in-memory todo subsystem and transient system message channel
+
+### Fixed
+
+- update quinn-proto to 0.11.18, resolving three denial-of-service advisories
+
 ## [0.6.0](https://github.com/lexoliu/aither/compare/v0.5.0...v0.6.0) - 2026-10-10
 
 ### Added

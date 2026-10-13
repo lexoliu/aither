@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/lexoliu/aither/compare/agent-v0.6.0...agent-v0.7.0) - 2026-10-13
+
+### Added
+
+- terminal agents initialize a verified baseline tool distribution before running ([#107](https://github.com/lexoliu/aither/pull/107))
+- alert on stale `tasks.md` during sustained tool activity ([#95](https://github.com/lexoliu/aither/pull/95))
+- `push_system_alert` accepts `impl Into<String>`
+
+### Changed
+
+- render terminal output before compressing it; keep output that ends without a newline unterminated ([#102](https://github.com/lexoliu/aither/pull/102))
+- split context metrics from reminder population and deliver ad-hoc alerts
+
+### Removed
+
+- the in-memory todo subsystem ([#92](https://github.com/lexoliu/aither/pull/92))
+- the transient system message channel
+
 ## [0.6.0](https://github.com/lexoliu/aither/compare/agent-v0.5.0...agent-v0.6.0) - 2026-10-10
 
 ### Added
