@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/lexoliu/aither/compare/models-v0.8.0...models-v0.9.0) - 2026-10-15
+
+### Other
+
+- *(models)* test lookup rules on a fixture, not the live snapshot
+
 ## [0.8.0](https://github.com/lexoliu/aither/compare/models-v0.7.0...models-v0.8.0) - 2026-10-15
 
 ### Other

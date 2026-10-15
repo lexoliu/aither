@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/lexoliu/aither/compare/sandbox-v0.8.0...sandbox-v0.9.0) - 2026-10-15
+
+### Fixed
+
+- *(sandbox)* serve the container IPC bridge on every host
+
+### Other
+
+- Merge pull request #136 from lexoliu/fix/135-container-posix-paths
+- Merge pull request #134 from lexoliu/fix/133-windows-ipc-bridge
+
 ## [0.8.0](https://github.com/lexoliu/aither/compare/sandbox-v0.7.0...sandbox-v0.8.0) - 2026-10-15
 
 ### Added
