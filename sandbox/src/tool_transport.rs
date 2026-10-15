@@ -6,6 +6,7 @@ use std::time::Duration;
 use askama::Template;
 use futures_lite::io::AsyncWriteExt;
 
+use crate::ContainerPath;
 use crate::shell_session::{ContainerShellRuntime, SshServer};
 use crate::tool_runtime::{PreparedTools, ToolBundle, ToolRuntimeError, ToolTarget};
 
@@ -178,6 +179,12 @@ struct ToolInstallTemplate<'a> {
     probe_only: bool,
 }
 
+/// A container mount point as a POSIX path; `procfs` parses it into a host
+/// [`PathBuf`], whose components follow host separator rules.
+fn mount_point(mount: &procfs_core::process::MountInfo) -> &typed_path::UnixPath {
+    typed_path::UnixPath::new(mount.mount_point.as_os_str().as_encoded_bytes())
+}
+
 #[derive(Template)]
 #[template(path = "tool_verify.sh", escape = "none")]
 struct ToolVerifyTemplate<'a> {
@@ -189,24 +196,23 @@ impl ToolBundle {
     pub(crate) async fn verify_container_mount(
         &self,
         transport: &impl ToolTransport,
-    ) -> Result<PreparedTools, ToolRuntimeError> {
+    ) -> Result<PreparedTools<ContainerPath>, ToolRuntimeError> {
         use procfs_core::FromRead;
         let directory = self.container_directory()?;
         let output = successful_output(transport.run("cat /proc/self/mountinfo", None).await?)?;
         let mounts = procfs_core::process::MountInfos::from_read(output.as_bytes())?;
+        let tools = typed_path::UnixPath::new(directory.as_str());
         if !mounts
             .iter()
-            .any(|mount| mount.mount_point == directory && mount.mount_options.contains_key("ro"))
+            .any(|mount| mount_point(mount) == tools && mount.mount_options.contains_key("ro"))
             || mounts.iter().any(|mount| {
-                mount.mount_point.starts_with(&directory) && !mount.mount_options.contains_key("ro")
+                mount_point(mount).starts_with(tools) && !mount.mount_options.contains_key("ro")
             })
         {
             return Err(ToolRuntimeError::MissingReadonlyMount(directory));
         }
         let script = ToolVerifyTemplate {
-            directory: shell_words::quote(
-                directory.to_str().ok_or(ToolRuntimeError::InvalidProbe)?,
-            ),
+            directory: shell_words::quote(directory.as_str()),
             tools: self
                 .binaries
                 .iter()
@@ -221,7 +227,7 @@ impl ToolBundle {
         let catalog = self.catalog();
         catalog.verify_versions(&output)?;
         Ok(PreparedTools {
-            bin_dir: directory.join("bin"),
+            bin_dir: self.container_bin_dir()?,
             catalog,
         })
     }
@@ -235,7 +241,7 @@ impl ToolBundle {
         transport: &impl ToolTransport,
         root: &Path,
         authorize: F,
-    ) -> Result<PreparedTools, ToolRuntimeError>
+    ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError>
     where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<(), ToolRuntimeError>> + Send,
@@ -360,7 +366,7 @@ mod tests {
         ] {
             let transport = MountTransport {
                 mountinfo: MountInfoTemplate {
-                    directory: directory.to_str().unwrap(),
+                    directory: directory.as_str(),
                     options,
                     nested,
                     nested_options,
@@ -370,7 +376,10 @@ mod tests {
             };
             let result = bundle.verify_container_mount(&transport).await;
             if accepted {
-                assert_eq!(result.unwrap().bin_dir(), &directory.join("bin"));
+                assert_eq!(
+                    result.unwrap().bin_dir().as_str(),
+                    format!("{directory}/bin")
+                );
             } else {
                 assert!(matches!(
                     result,

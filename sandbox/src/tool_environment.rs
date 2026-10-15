@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use futures::{StreamExt, TryStreamExt, stream};
 
+use crate::ContainerPath;
 use crate::shell_session::{
     ShellBackend, ShellSessionRegistry, SshRuntimeProfile, SshServer, SshSessionAuthorizer,
     bootstrap_ssh_runtime,
@@ -12,18 +13,37 @@ use crate::tool_runtime::{
 };
 use crate::tool_transport::{ContainerToolTransport, SshToolTransport, probe_tool_environment};
 
+/// The home backend's tools, typed by where that backend sees them.
 #[derive(Debug, Clone)]
-struct PreparedHome {
-    backend: ShellBackend,
-    container_id: Option<String>,
-    tools: PreparedTools,
+enum PreparedHome {
+    Local(PreparedTools<PathBuf>),
+    Container {
+        container_id: String,
+        tools: PreparedTools<ContainerPath>,
+    },
+}
+
+impl PreparedHome {
+    const fn backend(&self) -> ShellBackend {
+        match self {
+            Self::Local(_) => ShellBackend::Local,
+            Self::Container { .. } => ShellBackend::Container,
+        }
+    }
+
+    const fn catalog(&self) -> &ToolCatalog {
+        match self {
+            Self::Local(tools) => tools.catalog(),
+            Self::Container { tools, .. } => tools.catalog(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct PreparedSsh {
     server: SshServer,
     runtime: SshRuntimeProfile,
-    tools: PreparedTools,
+    tools: PreparedTools<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,9 +77,8 @@ impl ShellSessionRegistry {
                     .load(&info.target, &cache_root.join("artifacts"))
                     .await?;
                 let tools = bundle.verify_container_mount(&transport).await?;
-                Ok::<_, ToolRuntimeError>(Some(PreparedHome {
-                    backend: ShellBackend::Container,
-                    container_id: Some(runtime.container_id().into()),
+                Ok::<_, ToolRuntimeError>(Some(PreparedHome::Container {
+                    container_id: runtime.container_id().into(),
                     tools,
                 }))
             } else if availability.local {
@@ -67,11 +86,7 @@ impl ShellSessionRegistry {
                     .load(&ToolTarget::native()?, &cache_root.join("artifacts"))
                     .await?;
                 let tools = bundle.prepare_local(&cache_root.join("runtimes")).await?;
-                Ok(Some(PreparedHome {
-                    backend: ShellBackend::Local,
-                    container_id: None,
-                    tools,
-                }))
+                Ok(Some(PreparedHome::Local(tools)))
             } else {
                 Ok(None)
             }
@@ -106,7 +121,7 @@ impl ShellSessionRegistry {
         ssh.sort_by(|left, right| left.server.id().cmp(right.server.id()));
         let catalog = home
             .as_ref()
-            .map(|home| home.tools.catalog())
+            .map(PreparedHome::catalog)
             .or_else(|| ssh.first().map(|ssh| ssh.tools.catalog()))
             .ok_or_else(|| {
                 ToolRuntimeError::NotInitialized("no configured execution environment".into())
@@ -129,19 +144,16 @@ impl ShellSessionRegistry {
             .prepared_tools
             .as_ref()
             .ok_or_else(|| ToolRuntimeError::NotInitialized("execution environments".into()))?;
-        if prepared.home.as_ref().map(|home| home.backend) != self.resolve_local_backend().ok() {
+        if prepared.home.as_ref().map(PreparedHome::backend) != self.resolve_local_backend().ok() {
             return Err(ToolRuntimeError::EnvironmentChanged(
                 PreparedEnvironment::HomeBackend,
             ));
         }
-        if let Some(container_id) = prepared
-            .home
-            .as_ref()
-            .and_then(|home| home.container_id.as_deref())
+        if let Some(PreparedHome::Container { container_id, .. }) = prepared.home.as_ref()
             && self
                 .container_runtime()
                 .map(crate::ContainerShellRuntime::container_id)
-                != Some(container_id)
+                != Some(container_id.as_str())
         {
             return Err(ToolRuntimeError::EnvironmentChanged(
                 PreparedEnvironment::Container,
@@ -166,22 +178,28 @@ impl ShellSessionRegistry {
         Ok(prepared)
     }
 
-    pub(crate) fn home_tools(
+    pub(crate) fn local_tools(&self) -> Result<&PreparedTools<PathBuf>, ToolRuntimeError> {
+        match &self.prepared_environments()?.home {
+            Some(PreparedHome::Local(tools)) => Ok(tools),
+            _ => Err(ToolRuntimeError::NotInitialized("local environment".into())),
+        }
+    }
+
+    pub(crate) fn container_tools(
         &self,
-        backend: ShellBackend,
-    ) -> Result<&PreparedTools, ToolRuntimeError> {
-        self.prepared_environments()?
-            .home
-            .as_ref()
-            .filter(|home| home.backend == backend)
-            .map(|home| &home.tools)
-            .ok_or_else(|| ToolRuntimeError::NotInitialized("home environment".into()))
+    ) -> Result<&PreparedTools<ContainerPath>, ToolRuntimeError> {
+        match &self.prepared_environments()?.home {
+            Some(PreparedHome::Container { tools, .. }) => Ok(tools),
+            _ => Err(ToolRuntimeError::NotInitialized(
+                "container environment".into(),
+            )),
+        }
     }
 
     pub(crate) fn ssh_tools(
         &self,
         server: &SshServer,
-    ) -> Result<(&SshRuntimeProfile, &PreparedTools), ToolRuntimeError> {
+    ) -> Result<(&SshRuntimeProfile, &PreparedTools<PathBuf>), ToolRuntimeError> {
         self.prepared_environments()?
             .ssh
             .iter()
@@ -201,33 +219,27 @@ impl ShellSessionRegistry {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_test_tools(self, tools: PreparedTools) -> Self {
-        self.with_test_home(ShellBackend::Local, None, tools)
+    pub(crate) fn with_test_tools(self, tools: PreparedTools<PathBuf>) -> Self {
+        self.with_test_home(PreparedHome::Local(tools))
     }
 
     #[cfg(test)]
     pub(crate) fn with_test_container_tools(
         self,
-        tools: PreparedTools,
+        tools: PreparedTools<ContainerPath>,
         container_id: String,
     ) -> Self {
-        self.with_test_home(ShellBackend::Container, Some(container_id), tools)
+        self.with_test_home(PreparedHome::Container {
+            container_id,
+            tools,
+        })
     }
 
     #[cfg(test)]
-    fn with_test_home(
-        mut self,
-        backend: ShellBackend,
-        container_id: Option<String>,
-        tools: PreparedTools,
-    ) -> Self {
-        let catalog = tools.catalog().clone();
+    fn with_test_home(mut self, home: PreparedHome) -> Self {
+        let catalog = home.catalog().clone();
         self.prepared_tools = Some(PreparedToolEnvironments {
-            home: Some(PreparedHome {
-                backend,
-                container_id,
-                tools,
-            }),
+            home: Some(home),
             ssh: Vec::new(),
             catalog,
         });
@@ -236,7 +248,11 @@ impl ShellSessionRegistry {
 
     /// Records `server` as prepared with `tools`, as SSH bootstrap would.
     #[cfg(test)]
-    pub(crate) fn with_test_ssh(mut self, server: SshServer, tools: PreparedTools) -> Self {
+    pub(crate) fn with_test_ssh(
+        mut self,
+        server: SshServer,
+        tools: PreparedTools<PathBuf>,
+    ) -> Self {
         let prepared = self
             .prepared_tools
             .as_mut()

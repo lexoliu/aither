@@ -6,6 +6,8 @@ use askama::Template;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::ContainerPath;
+
 /// Commands guaranteed by a prepared execution environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -226,7 +228,10 @@ impl ToolBundle {
     ///
     /// # Errors
     /// Returns errors for target mismatch, I/O failure or tampered cached content.
-    pub async fn prepare_local(&self, root: &Path) -> Result<PreparedTools, ToolRuntimeError> {
+    pub async fn prepare_local(
+        &self,
+        root: &Path,
+    ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
         if self.target != ToolTarget::native()? {
             return Err(ToolRuntimeError::TargetMismatch);
         }
@@ -243,7 +248,7 @@ impl ToolBundle {
     pub async fn prepare_container_mount(
         &self,
         root: &Path,
-    ) -> Result<(crate::MountSpec, PreparedTools), ToolRuntimeError> {
+    ) -> Result<(crate::MountSpec, PreparedTools<PathBuf>), ToolRuntimeError> {
         let bundle = self.clone();
         let root = root.to_path_buf();
         let source = blocking::unblock(move || bundle.prepare_local_sync(&root)).await?;
@@ -259,41 +264,123 @@ impl ToolBundle {
         ))
     }
 
-    pub(crate) fn container_directory(&self) -> Result<PathBuf, ToolRuntimeError> {
-        Ok(Path::new("/opt/aither/tools").join(self.cache_key()?))
+    /// Where the prepared runtime is mounted inside a container.
+    pub(crate) fn container_directory(&self) -> Result<ContainerPath, ToolRuntimeError> {
+        Ok(ContainerPath::root()
+            .join("opt/aither/tools")
+            .join(self.cache_key()?))
     }
 
-    fn prepare_local_sync(&self, root: &Path) -> Result<PreparedTools, ToolRuntimeError> {
+    /// The executable directory inside a container, which goes on its `PATH`.
+    pub(crate) fn container_bin_dir(&self) -> Result<ContainerPath, ToolRuntimeError> {
+        Ok(self.container_directory()?.join("bin"))
+    }
+
+    /// Returns the verified runtime at `<root>/<cache key>`, staging it when it is
+    /// missing and replacing it when its contents are invalid.
+    ///
+    /// Verifying a valid runtime takes no lock. Creation and replacement run under an
+    /// exclusive lock on `<root>/.<cache key>.lock`, so concurrent preparers never
+    /// discard a runtime another preparer has just activated.
+    fn prepare_local_sync(&self, root: &Path) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
         std::fs::create_dir_all(root)?;
         let root = std::fs::canonicalize(root)?;
-        let destination = root.join(self.cache_key()?);
-        if !destination.try_exists()? {
-            let stage = tempfile::Builder::new()
-                .prefix(".initializing-")
-                .tempdir_in(&root)?;
-            let bin = stage.path().join("bin");
-            std::fs::create_dir(&bin)?;
-            for binary in self.binaries.iter() {
-                let path = bin.join(binary.tool.executable_name(&self.target));
-                std::fs::write(&path, &binary.bytes)?;
-                set_executable_readonly(&path)?;
-            }
-            match std::fs::rename(stage.path(), &destination) {
-                Ok(()) => {}
-                Err(error) if destination.try_exists()? => {
-                    tracing::debug!(%error, "another initializer activated the tool bundle");
-                }
-                Err(error) => return Err(error.into()),
-            }
+        let key = self.cache_key()?;
+        let destination = root.join(&key);
+        if let Some(prepared) = self.reusable(&destination)? {
+            return Ok(prepared);
         }
+        let lock_path = root.join(format!(".{key}.lock"));
+        let mut lock = fd_lock::RwLock::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)?,
+        );
+        let _guard = lock.write()?;
+        // A preparer holding the lock before us may have activated a valid runtime.
+        if let Some(prepared) = self.reusable(&destination)? {
+            return Ok(prepared);
+        }
+        let stage = self.stage(&root)?;
+        let discarded = if destination.try_exists()? {
+            let discarded = tempfile::Builder::new()
+                .prefix(".invalid-")
+                .tempdir_in(&root)?;
+            std::fs::rename(&destination, discarded.path().join("runtime"))?;
+            Some(discarded)
+        } else {
+            None
+        };
+        match std::fs::rename(stage.path(), &destination) {
+            Ok(()) => {}
+            Err(error) if destination.try_exists()? => {
+                tracing::debug!(%error, "another initializer activated the tool bundle");
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(discarded) = discarded {
+            discarded.close()?;
+        }
+        self.verify_prepared(&destination)
+    }
+
+    /// Verifies an existing runtime; `None` when it is absent or must be replaced.
+    fn reusable(
+        &self,
+        destination: &Path,
+    ) -> Result<Option<PreparedTools<PathBuf>>, ToolRuntimeError> {
+        if !destination.try_exists()? {
+            return Ok(None);
+        }
+        match self.verify_prepared(destination) {
+            Ok(prepared) => Ok(Some(prepared)),
+            Err(
+                error @ (ToolRuntimeError::InvalidCache(_) | ToolRuntimeError::Integrity { .. }),
+            ) => {
+                tracing::warn!(
+                    path = %destination.display(),
+                    %error,
+                    "prepared tool runtime is invalid and will be replaced"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Writes every executable into a fresh `.initializing-` directory under `root`.
+    fn stage(&self, root: &Path) -> Result<tempfile::TempDir, ToolRuntimeError> {
+        let stage = tempfile::Builder::new()
+            .prefix(".initializing-")
+            .tempdir_in(root)?;
+        let bin = stage.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        for binary in self.binaries.iter() {
+            let path = bin.join(binary.tool.executable_name(&self.target));
+            std::fs::write(&path, &binary.bytes)?;
+            set_executable_readonly(&path)?;
+        }
+        Ok(stage)
+    }
+
+    /// Checks that every executable under `destination` is a regular, read-only
+    /// executable file with the trusted digest.
+    fn verify_prepared(
+        &self,
+        destination: &Path,
+    ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
         let bin_dir = destination.join("bin");
         for binary in self.binaries.iter() {
             let path = bin_dir.join(binary.tool.executable_name(&self.target));
-            let metadata = std::fs::symlink_metadata(&path)?;
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| cache_entry_error(&path, error))?;
             if !metadata.file_type().is_file() {
                 return Err(ToolRuntimeError::InvalidCache(path));
             }
-            if digest(&std::fs::read(&path)?) != binary.sha256 {
+            let bytes = std::fs::read(&path).map_err(|error| cache_entry_error(&path, error))?;
+            if digest(&bytes) != binary.sha256 {
                 return Err(ToolRuntimeError::Integrity { tool: binary.tool });
             }
             #[cfg(unix)]
@@ -303,6 +390,10 @@ impl ToolBundle {
                 if mode & 0o222 != 0 || mode & 0o111 == 0 {
                     return Err(ToolRuntimeError::InvalidCache(path));
                 }
+            }
+            #[cfg(not(unix))]
+            if !metadata.permissions().readonly() {
+                return Err(ToolRuntimeError::InvalidCache(path));
             }
         }
         Ok(PreparedTools {
@@ -315,6 +406,16 @@ impl ToolBundle {
 /// Computes the SHA-256 digest used to validate artifact bytes.
 pub fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+/// Names the cache entry when it is missing or its parent is not a directory.
+fn cache_entry_error(path: &Path, error: std::io::Error) -> ToolRuntimeError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+            ToolRuntimeError::InvalidCache(path.to_path_buf())
+        }
+        _ => ToolRuntimeError::Io(error),
+    }
 }
 
 fn set_executable_readonly(path: &Path) -> Result<(), std::io::Error> {
@@ -332,16 +433,20 @@ fn set_executable_readonly(path: &Path) -> Result<(), std::io::Error> {
 }
 
 /// Tool directory available only after successful initialization.
+///
+/// `D` is the path type of the environment the tools run in: a host
+/// [`PathBuf`] for the local sandbox and SSH, a [`ContainerPath`] inside a
+/// container.
 #[derive(Debug, Clone)]
-pub struct PreparedTools {
-    pub(crate) bin_dir: PathBuf,
+pub struct PreparedTools<D> {
+    pub(crate) bin_dir: D,
     pub(crate) catalog: ToolCatalog,
 }
 
-impl PreparedTools {
+impl<D> PreparedTools<D> {
     /// Read-only executable directory to expose to the sandbox.
     #[must_use]
-    pub const fn bin_dir(&self) -> &PathBuf {
+    pub const fn bin_dir(&self) -> &D {
         &self.bin_dir
     }
 
@@ -350,7 +455,9 @@ impl PreparedTools {
     pub const fn catalog(&self) -> &ToolCatalog {
         &self.catalog
     }
+}
 
+impl PreparedTools<PathBuf> {
     pub(crate) async fn verify_local_versions<E: executor_core::Executor + Clone + 'static>(
         &self,
         executor: E,
@@ -449,18 +556,32 @@ struct ToolPathTemplate<'a> {
     script: &'a str,
 }
 
-impl PreparedTools {
-    pub(crate) fn wrap_script(&self, script: &str) -> Result<String, ToolRuntimeError> {
-        let directory = self
-            .bin_dir
+impl PreparedTools<PathBuf> {
+    /// The executable directory as text a shell script can name.
+    pub(crate) fn script_bin_dir(&self) -> Result<&str, ToolRuntimeError> {
+        self.bin_dir
             .to_str()
-            .ok_or_else(|| ToolRuntimeError::InvalidCache(self.bin_dir.clone()))?;
-        Ok(ToolPathTemplate {
-            bin_dir: shell_words::quote(directory),
-            script,
-        }
-        .render()?)
+            .ok_or_else(|| ToolRuntimeError::InvalidCache(self.bin_dir.clone()))
     }
+
+    pub(crate) fn wrap_script(&self, script: &str) -> Result<String, ToolRuntimeError> {
+        render_tool_path(self.script_bin_dir()?, script)
+    }
+}
+
+impl PreparedTools<ContainerPath> {
+    pub(crate) fn wrap_script(&self, script: &str) -> Result<String, ToolRuntimeError> {
+        render_tool_path(self.bin_dir.as_str(), script)
+    }
+}
+
+/// Prepends `bin_dir` to a POSIX shell script's `PATH`.
+fn render_tool_path(bin_dir: &str, script: &str) -> Result<String, ToolRuntimeError> {
+    Ok(ToolPathTemplate {
+        bin_dir: shell_words::quote(bin_dir),
+        script,
+    }
+    .render()?)
 }
 
 /// Prepared command versions, in stable order independent of cache paths.
@@ -608,7 +729,7 @@ pub enum ToolRuntimeError {
     MountInfo(#[from] procfs_core::ProcError),
     #[doc = "The tools directory is not protected by a read-only container mount."]
     #[error("managed tools require a read-only container mount: {0}")]
-    MissingReadonlyMount(PathBuf),
+    MissingReadonlyMount(ContainerPath),
     /// Required command missing from a bundle.
     #[error("required tool is missing: {0:?}")]
     MissingTool(ManagedTool),
@@ -694,6 +815,49 @@ pub mod tests {
             })
             .collect();
         ToolBundle::new(ToolTarget::native().unwrap(), binaries).unwrap()
+    }
+
+    /// Tools as a container sees them once the bundle is mounted read-only.
+    pub fn container_tools(bundle: &ToolBundle) -> PreparedTools<ContainerPath> {
+        PreparedTools {
+            bin_dir: bundle.container_bin_dir().unwrap(),
+            catalog: bundle.catalog(),
+        }
+    }
+
+    // Runs on every host: Windows must still produce POSIX container paths.
+    #[test]
+    fn container_tool_paths_are_posix_on_every_host() {
+        let bundle = bundle();
+        let key = bundle.cache_key().unwrap();
+        assert_eq!(
+            bundle.container_directory().unwrap().as_str(),
+            format!("/opt/aither/tools/{key}")
+        );
+        assert_eq!(
+            bundle.container_bin_dir().unwrap().as_str(),
+            format!("/opt/aither/tools/{key}/bin")
+        );
+        let script = container_tools(&bundle)
+            .wrap_script("rg --version")
+            .unwrap();
+        assert!(
+            script.starts_with(&format!("PATH=/opt/aither/tools/{key}/bin")),
+            "{script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_mount_targets_the_posix_tool_directory() {
+        let cache = tempfile::tempdir().unwrap();
+        let bundle = bundle();
+        let (mount, host) = bundle.prepare_container_mount(cache.path()).await.unwrap();
+        assert_eq!(
+            mount.container_path.as_str(),
+            format!("/opt/aither/tools/{}", bundle.cache_key().unwrap())
+        );
+        assert_eq!(Some(mount.host_path.as_path()), host.bin_dir().parent());
+        assert!(mount.access.read_only());
     }
 
     #[test]
@@ -793,15 +957,36 @@ pub mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn tampered_cache_fails_closed() {
-        let cache = tempfile::tempdir().unwrap();
-        let bundle = bundle();
-        let ready = bundle.prepare_local(cache.path()).await.unwrap();
-        let path = ready
-            .bin_dir()
-            .join(ManagedTool::Ripgrep.executable_name(&bundle.target));
-        let mut permissions = async_fs::metadata(&path).await.unwrap().permissions();
+    fn assert_prepared(bundle: &ToolBundle, prepared: &PreparedTools<PathBuf>) {
+        for tool in ManagedTool::ALL {
+            let path = prepared
+                .bin_dir()
+                .join(tool.executable_name(&bundle.target));
+            assert_eq!(
+                std::fs::read(&path).unwrap().as_slice(),
+                bundle.binary(tool).bytes.as_ref(),
+                "{} differs from the bundle",
+                path.display()
+            );
+        }
+        bundle
+            .verify_prepared(prepared.bin_dir().parent().unwrap())
+            .unwrap();
+    }
+
+    /// Entries left in the cache root other than the runtime and its lock file.
+    fn leftovers(root: &Path, bundle: &ToolBundle) -> Vec<OsString> {
+        let key = bundle.cache_key().unwrap();
+        let lock = format!(".{key}.lock");
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| *name != *key && *name != *lock)
+            .collect()
+    }
+
+    fn make_writable(path: &Path) {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -809,14 +994,116 @@ pub mod tests {
         }
         #[cfg(not(unix))]
         permissions.set_readonly(false);
-        async_fs::set_permissions(&path, permissions).await.unwrap();
-        async_fs::write(path, b"tampered").await.unwrap();
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn missing_executable_is_reported_with_its_path() {
+        let cache = tempfile::tempdir().unwrap();
+        let bundle = bundle();
+        let destination = cache.path().join(bundle.cache_key().unwrap());
+        std::fs::create_dir_all(destination.join("bin")).unwrap();
+        let first = destination
+            .join("bin")
+            .join(bundle.binaries[0].tool.executable_name(&bundle.target));
         assert!(matches!(
-            bundle.prepare_local(cache.path()).await,
+            bundle.verify_prepared(&destination),
+            Err(ToolRuntimeError::InvalidCache(path)) if path == first
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_skeleton_is_replaced() {
+        let cache = tempfile::tempdir().unwrap();
+        let bundle = bundle();
+        std::fs::create_dir_all(cache.path().join(bundle.cache_key().unwrap()).join("bin"))
+            .unwrap();
+        let ready = bundle.prepare_local(cache.path()).await.unwrap();
+        assert_prepared(&bundle, &ready);
+        assert_eq!(leftovers(cache.path(), &bundle), Vec::<OsString>::new());
+    }
+
+    #[tokio::test]
+    async fn tampered_executable_is_replaced() {
+        let cache = tempfile::tempdir().unwrap();
+        let bundle = bundle();
+        let ready = bundle.prepare_local(cache.path()).await.unwrap();
+        let path = ready
+            .bin_dir()
+            .join(ManagedTool::Ripgrep.executable_name(&bundle.target));
+        make_writable(&path);
+        std::fs::write(&path, b"tampered").unwrap();
+        assert!(matches!(
+            bundle.verify_prepared(ready.bin_dir().parent().unwrap()),
             Err(ToolRuntimeError::Integrity {
                 tool: ManagedTool::Ripgrep
             })
         ));
+        let repaired = bundle.prepare_local(cache.path()).await.unwrap();
+        assert_eq!(repaired.bin_dir(), ready.bin_dir());
+        assert_prepared(&bundle, &repaired);
+        assert_eq!(leftovers(cache.path(), &bundle), Vec::<OsString>::new());
+    }
+
+    #[tokio::test]
+    async fn writable_executable_is_replaced() {
+        let cache = tempfile::tempdir().unwrap();
+        let bundle = bundle();
+        let ready = bundle.prepare_local(cache.path()).await.unwrap();
+        let path = ready
+            .bin_dir()
+            .join(ManagedTool::Jq.executable_name(&bundle.target));
+        make_writable(&path);
+        assert!(matches!(
+            bundle.verify_prepared(ready.bin_dir().parent().unwrap()),
+            Err(ToolRuntimeError::InvalidCache(invalid)) if invalid == path
+        ));
+        let repaired = bundle.prepare_local(cache.path()).await.unwrap();
+        assert_prepared(&bundle, &repaired);
+    }
+
+    #[tokio::test]
+    async fn valid_runtime_is_reused_untouched() {
+        let cache = tempfile::tempdir().unwrap();
+        let bundle = bundle();
+        let ready = bundle.prepare_local(cache.path()).await.unwrap();
+        let snapshot = |prepared: &PreparedTools<PathBuf>| {
+            let mut entries = vec![prepared.bin_dir().parent().unwrap().to_path_buf()];
+            entries.push(prepared.bin_dir().clone());
+            entries.extend(ManagedTool::ALL.into_iter().map(|tool| {
+                prepared
+                    .bin_dir()
+                    .join(tool.executable_name(&bundle.target))
+            }));
+            entries
+                .into_iter()
+                .map(|path| {
+                    let metadata = std::fs::symlink_metadata(&path).unwrap();
+                    #[cfg(unix)]
+                    let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+                    #[cfg(not(unix))]
+                    let inode = 0;
+                    (path, inode, metadata.modified().unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot(&ready);
+        let reused = bundle.prepare_local(cache.path()).await.unwrap();
+        assert_eq!(before, snapshot(&reused));
+    }
+
+    #[tokio::test]
+    async fn concurrent_preparers_repair_one_damaged_runtime() {
+        let cache = tempfile::tempdir().unwrap();
+        let bundle = bundle();
+        std::fs::create_dir_all(cache.path().join(bundle.cache_key().unwrap()).join("bin"))
+            .unwrap();
+        let results =
+            futures::future::join_all((0..8).map(|_| bundle.prepare_local(cache.path()))).await;
+        for result in results {
+            assert_prepared(&bundle, &result.unwrap());
+        }
+        assert_eq!(leftovers(cache.path(), &bundle), Vec::<OsString>::new());
     }
 
     #[test]

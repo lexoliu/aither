@@ -128,23 +128,33 @@ pub fn classify_entry(info: &ModelEntry, breakpoints: Option<ChatPriceBreakpoint
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ModelRegistry;
+    use crate::registry::tests::fixture;
 
     #[test]
-    fn bundled_registry_classifies_known_models() {
-        let registry = ModelRegistry::bundled();
-        assert_eq!(registry.tier("gpt-image-1"), ModelTier::ImageGeneration);
-        // Flagship reasoning models must not classify as Fast.
-        assert_ne!(registry.tier("claude-opus-4-1"), ModelTier::Fast);
-        // Small/cheap models must not classify as Advanced.
-        assert_ne!(registry.tier("gpt-4o-mini"), ModelTier::Advanced);
+    fn fixture_registry_classifies_by_mode_and_price() {
+        let registry = fixture();
+        assert_eq!(registry.tier("fixture-image"), ModelTier::ImageGeneration);
+        assert_eq!(registry.tier("fixture-embedding"), ModelTier::Balanced);
+        // The most expensive chat model lands in the top price tertile,
+        // the cheapest in the bottom one.
+        assert_eq!(registry.tier("fixture-flagship"), ModelTier::Advanced);
+        assert_eq!(registry.tier("fixture-gpt-mini"), ModelTier::Fast);
+    }
+
+    #[test]
+    fn unpriced_chat_model_falls_back_to_context_window() {
+        let registry = fixture();
+        // 128k context sits between the Fast and Advanced context bounds.
+        assert_eq!(
+            registry.tier("github_copilot/fixture-hosted"),
+            ModelTier::Balanced
+        );
     }
 
     #[test]
     fn unknown_model_defaults_to_balanced() {
-        let registry = ModelRegistry::bundled();
         assert_eq!(
-            registry.tier("definitely-not-a-real-model-xyz"),
+            fixture().tier("definitely-not-a-real-model-xyz"),
             ModelTier::Balanced
         );
     }

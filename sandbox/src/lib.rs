@@ -85,8 +85,8 @@ pub use command::{
     register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
 };
 pub use container::{
-    ContainerImageSpec, ContainerLaunchSpec, ContainerRuntimeKind, MountAccess, MountRoot,
-    MountRootError, MountSpec, RuntimePreference,
+    ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
+    MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,
 };
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
 pub use heel::NetworkAuditLog;
