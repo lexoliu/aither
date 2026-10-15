@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/lexoliu/aither/compare/cli-v0.6.0...cli-v0.7.0) - 2026-10-13
+
+### Other
+
+- Fix clippy warnings on stable
+- Remove the in-memory todo subsystem
+
 ## [0.6.0](https://github.com/lexoliu/aither/compare/cli-v0.5.0...cli-v0.6.0) - 2026-10-10
 
 ### Added
