@@ -10,11 +10,10 @@
 //! (e.g., `amber-forest-thunder-pearl/`). All terminal executions share this
 //! directory, but each execution gets a fresh sandbox (new TTY/process).
 
-#[cfg(unix)]
-use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream};
 use std::{
     borrow::Cow,
     io::{Read, Write},
+    net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -28,10 +27,8 @@ use aither_core::llm::ToolContext;
 use aither_core::llm::{IntoToolResult, Tool, ToolResult};
 use askama::Template;
 use async_channel::{Receiver, Sender};
-#[cfg(unix)]
 use async_io::Async;
 use executor_core::{Executor, Task};
-#[cfg(unix)]
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use heel::{
     Access, AllowAll, Audited, CpuPriority, DomainRequest, Grant, IoPriority, IpcRouter,
@@ -2026,14 +2023,7 @@ where
     .await?;
     let exit_code = result.exit_code;
 
-    #[cfg(unix)]
-    {
-        debug!(exit_code, "background script completed");
-    }
-    #[cfg(not(unix))]
-    {
-        debug!(exit_code, "background script completed");
-    }
+    debug!(exit_code, "background script completed");
 
     let output_path = result.stdout.stored_path(&store_dir);
     job_registry.complete(pid, exit_code, output_path).await;
@@ -2983,7 +2973,6 @@ impl ContainerIpcBridge {
     }
 }
 
-#[cfg(unix)]
 fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
     executor: E,
     registry: Arc<ToolRegistry>,
@@ -3032,24 +3021,11 @@ fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
     })
 }
 
-#[cfg(not(unix))]
-fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
-    _executor: E,
-    _registry: Arc<ToolRegistry>,
-    _bind: BridgeAddress,
-) -> Result<ContainerIpcBridge, TerminalError> {
-    Err(TerminalError::Execution(
-        "container IPC bridge is only supported on unix hosts".to_string(),
-    ))
-}
-
-#[cfg(unix)]
 enum ContainerIpcBridgeEvent {
     Accept(std::io::Result<(Async<StdTcpStream>, std::net::SocketAddr)>),
     Shutdown,
 }
 
-#[cfg(unix)]
 async fn run_container_ipc_bridge<E: Executor + Clone + 'static>(
     listener: Async<StdTcpListener>,
     registry: Arc<ToolRegistry>,
@@ -3090,7 +3066,6 @@ async fn run_container_ipc_bridge<E: Executor + Clone + 'static>(
     Ok(())
 }
 
-#[cfg(unix)]
 async fn handle_container_ipc_connection(
     mut stream: Async<StdTcpStream>,
     registry: Arc<ToolRegistry>,
@@ -3137,7 +3112,6 @@ async fn handle_container_ipc_connection(
     }
 }
 
-#[cfg(unix)]
 fn decode_container_ipc_args(params: &[u8]) -> Result<Vec<String>, String> {
     let parsed: serde_json::Value =
         rmp_serde::from_slice(params).map_err(|e| format!("invalid IPC params: {e}"))?;
@@ -3151,7 +3125,6 @@ fn decode_container_ipc_args(params: &[u8]) -> Result<Vec<String>, String> {
     Ok(crate::command::flatten_args_to_cli(&args))
 }
 
-#[cfg(unix)]
 async fn write_container_ipc_success(
     stream: &mut Async<StdTcpStream>,
     response: &crate::command::CommandEnvelope,
@@ -3161,7 +3134,6 @@ async fn write_container_ipc_success(
     write_container_ipc_response(stream, true, &payload).await
 }
 
-#[cfg(unix)]
 async fn write_container_ipc_error(
     stream: &mut Async<StdTcpStream>,
     message: &str,
@@ -3171,7 +3143,6 @@ async fn write_container_ipc_error(
     write_container_ipc_response(stream, false, &payload).await
 }
 
-#[cfg(unix)]
 async fn write_container_ipc_response(
     stream: &mut Async<StdTcpStream>,
     success: bool,
@@ -4875,17 +4846,14 @@ mod tests {
     /// Probe tool for the container acceptance test: it answers an IPC call
     /// with the marker it was invoked with, so a request that actually reached
     /// the live handler is unmistakable.
-    #[cfg(all(unix, aither_container_acceptance))]
     #[derive(Debug, Deserialize, JsonSchema)]
     struct ProbeEchoArgs {
         /// Marker echoed back to the caller.
         marker: String,
     }
 
-    #[cfg(all(unix, aither_container_acceptance))]
     struct ProbeEchoTool;
 
-    #[cfg(all(unix, aither_container_acceptance))]
     impl Tool for ProbeEchoTool {
         fn name(&self) -> Cow<'static, str> {
             "probe_echo".into()
@@ -4903,6 +4871,76 @@ mod tests {
                 "marker": arguments.marker,
             })))
         }
+    }
+
+    /// Host side of the container IPC transport on every platform: a client
+    /// speaking the bridge's framing over loopback TCP reaches the registry's
+    /// live handler and gets its envelope back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn container_ipc_bridge_round_trips_a_command_over_tcp() {
+        let outputs = tempfile::tempdir().expect("outputs dir should be created");
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(ProbeEchoTool);
+        let registry = Arc::new(builder.build(outputs.path()));
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+        let bridge = start_container_ipc_bridge(
+            executor_core::tokio::TokioGlobal,
+            registry,
+            BridgeAddress::try_from(loopback).expect("loopback binds the bridge"),
+        )
+        .expect("bridge should start on loopback");
+
+        let mut stream = Async::<StdTcpStream>::connect(SocketAddr::new(loopback, bridge.port()))
+            .await
+            .expect("client should connect to the bridge");
+
+        let method = b"probe_echo";
+        let params = rmp_serde::to_vec(&serde_json::json!({ "marker": "pong" }))
+            .expect("params should encode");
+        let mut request = vec![u8::try_from(method.len()).expect("method name fits a byte")];
+        request.extend_from_slice(method);
+        request.extend_from_slice(&params);
+        let request_length = u32::try_from(request.len()).expect("request fits the frame");
+        stream
+            .write_all(&request_length.to_be_bytes())
+            .await
+            .expect("request length should be written");
+        stream
+            .write_all(&request)
+            .await
+            .expect("request body should be written");
+
+        let mut length_bytes = [0_u8; 4];
+        stream
+            .read_exact(&mut length_bytes)
+            .await
+            .expect("response length should be read");
+        let mut response = vec![0_u8; u32::from_be_bytes(length_bytes) as usize];
+        stream
+            .read_exact(&mut response)
+            .await
+            .expect("response body should be read");
+
+        let (success, payload) = response
+            .split_first()
+            .expect("response carries a success flag");
+        assert_eq!(*success, 1, "bridge should report success");
+        let envelope: crate::command::CommandEnvelope =
+            rmp_serde::from_slice(payload).expect("response should decode as an envelope");
+        assert_eq!(
+            envelope,
+            crate::command::CommandEnvelope {
+                ok: true,
+                payload: Some(crate::command::CommandPayload::Json {
+                    value: serde_json::json!({ "marker": "pong" }),
+                }),
+                error: None,
+            },
+            "probe_echo should answer from the live handler"
+        );
+
+        drop(stream);
+        bridge.stop().await;
     }
 
     /// Scratch `ubuntu:24.04` container used by the acceptance test; removed
