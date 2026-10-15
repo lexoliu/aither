@@ -41,7 +41,7 @@ use shell_words::split as split_shell_words;
 use tracing::{debug, info, warn};
 
 use crate::{
-    PreparedTools, ToolDistribution, ToolRuntimeError,
+    ContainerPath, PreparedTools, ToolDistribution, ToolRuntimeError,
     builtin::builtin_router,
     command::ToolRegistry,
     job_registry::{JobRegistry, job_registry_channel},
@@ -1069,12 +1069,9 @@ where
     }
 
     /// Prepared tools of the local home backend, when this terminal runs on it.
-    fn local_home_tools(&self) -> Result<Option<&PreparedTools>, ToolRuntimeError> {
+    fn local_home_tools(&self) -> Result<Option<&PreparedTools<PathBuf>>, ToolRuntimeError> {
         match self.shell_sessions.resolve_local_backend() {
-            Ok(ShellBackend::Local) => self
-                .shell_sessions
-                .home_tools(ShellBackend::Local)
-                .map(Some),
+            Ok(ShellBackend::Local) => self.shell_sessions.local_tools().map(Some),
             _ => Ok(None),
         }
     }
@@ -1282,24 +1279,21 @@ where
                 "unsafe mode is only available in heel local runtime".into(),
             ));
         }
-        let container_runtime = if backend == ShellBackend::Container {
-            Some(
-                self.shell_sessions
+        let backend = match backend {
+            ShellBackend::Local => {
+                ExecutionBackend::Local(self.shell_sessions.local_tools()?.clone())
+            }
+            ShellBackend::Container => ExecutionBackend::Container {
+                runtime: self
+                    .shell_sessions
                     .container_runtime()
                     .cloned()
                     .ok_or(ToolRuntimeError::MissingContainerRuntime)?,
-            )
-        } else {
-            None
+                tools: self.shell_sessions.container_tools()?.clone(),
+            },
+            ShellBackend::Ssh => unreachable!("the home backend is never SSH"),
         };
-        Ok(ExecutionTarget {
-            backend,
-            mode,
-            ssh_target: None,
-            ssh_runtime: None,
-            container_runtime,
-            prepared_tools: self.shell_sessions.home_tools(backend)?.clone(),
-        })
+        Ok(ExecutionTarget { mode, backend })
     }
 
     fn resolve_ssh_target(
@@ -1317,12 +1311,12 @@ where
             .map_err(TerminalError::InvalidTarget)?;
         let (runtime, tools) = self.shell_sessions.ssh_tools(&server)?;
         Ok(ExecutionTarget {
-            backend: ShellBackend::Ssh,
             mode: TerminalMode::Sandboxed,
-            ssh_target: Some(server.target),
-            ssh_runtime: Some(runtime.clone()),
-            container_runtime: None,
-            prepared_tools: tools.clone(),
+            backend: ExecutionBackend::Ssh {
+                target: server.target,
+                runtime: runtime.clone(),
+                tools: tools.clone(),
+            },
         })
     }
 
@@ -1376,19 +1370,12 @@ where
             raw,
             timeout,
         } = request;
-        let ExecutionTarget {
-            backend,
-            mode,
-            ssh_target,
-            ssh_runtime,
-            container_runtime,
-            prepared_tools,
-        } = target;
+        let ExecutionTarget { mode, backend } = target;
         let (result_tx, result_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
         let (stdin_blocked_tx, stdin_blocked_rx) = async_channel::bounded(1);
         let background_mode = Arc::new(AtomicBool::new(timeout == 0));
-        let stdin_blocked_notice = if supports_stdin_blocked_notice(backend) {
+        let stdin_blocked_notice = if supports_stdin_blocked_notice(backend.kind()) {
             Some(stdin_blocked_tx)
         } else {
             None
@@ -1416,10 +1403,6 @@ where
                 script,
                 mode,
                 backend,
-                ssh_target,
-                ssh_runtime,
-                container_runtime,
-                prepared_tools,
                 stdin_blocked_notice,
                 background_startup,
                 expect,
@@ -1472,32 +1455,18 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         let raw = arguments.raw;
         let timeout = arguments.timeout;
 
-        let ExecutionTarget {
-            backend,
-            mode,
-            ssh_target,
-            ssh_runtime,
-            container_runtime,
-            prepared_tools,
-        } = self.resolve_execution_target(&arguments)?;
-        if backend == ShellBackend::Local {
-            prepared_tools
+        let target = self.resolve_execution_target(&arguments)?;
+        if let ExecutionBackend::Local(tools) = &target.backend {
+            tools
                 .ensure_readonly(
                     std::iter::once(&self.working_dir).chain(self.writable_paths.iter()),
                 )
                 .await?;
         }
-        self.ensure_permission_allowed(mode, &script).await?;
+        self.ensure_permission_allowed(target.mode, &script).await?;
         let store_dir = self.output_store.dir().to_path_buf();
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
-            target: ExecutionTarget {
-                backend,
-                mode,
-                ssh_target,
-                ssh_runtime,
-                container_runtime,
-                prepared_tools,
-            },
+            target,
             task_id: task_id.clone(),
             execution_id,
             script,
@@ -1694,11 +1663,7 @@ struct StandaloneExecution<P, E> {
     background_mode: Arc<AtomicBool>,
     script: String,
     mode: TerminalMode,
-    backend: ShellBackend,
-    ssh_target: Option<String>,
-    ssh_runtime: Option<SshRuntimeProfile>,
-    container_runtime: Option<ContainerShellRuntime>,
-    prepared_tools: PreparedTools,
+    backend: ExecutionBackend,
     stdin_blocked_notice: Option<Sender<String>>,
     background_startup: BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
@@ -1722,11 +1687,7 @@ struct StandaloneStart<'a, P, E> {
     execution_id: &'a str,
     script: &'a str,
     mode: TerminalMode,
-    backend: ShellBackend,
-    ssh_target: Option<&'a str>,
-    ssh_runtime: Option<SshRuntimeProfile>,
-    container_runtime: Option<&'a ContainerShellRuntime>,
-    prepared_tools: &'a PreparedTools,
+    backend: &'a ExecutionBackend,
     stdin_blocked_notice: Option<Sender<String>>,
     background_startup: &'a BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
@@ -1734,7 +1695,7 @@ struct StandaloneStart<'a, P, E> {
 }
 
 struct LocalBackgroundExecution<'a, E> {
-    prepared_tools: &'a PreparedTools,
+    prepared_tools: &'a PreparedTools<PathBuf>,
     working_dir: &'a Path,
     writable_paths: &'a [PathBuf],
     readable_paths: &'a [PathBuf],
@@ -1757,8 +1718,8 @@ struct ContainerBackgroundExecution<'a, E> {
     execution_id: &'a str,
     script: &'a str,
     mode: TerminalMode,
-    container_runtime: Option<&'a ContainerShellRuntime>,
-    prepared_tools: &'a PreparedTools,
+    container_runtime: &'a ContainerShellRuntime,
+    prepared_tools: &'a PreparedTools<ContainerPath>,
     ipc_commands: &'a [String],
     job_registry: &'a JobRegistry,
     stdin_blocked_notice: Option<Sender<String>>,
@@ -1767,13 +1728,13 @@ struct ContainerBackgroundExecution<'a, E> {
 }
 
 struct SshBackgroundExecution<'a> {
-    prepared_tools: &'a PreparedTools,
+    prepared_tools: &'a PreparedTools<PathBuf>,
     task_id: &'a str,
     execution_id: &'a str,
     script: &'a str,
     mode: TerminalMode,
-    ssh_target: Option<&'a str>,
-    ssh_runtime: Option<SshRuntimeProfile>,
+    ssh_target: &'a str,
+    ssh_runtime: &'a SshRuntimeProfile,
     job_registry: &'a JobRegistry,
     background_startup: &'a BackgroundStartup,
 }
@@ -1790,13 +1751,36 @@ struct CompletedProcessOutput<'a> {
     raw: bool,
 }
 
+/// Where a command runs, with the tools prepared for exactly that environment.
+enum ExecutionBackend {
+    /// The local sandbox, whose tools live at a host path.
+    Local(PreparedTools<PathBuf>),
+    /// A container, whose tools are mounted at a container path.
+    Container {
+        runtime: ContainerShellRuntime,
+        tools: PreparedTools<ContainerPath>,
+    },
+    /// A remote host over SSH.
+    Ssh {
+        target: String,
+        runtime: SshRuntimeProfile,
+        tools: PreparedTools<PathBuf>,
+    },
+}
+
+impl ExecutionBackend {
+    const fn kind(&self) -> ShellBackend {
+        match self {
+            Self::Local(_) => ShellBackend::Local,
+            Self::Container { .. } => ShellBackend::Container,
+            Self::Ssh { .. } => ShellBackend::Ssh,
+        }
+    }
+}
+
 struct ExecutionTarget {
-    backend: ShellBackend,
     mode: TerminalMode,
-    ssh_target: Option<String>,
-    ssh_runtime: Option<SshRuntimeProfile>,
-    container_runtime: Option<ContainerShellRuntime>,
-    prepared_tools: PreparedTools,
+    backend: ExecutionBackend,
 }
 
 struct TerminalSpawnRequest {
@@ -1831,11 +1815,7 @@ struct SpawnedTerminalTask<P, E> {
     background_mode: Arc<AtomicBool>,
     script: String,
     mode: TerminalMode,
-    backend: ShellBackend,
-    ssh_target: Option<String>,
-    ssh_runtime: Option<SshRuntimeProfile>,
-    container_runtime: Option<ContainerShellRuntime>,
-    prepared_tools: PreparedTools,
+    backend: ExecutionBackend,
     stdin_blocked_notice: Option<Sender<String>>,
     background_startup: BackgroundStartup,
     expect: OutputFormat,
@@ -1870,10 +1850,6 @@ where
         script,
         mode,
         backend,
-        ssh_target,
-        ssh_runtime,
-        container_runtime,
-        prepared_tools,
         stdin_blocked_notice,
         background_startup,
         expect,
@@ -1902,10 +1878,6 @@ where
         script: script.clone(),
         mode,
         backend,
-        ssh_target,
-        ssh_runtime,
-        container_runtime,
-        prepared_tools,
         stdin_blocked_notice,
         background_startup,
         network_audit,
@@ -1957,10 +1929,6 @@ where
         script,
         mode,
         backend,
-        ssh_target,
-        ssh_runtime,
-        container_runtime,
-        prepared_tools,
         stdin_blocked_notice,
         background_startup,
         network_audit,
@@ -1990,11 +1958,7 @@ where
         execution_id: &execution_id,
         script: &script,
         mode,
-        backend,
-        ssh_target: ssh_target.as_deref(),
-        ssh_runtime,
-        container_runtime: container_runtime.as_ref(),
-        prepared_tools: &prepared_tools,
+        backend: &backend,
         stdin_blocked_notice,
         background_startup: &background_startup,
         network_audit,
@@ -2038,41 +2002,48 @@ where
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
-    if matches!(request.backend, ShellBackend::Container) {
-        let ipc_commands = request.registry.registered_tool_names();
-        return execute_container_background(ContainerBackgroundExecution {
-            executor: request.executor,
-            registry: request.registry,
-            task_id: request.task_id,
-            execution_id: request.execution_id,
-            script: request.script,
-            mode: request.mode,
-            container_runtime: request.container_runtime,
-            prepared_tools: request.prepared_tools,
-            ipc_commands: &ipc_commands,
-            job_registry: request.job_registry,
-            stdin_blocked_notice: request.stdin_blocked_notice,
-            background_startup: request.background_startup,
-            priority: request.priority,
-        })
-        .await;
-    }
-    if matches!(request.backend, ShellBackend::Ssh) {
-        return execute_ssh_background(SshBackgroundExecution {
-            prepared_tools: request.prepared_tools,
-            task_id: request.task_id,
-            execution_id: request.execution_id,
-            script: request.script,
-            mode: request.mode,
-            ssh_target: request.ssh_target,
-            ssh_runtime: request.ssh_runtime,
-            job_registry: request.job_registry,
-            background_startup: request.background_startup,
-        })
-        .await;
-    }
+    let prepared_tools = match request.backend {
+        ExecutionBackend::Local(tools) => tools,
+        ExecutionBackend::Container { runtime, tools } => {
+            let ipc_commands = request.registry.registered_tool_names();
+            return execute_container_background(ContainerBackgroundExecution {
+                executor: request.executor,
+                registry: request.registry,
+                task_id: request.task_id,
+                execution_id: request.execution_id,
+                script: request.script,
+                mode: request.mode,
+                container_runtime: runtime,
+                prepared_tools: tools,
+                ipc_commands: &ipc_commands,
+                job_registry: request.job_registry,
+                stdin_blocked_notice: request.stdin_blocked_notice,
+                background_startup: request.background_startup,
+                priority: request.priority,
+            })
+            .await;
+        }
+        ExecutionBackend::Ssh {
+            target,
+            runtime,
+            tools,
+        } => {
+            return execute_ssh_background(SshBackgroundExecution {
+                prepared_tools: tools,
+                task_id: request.task_id,
+                execution_id: request.execution_id,
+                script: request.script,
+                mode: request.mode,
+                ssh_target: target,
+                ssh_runtime: runtime,
+                job_registry: request.job_registry,
+                background_startup: request.background_startup,
+            })
+            .await;
+        }
+    };
     let local = LocalBackgroundExecution {
-        prepared_tools: request.prepared_tools,
+        prepared_tools,
         working_dir: request.working_dir,
         writable_paths: request.writable_paths,
         readable_paths: request.readable_paths,
@@ -2256,7 +2227,7 @@ async fn save_completed_stderr(
 fn local_path_grants<'a>(
     writable: &'a [PathBuf],
     readable: &'a [PathBuf],
-    tools: &'a PreparedTools,
+    tools: &'a PreparedTools<PathBuf>,
 ) -> impl Iterator<Item = Grant> + 'a {
     writable
         .iter()
@@ -2505,9 +2476,7 @@ async fn wait_for_local_process_exit(
 async fn execute_container_background<E: Executor + Clone + 'static>(
     context: ContainerBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let container_runtime = context.container_runtime.ok_or_else(|| {
-        TerminalError::Execution("missing container runtime for container backend".into())
-    })?;
+    let container_runtime = context.container_runtime;
     let exec = container_runtime.exec();
 
     // Use lower 32 bits of a UUID as a synthetic PID for job tracking.
@@ -2616,22 +2585,14 @@ struct SshToolExecutionTemplate<'a> {
 async fn execute_ssh_background(
     context: SshBackgroundExecution<'_>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let target = context
-        .ssh_target
-        .ok_or_else(|| TerminalError::Execution("missing ssh target".to_string()))?;
-    let runtime = context
-        .ssh_runtime
-        .ok_or_else(|| TerminalError::Execution("missing ssh runtime profile".to_string()))?;
-
-    let remote_cmd = match (runtime, context.mode) {
+    let target = context.ssh_target;
+    let remote_cmd = match (context.ssh_runtime, context.mode) {
         (SshRuntimeProfile::Heel { binary }, TerminalMode::Sandboxed) => {
             let script = context.prepared_tools.wrap_script(context.script)?;
             let (program, args) = shell_launch(&script);
-            let directory = context.prepared_tools.bin_dir().to_str().ok_or_else(|| {
-                ToolRuntimeError::InvalidCache(context.prepared_tools.bin_dir().clone())
-            })?;
+            let directory = context.prepared_tools.script_bin_dir()?;
             SshToolExecutionTemplate {
-                binary: shell_words::quote(&binary),
+                binary: shell_words::quote(binary),
                 tools_dir: shell_words::quote(directory),
                 program: shell_words::quote(&program),
                 arguments: shell_words::join(&args),
@@ -2716,7 +2677,7 @@ fn shell_escape(value: &str) -> String {
 
 async fn prepare_session_runtime_environment(
     working_dir: &Path,
-    tools: &PreparedTools,
+    tools: &PreparedTools<PathBuf>,
 ) -> Result<Vec<(String, String)>, TerminalError> {
     let session_tmp = working_dir.join("tmp");
     let session_cache = working_dir.join(".cache");
@@ -3609,7 +3570,10 @@ mod tests {
             ssh: false,
         })
         .with_container_runtime(test_container_runtime("aither-tools-a"))
-        .with_test_container_tools(tools, "aither-tools-a".to_string());
+        .with_test_container_tools(
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle()),
+            "aither-tools-a".to_string(),
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let adopt = |sessions: ShellSessionRegistry| {
@@ -4247,15 +4211,7 @@ mod tests {
             background_mode: Arc::new(AtomicBool::new(false)),
             script: "/bin/pwd".to_string(),
             mode: TerminalMode::Sandboxed,
-            backend: ShellBackend::Local,
-            ssh_target: None,
-            ssh_runtime: None,
-            container_runtime: None,
-            prepared_tools: tool
-                .shell_sessions
-                .home_tools(ShellBackend::Local)
-                .unwrap()
-                .clone(),
+            backend: ExecutionBackend::Local(tool.shell_sessions.local_tools().unwrap().clone()),
             stdin_blocked_notice: None,
             background_startup: BackgroundStartup::new(startup_tx),
             network_audit: None,
@@ -5092,21 +5048,9 @@ mod tests {
         // The container backend needs its own prepared tools: the registry
         // entry names the container and its `/opt/aither/tools` bin dir, which
         // the wrapped script puts on `PATH`. Nothing in this test invokes a
-        // prepared command, so preparing the catalog on the host and pointing
-        // the bin dir at the container path is enough.
-        let tools_cache = tempfile::tempdir().expect("tools cache should be created");
-        let bundle = crate::tool_runtime::tests::bundle();
-        let prepared = bundle
-            .prepare_local(tools_cache.path())
-            .await
-            .expect("test tools should prepare");
-        let container_tools = crate::tool_runtime::PreparedTools {
-            bin_dir: bundle
-                .container_directory()
-                .expect("the bundle has a container directory")
-                .join("bin"),
-            catalog: prepared.catalog().clone(),
-        };
+        // prepared command, so the bundle's container view is enough.
+        let container_tools =
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle());
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,
