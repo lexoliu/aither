@@ -698,6 +698,31 @@ pub struct Configured {
     registry: Arc<ToolRegistry>,
 }
 
+/// Registry state that can be rebound to a different job registry.
+///
+/// Sealed: declared `pub` only so it may bound the public `TerminalTool`
+/// impl; it lives in this private module and is not re-exported.
+pub trait RegistryState: Clone {
+    /// Returns this state with its terminal controls bound to `jobs`.
+    fn for_jobs(&self, jobs: JobRegistry, output_dir: PathBuf) -> Self;
+}
+
+impl RegistryState for Unconfigured {
+    fn for_jobs(&self, _jobs: JobRegistry, _output_dir: PathBuf) -> Self {
+        Self
+    }
+}
+
+impl RegistryState for Configured {
+    fn for_jobs(&self, jobs: JobRegistry, output_dir: PathBuf) -> Self {
+        Self {
+            registry: Arc::new(
+                ToolRegistry::clone(&self.registry).with_terminal_controls(jobs, output_dir),
+            ),
+        }
+    }
+}
+
 /// The terminal tool for executing scripts in a sandbox.
 pub struct TerminalTool<P, E, State = Unconfigured> {
     /// Shared working directory (four random words, e.g., `amber-forest-thunder-pearl/`)
@@ -756,9 +781,20 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
 }
 
 impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
-    /// Injects the shared runtime registry used by `terminal` execution mode resolution.
+    /// Injects the runtime configuration used by `terminal` execution mode resolution.
+    ///
+    /// The registry is configuration to prepare with [`Self::initialize_tools`];
+    /// a registry that is already prepared is installed with
+    /// [`Self::adopt_prepared_tools`], which checks it against this terminal.
+    ///
+    /// # Panics
+    /// Panics if `sessions` is already prepared.
     #[must_use]
     pub fn with_shell_sessions(mut self, sessions: ShellSessionRegistry) -> Self {
+        assert!(
+            sessions.prepared_tools.is_none(),
+            "a prepared shell session registry is installed with adopt_prepared_tools"
+        );
         self.shell_sessions = sessions;
         self
     }
@@ -983,42 +1019,6 @@ where
         self
     }
 
-    /// Creates a child `TerminalTool` that shares the same sandbox and permission handler
-    /// but has independent background task tracking.
-    ///
-    /// Use this to create terminal tools for subagents that:
-    /// - Share the same working directory and output store
-    /// - Share the same permission handler (security policies enforced consistently)
-    /// - Have independent completion channels (no message mixup)
-    #[must_use]
-    pub fn child(&self) -> Self {
-        let (completed_tx, completed_rx) = async_channel::unbounded();
-        let running_tasks = Arc::new(AtomicUsize::new(0));
-        let (permission_tx, permission_rx) = async_channel::unbounded();
-        let (job_registry, job_registry_service) = job_registry_channel();
-        self.executor
-            .spawn(async move { job_registry_service.serve().await })
-            .detach();
-        Self {
-            working_dir: self.working_dir.clone(),
-            shell_sessions: self.shell_sessions.clone(),
-            permission_handler: self.permission_handler.clone(), // Arc clone - shares handler
-            executor: self.executor.clone(),
-            output_store: self.output_store.clone(),
-            job_registry,
-            completed_rx,
-            completed_tx,
-            running_tasks,
-            permission_rx,
-            permission_tx,
-            writable_paths: self.writable_paths.clone(),
-            readable_paths: self.readable_paths.clone(),
-            network_audit: self.network_audit.clone(),
-            priority: self.priority,
-            registry: self.registry.clone(),
-        }
-    }
-
     /// Initializes tools before agent construction or command execution.
     ///
     /// # Errors
@@ -1036,21 +1036,56 @@ where
             .shell_sessions
             .initialize_tools(distribution, cache_root)
             .await?;
-        if let Ok(backend) = self.shell_sessions.resolve_local_backend()
-            && backend == ShellBackend::Local
-        {
-            self.shell_sessions
-                .home_tools(backend)?
-                .ensure_readonly(
-                    std::iter::once(&self.working_dir).chain(self.writable_paths.iter()),
-                )
-                .await?;
-            self.shell_sessions
-                .home_tools(backend)?
-                .verify_local_versions(self.executor.clone())
-                .await?;
+        if let Some(tools) = self.local_home_tools()? {
+            tools.ensure_readonly(self.writable_grants()).await?;
+            tools.verify_local_versions(self.executor.clone()).await?;
         }
         Ok(self)
+    }
+
+    /// Adopts a registry that [`Self::initialize_tools`] already prepared for
+    /// another terminal.
+    ///
+    /// Only the checks that depend on this terminal run again: its working
+    /// directory and writable paths must not expose the managed tool
+    /// directory. Artifact downloads, integrity hashing, version probes and SSH
+    /// bootstrap — with its connection consent — are not repeated.
+    ///
+    /// # Errors
+    /// Rejects a registry that is not prepared, one whose home backend,
+    /// container or SSH server set changed after preparation, and writable
+    /// grants that expose the managed tools.
+    pub async fn adopt_prepared_tools(
+        mut self,
+        sessions: ShellSessionRegistry,
+    ) -> Result<Self, ToolRuntimeError>
+    where
+        P: PermissionHandler,
+        State: Send,
+    {
+        sessions.prepared_catalog()?;
+        self.shell_sessions = sessions;
+        if let Some(tools) = self.local_home_tools()? {
+            tools.ensure_readonly(self.writable_grants()).await?;
+        }
+        Ok(self)
+    }
+
+    /// Prepared tools of the local home backend, when this terminal runs on it.
+    fn local_home_tools(&self) -> Result<Option<&PreparedTools>, ToolRuntimeError> {
+        match self.shell_sessions.resolve_local_backend() {
+            Ok(ShellBackend::Local) => self
+                .shell_sessions
+                .home_tools(ShellBackend::Local)
+                .map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// The paths this terminal grants write access to, which must not expose
+    /// the managed tools.
+    fn writable_grants(&self) -> impl Iterator<Item = &PathBuf> + Send {
+        std::iter::once(&self.working_dir).chain(self.writable_paths.iter())
     }
 
     /// Initialized session configuration shared with child terminals.
@@ -1121,6 +1156,50 @@ where
     /// Checks if there are any pending background tasks.
     pub fn has_pending_tasks(&self) -> bool {
         !self.completed_rx.is_empty() || self.running_tasks.load(Ordering::Acquire) > 0
+    }
+}
+
+impl<P, E, State> TerminalTool<P, E, State>
+where
+    E: Executor + Clone + 'static,
+    State: RegistryState,
+{
+    /// Creates a child `TerminalTool` that shares the same sandbox and permission handler
+    /// but has independent background task tracking.
+    ///
+    /// Use this to create terminal tools for subagents that:
+    /// - Share the same working directory and output store
+    /// - Share the same permission handler (security policies enforced consistently)
+    /// - Have independent completion channels (no message mixup)
+    #[must_use]
+    pub fn child(&self) -> Self {
+        let (completed_tx, completed_rx) = async_channel::unbounded();
+        let running_tasks = Arc::new(AtomicUsize::new(0));
+        let (permission_tx, permission_rx) = async_channel::unbounded();
+        let (job_registry, job_registry_service) = job_registry_channel();
+        self.executor
+            .spawn(async move { job_registry_service.serve().await })
+            .detach();
+        Self {
+            working_dir: self.working_dir.clone(),
+            shell_sessions: self.shell_sessions.clone(),
+            permission_handler: self.permission_handler.clone(), // Arc clone - shares handler
+            executor: self.executor.clone(),
+            output_store: self.output_store.clone(),
+            completed_rx,
+            completed_tx,
+            running_tasks,
+            permission_rx,
+            permission_tx,
+            writable_paths: self.writable_paths.clone(),
+            readable_paths: self.readable_paths.clone(),
+            network_audit: self.network_audit.clone(),
+            priority: self.priority,
+            registry: self
+                .registry
+                .for_jobs(job_registry.clone(), self.outputs_dir()),
+            job_registry,
+        }
     }
 }
 
@@ -3336,6 +3415,291 @@ mod tests {
         (cache, registry)
     }
 
+    /// Counts the consent prompts an SSH authorizer receives and denies each.
+    #[derive(Default)]
+    struct CountingSshAuthorizer {
+        connects: AtomicUsize,
+        installs: AtomicUsize,
+    }
+
+    impl crate::SshSessionAuthorizer for CountingSshAuthorizer {
+        fn authorize_connect(
+            &self,
+            _target: &str,
+        ) -> impl std::future::Future<Output = Result<bool, crate::SshAuthorizationError>> + Send
+        {
+            self.connects.fetch_add(1, AtomicOrdering::SeqCst);
+            std::future::ready(Ok(false))
+        }
+
+        fn authorize_runtime_install(
+            &self,
+            _target: &str,
+            _details: &str,
+        ) -> impl std::future::Future<Output = Result<bool, crate::SshAuthorizationError>> + Send
+        {
+            self.installs.fetch_add(1, AtomicOrdering::SeqCst);
+            std::future::ready(Ok(false))
+        }
+    }
+
+    /// A container executor for registries whose container is never reached.
+    struct UnreachableContainerExec;
+
+    impl crate::ContainerExec for UnreachableContainerExec {
+        fn exec(
+            &self,
+            _container_id: &str,
+            _script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _stdin_blocked_notice: Option<Sender<String>>,
+        ) -> impl std::future::Future<Output = Result<crate::ContainerExecOutcome, String>> + Send
+        {
+            std::future::ready(Err("adoption never executes in the container".to_string()))
+        }
+    }
+
+    fn test_container_runtime(container_id: &str) -> ContainerShellRuntime {
+        ContainerShellRuntime::new(
+            container_id,
+            crate::ContainerIpcRoute::new(
+                "host.docker.internal",
+                crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
+                    .expect("loopback binds the bridge"),
+            ),
+            crate::AnyContainerExec::new(Arc::new(UnreachableContainerExec)),
+        )
+    }
+
+    fn build_server() -> crate::SshServer {
+        crate::SshServer {
+            name: "build".to_string(),
+            target: "builder@build.internal".to_string(),
+        }
+    }
+
+    /// Local and SSH configuration gated by `authorizer`, not yet prepared.
+    fn local_and_ssh_registry(authorizer: &Arc<CountingSshAuthorizer>) -> ShellSessionRegistry {
+        ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: true,
+            container: false,
+            ssh: true,
+        })
+        .with_ssh_servers(vec![build_server()])
+        .expect("ssh server should configure")
+        .with_ssh_authorizer(Arc::clone(authorizer))
+    }
+
+    async fn fresh_terminal(
+        dir: &Path,
+    ) -> TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> {
+        TerminalTool::new_exact(
+            dir,
+            TestPermissionHandler::default(),
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("terminal tool should initialize")
+    }
+
+    /// A trusted manifest serving `script` for every managed tool at version 1.0.0.
+    #[cfg(unix)]
+    async fn script_distribution(directory: &Path, script: &[u8]) -> ToolDistribution {
+        let path = directory.join("baseline-tool");
+        async_fs::write(&path, script).await.unwrap();
+        let artifacts = crate::ManagedTool::ALL
+            .into_iter()
+            .map(|tool| crate::ToolArtifact {
+                tool,
+                version: "1.0.0".into(),
+                target: crate::ToolTarget::native().unwrap(),
+                url: crate::ToolArtifactLocation::Download(
+                    url::Url::from_file_path(&path).unwrap(),
+                ),
+                sha256: hex::encode(crate::tool_runtime::digest(script)),
+                encoding: crate::ToolArtifactFormat::Executable,
+            })
+            .collect::<Vec<_>>();
+        ToolDistribution::from_json(
+            &serde_json::to_vec(&serde_json::json!({ "artifacts": artifacts })).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adopted_registry_runs_baseline_tools_without_ssh_consent_or_version_probes() {
+        let authorizer = Arc::new(CountingSshAuthorizer::default());
+
+        // Full preparation asks the authorizer before connecting to every
+        // server; the denial ends it.
+        let artifacts = tempfile::tempdir().unwrap();
+        let distribution = script_distribution(
+            artifacts.path(),
+            b"#!/bin/sh\nprintf '%s\\n' 'tool 1.0.0'\n",
+        )
+        .await;
+        let first = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let denied = fresh_terminal(first.path())
+            .await
+            .with_shell_sessions(local_and_ssh_registry(&authorizer))
+            .initialize_tools(&distribution, cache.path())
+            .await;
+        assert!(
+            matches!(denied, Err(ToolRuntimeError::SshBootstrap(_))),
+            "a denied connection must fail preparation"
+        );
+        assert_eq!(authorizer.connects.load(AtomicOrdering::SeqCst), 1);
+
+        // Tools pinned to a version their commands do not report: the version
+        // probe of full preparation rejects them.
+        let tools_cache = tempfile::tempdir().unwrap();
+        let tools = crate::tool_runtime::tests::bundle_pinned("2.0.0")
+            .prepare_local(tools_cache.path())
+            .await
+            .unwrap();
+        assert!(matches!(
+            tools
+                .verify_local_versions(executor_core::tokio::TokioGlobal)
+                .await,
+            Err(ToolRuntimeError::VersionMismatch(_))
+        ));
+        let prepared = local_and_ssh_registry(&authorizer)
+            .with_test_tools(tools.clone())
+            .with_test_ssh(build_server(), tools);
+
+        let second = tempfile::tempdir().unwrap();
+        let terminal = fresh_terminal(second.path())
+            .await
+            .adopt_prepared_tools(prepared)
+            .await
+            .expect("a prepared registry should be adopted without probing or consent");
+        assert_eq!(authorizer.connects.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(authorizer.installs.load(AtomicOrdering::SeqCst), 0);
+
+        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+        let terminal = terminal.with_registry(registry);
+        let result = terminal
+            .call(
+                TerminalArgs {
+                    description: "run every baseline command".to_string(),
+                    script: "apply_patch --version && rg --version && ast-grep --version && jq --version"
+                        .to_string(),
+                    mode: TerminalExecutionMode::Sandboxed,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    timeout: 30,
+                    max_lines: 50,
+                    raw: true,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("baseline commands should run");
+        let payload = parse_terminal_tool_result(&result);
+        assert_eq!(payload.exit_code, 0, "{payload:?}");
+        let stdout = output_text(&payload.stdout).unwrap_or_default();
+        for command in ["apply_patch", "rg", "ast-grep", "jq"] {
+            assert!(
+                stdout.contains(&format!("{command} 1.0.0")),
+                "{command} should run from the adopted tools; stdout: {stdout}"
+            );
+        }
+        assert_eq!(authorizer.connects.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(authorizer.installs.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn adoption_rejects_a_registry_changed_after_preparation() {
+        let authorizer = Arc::new(CountingSshAuthorizer::default());
+        let tools_cache = tempfile::tempdir().unwrap();
+        let tools = crate::tool_runtime::tests::bundle()
+            .prepare_local(tools_cache.path())
+            .await
+            .unwrap();
+        let prepared = local_and_ssh_registry(&authorizer)
+            .with_test_tools(tools.clone())
+            .with_test_ssh(build_server(), tools.clone());
+        let staging = crate::SshServer {
+            name: "staging".to_string(),
+            target: "deploy@staging.internal".to_string(),
+        };
+        let retargeted = crate::SshServer {
+            target: "builder@build-2.internal".to_string(),
+            ..build_server()
+        };
+        let container = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: false,
+            container: true,
+            ssh: false,
+        })
+        .with_container_runtime(test_container_runtime("aither-tools-a"))
+        .with_test_container_tools(tools, "aither-tools-a".to_string());
+
+        let dir = tempfile::tempdir().unwrap();
+        let adopt = |sessions: ShellSessionRegistry| {
+            let dir = dir.path().to_path_buf();
+            async move {
+                fresh_terminal(&dir)
+                    .await
+                    .adopt_prepared_tools(sessions)
+                    .await
+            }
+        };
+
+        assert!(adopt(prepared.clone()).await.is_ok());
+        assert!(adopt(container.clone()).await.is_ok());
+        assert!(matches!(
+            adopt(local_and_ssh_registry(&authorizer)).await,
+            Err(ToolRuntimeError::NotInitialized(_))
+        ));
+        for servers in [vec![build_server(), staging], Vec::new(), vec![retargeted]] {
+            assert!(matches!(
+                adopt(prepared.clone().with_ssh_servers(servers).unwrap()).await,
+                Err(ToolRuntimeError::EnvironmentChanged(
+                    crate::PreparedEnvironment::SshServers
+                ))
+            ));
+        }
+        assert!(matches!(
+            adopt(container.with_container_runtime(test_container_runtime("aither-tools-b"))).await,
+            Err(ToolRuntimeError::EnvironmentChanged(
+                crate::PreparedEnvironment::Container
+            ))
+        ));
+        assert!(matches!(
+            adopt(prepared.with_availability(ShellRuntimeAvailability {
+                local: true,
+                container: true,
+                ssh: true,
+            }))
+            .await,
+            Err(ToolRuntimeError::EnvironmentChanged(
+                crate::PreparedEnvironment::HomeBackend
+            ))
+        ));
+        assert_eq!(authorizer.connects.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn adoption_rechecks_this_terminals_writable_paths() {
+        let (cache, prepared) = prepared_test_registry().await;
+        let dir = tempfile::tempdir().unwrap();
+        let exposed = fresh_terminal(dir.path())
+            .await
+            .with_writable_paths([cache.path()])
+            .adopt_prepared_tools(prepared)
+            .await;
+        assert!(matches!(
+            exposed,
+            Err(ToolRuntimeError::WritableToolDirectory(_))
+        ));
+    }
+
     fn parse_terminal_tool_result(result: &ToolResult) -> TerminalResult {
         serde_json::from_str(
             &result
@@ -3687,7 +4051,9 @@ mod tests {
             )
             .await
             .expect("terminal tool should initialize")
-            .with_shell_sessions(shell_sessions);
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
         tool.job_registry()
             .register(
                 424_242,
@@ -3738,6 +4104,117 @@ mod tests {
         assert_eq!(names, vec!["terminal"]);
     }
 
+    async fn query_control(
+        registry: &ToolRegistry,
+        name: &str,
+        args: &[&str],
+    ) -> serde_json::Value {
+        let args = args.iter().map(ToString::to_string).collect::<Vec<_>>();
+        serde_json::to_value(registry.query_tool_handler(name, &args).await)
+            .expect("command envelope should serialize")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_child_terminal_controls_address_child_jobs() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
+            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                local: true,
+                container: false,
+                ssh: false,
+            });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let parent = tool.with_registry(registry);
+        let child = parent.child();
+
+        let result = child
+            .call(
+                TerminalArgs {
+                    description: "echo one stdin line then sleep".to_string(),
+                    script: "read line; printf 'got %s\\n' \"$line\"; sleep 30".to_string(),
+                    mode: TerminalExecutionMode::Sandboxed,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    timeout: 0,
+                    max_lines: 50,
+                    raw: false,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal call should succeed");
+        let payload = parse_terminal_tool_result(&result);
+        assert_eq!(payload.status.as_deref(), Some("running"));
+        let task_id = payload
+            .task_id
+            .expect("timeout=0 should return a background task id");
+
+        let input = query_control(
+            child.registry(),
+            "terminal_input",
+            &["--task-id", &task_id, "--input", "ping"],
+        )
+        .await;
+        assert_eq!(input["ok"], true, "child terminal_input failed: {input}");
+
+        let echoed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let read =
+                    query_control(child.registry(), "terminal_read", &["--task-id", &task_id])
+                        .await;
+                assert_eq!(read["ok"], true, "child terminal_read failed: {read}");
+                if read.to_string().contains("got ping") {
+                    return read;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("child terminal_read should observe the echoed line");
+        assert!(echoed.to_string().contains("running"), "{echoed}");
+
+        let parent_read =
+            query_control(parent.registry(), "terminal_read", &["--task-id", &task_id]).await;
+        assert_eq!(parent_read["ok"], false, "{parent_read}");
+        assert!(
+            parent_read["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("unknown task_id")),
+            "parent terminal_read must not see the child's task: {parent_read}"
+        );
+        let parent_kill =
+            query_control(parent.registry(), "terminal_kill", &["--task-id", &task_id]).await;
+        assert!(
+            parent_kill.to_string().contains("\"killed\":false"),
+            "parent terminal_kill must not reach the child's task: {parent_kill}"
+        );
+
+        let kill = query_control(child.registry(), "terminal_kill", &["--task-id", &task_id]).await;
+        assert!(
+            kill.to_string().contains("\"killed\":true"),
+            "child terminal_kill should stop its task: {kill}"
+        );
+        let stopped =
+            query_control(child.registry(), "terminal_read", &["--task-id", &task_id]).await;
+        assert!(
+            stopped.to_string().contains("\"kind\":\"killed\""),
+            "child task should be reported killed: {stopped}"
+        );
+    }
+
     // These four drive a real sandbox running `/bin/pwd`. `heel` reports
     // `UnsupportedPlatform` off Unix, and the binary they run does not exist
     // there either, so there is nothing for them to exercise on Windows.
@@ -3780,7 +4257,9 @@ mod tests {
             )
             .await
             .expect("terminal tool should initialize")
-            .with_shell_sessions(shell_sessions);
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
         let job_registry = tool.job_registry();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
@@ -3839,7 +4318,9 @@ mod tests {
             )
             .await
             .expect("terminal tool should initialize")
-            .with_shell_sessions(shell_sessions)
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
             .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
                 local: true,
                 container: false,
@@ -3895,7 +4376,9 @@ mod tests {
             )
             .await
             .expect("terminal tool should initialize")
-            .with_shell_sessions(shell_sessions)
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
             .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
                 local: true,
                 container: false,
@@ -3969,7 +4452,9 @@ mod tests {
             )
             .await
             .expect("terminal tool should initialize")
-            .with_shell_sessions(shell_sessions)
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
             .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
                 local: true,
                 container: false,
@@ -4042,7 +4527,9 @@ mod tests {
             )
             .await
             .expect("terminal tool should initialize")
-            .with_shell_sessions(shell_sessions)
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
             .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
                 local: true,
                 container: false,
@@ -4145,7 +4632,9 @@ mod tests {
             )
             .await
             .expect("terminal tool should initialize")
-            .with_shell_sessions(shell_sessions)
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
             .with_process_priority(priority);
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
         (cache, tool.with_registry(registry))
@@ -4597,7 +5086,9 @@ mod tests {
             )
             .await
             .expect("terminal tool should initialize")
-            .with_shell_sessions(shell_sessions)
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
             .with_process_priority(ProcessPriority::new(
                 CpuPriority::Nice(NiceLevel::new(5).expect("nice level 5 is in range")),
                 IoPriority::Normal,

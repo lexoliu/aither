@@ -121,7 +121,8 @@ pub use tool_distribution::{
     ToolArtifact, ToolArtifactFormat, ToolArtifactLocation, ToolDistribution,
 };
 pub use tool_runtime::{
-    ManagedTool, PreparedTools, ToolBinary, ToolBundle, ToolCatalog, ToolRuntimeError, ToolTarget,
+    ManagedTool, PreparedEnvironment, PreparedTools, ToolBinary, ToolBundle, ToolCatalog,
+    ToolRuntimeError, ToolTarget,
 };
 pub use tool_transport::{
     ContainerToolTransport, SshToolTransport, ToolEnvironmentInfo, ToolTransport,
