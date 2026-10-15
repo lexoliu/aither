@@ -372,6 +372,10 @@ impl ToolBundle {
                     return Err(ToolRuntimeError::InvalidCache(path));
                 }
             }
+            #[cfg(not(unix))]
+            if !metadata.permissions().readonly() {
+                return Err(ToolRuntimeError::InvalidCache(path));
+            }
         }
         Ok(PreparedTools {
             bin_dir,
