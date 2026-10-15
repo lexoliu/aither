@@ -3505,6 +3505,7 @@ mod tests {
     }
 
     /// A trusted manifest serving `script` for every managed tool at version 1.0.0.
+    #[cfg(unix)]
     async fn script_distribution(directory: &Path, script: &[u8]) -> ToolDistribution {
         let path = directory.join("baseline-tool");
         async_fs::write(&path, script).await.unwrap();
@@ -3527,6 +3528,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn adopted_registry_runs_baseline_tools_without_ssh_consent_or_version_probes() {
         let authorizer = Arc::new(CountingSshAuthorizer::default());
