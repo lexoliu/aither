@@ -65,96 +65,64 @@ pub fn tier(model_id: &str) -> ModelTier {
 
 #[cfg(test)]
 mod tests {
+    //! The bundled snapshot is refreshed from `LiteLLM` upstream, so these
+    //! tests only assert properties every valid snapshot has. Lookup and
+    //! tier behaviour is tested on a fixture in `registry` and `tier`.
+
     use super::*;
 
     #[test]
-    fn test_lookup_gpt4o() {
-        let entry = lookup("gpt-4o").expect("gpt-4o should exist");
-        assert_eq!(entry.id(), "gpt-4o");
-        assert!(entry.max_input_tokens().unwrap_or(0) >= 128_000);
-        assert!(entry.has_ability(Ability::Vision));
-        assert!(entry.has_ability(Ability::ToolUse));
+    fn bundled_matches_runtime_conversion_of_snapshot() {
+        let runtime =
+            ModelRegistry::from_litellm_json(include_bytes!("../data/litellm_snapshot.json"));
+        let bundled: Vec<_> = all_models().map(ModelEntry::litellm_id).collect();
+        let converted: Vec<_> = runtime.all().map(ModelEntry::litellm_id).collect();
+        assert_eq!(bundled, converted);
     }
 
     #[test]
-    fn test_lookup_claude() {
-        // Canary ID: must name a model the committed snapshot really
-        // publishes — a retired ID is a lookup miss, not a fallback.
-        let entry = lookup("claude-sonnet-5-5").expect("claude-sonnet-5-5 should exist");
-        assert!(entry.max_input_tokens().unwrap_or(0) >= 200_000);
-        assert!(entry.has_ability(Ability::ToolUse));
-    }
-
-    #[test]
-    fn test_lookup_retired_id_returns_none() {
-        // `claude-sonnet-4-20250514` and bare `claude-sonnet-4` were pruned
-        // by LiteLLM upstream; the only remaining `claude-sonnet-4` record
-        // is GitHub Copilot's, and a bare query must not bind it.
-        assert!(lookup("claude-sonnet-4-20250514").is_none());
-        assert!(lookup("claude-sonnet-4").is_none());
-        // Provider-scoped queries still normalize inside their own namespace.
-        let entry = lookup("github_copilot/claude-sonnet-4-20250514")
-            .expect("provider-scoped dated alias should resolve");
-        assert_eq!(entry.litellm_id(), "github_copilot/claude-sonnet-4");
-    }
-
-    #[test]
-    fn test_lookup_unknown_id_returns_none() {
-        assert!(lookup("no-such-model-xyz").is_none());
-    }
-
-    #[test]
-    fn test_lookup_gemini() {
-        let entry = lookup("gemini/gemini-2.5-flash").expect("gemini-2.5-flash should exist");
-        assert!(entry.max_input_tokens().unwrap_or(0) >= 1_000_000);
-        // `gemini/` is Google's own namespace, so bare IDs resolve to
-        // first-party records there too.
-        assert!(lookup("gemini-robotics-er-2-preview").is_some());
-    }
-
-    #[test]
-    fn test_lookup_case_insensitive() {
-        let entry = lookup("GPT-4O").expect("case-insensitive lookup should work");
-        assert_eq!(entry.id(), "gpt-4o");
-    }
-
-    #[test]
-    fn test_lookup_dated_alias() {
-        // A dated snapshot ID exact-matches its own record, while a date
-        // suffix with no dedicated record normalizes to the base model.
-        assert!(lookup("gpt-4o-2024-05-13").is_some());
-        let entry = lookup("gpt-4o-21000101").expect("dated alias should resolve");
-        assert_eq!(entry.id(), "gpt-4o");
-    }
-
-    #[test]
-    fn test_models_with_ability() {
-        let vision_models: Vec<_> = models_with_ability(Ability::Vision).collect();
-        assert_ne!(vision_models.len(), 0);
-        assert!(vision_models.iter().all(|m| m.has_ability(Ability::Vision)));
-    }
-
-    #[test]
-    fn test_models_by_mode() {
-        let chat_models: Vec<_> = models_by_mode(ModelMode::Chat).collect();
-        assert_ne!(chat_models.len(), 0);
-        assert!(chat_models.iter().all(|m| m.mode() == ModelMode::Chat));
-    }
-
-    #[test]
-    fn test_registry_not_empty() {
+    fn bundled_registry_is_populated() {
         let registry = ModelRegistry::bundled();
         assert!(
             registry.len() > 100,
             "Expected 100+ models, got {}",
             registry.len()
         );
+        assert_ne!(models_by_mode(ModelMode::Chat).count(), 0);
     }
 
     #[test]
-    fn test_pricing_populated() {
-        let entry = lookup("gpt-4o").expect("gpt-4o should exist");
-        assert!(entry.pricing().input_per_token() > 0.0);
-        assert!(entry.pricing().output_per_token() > 0.0);
+    fn every_entry_is_reachable_by_its_litellm_id() {
+        for entry in all_models() {
+            assert!(
+                lookup(entry.litellm_id()).is_some(),
+                "{} is not reachable by its own key",
+                entry.litellm_id()
+            );
+            assert!(
+                entry.litellm_id().ends_with(entry.id()),
+                "{} does not end with its canonical id {}",
+                entry.litellm_id(),
+                entry.id()
+            );
+        }
+    }
+
+    #[test]
+    fn query_helpers_return_only_matching_entries() {
+        assert!(models_with_ability(Ability::Vision).all(|m| m.has_ability(Ability::Vision)));
+        assert!(models_by_mode(ModelMode::Chat).all(|m| m.mode() == ModelMode::Chat));
+        assert!(models_for_provider(&Provider::OpenAI).all(|m| *m.provider() == Provider::OpenAI));
+    }
+
+    #[test]
+    fn image_generation_entries_classify_as_image_tier() {
+        for entry in models_by_mode(ModelMode::ImageGeneration) {
+            assert!(entry.has_ability(Ability::ImageGeneration));
+            assert_eq!(
+                ModelRegistry::bundled().tier_of(entry),
+                ModelTier::ImageGeneration
+            );
+        }
     }
 }

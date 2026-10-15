@@ -1,0 +1,95 @@
+{
+  "sample_spec": {
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "max_input_tokens": 1,
+    "input_cost_per_token": 0.0,
+    "output_cost_per_token": 0.0
+  },
+  "anthropic/fixture-claude-mid": {
+    "litellm_provider": "anthropic",
+    "mode": "chat",
+    "max_input_tokens": 200000,
+    "input_cost_per_token": 3e-06,
+    "output_cost_per_token": 1.5e-05
+  },
+  "fixture-claude-mid": {
+    "litellm_provider": "anthropic",
+    "mode": "chat",
+    "max_input_tokens": 200000,
+    "input_cost_per_token": 3e-06,
+    "output_cost_per_token": 1.5e-05,
+    "supports_function_calling": true
+  },
+  "fixture-gpt": {
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "max_input_tokens": 128000,
+    "input_cost_per_token": 2.5e-06,
+    "output_cost_per_token": 1e-05,
+    "supports_function_calling": true,
+    "supports_vision": true
+  },
+  "fixture-gpt-2024-05-13": {
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "max_input_tokens": 128000,
+    "input_cost_per_token": 5e-06,
+    "output_cost_per_token": 1.5e-05
+  },
+  "fixture-gpt-mini": {
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "max_input_tokens": 128000,
+    "input_cost_per_token": 1.5e-07,
+    "output_cost_per_token": 6e-07
+  },
+  "fixture-flagship": {
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "max_input_tokens": 200000,
+    "input_cost_per_token": 1.5e-05,
+    "output_cost_per_token": 7.5e-05,
+    "supports_reasoning": true
+  },
+  "fixture-image": {
+    "litellm_provider": "openai",
+    "mode": "image_generation"
+  },
+  "fixture-embedding": {
+    "litellm_provider": "openai",
+    "mode": "embedding",
+    "max_input_tokens": 8191,
+    "input_cost_per_token": 2e-08
+  },
+  "gemini/fixture-gemini": {
+    "litellm_provider": "gemini",
+    "mode": "chat",
+    "max_input_tokens": 1048576,
+    "input_cost_per_token": 3e-07,
+    "output_cost_per_token": 2.5e-06
+  },
+  "github_copilot/fixture-hosted": {
+    "litellm_provider": "github_copilot",
+    "mode": "chat",
+    "max_input_tokens": 128000
+  },
+  "azure/fixture-azure-only": {
+    "litellm_provider": "azure",
+    "mode": "chat",
+    "max_input_tokens": 128000,
+    "input_cost_per_token": 1e-06,
+    "output_cost_per_token": 4e-06
+  },
+  "bedrock/fixture-bedrock-v1:0": {
+    "litellm_provider": "bedrock",
+    "mode": "chat",
+    "max_input_tokens": 200000,
+    "input_cost_per_token": 3e-06,
+    "output_cost_per_token": 1.5e-05
+  },
+  "fixture-unknown-mode": {
+    "litellm_provider": "openai",
+    "mode": "not_a_mode"
+  }
+}
