@@ -964,7 +964,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
 impl<P, E, State> TerminalTool<P, E, State>
 where
     E: Executor + Clone + 'static,
-    State: RegistryState,
+    State: Clone,
 {
     /// Adds additional writable paths to the sandbox configuration.
     ///
@@ -1006,44 +1006,6 @@ where
     pub const fn with_process_priority(mut self, priority: ProcessPriority) -> Self {
         self.priority = priority;
         self
-    }
-
-    /// Creates a child `TerminalTool` that shares the same sandbox and permission handler
-    /// but has independent background task tracking.
-    ///
-    /// Use this to create terminal tools for subagents that:
-    /// - Share the same working directory and output store
-    /// - Share the same permission handler (security policies enforced consistently)
-    /// - Have independent completion channels (no message mixup)
-    #[must_use]
-    pub fn child(&self) -> Self {
-        let (completed_tx, completed_rx) = async_channel::unbounded();
-        let running_tasks = Arc::new(AtomicUsize::new(0));
-        let (permission_tx, permission_rx) = async_channel::unbounded();
-        let (job_registry, job_registry_service) = job_registry_channel();
-        self.executor
-            .spawn(async move { job_registry_service.serve().await })
-            .detach();
-        Self {
-            working_dir: self.working_dir.clone(),
-            shell_sessions: self.shell_sessions.clone(),
-            permission_handler: self.permission_handler.clone(), // Arc clone - shares handler
-            executor: self.executor.clone(),
-            output_store: self.output_store.clone(),
-            completed_rx,
-            completed_tx,
-            running_tasks,
-            permission_rx,
-            permission_tx,
-            writable_paths: self.writable_paths.clone(),
-            readable_paths: self.readable_paths.clone(),
-            network_audit: self.network_audit.clone(),
-            priority: self.priority,
-            registry: self
-                .registry
-                .for_jobs(job_registry.clone(), self.outputs_dir()),
-            job_registry,
-        }
     }
 
     /// Initializes tools before agent construction or command execution.
@@ -1148,6 +1110,50 @@ where
     /// Checks if there are any pending background tasks.
     pub fn has_pending_tasks(&self) -> bool {
         !self.completed_rx.is_empty() || self.running_tasks.load(Ordering::Acquire) > 0
+    }
+}
+
+impl<P, E, State> TerminalTool<P, E, State>
+where
+    E: Executor + Clone + 'static,
+    State: RegistryState,
+{
+    /// Creates a child `TerminalTool` that shares the same sandbox and permission handler
+    /// but has independent background task tracking.
+    ///
+    /// Use this to create terminal tools for subagents that:
+    /// - Share the same working directory and output store
+    /// - Share the same permission handler (security policies enforced consistently)
+    /// - Have independent completion channels (no message mixup)
+    #[must_use]
+    pub fn child(&self) -> Self {
+        let (completed_tx, completed_rx) = async_channel::unbounded();
+        let running_tasks = Arc::new(AtomicUsize::new(0));
+        let (permission_tx, permission_rx) = async_channel::unbounded();
+        let (job_registry, job_registry_service) = job_registry_channel();
+        self.executor
+            .spawn(async move { job_registry_service.serve().await })
+            .detach();
+        Self {
+            working_dir: self.working_dir.clone(),
+            shell_sessions: self.shell_sessions.clone(),
+            permission_handler: self.permission_handler.clone(), // Arc clone - shares handler
+            executor: self.executor.clone(),
+            output_store: self.output_store.clone(),
+            completed_rx,
+            completed_tx,
+            running_tasks,
+            permission_rx,
+            permission_tx,
+            writable_paths: self.writable_paths.clone(),
+            readable_paths: self.readable_paths.clone(),
+            network_audit: self.network_audit.clone(),
+            priority: self.priority,
+            registry: self
+                .registry
+                .for_jobs(job_registry.clone(), self.outputs_dir()),
+            job_registry,
+        }
     }
 }
 
