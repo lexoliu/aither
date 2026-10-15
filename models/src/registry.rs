@@ -300,3 +300,180 @@ fn parse_ability(s: &str) -> Option<Ability> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    /// Registry built from a small hand-written `LiteLLM` dataset, so lookup
+    /// and tier behaviour is tested independently of the bundled snapshot,
+    /// which upstream refreshes can change at any time.
+    pub fn fixture() -> ModelRegistry {
+        ModelRegistry::from_litellm_json(include_bytes!("../testdata/litellm_fixture.json"))
+    }
+
+    fn litellm_id_of(registry: &ModelRegistry, query: &str) -> Option<String> {
+        registry
+            .lookup(query)
+            .map(|entry| entry.litellm_id().to_owned())
+    }
+
+    #[test]
+    fn fixture_skips_sample_spec_and_unknown_modes() {
+        let registry = fixture();
+        assert_eq!(registry.len(), 12);
+        assert!(registry.lookup("sample_spec").is_none());
+        assert!(registry.lookup("fixture-unknown-mode").is_none());
+    }
+
+    #[test]
+    fn exact_lookup_returns_converted_entry() {
+        let registry = fixture();
+        let entry = registry.lookup("fixture-gpt").expect("fixture-gpt exists");
+        assert_eq!(entry.id(), "fixture-gpt");
+        assert_eq!(*entry.provider(), Provider::OpenAI);
+        assert_eq!(entry.mode(), ModelMode::Chat);
+        assert_eq!(entry.max_input_tokens(), Some(128_000));
+        assert!(entry.has_ability(Ability::Vision));
+        assert!(entry.has_ability(Ability::ToolUse));
+        assert!(entry.pricing().input_per_token() > 0.0);
+        assert!(entry.pricing().output_per_token() > 0.0);
+    }
+
+    #[test]
+    fn lookup_is_case_insensitive() {
+        let registry = fixture();
+        assert_eq!(
+            litellm_id_of(&registry, "FIXTURE-GPT").as_deref(),
+            Some("fixture-gpt")
+        );
+        assert_eq!(
+            litellm_id_of(&registry, "GITHUB_COPILOT/FIXTURE-HOSTED").as_deref(),
+            Some("github_copilot/fixture-hosted")
+        );
+    }
+
+    #[test]
+    fn dated_snapshot_with_own_record_matches_exactly() {
+        let registry = fixture();
+        assert_eq!(
+            litellm_id_of(&registry, "fixture-gpt-2024-05-13").as_deref(),
+            Some("fixture-gpt-2024-05-13")
+        );
+    }
+
+    #[test]
+    fn version_suffixes_normalize_to_base_model() {
+        let registry = fixture();
+        for alias in [
+            "fixture-gpt-21000101",
+            "fixture-gpt-2099-01-01",
+            "fixture-gpt@20240513",
+            "fixture-gpt-v2",
+            "fixture-gpt-v2:1",
+        ] {
+            assert_eq!(
+                litellm_id_of(&registry, alias).as_deref(),
+                Some("fixture-gpt"),
+                "{alias} should normalize to fixture-gpt"
+            );
+        }
+        // Normalization stays within the queried family.
+        assert_eq!(
+            litellm_id_of(&registry, "fixture-gpt-mini-20250101").as_deref(),
+            Some("fixture-gpt-mini")
+        );
+    }
+
+    #[test]
+    fn normalization_never_changes_model_family() {
+        let registry = fixture();
+        assert!(registry.lookup("fixture-gpt-turbo").is_none());
+        assert!(registry.lookup("fixture-gpt-mini-turbo").is_none());
+    }
+
+    #[test]
+    fn unknown_id_returns_none() {
+        let registry = fixture();
+        assert!(registry.lookup("no-such-model-xyz").is_none());
+        assert!(registry.lookup("no-such-model-xyz-20250101").is_none());
+    }
+
+    #[test]
+    fn bare_id_does_not_bind_provider_scoped_record() {
+        let registry = fixture();
+        // Only a hosted (`github_copilot/`, `azure/`) record exists, so the
+        // bare ID — dated or not — is a miss rather than a fallback.
+        assert!(registry.lookup("fixture-hosted").is_none());
+        assert!(registry.lookup("fixture-hosted-20250514").is_none());
+        assert!(registry.lookup("fixture-azure-only").is_none());
+        assert!(registry.lookup("fixture-bedrock-v1:0").is_none());
+    }
+
+    #[test]
+    fn provider_scoped_query_normalizes_within_its_namespace() {
+        let registry = fixture();
+        assert_eq!(
+            litellm_id_of(&registry, "github_copilot/fixture-hosted-20250514").as_deref(),
+            Some("github_copilot/fixture-hosted")
+        );
+        assert_eq!(
+            litellm_id_of(&registry, "azure/fixture-azure-only").as_deref(),
+            Some("azure/fixture-azure-only")
+        );
+        assert_eq!(
+            litellm_id_of(&registry, "bedrock/fixture-bedrock-v1:0").as_deref(),
+            Some("bedrock/fixture-bedrock-v1:0")
+        );
+        // Another provider's namespace does not answer for this one.
+        assert!(registry.lookup("azure/fixture-hosted").is_none());
+    }
+
+    #[test]
+    fn first_party_prefix_claims_bare_id() {
+        let registry = fixture();
+        assert_eq!(
+            litellm_id_of(&registry, "fixture-gemini").as_deref(),
+            Some("gemini/fixture-gemini")
+        );
+        assert_eq!(
+            litellm_id_of(&registry, "fixture-gemini-2099-01-01").as_deref(),
+            Some("gemini/fixture-gemini")
+        );
+    }
+
+    #[test]
+    fn unprefixed_record_wins_bare_id_over_first_party_prefix() {
+        let registry = fixture();
+        // `anthropic/fixture-claude-mid` precedes the unprefixed record in
+        // iteration order; the unprefixed key still owns the bare ID.
+        assert_eq!(
+            litellm_id_of(&registry, "fixture-claude-mid").as_deref(),
+            Some("fixture-claude-mid")
+        );
+        assert_eq!(
+            litellm_id_of(&registry, "anthropic/fixture-claude-mid").as_deref(),
+            Some("anthropic/fixture-claude-mid")
+        );
+    }
+
+    #[test]
+    fn query_helpers_filter_by_mode_ability_and_provider() {
+        let registry = fixture();
+        let image: Vec<_> = registry
+            .models_by_mode(ModelMode::ImageGeneration)
+            .map(ModelEntry::litellm_id)
+            .collect();
+        assert_eq!(image, ["fixture-image"]);
+        let reasoning: Vec<_> = registry
+            .models_with_ability(Ability::Reasoning)
+            .map(ModelEntry::litellm_id)
+            .collect();
+        assert_eq!(reasoning, ["fixture-flagship"]);
+        let copilot: Vec<_> = registry
+            .models_for_provider(&Provider::Copilot)
+            .map(ModelEntry::litellm_id)
+            .collect();
+        assert_eq!(copilot, ["github_copilot/fixture-hosted"]);
+    }
+}
