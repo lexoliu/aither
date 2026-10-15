@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/lexoliu/aither/compare/sandbox-v0.7.0...sandbox-v0.8.0) - 2026-10-15
+
+### Added
+
+- *(agent)* adopt an already prepared tool environment
+
+### Other
+
+- *(sandbox)* run the shell-fixture adoption test on unix only
+- Keep the general TerminalTool methods on a plain Clone state
+- Bind a child terminal's control commands to its own jobs
+
 ## [0.7.0](https://github.com/lexoliu/aither/compare/sandbox-v0.6.0...sandbox-v0.7.0) - 2026-10-13
 
 ### Added
