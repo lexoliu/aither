@@ -521,6 +521,27 @@ impl ToolCatalog {
     }
 }
 
+/// A part of a registry's configuration that preparation is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedEnvironment {
+    /// The backend that runs commands on this machine or in its container.
+    HomeBackend,
+    /// The container the home tools were mounted into.
+    Container,
+    /// The set of SSH servers and their targets.
+    SshServers,
+}
+
+impl std::fmt::Display for PreparedEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::HomeBackend => "the home execution backend",
+            Self::Container => "the container runtime",
+            Self::SshServers => "the SSH server set",
+        })
+    }
+}
+
 /// Fail-closed errors from tool initialization and shell integration.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolRuntimeError {
@@ -565,6 +586,9 @@ pub enum ToolRuntimeError {
     /// Initialization has not prepared the requested execution environment.
     #[error("tool runtime is not initialized for {0}")]
     NotInitialized(String),
+    /// The registry's configuration changed after its environments were prepared.
+    #[error("{0} changed after tool preparation")]
+    EnvironmentChanged(PreparedEnvironment),
     /// Agent write permissions would expose managed executable contents.
     #[error("managed tool directory overlaps a writable sandbox path: {0}")]
     WritableToolDirectory(PathBuf),
@@ -655,12 +679,18 @@ pub mod tests {
     }
 
     pub fn bundle() -> ToolBundle {
+        bundle_pinned("1.0.0")
+    }
+
+    /// A bundle pinned to `version` whose commands all report version 1.0.0,
+    /// so any other pin fails the version probe while passing integrity checks.
+    pub fn bundle_pinned(version: &str) -> ToolBundle {
         let binaries = ManagedTool::ALL
             .into_iter()
             .map(|tool| {
                 let bytes =
                     format!("#!/bin/sh\nprintf '%s\\n' '{} 1.0.0'\n", tool.command()).into_bytes();
-                ToolBinary::verify(tool, "1.0.0", &digest(&bytes), bytes).unwrap()
+                ToolBinary::verify(tool, version, &digest(&bytes), bytes).unwrap()
             })
             .collect();
         ToolBundle::new(ToolTarget::native().unwrap(), binaries).unwrap()
