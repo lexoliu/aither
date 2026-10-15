@@ -94,7 +94,7 @@ pub use hook::{
     StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
 };
 pub use stream::AgentStream;
-pub use terminal_agent::TerminalAgentBuilder;
+pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};
 pub use tools::AgentTools;
 
 // Model groups for budget tracking and fallback

@@ -7,7 +7,9 @@ use crate::shell_session::{
     bootstrap_ssh_runtime,
 };
 use crate::tool_distribution::ToolDistribution;
-use crate::tool_runtime::{PreparedTools, ToolCatalog, ToolRuntimeError, ToolTarget};
+use crate::tool_runtime::{
+    PreparedEnvironment, PreparedTools, ToolCatalog, ToolRuntimeError, ToolTarget,
+};
 use crate::tool_transport::{ContainerToolTransport, SshToolTransport, probe_tool_environment};
 
 #[derive(Debug, Clone)]
@@ -117,42 +119,73 @@ impl ShellSessionRegistry {
         Ok(self)
     }
 
+    /// Prepared environments, provided they are exactly the configured backends.
+    ///
+    /// Preparation is bound to the home backend, the container it mounted
+    /// into and the SSH server set; a registry whose configuration changed
+    /// after preparation describes environments nobody prepared.
+    fn prepared_environments(&self) -> Result<&PreparedToolEnvironments, ToolRuntimeError> {
+        let prepared = self
+            .prepared_tools
+            .as_ref()
+            .ok_or_else(|| ToolRuntimeError::NotInitialized("execution environments".into()))?;
+        if prepared.home.as_ref().map(|home| home.backend) != self.resolve_local_backend().ok() {
+            return Err(ToolRuntimeError::EnvironmentChanged(
+                PreparedEnvironment::HomeBackend,
+            ));
+        }
+        if let Some(container_id) = prepared
+            .home
+            .as_ref()
+            .and_then(|home| home.container_id.as_deref())
+            && self
+                .container_runtime()
+                .map(crate::ContainerShellRuntime::container_id)
+                != Some(container_id)
+        {
+            return Err(ToolRuntimeError::EnvironmentChanged(
+                PreparedEnvironment::Container,
+            ));
+        }
+        let mut configured = if self.availability().ssh {
+            self.ssh_servers().iter().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        configured.sort_by(|left, right| left.id().cmp(right.id()));
+        if !prepared
+            .ssh
+            .iter()
+            .map(|ready| &ready.server)
+            .eq(configured)
+        {
+            return Err(ToolRuntimeError::EnvironmentChanged(
+                PreparedEnvironment::SshServers,
+            ));
+        }
+        Ok(prepared)
+    }
+
     pub(crate) fn home_tools(
         &self,
         backend: ShellBackend,
     ) -> Result<&PreparedTools, ToolRuntimeError> {
-        let home = self
-            .prepared_tools
+        self.prepared_environments()?
+            .home
             .as_ref()
-            .and_then(|prepared| prepared.home.as_ref())
-            .ok_or_else(|| ToolRuntimeError::NotInitialized("home environment".into()))?;
-        if home.backend != backend {
-            return Err(ToolRuntimeError::NotInitialized(
-                "home backend changed".into(),
-            ));
-        }
-        if let Some(container_id) = &home.container_id
-            && self
-                .container_runtime()
-                .map(crate::ContainerShellRuntime::container_id)
-                != Some(container_id.as_str())
-        {
-            return Err(ToolRuntimeError::NotInitialized("container changed".into()));
-        }
-        Ok(&home.tools)
+            .filter(|home| home.backend == backend)
+            .map(|home| &home.tools)
+            .ok_or_else(|| ToolRuntimeError::NotInitialized("home environment".into()))
     }
 
     pub(crate) fn ssh_tools(
         &self,
         server: &SshServer,
     ) -> Result<(&SshRuntimeProfile, &PreparedTools), ToolRuntimeError> {
-        self.prepared_tools
-            .as_ref()
-            .and_then(|prepared| {
-                prepared.ssh.iter().find(|ready| {
-                    ready.server.name == server.name && ready.server.target == server.target
-                })
-            })
+        self.prepared_environments()?
+            .ssh
+            .iter()
+            .find(|ready| &ready.server == server)
             .map(|ready| (&ready.runtime, &ready.tools))
             .ok_or_else(|| ToolRuntimeError::NotInitialized(server.id().into()))
     }
@@ -160,20 +193,11 @@ impl ShellSessionRegistry {
     /// Catalog derived only from environments that completed initialization.
     ///
     /// # Errors
-    /// Rejects an uninitialized registry or configuration changed after preparation.
+    /// Rejects an uninitialized registry, or one whose home backend, container
+    /// or SSH server set changed after preparation.
     pub fn prepared_catalog(&self) -> Result<&ToolCatalog, ToolRuntimeError> {
-        if let Ok(backend) = self.resolve_local_backend() {
-            let _ = self.home_tools(backend)?;
-        }
-        if self.availability().ssh {
-            for server in self.list_ssh_servers() {
-                let _ = self.ssh_tools(&server)?;
-            }
-        }
-        self.prepared_tools
-            .as_ref()
+        self.prepared_environments()
             .map(|prepared| &prepared.catalog)
-            .ok_or_else(|| ToolRuntimeError::NotInitialized("execution environments".into()))
     }
 
     #[cfg(test)]
@@ -181,7 +205,7 @@ impl ShellSessionRegistry {
         self.with_test_home(ShellBackend::Local, None, tools)
     }
 
-    #[cfg(all(test, aither_container_acceptance))]
+    #[cfg(test)]
     pub(crate) fn with_test_container_tools(
         self,
         tools: PreparedTools,
@@ -207,6 +231,26 @@ impl ShellSessionRegistry {
             ssh: Vec::new(),
             catalog,
         });
+        self
+    }
+
+    /// Records `server` as prepared with `tools`, as SSH bootstrap would.
+    #[cfg(test)]
+    pub(crate) fn with_test_ssh(mut self, server: SshServer, tools: PreparedTools) -> Self {
+        let prepared = self
+            .prepared_tools
+            .as_mut()
+            .expect("prepare the home environment before an SSH server");
+        prepared.ssh.push(PreparedSsh {
+            server,
+            runtime: SshRuntimeProfile::Heel {
+                binary: "/usr/local/bin/heel".into(),
+            },
+            tools,
+        });
+        prepared
+            .ssh
+            .sort_by(|left, right| left.server.id().cmp(right.server.id()));
         self
     }
 }

@@ -523,6 +523,10 @@ impl ShellSessionRegistry {
         self.ssh_servers.clone()
     }
 
+    pub(crate) fn ssh_servers(&self) -> &[SshServer] {
+        &self.ssh_servers
+    }
+
     pub(crate) const fn container_runtime(&self) -> Option<&ContainerShellRuntime> {
         self.container_runtime.as_ref()
     }

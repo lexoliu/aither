@@ -33,6 +33,7 @@
 
 use std::borrow::Cow;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -55,7 +56,8 @@ use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalD
 use aither_sandbox::{
     CommandPayload, ContainerShellRuntime, PermissionHandler, ShellRuntimeAvailability,
     ShellSessionRegistry, SshServer, SshSessionAuthorizer, TerminalTool, TerminalToolFactory,
-    TerminalToolFactoryReceiver, ToolRegistryBuilder, Unconfigured, terminal_tool_factory_channel,
+    TerminalToolFactoryReceiver, ToolDistribution, ToolRegistryBuilder, ToolRuntimeError,
+    Unconfigured, terminal_tool_factory_channel,
 };
 
 /// System prompt template for terminal-first agents.
@@ -148,11 +150,29 @@ pub struct SubagentInfo {
     pub path: String,
 }
 
+/// [`TerminalAgentBuilder`] state while its shell backends are still being
+/// configured: the terminal's tool environments are not prepared yet.
+#[derive(Debug, Clone, Copy)]
+pub struct Unprepared;
+
+/// [`TerminalAgentBuilder`] state once its terminal holds prepared tool
+/// environments, either from [`TerminalAgentBuilder::initialize_tools`] or
+/// adopted with [`TerminalAgentBuilder::prepared_shell_sessions`].
+///
+/// The shell backends are fixed in this state: preparation is bound to them,
+/// so the builder no longer offers the methods that change them.
+#[derive(Debug, Clone, Copy)]
+pub struct Prepared;
+
 /// Builder for creating terminal-first agents.
 ///
 /// All registered tools become IPC commands accessible via `terminal`.
 /// The LLM only sees the `terminal` tool.
-pub struct TerminalAgentBuilder<LLM, P, E, H = ()>
+///
+/// `S` tracks whether the terminal's tool environments are prepared
+/// ([`Unprepared`] or [`Prepared`]); shell backends are configured only before
+/// preparation.
+pub struct TerminalAgentBuilder<LLM, P, E, H = (), S = Unprepared>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
@@ -166,12 +186,12 @@ where
     tool_descriptions: Vec<(String, String)>,
     skills: Vec<SkillInfo>,
     subagents: Vec<SubagentInfo>,
-    shell_sessions: ShellSessionRegistry,
     #[cfg(feature = "skills")]
     skill_registry: Option<SkillRegistry>,
+    state: PhantomData<S>,
 }
 
-impl<LLM, P, E, H> std::fmt::Debug for TerminalAgentBuilder<LLM, P, E, H>
+impl<LLM, P, E, H, S> std::fmt::Debug for TerminalAgentBuilder<LLM, P, E, H, S>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
@@ -213,7 +233,7 @@ where
         let kill_terminal_tool = KillTerminalTool::new(job_registry.clone());
         let input_terminal_tool = InputTerminalTool::new(job_registry.clone());
         let read_terminal_delta_tool = ReadTerminalDeltaTool::new(job_registry);
-        terminal_tool = terminal_tool.with_shell_sessions(shell_sessions.clone());
+        terminal_tool = terminal_tool.with_shell_sessions(shell_sessions);
 
         let kill_def = ToolDefinition::new(&kill_terminal_tool);
         tool_descriptions.push((
@@ -245,20 +265,40 @@ where
             tool_descriptions,
             skills: Vec::new(),
             subagents: Vec::new(),
-            shell_sessions,
             #[cfg(feature = "skills")]
             skill_registry: None,
+            state: PhantomData,
         }
     }
 }
 
-impl<LLM, P, E, H> TerminalAgentBuilder<LLM, P, E, H>
+impl<LLM, P, E, H, S> TerminalAgentBuilder<LLM, P, E, H, S>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
     H: Hook,
 {
+    /// Moves every part into a builder with another hook chain or state.
+    fn rebuild<NH, NS>(
+        self,
+        inner: impl FnOnce(AgentBuilder<LLM, LLM, LLM, H>) -> AgentBuilder<LLM, LLM, LLM, NH>,
+    ) -> TerminalAgentBuilder<LLM, P, E, NH, NS> {
+        TerminalAgentBuilder {
+            inner: inner(self.inner),
+            terminal_tool: self.terminal_tool,
+            registry_builder: self.registry_builder,
+            terminal_tool_factory: self.terminal_tool_factory,
+            terminal_tool_factory_receiver: self.terminal_tool_factory_receiver,
+            tool_descriptions: self.tool_descriptions,
+            skills: self.skills,
+            subagents: self.subagents,
+            #[cfg(feature = "skills")]
+            skill_registry: self.skill_registry,
+            state: PhantomData,
+        }
+    }
+
     async fn resolve_absolute_dir(
         path: &std::path::Path,
         kind: &str,
@@ -354,52 +394,6 @@ where
 
         self.terminal_tool = self.terminal_tool.with_readable_paths([abs_path]);
         Ok(self)
-    }
-
-    /// Sets runtime shell backend availability for `terminal`.
-    #[must_use]
-    pub fn shell_runtime_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
-        self.shell_sessions = self.shell_sessions.with_availability(availability.clone());
-        self.terminal_tool = self
-            .terminal_tool
-            .with_shell_sessions(self.shell_sessions.clone())
-            .with_shell_runtime_availability(availability);
-        self
-    }
-
-    /// Sets preconfigured SSH targets that can be used by `terminal` with ssh mode.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the SSH server configuration is invalid.
-    #[must_use]
-    pub fn ssh_servers(mut self, servers: Vec<SshServer>) -> Self {
-        self.shell_sessions = self
-            .shell_sessions
-            .with_ssh_servers(servers)
-            .expect("invalid ssh server configuration");
-        self.terminal_tool = self
-            .terminal_tool
-            .with_shell_sessions(self.shell_sessions.clone());
-        self
-    }
-
-    /// Sets the SSH session authorizer for interactive connect/install consent prompts.
-    #[must_use]
-    pub fn ssh_authorizer<T: SshSessionAuthorizer + 'static>(mut self, authorizer: Arc<T>) -> Self {
-        self.shell_sessions = self.shell_sessions.with_ssh_authorizer(authorizer);
-        self.terminal_tool = self
-            .terminal_tool
-            .with_shell_sessions(self.shell_sessions.clone());
-        self
-    }
-
-    /// Sets the container runtime for container-backed shell sessions.
-    #[must_use]
-    pub fn container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
-        self.shell_sessions = self.shell_sessions.with_container_runtime(runtime.clone());
-        self.terminal_tool = self.terminal_tool.with_container_runtime(runtime);
-        self
     }
 
     /// Registers a tool as an IPC command accessible via `terminal`.
@@ -567,7 +561,7 @@ where
     /// Panics when no shell backend is available.
     #[must_use]
     pub fn with_default_prompt(mut self) -> Self {
-        let availability = self.shell_sessions.availability();
+        let availability = self.terminal_tool.shell_sessions().availability();
         let host_profile = if availability.container {
             "container"
         } else if availability.local {
@@ -595,7 +589,8 @@ where
         );
         self.inner = self.inner.system_named("shell_runtime", shell_context);
 
-        let ssh_context = describe_ssh_servers(&self.shell_sessions.list_ssh_servers());
+        let ssh_context =
+            describe_ssh_servers(&self.terminal_tool.shell_sessions().list_ssh_servers());
         let host_runtime_context =
             describe_host_runtime_context(host_profile, &availability, ssh_context.as_str());
 
@@ -645,20 +640,11 @@ where
     }
 
     /// Adds a hook to intercept agent operations.
-    pub fn hook<NH: Hook>(self, hook: NH) -> TerminalAgentBuilder<LLM, P, E, crate::HCons<NH, H>> {
-        TerminalAgentBuilder {
-            inner: self.inner.hook(hook),
-            terminal_tool: self.terminal_tool,
-            registry_builder: self.registry_builder,
-            terminal_tool_factory: self.terminal_tool_factory,
-            terminal_tool_factory_receiver: self.terminal_tool_factory_receiver,
-            tool_descriptions: self.tool_descriptions,
-            skills: self.skills,
-            subagents: self.subagents,
-            shell_sessions: self.shell_sessions,
-            #[cfg(feature = "skills")]
-            skill_registry: self.skill_registry,
-        }
+    pub fn hook<NH: Hook>(
+        self,
+        hook: NH,
+    ) -> TerminalAgentBuilder<LLM, P, E, crate::HCons<NH, H>, S> {
+        self.rebuild(|inner| inner.hook(hook))
     }
 
     /// Loads skills from a filesystem path.
@@ -857,23 +843,6 @@ where
         &mut self.registry_builder
     }
 
-    /// Prepares baseline tools for configured backends before building the agent.
-    ///
-    /// # Errors
-    /// Fails if provisioning, integrity validation or sandbox protection fails.
-    pub async fn initialize_tools(
-        mut self,
-        distribution: &aither_sandbox::ToolDistribution,
-        cache_root: &std::path::Path,
-    ) -> Result<Self, aither_sandbox::ToolRuntimeError> {
-        self.terminal_tool = self
-            .terminal_tool
-            .initialize_tools(distribution, cache_root)
-            .await?;
-        self.shell_sessions = self.terminal_tool.shell_sessions().clone();
-        Ok(self)
-    }
-
     /// Returns the sandbox working directory path.
     pub fn sandbox_dir(&self) -> Cow<'_, str> {
         self.terminal_tool.working_dir().to_string_lossy()
@@ -925,6 +894,115 @@ where
         };
 
         inner.build()
+    }
+}
+
+impl<LLM, P, E, H> TerminalAgentBuilder<LLM, P, E, H, Unprepared>
+where
+    LLM: LanguageModel + Clone,
+    P: PermissionHandler + 'static,
+    E: Executor + Clone + 'static,
+    H: Hook,
+{
+    /// Sets runtime shell backend availability for `terminal`.
+    #[must_use]
+    pub fn shell_runtime_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
+        self.terminal_tool = self
+            .terminal_tool
+            .with_shell_runtime_availability(availability);
+        self
+    }
+
+    /// Sets preconfigured SSH targets that can be used by `terminal` with ssh mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the SSH server configuration is invalid.
+    #[must_use]
+    pub fn ssh_servers(mut self, servers: Vec<SshServer>) -> Self {
+        let sessions = self
+            .terminal_tool
+            .shell_sessions()
+            .clone()
+            .with_ssh_servers(servers)
+            .expect("invalid ssh server configuration");
+        self.terminal_tool = self.terminal_tool.with_shell_sessions(sessions);
+        self
+    }
+
+    /// Sets the SSH session authorizer for interactive connect/install consent prompts.
+    #[must_use]
+    pub fn ssh_authorizer<T: SshSessionAuthorizer + 'static>(mut self, authorizer: Arc<T>) -> Self {
+        let sessions = self
+            .terminal_tool
+            .shell_sessions()
+            .clone()
+            .with_ssh_authorizer(authorizer);
+        self.terminal_tool = self.terminal_tool.with_shell_sessions(sessions);
+        self
+    }
+
+    /// Sets the container runtime for container-backed shell sessions.
+    #[must_use]
+    pub fn container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
+        self.terminal_tool = self.terminal_tool.with_container_runtime(runtime);
+        self
+    }
+
+    /// Prepares baseline tools for the configured backends before building the agent.
+    ///
+    /// The prepared registry is available afterwards from
+    /// [`TerminalAgentBuilder::shell_sessions`], so an application that
+    /// rebuilds its agent can adopt it with [`Self::prepared_shell_sessions`]
+    /// instead of preparing again.
+    ///
+    /// # Errors
+    /// Fails if provisioning, integrity validation or sandbox protection fails.
+    pub async fn initialize_tools(
+        mut self,
+        distribution: &ToolDistribution,
+        cache_root: &std::path::Path,
+    ) -> Result<TerminalAgentBuilder<LLM, P, E, H, Prepared>, ToolRuntimeError> {
+        self.terminal_tool = self
+            .terminal_tool
+            .initialize_tools(distribution, cache_root)
+            .await?;
+        Ok(self.rebuild(std::convert::identity))
+    }
+
+    /// Adopts a registry another builder already prepared with
+    /// [`Self::initialize_tools`], taking its shell backends with it.
+    ///
+    /// Only this terminal's own checks run: its working directory and writable
+    /// paths must not expose the managed tools. Downloads, integrity hashing,
+    /// version probes and SSH bootstrap — including its connection consent
+    /// prompt — are not repeated.
+    ///
+    /// # Errors
+    /// Rejects a registry that is not prepared, one whose home backend,
+    /// container or SSH server set changed after preparation, and writable
+    /// grants that expose the managed tools.
+    pub async fn prepared_shell_sessions(
+        mut self,
+        sessions: ShellSessionRegistry,
+    ) -> Result<TerminalAgentBuilder<LLM, P, E, H, Prepared>, ToolRuntimeError> {
+        self.terminal_tool = self.terminal_tool.adopt_prepared_tools(sessions).await?;
+        Ok(self.rebuild(std::convert::identity))
+    }
+}
+
+impl<LLM, P, E, H> TerminalAgentBuilder<LLM, P, E, H, Prepared>
+where
+    LLM: LanguageModel + Clone,
+    P: PermissionHandler + 'static,
+    E: Executor + Clone + 'static,
+    H: Hook,
+{
+    /// The prepared registry, for a later builder to adopt with
+    /// [`TerminalAgentBuilder::prepared_shell_sessions`].
+    #[must_use]
+    pub const fn shell_sessions(&self) -> &ShellSessionRegistry {
+        self.terminal_tool.shell_sessions()
     }
 }
 
@@ -1252,29 +1330,10 @@ mod tests {
         assert!(prompt.contains("<unsafe>"));
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn terminal_agent_builder_keeps_ipc_tools_out_of_llm_tool_surface() {
-        use aither_sandbox::{
-            ManagedTool, ToolArtifact, ToolArtifactFormat, ToolDistribution, ToolTarget,
-        };
-        use sha2::Digest as _;
-        #[derive(serde::Serialize)]
-        struct Manifest {
-            artifacts: Vec<ToolArtifact>,
-        }
-        let dir = tempdir().expect("tempdir should exist");
-        let terminal_tool =
-            aither_sandbox::TerminalTool::<NoopPermissionHandler, TokioGlobal>::new_exact(
-                dir.path(),
-                NoopPermissionHandler,
-                TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize");
-
-        let source = tempdir().unwrap();
-        let cache = tempdir().unwrap();
-        let fixture = source.path().join("baseline_tool.rs");
+    /// Compiles the baseline-tool fixture, which reports version 1.0.0 for
+    /// every command, into `source`.
+    async fn compile_baseline_fixture(source: &std::path::Path) -> std::path::PathBuf {
+        let fixture = source.join("baseline_tool.rs");
         async_fs::write(
             &fixture,
             include_bytes!("../templates/test_baseline_tool.rs"),
@@ -1282,7 +1341,6 @@ mod tests {
         .await
         .unwrap();
         let path = source
-            .path()
             .join("baseline-tool")
             .with_extension(std::env::consts::EXE_EXTENSION);
         let compiled = async_process::Command::new("rustc")
@@ -1296,23 +1354,201 @@ mod tests {
             .await
             .unwrap();
         assert!(compiled.status.success(), "{compiled:?}");
-        let binary = async_fs::read(&path).await.unwrap();
+        path
+    }
+
+    /// A trusted manifest serving `binary` for every managed tool, pinned to `version`.
+    async fn fixture_distribution(
+        binary: &std::path::Path,
+        version: &str,
+    ) -> aither_sandbox::ToolDistribution {
+        use aither_sandbox::{
+            ManagedTool, ToolArtifact, ToolArtifactFormat, ToolDistribution, ToolTarget,
+        };
+        use sha2::Digest as _;
+        #[derive(serde::Serialize)]
+        struct Manifest {
+            artifacts: Vec<ToolArtifact>,
+        }
+        let bytes = async_fs::read(binary).await.unwrap();
         let artifacts = ManagedTool::ALL
             .into_iter()
             .map(|tool| ToolArtifact {
                 tool,
-                version: "1.0.0".into(),
+                version: version.into(),
                 target: ToolTarget::native().unwrap(),
                 url: aither_sandbox::ToolArtifactLocation::Download(
-                    url::Url::from_file_path(&path).unwrap(),
+                    url::Url::from_file_path(binary).unwrap(),
                 ),
-                sha256: format!("{:x}", sha2::Sha256::digest(&binary)),
+                sha256: format!("{:x}", sha2::Sha256::digest(&bytes)),
                 encoding: ToolArtifactFormat::Executable,
             })
             .collect();
-        let distribution =
-            ToolDistribution::from_json(&serde_json::to_vec(&Manifest { artifacts }).unwrap())
-                .unwrap();
+        ToolDistribution::from_json(&serde_json::to_vec(&Manifest { artifacts }).unwrap()).unwrap()
+    }
+
+    async fn noop_terminal(
+        dir: &std::path::Path,
+    ) -> aither_sandbox::TerminalTool<NoopPermissionHandler, TokioGlobal> {
+        aither_sandbox::TerminalTool::new_exact(dir, NoopPermissionHandler, TokioGlobal)
+            .await
+            .expect("terminal tool should initialize")
+    }
+
+    /// Asks for one terminal call running every baseline command, then stops.
+    #[derive(Clone)]
+    struct BaselineCommandLlm {
+        requests: async_channel::Sender<LLMRequest>,
+        turns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LanguageModel for BaselineCommandLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.requests
+                .try_send(request)
+                .expect("record model request");
+            let turn = self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let event = if turn == 0 {
+                Event::ToolCall(aither_core::llm::ToolCall::new(
+                    "baseline",
+                    "terminal",
+                    serde_json::json!({
+                        "description": "Run every baseline command",
+                        "script": "apply_patch --version && rg --version && ast-grep --version && jq --version",
+                        "mode": "sandboxed",
+                        "timeout": 30,
+                        "raw": true
+                    }),
+                ))
+            } else {
+                Event::Text("done".into())
+            };
+            futures_lite::stream::once(Ok(event))
+        }
+
+        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
+            std::future::ready(ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                100_000,
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebuilt_agent_adopts_prepared_tools_and_runs_baseline_commands() {
+        let source = tempdir().unwrap();
+        let binary = compile_baseline_fixture(source.path()).await;
+        let distribution = fixture_distribution(&binary, "1.0.0").await;
+        let cache = tempdir().unwrap();
+        let (requests, _captured) = async_channel::bounded(4);
+        let first_dir = tempdir().unwrap();
+        let first =
+            TerminalAgentBuilder::new(MockLlm { requests }, noop_terminal(first_dir.path()).await)
+                .initialize_tools(&distribution, cache.path())
+                .await
+                .expect("first agent prepares its tools");
+        let prepared = first.shell_sessions().clone();
+        let _first_agent = first.build();
+
+        let (requests, captured) = async_channel::bounded(4);
+        let second_dir = tempdir().unwrap();
+        let mut second = TerminalAgentBuilder::new(
+            BaselineCommandLlm {
+                requests,
+                turns: Arc::default(),
+            },
+            noop_terminal(second_dir.path()).await,
+        )
+        .max_iterations(2)
+        .with_default_prompt()
+        .prepared_shell_sessions(prepared)
+        .await
+        .expect("second agent adopts the prepared registry")
+        .build();
+        let events = second.run("Check the baseline commands", []);
+        futures_lite::pin!(events);
+        while futures_lite::StreamExt::next(&mut events).await.is_some() {}
+
+        let first_request = captured
+            .try_recv()
+            .expect("first model request was recorded");
+        assert!(
+            first_request
+                .messages()
+                .iter()
+                .any(|message| message.content().contains("<prepared_tools>")),
+            "the adopted catalog reaches the model"
+        );
+        let second_request = captured
+            .try_recv()
+            .expect("the terminal result was sent back to the model");
+        let transcript = second_request
+            .messages()
+            .iter()
+            .map(aither_core::llm::Message::content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("baseline-tool 1.0.0"),
+            "baseline commands ran from the adopted tools: {transcript}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adoption_skips_the_version_probe_that_preparation_runs() {
+        let source = tempdir().unwrap();
+        let binary = compile_baseline_fixture(source.path()).await;
+        // The fixture reports 1.0.0, so the probe rejects a 2.0.0 pin while
+        // downloads and integrity checks accept it.
+        let distribution = fixture_distribution(&binary, "2.0.0").await;
+        let cache = tempdir().unwrap();
+        let (requests, _captured) = async_channel::bounded(4);
+
+        let probed_dir = tempdir().unwrap();
+        let probed = TerminalAgentBuilder::new(
+            MockLlm {
+                requests: requests.clone(),
+            },
+            noop_terminal(probed_dir.path()).await,
+        )
+        .initialize_tools(&distribution, cache.path())
+        .await;
+        assert!(matches!(
+            probed,
+            Err(aither_sandbox::ToolRuntimeError::VersionMismatch(_))
+        ));
+
+        let prepared = ShellSessionRegistry::new(ShellRuntimeAvailability::default())
+            .initialize_tools(&distribution, cache.path())
+            .await
+            .expect("registry preparation runs no terminal probe");
+        let adopted_dir = tempdir().unwrap();
+        TerminalAgentBuilder::new(
+            MockLlm { requests },
+            noop_terminal(adopted_dir.path()).await,
+        )
+        .prepared_shell_sessions(prepared)
+        .await
+        .expect("adoption does not probe versions again")
+        .build();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_agent_builder_keeps_ipc_tools_out_of_llm_tool_surface() {
+        let dir = tempdir().expect("tempdir should exist");
+        let terminal_tool = noop_terminal(dir.path()).await;
+        let source = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let binary = compile_baseline_fixture(source.path()).await;
+        let distribution = fixture_distribution(&binary, "1.0.0").await;
         let (requests, captured) = async_channel::bounded(4);
         let mut agent = TerminalAgentBuilder::new(MockLlm { requests }, terminal_tool)
             .max_iterations(1)
