@@ -698,6 +698,31 @@ pub struct Configured {
     registry: Arc<ToolRegistry>,
 }
 
+/// Registry state that can be rebound to a different job registry.
+///
+/// Sealed: declared `pub` only so it may bound the public `TerminalTool`
+/// impl; it lives in this private module and is not re-exported.
+pub trait RegistryState: Clone {
+    /// Returns this state with its terminal controls bound to `jobs`.
+    fn for_jobs(&self, jobs: JobRegistry, output_dir: PathBuf) -> Self;
+}
+
+impl RegistryState for Unconfigured {
+    fn for_jobs(&self, _jobs: JobRegistry, _output_dir: PathBuf) -> Self {
+        Self
+    }
+}
+
+impl RegistryState for Configured {
+    fn for_jobs(&self, jobs: JobRegistry, output_dir: PathBuf) -> Self {
+        Self {
+            registry: Arc::new(
+                ToolRegistry::clone(&self.registry).with_terminal_controls(jobs, output_dir),
+            ),
+        }
+    }
+}
+
 /// The terminal tool for executing scripts in a sandbox.
 pub struct TerminalTool<P, E, State = Unconfigured> {
     /// Shared working directory (four random words, e.g., `amber-forest-thunder-pearl/`)
@@ -939,7 +964,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
 impl<P, E, State> TerminalTool<P, E, State>
 where
     E: Executor + Clone + 'static,
-    State: Clone,
+    State: RegistryState,
 {
     /// Adds additional writable paths to the sandbox configuration.
     ///
@@ -1005,7 +1030,6 @@ where
             permission_handler: self.permission_handler.clone(), // Arc clone - shares handler
             executor: self.executor.clone(),
             output_store: self.output_store.clone(),
-            job_registry,
             completed_rx,
             completed_tx,
             running_tasks,
@@ -1015,7 +1039,10 @@ where
             readable_paths: self.readable_paths.clone(),
             network_audit: self.network_audit.clone(),
             priority: self.priority,
-            registry: self.registry.clone(),
+            registry: self
+                .registry
+                .for_jobs(job_registry.clone(), self.outputs_dir()),
+            job_registry,
         }
     }
 
@@ -3736,6 +3763,115 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["terminal"]);
+    }
+
+    async fn query_control(
+        registry: &ToolRegistry,
+        name: &str,
+        args: &[&str],
+    ) -> serde_json::Value {
+        let args = args.iter().map(ToString::to_string).collect::<Vec<_>>();
+        serde_json::to_value(registry.query_tool_handler(name, &args).await)
+            .expect("command envelope should serialize")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_child_terminal_controls_address_child_jobs() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .with_shell_sessions(shell_sessions)
+            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                local: true,
+                container: false,
+                ssh: false,
+            });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let parent = tool.with_registry(registry);
+        let child = parent.child();
+
+        let result = child
+            .call(
+                TerminalArgs {
+                    description: "echo one stdin line then sleep".to_string(),
+                    script: "read line; printf 'got %s\\n' \"$line\"; sleep 30".to_string(),
+                    mode: TerminalExecutionMode::Sandboxed,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    timeout: 0,
+                    max_lines: 50,
+                    raw: false,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal call should succeed");
+        let payload = parse_terminal_tool_result(&result);
+        assert_eq!(payload.status.as_deref(), Some("running"));
+        let task_id = payload
+            .task_id
+            .expect("timeout=0 should return a background task id");
+
+        let input = query_control(
+            child.registry(),
+            "terminal_input",
+            &["--task-id", &task_id, "--input", "ping"],
+        )
+        .await;
+        assert_eq!(input["ok"], true, "child terminal_input failed: {input}");
+
+        let echoed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let read =
+                    query_control(child.registry(), "terminal_read", &["--task-id", &task_id])
+                        .await;
+                assert_eq!(read["ok"], true, "child terminal_read failed: {read}");
+                if read.to_string().contains("got ping") {
+                    return read;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("child terminal_read should observe the echoed line");
+        assert!(echoed.to_string().contains("running"), "{echoed}");
+
+        let parent_read =
+            query_control(parent.registry(), "terminal_read", &["--task-id", &task_id]).await;
+        assert_eq!(parent_read["ok"], false, "{parent_read}");
+        assert!(
+            parent_read["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("unknown task_id")),
+            "parent terminal_read must not see the child's task: {parent_read}"
+        );
+        let parent_kill =
+            query_control(parent.registry(), "terminal_kill", &["--task-id", &task_id]).await;
+        assert!(
+            parent_kill.to_string().contains("\"killed\":false"),
+            "parent terminal_kill must not reach the child's task: {parent_kill}"
+        );
+
+        let kill = query_control(child.registry(), "terminal_kill", &["--task-id", &task_id]).await;
+        assert!(
+            kill.to_string().contains("\"killed\":true"),
+            "child terminal_kill should stop its task: {kill}"
+        );
+        let stopped =
+            query_control(child.registry(), "terminal_read", &["--task-id", &task_id]).await;
+        assert!(
+            stopped.to_string().contains("\"kind\":\"killed\""),
+            "child task should be reported killed: {stopped}"
+        );
     }
 
     // These four drive a real sandbox running `/bin/pwd`. `heel` reports
