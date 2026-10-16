@@ -2523,6 +2523,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             port: bridge.port(),
         }),
         context.priority,
+        context.prepared_tools.bin_dir(),
         CONTAINER_EXEC_WORKING_DIR,
     )?;
 
@@ -2772,6 +2773,7 @@ struct ContainerHeelRunTemplate<'a> {
     heel_bin: &'a str,
     resolve_heel: bool,
     escaped_working_dir: &'a str,
+    escaped_tools_dir: &'a str,
     escaped_ipc_endpoint: Option<String>,
     nice: Option<u8>,
     io_priority: Option<&'static str>,
@@ -2792,7 +2794,10 @@ struct ContainerHeelRunTemplate<'a> {
 ///
 /// The container is already the isolation boundary, so the invocation asks for
 /// `permissive` isolation: the script keeps the filesystem permissions it had
-/// as the container caller. `PATH` and `HOME` are forwarded so the generated
+/// as the container caller. The ruleset still exec-denies everything outside
+/// the system directories, so `--executable` grants the mounted tools
+/// directory read-execute — without it every prepared tool fails with
+/// Permission denied. `PATH` and `HOME` are forwarded so the generated
 /// `heel ipc` shims still resolve and the script sees its usual environment.
 /// Networking keeps heel's deny-all default, and no rule is bent to pass the
 /// IPC transport: `--ipc-endpoint` has heel relay the sandbox's local IPC
@@ -2804,6 +2809,7 @@ fn heel_run_container_command(
     heel_bin: &str,
     resolve_heel: bool,
     ipc_endpoint: Option<ContainerIpcEndpoint<'_>>,
+    tools_dir: &ContainerPath,
     working_dir: &str,
 ) -> Result<String, TerminalError> {
     let nice = match priority.cpu() {
@@ -2816,6 +2822,7 @@ fn heel_run_container_command(
         IoPriority::Normal => None,
     };
     let escaped_working_dir = shell_escape(working_dir);
+    let escaped_tools_dir = shell_escape(tools_dir.as_str());
     let escaped_ipc_endpoint = ipc_endpoint
         .map(|endpoint| format!("tcp://{}:{}", endpoint.host, endpoint.port))
         .map(|endpoint| shell_escape(&endpoint));
@@ -2824,6 +2831,7 @@ fn heel_run_container_command(
         heel_bin,
         resolve_heel,
         escaped_working_dir: &escaped_working_dir,
+        escaped_tools_dir: &escaped_tools_dir,
         escaped_ipc_endpoint,
         nice,
         io_priority,
@@ -2838,6 +2846,7 @@ fn heel_run_container_command(
 fn prioritized_container_script(
     script: &str,
     priority: ProcessPriority,
+    tools_dir: &ContainerPath,
     working_dir: &str,
 ) -> Result<String, TerminalError> {
     if priority.is_normal() {
@@ -2852,6 +2861,7 @@ fn prioritized_container_script(
         "\"$MAY_HEEL_BIN\"",
         true,
         None,
+        tools_dir,
         working_dir,
     )
 }
@@ -2861,10 +2871,11 @@ fn wrap_container_script(
     ipc_commands: &[String],
     ipc_endpoint: Option<ContainerIpcEndpoint<'_>>,
     priority: ProcessPriority,
+    tools_dir: &ContainerPath,
     working_dir: &str,
 ) -> Result<String, TerminalError> {
     if ipc_commands.is_empty() {
-        return prioritized_container_script(script, priority, working_dir);
+        return prioritized_container_script(script, priority, tools_dir, working_dir);
     }
 
     let endpoint = ipc_endpoint.ok_or_else(|| {
@@ -2903,6 +2914,7 @@ fn wrap_container_script(
             "\"$MAY_IPC_BIN\"",
             false,
             Some(endpoint),
+            tools_dir,
             working_dir,
         )?
     };
@@ -3842,6 +3854,13 @@ mod tests {
         assert!(missing_description.to_string().contains("description"));
     }
 
+    /// The tools bin directory a container execution passes to the wrapper.
+    fn container_tools_dir() -> ContainerPath {
+        crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle())
+            .bin_dir()
+            .clone()
+    }
+
     #[test]
     fn wrap_container_script_refreshes_command_hash_table() {
         let wrapped = wrap_container_script(
@@ -3852,6 +3871,7 @@ mod tests {
                 port: 9000,
             }),
             ProcessPriority::default(),
+            &container_tools_dir(),
             CONTAINER_EXEC_WORKING_DIR,
         )
         .expect("wrap script");
@@ -3871,6 +3891,7 @@ mod tests {
                 port: 9000,
             }),
             ProcessPriority::default(),
+            &container_tools_dir(),
             CONTAINER_EXEC_WORKING_DIR,
         )
         .expect("wrap script");
@@ -3888,6 +3909,7 @@ mod tests {
                 port: 9000,
             }),
             ProcessPriority::default(),
+            &container_tools_dir(),
             CONTAINER_EXEC_WORKING_DIR,
         )
         .expect_err("invalid command name must fail");
@@ -3908,6 +3930,7 @@ mod tests {
                 port: 43123,
             }),
             ProcessPriority::default(),
+            &container_tools_dir(),
             CONTAINER_EXEC_WORKING_DIR,
         )
         .expect("wrap script");
@@ -4742,6 +4765,8 @@ mod tests {
             CpuPriority::Nice(NiceLevel::new(5).expect("nice level 5 is in range")),
             IoPriority::Background,
         );
+        let tools_dir = container_tools_dir();
+        let executable = format!("--executable {}", shell_escape(tools_dir.as_str()));
         let wrapped = wrap_container_script(
             "echo ok",
             &[String::from("websearch")],
@@ -4750,25 +4775,41 @@ mod tests {
                 port: 9000,
             }),
             priority,
+            &tools_dir,
             "/workspace",
         )
         .expect("wrap script");
         assert!(wrapped.contains(
             "\"$MAY_IPC_BIN\" run --isolation permissive --working-dir '/workspace' \
-             --env-passthrough PATH --env-passthrough HOME \
-             --ipc-endpoint 'tcp://host.docker.internal:9000' --grant \"$MAY_IPC_DIR=rx\" \
+             --env-passthrough PATH --env-passthrough HOME"
+        ));
+        assert!(wrapped.contains(&executable));
+        assert!(wrapped.contains(
+            "--ipc-endpoint 'tcp://host.docker.internal:9000' --grant \"$MAY_IPC_DIR=rx\" \
              --nice 5 --io-priority background -- sh -c 'echo ok'"
         ));
         assert!(wrapped.contains("HEEL_IPC_ENDPOINT"));
 
-        let bare = wrap_container_script("echo ok", &[], None, priority, "/workspace")
+        let bare = wrap_container_script("echo ok", &[], None, priority, &tools_dir, "/workspace")
             .expect("wrap script");
         assert!(bare.contains("MAY_HEEL_BIN=\"$(command -v heel || true)\""));
         assert!(bare.contains(
             "\"$MAY_HEEL_BIN\" run --isolation permissive --working-dir '/workspace' \
-             --env-passthrough PATH --env-passthrough HOME \
-             --nice 5 --io-priority background -- sh -c 'echo ok'"
+             --env-passthrough PATH --env-passthrough HOME"
         ));
+        assert!(bare.contains(&executable));
+        assert!(bare.contains("--nice 5 --io-priority background -- sh -c 'echo ok'"));
+
+        let normal = wrap_container_script(
+            "echo ok",
+            &[],
+            None,
+            ProcessPriority::default(),
+            &tools_dir,
+            "/workspace",
+        )
+        .expect("wrap script");
+        assert_eq!(normal, "echo ok");
     }
 
     #[test]
@@ -4778,6 +4819,7 @@ mod tests {
             &[],
             None,
             ProcessPriority::new(CpuPriority::Normal, IoPriority::Utility),
+            &container_tools_dir(),
             "/workspace",
         )
         .expect("wrap script");
@@ -4792,6 +4834,7 @@ mod tests {
                 CpuPriority::Nice(NiceLevel::new(9).expect("nice level 9 is in range")),
                 IoPriority::Normal,
             ),
+            &container_tools_dir(),
             "/workspace",
         )
         .expect("wrap script");
