@@ -4949,13 +4949,15 @@ mod tests {
 
     #[cfg(all(unix, aither_container_acceptance))]
     impl TestDockerContainer {
-        /// Starts a container with `heel_bin` mounted at `/usr/local/bin/heel`
-        /// and `host.docker.internal` resolving to the docker host gateway,
+        /// Starts a container with `heel_bin` mounted at `/usr/local/bin/heel`,
+        /// the prepared tool bundle mounted read-only where production mounts
+        /// it, and `host.docker.internal` resolving to the docker host gateway,
         /// and prepares the `/workspace` directory container executions run
         /// in. Returns `None` when docker cannot start the container.
-        fn start(heel_bin: &Path) -> Option<Self> {
+        fn start(heel_bin: &Path, tools: &crate::MountSpec) -> Option<Self> {
             let name = format!("aither-test-{}", uuid::Uuid::new_v4().simple());
             let mount = format!("{}:/usr/local/bin/heel:ro", heel_bin.display());
+            let tools_mount = format!("{}:{}:ro", tools.host_path.display(), tools.container_path);
             let output = std::process::Command::new("docker")
                 .args([
                     "run",
@@ -4965,6 +4967,8 @@ mod tests {
                     "--add-host=host.docker.internal:host-gateway",
                     "-v",
                     &mount,
+                    "-v",
+                    &tools_mount,
                     "ubuntu:24.04",
                     "tail",
                     "-f",
@@ -5056,9 +5060,16 @@ mod tests {
     /// a real docker daemon and a Linux `heel` binary, which the dedicated CI
     /// job provides and the feature matrices do not. A missing daemon or
     /// binary fails the test — it is never skipped silently.
+    /// Starts the acceptance container with the test bundle staged and
+    /// mounted read-only as production mounts it, so the wrapped script runs
+    /// a prepared command from that mount. The returned directory holds the
+    /// staged bundle and must outlive the container.
     #[cfg(all(unix, aither_container_acceptance))]
-    #[tokio::test]
-    async fn container_command_runs_with_configured_nice_and_reaches_ipc() {
+    async fn start_acceptance_container() -> (
+        TestDockerContainer,
+        crate::tool_runtime::ToolBundle,
+        tempfile::TempDir,
+    ) {
         let docker_ready = std::process::Command::new("docker")
             .arg("info")
             .output()
@@ -5069,8 +5080,21 @@ mod tests {
         );
         let heel_bin = container_test_heel_binary()
             .expect("container acceptance requires a Linux heel binary (set HEEL_BIN)");
-        let container = TestDockerContainer::start(&heel_bin)
+        let bundle = crate::tool_runtime::tests::bundle();
+        let tools_cache = tempfile::tempdir().expect("tool cache dir should be created");
+        let (tools_mount, _) = bundle
+            .prepare_container_mount(tools_cache.path())
+            .await
+            .expect("test bundle should stage for a container mount");
+        let container = TestDockerContainer::start(&heel_bin, &tools_mount)
             .expect("container acceptance could not start ubuntu:24.04");
+        (container, bundle, tools_cache)
+    }
+
+    #[cfg(all(unix, aither_container_acceptance))]
+    #[tokio::test]
+    async fn container_command_runs_with_configured_nice_and_reaches_ipc() {
+        let (container, bundle, _tools_cache) = start_acceptance_container().await;
 
         let client = Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("docker client should connect"),
@@ -5090,10 +5114,8 @@ mod tests {
 
         // The container backend needs its own prepared tools: the registry
         // entry names the container and its `/opt/aither/tools` bin dir, which
-        // the wrapped script puts on `PATH`. Nothing in this test invokes a
-        // prepared command, so the bundle's container view is enough.
-        let container_tools =
-            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle());
+        // the wrapped script puts on `PATH` and heel must grant execute on.
+        let container_tools = crate::tool_runtime::tests::container_tools(&bundle);
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,
@@ -5129,6 +5151,7 @@ mod tests {
                     description: "probe container priority and IPC transport".to_string(),
                     script: concat!(
                         "printf 'nice=%s\\n' \"$(nice)\"; ",
+                        "jq --version; ",
                         "probe_echo --marker pong; ",
                         "printf 'probe_exit=%s\\n' \"$?\""
                     )
@@ -5146,8 +5169,13 @@ mod tests {
             .await
             .expect("container terminal call should succeed");
         let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.exit_code, 0);
         let stdout = output_text(&payload.stdout).unwrap_or_default();
+        assert_eq!(
+            payload.exit_code,
+            0,
+            "container command failed; stdout: {stdout}; stderr: {:?}",
+            payload.stderr.as_ref().and_then(output_text)
+        );
         // The CI job runs the test with --nocapture so the container's output
         // — the applied nice level and the live probe reply — lands in the
         // job log.
@@ -5155,6 +5183,10 @@ mod tests {
         assert!(
             stdout.contains("nice=5"),
             "container command should run at the configured nice level; stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("jq 1.0.0"),
+            "a prepared command should run from the read-only tools mount; stdout: {stdout}"
         );
         assert!(
             stdout.contains("pong"),
