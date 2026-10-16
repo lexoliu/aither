@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3](https://github.com/lexoliu/aither/compare/cli-v0.9.2...cli-v0.9.3) - 2026-10-16
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.8.0](https://github.com/lexoliu/aither/compare/cli-v0.7.0...cli-v0.8.0) - 2026-10-15
 
 ### Other
