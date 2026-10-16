@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/lexoliu/aither/compare/sandbox-v0.9.0...sandbox-v0.9.1) - 2026-10-16
+
+### Other
+
+- Run a prepared command in the container acceptance test
+- Grant the container heel run execute on the prepared tools directory
+
 ## [0.9.0](https://github.com/lexoliu/aither/compare/sandbox-v0.8.0...sandbox-v0.9.0) - 2026-10-15
 
 ### Fixed
