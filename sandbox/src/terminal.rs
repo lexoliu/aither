@@ -2523,6 +2523,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             port: bridge.port(),
         }),
         context.priority,
+        context.prepared_tools.bin_dir(),
         CONTAINER_EXEC_WORKING_DIR,
     )?;
 
@@ -2772,6 +2773,7 @@ struct ContainerHeelRunTemplate<'a> {
     heel_bin: &'a str,
     resolve_heel: bool,
     escaped_working_dir: &'a str,
+    escaped_tools_dir: &'a str,
     escaped_ipc_endpoint: Option<String>,
     nice: Option<u8>,
     io_priority: Option<&'static str>,
@@ -2792,7 +2794,10 @@ struct ContainerHeelRunTemplate<'a> {
 ///
 /// The container is already the isolation boundary, so the invocation asks for
 /// `permissive` isolation: the script keeps the filesystem permissions it had
-/// as the container caller. `PATH` and `HOME` are forwarded so the generated
+/// as the container caller. The ruleset still exec-denies everything outside
+/// the system directories, so `--executable` grants the mounted tools
+/// directory read-execute — without it every prepared tool fails with
+/// Permission denied. `PATH` and `HOME` are forwarded so the generated
 /// `heel ipc` shims still resolve and the script sees its usual environment.
 /// Networking keeps heel's deny-all default, and no rule is bent to pass the
 /// IPC transport: `--ipc-endpoint` has heel relay the sandbox's local IPC
@@ -2804,6 +2809,7 @@ fn heel_run_container_command(
     heel_bin: &str,
     resolve_heel: bool,
     ipc_endpoint: Option<ContainerIpcEndpoint<'_>>,
+    tools_dir: &ContainerPath,
     working_dir: &str,
 ) -> Result<String, TerminalError> {
     let nice = match priority.cpu() {
@@ -2816,6 +2822,7 @@ fn heel_run_container_command(
         IoPriority::Normal => None,
     };
     let escaped_working_dir = shell_escape(working_dir);
+    let escaped_tools_dir = shell_escape(tools_dir.as_str());
     let escaped_ipc_endpoint = ipc_endpoint
         .map(|endpoint| format!("tcp://{}:{}", endpoint.host, endpoint.port))
         .map(|endpoint| shell_escape(&endpoint));
@@ -2824,6 +2831,7 @@ fn heel_run_container_command(
         heel_bin,
         resolve_heel,
         escaped_working_dir: &escaped_working_dir,
+        escaped_tools_dir: &escaped_tools_dir,
         escaped_ipc_endpoint,
         nice,
         io_priority,
@@ -2838,6 +2846,7 @@ fn heel_run_container_command(
 fn prioritized_container_script(
     script: &str,
     priority: ProcessPriority,
+    tools_dir: &ContainerPath,
     working_dir: &str,
 ) -> Result<String, TerminalError> {
     if priority.is_normal() {
@@ -2852,6 +2861,7 @@ fn prioritized_container_script(
         "\"$MAY_HEEL_BIN\"",
         true,
         None,
+        tools_dir,
         working_dir,
     )
 }
@@ -2861,10 +2871,11 @@ fn wrap_container_script(
     ipc_commands: &[String],
     ipc_endpoint: Option<ContainerIpcEndpoint<'_>>,
     priority: ProcessPriority,
+    tools_dir: &ContainerPath,
     working_dir: &str,
 ) -> Result<String, TerminalError> {
     if ipc_commands.is_empty() {
-        return prioritized_container_script(script, priority, working_dir);
+        return prioritized_container_script(script, priority, tools_dir, working_dir);
     }
 
     let endpoint = ipc_endpoint.ok_or_else(|| {
@@ -2903,6 +2914,7 @@ fn wrap_container_script(
             "\"$MAY_IPC_BIN\"",
             false,
             Some(endpoint),
+            tools_dir,
             working_dir,
         )?
     };
@@ -3842,6 +3854,13 @@ mod tests {
         assert!(missing_description.to_string().contains("description"));
     }
 
+    /// The tools bin directory a container execution passes to the wrapper.
+    fn container_tools_dir() -> ContainerPath {
+        crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle())
+            .bin_dir()
+            .clone()
+    }
+
     #[test]
     fn wrap_container_script_refreshes_command_hash_table() {
         let wrapped = wrap_container_script(
@@ -3852,6 +3871,7 @@ mod tests {
                 port: 9000,
             }),
             ProcessPriority::default(),
+            &container_tools_dir(),
             CONTAINER_EXEC_WORKING_DIR,
         )
         .expect("wrap script");
@@ -3871,6 +3891,7 @@ mod tests {
                 port: 9000,
             }),
             ProcessPriority::default(),
+            &container_tools_dir(),
             CONTAINER_EXEC_WORKING_DIR,
         )
         .expect("wrap script");
@@ -3888,6 +3909,7 @@ mod tests {
                 port: 9000,
             }),
             ProcessPriority::default(),
+            &container_tools_dir(),
             CONTAINER_EXEC_WORKING_DIR,
         )
         .expect_err("invalid command name must fail");
@@ -3908,6 +3930,7 @@ mod tests {
                 port: 43123,
             }),
             ProcessPriority::default(),
+            &container_tools_dir(),
             CONTAINER_EXEC_WORKING_DIR,
         )
         .expect("wrap script");
@@ -4742,6 +4765,8 @@ mod tests {
             CpuPriority::Nice(NiceLevel::new(5).expect("nice level 5 is in range")),
             IoPriority::Background,
         );
+        let tools_dir = container_tools_dir();
+        let executable = format!("--executable {}", shell_escape(tools_dir.as_str()));
         let wrapped = wrap_container_script(
             "echo ok",
             &[String::from("websearch")],
@@ -4750,25 +4775,41 @@ mod tests {
                 port: 9000,
             }),
             priority,
+            &tools_dir,
             "/workspace",
         )
         .expect("wrap script");
         assert!(wrapped.contains(
             "\"$MAY_IPC_BIN\" run --isolation permissive --working-dir '/workspace' \
-             --env-passthrough PATH --env-passthrough HOME \
-             --ipc-endpoint 'tcp://host.docker.internal:9000' --grant \"$MAY_IPC_DIR=rx\" \
+             --env-passthrough PATH --env-passthrough HOME"
+        ));
+        assert!(wrapped.contains(&executable));
+        assert!(wrapped.contains(
+            "--ipc-endpoint 'tcp://host.docker.internal:9000' --grant \"$MAY_IPC_DIR=rx\" \
              --nice 5 --io-priority background -- sh -c 'echo ok'"
         ));
         assert!(wrapped.contains("HEEL_IPC_ENDPOINT"));
 
-        let bare = wrap_container_script("echo ok", &[], None, priority, "/workspace")
+        let bare = wrap_container_script("echo ok", &[], None, priority, &tools_dir, "/workspace")
             .expect("wrap script");
         assert!(bare.contains("MAY_HEEL_BIN=\"$(command -v heel || true)\""));
         assert!(bare.contains(
             "\"$MAY_HEEL_BIN\" run --isolation permissive --working-dir '/workspace' \
-             --env-passthrough PATH --env-passthrough HOME \
-             --nice 5 --io-priority background -- sh -c 'echo ok'"
+             --env-passthrough PATH --env-passthrough HOME"
         ));
+        assert!(bare.contains(&executable));
+        assert!(bare.contains("--nice 5 --io-priority background -- sh -c 'echo ok'"));
+
+        let normal = wrap_container_script(
+            "echo ok",
+            &[],
+            None,
+            ProcessPriority::default(),
+            &tools_dir,
+            "/workspace",
+        )
+        .expect("wrap script");
+        assert_eq!(normal, "echo ok");
     }
 
     #[test]
@@ -4778,6 +4819,7 @@ mod tests {
             &[],
             None,
             ProcessPriority::new(CpuPriority::Normal, IoPriority::Utility),
+            &container_tools_dir(),
             "/workspace",
         )
         .expect("wrap script");
@@ -4792,6 +4834,7 @@ mod tests {
                 CpuPriority::Nice(NiceLevel::new(9).expect("nice level 9 is in range")),
                 IoPriority::Normal,
             ),
+            &container_tools_dir(),
             "/workspace",
         )
         .expect("wrap script");
@@ -4906,13 +4949,15 @@ mod tests {
 
     #[cfg(all(unix, aither_container_acceptance))]
     impl TestDockerContainer {
-        /// Starts a container with `heel_bin` mounted at `/usr/local/bin/heel`
-        /// and `host.docker.internal` resolving to the docker host gateway,
+        /// Starts a container with `heel_bin` mounted at `/usr/local/bin/heel`,
+        /// the prepared tool bundle mounted read-only where production mounts
+        /// it, and `host.docker.internal` resolving to the docker host gateway,
         /// and prepares the `/workspace` directory container executions run
         /// in. Returns `None` when docker cannot start the container.
-        fn start(heel_bin: &Path) -> Option<Self> {
+        fn start(heel_bin: &Path, tools: &crate::MountSpec) -> Option<Self> {
             let name = format!("aither-test-{}", uuid::Uuid::new_v4().simple());
             let mount = format!("{}:/usr/local/bin/heel:ro", heel_bin.display());
+            let tools_mount = format!("{}:{}:ro", tools.host_path.display(), tools.container_path);
             let output = std::process::Command::new("docker")
                 .args([
                     "run",
@@ -4922,6 +4967,8 @@ mod tests {
                     "--add-host=host.docker.internal:host-gateway",
                     "-v",
                     &mount,
+                    "-v",
+                    &tools_mount,
                     "ubuntu:24.04",
                     "tail",
                     "-f",
@@ -5013,9 +5060,16 @@ mod tests {
     /// a real docker daemon and a Linux `heel` binary, which the dedicated CI
     /// job provides and the feature matrices do not. A missing daemon or
     /// binary fails the test — it is never skipped silently.
+    /// Starts the acceptance container with the test bundle staged and
+    /// mounted read-only as production mounts it, so the wrapped script runs
+    /// a prepared command from that mount. The returned directory holds the
+    /// staged bundle and must outlive the container.
     #[cfg(all(unix, aither_container_acceptance))]
-    #[tokio::test]
-    async fn container_command_runs_with_configured_nice_and_reaches_ipc() {
+    async fn start_acceptance_container() -> (
+        TestDockerContainer,
+        crate::tool_runtime::ToolBundle,
+        tempfile::TempDir,
+    ) {
         let docker_ready = std::process::Command::new("docker")
             .arg("info")
             .output()
@@ -5026,8 +5080,21 @@ mod tests {
         );
         let heel_bin = container_test_heel_binary()
             .expect("container acceptance requires a Linux heel binary (set HEEL_BIN)");
-        let container = TestDockerContainer::start(&heel_bin)
+        let bundle = crate::tool_runtime::tests::bundle();
+        let tools_cache = tempfile::tempdir().expect("tool cache dir should be created");
+        let (tools_mount, _) = bundle
+            .prepare_container_mount(tools_cache.path())
+            .await
+            .expect("test bundle should stage for a container mount");
+        let container = TestDockerContainer::start(&heel_bin, &tools_mount)
             .expect("container acceptance could not start ubuntu:24.04");
+        (container, bundle, tools_cache)
+    }
+
+    #[cfg(all(unix, aither_container_acceptance))]
+    #[tokio::test]
+    async fn container_command_runs_with_configured_nice_and_reaches_ipc() {
+        let (container, bundle, _tools_cache) = start_acceptance_container().await;
 
         let client = Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("docker client should connect"),
@@ -5047,10 +5114,8 @@ mod tests {
 
         // The container backend needs its own prepared tools: the registry
         // entry names the container and its `/opt/aither/tools` bin dir, which
-        // the wrapped script puts on `PATH`. Nothing in this test invokes a
-        // prepared command, so the bundle's container view is enough.
-        let container_tools =
-            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle());
+        // the wrapped script puts on `PATH` and heel must grant execute on.
+        let container_tools = crate::tool_runtime::tests::container_tools(&bundle);
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,
@@ -5086,6 +5151,7 @@ mod tests {
                     description: "probe container priority and IPC transport".to_string(),
                     script: concat!(
                         "printf 'nice=%s\\n' \"$(nice)\"; ",
+                        "jq --version; ",
                         "probe_echo --marker pong; ",
                         "printf 'probe_exit=%s\\n' \"$?\""
                     )
@@ -5103,8 +5169,13 @@ mod tests {
             .await
             .expect("container terminal call should succeed");
         let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.exit_code, 0);
         let stdout = output_text(&payload.stdout).unwrap_or_default();
+        assert_eq!(
+            payload.exit_code,
+            0,
+            "container command failed; stdout: {stdout}; stderr: {:?}",
+            payload.stderr.as_ref().and_then(output_text)
+        );
         // The CI job runs the test with --nocapture so the container's output
         // — the applied nice level and the live probe reply — lands in the
         // job log.
@@ -5112,6 +5183,10 @@ mod tests {
         assert!(
             stdout.contains("nice=5"),
             "container command should run at the configured nice level; stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("jq 1.0.0"),
+            "a prepared command should run from the read-only tools mount; stdout: {stdout}"
         );
         assert!(
             stdout.contains("pong"),
