@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3](https://github.com/lexoliu/aither/compare/sandbox-v0.9.1...sandbox-v0.9.3) - 2026-10-16
+
+### Other
+
+- release v0.9.2
+- Encode container IPC responses with field names
+
 ## [0.9.2](https://github.com/lexoliu/aither/compare/sandbox-v0.9.1...sandbox-v0.9.2) - 2026-10-16
 
 ### Other
