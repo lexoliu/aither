@@ -3102,7 +3102,7 @@ async fn write_container_ipc_success(
     stream: &mut Async<StdTcpStream>,
     response: &crate::command::CommandEnvelope,
 ) -> Result<(), String> {
-    let payload = rmp_serde::to_vec(response)
+    let payload = rmp_serde::to_vec_named(response)
         .map_err(|e| format!("failed to encode IPC success payload: {e}"))?;
     write_container_ipc_response(stream, true, &payload).await
 }
@@ -3111,7 +3111,7 @@ async fn write_container_ipc_error(
     stream: &mut Async<StdTcpStream>,
     message: &str,
 ) -> Result<(), String> {
-    let payload = rmp_serde::to_vec(&message.to_string())
+    let payload = rmp_serde::to_vec_named(&message.to_string())
         .map_err(|e| format!("failed to encode IPC error payload: {e}"))?;
     write_container_ipc_response(stream, false, &payload).await
 }
@@ -4894,7 +4894,7 @@ mod tests {
             .expect("client should connect to the bridge");
 
         let method = b"probe_echo";
-        let params = rmp_serde::to_vec(&serde_json::json!({ "marker": "pong" }))
+        let params = rmp_serde::to_vec_named(&serde_json::json!({ "marker": "pong" }))
             .expect("params should encode");
         let mut request = vec![u8::try_from(method.len()).expect("method name fits a byte")];
         request.extend_from_slice(method);
@@ -4924,18 +4924,19 @@ mod tests {
             .split_first()
             .expect("response carries a success flag");
         assert_eq!(*success, 1, "bridge should report success");
-        let envelope: crate::command::CommandEnvelope =
-            rmp_serde::from_slice(payload).expect("response should decode as an envelope");
+        let envelope: serde_json::Value =
+            rmp_serde::from_slice(payload).expect("response should decode as msgpack");
         assert_eq!(
             envelope,
-            crate::command::CommandEnvelope {
+            serde_json::to_value(crate::command::CommandEnvelope {
                 ok: true,
                 payload: Some(crate::command::CommandPayload::Json {
                     value: serde_json::json!({ "marker": "pong" }),
                 }),
                 error: None,
-            },
-            "probe_echo should answer from the live handler"
+            })
+            .expect("envelope should convert to JSON"),
+            "probe_echo should answer from the live handler with field names, as heel's router does"
         );
 
         drop(stream);
