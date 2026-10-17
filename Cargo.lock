@@ -97,6 +97,7 @@ dependencies = [
  "aither-core",
  "aither-fs",
  "aither-mcp",
+ "aither-openai",
  "aither-sandbox",
  "aither-skills",
  "aither-webfetch",
