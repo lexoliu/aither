@@ -697,7 +697,7 @@ fn print_history<Advanced, Balanced, Fast, H>(agent: &Agent<Advanced, Balanced, 
 where
     Advanced: LanguageModel,
     Balanced: LanguageModel,
-    Fast: LanguageModel,
+    Fast: LanguageModel + 'static,
     H: Hook,
 {
     let history = agent.history();

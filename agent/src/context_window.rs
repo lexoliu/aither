@@ -3,49 +3,52 @@
 use aither_core::llm::Message;
 use serde::{Deserialize, Serialize};
 
-/// High-level lifecycle phase of the assembled context window.
+/// Lifecycle phase of the assembled context window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextWindowPhase {
-    /// Regular operating state.
+    /// Usage is below the compaction threshold.
     Stable,
-    /// A lightweight reassembly should run before attempting compaction.
+    /// The window should be rebuilt before the next request.
+    ///
+    /// Either the prompt cache has gone cold after an idle gap, or a system
+    /// block rewrite is waiting for a moment where it costs nothing.
     ReassemblyDue,
-    /// Full-window usage is high enough that compaction should be considered.
-    CompressionDue,
-    /// Usage is close enough to the hard limit that the model should hand off.
-    HandoffDue,
-    /// A handoff document is already active in the context.
-    HandoffActive,
+    /// A compaction is in flight alongside the run.
+    Compacting,
+    /// Usage reached the pause threshold and the run must wait for a handoff.
+    Exhausted,
 }
 
 /// Metrics describing the currently assembled context window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextWindowMetrics {
-    /// Estimated fraction of the effective context window currently in use.
+    /// Fraction of the calibrated context window currently in use.
     pub usage_fraction: f32,
-    /// Context window of the currently selected reasoning model.
-    pub selected_model_context_window: Option<u32>,
-    /// Context window of the fast model used for compaction.
-    pub fast_model_context_window: Option<u32>,
-    /// Effective window used for budgeting (minimum of selected and fast).
-    pub effective_context_window: usize,
-    /// Number of persistent system blocks in the structured context.
+    /// Usable context window in tokens.
+    pub context_window: u32,
+    /// Estimated prompt tokens currently held in the window.
+    pub estimated_tokens: usize,
+    /// Characters per token, calibrated against the provider's own counts.
+    pub chars_per_token: f64,
+    /// Number of persistent system blocks in the stable prefix.
     pub system_block_count: usize,
-    /// Number of ephemeral reminders currently assembled.
-    pub reminder_count: usize,
-    /// Number of recent conversation messages.
+    /// Number of conversation messages.
     pub recent_message_count: usize,
-    /// Number of recent system messages that can be pruned by reassembly.
+    /// Number of durable system alerts that reassembly can prune.
     pub recent_system_message_count: usize,
-    /// Whether a persisted handoff document is present.
+    /// Whether a handoff document is present.
     pub has_handoff: bool,
+    /// Whether a system block rewrite is waiting for reassembly.
+    pub has_staged_system_updates: bool,
+    /// How many times the cacheable prefix has been rewritten this session.
+    pub prompt_cache_epoch: u32,
 }
 
 /// Fully assembled LLM request window plus lifecycle metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextWindowSnapshot {
-    /// Lifecycle phase derived from current budgeting rules.
+    /// Lifecycle phase derived from the current policy.
     pub phase: ContextWindowPhase,
     /// Metrics for observability and persistence.
     pub metrics: ContextWindowMetrics,

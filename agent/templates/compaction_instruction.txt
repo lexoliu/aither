@@ -1,6 +1,10 @@
 Your context window is being compacted. Generate a structured handoff object so a fresh instance of yourself can continue seamlessly.
 
-{focus_instruction}
+{% if let Some(focus) = focus %}
+Focus the handoff on: {{ focus }}
+{% else %}
+No additional focus hint was provided.
+{% endif %}
 
 Output a single JSON object with EXACTLY these top-level keys:
 - `current_task`: string
@@ -16,10 +20,9 @@ Populate them as follows:
 - `files_paths`: every file path you have read, written, or plan to modify
 - `errors_fixes`: errors encountered and how they were resolved or remain pending
 - `pending_work`: remaining work in order, including the immediate next action
-- `recovery_hints`: database-backed session history/context snapshot recovery hints and any other important state locations
+- `recovery_hints`: session history and context snapshot recovery hints, plus any other important state locations
 
 Rules:
 - Be concise but complete -- every detail you omit is permanently lost.
 - Prefer file paths over inline content (the new instance can read them).
 - Do NOT include markdown, code fences, commentary, or any text outside the JSON object.
-
