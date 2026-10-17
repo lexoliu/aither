@@ -376,7 +376,7 @@ fn extract_executable(
             let mut found = None;
             for index in 0..archive.len() {
                 let entry = archive.by_index(index)?;
-                if entry.name() != name {
+                if entry.name()? != name {
                     continue;
                 }
                 if found.is_some() || !entry.is_file() || entry.is_symlink() {
