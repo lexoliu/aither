@@ -50,6 +50,7 @@ tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 url = "2.5.8"
 async-process = "=2.5.0"
+aither-openai.workspace = true
 
 [features]
 default = []

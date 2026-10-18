@@ -6,6 +6,7 @@
 
 use num_traits::ToPrimitive as _;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use aither_core::{
@@ -115,32 +116,6 @@ enum ModelEventAction {
 
 type ToolExecutionResult = Result<(String, String, aither_core::llm::ToolResult), AgentError>;
 type ToolExecutionSignal = ExecutionSignal<ToolExecutionResult>;
-
-macro_rules! drain_model_stream {
-    ($stream:expr, $hooks:expr, $cache_stats:expr, $events:expr, $text_chunks:expr, $tool_calls:expr, $reasoning:expr, $malformed:expr) => {{
-        let stream = $stream;
-        futures_lite::pin!(stream);
-        while let Some(event) = stream.next().await {
-            match handle_model_event(
-                $hooks,
-                $cache_stats,
-                event.map_err(|error| error.to_string()),
-                $text_chunks,
-                $tool_calls,
-                $reasoning,
-            )
-            .await?
-            {
-                ModelEventAction::Emit(event) => $events.emit(event),
-                ModelEventAction::Continue => {}
-                ModelEventAction::RetryMalformed => {
-                    $malformed = true;
-                    break;
-                }
-            }
-        }
-    }};
-}
 
 async fn handle_model_event<H: Hook>(
     hooks: &H,
@@ -560,6 +535,34 @@ where
     Fast: LanguageModel,
     H: Hook,
 {
+    /// Response stream of the active tier, boxed so the provider's concrete
+    /// stream type does not inflate this async chain's poll frames in debug
+    /// builds (aither#143).
+    fn respond_stream<'a>(
+        tier: ModelTier,
+        advanced: &'a Advanced,
+        balanced: &'a Balanced,
+        fast: &'a Fast,
+        request: LLMRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<Event, String>> + Send + 'a>> {
+        match tier {
+            ModelTier::Advanced => Box::pin(
+                advanced
+                    .respond(request)
+                    .map(|event| event.map_err(|error| error.to_string())),
+            ),
+            ModelTier::Balanced => Box::pin(
+                balanced
+                    .respond(request)
+                    .map(|event| event.map_err(|error| error.to_string())),
+            ),
+            ModelTier::Fast => Box::pin(
+                fast.respond(request)
+                    .map(|event| event.map_err(|error| error.to_string())),
+            ),
+        }
+    }
+
     async fn collect_model_turn(
         &mut self,
         request: LLMRequest,
@@ -570,42 +573,31 @@ where
         let mut reasoning = Vec::new();
         let mut malformed_function_call = false;
 
-        match self.tier {
-            ModelTier::Advanced => {
-                drain_model_stream!(
-                    self.advanced.respond(request),
-                    &self.hooks,
-                    &mut self.cache_stats,
-                    events,
-                    &mut text_chunks,
-                    &mut tool_calls,
-                    &mut reasoning,
-                    malformed_function_call
-                );
-            }
-            ModelTier::Balanced => {
-                drain_model_stream!(
-                    self.balanced.respond(request),
-                    &self.hooks,
-                    &mut self.cache_stats,
-                    events,
-                    &mut text_chunks,
-                    &mut tool_calls,
-                    &mut reasoning,
-                    malformed_function_call
-                );
-            }
-            ModelTier::Fast => {
-                drain_model_stream!(
-                    self.fast.respond(request),
-                    &self.hooks,
-                    &mut self.cache_stats,
-                    events,
-                    &mut text_chunks,
-                    &mut tool_calls,
-                    &mut reasoning,
-                    malformed_function_call
-                );
+        let stream = Self::respond_stream(
+            self.tier,
+            &self.advanced,
+            &self.balanced,
+            &self.fast,
+            request,
+        );
+        futures_lite::pin!(stream);
+        while let Some(event) = stream.next().await {
+            match handle_model_event(
+                &self.hooks,
+                &mut self.cache_stats,
+                event,
+                &mut text_chunks,
+                &mut tool_calls,
+                &mut reasoning,
+            )
+            .await?
+            {
+                ModelEventAction::Emit(event) => events.emit(event),
+                ModelEventAction::Continue => {}
+                ModelEventAction::RetryMalformed => {
+                    malformed_function_call = true;
+                    break;
+                }
             }
         }
 
@@ -1324,48 +1316,22 @@ where
         messages.push(Message::user(handoff_prompt));
 
         let mut chunks = Vec::new();
-        match self.tier {
-            ModelTier::Advanced => {
-                let stream = self.advanced.respond(LLMRequest::new(messages.clone()));
-                futures_lite::pin!(stream);
-                while let Some(event) = stream.next().await {
-                    match event {
-                        Ok(Event::Text(text)) => chunks.push(text),
-                        Ok(Event::BuiltInToolResult { tool, result }) => {
-                            chunks.push(format_builtin_tool_result(&tool, &result));
-                        }
-                        Ok(_) => {}
-                        Err(e) => return Err(AgentError::Llm(e.to_string())),
-                    }
+        let stream = Self::respond_stream(
+            self.tier,
+            &self.advanced,
+            &self.balanced,
+            &self.fast,
+            LLMRequest::new(messages),
+        );
+        futures_lite::pin!(stream);
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(Event::Text(text)) => chunks.push(text),
+                Ok(Event::BuiltInToolResult { tool, result }) => {
+                    chunks.push(format_builtin_tool_result(&tool, &result));
                 }
-            }
-            ModelTier::Balanced => {
-                let stream = self.balanced.respond(LLMRequest::new(messages.clone()));
-                futures_lite::pin!(stream);
-                while let Some(event) = stream.next().await {
-                    match event {
-                        Ok(Event::Text(text)) => chunks.push(text),
-                        Ok(Event::BuiltInToolResult { tool, result }) => {
-                            chunks.push(format_builtin_tool_result(&tool, &result));
-                        }
-                        Ok(_) => {}
-                        Err(e) => return Err(AgentError::Llm(e.to_string())),
-                    }
-                }
-            }
-            ModelTier::Fast => {
-                let stream = self.fast.respond(LLMRequest::new(messages));
-                futures_lite::pin!(stream);
-                while let Some(event) = stream.next().await {
-                    match event {
-                        Ok(Event::Text(text)) => chunks.push(text),
-                        Ok(Event::BuiltInToolResult { tool, result }) => {
-                            chunks.push(format_builtin_tool_result(&tool, &result));
-                        }
-                        Ok(_) => {}
-                        Err(e) => return Err(AgentError::Llm(e.to_string())),
-                    }
-                }
+                Ok(_) => {}
+                Err(e) => return Err(AgentError::Llm(e)),
             }
         }
 
@@ -2216,6 +2182,35 @@ mod tests {
                 "mock model",
                 self.context_length,
             ))
+        }
+    }
+
+    /// aither#143: the provider `respond` stream's multi-KB state machine must
+    /// stay boxed at the leaf (`respond_stream`); if the box is removed these
+    /// futures embed it by value and each poll frame pays the ~32 KB temp.
+    #[test]
+    fn run_futures_stay_small_with_a_real_provider_type() {
+        let provider = aither_openai::OpenAI::new("sk-test").with_base_url("http://127.0.0.1:9");
+        let mut agent = Agent::new(provider);
+        let (tx, _rx) = async_channel::unbounded();
+        let sink = EventSink { sender: tx };
+
+        let request = LLMRequest::new(vec![Message::user("hi")]);
+        {
+            let fut = agent.collect_model_turn(request, &sink);
+            assert!(
+                std::mem::size_of_val(&fut) < 8 * 1024,
+                "collect_model_turn future is {} B",
+                std::mem::size_of_val(&fut)
+            );
+        }
+        {
+            let fut = agent.run_streaming("hi".to_string(), Vec::new(), &sink);
+            assert!(
+                std::mem::size_of_val(&fut) < 8 * 1024,
+                "run_streaming future is {} B",
+                std::mem::size_of_val(&fut)
+            );
         }
     }
 
