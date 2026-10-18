@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/lexoliu/aither/compare/agent-v0.9.2...agent-v0.10.0) - 2026-10-18
+
+### Other
+
+- Upgrade dependencies to latest and trim feature sets ([#166](https://github.com/lexoliu/aither/pull/166))
+- Merge pull request #164 from lexoliu/fix/tool-delta-incremental
+- Emit incremental ToolCallDelta argument fragments
+- Add preview_request_messages_with for non-mutating previews
+- Box the provider respond stream once at the leaf
+
 ## [0.8.0](https://github.com/lexoliu/aither/compare/agent-v0.7.0...agent-v0.8.0) - 2026-10-15
 
 ### Added
