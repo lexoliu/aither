@@ -3080,8 +3080,13 @@ async fn handle_container_ipc_connection(
             .map_err(|e| format!("invalid IPC method name utf8: {e}"))?;
         let params = &body[1 + method_length..];
         let cli_args = decode_container_ipc_args(params)?;
-        let response = registry.query_tool_handler(method, &cli_args).await;
-        write_container_ipc_success(&mut stream, &response).await?;
+        let envelope = registry.query_tool_handler(method, &cli_args).await;
+        match crate::command::envelope_to_cli(envelope) {
+            Ok(rendered) => write_container_ipc_success(&mut stream, &rendered).await?,
+            Err(error) => {
+                write_container_ipc_error(&mut stream, &error.to_string()).await?;
+            }
+        }
     }
 }
 
@@ -3100,9 +3105,9 @@ fn decode_container_ipc_args(params: &[u8]) -> Result<Vec<String>, String> {
 
 async fn write_container_ipc_success(
     stream: &mut Async<StdTcpStream>,
-    response: &crate::command::CommandEnvelope,
+    rendered: &str,
 ) -> Result<(), String> {
-    let payload = rmp_serde::to_vec_named(response)
+    let payload = rmp_serde::to_vec_named(rendered)
         .map_err(|e| format!("failed to encode IPC success payload: {e}"))?;
     write_container_ipc_response(stream, true, &payload).await
 }
@@ -4924,19 +4929,13 @@ mod tests {
             .split_first()
             .expect("response carries a success flag");
         assert_eq!(*success, 1, "bridge should report success");
-        let envelope: serde_json::Value =
+        let rendered: String =
             rmp_serde::from_slice(payload).expect("response should decode as msgpack");
         assert_eq!(
-            envelope,
-            serde_json::to_value(crate::command::CommandEnvelope {
-                ok: true,
-                payload: Some(crate::command::CommandPayload::Json {
-                    value: serde_json::json!({ "marker": "pong" }),
-                }),
-                error: None,
-            })
-            .expect("envelope should convert to JSON"),
-            "probe_echo should answer from the live handler with field names, as heel's router does"
+            rendered,
+            serde_json::to_string_pretty(&serde_json::json!({ "marker": "pong" }))
+                .expect("value should render"),
+            "probe_echo should answer with the CLI-rendered payload, as `heel ipc` prints it"
         );
 
         drop(stream);

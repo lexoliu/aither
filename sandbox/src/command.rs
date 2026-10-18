@@ -745,7 +745,7 @@ impl ToolCallCommand {
 /// Renders a tool call's outcome the way the terminal caller expects it:
 /// content on stdout for success, a transport error for failure so `heel ipc`
 /// exits non-zero.
-fn envelope_to_cli(envelope: CommandEnvelope) -> Result<String, IpcError> {
+pub fn envelope_to_cli(envelope: CommandEnvelope) -> Result<String, IpcError> {
     if !envelope.ok {
         return Err(IpcError::remote(
             envelope
