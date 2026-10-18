@@ -18,7 +18,7 @@ aither-sandbox.workspace = true
 executor-core = "0.7"
 anyhow = "1.0.104"
 askama = "0.16"
-schemars = "1.2.2"
+schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
@@ -40,16 +40,18 @@ async-stream = "0.3.6"
 futures = "0.3"
 futures-core = "0.3.34"
 futures-lite = "2.6"
-sha2 = "0.10"
-similar = "2"
+sha2 = "0.11"
+similar = "3"
 uuid = { version = "1", features = ["v4"] }
 num-traits = "0.2"
 
 [dev-dependencies]
+hex = "0.4"
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 url = "2.5.8"
 async-process = "=2.5.0"
+aither-openai.workspace = true
 
 [features]
 default = []

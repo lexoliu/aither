@@ -25,7 +25,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
 url = "2"
-zenwave = { workspace = true, features = ["default"] }
+zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-io = "2"
@@ -37,7 +37,7 @@ wasm-bindgen-futures = "0.4"
 async-channel = "2"
 
 [dev-dependencies]
-tokio = { version = "1.0", features = ["macros", "rt"] }
+tokio = { version = "1.53", features = ["macros", "rt"] }
 
 [lints]
 workspace = true

@@ -173,6 +173,10 @@ pub enum Event {
     /// Consumers can use this to show early UI feedback (e.g., tool name
     /// and partial description) before the full arguments are available.
     ///
+    /// `arguments_fragment` is an increment: it carries only the argument
+    /// bytes produced since the previous delta for this call, so
+    /// concatenating a call's fragments reconstructs its full arguments.
+    ///
     /// A final [`Event::ToolCall`] is always emitted once the tool call
     /// is fully assembled; consumers that don't need incremental progress
     /// can ignore `ToolCallDelta` entirely.
@@ -182,7 +186,7 @@ pub enum Event {
         /// Tool name (available from the first delta for Claude;
         /// may arrive incrementally for `OpenAI`).
         name: String,
-        /// Partial JSON arguments accumulated so far.
+        /// Incremental JSON arguments fragment for this delta.
         arguments_fragment: String,
     },
 

@@ -38,6 +38,7 @@ use aither_core::llm::{IntoToolResult, Tool, ToolContext, ToolResult};
 use askama::Template;
 use base64::Engine as _;
 use heel::IpcCommand;
+use heel::ipc::IpcError;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -247,7 +248,6 @@ type ToolHandlerFn = Box<
 struct ToolEntry {
     handler: ToolHandlerFn,
     help: String,
-    positional_args: Vec<String>,
     stdin_arg: Option<String>,
 }
 
@@ -255,7 +255,6 @@ impl std::fmt::Debug for ToolEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolEntry")
             .field("help", &self.help)
-            .field("positional_args", &self.positional_args)
             .field("stdin_arg", &self.stdin_arg)
             .finish_non_exhaustive()
     }
@@ -456,10 +455,10 @@ impl ToolRegistryBuilder {
 
     /// Configures a tool to be callable from the sandbox.
     ///
-    /// The positional arguments are automatically detected from the schema -
-    /// all required fields become positional args in order.
-    /// For example, if a tool has `query: String` as its first required field,
-    /// then `websearch "rust"` → `websearch --query "rust"`.
+    /// The tool's argument schema is what the sandbox-side command line parses
+    /// against — positional words bind to required fields, so a tool with a
+    /// required `query: String` accepts `websearch "rust"` as well as
+    /// `websearch --query "rust"`.
     ///
     /// # Panics
     /// Panics if the tool argument schema cannot be serialized.
@@ -471,8 +470,6 @@ impl ToolRegistryBuilder {
         let schema = serde_json::to_value(schemars::schema_for!(T::Arguments))
             .expect("failed to serialize tool schema");
 
-        // Auto-detect positional args from schema: all required fields
-        let positional_args = detect_positional_args(&schema);
         // Auto-detect stdin_arg from schema: optional "input" field
         let stdin_arg = detect_stdin_arg(&schema);
 
@@ -516,7 +513,6 @@ impl ToolRegistryBuilder {
             ToolEntry {
                 handler,
                 help: help_text,
-                positional_args,
                 stdin_arg,
             },
         );
@@ -542,7 +538,6 @@ impl ToolRegistryBuilder {
         let name = definition.name().to_string();
         let description = definition.description().to_string();
         let schema = definition.arguments_openai_schema();
-        let positional_args = detect_positional_args(&schema);
         let stdin_arg = detect_stdin_arg(&schema);
         let help_text = if description.is_empty() {
             schema_to_help(&schema)
@@ -578,7 +573,6 @@ impl ToolRegistryBuilder {
             ToolEntry {
                 handler: raw_handler,
                 help: help_text,
-                positional_args,
                 stdin_arg,
             },
         );
@@ -591,7 +585,6 @@ impl ToolRegistryBuilder {
         &mut self,
         name: impl Into<String>,
         help: impl Into<String>,
-        positional_args: Vec<String>,
         handler: F,
     ) where
         F: Fn(
@@ -607,7 +600,6 @@ impl ToolRegistryBuilder {
             ToolEntry {
                 handler: Box::new(handler),
                 help: help.into(),
-                positional_args,
                 stdin_arg: None,
             },
         );
@@ -632,38 +624,6 @@ impl ToolRegistryBuilder {
 pub struct ToolRegistry {
     entries: HashMap<String, Arc<ToolEntry>>,
     output_dir: PathBuf,
-}
-
-/// Detects positional arguments from a JSON schema.
-///
-/// Returns required field names that are suitable for positional argument
-/// conversion in wrapper scripts. Array-typed fields are excluded because
-/// they need repeated `--flag value` syntax (e.g. `--options A --options B`).
-fn detect_positional_args(schema: &Value) -> Vec<String> {
-    let properties = schema.get("properties").and_then(Value::as_object);
-
-    let required: Vec<String> = schema
-        .get("required")
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    required
-        .into_iter()
-        .filter(|name| {
-            // Exclude array-typed fields -- they require repeated --flag syntax
-            if let Some(props) = properties
-                && let Some(prop_schema) = props.get(name)
-            {
-                return get_instance_type(prop_schema, prop_schema) != Some("array");
-            }
-            true
-        })
-        .collect()
 }
 
 /// Detects the stdin argument from a JSON schema.
@@ -737,15 +697,6 @@ impl ToolRegistry {
         self.entries.get(tool_name).map(|e| e.help.clone())
     }
 
-    /// Returns the positional arguments for a tool.
-    #[must_use]
-    pub fn tool_positional_args(&self, tool_name: &str) -> Vec<String> {
-        self.entries
-            .get(tool_name)
-            .map(|e| e.positional_args.clone())
-            .unwrap_or_default()
-    }
-
     /// Returns the stdin argument for a tool.
     #[must_use]
     pub fn tool_stdin_arg(&self, tool_name: &str) -> Option<String> {
@@ -791,23 +742,59 @@ impl ToolCallCommand {
     }
 }
 
+/// Renders a tool call's outcome the way the terminal caller expects it:
+/// content on stdout for success, a transport error for failure so `heel ipc`
+/// exits non-zero.
+pub fn envelope_to_cli(envelope: CommandEnvelope) -> Result<String, IpcError> {
+    if !envelope.ok {
+        return Err(IpcError::remote(
+            envelope
+                .error
+                .unwrap_or_else(|| "command failed".to_string()),
+        ));
+    }
+    envelope
+        .payload
+        .map_or_else(|| Ok(String::new()), |payload| payload.render_for_cli())
+        .map_err(IpcError::remote)
+}
+
+/// Rebuilds the command line a `heel ipc` request carries.
+///
+/// Raw-args commands deliver their argv untouched in `args`; named entries —
+/// the declared stdin field, or named parameters from a bound-args client —
+/// are appended as `--name value` pairs, unless the argv already declared
+/// them (an explicit flag on the command line wins over piped input).
 pub fn flatten_args_to_cli(args: &std::collections::HashMap<String, Value>) -> Vec<String> {
+    let mut cli_args = Vec::new();
     if let Some(Value::Array(arr)) = args.get("args") {
-        return arr
-            .iter()
-            .filter_map(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                Value::Number(n) => Some(n.to_string()),
-                Value::Bool(b) => Some(b.to_string()),
-                _ => None,
-            })
-            .collect();
+        cli_args.extend(arr.iter().filter_map(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        }));
     }
 
-    let mut cli_args = Vec::new();
-    let mut keys = args.keys().map(String::as_str).collect::<Vec<_>>();
+    // Options already spelled out in the verbatim argv keep their value; a
+    // same-named bound field would only come from piped stdin.
+    let declared: HashSet<String> = cli_args
+        .iter()
+        .filter_map(|arg| arg.strip_prefix("--"))
+        .filter_map(|name| name.split('=').next())
+        .map(str::to_string)
+        .collect();
+
+    let mut keys = args
+        .keys()
+        .map(String::as_str)
+        .filter(|key| *key != "args")
+        .collect::<Vec<_>>();
     keys.sort_unstable();
     for key in keys {
+        if declared.contains(key.replace('_', "-").as_str()) {
+            continue;
+        }
         let value = args
             .get(key)
             .expect("flatten_args_to_cli keys must resolve back into the map");
@@ -854,19 +841,16 @@ fn flatten_named_arg_to_cli(cli_args: &mut Vec<String>, key: &str, value: &Value
 
 impl IpcCommand for ToolCallCommand {
     type Args = std::collections::HashMap<String, Value>;
-    type Response = CommandEnvelope;
+    type Response = String;
 
     fn name(&self) -> Cow<'static, str> {
         Cow::Owned(self.tool_name.clone())
     }
 
-    fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
-        let args = self.registry.tool_positional_args(&self.tool_name);
-        if args.is_empty() {
-            Cow::Borrowed(&[])
-        } else {
-            Cow::Owned(args.into_iter().map(Cow::Owned).collect())
-        }
+    /// The schema parser on this side binds positionals itself; the client
+    /// cannot know them for tagged-enum tools, so every word goes through.
+    fn raw_args(&self) -> bool {
+        true
     }
 
     fn stdin_arg(&self) -> Option<Cow<'static, str>> {
@@ -875,7 +859,7 @@ impl IpcCommand for ToolCallCommand {
             .map(Cow::Owned)
     }
 
-    async fn handle(&self, args: Self::Args) -> CommandEnvelope {
+    async fn handle(&self, args: Self::Args) -> Result<String, IpcError> {
         let cli_args = flatten_args_to_cli(&args);
         tracing::info!(tool = %self.tool_name, args = ?cli_args, "ToolCallCommand::handle invoked");
 
@@ -886,13 +870,15 @@ impl IpcCommand for ToolCallCommand {
                 .tool_help(&self.tool_name)
                 .unwrap_or_else(|| no_help_available_text(self.tool_name.as_str()));
             tracing::info!(tool = %self.tool_name, "Returning help text");
-            return CommandEnvelope::success(CommandPayload::Text { content: help });
+            return Ok(help);
         }
 
         tracing::info!(tool = %self.tool_name, "Calling registry.query_tool_handler");
-        self.registry
-            .query_tool_handler(&self.tool_name, &cli_args)
-            .await
+        envelope_to_cli(
+            self.registry
+                .query_tool_handler(&self.tool_name, &cli_args)
+                .await,
+        )
     }
 }
 
@@ -933,36 +919,40 @@ impl IpcGatewayCommand {
 
 impl IpcCommand for IpcGatewayCommand {
     type Args = std::collections::HashMap<String, Value>;
-    type Response = CommandEnvelope;
+    type Response = String;
 
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("ipc")
     }
 
-    async fn handle(&self, args: Self::Args) -> CommandEnvelope {
+    fn raw_args(&self) -> bool {
+        true
+    }
+
+    async fn handle(&self, args: Self::Args) -> Result<String, IpcError> {
         let cli_args = flatten_args_to_cli(&args);
         if cli_args.is_empty() {
-            return CommandEnvelope::failure("usage: ipc <tool> [args ...]");
+            return Err(IpcError::remote("usage: ipc <tool> [args ...]"));
         }
 
         if has_help_flag(&cli_args) && cli_args.len() == 1 {
             let mut names = self.registry.registered_tool_names();
             names.sort();
             let joined_names = names.join(", ");
-            return CommandEnvelope::success(CommandPayload::Text {
-                content: IpcGatewayHelpTemplate {
-                    tool_names: joined_names.as_str(),
-                }
-                .render()
-                .expect("ipc gateway help template must render"),
-            });
+            return Ok(IpcGatewayHelpTemplate {
+                tool_names: joined_names.as_str(),
+            }
+            .render()
+            .expect("ipc gateway help template must render"));
         }
 
         let tool_name = &cli_args[0];
         let tool_args = cli_args[1..].to_vec();
-        self.registry
-            .query_tool_handler(tool_name, &tool_args)
-            .await
+        envelope_to_cli(
+            self.registry
+                .query_tool_handler(tool_name, &tool_args)
+                .await,
+        )
     }
 }
 
@@ -1044,7 +1034,6 @@ pub struct IpcToolCommand<T: Tool> {
     tool: Arc<T>,
     schema: Value,
     name: String,
-    positional_args: Vec<String>,
     stdin_arg: Option<String>,
     help: String,
 }
@@ -1064,7 +1053,6 @@ impl<T: Tool + Clone> Clone for IpcToolCommand<T> {
             tool: self.tool.clone(),
             schema: self.schema.clone(),
             name: self.name.clone(),
-            positional_args: self.positional_args.clone(),
             stdin_arg: self.stdin_arg.clone(),
             help: self.help.clone(),
         }
@@ -1084,7 +1072,6 @@ where
         let schema = serde_json::to_value(schemars::schema_for!(T::Arguments))
             .expect("failed to serialize tool schema");
         let name = tool.name().to_string();
-        let positional_args = detect_positional_args(&schema);
         let stdin_arg = detect_stdin_arg(&schema);
         let help = schema_to_help(&schema);
 
@@ -1092,7 +1079,6 @@ where
             tool: Arc::new(tool),
             schema,
             name,
-            positional_args,
             stdin_arg,
             help,
         }
@@ -1105,37 +1091,26 @@ where
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
     type Args = HashMap<String, Value>;
-    type Response = CommandEnvelope;
+    type Response = String;
 
     fn name(&self) -> Cow<'static, str> {
         Cow::Owned(self.name.clone())
     }
 
-    fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
-        if self.positional_args.is_empty() {
-            Cow::Borrowed(&[])
-        } else {
-            Cow::Owned(
-                self.positional_args
-                    .iter()
-                    .map(|s| Cow::Owned(s.clone()))
-                    .collect(),
-            )
-        }
+    fn raw_args(&self) -> bool {
+        true
     }
 
     fn stdin_arg(&self) -> Option<Cow<'static, str>> {
         self.stdin_arg.clone().map(Cow::Owned)
     }
 
-    async fn handle(&self, args: Self::Args) -> CommandEnvelope {
+    async fn handle(&self, args: Self::Args) -> Result<String, IpcError> {
         let cli_args = flatten_args_to_cli(&args);
 
         // Handle help flags
         if has_help_flag(&cli_args) {
-            return CommandEnvelope::success(CommandPayload::Text {
-                content: self.help.clone(),
-            });
+            return Ok(self.help.clone());
         }
 
         // Parse CLI args to JSON
@@ -1143,10 +1118,10 @@ where
             Ok(args) => args,
             Err(e) => {
                 let message = e.to_string();
-                return CommandEnvelope::failure(tool_usage_error(
+                return Err(IpcError::remote(tool_usage_error(
                     message.as_str(),
                     self.name.as_str(),
-                ));
+                )));
             }
         };
 
@@ -1155,21 +1130,21 @@ where
             Ok(args) => args,
             Err(e) => {
                 let message = prefix_error("invalid arguments: ", &e);
-                return CommandEnvelope::failure(tool_usage_error(
+                return Err(IpcError::remote(tool_usage_error(
                     message.as_str(),
                     self.name.as_str(),
-                ));
+                )));
             }
         };
 
         // A shell invocation has nowhere to show progress.
         match self.tool.call(parsed, ToolContext::new()).await {
             Ok(output) => match tool_output_to_payload(output) {
-                Ok(Some(payload)) => CommandEnvelope::success(payload),
-                Ok(None) => CommandEnvelope::success_empty(),
-                Err(error) => CommandEnvelope::failure(error),
+                Ok(Some(payload)) => payload.render_for_cli().map_err(IpcError::remote),
+                Ok(None) => Ok(String::new()),
+                Err(error) => Err(IpcError::remote(error)),
             },
-            Err(e) => CommandEnvelope::failure(e.to_string()),
+            Err(e) => Err(IpcError::remote(e.to_string())),
         }
     }
 }
@@ -2334,9 +2309,15 @@ mod tests {
         let schema = schemars::schema_for!(AskUserLikeArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
-        // Only question should be positional, not options
-        let positional = detect_positional_args(&schema);
-        assert_eq!(positional, vec!["question"]);
+        // Bare words bind to required fields in order, but `options` is an
+        // array — it only parses through repeated `--options` flags.
+        let result = cli_to_json(
+            &schema,
+            &["Pick one".into(), "--options".into(), "A".into()],
+        )
+        .expect("parses");
+        assert_eq!(result["question"], "Pick one");
+        assert_eq!(result["options"], serde_json::json!(["A"]));
     }
 
     #[test]
@@ -2537,6 +2518,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_flatten_args_to_cli_merges_verbatim_argv_and_named_fields() {
+        // What `heel ipc --raw-args` sends for a piped invocation: argv in
+        // "args" plus the stdin field bound by name.
+        let args = serde_json::from_value::<HashMap<String, Value>>(serde_json::json!({
+            "args": ["render", "--detail", "full"],
+            "input": "piped contents"
+        }))
+        .expect("structured args should deserialize");
+
+        let cli = flatten_args_to_cli(&args);
+        assert_eq!(
+            cli,
+            vec!["render", "--detail", "full", "--input", "piped contents"]
+        );
+    }
+
+    #[test]
+    fn test_flatten_args_to_cli_explicit_flag_wins_over_bound_stdin() {
+        // `cmd --input explicit < file` — the flag on the command line decides,
+        // not the piped contents.
+        let args = serde_json::from_value::<HashMap<String, Value>>(serde_json::json!({
+            "args": ["--input", "explicit"],
+            "input": "piped contents"
+        }))
+        .expect("structured args should deserialize");
+
+        let cli = flatten_args_to_cli(&args);
+        assert_eq!(cli, vec!["--input", "explicit"]);
+    }
+
     #[tokio::test]
     async fn test_handle_large_output_write_failure_returns_error_message() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2624,17 +2636,91 @@ mod tests {
         }))
         .unwrap();
 
-        let result = cmd.handle(args).await;
-        tracing::debug!("result: {}", serde_json::to_string_pretty(&result).unwrap());
-        assert!(result.ok, "command should succeed: {result:?}");
-
-        let Some(CommandPayload::Json { value: parsed }) = result.payload else {
-            panic!("expected JSON payload, got {result:?}");
-        };
+        let rendered = cmd.handle(args).await.expect("command should succeed");
+        tracing::debug!("result: {rendered}");
+        let parsed: Value = serde_json::from_str(&rendered).expect("rendered output is JSON");
         let options = parsed["option"].as_array().expect("option should be array");
         assert_eq!(options.len(), 3, "expected 3 options, got: {options:?}");
         assert_eq!(options[0], "原味");
         assert_eq!(options[1], "番茄味");
         assert_eq!(options[2], "芝士味");
+    }
+
+    #[tokio::test]
+    async fn test_tagged_enum_tool_receives_subcommands_through_raw_args() {
+        use aither_core::llm::{Tool, ToolResult};
+        use std::borrow::Cow;
+
+        /// Echoes which variant the schema parser picked, like `browser` does.
+        #[derive(Debug, Clone)]
+        struct FakeFileOps;
+        impl Tool for FakeFileOps {
+            fn name(&self) -> Cow<'static, str> {
+                "file_ops".into()
+            }
+            type Arguments = TaggedOperationArgs;
+            type Res = ToolResult;
+
+            fn call(
+                &self,
+                args: Self::Arguments,
+                _cx: aither_core::llm::ToolContext,
+            ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send
+            {
+                let text = match args {
+                    TaggedOperationArgs::Read { path } => format!("read {path}"),
+                    TaggedOperationArgs::Write { path, content } => {
+                        format!("write {path} = {content}")
+                    }
+                };
+                std::future::ready(Ok(ToolResult::Text { text }))
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(FakeFileOps);
+        let registry = std::sync::Arc::new(builder.build(tmp.path()));
+        let cmd = ToolCallCommand::new("file_ops", registry);
+
+        // `file_ops read input.txt` — the subcommand word and the variant's
+        // positional field both reach the schema parser untouched.
+        let read = cmd
+            .handle(
+                serde_json::from_value(serde_json::json!({
+                    "args": ["read", "input.txt"]
+                }))
+                .unwrap(),
+            )
+            .await
+            .expect("read parses and runs");
+        assert_eq!(read, "read input.txt");
+
+        let write = cmd
+            .handle(
+                serde_json::from_value(serde_json::json!({
+                    "args": ["write", "out.txt", "hello"]
+                }))
+                .unwrap(),
+            )
+            .await
+            .expect("write parses and runs");
+        assert_eq!(write, "write out.txt = hello");
+
+        // An unknown subcommand fails the call rather than printing an
+        // `ok:false` payload to a shell that cannot tell it from success.
+        let error = cmd
+            .handle(
+                serde_json::from_value(serde_json::json!({
+                    "args": ["explode"]
+                }))
+                .unwrap(),
+            )
+            .await
+            .expect_err("unknown subcommand must fail");
+        assert!(
+            error.to_string().contains("unknown subcommand 'explode'"),
+            "unexpected error: {error}"
+        );
     }
 }

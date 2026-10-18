@@ -14,20 +14,23 @@ categories = ["api-bindings"]
 [dependencies]
 aither-core.workspace = true
 aither-rag.workspace = true
-arrow-array = "58.0"
-arrow-schema = "58.0"
-async-fs = "2.1"
+arrow-array = "58.4"
+arrow-schema = "58.4"
+async-fs = "2.2"
 futures-lite = "2.6"
 ignore = "0.4"
 jiff = "0.2"
-lance-index = "10.0"
-lancedb = { version = "0.37", default-features = false }
-regex = "1.12"
-schemars = { version = "1.0", features = ["derive"] }
+lance-index = "13.0"
+# `remote` is required even for local-only use: lancedb 0.40's `job.rs`
+# references `Error::Http` unconditionally, so the crate does not compile
+# without it.
+lancedb = { version = "0.40", default-features = false, features = ["remote"] }
+regex = "1.13"
+schemars = { version = "1.2", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 shell-words = "1.1"
-sqlparser = "0.58.0"
+sqlparser = "0.63.0"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 

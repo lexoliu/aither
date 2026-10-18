@@ -1380,7 +1380,7 @@ mod tests {
                 url: aither_sandbox::ToolArtifactLocation::Download(
                     url::Url::from_file_path(binary).unwrap(),
                 ),
-                sha256: format!("{:x}", sha2::Sha256::digest(&bytes)),
+                sha256: hex::encode(sha2::Sha256::digest(&bytes)),
                 encoding: ToolArtifactFormat::Executable,
             })
             .collect();

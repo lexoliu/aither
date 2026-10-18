@@ -16,7 +16,7 @@ aither-core.workspace = true
 aither-models.workspace = true
 async-lock = "3.4"
 async-stream = "0.3"
-base64 = "0.22"
+base64 = "0.23"
 futures-core = { version = "0.3", default-features = false }
 futures-lite = "2.6"
 mistralrs = { version = "0.7.0-alpha.4", default-features = false }
