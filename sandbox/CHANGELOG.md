@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/lexoliu/aither/compare/sandbox-v0.9.2...sandbox-v0.10.0) - 2026-10-18
+
+### Other
+
+- Upgrade dependencies to latest and trim feature sets ([#166](https://github.com/lexoliu/aither/pull/166))
+- Render container bridge responses like heel ipc does
+- deliver tool argv verbatim and render results for the terminal ([#160](https://github.com/lexoliu/aither/pull/160))
+- Bump zip to 9.0.5 for RUSTSEC-2026-0367/0368/0369
+
 ## [0.9.2](https://github.com/lexoliu/aither/compare/sandbox-v0.9.1...sandbox-v0.9.2) - 2026-10-16
 
 ### Other
