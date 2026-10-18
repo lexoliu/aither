@@ -70,7 +70,7 @@ semver = { version = "1.0.28", features = ["serde"] }
 tar = { version = "0.4.46", default-features = false }
 flate2 = "1.1.10"
 zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
-zenwave = { workspace = true, features = ["hyper-rustls"] }
+zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 url = { version = "2.5.8", features = ["serde"] }
 procfs-core = { version = "0.18.0", default-features = false }
 fd-lock = "4"
