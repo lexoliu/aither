@@ -28,17 +28,20 @@ tree-sitter-rust = "0.21.2"
 
 # HNSW Index
 instant-distance = "0.6.1"
-arc-swap = "1.7"
-ordered-float = "5.3"
+arc-swap = "1.9"
+ordered-float = "5.4"
 
 # Persistence
 rkyv = { version = "0.8", features = ["bytecheck"] }
 redb = "2.6"
-lancedb = { version = "0.37", default-features = false, optional = true }
+# `remote` is required even for local-only use: lancedb 0.40's `job.rs`
+# references `Error::Http` unconditionally, so the crate does not compile
+# without it.
+lancedb = { version = "0.40", default-features = false, features = ["remote"], optional = true }
 # Must match the arrow version `lancedb` links against, or the RecordBatch
 # types are nominally distinct and its traits do not apply.
-arrow-array = { version = "58.0", optional = true }
-arrow-schema = { version = "58.0", optional = true }
+arrow-array = { version = "58.4", optional = true }
+arrow-schema = { version = "58.4", optional = true }
 futures = { version = "0.3", optional = true }
 tokio = { version = "1.53", features = ["rt-multi-thread"], optional = true }
 
