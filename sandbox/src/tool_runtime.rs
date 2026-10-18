@@ -1130,8 +1130,11 @@ pub mod tests {
         }
         type Args = RuntimeProbeArgs;
         type Response = String;
-        fn handle(&self, _args: RuntimeProbeArgs) -> impl Future<Output = String> {
-            std::future::ready("runtime_probe_ok".into())
+        fn handle(
+            &self,
+            _args: RuntimeProbeArgs,
+        ) -> impl Future<Output = Result<String, heel::IpcError>> {
+            std::future::ready(Ok("runtime_probe_ok".into()))
         }
     }
 
