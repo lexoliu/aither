@@ -619,6 +619,10 @@ struct ToolCallAccumulator {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    /// Bytes of `arguments` already emitted as `ToolCallDelta` fragments.
+    emitted: usize,
+    /// Whether the first `ToolCallDelta` announcing id and name went out.
+    announced: bool,
 }
 
 /// Merge one `delta.tool_calls` entry into the accumulator for its index.
@@ -769,13 +773,23 @@ fn chat_completions_stream_inner(
                                 if let Some(calls) = &choice.delta.tool_calls {
                                     for call in calls {
                                         let acc = accumulate_tool_call_delta(&mut tool_calls, call);
-                                        // Emit delta for UI progress
+                                        // Emit incremental fragments for UI
+                                        // progress; the first emission may
+                                        // precede any argument bytes, so the
+                                        // tool name surfaces as soon as both
+                                        // id and name are known.
                                         if let (Some(id), Some(name)) = (&acc.id, &acc.name) {
-                                            yield Ok(Event::ToolCallDelta {
-                                                id: id.clone(),
-                                                name: name.clone(),
-                                                arguments_fragment: acc.arguments.clone(),
-                                            });
+                                            let fragment =
+                                                acc.arguments[acc.emitted..].to_string();
+                                            if !fragment.is_empty() || !acc.announced {
+                                                acc.emitted = acc.arguments.len();
+                                                acc.announced = true;
+                                                yield Ok(Event::ToolCallDelta {
+                                                    id: id.clone(),
+                                                    name: name.clone(),
+                                                    arguments_fragment: fragment,
+                                                });
+                                            }
                                         }
                                     }
                                 }
@@ -1196,12 +1210,12 @@ fn responses_stream_inner(
                                 ResponsesStreamEvent::FunctionCallArgumentsDelta { delta, output_index, .. } => {
                                     let acc = function_calls.entry(output_index).or_default();
                                     acc.arguments.push_str(&delta);
-                                    // Emit delta for UI progress
+                                    // Emit the wire delta verbatim for UI progress
                                     if let (Some(call_id), Some(name)) = (&acc.call_id, &acc.name) {
                                         yield Ok(Event::ToolCallDelta {
                                             id: call_id.clone(),
                                             name: name.clone(),
-                                            arguments_fragment: acc.arguments.clone(),
+                                            arguments_fragment: delta,
                                         });
                                     }
                                 }
