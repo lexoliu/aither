@@ -28,7 +28,7 @@ sha2 = "0.11"
 thiserror = "2"
 tracing = "0.1"
 url = { version = "2.5", default-features = false }
-zenwave = { workspace = true, features = ["default"] }
+zenwave = { workspace = true, features = ["hyper-rustls"] }
 
 [lints]
 workspace = true

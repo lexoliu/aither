@@ -32,7 +32,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
 url = "2"
-zenwave = { workspace = true, features = ["default"] }
+zenwave = { workspace = true, features = ["hyper-rustls"] }
 
 [dev-dependencies]
 futures-lite = "2.6"
