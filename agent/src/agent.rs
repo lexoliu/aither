@@ -451,11 +451,6 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Start time of the most recent LLM request issued by this agent.
     pub(crate) last_request_started_at: Option<Instant>,
 
-    /// Transient per-turn system messages injected by the host application.
-    ///
-    /// These participate in prompt assembly for the current turn but are not
-    /// stored in the persistent context or checkpoints.
-
     /// Rolling KV-cache statistics accumulated from emitted `Usage` events.
     ///
     /// Hosts can read [`Agent::cache_stats`] at any time to observe the
@@ -1769,13 +1764,33 @@ where
         prompt: &str,
         attachments: impl IntoIterator<Item = Attachment>,
     ) -> Vec<Message> {
+        self.preview_request_messages_with(prompt, std::iter::empty(), attachments)
+            .await
+    }
+
+    /// Returns the exact request message sequence that would be sent for the
+    /// next turn, with `extra_messages` appended at the conversation tail
+    /// before the prompt.
+    ///
+    /// This is the non-mutating counterpart of pushing those messages onto the
+    /// live context and then running the turn — the shape a host gets for
+    /// per-turn hidden context injected ahead of the user's message. The
+    /// extras are not persisted: the context, working-docs baseline, and
+    /// system blocks are left exactly as a normal first assembly would.
+    pub async fn preview_request_messages_with(
+        &mut self,
+        prompt: &str,
+        extra_messages: impl IntoIterator<Item = Message>,
+        attachments: impl IntoIterator<Item = Attachment>,
+    ) -> Vec<Message> {
         self.ensure_initialized().await;
-        // Fork context, add the user message, build messages
+        // Fork context, add the extra and user messages, build messages
         let checkpoint = self.context.checkpoint();
         // `populate_dynamic_reminders` also advances the working-docs diff
         // baseline, which lives outside the context checkpoint — preserve it
         // so a preview cannot consume a diff the real request should surface.
         let working_docs_baseline = self.last_working_docs.clone();
+        self.context.extend(extra_messages);
         self.context
             .push(Message::user(prompt).with_attachments(attachments));
         let messages = self.build_request_messages().await;
@@ -2728,5 +2743,52 @@ mod tests {
             agent.last_working_docs.is_none(),
             "preview must restore the working-docs baseline"
         );
+    }
+
+    #[tokio::test]
+    async fn preview_with_extras_leaves_uninitialized_agent_in_first_turn_state() {
+        use aither_core::llm::Role;
+
+        let mut previewed = Agent::builder(MockLlm {
+            context_length: 1_000,
+        })
+        .build();
+        let mut control = Agent::builder(MockLlm {
+            context_length: 1_000,
+        })
+        .build();
+        // A normal first assembly initializes the agent and populates the
+        // static system blocks into its context.
+        control.snapshot_context_window().await;
+
+        let messages = previewed
+            .preview_request_messages_with(
+                "hi",
+                [Message::system("hidden note")],
+                std::iter::empty(),
+            )
+            .await;
+
+        // The extra message lands at the conversation tail ahead of the
+        // prompt, matching the run ordering when a host pushes it first.
+        let hidden_pos = messages
+            .iter()
+            .position(|message| {
+                message.role() == Role::System && message.content() == "hidden note"
+            })
+            .expect("extra message must appear in the previewed request");
+        assert_eq!(messages[hidden_pos + 1].role(), Role::User);
+        assert_eq!(messages[hidden_pos + 1].content(), "hi");
+
+        // Post-preview state is exactly what a normal first turn leaves:
+        // initialized with the static blocks populated, and neither the
+        // prompt nor the extra message persisted.
+        assert!(previewed.initialized);
+        assert_eq!(
+            previewed.context().system_blocks(),
+            control.context().system_blocks()
+        );
+        assert!(previewed.context().is_conversation_empty());
+        assert_eq!(previewed.context().reminders(), [] as [&str; 0]);
     }
 }
