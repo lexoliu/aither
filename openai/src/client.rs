@@ -10,8 +10,8 @@ use crate::{
         responses_tool_choice, to_chat_messages, to_responses_input,
     },
     response::{
-        ChatCompletionChunk, ChatCompletionUsage, ResponsesOutputItem, ResponsesStreamEvent,
-        ResponsesUsage, should_skip_event,
+        ChatCompletionChunk, ChatCompletionUsage, DeltaToolCall, ResponsesOutputItem,
+        ResponsesStreamEvent, ResponsesUsage, should_skip_event,
     },
 };
 use aither_core::{
@@ -621,6 +621,36 @@ struct ToolCallAccumulator {
     arguments: String,
 }
 
+/// Merge one `delta.tool_calls` entry into the accumulator for its index.
+///
+/// Compatible servers are expected to omit `id`/`name` on continuation
+/// deltas; some instead send them again as empty strings. Empty values are
+/// not authoritative — they must not overwrite the id or name captured
+/// from the first delta.
+fn accumulate_tool_call_delta<'a>(
+    tool_calls: &'a mut HashMap<usize, ToolCallAccumulator>,
+    call: &DeltaToolCall,
+) -> &'a mut ToolCallAccumulator {
+    let index = call.index.unwrap_or(0);
+    let acc = tool_calls.entry(index).or_default();
+    if let Some(id) = &call.id
+        && !id.is_empty()
+    {
+        acc.id = Some(id.clone());
+    }
+    if let Some(function) = &call.function {
+        if let Some(name) = &function.name
+            && !name.is_empty()
+        {
+            acc.name = Some(name.clone());
+        }
+        if let Some(args) = &function.arguments {
+            acc.arguments.push_str(args);
+        }
+    }
+    acc
+}
+
 /// Make a chat completions SSE request (single attempt).
 async fn chat_completions_request(
     cfg: &Config,
@@ -738,19 +768,7 @@ fn chat_completions_stream_inner(
                                 // Accumulate tool calls and emit deltas
                                 if let Some(calls) = &choice.delta.tool_calls {
                                     for call in calls {
-                                        let index = call.index.unwrap_or(0);
-                                        let acc = tool_calls.entry(index).or_default();
-                                        if let Some(id) = &call.id {
-                                            acc.id = Some(id.clone());
-                                        }
-                                        if let Some(function) = &call.function {
-                                            if let Some(name) = &function.name {
-                                                acc.name = Some(name.clone());
-                                            }
-                                            if let Some(args) = &function.arguments {
-                                                acc.arguments.push_str(args);
-                                            }
-                                        }
+                                        let acc = accumulate_tool_call_delta(&mut tool_calls, call);
                                         // Emit delta for UI progress
                                         if let (Some(id), Some(name)) = (&acc.id, &acc.name) {
                                             yield Ok(Event::ToolCallDelta {
@@ -1286,9 +1304,57 @@ mod tests {
     use super::*;
     use crate::response::{
         ChatCompletionTokensDetails, ChatCompletionUsage, ChatPromptTokensDetails,
-        ResponsesInputTokenDetails, ResponsesOutputTokenDetails, ResponsesUsage,
+        DeltaToolFunction, ResponsesInputTokenDetails, ResponsesOutputTokenDetails, ResponsesUsage,
     };
     use std::time::Duration;
+
+    fn chat_delta(id: Option<&str>, name: Option<&str>, arguments: &str) -> DeltaToolCall {
+        DeltaToolCall {
+            index: Some(0),
+            id: id.map(str::to_string),
+            function: Some(DeltaToolFunction {
+                name: name.map(str::to_string),
+                arguments: Some(arguments.to_string()),
+            }),
+        }
+    }
+
+    #[test]
+    fn chat_tool_call_accumulates_name_and_arguments() {
+        let mut tool_calls = HashMap::new();
+        accumulate_tool_call_delta(
+            &mut tool_calls,
+            &chat_delta(Some("call_1"), Some("search"), ""),
+        );
+        accumulate_tool_call_delta(&mut tool_calls, &chat_delta(None, None, "{\"q\":"));
+        accumulate_tool_call_delta(&mut tool_calls, &chat_delta(None, None, "\"rust\"}"));
+
+        let acc = &tool_calls[&0];
+        assert_eq!(acc.id.as_deref(), Some("call_1"));
+        assert_eq!(acc.name.as_deref(), Some("search"));
+        assert_eq!(acc.arguments, "{\"q\":\"rust\"}");
+    }
+
+    #[test]
+    fn chat_tool_call_empty_delta_fields_do_not_overwrite() {
+        let mut tool_calls = HashMap::new();
+        accumulate_tool_call_delta(
+            &mut tool_calls,
+            &chat_delta(Some("call_1"), Some("search"), ""),
+        );
+        // Some compatible servers repeat `id`/`name` as empty strings on
+        // every continuation delta instead of omitting them.
+        accumulate_tool_call_delta(&mut tool_calls, &chat_delta(Some(""), Some(""), "{\"q\":"));
+        accumulate_tool_call_delta(
+            &mut tool_calls,
+            &chat_delta(Some(""), Some(""), "\"rust\"}"),
+        );
+
+        let acc = &tool_calls[&0];
+        assert_eq!(acc.id.as_deref(), Some("call_1"));
+        assert_eq!(acc.name.as_deref(), Some("search"));
+        assert_eq!(acc.arguments, "{\"q\":\"rust\"}");
+    }
 
     #[test]
     fn done_function_call_is_not_emitted_twice() {
