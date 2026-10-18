@@ -134,7 +134,7 @@ mod server;
 mod session;
 pub mod vendor;
 
-pub use adapter::agent_event_to_session_update;
+pub use adapter::SessionUpdateMapper;
 pub use client::{AcpClient, ClientError, ClientHandler, ResponseFuture};
 pub use protocol::*;
 pub use server::AcpServer;
