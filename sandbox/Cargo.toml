@@ -47,7 +47,7 @@ async-channel = "2"
 tokio = { version = "1", features = ["io-util", "macros", "rt"] }
 strsim = "0.11.1"
 human-hash = "0.4"
-askama = "0.14"
+askama = "0.16"
 quick-xml = { version = "0.42", features = ["serialize"] }
 shell-words = "1.1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
@@ -62,15 +62,15 @@ tree-sitter = { version = "0.22.6", optional = true }
 rs-tree-sitter-languages = { version = "0.0.2", optional = true }
 vte = { version = "0.15", default-features = false, features = ["std"] }
 sha2 = "0.11"
-blocking = "1.6.2"
-futures = "0.3.31"
-tempfile = "3.20.0"
+blocking = "1.7.0"
+futures = "0.3.34"
+tempfile = "3.27.0"
 hex = "0.4.3"
-semver = { version = "1.0.26", features = ["serde"] }
-tar = { version = "0.4.44", default-features = false }
-flate2 = "1.1.2"
+semver = { version = "1.0.28", features = ["serde"] }
+tar = { version = "0.4.46", default-features = false }
+flate2 = "1.1.10"
 zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
-zenwave = { workspace = true, features = ["default"] }
+zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 url = { version = "2.5.8", features = ["serde"] }
 procfs-core = { version = "0.18.0", default-features = false }
 fd-lock = "4"

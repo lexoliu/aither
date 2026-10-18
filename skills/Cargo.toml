@@ -20,7 +20,7 @@ futures-lite = "2"
 
 [dev-dependencies]
 tempfile = "3.27"
-tokio = { version = "1.0", features = ["macros", "rt"] }
+tokio = { version = "1.53", features = ["macros", "rt"] }
 
 [lints]
 workspace = true
