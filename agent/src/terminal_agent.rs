@@ -214,14 +214,15 @@ where
 {
     /// Creates a new terminal-first agent builder.
     ///
-    /// Creates the agent with only the native `terminal` tool; terminal controls
-    /// and other registered capabilities are IPC commands accessible through
-    /// `terminal` (registered via `.tool()`).
+    /// Creates the agent with native tools (`terminal_kill`, `terminal_input`,
+    /// `terminal_read`, `terminal`) and IPC commands accessible through
+    /// `terminal` (registered via `.tool()`). The native control tools address
+    /// the same background jobs as `terminal` and are not advertised as commands.
     pub fn new(llm: LLM, mut terminal_tool: TerminalTool<P, E, Unconfigured>) -> Self {
         let (terminal_tool_factory, terminal_tool_factory_receiver) =
             terminal_tool_factory_channel();
-        let mut registry_builder = ToolRegistryBuilder::new();
-        let mut tool_descriptions = Vec::new();
+        let registry_builder = ToolRegistryBuilder::new();
+        let tool_descriptions = Vec::new();
 
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: true,
@@ -235,26 +236,10 @@ where
         let read_terminal_delta_tool = ReadTerminalDeltaTool::new(job_registry);
         terminal_tool = terminal_tool.with_shell_sessions(shell_sessions);
 
-        let kill_def = ToolDefinition::new(&kill_terminal_tool);
-        tool_descriptions.push((
-            kill_def.name().to_string(),
-            short_description(kill_def.description()),
-        ));
-        let input_def = ToolDefinition::new(&input_terminal_tool);
-        tool_descriptions.push((
-            input_def.name().to_string(),
-            short_description(input_def.description()),
-        ));
-        let read_delta_def = ToolDefinition::new(&read_terminal_delta_tool);
-        tool_descriptions.push((
-            read_delta_def.name().to_string(),
-            short_description(read_delta_def.description()),
-        ));
-
-        registry_builder.configure_tool(kill_terminal_tool);
-        registry_builder.configure_tool(input_terminal_tool);
-        registry_builder.configure_tool(read_terminal_delta_tool);
-        let inner = AgentBuilder::new(llm);
+        let inner = AgentBuilder::new(llm)
+            .tool(kill_terminal_tool)
+            .tool(input_terminal_tool)
+            .tool(read_terminal_delta_tool);
 
         Self {
             inner,
@@ -1542,7 +1527,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn terminal_agent_builder_keeps_ipc_tools_out_of_llm_tool_surface() {
+    async fn terminal_agent_builder_exposes_native_terminal_controls_and_keeps_ipc_tools_out() {
         let dir = tempdir().expect("tempdir should exist");
         let terminal_tool = noop_terminal(dir.path()).await;
         let source = tempdir().unwrap();
@@ -1550,14 +1535,21 @@ mod tests {
         let binary = compile_baseline_fixture(source.path()).await;
         let distribution = fixture_distribution(&binary, "1.0.0").await;
         let (requests, captured) = async_channel::bounded(4);
-        let mut agent = TerminalAgentBuilder::new(MockLlm { requests }, terminal_tool)
+        let builder = TerminalAgentBuilder::new(MockLlm { requests }, terminal_tool)
             .max_iterations(1)
             .tool(MockTool)
             .with_default_prompt()
             .initialize_tools(&distribution, cache.path())
             .await
-            .unwrap()
-            .build();
+            .unwrap();
+        let mut catalog_names = builder
+            .tool_descriptions()
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        catalog_names.sort_unstable();
+        assert_eq!(catalog_names, ["mock_tool"]);
+        let mut agent = builder.build();
 
         let mut tool_names = agent
             .tools
@@ -1567,7 +1559,15 @@ mod tests {
             .collect::<Vec<_>>();
         tool_names.sort();
 
-        assert_eq!(tool_names, vec!["terminal".to_string()]);
+        assert_eq!(
+            tool_names,
+            [
+                "terminal",
+                "terminal_input",
+                "terminal_kill",
+                "terminal_read"
+            ]
+        );
         let events = agent.run("Inspect the repository", []);
         futures_lite::pin!(events);
         while futures_lite::StreamExt::next(&mut events).await.is_some() {}
@@ -1580,7 +1580,12 @@ mod tests {
                 .iter()
                 .map(ToolDefinition::name)
                 .collect::<Vec<_>>(),
-            vec!["terminal"]
+            vec![
+                "terminal",
+                "terminal_input",
+                "terminal_kill",
+                "terminal_read"
+            ]
         );
         let catalog = request
             .messages()
@@ -1591,5 +1596,104 @@ mod tests {
         for command in ["apply_patch", "rg -n", "ast-grep run", "jq"] {
             assert!(catalog.contains(command));
         }
+    }
+
+    /// Asks for one native `terminal_kill` call, then stops.
+    #[derive(Clone)]
+    struct KillTaskLlm {
+        requests: async_channel::Sender<LLMRequest>,
+        turns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LanguageModel for KillTaskLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.requests
+                .try_send(request)
+                .expect("record model request");
+            let turn = self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let event = if turn == 0 {
+                Event::ToolCall(aither_core::llm::ToolCall::new(
+                    "stop",
+                    "terminal_kill",
+                    serde_json::json!({ "task_id": "background-task" }),
+                ))
+            } else {
+                Event::Text("done".into())
+            };
+            futures_lite::stream::once(Ok(event))
+        }
+
+        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
+            std::future::ready(ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                100_000,
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_terminal_kill_stops_a_job_of_the_agents_terminal() {
+        let source = tempdir().unwrap();
+        let binary = compile_baseline_fixture(source.path()).await;
+        let distribution = fixture_distribution(&binary, "1.0.0").await;
+        let cache = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        let terminal_tool = noop_terminal(dir.path()).await;
+        let jobs = terminal_tool.job_registry();
+        jobs.register(
+            424_242,
+            "background-task",
+            "execution",
+            "sleep 60",
+            aither_sandbox::TerminalMode::Sandboxed,
+            None,
+        )
+        .await;
+        let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
+        jobs.attach_kill_switch(424_242, kill_tx).await;
+        let (requests, captured) = async_channel::bounded(8);
+        let mut agent = TerminalAgentBuilder::new(
+            KillTaskLlm {
+                requests,
+                turns: Arc::default(),
+            },
+            terminal_tool,
+        )
+        .max_iterations(3)
+        .initialize_tools(&distribution, cache.path())
+        .await
+        .unwrap()
+        .build();
+
+        let events = agent.run("Stop the background task", []);
+        futures_lite::pin!(events);
+        while futures_lite::StreamExt::next(&mut events).await.is_some() {}
+
+        kill_rx
+            .try_recv()
+            .expect("the native terminal_kill call reached the terminal's job");
+        assert!(!jobs.has_running().await);
+        let _ = captured.try_recv().expect("first request");
+        let reply = captured
+            .try_recv()
+            .expect("the kill result reached the model");
+        let transcript = reply
+            .messages()
+            .iter()
+            .map(aither_core::llm::Message::content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("\"killed\":true"),
+            "native terminal_kill reported the kill: {transcript}"
+        );
     }
 }
