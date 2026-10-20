@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/lexoliu/aither/compare/acp-v0.10.0...acp-v0.10.1) - 2026-10-20
+
+### Fixed
+
+- *(acp)* title and classify the tools that actually arrive natively
+
+### Other
+
+- Merge pull request #176 from lexoliu/main
+
 ## [0.10.0](https://github.com/lexoliu/aither/compare/acp-v0.9.2...acp-v0.10.0) - 2026-10-18
 
 ### Other
