@@ -3283,7 +3283,7 @@ fn create_ipc_router(registry: &Arc<ToolRegistry>) -> Option<IpcRouter> {
 fn create_ipc_gateway_router(registry: &Arc<ToolRegistry>) -> Option<IpcRouter> {
     let mut router = crate::register_ipc_gateway_command(IpcRouter::new(), Arc::clone(registry));
 
-    // In unsafe mode, keep tool commands usable (websearch/webfetch/ask/task/todo...),
+    // In unsafe mode, keep tool commands usable (websearch/webfetch/ask/subagent...),
     // but never override native shell task/process commands like kill/jobs.
     let blocked = ["kill", "jobs"];
     let tool_names = registry.registered_tool_names();
