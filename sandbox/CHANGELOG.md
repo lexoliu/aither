@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2](https://github.com/lexoliu/aither/compare/sandbox-v0.10.0...sandbox-v0.10.2) - 2026-10-20
+
+### Fixed
+
+- *(acp)* title and classify the tools that actually arrive natively
+
+### Other
+
+- release v0.10.0
+- Merge pull request #176 from lexoliu/main
+
 ## [0.10.1](https://github.com/lexoliu/aither/compare/sandbox-v0.10.0...sandbox-v0.10.1) - 2026-10-20
 
 ### Fixed
