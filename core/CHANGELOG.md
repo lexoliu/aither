@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/lexoliu/aither/compare/core-v0.9.2...core-v0.10.0) - 2026-10-18
+
+### Other
+
+- Emit incremental ToolCallDelta argument fragments
+
 ## [0.8.0](https://github.com/lexoliu/aither/compare/core-v0.7.0...core-v0.8.0) - 2026-10-15
 
 ### Other
