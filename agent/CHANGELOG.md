@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/lexoliu/aither/compare/agent-v0.10.0...agent-v0.10.1) - 2026-10-20
+
+### Fixed
+
+- *(agent)* register terminal control tools natively again
+
+### Other
+
+- Merge pull request #176 from lexoliu/main
+
 ## [0.10.0](https://github.com/lexoliu/aither/compare/agent-v0.9.2...agent-v0.10.0) - 2026-10-18
 
 ### Other
