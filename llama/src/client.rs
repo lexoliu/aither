@@ -90,7 +90,7 @@ impl LanguageModel for Llama {
         )
     }
 
-    fn profile(&self) -> impl std::future::Future<Output = Profile> + Send {
+    fn profile(&self) -> impl std::future::Future<Output = Result<Profile, Self::Error>> + Send {
         let cfg = self.inner.clone();
         let context_length = cfg
             .n_ctx
@@ -102,14 +102,14 @@ impl LanguageModel for Llama {
                 .and_then(|s| s.to_str())
                 .unwrap_or("llama-local")
                 .to_string();
-            Profile::new(
+            Ok(Profile::new(
                 model_name.clone(),
                 "llama.cpp",
                 model_name,
                 "Local llama.cpp GGUF model",
                 context_length,
             )
-            .with_abilities([Ability::ToolUse, Ability::Reasoning])
+            .with_abilities([Ability::ToolUse, Ability::Reasoning]))
         }
     }
 }

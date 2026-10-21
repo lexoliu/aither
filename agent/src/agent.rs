@@ -615,7 +615,7 @@ where
             run_id.clone(),
             self.config.max_iterations,
         ));
-        self.ensure_initialized().await;
+        self.ensure_initialized().await?;
         #[cfg(feature = "skills")]
         for event in self.activate_skills_for_prompt(&prompt) {
             events.emit(event);
@@ -1260,7 +1260,7 @@ where
         &mut self,
         focus: Option<&str>,
     ) -> Result<Option<CompactResult>, AgentError> {
-        self.ensure_initialized().await;
+        self.ensure_initialized().await?;
 
         let messages = self.context.conversation_messages();
         if messages.is_empty() {
@@ -1458,8 +1458,8 @@ where
     ///
     /// Returns an error when checkpoint construction or checkpoint hooks fail.
     pub async fn export_checkpoint(&mut self) -> Result<AgentCheckpoint, AgentError> {
-        self.ensure_initialized().await;
-        let context_window = self.snapshot_context_window().await;
+        self.ensure_initialized().await?;
+        let context_window = self.snapshot_context_window().await?;
         Ok(AgentCheckpoint {
             context: self.context.checkpoint(),
             tool_surface_hash: self.tool_surface_hash(),
@@ -1490,9 +1490,14 @@ where
     ///
     /// This is a pure measurement: it does not repopulate reminders or
     /// otherwise mutate the context.
-    pub async fn snapshot_context_window(&mut self) -> ContextWindowSnapshot {
-        self.ensure_initialized().await;
-        self.context_window_snapshot()
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model profiles cannot be fetched during
+    /// initialization.
+    pub async fn snapshot_context_window(&mut self) -> Result<ContextWindowSnapshot, AgentError> {
+        self.ensure_initialized().await?;
+        Ok(self.context_window_snapshot())
     }
 
     /// Returns the model profile if available.
@@ -1502,27 +1507,45 @@ where
     }
 
     /// Ensures the agent is initialized (profiles fetched, static blocks set up).
-    async fn ensure_initialized(&mut self) {
+    async fn ensure_initialized(&mut self) -> Result<(), AgentError> {
         if self.initialized {
-            return;
+            return Ok(());
         }
 
         // Fetch profile for the selected tier (for context window decisions)
         self.profile = Some(match self.tier {
-            ModelTier::Advanced => self.advanced.profile().await,
-            ModelTier::Balanced => self.balanced.profile().await,
-            ModelTier::Fast => self.fast.profile().await,
+            ModelTier::Advanced => self
+                .advanced
+                .profile()
+                .await
+                .map_err(|error| AgentError::Llm(error.to_string()))?,
+            ModelTier::Balanced => self
+                .balanced
+                .profile()
+                .await
+                .map_err(|error| AgentError::Llm(error.to_string()))?,
+            ModelTier::Fast => self
+                .fast
+                .profile()
+                .await
+                .map_err(|error| AgentError::Llm(error.to_string()))?,
         });
 
         // Fetch fast model profile (for compression decisions)
         // We always need this because compression uses the fast model
-        self.fast_profile = Some(self.fast.profile().await);
+        self.fast_profile = Some(
+            self.fast
+                .profile()
+                .await
+                .map_err(|error| AgentError::Llm(error.to_string()))?,
+        );
 
         // Populate static system blocks in Context from AgentConfig.
         // These form the stable, cacheable prefix.
         self.populate_system_blocks();
 
         self.initialized = true;
+        Ok(())
     }
 
     /// Populates the Context's system blocks from `AgentConfig`.
@@ -1747,11 +1770,13 @@ where
         let tier_context = self
             .profile
             .as_ref()
-            .map_or(100_000, |profile| profile.context_length as usize);
+            .expect("agent initialized without a model profile")
+            .context_length as usize;
         let fast_context = self
             .fast_profile
             .as_ref()
-            .map_or(100_000, |profile| profile.context_length as usize);
+            .expect("agent initialized without a fast model profile")
+            .context_length as usize;
         tier_context.min(fast_context)
     }
 
@@ -1759,11 +1784,16 @@ where
     ///
     /// This is intended for observability/debug UIs and does not mutate agent memory.
     /// Temporarily adds the prompt to a forked context, builds the messages, then discards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model profiles cannot be fetched during
+    /// initialization.
     pub async fn preview_request_messages(
         &mut self,
         prompt: &str,
         attachments: impl IntoIterator<Item = Attachment>,
-    ) -> Vec<Message> {
+    ) -> Result<Vec<Message>, AgentError> {
         self.preview_request_messages_with(prompt, std::iter::empty(), attachments)
             .await
     }
@@ -1777,13 +1807,18 @@ where
     /// per-turn hidden context injected ahead of the user's message. The
     /// extras are not persisted: the context, working-docs baseline, and
     /// system blocks are left exactly as a normal first assembly would.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model profiles cannot be fetched during
+    /// initialization.
     pub async fn preview_request_messages_with(
         &mut self,
         prompt: &str,
         extra_messages: impl IntoIterator<Item = Message>,
         attachments: impl IntoIterator<Item = Attachment>,
-    ) -> Vec<Message> {
-        self.ensure_initialized().await;
+    ) -> Result<Vec<Message>, AgentError> {
+        self.ensure_initialized().await?;
         // Fork context, add the extra and user messages, build messages
         let checkpoint = self.context.checkpoint();
         // `populate_dynamic_reminders` also advances the working-docs diff
@@ -1796,7 +1831,7 @@ where
         let messages = self.build_request_messages().await;
         self.context.restore(checkpoint);
         self.last_working_docs = working_docs_baseline;
-        messages
+        Ok(messages)
     }
 
     /// Injects a handoff instruction when context usage approaches the threshold.
@@ -1844,7 +1879,7 @@ where
     /// to ensure there's room for the fast LLM during compaction.
     ///
     async fn maybe_compress(&mut self) -> Result<(), AgentError> {
-        self.ensure_initialized().await;
+        self.ensure_initialized().await?;
         let snapshot = self.context_window_snapshot();
         let context_strategy = self.config.context.clone();
 
@@ -2189,14 +2224,16 @@ mod tests {
             futures_lite::stream::empty()
         }
 
-        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
-            std::future::ready(ModelProfile::new(
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "mock model",
                 self.context_length,
-            ))
+            )))
         }
     }
 
@@ -2255,7 +2292,10 @@ mod tests {
         );
         agent.push_message(Message::user("hello"));
 
-        let snapshot = agent.snapshot_context_window().await;
+        let snapshot = agent
+            .snapshot_context_window()
+            .await
+            .expect("snapshot should initialize");
 
         assert_eq!(snapshot.phase, ContextWindowPhase::CompressionDue);
         assert!(snapshot.metrics.system_block_count > 0);
@@ -2270,7 +2310,10 @@ mod tests {
         });
         agent.context_mut().set_handoff("resume here");
 
-        let snapshot = agent.snapshot_context_window().await;
+        let snapshot = agent
+            .snapshot_context_window()
+            .await
+            .expect("snapshot should initialize");
 
         assert_eq!(snapshot.phase, ContextWindowPhase::HandoffActive);
         assert!(snapshot.metrics.has_handoff);
@@ -2340,7 +2383,10 @@ mod tests {
             "<system-reminder>ephemeral</system-reminder>",
         ));
 
-        let snapshot = agent.snapshot_context_window().await;
+        let snapshot = agent
+            .snapshot_context_window()
+            .await
+            .expect("snapshot should initialize");
         assert_eq!(snapshot.phase, ContextWindowPhase::ReassemblyDue);
 
         agent
@@ -2368,6 +2414,7 @@ mod tests {
         agent.push_message(Message::system(
             "<system-reminder>ephemeral</system-reminder>",
         ));
+        agent.ensure_initialized().await.expect("agent initializes");
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(5));
 
         let _ = agent.build_live_request_messages().await;
@@ -2705,6 +2752,7 @@ mod tests {
         });
         agent.push_system_alert("no native tool named foo");
 
+        agent.ensure_initialized().await.expect("agent initializes");
         let snapshot = agent.assemble_context_window().await;
 
         assert!(
@@ -2759,7 +2807,10 @@ mod tests {
         .build();
         // A normal first assembly initializes the agent and populates the
         // static system blocks into its context.
-        control.snapshot_context_window().await;
+        control
+            .snapshot_context_window()
+            .await
+            .expect("control agent initializes");
 
         let messages = previewed
             .preview_request_messages_with(
@@ -2767,7 +2818,8 @@ mod tests {
                 [Message::system("hidden note")],
                 std::iter::empty(),
             )
-            .await;
+            .await
+            .expect("preview should initialize");
 
         // The extra message lands at the conversation tail ahead of the
         // prompt, matching the run ordering when a host pushes it first.

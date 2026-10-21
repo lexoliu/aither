@@ -108,30 +108,30 @@ impl LanguageModel for Copilot {
         }
     }
 
-    fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
+    fn profile(
+        &self,
+    ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
         let cfg = self.inner.clone();
         async move {
             // Try to get context window from models database
             let context_length = aither_models::lookup(&cfg.model)
                 .and_then(aither_models::ModelEntry::max_input_tokens)
-                .unwrap_or_else(|| {
-                    const DEFAULT_CONTEXT_LENGTH: u32 = 8192;
-                    tracing::warn!(
-                        model = %cfg.model,
-                        fallback_context_length = DEFAULT_CONTEXT_LENGTH,
-                        "Copilot model missing context metadata in aither-models, using fallback",
-                    );
-                    DEFAULT_CONTEXT_LENGTH
-                });
+                .ok_or_else(|| {
+                    CopilotError::Api(format!(
+                        "cannot determine context length for model '{model}': \
+                         aither-models has no entry",
+                        model = cfg.model,
+                    ))
+                })?;
 
-            ModelProfile::new(
+            Ok(ModelProfile::new(
                 cfg.model.clone(),
                 "GitHub Copilot",
                 cfg.model.clone(),
                 "GitHub Copilot model",
                 context_length,
             )
-            .with_ability(Ability::ToolUse)
+            .with_ability(Ability::ToolUse))
         }
     }
 }

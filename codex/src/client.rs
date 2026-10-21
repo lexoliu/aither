@@ -216,18 +216,26 @@ impl LanguageModel for Codex {
         }
     }
 
-    fn profile(&self) -> impl core::future::Future<Output = ModelProfile> + Send {
+    fn profile(
+        &self,
+    ) -> impl core::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
         let model = self.inner.model.clone();
         async move {
             let entry = aither_models::lookup(&model);
+            let context_length = entry
+                .and_then(aither_models::ModelEntry::max_input_tokens)
+                .ok_or_else(|| {
+                    CodexError::Api(format!(
+                        "cannot determine context length for model '{model}': \
+                         aither-models has no entry"
+                    ))
+                })?;
             let mut profile = ModelProfile::new(
                 model.clone(),
                 "openai",
                 model,
                 "OpenAI model through a ChatGPT subscription",
-                entry
-                    .and_then(aither_models::ModelEntry::max_input_tokens)
-                    .unwrap_or(0),
+                context_length,
             )
             .with_ability(Ability::ToolUse);
             if let Some(entry) = entry {
@@ -237,7 +245,7 @@ impl LanguageModel for Codex {
                     }
                 }
             }
-            profile
+            Ok(profile)
         }
     }
 }
