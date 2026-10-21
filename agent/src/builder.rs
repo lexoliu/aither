@@ -6,7 +6,10 @@
 #[cfg(feature = "skills")]
 use std::sync::Arc;
 
-use aither_core::{LanguageModel, llm::Tool};
+use aither_core::{
+    LanguageModel,
+    llm::{Tool, tool::ToolDefinition},
+};
 use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, PermissionEventReceiver};
 #[cfg(feature = "skills")]
 use aither_skills::SkillRegistry;
@@ -471,6 +474,15 @@ where
     pub fn config(mut self, config: AgentConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Returns the definitions of the tools registered on this builder so far.
+    ///
+    /// These are the definitions the built agent sends to the model, in the
+    /// order the tool registry holds them.
+    #[must_use]
+    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools.active_definitions()
     }
 
     /// Builds the agent.
