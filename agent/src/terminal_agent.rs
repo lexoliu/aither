@@ -1237,14 +1237,16 @@ mod tests {
             futures_lite::stream::empty()
         }
 
-        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
-            std::future::ready(ModelProfile::new(
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "mock model",
                 100_000,
-            ))
+            )))
         }
     }
 
@@ -1442,14 +1444,16 @@ mod tests {
             futures_lite::stream::once(Ok(event))
         }
 
-        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
-            std::future::ready(ModelProfile::new(
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "mock model",
                 100_000,
-            ))
+            )))
         }
     }
 
@@ -1672,14 +1676,16 @@ mod tests {
             futures_lite::stream::once(Ok(event))
         }
 
-        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
-            std::future::ready(ModelProfile::new(
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "mock model",
                 100_000,
-            ))
+            )))
         }
     }
 

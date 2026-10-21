@@ -498,7 +498,7 @@ impl LanguageModel for OpenAI {
         ))
     }
 
-    fn profile(&self) -> impl Future<Output = ModelProfile> + Send {
+    fn profile(&self) -> impl Future<Output = Result<ModelProfile, Self::Error>> + Send {
         let cfg = self.inner.clone();
         async move {
             // Try to fetch context window from API, fallback to models database
@@ -508,18 +508,14 @@ impl LanguageModel for OpenAI {
                     tracing::debug!("API did not return context_length: {e}");
                     aither_models::lookup(&cfg.chat_model)
                         .and_then(aither_models::ModelEntry::max_input_tokens)
-                        .unwrap_or_else(|| {
-                            // Custom/self-hosted models are legitimately absent
-                            // from both the provider API and the registry, so
-                            // assume a conservative context window rather than
-                            // failing the whole conversation.
-                            tracing::warn!(
-                                model = %cfg.chat_model,
-                                assumed_context_length = UNKNOWN_MODEL_CONTEXT_LENGTH,
-                                "model missing context metadata from provider and aither-models"
-                            );
-                            UNKNOWN_MODEL_CONTEXT_LENGTH
-                        })
+                        .ok_or_else(|| {
+                            OpenAIError::Api(format!(
+                                "cannot determine context length for model '{model}': \
+                                 {models_url} request failed ({e}) and aither-models has no entry",
+                                model = cfg.chat_model,
+                                models_url = cfg.request_url("/models"),
+                            ))
+                        })?
                 }
             };
 
@@ -536,22 +532,16 @@ impl LanguageModel for OpenAI {
                     profile.abilities.push(*ability);
                 }
             }
-            profile
+            Ok(profile)
         }
     }
 }
 
 /// Fetch context window size from the models API.
-/// Context window assumed for models with no metadata from either the
-/// provider API or the aither-models registry (custom/self-hosted models).
-/// Conservative enough to be safe for compaction budgeting on any modern
-/// OpenAI-compatible backend.
-const UNKNOWN_MODEL_CONTEXT_LENGTH: u32 = 32_768;
-
 async fn fetch_model_context_length(cfg: &Config) -> Result<u32, OpenAIError> {
     use crate::response::ModelsListResponse;
 
-    let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+    let url = cfg.request_url("/models");
     let mut backend = client();
     let mut builder = backend
         .get(&url)
@@ -1511,6 +1501,66 @@ mod tests {
         assert!(
             error.to_string().contains("blank call_id"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// Serves a single fixed HTTP response on a loopback address.
+    fn serve_once(body: &'static str) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub server");
+        let addr = listener.local_addr().expect("stub server address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Read until the request headers are complete; the stub has no body to consume.
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let Ok(n) = stream.read(&mut chunk) else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn profile_errors_when_context_length_is_unknown() {
+        // aither#181: a /models listing without context_length, for a model
+        // the aither-models registry does not know, must surface an error
+        // instead of silently assuming a context window.
+        let base_url = serve_once(
+            r#"{"object":"list","data":[{"id":"unregistered-stub-model","object":"model","created":1,"owned_by":"stub"}]}"#,
+        );
+        let model = OpenAI::builder("test-key")
+            .base_url(base_url)
+            .model("unregistered-stub-model")
+            .build();
+
+        let err = model
+            .profile()
+            .await
+            .expect_err("profile must fail when the context window is unknown");
+        let message = err.to_string();
+        assert!(
+            message.contains("unregistered-stub-model"),
+            "error must name the model: {message}"
+        );
+        assert!(
+            message.contains("/models"),
+            "error must name the endpoint that was asked: {message}"
         );
     }
 

@@ -558,14 +558,16 @@ mod tests {
 
         fn profile(
             &self,
-        ) -> impl std::future::Future<Output = aither_core::llm::model::Profile> + Send {
-            std::future::ready(aither_core::llm::model::Profile::new(
+        ) -> impl std::future::Future<
+            Output = Result<aither_core::llm::model::Profile, Self::Error>,
+        > + Send {
+            std::future::ready(Ok(aither_core::llm::model::Profile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "A mock model for testing",
                 100_000,
-            ))
+            )))
         }
     }
 

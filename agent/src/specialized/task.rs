@@ -882,14 +882,16 @@ mod tests {
             futures_lite::stream::pending()
         }
 
-        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
-            std::future::ready(ModelProfile::new(
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
                 "mock",
                 "test",
                 "pending-model",
                 "pending model",
                 128_000,
-            ))
+            )))
         }
     }
 
