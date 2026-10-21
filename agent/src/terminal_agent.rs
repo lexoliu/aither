@@ -812,6 +812,32 @@ where
         &self.tool_descriptions
     }
 
+    /// Returns the definitions of the native tools the built agent exposes to
+    /// the model.
+    ///
+    /// The list covers every tool registered on the inner [`AgentBuilder`]
+    /// (`terminal_kill`, `terminal_input`, `terminal_read`) plus `terminal`,
+    /// which `build()` registers last, in the order the built agent's tool
+    /// registry holds them.
+    ///
+    /// `terminal` only implements [`Tool`] once it holds a command registry,
+    /// but its definition — the name, the `TerminalArgs` schema and the
+    /// description the schema carries — is independent of the registry's
+    /// contents, so an empty registry yields the same definition `build()`
+    /// registers.
+    #[must_use]
+    pub fn native_tool_definitions(&self) -> Vec<ToolDefinition> {
+        let mut definitions = self.inner.tool_definitions();
+        let terminal = self.terminal_tool.clone().with_registry(Arc::new(
+            ToolRegistryBuilder::new().build(self.terminal_tool.outputs_dir()),
+        ));
+        definitions.push(ToolDefinition::new(&terminal));
+        // The registry keys tools by name, so the definition list the built
+        // agent sends is name-ordered.
+        definitions.sort_by(|a, b| a.name().cmp(b.name()));
+        definitions
+    }
+
     /// Whether a CLI command with `name` is registered in the terminal registry.
     fn has_command(&self, name: &str) -> bool {
         self.tool_descriptions.iter().any(|(n, _)| n == name)
@@ -1596,6 +1622,24 @@ mod tests {
         for command in ["apply_patch", "rg -n", "ast-grep run", "jq"] {
             assert!(catalog.contains(command));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_tool_definitions_match_the_built_agents_tool_definitions() {
+        let source = tempdir().unwrap();
+        let binary = compile_baseline_fixture(source.path()).await;
+        let distribution = fixture_distribution(&binary, "1.0.0").await;
+        let cache = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        let (requests, _captured) = async_channel::bounded(4);
+        let builder =
+            TerminalAgentBuilder::new(MockLlm { requests }, noop_terminal(dir.path()).await)
+                .initialize_tools(&distribution, cache.path())
+                .await
+                .unwrap();
+        let expected = builder.native_tool_definitions();
+        let agent = builder.build();
+        assert_eq!(expected, agent.tools.active_definitions());
     }
 
     /// Asks for one native `terminal_kill` call, then stops.
