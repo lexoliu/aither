@@ -2621,6 +2621,7 @@ mod tests {
         );
         agent.skill_registry = Some(Arc::new(registry));
         let _ = agent.activate_skills_for_prompt("please review this patch");
+        agent.ensure_initialized().await.expect("agent initializes");
 
         let messages = agent.build_live_request_messages().await;
         assert!(
