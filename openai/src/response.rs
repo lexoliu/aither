@@ -189,6 +189,37 @@ pub enum ResponsesOutputItem {
         #[serde(default)]
         encrypted_content: Option<String>,
     },
+    /// Server-side web search call.
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        id: String,
+        #[serde(default)]
+        status: Option<String>,
+        /// Invocation action, e.g. `{"type":"search","query":"..."}` — usually
+        /// populated only once the item completes.
+        #[serde(default)]
+        action: Option<serde_json::Value>,
+    },
+    /// Server-side file search call.
+    #[serde(rename = "file_search_call")]
+    FileSearchCall {
+        id: String,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        queries: Vec<String>,
+        #[serde(default)]
+        results: Option<Vec<serde_json::Value>>,
+    },
+    /// Server-side code interpreter call.
+    #[serde(rename = "code_interpreter_call")]
+    CodeInterpreterCall {
+        id: String,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        code: Option<String>,
+    },
     /// Catch-all
     #[serde(other)]
     Other,

@@ -215,13 +215,15 @@ fn events_from_content(content: &GeminiContent) -> Vec<Event> {
 
     for part in &content.parts {
         if let Some(code) = &part.executable_code {
-            events.push(Event::BuiltInToolResult {
+            events.push(Event::BuiltInToolCall {
+                id: String::new(),
                 tool: "code_execution".to_string(),
-                result: format!("```{}\n{}\n```", code.language.to_lowercase(), code.code),
+                detail: format!("```{}\n{}\n```", code.language.to_lowercase(), code.code),
             });
         }
         if let Some(result) = &part.code_execution_result {
             events.push(Event::BuiltInToolResult {
+                id: String::new(),
                 tool: "code_execution".to_string(),
                 result: format!("```output\n{}\n```", result.output),
             });
