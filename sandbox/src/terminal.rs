@@ -873,6 +873,8 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     writable_paths: Vec<PathBuf>,
     /// Additional paths that should be readable (but not writable) in the sandbox.
     readable_paths: Vec<PathBuf>,
+    /// Extra environment variables resolved for each spawned execution.
+    env_source: Option<Arc<dyn TerminalEnvSource>>,
     /// Rolling audit log recording every sandboxed network policy decision.
     network_audit: Option<NetworkAuditLog>,
     /// Scheduling priority applied to every sandboxed execution.
@@ -904,6 +906,7 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             permission_tx: self.permission_tx.clone(),
             writable_paths: self.writable_paths.clone(),
             readable_paths: self.readable_paths.clone(),
+            env_source: self.env_source.clone(),
             network_audit: self.network_audit.clone(),
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1018,6 +1021,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             permission_tx,
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
+            env_source: None,
             network_audit: None,
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1081,6 +1085,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             permission_tx,
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
+            env_source: None,
             network_audit: None,
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1113,12 +1118,29 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             permission_tx: self.permission_tx,
             writable_paths: self.writable_paths,
             readable_paths: self.readable_paths,
+            env_source: self.env_source,
             network_audit: self.network_audit,
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver,
             registry: Configured { registry },
         }
+    }
+}
+
+/// Supplies extra environment variables resolved for each spawned execution.
+///
+/// Implemented by embedders that need values decided at command time —
+/// secrets read from a live store, per-call overrides — rather than at tool
+/// construction. `Vec<(String, String)>` implements it for static pairs.
+pub trait TerminalEnvSource: std::fmt::Debug + Send + Sync {
+    /// `(name, value)` pairs injected into the spawned command's environment.
+    fn env(&self) -> Vec<(String, String)>;
+}
+
+impl TerminalEnvSource for Vec<(String, String)> {
+    fn env(&self) -> Vec<(String, String)> {
+        self.clone()
     }
 }
 
@@ -1152,6 +1174,27 @@ where
         self.readable_paths
             .extend(paths.into_iter().map(Into::into));
         self
+    }
+
+    /// Injects extra environment variables into every command this tool
+    /// spawns in the home environment.
+    ///
+    /// The source is resolved per execution, so values it returns reflect
+    /// the moment each command launches. Injection applies to the local and
+    /// container backends; SSH targets are deliberately excluded so
+    /// host-side values (for example secrets) never reach remote machines.
+    /// Caller-provided names override the session's computed environment.
+    #[must_use]
+    pub fn with_env_source(mut self, source: impl TerminalEnvSource + 'static) -> Self {
+        self.env_source = Some(Arc::new(source));
+        self
+    }
+
+    /// Injects a fixed set of environment variables into every spawned
+    /// command; a convenience for [`Self::with_env_source`] over static pairs.
+    #[must_use]
+    pub fn with_envs(self, envs: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.with_env_source(envs.into_iter().collect::<Vec<_>>())
     }
 
     /// Lowers the scheduling priority of the commands this tool runs.
@@ -1403,6 +1446,7 @@ where
             permission_tx,
             writable_paths: self.writable_paths.clone(),
             readable_paths: self.readable_paths.clone(),
+            env_source: self.env_source.clone(),
             network_audit: self.network_audit.clone(),
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1614,6 +1658,7 @@ where
                 working_dir: self.working_dir.clone(),
                 writable_paths: self.writable_paths.clone(),
                 readable_paths: self.readable_paths.clone(),
+                env_source: self.env_source.clone(),
                 executor: self.executor.clone(),
                 registry: self.registry().clone(),
                 permission_handler: self.permission_handler.clone(),
@@ -1995,6 +2040,7 @@ struct StandaloneExecution<P, E> {
     working_dir: PathBuf,
     writable_paths: Vec<PathBuf>,
     readable_paths: Vec<PathBuf>,
+    env_source: Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
     registry: Arc<ToolRegistry>,
     permission_handler: Arc<P>,
@@ -2022,6 +2068,7 @@ struct StandaloneStart<'a, P, E> {
     working_dir: &'a Path,
     writable_paths: &'a [PathBuf],
     readable_paths: &'a [PathBuf],
+    env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
     registry: &'a Arc<ToolRegistry>,
     permission_handler: Arc<P>,
@@ -2044,6 +2091,7 @@ struct LocalBackgroundExecution<'a, E> {
     working_dir: &'a Path,
     writable_paths: &'a [PathBuf],
     readable_paths: &'a [PathBuf],
+    env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
     registry: &'a Arc<ToolRegistry>,
     task_id: &'a str,
@@ -2060,6 +2108,7 @@ struct LocalBackgroundExecution<'a, E> {
 
 struct ContainerBackgroundExecution<'a, E> {
     executor: E,
+    env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     registry: &'a Arc<ToolRegistry>,
     task_id: &'a str,
     execution_id: &'a str,
@@ -2172,6 +2221,7 @@ struct SpawnedTerminalTask<P, E> {
     result_tx: Sender<Result<TerminalResult, String>>,
     completed_tx: Sender<CompletedTask>,
     running_tasks: Arc<AtomicUsize>,
+    env_source: Option<Arc<dyn TerminalEnvSource>>,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
@@ -2187,6 +2237,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        env_source,
         executor,
         registry,
         permission_handler,
@@ -2216,6 +2267,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        env_source,
         executor,
         registry,
         permission_handler,
@@ -2269,6 +2321,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        env_source,
         executor,
         registry,
         permission_handler,
@@ -2302,6 +2355,7 @@ where
         working_dir: &working_dir,
         writable_paths: &writable_paths,
         readable_paths: &readable_paths,
+        env_source: &env_source,
         executor,
         registry: &registry,
         permission_handler,
@@ -2386,6 +2440,7 @@ where
             let ipc_commands = request.registry.registered_tool_names();
             return execute_container_background(ContainerBackgroundExecution {
                 executor: request.executor,
+                env_source: request.env_source,
                 registry: request.registry,
                 task_id: request.task_id,
                 execution_id: request.execution_id,
@@ -2425,6 +2480,7 @@ where
         working_dir: request.working_dir,
         writable_paths: request.writable_paths,
         readable_paths: request.readable_paths,
+        env_source: request.env_source,
         executor: request.executor,
         registry: request.registry,
         task_id: request.task_id,
@@ -2638,8 +2694,11 @@ where
     E: Executor + Clone + 'static,
     N: NetworkPolicy + 'static,
 {
-    let runtime_environment =
+    let mut runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    if let Some(source) = context.env_source {
+        runtime_environment.extend(source.env());
+    }
     #[cfg(all(unix, feature = "jobserver"))]
     let runtime_environment =
         with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
@@ -2720,8 +2779,11 @@ where
 async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let runtime_environment =
+    let mut runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    if let Some(source) = context.env_source {
+        runtime_environment.extend(source.env());
+    }
     #[cfg(all(unix, feature = "jobserver"))]
     let runtime_environment =
         with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
@@ -2931,6 +2993,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         )?)
     };
     let script = context.prepared_tools.wrap_script(context.script)?;
+    let script = inject_env_exports(script, context.env_source.as_ref())?;
     let wrapped_script = wrap_container_script(
         &script,
         context.ipc_commands,
@@ -3081,6 +3144,35 @@ async fn execute_ssh_background(
             Err(TerminalError::Execution(err.to_string()))
         }
     }
+}
+
+/// Prepends a source's env pairs to `script` as `export` statements, for
+/// backends (container exec) whose channel accepts only a script — never an
+/// env channel. Names are validated so a provider can't inject shell syntax.
+fn inject_env_exports(
+    script: String,
+    env_source: Option<&Arc<dyn TerminalEnvSource>>,
+) -> Result<String, TerminalError> {
+    let Some(source) = env_source else {
+        return Ok(script);
+    };
+    let mut rendered = String::new();
+    for (name, value) in source.env() {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || name.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            return Err(TerminalError::Execution(format!(
+                "invalid environment variable name for container exec: {name}"
+            )));
+        }
+        rendered.push_str("export ");
+        rendered.push_str(&name);
+        rendered.push('=');
+        rendered.push_str(&shell_escape(&value));
+        rendered.push('\n');
+    }
+    rendered.push_str(&script);
+    Ok(rendered)
 }
 
 fn shell_escape(value: &str) -> String {
@@ -4091,6 +4183,31 @@ mod tests {
         assert_eq!(args, ["-c", script]);
     }
 
+    #[test]
+    fn inject_env_exports_prepends_valid_pairs() {
+        let source: Option<Arc<dyn TerminalEnvSource>> = Some(Arc::new(vec![
+            ("MY_KEY".to_string(), "it's".to_string()),
+            ("OTHER".to_string(), "x".to_string()),
+        ]));
+        let rendered = inject_env_exports("echo hi".to_string(), source.as_ref())
+            .expect("valid env names should render");
+        assert_eq!(
+            rendered,
+            "export MY_KEY='it'\"'\"'s'\nexport OTHER='x'\necho hi"
+        );
+    }
+
+    #[test]
+    fn inject_env_exports_rejects_shell_syntax_names() {
+        let source: Option<Arc<dyn TerminalEnvSource>> =
+            Some(Arc::new(vec![("BAD;name".to_string(), "x".to_string())]));
+        assert!(inject_env_exports("echo hi".to_string(), source.as_ref()).is_err());
+        assert_eq!(
+            inject_env_exports("echo hi".to_string(), None).expect("no source passes through"),
+            "echo hi"
+        );
+    }
+
     #[tokio::test]
     async fn session_runtime_environment_is_prepared_without_wrapping_the_script() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -4669,6 +4786,7 @@ mod tests {
             working_dir: tool.working_dir().clone(),
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
+            env_source: None,
             executor: executor_core::tokio::TokioGlobal,
             registry,
             permission_handler: Arc::new(TestPermissionHandler::default()),
