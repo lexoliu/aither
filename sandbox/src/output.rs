@@ -266,9 +266,8 @@ struct StoredOutputPreviewTemplate<'a> {
     url: &'a str,
 }
 
-/// Renders the model-facing content for a stored text output: a head+tail
-/// preview within the caller's budget plus the file reference and read
-/// guidance.
+/// Renders the head+tail form of a cut text output: a preview within the
+/// caller's budget plus the file reference and read guidance.
 ///
 /// `text` must be exactly what was written to `url`, because the preview's
 /// omitted-range marker reports line numbers of that file.
@@ -280,9 +279,9 @@ fn stored_text_content(
     url: &str,
     max_lines: usize,
     byte_budget: usize,
-) -> Content {
+) -> String {
     let preview = crate::output_compress::stored_preview(text, max_lines, byte_budget);
-    let rendered = StoredOutputPreviewTemplate {
+    StoredOutputPreviewTemplate {
         preview: preview.trim_end_matches('\n'),
         reason,
         line_count,
@@ -290,11 +289,82 @@ fn stored_text_content(
         url,
     }
     .render()
-    .expect("stored output preview template must render");
-    Content::Text {
-        text: rendered,
-        truncated: true,
+    .expect("stored output preview template must render")
+}
+
+/// A text output that exceeded a limit, with the limits that cut it.
+struct CutText<'a> {
+    /// The original bytes, which are what gets stored.
+    data: &'a [u8],
+    /// `data` as text.
+    text: &'a str,
+    reason: &'a str,
+    line_count: usize,
+    max_lines: usize,
+    byte_budget: usize,
+}
+
+/// Delivers a text output that exceeded a limit.
+///
+/// The model-facing form is the folded view when the text is source code and
+/// the folded view fits `byte_budget`, otherwise the head+tail preview. That
+/// form, with its markers and stored-output notice, is compared in bytes with
+/// the original: when it is not smaller the original is returned inline and
+/// uncut, and nothing is written to disk.
+async fn cut_text_output(
+    dir: &Path,
+    format: OutputFormat,
+    cut: CutText<'_>,
+) -> std::io::Result<OutputEntry> {
+    let CutText {
+        data,
+        text,
+        reason,
+        line_count,
+        max_lines,
+        byte_budget,
+    } = cut;
+    let (url, path) = allocate_file(dir, data, format);
+
+    let folded =
+        crate::output_compress::folded_code_content(text, &url, &path.display().to_string())
+            .filter(|folded| folded.len() <= byte_budget);
+    let rendered = folded.unwrap_or_else(|| {
+        stored_text_content(
+            text,
+            reason,
+            line_count,
+            data.len(),
+            &url,
+            max_lines,
+            byte_budget,
+        )
+    });
+
+    if rendered.len() >= data.len() {
+        debug!(
+            original = data.len(),
+            cut = rendered.len(),
+            "cut form is not smaller than the output, returning it inline"
+        );
+        return Ok(OutputEntry::Inline {
+            content: Content::Text {
+                text: text.to_owned(),
+                truncated: false,
+            },
+        });
     }
+
+    fs::write(&path, data).await?;
+    debug!(url = %url, size = data.len(), format = ?format, "saved output");
+    Ok(OutputEntry::Stored {
+        path: path.display().to_string(),
+        url,
+        content: Some(Content::Text {
+            text: rendered,
+            truncated: true,
+        }),
+    })
 }
 
 /// A pending URL allocation that hasn't been written to disk yet.
@@ -673,65 +743,61 @@ pub async fn save_text_with_line_limit(
         return Ok(OutputEntry::Inline { content });
     }
 
-    // Save full output to file, but still hand the model a head+tail preview
-    // within its requested budget so it never has to re-read blind.
-    let (url, path) = create_file(dir, data, format).await?;
-
+    // Cut: store the full output and hand the model a preview within its
+    // requested budget so it never has to re-read blind, unless the preview
+    // would not be smaller than the output.
     let byte_budget = byte_limit.unwrap_or(INLINE_OUTPUT_LIMIT);
     let reason = if exceeds_lines {
         format!("output exceeded max_lines limit ({line_count} lines > {max_lines} max)")
     } else {
         format!("output exceeded the {byte_budget}-byte inline limit")
     };
-    let content = stored_text_content(
-        &text,
-        &reason,
-        line_count,
-        data.len(),
-        &url,
-        max_lines,
-        byte_budget,
-    );
-
-    Ok(OutputEntry::Stored {
-        path: path.display().to_string(),
-        url,
-        content: Some(content),
-    })
+    cut_text_output(
+        dir,
+        format,
+        CutText {
+            data,
+            text: &text,
+            reason: &reason,
+            line_count,
+            max_lines,
+            byte_budget,
+        },
+    )
+    .await
 }
 
 /// Saves output that exceeds limit - stores full content, returning a
-/// head+tail preview plus the file reference for text formats.
+/// preview plus the file reference for text formats.
 async fn save_large_output(
     dir: &Path,
     data: &[u8],
     format: OutputFormat,
 ) -> std::io::Result<OutputEntry> {
-    // Store full content to file
+    if matches!(format, OutputFormat::Text | OutputFormat::Auto) {
+        let text = String::from_utf8_lossy(data);
+        let reason = format!("output exceeded the {INLINE_OUTPUT_LIMIT}-byte inline limit");
+        return cut_text_output(
+            dir,
+            format,
+            CutText {
+                data,
+                text: &text,
+                reason: &reason,
+                line_count: text.lines().count(),
+                max_lines: usize::MAX,
+                byte_budget: INLINE_OUTPUT_LIMIT,
+            },
+        )
+        .await;
+    }
+
+    // Binary/video/image just get the file path.
     let (url, path) = create_file(dir, data, format).await?;
-
-    let content = match format {
-        OutputFormat::Text | OutputFormat::Auto => {
-            let text = String::from_utf8_lossy(data);
-            let line_count = text.lines().count();
-            let reason = format!("output exceeded the {INLINE_OUTPUT_LIMIT}-byte inline limit");
-            Some(stored_text_content(
-                &text,
-                &reason,
-                line_count,
-                data.len(),
-                &url,
-                usize::MAX,
-                INLINE_OUTPUT_LIMIT,
-            ))
-        }
-        _ => None, // Binary/video/image just get file path
-    };
-
     Ok(OutputEntry::Stored {
         path: path.display().to_string(),
         url,
-        content,
+        content: None,
     })
 }
 
@@ -782,18 +848,22 @@ fn prepare_image_for_context(
     })
 }
 
+/// Picks the four-random-words name a file for `data` will have, without
+/// writing it.
+fn allocate_file(dir: &Path, data: &[u8], format: OutputFormat) -> (String, PathBuf) {
+    let ext = extension_for_data(data, format);
+    let name = generate_word_filename();
+    let filename = format!("{name}.{ext}");
+    (format!("outputs/{filename}"), dir.join(&filename))
+}
+
 /// Creates a file with a four-random-words name.
 async fn create_file(
     dir: &Path,
     data: &[u8],
     format: OutputFormat,
 ) -> std::io::Result<(String, PathBuf)> {
-    let ext = extension_for_data(data, format);
-    let name = generate_word_filename();
-    let filename = format!("{name}.{ext}");
-    let url = format!("outputs/{filename}");
-    let filepath = dir.join(&filename);
-
+    let (url, filepath) = allocate_file(dir, data, format);
     fs::write(&filepath, data).await?;
     debug!(url = %url, size = data.len(), format = ?format, "saved output");
 
@@ -1115,7 +1185,8 @@ mod tests {
     #[tokio::test]
     async fn stored_text_output_preview_honors_max_lines() {
         let dir = tempfile::tempdir().unwrap();
-        let data = "alpha\nbeta\ngamma\ndelta\n".repeat(2);
+        let pad = "p".repeat(400);
+        let data = format!("alpha{pad}\nbeta{pad}\ngamma{pad}\ndelta{pad}\n").repeat(2);
 
         let entry = save_text_with_line_limit(
             dir.path(),
@@ -1137,11 +1208,11 @@ mod tests {
         };
         // Eight lines, a budget of three: one for the head, two for the tail.
         assert!(
-            text.starts_with("alpha\n[... lines 2-6 of 8 omitted"),
+            text.starts_with(&format!("alpha{pad}\n[... lines 2-6 of 8 omitted")),
             "preview must stop at max_lines: {text}"
         );
         assert!(
-            text.contains("gamma\ndelta\n[Preview only:"),
+            text.contains(&format!("gamma{pad}\ndelta{pad}\n[Preview only:")),
             "tail must close the preview: {text}"
         );
     }
@@ -1211,5 +1282,171 @@ mod tests {
         assert_eq!(stored_lines[first - 2], preview_lines[marker_index - 1]);
         assert_eq!(stored_lines[last], preview_lines[marker_index + 1]);
         assert_eq!(stored_lines[total_lines - 1], "error: test failed");
+    }
+
+    fn stored_file_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir).expect("read dir").count()
+    }
+
+    #[tokio::test]
+    async fn output_just_over_max_lines_is_returned_inline_when_the_cut_is_larger() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = (0..212).fold(String::new(), |mut data, i| {
+            use std::fmt::Write as _;
+            writeln!(data, "ok {i}").expect("writing to a String cannot fail");
+            data
+        });
+
+        let entry = save_text_with_line_limit(
+            dir.path(),
+            data.as_bytes(),
+            OutputFormat::Text,
+            MediaResolution::Auto,
+            200,
+            Some(INLINE_OUTPUT_LIMIT),
+        )
+        .await
+        .unwrap();
+
+        let OutputEntry::Inline {
+            content: Content::Text { text, truncated },
+        } = entry
+        else {
+            panic!("expected the original inline");
+        };
+        assert!(!truncated);
+        assert_eq!(text, data);
+        assert_eq!(stored_file_count(dir.path()), 0, "nothing may be stored");
+    }
+
+    #[tokio::test]
+    async fn large_output_that_shrinks_is_stored_with_its_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = "a reasonably long line of command output text\n".repeat(1000);
+
+        let entry = save_text_with_line_limit(
+            dir.path(),
+            data.as_bytes(),
+            OutputFormat::Text,
+            MediaResolution::Auto,
+            200,
+            Some(INLINE_OUTPUT_LIMIT),
+        )
+        .await
+        .unwrap();
+
+        let OutputEntry::Stored {
+            content: Some(Content::Text { text, truncated }),
+            path,
+            ..
+        } = entry
+        else {
+            panic!("expected stored entry with text content");
+        };
+        assert!(truncated);
+        assert!(text.len() < data.len());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), data);
+        assert_eq!(stored_file_count(dir.path()), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_single_line_is_stored_only_when_the_cut_is_smaller() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = "x".repeat(INLINE_OUTPUT_LIMIT * 2);
+
+        let entry = OutputStore::save_to_dir(
+            dir.path(),
+            data.as_bytes(),
+            OutputFormat::Text,
+            MediaResolution::Auto,
+        )
+        .await
+        .unwrap();
+
+        let OutputEntry::Stored {
+            content: Some(Content::Text { text, .. }),
+            ..
+        } = entry
+        else {
+            panic!("expected stored entry with text content");
+        };
+        assert!(text.len() < data.len());
+    }
+
+    #[cfg(feature = "code-folding")]
+    fn rust_source(functions: usize) -> String {
+        let mut source = String::new();
+        for index in 0..functions {
+            writeln!(source, "fn compute_{index}(input: u64) -> u64 {{").unwrap();
+            for step in 0..8 {
+                writeln!(
+                    source,
+                    "    let step_{step} = input.wrapping_mul({step} + 3);"
+                )
+                .unwrap();
+            }
+            writeln!(source, "    input + step_7\n}}\n").unwrap();
+        }
+        source
+    }
+
+    #[cfg(feature = "code-folding")]
+    #[tokio::test]
+    async fn source_code_over_the_limit_is_stored_with_a_folded_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = rust_source(40);
+        assert!(data.lines().count() > 200);
+
+        let entry = save_text_with_line_limit(
+            dir.path(),
+            data.as_bytes(),
+            OutputFormat::Text,
+            MediaResolution::Auto,
+            200,
+            Some(INLINE_OUTPUT_LIMIT),
+        )
+        .await
+        .unwrap();
+
+        let OutputEntry::Stored {
+            content: Some(Content::Text { text, .. }),
+            path,
+            ..
+        } = entry
+        else {
+            panic!("expected stored entry with a folded preview");
+        };
+        assert!(text.contains("fn compute_0"), "{text}");
+        assert!(text.contains("Code folded"), "{text}");
+        assert!(!text.contains("step_3 ="), "bodies must be folded: {text}");
+        assert!(text.len() < data.len());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), data);
+    }
+
+    #[cfg(feature = "code-folding")]
+    #[tokio::test]
+    async fn small_source_code_is_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = rust_source(3);
+
+        let entry = save_text_with_line_limit(
+            dir.path(),
+            data.as_bytes(),
+            OutputFormat::Text,
+            MediaResolution::Auto,
+            200,
+            Some(INLINE_OUTPUT_LIMIT),
+        )
+        .await
+        .unwrap();
+
+        let OutputEntry::Inline {
+            content: Content::Text { text, .. },
+        } = entry
+        else {
+            panic!("expected the source inline");
+        };
+        assert_eq!(text, data);
+        assert_eq!(stored_file_count(dir.path()), 0);
     }
 }
