@@ -17,14 +17,16 @@ use std::time::Instant;
 use aither_core::llm::ToolContext;
 use aither_core::{
     LanguageModel,
-    llm::{Tool, ToolResult},
+    llm::{Tool, ToolResult, oneshot},
 };
 use aither_sandbox::TerminalToolFactory;
+use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::AgentBuilder;
 use crate::fs_util::path_exists;
+use crate::model_group::ModelTier;
 use crate::subagent_file::SubagentDefinition;
 
 async fn checked_path_exists(path: &Path) -> anyhow::Result<bool> {
@@ -42,6 +44,8 @@ pub type SubagentBuilder<LLM> = Arc<dyn Fn(LLM) -> AgentBuilder<LLM, LLM, LLM, (
 pub struct SubagentType<LLM> {
     /// Description shown to the main agent.
     pub description: String,
+    /// Model tier this subagent runs on when the caller does not choose one.
+    pub model: Option<ModelTier>,
     /// Builder function that creates the configured agent builder.
     builder: SubagentBuilder<LLM>,
 }
@@ -88,8 +92,17 @@ impl<LLM: Clone> SubagentType<LLM> {
     {
         Self {
             description: description.into(),
+            model: None,
             builder: Arc::new(builder),
         }
+    }
+
+    /// Declare the model tier this subagent runs on unless the caller
+    /// overrides it in `SubagentArgs::model`.
+    #[must_use]
+    pub const fn with_model(mut self, model: ModelTier) -> Self {
+        self.model = Some(model);
+        self
     }
 
     /// Get the agent builder for this subagent type.
@@ -113,13 +126,41 @@ impl<LLM: Clone> SubagentType<LLM> {
 ///
 /// You can also load custom subagents from `.md` files by specifying a path
 /// (e.g., `./custom-agent.md` or `subagents/researcher.md`).
+///
+/// The task prompt is read from a file: write the full prompt to a file
+/// first, then pass its path in `prompt_file`. Inline prompt text is not a
+/// file path and is rejected.
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
 pub struct SubagentArgs {
     /// Subagent type name (e.g., "explore", "plan") or path to a subagent file.
     /// If the value contains '/' or ends with '.md', it's treated as a file path.
     pub subagent: String,
-    /// The detailed task prompt for the subagent.
-    pub prompt: String,
+    /// Path to a file containing the detailed task prompt for the subagent.
+    /// The file must exist and be non-empty.
+    pub prompt_file: String,
+    /// Model tier to run the subagent on. When omitted and the subagent
+    /// definition declares none, the fast model reads the prompt and routes
+    /// it to one of the configured tiers.
+    pub model: Option<ModelTier>,
+}
+
+/// How the model that ran a subagent was selected.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ModelSource {
+    /// The call's `model` argument or the subagent definition chose it.
+    Chosen,
+    /// The fast model routed the prompt to it.
+    Routed,
+}
+
+/// The model that ran a subagent, reported back to the caller.
+#[derive(Debug, Clone, Serialize)]
+struct SubagentRunModel {
+    /// Profile name of the model that ran.
+    name: String,
+    /// Whether the model was chosen or routed.
+    source: ModelSource,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +168,8 @@ struct SubagentResult {
     subagent: String,
     status: &'static str,
     result: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<SubagentRunModel>,
 }
 
 impl SubagentResult {
@@ -135,8 +178,46 @@ impl SubagentResult {
             subagent,
             status: "cancelled",
             result: "Cancelled by user".to_string(),
+            model: None,
         }
     }
+}
+
+/// Structured response the fast model returns when routing a prompt.
+#[derive(Debug, JsonSchema, Deserialize)]
+struct SubagentRouting {
+    /// The configured model tier that best fits the task.
+    model: ModelTier,
+}
+
+/// One configured model offered to the router.
+struct RouterModel<'a> {
+    tier: &'static str,
+    name: &'a str,
+    description: &'a str,
+}
+
+/// Router prompt listing the configured models by tier.
+#[derive(Template)]
+#[template(path = "subagent_router.txt", escape = "none")]
+struct SubagentRouter<'a> {
+    models: [RouterModel<'a>; 3],
+}
+
+const fn tier_label(tier: ModelTier) -> &'static str {
+    match tier {
+        ModelTier::Advanced => "advanced",
+        ModelTier::Balanced => "balanced",
+        ModelTier::Fast => "fast",
+    }
+}
+
+/// Where a subagent request gets its definition and builder from.
+enum Source<'a, LLM> {
+    /// A `SubagentDefinition` loaded from a file.
+    File(SubagentDefinition),
+    /// A registered `SubagentType` on the tool.
+    Registered(&'a SubagentType<LLM>),
 }
 
 /// Snapshot of one in-flight subagent run.
@@ -296,7 +377,13 @@ where
 ///     .build();
 /// ```
 pub struct SubagentTool<LLM> {
-    llm: LLM,
+    /// Model a subagent runs on when the advanced tier is selected.
+    advanced: LLM,
+    /// Model a subagent runs on when the balanced tier is selected.
+    balanced: LLM,
+    /// Model a subagent runs on when the fast tier is selected; also routes
+    /// prompts that carry no model selector.
+    fast: LLM,
     types: HashMap<String, SubagentType<LLM>>,
     /// Base directory for resolving relative paths (e.g., sandbox directory).
     base_dir: Option<PathBuf>,
@@ -321,9 +408,15 @@ impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
 
 impl<LLM: Clone + Sync> SubagentTool<LLM> {
     /// Creates a new `TaskTool` with the given LLM.
+    ///
+    /// All three model tiers (advanced/balanced/fast) use the same model;
+    /// configure distinct ones with [`with_balanced_model`](Self::with_balanced_model)
+    /// and [`with_fast_model`](Self::with_fast_model).
     pub fn new(llm: LLM) -> Self {
         Self {
-            llm,
+            advanced: llm.clone(),
+            balanced: llm.clone(),
+            fast: llm,
             types: HashMap::new(),
             base_dir: None,
             mounts: Vec::new(),
@@ -351,6 +444,21 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         I: IntoIterator<Item = SubagentFileMount>,
     {
         self.mounts = mounts.into_iter().collect();
+        self
+    }
+
+    /// Sets the model that runs a subagent when the balanced tier is selected.
+    #[must_use]
+    pub fn with_balanced_model(mut self, model: LLM) -> Self {
+        self.balanced = model;
+        self
+    }
+
+    /// Sets the model that runs a subagent when the fast tier is selected and
+    /// that routes prompts with no model selector.
+    #[must_use]
+    pub fn with_fast_model(mut self, model: LLM) -> Self {
+        self.fast = model;
         self
     }
 
@@ -569,6 +677,90 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
 
         Self::resolve_relative_path_through_mounts(file_path, file_path, mounts).await
     }
+
+    /// The configured model behind a tier.
+    const fn model_for(&self, tier: ModelTier) -> &LLM {
+        match tier {
+            ModelTier::Advanced => &self.advanced,
+            ModelTier::Balanced => &self.balanced,
+            ModelTier::Fast => &self.fast,
+        }
+    }
+
+    /// Reads the subagent prompt from the file `prompt_file` points to.
+    ///
+    /// The prompt is always a file: inline text fails path resolution, and a
+    /// missing or empty file is an error.
+    async fn read_prompt(&self, prompt_file: &str) -> anyhow::Result<String> {
+        let resolved = Self::resolve_subagent_path(
+            &self.effective_mounts(),
+            self.base_dir.as_deref(),
+            Path::new(prompt_file),
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("subagent prompt must be a path to a prompt file: {error}")
+        })?;
+        let content = async_fs::read_to_string(&resolved).await.map_err(|error| {
+            anyhow::anyhow!(
+                "failed to read subagent prompt file '{}': {error}",
+                resolved.display()
+            )
+        })?;
+        let prompt = content.trim();
+        if prompt.is_empty() {
+            anyhow::bail!("subagent prompt file '{}' is empty", resolved.display());
+        }
+        Ok(prompt.to_string())
+    }
+
+    /// Resolves `args.subagent` into the source a call builds its agent from.
+    ///
+    /// Returns the subagent id, the model the definition declares (if any),
+    /// and the source. Values containing '/' or ending in '.md' load a
+    /// `SubagentDefinition` from a file; anything else must name a
+    /// registered subagent type.
+    async fn resolve_source(
+        &self,
+        subagent: &str,
+    ) -> anyhow::Result<(String, Option<ModelTier>, Source<'_, LLM>)> {
+        let is_file_path = subagent.contains('/')
+            || Path::new(subagent)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
+
+        if is_file_path {
+            // Resolve file paths using explicit search roots.
+            let resolved_path = Self::resolve_subagent_path(
+                &self.effective_mounts(),
+                self.base_dir.as_deref(),
+                &PathBuf::from(subagent),
+            )
+            .await?;
+            let def = SubagentDefinition::from_file_async(&resolved_path)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to read subagent file '{}': {e}",
+                        resolved_path.display()
+                    )
+                })?;
+            return Ok((def.id.clone(), def.model, Source::File(def)));
+        }
+
+        let subagent_type = self.types.get(subagent).ok_or_else(|| {
+            let available: Vec<&str> = self.types.keys().map(std::string::String::as_str).collect();
+            anyhow::anyhow!(
+                "Unknown subagent type '{subagent}'. Available: {}",
+                available.join(", ")
+            )
+        })?;
+        Ok((
+            subagent.to_string(),
+            subagent_type.model,
+            Source::Registered(subagent_type),
+        ))
+    }
 }
 
 impl<LLM: LanguageModel + Clone + Sync> SubagentTool<LLM> {
@@ -578,13 +770,113 @@ impl<LLM: LanguageModel + Clone + Sync> SubagentTool<LLM> {
     /// The subagent will use the definition's system prompt and max iterations.
     #[must_use]
     pub fn with_definition(self, def: SubagentDefinition) -> Self {
-        let subagent = SubagentType::new(def.description.clone(), move |llm| {
+        let mut subagent = SubagentType::new(def.description.clone(), move |llm| {
             crate::AgentBuilder::new(llm)
                 .agent_kind(crate::AgentKind::Chatbot)
                 .system_prompt(&def.system_prompt)
                 .max_iterations(def.max_iterations)
         });
+        subagent.model = def.model;
         self.with_type(def.id, subagent)
+    }
+
+    /// Picks the model a subagent call runs on.
+    ///
+    /// A `chosen` tier — from `SubagentArgs::model` or the definition —
+    /// is used as given. Without one, [`route_model`](Self::route_model)
+    /// asks the fast model which configured tier fits the prompt.
+    async fn select_model(
+        &self,
+        prompt: &str,
+        chosen: Option<ModelTier>,
+    ) -> anyhow::Result<(ModelTier, SubagentRunModel)> {
+        if let Some(tier) = chosen {
+            let profile = self.model_for(tier).profile().await.map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to fetch the {} model profile: {error}",
+                    tier_label(tier)
+                )
+            })?;
+            return Ok((
+                tier,
+                SubagentRunModel {
+                    name: profile.name,
+                    source: ModelSource::Chosen,
+                },
+            ));
+        }
+
+        let (tier, name) = self.route_model(prompt).await?;
+        Ok((
+            tier,
+            SubagentRunModel {
+                name,
+                source: ModelSource::Routed,
+            },
+        ))
+    }
+
+    /// Asks the fast model which configured tier fits `prompt`.
+    ///
+    /// Returns the routed tier and the profile name of the model behind it.
+    async fn route_model(&self, prompt: &str) -> anyhow::Result<(ModelTier, String)> {
+        let (advanced, balanced, fast) = futures::join!(
+            self.advanced.profile(),
+            self.balanced.profile(),
+            self.fast.profile(),
+        );
+        let profiles = [
+            (ModelTier::Advanced, advanced),
+            (ModelTier::Balanced, balanced),
+            (ModelTier::Fast, fast),
+        ]
+        .map(|(tier, profile)| {
+            profile.map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to fetch the {} model profile for subagent routing: {error}",
+                    tier_label(tier)
+                )
+            })
+        });
+        let [advanced, balanced, fast] = profiles;
+        let (advanced, balanced, fast) = (advanced?, balanced?, fast?);
+
+        let system = SubagentRouter {
+            models: [
+                RouterModel {
+                    tier: tier_label(ModelTier::Advanced),
+                    name: &advanced.name,
+                    description: &advanced.description,
+                },
+                RouterModel {
+                    tier: tier_label(ModelTier::Balanced),
+                    name: &balanced.name,
+                    description: &balanced.description,
+                },
+                RouterModel {
+                    tier: tier_label(ModelTier::Fast),
+                    name: &fast.name,
+                    description: &fast.description,
+                },
+            ],
+        }
+        .render()
+        .map_err(|error| anyhow::anyhow!("failed to render the subagent router prompt: {error}"))?;
+
+        let routing: SubagentRouting = self
+            .fast
+            .generate(oneshot(system, prompt.to_string()))
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("the fast model failed to route the subagent prompt: {error}")
+            })?;
+
+        let name = match routing.model {
+            ModelTier::Advanced => advanced.name,
+            ModelTier::Balanced => balanced.name,
+            ModelTier::Fast => fast.name,
+        };
+        Ok((routing.model, name))
     }
 
     /// Register all builtin subagents.
@@ -615,55 +907,27 @@ where
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        // Determine if subagent is a file path or a registered type name
-        // File paths contain '/' or end with '.md'
-        let is_file_path = args.subagent.contains('/')
-            || Path::new(&args.subagent)
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
+        let (subagent_id, declared_model, source) = self.resolve_source(&args.subagent).await?;
 
-        let (subagent_id, agent_builder) = if is_file_path {
-            // Load subagent from file
-            // Resolve paths using explicit search roots.
-            let file_path = PathBuf::from(&args.subagent);
-            let resolved_path = Self::resolve_subagent_path(
-                &self.effective_mounts(),
-                self.base_dir.as_deref(),
-                &file_path,
-            )
+        // The task prompt comes from a file; inline prompt text is rejected.
+        let prompt = self.read_prompt(&args.prompt_file).await?;
+
+        // A model given by the caller or the definition runs as given;
+        // otherwise the fast model routes the prompt to a configured tier.
+        let (tier, model) = self
+            .select_model(&prompt, args.model.or(declared_model))
             .await?;
+        let selected = self.model_for(tier).clone();
 
-            let def = SubagentDefinition::from_file_async(&resolved_path)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to read subagent file '{}': {e}",
-                        resolved_path.display()
-                    )
-                })?;
-
-            let builder = crate::AgentBuilder::new(self.llm.clone())
+        let agent_builder = match source {
+            Source::File(def) => crate::AgentBuilder::new(selected)
                 .agent_kind(crate::AgentKind::Chatbot)
                 .system_prompt(&def.system_prompt)
-                .max_iterations(def.max_iterations);
-
-            (def.id, builder)
-        } else {
-            // Use registered subagent type
-            let type_name = &args.subagent;
-            let subagent_type = self.types.get(type_name).ok_or_else(|| {
-                let available: Vec<&str> =
-                    self.types.keys().map(std::string::String::as_str).collect();
-                anyhow::anyhow!(
-                    "Unknown subagent type '{}'. Available: {}",
-                    type_name,
-                    available.join(", ")
-                )
-            })?;
-            (type_name.clone(), subagent_type.builder(self.llm.clone()))
+                .max_iterations(def.max_iterations),
+            Source::Registered(subagent_type) => subagent_type.builder(selected),
         };
 
-        tracing::info!(subagent = %subagent_id, "Starting subagent");
+        tracing::info!(subagent = %subagent_id, model = %model.name.as_str(), "Starting subagent");
 
         // Add child terminal tool if factory is configured
         let (agent_builder, child_job_registry) = if let Some(factory) = &self.terminal_tool_factory
@@ -680,8 +944,8 @@ where
 
         let mut agent = agent_builder.build();
 
-        let (run_id, cancel_rx) = self.runs.begin(&subagent_id, &args.prompt);
-        let outcome = await_subagent_run(agent.query(&args.prompt), cancel_rx).await;
+        let (run_id, cancel_rx) = self.runs.begin(&subagent_id, &prompt);
+        let outcome = await_subagent_run(agent.query(&prompt), cancel_rx).await;
         self.runs.finish(run_id);
         if let Some(job_registry) = child_job_registry {
             let killed = job_registry.kill_running().await;
@@ -723,6 +987,7 @@ where
             subagent: subagent_id,
             status: "completed",
             result,
+            model: Some(model),
         })
     }
 }
@@ -742,11 +1007,18 @@ mod tests {
         let value = schema.to_value();
         let props = value.get("properties").expect("should have properties");
         assert!(props.get("subagent").is_some());
-        assert!(props.get("prompt").is_some());
+        assert!(props.get("prompt_file").is_some());
+        assert!(props.get("model").is_some());
 
-        // Check required order
-        let required = value.get("required").expect("should have required");
-        assert!(required.is_array());
+        // `model` stays optional; the caller may leave routing to the tool.
+        let required = value
+            .get("required")
+            .expect("should have required")
+            .as_array()
+            .expect("required should be an array");
+        assert!(required.contains(&serde_json::json!("subagent")));
+        assert!(required.contains(&serde_json::json!("prompt_file")));
+        assert!(!required.contains(&serde_json::json!("model")));
     }
 
     #[test]
@@ -755,6 +1027,10 @@ mod tests {
             subagent: "research".to_string(),
             status: "completed",
             result: "done".to_string(),
+            model: Some(SubagentRunModel {
+                name: "test-model".to_string(),
+                source: ModelSource::Routed,
+            }),
         })
         .expect("subagent result should serialize");
         assert_eq!(
@@ -763,6 +1039,21 @@ mod tests {
                 "subagent": "research",
                 "status": "completed",
                 "result": "done",
+                "model": {
+                    "name": "test-model",
+                    "source": "routed",
+                },
+            })
+        );
+
+        let cancelled = serde_json::to_value(SubagentResult::cancelled("explore".to_string()))
+            .expect("cancelled result should serialize");
+        assert_eq!(
+            cancelled,
+            serde_json::json!({
+                "subagent": "explore",
+                "status": "cancelled",
+                "result": "Cancelled by user",
             })
         );
     }
@@ -895,6 +1186,79 @@ mod tests {
         }
     }
 
+    /// A model that answers with its own name, so a result identifies which
+    /// configured model produced it. Structured-output requests get a fixed
+    /// JSON body back, which lets the fast model play router.
+    #[derive(Clone)]
+    struct TextLlm {
+        name: &'static str,
+        structured: &'static str,
+    }
+
+    impl TextLlm {
+        const fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                structured: "{}",
+            }
+        }
+
+        const fn routing(name: &'static str, decision: &'static str) -> Self {
+            Self {
+                name,
+                structured: decision,
+            }
+        }
+    }
+
+    impl LanguageModel for TextLlm {
+        type Error = NeverError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let text = if request.parameters().structured_outputs {
+                self.structured
+            } else {
+                self.name
+            };
+            futures_lite::stream::iter([Ok(Event::Text(text.to_string()))])
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                self.name,
+                "test",
+                self.name,
+                "text mock",
+                128_000,
+            )))
+        }
+    }
+
+    fn write_prompt_file(tag: &str, content: &str) -> (PathBuf, PathBuf) {
+        let dir = unique_temp_dir(tag);
+        let prompt_file = dir.join("prompt.txt");
+        std::fs::write(&prompt_file, content).expect("write prompt file");
+        (dir, prompt_file)
+    }
+
+    fn worker_tool<LLM: LanguageModel + Clone + Sync>(
+        tool: SubagentTool<LLM>,
+    ) -> SubagentTool<LLM> {
+        tool.with_type(
+            "worker",
+            SubagentType::new("worker for tests", |llm| {
+                crate::AgentBuilder::new(llm)
+                    .agent_kind(crate::AgentKind::Chatbot)
+                    .max_iterations(2)
+            }),
+        )
+    }
+
     #[tokio::test]
     async fn cancelled_run_returns_cancelled_result() {
         let runs = SubagentRuns::default();
@@ -908,13 +1272,16 @@ mod tests {
                         .max_iterations(5)
                 }),
             );
+        let (dir, prompt_file) = write_prompt_file("cancelled-run", "survey the codebase");
 
+        let prompt_path = prompt_file.to_string_lossy().into_owned();
         let call = tokio::spawn(async move {
             Tool::call(
                 &tool,
                 SubagentArgs {
                     subagent: "explore".to_string(),
-                    prompt: "survey the codebase".to_string(),
+                    prompt_file: prompt_path,
+                    model: Some(ModelTier::Fast),
                 },
                 ToolContext::new(),
             )
@@ -945,6 +1312,161 @@ mod tests {
         assert_eq!(value["subagent"], "explore");
         assert!(runs.list().is_empty(), "finished run must unregister");
         assert!(!runs.cancel(run.id), "finished run cannot be cancelled");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn inline_prompt_text_is_rejected() {
+        let tool = worker_tool(SubagentTool::new(TextLlm::new("only-model")));
+
+        let error = Tool::call(
+            &tool,
+            SubagentArgs {
+                subagent: "worker".to_string(),
+                prompt_file: "summarize the repository layout".to_string(),
+                model: Some(ModelTier::Fast),
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect_err("inline prompt text must be rejected");
+        assert!(
+            error.to_string().contains("prompt file"),
+            "error should name the file requirement: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_file_is_rejected() {
+        let tool = worker_tool(SubagentTool::new(TextLlm::new("only-model")));
+        let (dir, prompt_file) = write_prompt_file("empty-prompt", "   \n");
+
+        let error = Tool::call(
+            &tool,
+            SubagentArgs {
+                subagent: "worker".to_string(),
+                prompt_file: prompt_file.to_string_lossy().into_owned(),
+                model: Some(ModelTier::Fast),
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect_err("empty prompt file must be rejected");
+        assert!(
+            error.to_string().contains("is empty"),
+            "error should report the empty file: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_model_runs_as_given() {
+        let tool = worker_tool(
+            SubagentTool::new(TextLlm::new("advanced-model"))
+                .with_balanced_model(TextLlm::new("balanced-model"))
+                .with_fast_model(TextLlm::new("fast-model")),
+        );
+        let (dir, prompt_file) = write_prompt_file("explicit-model", "do the task");
+
+        let result = Tool::call(
+            &tool,
+            SubagentArgs {
+                subagent: "worker".to_string(),
+                prompt_file: prompt_file.to_string_lossy().into_owned(),
+                model: Some(ModelTier::Fast),
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect("subagent call failed");
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result, got {result:?}");
+        };
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["result"], "fast-model");
+        assert_eq!(value["model"]["name"], "fast-model");
+        assert_eq!(value["model"]["source"], "chosen");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn missing_model_is_routed_by_fast_model() {
+        let tool = worker_tool(
+            SubagentTool::new(TextLlm::new("advanced-model"))
+                .with_balanced_model(TextLlm::new("balanced-model"))
+                .with_fast_model(TextLlm::routing("fast-model", r#"{"model":"balanced"}"#)),
+        );
+        let (dir, prompt_file) = write_prompt_file("routed-model", "do the task");
+
+        let result = Tool::call(
+            &tool,
+            SubagentArgs {
+                subagent: "worker".to_string(),
+                prompt_file: prompt_file.to_string_lossy().into_owned(),
+                model: None,
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect("subagent call failed");
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result, got {result:?}");
+        };
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["result"], "balanced-model");
+        assert_eq!(value["model"]["name"], "balanced-model");
+        assert_eq!(value["model"]["source"], "routed");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn definition_model_is_used_when_caller_gives_none() {
+        let root = unique_temp_dir("definition-model");
+        let def_path = root.join("file-agent.md");
+        std::fs::write(
+            &def_path,
+            r"---
+version: 1
+name: file-agent
+description: agent loaded from a file
+model: fast
+---
+
+You are a file-defined agent.
+",
+        )
+        .expect("write subagent definition");
+        let (dir, prompt_file) = write_prompt_file("definition-model-prompt", "do the task");
+
+        let tool = SubagentTool::new(TextLlm::new("advanced-model"))
+            .with_balanced_model(TextLlm::new("balanced-model"))
+            .with_fast_model(TextLlm::new("fast-model"));
+
+        let result = Tool::call(
+            &tool,
+            SubagentArgs {
+                subagent: def_path.to_string_lossy().into_owned(),
+                prompt_file: prompt_file.to_string_lossy().into_owned(),
+                model: None,
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect("subagent call failed");
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result, got {result:?}");
+        };
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["result"], "fast-model");
+        assert_eq!(value["model"]["name"], "fast-model");
+        assert_eq!(value["model"]["source"], "chosen");
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

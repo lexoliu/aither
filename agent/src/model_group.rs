@@ -259,7 +259,19 @@ impl<M> ModelGroup<M> {
 }
 
 /// Model tier classification for organizing models.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    schemars::JsonSchema,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum ModelTier {
     /// High-capability models (e.g., GPT-4, Claude Opus)
     #[default]

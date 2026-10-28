@@ -358,7 +358,7 @@ mod tests {
             ),
             (
                 "subagent",
-                r#"{"subagent":"explore","prompt":"find the adapter code"}"#,
+                r#"{"subagent":"explore","prompt_file":"tmp/prompt.md"}"#,
                 "Running explore subagent",
                 ToolKind::Other,
             ),

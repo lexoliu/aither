@@ -1,0 +1,6 @@
+You route a subagent task to one of the configured models below, ordered from most to least capable.
+
+{% for model in models -%}
+- {{ model.tier }} ("{{ model.name }}"): {{ model.description }}
+{% endfor %}
+Pick the least capable model that can still complete the task well; cheap tasks should not burn the expensive model.

@@ -50,7 +50,7 @@ If multiple skills apply, use the minimal set that fully covers the request.
 {% endif %}
 {% if has_subagents %}
 <subagents>
-<invoke>Use `subagent --subagent "<type-or-path>" --prompt "<prompt>"`.</invoke>
+<invoke>Use `subagent --subagent "<type-or-path>" --prompt-file "<path>"`. Write the prompt to a file first; inline prompt text is rejected.</invoke>
 {{ subagents }}
 </subagents>
 {% endif %}
