@@ -72,6 +72,10 @@ pub mod builtin;
 /// Background job registry for tracking tasks.
 pub mod job_registry;
 
+/// Jobserver token pool brokering across commands.
+#[cfg(all(unix, feature = "jobserver"))]
+pub mod jobserver;
+
 /// Declarative host-based network policy.
 pub mod network_policy;
 
@@ -94,6 +98,10 @@ pub use heel::NetworkAuditLog;
 pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use job_registry::{
     JobInfo, JobRegistry, JobRegistryService, JobStatus, TerminalDelta, job_registry_channel,
+};
+#[cfg(all(unix, feature = "jobserver"))]
+pub use jobserver::{
+    CommandFifo, JobBroker, JobBrokerService, JobPool, JobserverError, job_broker_channel,
 };
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
