@@ -6,6 +6,7 @@
 //! ---
 //! name: subagent-id
 //! description: One sentence description of when to use this subagent.
+//! model: balanced
 //! ---
 //!
 //! # Subagent Title
@@ -15,6 +16,9 @@
 //!
 //! The `name` field is the subagent ID used for tool registration.
 //! The `description` field is shown in tool listings.
+//! The optional `model` field pins the subagent to a model tier
+//! (`advanced`, `balanced` or `fast`); when it is absent and the caller
+//! does not select a model either, the fast model routes the prompt.
 //! Everything after the frontmatter is the system prompt.
 
 use std::path::Path;
@@ -23,6 +27,8 @@ use async_fs as fs;
 use futures_lite::stream::StreamExt;
 use serde::Deserialize;
 
+use crate::model_group::ModelTier;
+
 const CURRENT_SUBAGENT_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +36,8 @@ struct SubagentFrontmatter {
     version: u32,
     name: String,
     description: String,
+    #[serde(default)]
+    model: Option<ModelTier>,
     #[serde(default = "default_max_iterations")]
     max_iterations: usize,
 }
@@ -47,6 +55,11 @@ pub struct SubagentDefinition {
     pub description: String,
     /// System prompt for the subagent.
     pub system_prompt: String,
+    /// Model tier the definition declares, if any.
+    ///
+    /// A caller-provided model takes precedence; when neither is set the
+    /// fast model routes the prompt to a configured tier.
+    pub model: Option<ModelTier>,
     /// Maximum iterations (default: 20).
     pub max_iterations: usize,
 }
@@ -116,6 +129,7 @@ impl SubagentDefinition {
             id: parsed.name,
             description: parsed.description,
             system_prompt: system_prompt.to_string(),
+            model: parsed.model,
             max_iterations: parsed.max_iterations,
         })
     }
@@ -183,6 +197,7 @@ mod tests {
 version: 1
 name: test-agent
 description: This is a test agent for exploring and testing.
+model: fast
 max_iterations: 42
 ---
 
@@ -197,8 +212,13 @@ You are a test agent. Do test things.
             def.description,
             "This is a test agent for exploring and testing."
         );
+        assert_eq!(def.model, Some(ModelTier::Fast));
         assert_eq!(def.max_iterations, 42);
         assert!(def.system_prompt.contains("You are a test agent"));
+
+        let without_model =
+            SubagentDefinition::parse(&content.replace("model: fast\n", "")).unwrap();
+        assert_eq!(without_model.model, None);
     }
 
     #[test]
