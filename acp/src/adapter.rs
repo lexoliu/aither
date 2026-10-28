@@ -106,6 +106,10 @@ impl SessionUpdateMapper {
                 }))
             }
 
+            AgentEvent::BuiltInToolCall { .. } | AgentEvent::BuiltInToolResult { .. } => {
+                map_builtin(event)
+            }
+
             AgentEvent::RunStart { .. }
             | AgentEvent::Checkpoint { .. }
             | AgentEvent::BackgroundTaskStarted { .. }
@@ -118,6 +122,40 @@ impl SessionUpdateMapper {
             | AgentEvent::Error(_)
             | AgentEvent::Usage(_) => None,
         }
+    }
+}
+
+/// Map a provider-hosted tool call or result onto the tool-call updates —
+/// the provider executes these, but they render like any other tool call.
+fn map_builtin(event: &AgentEvent) -> Option<SessionUpdate> {
+    match event {
+        AgentEvent::BuiltInToolCall { id, tool, detail } => {
+            Some(SessionUpdate::ToolCall(ToolCall {
+                tool_call_id: id.clone(),
+                title: format_tool_title(tool, detail),
+                kind: Some(infer_tool_kind(tool)),
+                status: Some(ToolCallStatus::Pending),
+                content: vec![],
+                locations: vec![],
+                raw_input: None,
+                raw_output: None,
+                meta: None,
+            }))
+        }
+        AgentEvent::BuiltInToolResult { id, result, .. } => {
+            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                tool_call_id: id.clone(),
+                status: Some(ToolCallStatus::Completed),
+                content: None,
+                title: None,
+                kind: None,
+                locations: None,
+                raw_input: None,
+                raw_output: Some(serde_json::Value::String(result.clone())),
+                meta: None,
+            }))
+        }
+        _ => None,
     }
 }
 

@@ -66,6 +66,29 @@ pub enum AgentEvent {
         result: ToolResult,
     },
 
+    /// A provider-hosted (server-side) tool call began.
+    ///
+    /// The provider executes these itself — nothing runs locally — but the
+    /// call is part of the visible stream so UIs can show it live.
+    BuiltInToolCall {
+        /// Provider-assigned call identifier (may be empty).
+        id: String,
+        /// Hosted tool name (e.g. `web_search`).
+        tool: String,
+        /// Invocation detail — query, URL or code — as known at emit time.
+        detail: String,
+    },
+
+    /// A provider-hosted (server-side) tool call produced a result.
+    BuiltInToolResult {
+        /// Call identifier matching the start event (may be empty).
+        id: String,
+        /// Hosted tool name.
+        tool: String,
+        /// Result summary.
+        result: String,
+    },
+
     /// Agent turn completed (may have more turns if tools were called).
     TurnComplete {
         /// The turn number (0-indexed).

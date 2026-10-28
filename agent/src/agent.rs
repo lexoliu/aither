@@ -153,10 +153,23 @@ async fn handle_model_event<H: Hook>(
             reasoning.push(state);
             Ok(ModelEventAction::Continue)
         }
-        Ok(Event::BuiltInToolResult { tool, result }) => {
-            let formatted = format_builtin_tool_result(&tool, &result);
-            text_chunks.push(formatted.clone());
-            Ok(ModelEventAction::Emit(AgentEvent::Text(formatted)))
+        Ok(Event::BuiltInToolCall { id, tool, detail }) => {
+            if !detail.is_empty() {
+                text_chunks.push(format_builtin_tool_result(&tool, &detail));
+            }
+            Ok(ModelEventAction::Emit(AgentEvent::BuiltInToolCall {
+                id,
+                tool,
+                detail,
+            }))
+        }
+        Ok(Event::BuiltInToolResult { id, tool, result }) => {
+            text_chunks.push(format_builtin_tool_result(&tool, &result));
+            Ok(ModelEventAction::Emit(AgentEvent::BuiltInToolResult {
+                id,
+                tool,
+                result,
+            }))
         }
         Ok(Event::Usage(usage)) => {
             cache_stats.record(&usage);
@@ -1333,7 +1346,7 @@ where
         while let Some(event) = stream.next().await {
             match event {
                 Ok(Event::Text(text)) => chunks.push(text),
-                Ok(Event::BuiltInToolResult { tool, result }) => {
+                Ok(Event::BuiltInToolResult { tool, result, .. }) => {
                     chunks.push(format_builtin_tool_result(&tool, &result));
                 }
                 Ok(_) => {}

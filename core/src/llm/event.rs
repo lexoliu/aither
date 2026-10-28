@@ -211,15 +211,38 @@ pub enum Event {
     /// assistant message they build; dropping them degrades multi-turn tool use.
     ReasoningState(ReasoningState),
 
+    /// A provider's built-in tool was invoked.
+    ///
+    /// Some providers have native tools that are executed server-side:
+    /// - `OpenAI`: `web_search`, file search, code interpreter
+    /// - Claude: `web_search`, `web_fetch`, code execution
+    /// - Gemini: code execution
+    ///
+    /// Unlike [`Event::ToolCall`], the consumer executes nothing — the
+    /// provider runs the call itself and a [`Event::BuiltInToolResult`]
+    /// follows with the outcome.
+    BuiltInToolCall {
+        /// Provider-assigned call identifier (may be empty).
+        id: String,
+        /// Name of the built-in tool (e.g. `web_search`).
+        tool: String,
+        /// Invocation detail available at emit time — the search query, the
+        /// URL, or the code — empty when the wire has not revealed it yet.
+        detail: String,
+    },
+
     /// Result from a provider's built-in tool.
     ///
     /// Some providers have native tools that are executed server-side:
-    /// - Gemini: Google Search grounding
-    /// - `OpenAI`: Code interpreter, file search
-    /// - Claude: (future built-in tools)
+    /// - Gemini: Google Search grounding, code execution
+    /// - `OpenAI`: Code interpreter, file search, web search
+    /// - Claude: server tools (`web_search`, `web_fetch`, code execution)
     ///
     /// These are already executed - this event contains the result.
     BuiltInToolResult {
+        /// Provider-assigned identifier of the call this answers; empty when
+        /// the provider does not carry one (e.g. Gemini parts).
+        id: String,
         /// Name of the built-in tool that was executed.
         tool: String,
         /// Result from the tool execution.
@@ -271,10 +294,29 @@ impl Event {
         })
     }
 
+    /// Creates a built-in tool call event.
+    #[must_use]
+    pub fn builtin_call(
+        id: impl Into<String>,
+        tool: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::BuiltInToolCall {
+            id: id.into(),
+            tool: tool.into(),
+            detail: detail.into(),
+        }
+    }
+
     /// Creates a built-in tool result event.
     #[must_use]
-    pub fn builtin_result(tool: impl Into<String>, result: impl Into<String>) -> Self {
+    pub fn builtin_result(
+        id: impl Into<String>,
+        tool: impl Into<String>,
+        result: impl Into<String>,
+    ) -> Self {
         Self::BuiltInToolResult {
+            id: id.into(),
             tool: tool.into(),
             result: result.into(),
         }
