@@ -45,9 +45,9 @@ use crate::{
 };
 
 use aither_sandbox::{
-    BackgroundReason, BackgroundTaskReceiver, JobRegistry, PermissionEvent,
-    PermissionEventReceiver, PermissionEventStage, TERMINAL_STDIN_BLOCKED_NOTICE, TerminalArgs,
-    TerminalExecutionMode, TerminalMode,
+    BackgroundTaskReceiver, JobRegistry, PermissionEvent, PermissionEventReceiver,
+    PermissionEventStage, TerminalArgs, TerminalBackgroundArgs, TerminalExecutionMode,
+    TerminalMode,
 };
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "skills")]
@@ -280,12 +280,6 @@ struct BackgroundTaskStartedEvent {
     output_preview: String,
     output_file: String,
     reminder: String,
-    reason: BackgroundReason,
-}
-
-struct TerminalInputNeededEvent {
-    task_id: Option<String>,
-    notice: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -878,7 +872,7 @@ where
             .collect();
         for result in results {
             let (call_id, call_name, tool_result) = result?;
-            let is_terminal_call = call_name == "terminal";
+            let is_terminal_call = matches!(call_name.as_str(), "terminal" | "terminal_background");
             if !known_tools.contains(&call_name) && !unknown_tools.contains(&call_name) {
                 unknown_tools.push(call_name.clone());
             }
@@ -906,12 +900,12 @@ where
             // the model retry the same wrong call.
             for name in &unknown_tools {
                 self.push_system_alert(format!(
-                    "There is no native tool named '{name}'. This runtime is terminal-first: the only native tools are terminal, terminal_kill, terminal_input, and terminal_read; every other capability is a CLI command executed through the `terminal` tool. If '{name}' is a capability, run it as a command (check with `{name} --help`)."
+                    "There is no native tool named '{name}'. This runtime is terminal-first: the only native tools are terminal, terminal_background, terminal_kill, terminal_input, and terminal_read; every other capability is a CLI command executed through the `terminal` tool. If '{name}' is a capability, run it as a command (check with `{name} --help`)."
                 ));
             }
         } else if has_tool_error {
             self.push_system_alert(
-                "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain terminal, terminal_kill, terminal_input, and terminal_read.",
+                "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain terminal, terminal_background, terminal_kill, terminal_input, and terminal_read.",
             );
         }
         self.push_completed_background_events(events);
@@ -934,19 +928,20 @@ where
                 started.task_id,
                 started.output_preview,
                 started.output_file,
-                started.reason,
-            ));
-        }
-        if let Some(waiting) = Self::detect_terminal_input_needed(content) {
-            events.emit(AgentEvent::terminal_input_needed(
-                waiting.task_id,
-                waiting.notice,
             ));
         }
     }
 
     fn push_completed_background_events(&mut self, events: &EventSink) {
-        if let Some(ref receiver) = self.background_receiver {
+        if let Some(receiver) = self.background_receiver.clone() {
+            for job in receiver.take_long_running_alerts() {
+                tracing::info!(task_id = %job.task_id, "background job crossed long-running threshold");
+                self.push_system_alert(format!(
+                    "Background job '{}' has been running for {} — check with terminal_read that it is still progressing normally, and terminal_kill it if it is stuck.",
+                    job.task_id,
+                    format_job_elapsed(job.elapsed)
+                ));
+            }
             for task in receiver.take_completed() {
                 tracing::info!(task_id = %task.task_id, "background task completed");
                 let result_msg = Self::format_background_task_result(&task);
@@ -1004,6 +999,7 @@ where
         let mut had_completed = self.drain_background_receiver(&receiver, events);
         let start = Instant::now();
         while start.elapsed() < BACKGROUND_TASK_MAX_WAIT {
+            self.push_long_running_alerts();
             if let Some(task) = receiver.recv_timeout(BACKGROUND_TASK_POLL_INTERVAL).await {
                 tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
                 self.push_completed_task_event(task, events);
@@ -1022,6 +1018,21 @@ where
         let outcome = self.run_agent_loop(run_id, iteration, events).await?;
         self.push_stop_events(run_id, outcome, events).await?;
         Ok(true)
+    }
+
+    /// Pushes one durable alert per background job that crossed the
+    /// terminal's long-running threshold.
+    fn push_long_running_alerts(&mut self) {
+        if let Some(receiver) = self.background_receiver.clone() {
+            for job in receiver.take_long_running_alerts() {
+                tracing::info!(task_id = %job.task_id, "background job crossed long-running threshold");
+                self.push_system_alert(format!(
+                    "Background job '{}' has been running for {} — check with terminal_read that it is still progressing normally, and terminal_kill it if it is stuck.",
+                    job.task_id,
+                    format_job_elapsed(job.elapsed)
+                ));
+            }
+        }
     }
 
     fn drain_background_receiver(
@@ -2005,12 +2016,6 @@ where
             .and_then(serde_json::Value::as_str)
             .unwrap_or("(missing output file)");
 
-        let reason = payload
-            .get("background_reason")
-            .cloned()
-            .and_then(|raw| serde_json::from_value::<BackgroundReason>(raw).ok())
-            .unwrap_or(BackgroundReason::Explicit);
-
         let reminder = BackgroundStartedReminderTemplate {
             task_id,
             output_preview,
@@ -2024,33 +2029,6 @@ where
             output_preview: output_preview.to_string(),
             output_file: output_file.to_string(),
             reminder,
-            reason,
-        })
-    }
-
-    fn detect_terminal_input_needed(tool_content: &str) -> Option<TerminalInputNeededEvent> {
-        let payload: aither_sandbox::TerminalResult = serde_json::from_str(tool_content).ok()?;
-        if payload.status.as_deref() != Some("running") {
-            return None;
-        }
-        let notice = match &payload.stdout {
-            aither_sandbox::OutputEntry::Inline { content }
-            | aither_sandbox::OutputEntry::Loaded { content, .. } => match content {
-                aither_sandbox::Content::Text { text, .. } => text.as_str(),
-                aither_sandbox::Content::Image { .. } => return None,
-            },
-            aither_sandbox::OutputEntry::Stored { content, .. } => match content {
-                Some(aither_sandbox::Content::Text { text, .. }) => text.as_str(),
-                Some(aither_sandbox::Content::Image { .. }) | None => return None,
-            },
-            aither_sandbox::OutputEntry::Empty => return None,
-        };
-        if !notice.starts_with(TERMINAL_STDIN_BLOCKED_NOTICE) {
-            return None;
-        }
-        Some(TerminalInputNeededEvent {
-            task_id: payload.task_id,
-            notice: notice.to_string(),
         })
     }
 
@@ -2099,20 +2077,34 @@ fn permission_event_key_for_call(
     tool_name: &str,
     arguments: &serde_json::Value,
 ) -> Option<PermissionEventKey> {
-    if tool_name != "terminal" {
-        return None;
-    }
-    let args: TerminalArgs = serde_json::from_value(arguments.clone()).ok()?;
-    let mode = match args.mode {
+    let (mode, script) = match tool_name {
+        "terminal" => {
+            let args: TerminalArgs = serde_json::from_value(arguments.clone()).ok()?;
+            (args.mode, args.script)
+        }
+        "terminal_background" => {
+            let args: TerminalBackgroundArgs = serde_json::from_value(arguments.clone()).ok()?;
+            (args.terminal.mode, args.terminal.script)
+        }
+        _ => return None,
+    };
+    let mode = match mode {
         TerminalExecutionMode::Sandboxed
         | TerminalExecutionMode::Default
         | TerminalExecutionMode::Ssh => return None,
         TerminalExecutionMode::Unsafe => TerminalMode::Unsafe,
     };
-    Some(PermissionEventKey {
-        mode,
-        script: args.script,
-    })
+    Some(PermissionEventKey { mode, script })
+}
+
+/// Renders a background job's runtime the way the alert text states it.
+fn format_job_elapsed(elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds >= 60 {
+        format!("{} minutes", seconds / 60)
+    } else {
+        format!("{seconds} seconds")
+    }
 }
 
 fn pause_reason_for_tool(tool_name: &str) -> Option<RunPauseReason> {
@@ -2434,7 +2426,6 @@ mod tests {
             ssh_server_id: None,
             expect: aither_sandbox::OutputFormat::Text,
             resolution: aither_sandbox::MediaResolution::Auto,
-            timeout: 30,
             max_lines: 200,
             raw: false,
         })
@@ -2446,7 +2437,6 @@ mod tests {
             ssh_server_id: None,
             expect: aither_sandbox::OutputFormat::Text,
             resolution: aither_sandbox::MediaResolution::Auto,
-            timeout: 30,
             max_lines: 200,
             raw: false,
         })
@@ -2458,7 +2448,6 @@ mod tests {
             ssh_server_id: None,
             expect: aither_sandbox::OutputFormat::Text,
             resolution: aither_sandbox::MediaResolution::Auto,
-            timeout: 30,
             max_lines: 200,
             raw: false,
         })
@@ -2487,7 +2476,6 @@ mod tests {
                 ssh_server_id: None,
                 expect: aither_sandbox::OutputFormat::Text,
                 resolution: aither_sandbox::MediaResolution::Auto,
-                timeout: 30,
                 max_lines: 200,
                 raw: false,
             })
