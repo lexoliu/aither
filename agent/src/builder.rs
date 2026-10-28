@@ -441,15 +441,13 @@ where
     /// Panics if the tool cannot be registered: another tool already uses
     /// its name, or it carries no description for the model to read. Both
     /// are mistakes in the calling program.
-    pub fn terminal<P, E, State>(
+    pub fn terminal<P, E>(
         mut self,
-        terminal_tool: aither_sandbox::TerminalTool<P, E, State>,
+        terminal_tool: aither_sandbox::TerminalTool<P, E, aither_sandbox::Configured>,
     ) -> Self
     where
         P: aither_sandbox::PermissionHandler + 'static,
         E: executor_core::Executor + Clone + 'static,
-        State: Clone + 'static,
-        aither_sandbox::TerminalTool<P, E, State>: Tool + 'static,
     {
         self.context.insert_system_text(
             "prepared_tools",
@@ -461,6 +459,9 @@ where
         let permission_receiver = terminal_tool.permission_receiver();
         let job_registry = terminal_tool.job_registry();
         self.sandbox_dir = Some(terminal_tool.working_dir().clone());
+        self.tools
+            .register(terminal_tool.background_tool())
+            .expect("tool registration must succeed: duplicate name or missing description");
         self.tools
             .register(terminal_tool)
             .expect("tool registration must succeed: duplicate name or missing description");

@@ -35,7 +35,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "description": "Verify prepared search, JSON and edit commands",
         "script": include_str!("../templates/verify_baseline_tools.sh"),
         "mode": "sandboxed",
-        "timeout": 30,
         "raw": true
     }))?;
     let result = terminal.call(arguments, ToolContext::new()).await?;
