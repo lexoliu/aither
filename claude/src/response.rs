@@ -309,84 +309,28 @@ pub struct MessagesResponse {
 
 /// Projects a non-streaming [`MessagesResponse`] into the same event stream a
 /// streaming response would have produced.
+///
+/// Each block is replayed through the same start/delta/stop handling the SSE
+/// parser drives, so every block type the stream can carry is projected by
+/// construction rather than re-implemented here.
 #[must_use]
 pub fn response_events(response: MessagesResponse) -> Vec<LLMEvent> {
     let mut state = StreamState::new();
     let mut events = Vec::new();
     for (index, block) in response.content.into_iter().enumerate() {
-        match block {
-            ContentBlockType::Text { text } => {
-                if !text.is_empty() {
-                    events.push(LLMEvent::Text(text));
-                }
-            }
-            block => {
-                ensure_block_capacity(&mut state, index);
-                let start = match &block {
-                    ContentBlockType::ToolUse { id, name, .. } => Some(LLMEvent::ToolCallDelta {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments_fragment: String::new(),
-                    }),
-                    _ => None,
-                };
-                match block {
-                    ContentBlockType::Thinking {
-                        thinking,
-                        signature,
-                    } => {
-                        if !thinking.is_empty() {
-                            events.push(LLMEvent::Reasoning(thinking.clone()));
-                        }
-                        state.blocks[index] = BlockState::Thinking {
-                            text: thinking,
-                            signature,
-                        };
-                    }
-                    ContentBlockType::RedactedThinking { data } => {
-                        state.blocks[index] = BlockState::RedactedThinking(data);
-                    }
-                    ContentBlockType::ToolUse { id, name, input } => {
-                        let input_json = input.to_string();
-                        if let Some(delta) = start {
-                            events.push(delta);
-                        }
-                        events.push(LLMEvent::ToolCallDelta {
-                            id: id.clone(),
-                            name: name.clone(),
-                            arguments_fragment: input_json.clone(),
-                        });
-                        state.blocks[index] = BlockState::ToolUse {
-                            id,
-                            name,
-                            input_json,
-                        };
-                    }
-                    ContentBlockType::Text { .. } => unreachable!(),
-                }
-                events.extend(state.finish_block(index));
-            }
-        }
+        events.extend(state.replay_block(index, block));
     }
-    let usage_event = response.usage.and_then(|usage| {
+    if let Some(usage) = response.usage {
         state.uncached_input_tokens = Some(usage.input_tokens);
         state.completion_tokens = Some(usage.output_tokens);
         state.cache_write_tokens = usage.cache_write_tokens();
         state.cache_read_tokens = usage.cache_read_input_tokens;
-        state.stop_reason = response.stop_reason;
         state.refresh_prompt_tokens();
-        state.maybe_usage_event()
-    });
-    for call in state.tool_calls {
-        events.push(LLMEvent::ToolCall(aither_core::llm::ToolCall {
-            id: call.id,
-            name: call.name,
-            arguments: call.input,
-            reasoning_state: None,
-        }));
     }
-    if let Some(usage_event) = usage_event {
-        events.push(usage_event);
+    state.stop_reason = response.stop_reason;
+    events.extend(state.maybe_usage_event());
+    for call in state.tool_calls {
+        events.push(LLMEvent::tool_call(call.id, call.name, call.input));
     }
     events
 }
@@ -787,6 +731,36 @@ impl StreamState {
         }
         self.refresh_prompt_tokens();
     }
+
+    /// Replays a complete content block through the block lifecycle —
+    /// non-streaming responses deliver whole blocks, so this synthesizes the
+    /// start/delta/stop sequence a stream would have carried for them.
+    ///
+    /// Tool input travels as `input_json_delta` events on a block that opens
+    /// with an empty `input`, and a missing input means the stream sent none.
+    fn replay_block(&mut self, index: usize, block: ContentBlockType) -> Vec<LLMEvent> {
+        let input_json = match &block {
+            ContentBlockType::ToolUse { input, .. }
+            | ContentBlockType::ServerToolUse { input, .. }
+                if !input.is_null() =>
+            {
+                Some(input.to_string())
+            }
+            _ => None,
+        };
+        let mut events = self.begin_block(ContentBlockStartEvent {
+            index,
+            content_block: block,
+        });
+        if let Some(partial_json) = input_json {
+            events.extend(self.apply_block_delta(ContentBlockDeltaEvent {
+                index,
+                delta: DeltaType::InputJsonDelta { partial_json },
+            }));
+        }
+        events.extend(self.finish_block(index));
+        events
+    }
 }
 
 /// Ensure the blocks vector has capacity for the given index.
@@ -989,5 +963,111 @@ mod tests {
         state.cache_write_tokens = Some(10);
         state.refresh_prompt_tokens();
         assert_eq!(state.prompt_tokens, Some(80));
+    }
+
+    #[test]
+    fn response_events_matches_streaming_projection() {
+        let response: MessagesResponse = serde_json::from_str(
+            r#"{
+                "content": [
+                    {"type": "text", "text": "Checking the weather."},
+                    {"type": "thinking", "thinking": "Need a forecast.", "signature": "sig_1"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}},
+                    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "Paris weather"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [{"type": "web_search_result", "title": "t", "url": "u"}]}
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 40, "output_tokens": 30, "cache_read_input_tokens": 10, "cache_creation_input_tokens": 5}
+            }"#,
+        )
+        .expect("response parses");
+
+        // The same response as the API would have streamed it.
+        let streamed = [
+            (
+                "message_start",
+                r#"{"message":{"id":"msg_1","model":"claude-test","usage":{"input_tokens":40,"output_tokens":1,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"text_delta","text":"Checking the weather."}}"#,
+            ),
+            ("content_block_stop", r#"{"index":0}"#),
+            (
+                "content_block_start",
+                r#"{"index":1,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"index":1,"delta":{"type":"thinking_delta","thinking":"Need a forecast."}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"index":1,"delta":{"type":"signature_delta","signature":"sig_1"}}"#,
+            ),
+            ("content_block_stop", r#"{"index":1}"#),
+            (
+                "content_block_start",
+                r#"{"index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"index":2,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"}}"#,
+            ),
+            ("content_block_stop", r#"{"index":2}"#),
+            (
+                "content_block_start",
+                r#"{"index":3,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"index":3,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"Paris weather\"}"}}"#,
+            ),
+            ("content_block_stop", r#"{"index":3}"#),
+            (
+                "content_block_start",
+                r#"{"index":4,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","title":"t","url":"u"}]}}"#,
+            ),
+            ("content_block_stop", r#"{"index":4}"#),
+            (
+                "message_delta",
+                r#"{"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":30}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ];
+
+        let mut state = StreamState::new();
+        let mut expected = Vec::new();
+        for (kind, data) in streamed {
+            expected.extend(
+                parse_event(&Event::from_data(data).with_event(kind), &mut state)
+                    .expect("SSE event parses"),
+            );
+        }
+        // The client drains completed tool calls after the stream ends.
+        expected.extend(
+            std::mem::take(&mut state.tool_calls)
+                .into_iter()
+                .map(|call| LLMEvent::tool_call(call.id, call.name, call.input)),
+        );
+
+        assert!(
+            expected
+                .iter()
+                .any(|event| matches!(event, LLMEvent::BuiltInToolCall { .. }))
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|event| matches!(event, LLMEvent::BuiltInToolResult { .. }))
+        );
+        assert_eq!(
+            format!("{:?}", response_events(response)),
+            format!("{expected:?}")
+        );
     }
 }

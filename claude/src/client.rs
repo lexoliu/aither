@@ -268,12 +268,7 @@ impl LanguageModel for Claude {
             for call in state.tool_calls {
                 // Claude scopes thinking to the turn, not to the individual
                 // call, so the state rides on the assistant message instead.
-                yield Ok(Event::ToolCall(aither_core::llm::ToolCall {
-                    id: call.id,
-                    name: call.name,
-                    arguments: call.input,
-                    reasoning_state: None,
-                }));
+                yield Ok(Event::tool_call(call.id, call.name, call.input));
             }
 
             debug!("Claude response complete, stop_reason: {:?}", state.stop_reason);
