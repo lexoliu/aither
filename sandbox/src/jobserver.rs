@@ -37,8 +37,6 @@ use rustix::fs::inotify;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::collections::HashMap;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use std::ffi::{OsStr, OsString};
-#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::io::OwnedFd;
 
 /// A single jobserver token byte, as used by GNU make.
@@ -325,12 +323,10 @@ pub fn job_broker_channel(
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let inotify_fd = {
+        // Each command fifo gets a watch of its own when it registers: a
+        // watch on `dir` would never report `IN_ACCESS`/`IN_MODIFY` for a
+        // fifo inside it.
         let fd = inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC)?;
-        inotify::add_watch(
-            &fd,
-            dir,
-            inotify::WatchFlags::ACCESS | inotify::WatchFlags::MODIFY,
-        )?;
         // SAFETY: `fd` is owned by the returned service and is deleted from
         // the poller in the service's `Drop`. If this call fails nothing is
         // registered; if the later `Async::new_nonblocking` fails, the poller
@@ -355,7 +351,7 @@ pub fn job_broker_channel(
             #[cfg(any(target_os = "linux", target_os = "android"))]
             inotify: inotify_fd,
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            names: HashMap::new(),
+            watches: HashMap::new(),
             next_id: 1,
             cursor: None,
         },
@@ -377,12 +373,13 @@ pub struct JobBrokerService {
     /// Broker-owned directory the per-command fifos live in.
     dir: PathBuf,
     fifos: BTreeMap<usize, FifoState>,
-    /// Linux: one watch on `dir` reports `IN_ACCESS`/`IN_MODIFY` per fifo.
+    /// Linux: one inotify object carrying one watch per command fifo.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     inotify: OwnedFd,
-    /// Linux: fifo file name to broker id, for inotify event lookup.
+    /// Linux: fifo watch descriptor to broker id, for inotify event
+    /// lookup.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    names: HashMap<OsString, usize>,
+    watches: HashMap<i32, usize>,
     next_id: usize,
     /// Last fifo id the feed pass moved a token into, for round-robin.
     cursor: Option<usize>,
@@ -501,8 +498,12 @@ impl JobBrokerService {
     ///   documented guarantee.
     /// - Linux and Android: `EPOLLOUT` fires only when the pipe was full,
     ///   which a one-token fifo never is, so a read produces no event.
-    ///   Instead one inotify watch on the fifo directory reports `IN_ACCESS`
-    ///   on every read and `IN_MODIFY` on every write.
+    ///   inotify reports access and modify instead — but only on a watch
+    ///   placed on the fifo itself: a watch on the fifo's directory never
+    ///   reports `IN_ACCESS`/`IN_MODIFY` for a fifo inside it (verified on
+    ///   Linux 7.2.9; regular files in the same directory do report them),
+    ///   so each fifo gets a watch of its own and events key on the watch
+    ///   descriptor.
     fn watch_fifo(
         &mut self,
         path: &Path,
@@ -520,12 +521,15 @@ impl JobBrokerService {
                     .get_ref()
                     .add_with_mode(read, Event::readable(id), PollMode::Edge)?;
             }
-            self.names.insert(
-                path.file_name()
-                    .expect("jobserver fifo path has a file name")
-                    .to_os_string(),
-                id,
-            );
+            let wd = inotify::add_watch(
+                &self.inotify,
+                path,
+                inotify::WatchFlags::ACCESS | inotify::WatchFlags::MODIFY,
+            )
+            .inspect_err(|_| {
+                let _ = self.poller.get_ref().delete(read);
+            })?;
+            self.watches.insert(wd, id);
             let _ = write;
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -585,7 +589,7 @@ impl JobBrokerService {
 
     /// Linux: reads pending inotify events and returns the fifo ids they
     /// touched. Both `IN_ACCESS` (a token consumed) and `IN_MODIFY` (a token
-    /// returned) land here.
+    /// returned) land here, keyed by the fifo's watch descriptor.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn inotify_fired(&mut self) -> Vec<usize> {
         let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
@@ -600,15 +604,21 @@ impl JobBrokerService {
                         continue;
                     }
                     if event.events().contains(inotify::ReadFlags::IGNORED) {
-                        panic!(
-                            "jobserver fifo directory watch on {} was removed; consumption can no longer wake the broker",
-                            self.dir.display()
-                        );
-                    }
-                    if let Some(name) = event.file_name() {
-                        if let Some(&id) = self.names.get(OsStr::from_bytes(name.to_bytes())) {
-                            ids.push(id);
+                        match self.watches.remove(&event.wd()) {
+                            // Expected: the broker's drain thread unlinked
+                            // the fifo, which removes its watch. `None`
+                            // means `finished` already dropped the mapping.
+                            Some(id) if self.fifos[&id].finishing => {}
+                            None => {}
+                            Some(id) => panic!(
+                                "jobserver fifo watch on {} was removed while the command was live; consumption can no longer wake the broker",
+                                self.fifos[&id].path.display()
+                            ),
                         }
+                        continue;
+                    }
+                    if let Some(&id) = self.watches.get(&event.wd()) {
+                        ids.push(id);
                     }
                 }
                 Err(error) if error == rustix_io::Errno::AGAIN => break,
@@ -712,9 +722,7 @@ impl JobBrokerService {
             .delete(&state.read)
             .expect("jobserver fifo read end deregistration failed");
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some(name) = state.path.file_name() {
-            self.names.remove(name);
-        }
+        self.watches.retain(|_, fifo_id| *fifo_id != id);
     }
 
     /// Feeds every empty active fifo one token from the pool, round-robin
