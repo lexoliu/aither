@@ -108,19 +108,109 @@ impl ContainerExec for AnyContainerExec {
     }
 }
 
+/// An address the container IPC bridge may listen on.
+///
+/// The bridge executes host IPC commands for whoever connects, so it is bound
+/// only to an address the container network alone reaches — never the
+/// unspecified (`0.0.0.0`, `::`) address, which would expose it on every
+/// interface including the LAN, nor a multicast address, which cannot serve a
+/// listener. Docker Desktop and `OrbStack` forward `host.docker.internal` to the
+/// host's loopback, so the bridge binds `127.0.0.1`; native Linux Docker
+/// routes the name to the container network's gateway the host owns (`docker0`
+/// or the docker `bridge` network gateway, e.g. `172.17.0.1`), so the bridge
+/// binds that address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BridgeAddress(std::net::IpAddr);
+
+/// Why an address cannot bind the container IPC bridge.
+#[derive(Debug, thiserror::Error)]
+pub enum BridgeAddressError {
+    /// The unspecified wildcard address would listen on every interface.
+    #[error("the unspecified address {0} would expose the container IPC bridge on every interface")]
+    Unspecified(std::net::IpAddr),
+    /// A multicast address cannot serve a listener.
+    #[error("the multicast address {0} cannot bind the container IPC bridge")]
+    Multicast(std::net::IpAddr),
+}
+
+impl TryFrom<std::net::IpAddr> for BridgeAddress {
+    type Error = BridgeAddressError;
+
+    fn try_from(address: std::net::IpAddr) -> Result<Self, Self::Error> {
+        if address.is_unspecified() {
+            return Err(BridgeAddressError::Unspecified(address));
+        }
+        if address.is_multicast() {
+            return Err(BridgeAddressError::Multicast(address));
+        }
+        Ok(Self(address))
+    }
+}
+
+impl BridgeAddress {
+    /// The address the bridge listens on.
+    #[must_use]
+    pub const fn ip(&self) -> std::net::IpAddr {
+        self.0
+    }
+}
+
+/// How a container reaches the host's IPC bridge.
+///
+/// `host` is the name the container dials (`host.docker.internal` on Docker —
+/// made resolvable through `--add-host=host.docker.internal:host-gateway` —
+/// `host.containers.internal` on Podman), and `bind` is the host address the
+/// bridge listens on: `127.0.0.1` on Docker Desktop and `OrbStack`, which
+/// forward the name to host loopback, or the container network's gateway
+/// address on native Linux Docker. The two belong to the same route, and only
+/// the caller — which knows the container runtime — can pair them correctly.
+#[derive(Clone, Debug)]
+pub struct ContainerIpcRoute {
+    host: String,
+    bind: BridgeAddress,
+}
+
+impl ContainerIpcRoute {
+    /// Creates the route a container uses to reach the host's IPC bridge.
+    ///
+    /// # Panics
+    /// Panics if `host` is empty after trimming.
+    #[must_use]
+    pub fn new(host: impl Into<String>, bind: BridgeAddress) -> Self {
+        let host = host.into();
+        assert!(
+            !host.trim().is_empty(),
+            "container IPC route requires a non-empty host"
+        );
+        Self { host, bind }
+    }
+
+    /// The name the container dials to reach the bridge.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The host address the bridge listens on.
+    #[must_use]
+    pub const fn bind(&self) -> BridgeAddress {
+        self.bind
+    }
+}
+
 /// Container runtime session metadata.
 #[derive(Clone)]
 pub struct ContainerShellRuntime {
     exec: Arc<dyn ContainerExecImpl>,
     container_id: String,
-    ipc_host: String,
+    ipc_route: ContainerIpcRoute,
 }
 
 impl std::fmt::Debug for ContainerShellRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContainerShellRuntime")
             .field("container_id", &self.container_id)
-            .field("ipc_host", &self.ipc_host)
+            .field("ipc_route", &self.ipc_route)
             .finish_non_exhaustive()
     }
 }
@@ -129,27 +219,22 @@ impl ContainerShellRuntime {
     /// Creates a container shell runtime.
     ///
     /// # Panics
-    /// Panics if `container_id` or `ipc_host` is empty after trimming.
+    /// Panics if `container_id` is empty after trimming.
     #[must_use]
     pub fn new(
         container_id: impl Into<String>,
-        ipc_host: impl Into<String>,
+        ipc_route: ContainerIpcRoute,
         exec: AnyContainerExec,
     ) -> Self {
         let container_id = container_id.into();
-        let ipc_host = ipc_host.into();
         assert!(
             !container_id.trim().is_empty(),
             "container runtime requires a non-empty container_id"
         );
-        assert!(
-            !ipc_host.trim().is_empty(),
-            "container runtime requires a non-empty ipc_host"
-        );
         Self {
             exec: exec.inner,
             container_id,
-            ipc_host,
+            ipc_route,
         }
     }
 
@@ -159,10 +244,10 @@ impl ContainerShellRuntime {
         &self.container_id
     }
 
+    /// Returns the route the container uses to reach the host's IPC bridge.
     #[must_use]
-    /// Returns the host name used for IPC callbacks from the container.
-    pub fn ipc_host(&self) -> &str {
-        &self.ipc_host
+    pub const fn ipc_route(&self) -> &ContainerIpcRoute {
+        &self.ipc_route
     }
 
     pub(crate) fn exec(&self) -> Arc<dyn ContainerExecImpl> {
@@ -262,16 +347,87 @@ pub trait SshSessionAuthorizer: Send + Sync {
     fn authorize_connect(
         &self,
         target: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
+    ) -> impl Future<Output = Result<bool, SshAuthorizationError>> + Send;
 
-    /// Asks whether the agent may install the `heel` runtime on `target`.
+    /// Asks whether the harness may prepare runtime components on `target`.
     ///
-    /// `details` describes the remote host so the user can judge the request.
-    fn authorize_heel_install(
+    /// `details` describes the remote host and components so the user can judge the request.
+    fn authorize_runtime_install(
         &self,
         target: &str,
         details: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
+    ) -> impl Future<Output = Result<bool, SshAuthorizationError>> + Send;
+}
+
+trait SshSessionAuthorizerImpl: Send + Sync {
+    fn connect<'a>(
+        &'a self,
+        target: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SshAuthorizationError>> + Send + 'a>>;
+    fn install<'a>(
+        &'a self,
+        target: &'a str,
+        details: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SshAuthorizationError>> + Send + 'a>>;
+}
+
+impl<T: SshSessionAuthorizer> SshSessionAuthorizerImpl for T {
+    fn connect<'a>(
+        &'a self,
+        target: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SshAuthorizationError>> + Send + 'a>> {
+        Box::pin(self.authorize_connect(target))
+    }
+    fn install<'a>(
+        &'a self,
+        target: &'a str,
+        details: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, SshAuthorizationError>> + Send + 'a>> {
+        Box::pin(self.authorize_runtime_install(target, details))
+    }
+}
+
+/// Shared authorizer with boxing confined to the private implementation boundary.
+#[derive(Clone)]
+pub struct AnySshSessionAuthorizer {
+    inner: Arc<dyn SshSessionAuthorizerImpl>,
+}
+
+impl std::fmt::Debug for AnySshSessionAuthorizer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnySshSessionAuthorizer")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnySshSessionAuthorizer {
+    /// Wraps a shared application authorizer.
+    #[must_use]
+    pub fn new<T: SshSessionAuthorizer + 'static>(authorizer: Arc<T>) -> Self {
+        Self { inner: authorizer }
+    }
+}
+
+impl SshSessionAuthorizer for AnySshSessionAuthorizer {
+    async fn authorize_connect(&self, target: &str) -> Result<bool, SshAuthorizationError> {
+        self.inner.connect(target).await
+    }
+    async fn authorize_runtime_install(
+        &self,
+        target: &str,
+        details: &str,
+    ) -> Result<bool, SshAuthorizationError> {
+        self.inner.install(target, details).await
+    }
+}
+
+/// Failure to obtain an application-level SSH authorization decision.
+#[derive(Debug, thiserror::Error)]
+pub enum SshAuthorizationError {
+    /// The application's permission prompt failed.
+    #[error("SSH permission prompt failed: {0}")]
+    Prompt(String),
 }
 
 /// Tracks which shell backends are configured and how to reach them.
@@ -282,8 +438,9 @@ pub trait SshSessionAuthorizer: Send + Sync {
 pub struct ShellSessionRegistry {
     availability: ShellRuntimeAvailability,
     ssh_servers: Vec<SshServer>,
-    ssh_authorizer: Option<Arc<dyn SshSessionAuthorizer>>,
+    ssh_authorizer: Option<AnySshSessionAuthorizer>,
     container_runtime: Option<ContainerShellRuntime>,
+    pub(crate) prepared_tools: Option<crate::tool_environment::PreparedToolEnvironments>,
 }
 
 impl std::fmt::Debug for ShellSessionRegistry {
@@ -296,12 +453,13 @@ impl std::fmt::Debug for ShellSessionRegistry {
 impl ShellSessionRegistry {
     /// Creates a registry advertising the given backends.
     #[must_use]
-    pub fn new(availability: ShellRuntimeAvailability) -> Self {
+    pub const fn new(availability: ShellRuntimeAvailability) -> Self {
         Self {
             availability,
             ssh_servers: Vec::new(),
             ssh_authorizer: None,
             container_runtime: None,
+            prepared_tools: None,
         }
     }
 
@@ -314,8 +472,11 @@ impl ShellSessionRegistry {
 
     /// The currently advertised backends.
     #[must_use]
-    pub fn with_ssh_authorizer(mut self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
-        self.ssh_authorizer = Some(authorizer);
+    pub fn with_ssh_authorizer<T: SshSessionAuthorizer + 'static>(
+        mut self,
+        authorizer: Arc<T>,
+    ) -> Self {
+        self.ssh_authorizer = Some(AnySshSessionAuthorizer::new(authorizer));
         self
     }
 
@@ -360,6 +521,10 @@ impl ShellSessionRegistry {
     /// Lists configured SSH servers.
     pub fn list_ssh_servers(&self) -> Vec<SshServer> {
         self.ssh_servers.clone()
+    }
+
+    pub(crate) fn ssh_servers(&self) -> &[SshServer] {
+        &self.ssh_servers
     }
 
     pub(crate) const fn container_runtime(&self) -> Option<&ContainerShellRuntime> {
@@ -432,7 +597,7 @@ impl ShellSessionRegistry {
 
     #[must_use]
     /// Returns the SSH authorizer when configured.
-    pub fn ssh_authorizer(&self) -> Option<Arc<dyn SshSessionAuthorizer>> {
+    pub fn ssh_authorizer(&self) -> Option<AnySshSessionAuthorizer> {
         self.ssh_authorizer.clone()
     }
 }
@@ -449,7 +614,7 @@ impl ShellSessionRegistry {
 /// succeed.
 pub async fn bootstrap_ssh_runtime(
     target: &str,
-    authorizer: &Option<Arc<dyn SshSessionAuthorizer>>,
+    authorizer: &Option<AnySshSessionAuthorizer>,
 ) -> Result<SshRuntimeProfile, anyhow::Error> {
     if let Some(auth) = authorizer {
         let allowed = auth
@@ -474,7 +639,7 @@ pub async fn bootstrap_ssh_runtime(
             remote.os, remote.arch
         );
         let approve_install = auth
-            .authorize_heel_install(target, &details)
+            .authorize_runtime_install(target, &details)
             .await
             .map_err(anyhow::Error::msg)?;
         if approve_install && install_heel(target, &remote).await? {
@@ -705,5 +870,47 @@ mod tests {
             error.contains("ssh_server_id is required"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn bridge_address_rejects_the_unspecified_and_multicast_addresses() {
+        use super::{BridgeAddress, BridgeAddressError};
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        for address in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ] {
+            assert!(
+                matches!(
+                    BridgeAddress::try_from(address),
+                    Err(BridgeAddressError::Unspecified(_))
+                ),
+                "{address} must be rejected as unspecified"
+            );
+        }
+        for address in [
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+        ] {
+            assert!(
+                matches!(
+                    BridgeAddress::try_from(address),
+                    Err(BridgeAddressError::Multicast(_))
+                ),
+                "{address} must be rejected as multicast"
+            );
+        }
+        for address in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1)),
+        ] {
+            assert_eq!(
+                BridgeAddress::try_from(address)
+                    .expect("a concrete host address should be accepted")
+                    .ip(),
+                address
+            );
+        }
     }
 }

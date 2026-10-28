@@ -59,7 +59,7 @@ impl LanguageModel for Gemini {
         }
     }
 
-    fn profile(&self) -> impl core::future::Future<Output = Profile> + Send {
+    fn profile(&self) -> impl core::future::Future<Output = Result<Profile, Self::Error>> + Send {
         let cfg = self.config().clone();
         async move {
             let model_name = cfg.text_model.trim_start_matches("models/").to_string();
@@ -72,11 +72,12 @@ impl LanguageModel for Gemini {
                     // Fallback to models database
                     aither_models::lookup(&model_name)
                         .and_then(aither_models::ModelEntry::max_input_tokens)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "Gemini model '{model_name}' missing context metadata from provider and aither-models"
-                            )
-                        })
+                        .ok_or_else(|| {
+                            GeminiError::Api(format!(
+                                "cannot determine context length for model '{model_name}': \
+                                 model info request failed ({e}) and aither-models has no entry"
+                            ))
+                        })?
                 }
             };
 
@@ -93,7 +94,7 @@ impl LanguageModel for Gemini {
                     profile.abilities.push(*ability);
                 }
             }
-            profile
+            Ok(profile)
         }
     }
 }

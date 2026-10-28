@@ -18,10 +18,10 @@ dom_smoothie = "0.18"
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 url = "2.5.8"
-zenwave = { workspace = true, features = ["default"] }
+zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 tracing.workspace = true
 regex = "1.13"
-html-escape = "0.2"
+html-escape = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 thiserror = "2"
 # Resolver used by the SSRF guard to check where a host actually points.

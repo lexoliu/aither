@@ -22,16 +22,13 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use aither_core::llm::model::Parameters;
-use aither_core::llm::{Event, LLMRequest, Message};
+use aither_core::llm::{Event, LLMRequest, Message, Role};
 use aither_core::{LanguageModel, llm::GenerateError};
 use askama::Template;
 use futures_lite::StreamExt as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sync_wrapper::SyncWrapper;
-
-use super::window::Context;
 
 /// Structured handoff document used to recover work after compaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -40,14 +37,19 @@ pub struct HandoffDocument {
     pub current_task: String,
     /// Decisions, constraints and patterns that must survive.
     pub key_decisions: Vec<String>,
-    /// Files read, written, or planned for modification.
-    pub files_paths: Vec<String>,
+    /// File ranges the next turns need in view, restored verbatim on apply.
+    #[serde(default)]
+    pub context_files: Vec<ContextFile>,
     /// Errors encountered and how they were resolved.
     pub errors_fixes: Vec<String>,
     /// Remaining work, in order, starting with the next action.
     pub pending_work: Vec<String>,
     /// Where the rest of the state can be recovered from.
     pub recovery_hints: Vec<String>,
+    /// Session skills whose instructions the next turns need in view,
+    /// chosen from the catalog the instruction lists.
+    #[serde(default)]
+    pub skills: Vec<String>,
     /// Mechanical index of on-disk materials produced during the compacted
     /// conversation (`outputs/`, `artifacts/`), each annotated with the
     /// originating command's description.
@@ -56,6 +58,42 @@ pub struct HandoffDocument {
     /// unreliable, and a missing entry directly causes work to be redone.
     #[serde(default)]
     pub file_index: Vec<String>,
+}
+
+/// A file range the next turns need in view, named by the handoff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ContextFile {
+    /// Path to the file, as it appears on disk.
+    pub path: String,
+    /// The 1-based inclusive line range to restore; absent restores the
+    /// whole file.
+    pub lines: Option<LineRange>,
+    /// Why the next turns need this file in view.
+    pub why: String,
+}
+
+/// A 1-based inclusive line range inside a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct LineRange {
+    /// First line to restore.
+    pub start: u32,
+    /// Last line to restore.
+    pub end: u32,
+}
+
+/// A skill the handoff may name for restoration.
+///
+/// The session's skill catalog is offered to the summarising model so it can
+/// name skills by their registry name; on apply, only names found in the
+/// catalog are restored, and the rest are reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillCatalogEntry {
+    /// The name the handoff names.
+    pub name: String,
+    /// What the skill is for, shown in the compaction prompt.
+    pub description: String,
+    /// The text restored into `<restored_context>`.
+    pub instructions: String,
 }
 
 #[derive(Template)]
@@ -68,6 +106,7 @@ struct HandoffDocumentTemplate<'a> {
 #[template(path = "compaction_instruction.txt", escape = "none")]
 struct CompactionInstruction<'a> {
     focus: Option<&'a str>,
+    skills: &'a [SkillCatalogEntry],
 }
 
 #[derive(Template)]
@@ -184,41 +223,55 @@ pub fn build_file_index(messages: &[Message]) -> Vec<String> {
 pub struct CompactionFork {
     /// Sequence number of the first item the handoff will *not* describe.
     fork_point: u64,
-    /// The main request's messages, with the handoff instruction appended.
-    messages: Vec<Message>,
-    /// The conversation the handoff describes, for the mechanical file index.
-    conversation: Vec<Message>,
+    /// The main request, source blocks, tools and cache parameters included,
+    /// with the handoff instruction appended to its messages. Replaying it is
+    /// what lets the provider serve the compaction from the same prefix
+    /// cache the run just paid for.
+    request: LLMRequest,
 }
 
 impl CompactionFork {
-    /// Snapshots `context` for compaction, optionally focused by `focus`.
+    /// Forks `request` — the exact request the run is about to send — into a
+    /// compaction request, optionally focused by `focus`.
     ///
-    /// The instruction is *appended*: everything before it is exactly what
-    /// the main request sent, so the provider's prefix cache still applies.
+    /// The instruction is *appended* and the tool definitions and parameters
+    /// are reused untouched: everything up to the instruction is byte-for-
+    /// byte what the main request sent, so the provider's prefix cache still
+    /// applies.
     ///
     /// # Errors
     ///
-    /// Returns [`CompactionError::Empty`] when there is no conversation yet.
+    /// Returns [`CompactionError::Empty`] when the request carries no
+    /// conversation to summarize.
     ///
     /// # Panics
     ///
     /// Panics if the compiled-in instruction template fails to render, which
     /// would mean the binary was built against a broken template.
-    pub fn new(context: &Context, focus: Option<&str>) -> Result<Self, CompactionError> {
-        let conversation = context.conversation_messages();
-        if conversation.is_empty() {
+    pub fn new(
+        request: &LLMRequest,
+        fork_point: u64,
+        focus: Option<&str>,
+        skills: &[SkillCatalogEntry],
+    ) -> Result<Self, CompactionError> {
+        if request
+            .messages()
+            .iter()
+            .all(|message| message.role() == Role::System)
+        {
             return Err(CompactionError::Empty);
         }
         let focus = focus.map(str::trim).filter(|focus| !focus.is_empty());
-        let instruction = CompactionInstruction { focus }
+        let instruction = CompactionInstruction { focus, skills }
             .render()
             .expect("compaction instruction template must render");
-        let mut messages = context.build_messages();
+        let mut messages = request.messages().to_vec();
         messages.push(Message::user(instruction));
         Ok(Self {
-            fork_point: context.fork_point(),
-            messages,
-            conversation,
+            fork_point,
+            request: LLMRequest::new(messages)
+                .with_parameters(request.parameters().clone())
+                .with_tool_definitions(request.tool_definitions().to_vec()),
         })
     }
 
@@ -226,6 +279,12 @@ impl CompactionFork {
     #[must_use]
     pub const fn fork_point(&self) -> u64 {
         self.fork_point
+    }
+
+    /// The request the fork replays, instruction included.
+    #[must_use]
+    pub const fn request(&self) -> &LLMRequest {
+        &self.request
     }
 
     /// Runs the compaction against `model`.
@@ -243,18 +302,10 @@ impl CompactionFork {
     ///
     /// Panics if the compiled-in retry template fails to render, which would
     /// mean the binary was built against a broken template.
-    pub async fn run<M: LanguageModel>(
-        self,
-        model: M,
-        parameters: Parameters,
-    ) -> Result<HandoffDocument, CompactionError> {
-        let Self {
-            messages,
-            conversation,
-            ..
-        } = self;
-        let request = LLMRequest::new(messages.clone()).with_parameters(parameters.clone());
-        let reason = match model.generate::<HandoffDocument>(request).await {
+    pub async fn run<M: LanguageModel>(self, model: M) -> Result<HandoffDocument, CompactionError> {
+        let Self { request, .. } = self;
+        let conversation = request.messages().to_vec();
+        let reason = match model.generate::<HandoffDocument>(request.clone()).await {
             Ok(document) => match document.validate() {
                 Ok(mut document) => {
                     document.file_index = build_file_index(&conversation);
@@ -276,10 +327,12 @@ impl CompactionFork {
         }
         .render()
         .expect("compaction retry template must render");
-        let mut retry_messages = messages;
-        retry_messages.push(Message::user(retry));
-        let request = LLMRequest::new(retry_messages).with_parameters(parameters);
-        let response = collect_text(&model, request).await?;
+        let (mut messages, parameters, definitions) = request.into_parts();
+        messages.push(Message::user(retry));
+        let retry_request = LLMRequest::new(messages)
+            .with_parameters(parameters)
+            .with_tool_definitions(definitions);
+        let response = collect_text(&model, retry_request).await?;
         let mut document = parse_handoff(&response)?.validate()?;
         document.file_index = build_file_index(&conversation);
         Ok(document)
@@ -332,15 +385,11 @@ impl std::fmt::Debug for PendingCompaction {
 impl PendingCompaction {
     /// Starts `fork` against an owned `model`.
     #[must_use]
-    pub fn start<M: LanguageModel + 'static>(
-        fork: CompactionFork,
-        model: M,
-        parameters: Parameters,
-    ) -> Self {
+    pub fn start<M: LanguageModel + 'static>(fork: CompactionFork, model: M) -> Self {
         let fork_point = fork.fork_point();
         Self {
             fork_point,
-            future: SyncWrapper::new(Box::pin(fork.run(model, parameters))),
+            future: SyncWrapper::new(Box::pin(fork.run(model))),
         }
     }
 
@@ -508,32 +557,61 @@ mod tests {
 
     #[test]
     fn forking_an_empty_context_is_an_error() {
-        let context = Context::new();
+        let request = LLMRequest::new(vec![Message::system("only the prefix")]);
         assert!(matches!(
-            CompactionFork::new(&context, None),
+            CompactionFork::new(&request, 0, None, &[]),
             Err(CompactionError::Empty)
         ));
     }
 
     #[test]
-    fn the_fork_reproduces_the_main_prefix_and_appends_the_instruction() {
-        let mut context = Context::new();
-        context.insert_system_named("base_system", "be useful");
-        context.push(Message::user("do the thing"));
+    fn the_fork_reproduces_the_main_request_and_appends_the_instruction() {
+        use aither_core::llm::model::Parameters;
 
-        let main = context.build_messages();
-        let fork = CompactionFork::new(&context, Some("the failing test")).expect("fork");
+        let parameters = Parameters {
+            temperature: Some(0.3),
+            ..Parameters::default()
+        };
+        let main = LLMRequest::new(vec![
+            Message::system("be useful"),
+            Message::system("<tool-outputs>tail block</tool-outputs>"),
+            Message::user("do the thing"),
+        ])
+        .with_parameters(parameters);
 
-        assert_eq!(fork.fork_point(), context.fork_point());
-        assert_eq!(fork.messages.len(), main.len() + 1);
-        for (index, message) in main.iter().enumerate() {
+        let skills = [SkillCatalogEntry {
+            name: "pdf".to_string(),
+            description: "read PDFs".to_string(),
+            instructions: "how to read PDFs".to_string(),
+        }];
+        let fork = CompactionFork::new(&main, 7, Some("the failing test"), &skills).expect("fork");
+
+        assert_eq!(fork.fork_point(), 7);
+        assert_eq!(
+            fork.request().parameters().temperature,
+            main.parameters().temperature,
+            "the compaction request reuses the main parameters"
+        );
+        assert_eq!(
+            fork.request().tool_definitions().len(),
+            main.tool_definitions().len(),
+            "the compaction request carries the same tools"
+        );
+        assert_eq!(fork.request().messages().len(), main.messages().len() + 1);
+        for (index, message) in main.messages().iter().enumerate() {
             assert_eq!(
                 message.content(),
-                fork.messages[index].content(),
+                fork.request().messages()[index].content(),
                 "fork perturbed prefix message {index}"
             );
         }
-        let instruction = fork.messages.last().expect("instruction").content();
+        let instruction = fork
+            .request()
+            .messages()
+            .last()
+            .expect("instruction")
+            .content();
         assert!(instruction.contains("Focus the handoff on: the failing test"));
+        assert!(instruction.contains("pdf"), "the skill catalog is offered");
     }
 }

@@ -268,18 +268,7 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
             format!("{description}\n\n{}", schema_to_help(&schema))
         };
 
-        // Detect positional args from schema (all required fields in order)
-        let positional_args = schema
-            .get("required")
-            .and_then(|r| r.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        registry.configure_raw_handler(name, help, positional_args, move |args| {
+        registry.configure_raw_handler(name, help, move |args| {
             let conn = conn.clone();
             let tool_name = tool_name.clone();
             let schema = schema.clone();

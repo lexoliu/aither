@@ -260,7 +260,7 @@ impl LanguageModel for AppleIntelligence {
         })
     }
 
-    fn profile(&self) -> impl Future<Output = Profile> + Send {
+    fn profile(&self) -> impl Future<Output = Result<Profile, Self::Error>> + Send {
         let caps = capabilities();
         let mut abilities = Vec::new();
         if caps.supports(Capabilities::TOOLS) {
@@ -274,16 +274,14 @@ impl LanguageModel for AppleIntelligence {
         }
         let context_length = crate::ffi::native_context_size()
             .expect("FoundationModels must expose a valid context size on supported OS versions");
-        core::future::ready(
-            Profile::new(
-                "apple-on-device",
-                "apple",
-                DEFAULT_MODEL_ID,
-                "Apple Intelligence on-device language model",
-                context_length,
-            )
-            .with_abilities(abilities),
+        core::future::ready(Ok(Profile::new(
+            "apple-on-device",
+            "apple",
+            DEFAULT_MODEL_ID,
+            "Apple Intelligence on-device language model",
+            context_length,
         )
+        .with_abilities(abilities)))
     }
 }
 
@@ -296,7 +294,7 @@ impl LanguageModelProvider for AppleIntelligenceProvider {
 
     async fn list_models(&self) -> Result<Vec<Profile>, Self::Error> {
         match AppleIntelligence::availability() {
-            Availability::Available => Ok(vec![AppleIntelligence.profile().await]),
+            Availability::Available => Ok(vec![AppleIntelligence.profile().await?]),
             Availability::Unavailable(reason) => Err(reason.into()),
         }
     }

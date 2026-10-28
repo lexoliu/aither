@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/lexoliu/aither/compare/agent-v0.10.0...agent-v0.10.1) - 2026-10-20
+
+### Fixed
+
+- *(agent)* register terminal control tools natively again
+
+### Other
+
+- Merge pull request #176 from lexoliu/main
+
+## [0.10.0](https://github.com/lexoliu/aither/compare/agent-v0.9.2...agent-v0.10.0) - 2026-10-18
+
+### Other
+
+- Upgrade dependencies to latest and trim feature sets ([#166](https://github.com/lexoliu/aither/pull/166))
+- Merge pull request #164 from lexoliu/fix/tool-delta-incremental
+- Emit incremental ToolCallDelta argument fragments
+- Add preview_request_messages_with for non-mutating previews
+- Box the provider respond stream once at the leaf
+
+## [0.8.0](https://github.com/lexoliu/aither/compare/agent-v0.7.0...agent-v0.8.0) - 2026-10-15
+
+### Added
+
+- *(agent)* adopt an already prepared tool environment
+
+## [0.7.0](https://github.com/lexoliu/aither/compare/agent-v0.6.0...agent-v0.7.0) - 2026-10-13
+
+### Added
+
+- terminal agents initialize a verified baseline tool distribution before running ([#107](https://github.com/lexoliu/aither/pull/107))
+- alert on stale `tasks.md` during sustained tool activity ([#95](https://github.com/lexoliu/aither/pull/95))
+- `push_system_alert` accepts `impl Into<String>`
+
+### Changed
+
+- render terminal output before compressing it; keep output that ends without a newline unterminated ([#102](https://github.com/lexoliu/aither/pull/102))
+- split context metrics from reminder population and deliver ad-hoc alerts
+
+### Removed
+
+- the in-memory todo subsystem ([#92](https://github.com/lexoliu/aither/pull/92))
+- the transient system message channel
+
 ## [0.6.0](https://github.com/lexoliu/aither/compare/agent-v0.5.0...agent-v0.6.0) - 2026-10-10
 
 ### Added

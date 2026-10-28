@@ -6,7 +6,10 @@
 #[cfg(feature = "skills")]
 use std::sync::Arc;
 
-use aither_core::{LanguageModel, llm::Tool};
+use aither_core::{
+    LanguageModel,
+    llm::{Tool, tool::ToolDefinition},
+};
 use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, PermissionEventReceiver};
 #[cfg(feature = "skills")]
 use aither_skills::SkillRegistry;
@@ -206,6 +209,13 @@ where
     ///
     /// Panics if the `knowledge_and_time` prompt template fails to render.
     pub fn dyn_terminal(mut self, dyn_tool: aither_sandbox::DynTerminalTool) -> Self {
+        self.context.insert_system_text(
+            "prepared_tools",
+            dyn_tool
+                .prepared_tools()
+                .render()
+                .expect("prepared tool catalog must render"),
+        );
         // Seed knowledge/time guidance against the shared command registry so
         // subagents are not told to run commands that were never registered
         // (e.g. `websearch` when a provider-hosted search tool is active).
@@ -436,6 +446,12 @@ where
         State: Clone + 'static,
         aither_sandbox::TerminalTool<P, E, State>: Tool + 'static,
     {
+        self.context.insert_system_text(
+            "prepared_tools",
+            terminal_tool
+                .prepared_tools_context()
+                .expect("terminal tools must be initialized before agent construction"),
+        );
         let background_receiver = terminal_tool.background_receiver();
         let permission_receiver = terminal_tool.permission_receiver();
         let job_registry = terminal_tool.job_registry();
@@ -455,11 +471,20 @@ where
         self
     }
 
+    /// Returns the definitions of the tools registered on this builder so far.
+    ///
+    /// These are the definitions the built agent sends to the model, in the
+    /// order the tool registry holds them.
+    #[must_use]
+    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools.active_definitions()
+    }
+
     /// Builds the agent.
     pub fn build(self) -> Agent<Advanced, Balanced, Fast, H> {
         Agent {
-            advanced: self.advanced,
-            balanced: self.balanced,
+            advanced: std::sync::Arc::new(self.advanced),
+            balanced: std::sync::Arc::new(self.balanced),
             fast: std::sync::Arc::new(self.fast),
             tier: self.tier,
             tools: self.tools,
@@ -529,14 +554,16 @@ mod tests {
 
         fn profile(
             &self,
-        ) -> impl std::future::Future<Output = aither_core::llm::model::Profile> + Send {
-            std::future::ready(aither_core::llm::model::Profile::new(
+        ) -> impl std::future::Future<
+            Output = Result<aither_core::llm::model::Profile, Self::Error>,
+        > + Send {
+            std::future::ready(Ok(aither_core::llm::model::Profile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "A mock model for testing",
                 100_000,
-            ))
+            )))
         }
     }
 

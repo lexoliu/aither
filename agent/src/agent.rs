@@ -5,6 +5,7 @@
 //! handles tool execution in an agent-controlled loop.
 
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,14 +24,14 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 #[cfg(feature = "skills")]
-use crate::context::ActiveSkills;
+use crate::context::{ActiveSkills, ContextSource as _, SkillCatalogEntry};
 use crate::{
     checkpoint::AgentCheckpoint,
     config::{AgentConfig, AgentKind},
     context::{
         AnyContextSource, BackgroundJobs, Block, CompactionFork, CompletedCompaction, Context,
-        ContextBudget, ContextSource as _, HandoffDocument, PendingCompaction, PromptCache,
-        TasksDocument, restore_context, serialize_xml,
+        ContextBudget, HandoffDocument, PendingCompaction, PromptCache, TasksDocument,
+        restore_context, serialize_xml,
     },
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
@@ -61,9 +62,32 @@ enum TurnStep {
     Compacted(Result<HandoffDocument, crate::context::CompactionError>),
 }
 
-/// The number of characters an assembled request renders to.
-fn request_chars(messages: &[Message]) -> usize {
-    messages.iter().map(|message| message.content().len()).sum()
+/// The number of characters an assembled request renders to, tool calls
+/// and tool definitions included — the provider counts all of them.
+fn request_chars(
+    messages: &[Message],
+    definitions: &[aither_core::llm::tool::ToolDefinition],
+) -> usize {
+    let messages: usize = messages
+        .iter()
+        .map(|message| {
+            let calls: usize = message
+                .tool_calls()
+                .iter()
+                .map(|call| call.name.len() + call.arguments.to_string().len())
+                .sum();
+            message.content().len() + calls
+        })
+        .sum();
+    let definitions: usize = definitions
+        .iter()
+        .map(|definition| {
+            definition.name().len()
+                + definition.description().len()
+                + definition.arguments_openai_schema().to_string().len()
+        })
+        .sum();
+    messages + definitions
 }
 
 enum ExecutionSignal<T> {
@@ -125,33 +149,6 @@ enum ModelEventAction {
 
 type ToolExecutionResult = Result<(String, String, aither_core::llm::ToolResult), AgentError>;
 type ToolExecutionSignal = ExecutionSignal<ToolExecutionResult>;
-
-macro_rules! drain_model_stream {
-    ($stream:expr, $hooks:expr, $cache_stats:expr, $budget:expr, $events:expr, $text_chunks:expr, $tool_calls:expr, $reasoning:expr, $malformed:expr) => {{
-        let stream = $stream;
-        futures_lite::pin!(stream);
-        while let Some(event) = stream.next().await {
-            match handle_model_event(
-                $hooks,
-                $cache_stats,
-                $budget,
-                event.map_err(|error| error.to_string()),
-                $text_chunks,
-                $tool_calls,
-                $reasoning,
-            )
-            .await?
-            {
-                ModelEventAction::Emit(event) => $events.emit(event),
-                ModelEventAction::Continue => {}
-                ModelEventAction::RetryMalformed => {
-                    $malformed = true;
-                    break;
-                }
-            }
-        }
-    }};
-}
 
 async fn handle_model_event<H: Hook>(
     hooks: &H,
@@ -383,10 +380,13 @@ impl PermissionPauseTracker {
 #[derive(Debug)]
 pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Primary LLM for main reasoning (most capable).
-    pub(crate) advanced: Advanced,
+    /// The advanced reasoning model, behind an Arc so a forked compaction
+    /// can own it while the run continues.
+    pub(crate) advanced: Arc<Advanced>,
 
     /// Balanced LLM for moderate tasks (subagents).
-    pub(crate) balanced: Balanced,
+    /// The balanced model, behind an Arc for the same reason.
+    pub(crate) balanced: Arc<Balanced>,
 
     /// Fast LLM for quick tasks (compaction, ask command).
     ///
@@ -481,8 +481,8 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
     #[must_use]
     pub fn with_config(llm: LLM, config: AgentConfig) -> Self {
         Self {
-            advanced: llm.clone(),
-            balanced: llm.clone(),
+            advanced: Arc::new(llm.clone()),
+            balanced: Arc::new(llm.clone()),
             fast: Arc::new(llm),
             tier: ModelTier::default(),
             tools: AgentTools::new(),
@@ -496,11 +496,11 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             completed_compaction: None,
             profile: None,
             initialized: false,
+            last_request_started_at: None,
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
             sandbox_dir: None,
-            last_request_started_at: None,
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -521,13 +521,41 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
 
 impl<Advanced, Balanced, Fast, H> Agent<Advanced, Balanced, Fast, H>
 where
-    Advanced: LanguageModel,
-    Balanced: LanguageModel,
+    Advanced: LanguageModel + 'static,
+    Balanced: LanguageModel + 'static,
     // Compaction runs as an owned future that outlives the turn it races
     // against, so the fast model it borrows must outlive the agent.
     Fast: LanguageModel + 'static,
     H: Hook,
 {
+    /// Response stream of the active tier, boxed so the provider's concrete
+    /// stream type does not inflate this async chain's poll frames in debug
+    /// builds (aither#143).
+    fn respond_stream<'a>(
+        tier: ModelTier,
+        advanced: &'a Arc<Advanced>,
+        balanced: &'a Arc<Balanced>,
+        fast: &'a Arc<Fast>,
+        request: LLMRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<Event, String>> + Send + 'a>> {
+        match tier {
+            ModelTier::Advanced => Box::pin(
+                advanced
+                    .respond(request)
+                    .map(|event| event.map_err(|error| error.to_string())),
+            ),
+            ModelTier::Balanced => Box::pin(
+                balanced
+                    .respond(request)
+                    .map(|event| event.map_err(|error| error.to_string())),
+            ),
+            ModelTier::Fast => Box::pin(
+                fast.respond(request)
+                    .map(|event| event.map_err(|error| error.to_string())),
+            ),
+        }
+    }
+
     async fn collect_model_turn(
         &mut self,
         request: LLMRequest,
@@ -538,45 +566,32 @@ where
         let mut reasoning = Vec::new();
         let mut malformed_function_call = false;
 
-        match self.tier {
-            ModelTier::Advanced => {
-                drain_model_stream!(
-                    self.advanced.respond(request),
-                    &self.hooks,
-                    &mut self.cache_stats,
-                    &mut self.budget,
-                    events,
-                    &mut text_chunks,
-                    &mut tool_calls,
-                    &mut reasoning,
-                    malformed_function_call
-                );
-            }
-            ModelTier::Balanced => {
-                drain_model_stream!(
-                    self.balanced.respond(request),
-                    &self.hooks,
-                    &mut self.cache_stats,
-                    &mut self.budget,
-                    events,
-                    &mut text_chunks,
-                    &mut tool_calls,
-                    &mut reasoning,
-                    malformed_function_call
-                );
-            }
-            ModelTier::Fast => {
-                drain_model_stream!(
-                    self.fast.respond(request),
-                    &self.hooks,
-                    &mut self.cache_stats,
-                    &mut self.budget,
-                    events,
-                    &mut text_chunks,
-                    &mut tool_calls,
-                    &mut reasoning,
-                    malformed_function_call
-                );
+        let stream = Self::respond_stream(
+            self.tier,
+            &self.advanced,
+            &self.balanced,
+            &self.fast,
+            request,
+        );
+        futures_lite::pin!(stream);
+        while let Some(event) = stream.next().await {
+            match handle_model_event(
+                &self.hooks,
+                &mut self.cache_stats,
+                &mut self.budget,
+                event,
+                &mut text_chunks,
+                &mut tool_calls,
+                &mut reasoning,
+            )
+            .await?
+            {
+                ModelEventAction::Emit(event) => events.emit(event),
+                ModelEventAction::Continue => {}
+                ModelEventAction::RetryMalformed => {
+                    malformed_function_call = true;
+                    break;
+                }
             }
         }
 
@@ -599,7 +614,7 @@ where
             run_id.clone(),
             self.config.max_iterations,
         ));
-        self.ensure_initialized().await;
+        self.ensure_initialized().await?;
         #[cfg(feature = "skills")]
         for event in self.activate_skills_for_prompt(&prompt) {
             events.emit(event);
@@ -1293,7 +1308,7 @@ where
         &mut self,
         focus: Option<&str>,
     ) -> Result<Option<CompactResult>, AgentError> {
-        self.ensure_initialized().await;
+        self.ensure_initialized().await?;
 
         let messages = self.context.conversation_messages();
         if messages.is_empty() {
@@ -1301,16 +1316,23 @@ where
         }
 
         let messages_compacted = messages.len();
-        let fork = CompactionFork::new(&self.context, focus)
+        let tail = self.render_tail().await;
+        let request = LLMRequest::new(self.context.build_request(&tail))
+            .with_parameters(self.config.request_parameters.clone())
+            .with_tool_definitions(self.tools.active_definitions());
+        #[cfg(feature = "skills")]
+        let skills = self.skill_catalog();
+        #[cfg(not(feature = "skills"))]
+        let skills = Vec::new();
+        let fork = CompactionFork::new(&request, self.context.fork_point(), focus, &skills)
             .map_err(|error| AgentError::Llm(error.to_string()))?;
         let fork_point = fork.fork_point();
-        let handoff = fork
-            .run(
-                Arc::clone(&self.fast),
-                self.config.request_parameters.clone(),
-            )
-            .await
-            .map_err(|error| AgentError::Llm(error.to_string()))?;
+        let handoff = match self.tier {
+            ModelTier::Advanced => fork.run(Arc::clone(&self.advanced)).await,
+            ModelTier::Balanced => fork.run(Arc::clone(&self.balanced)).await,
+            ModelTier::Fast => fork.run(Arc::clone(&self.fast)).await,
+        }
+        .map_err(|error| AgentError::Llm(error.to_string()))?;
         let summary = handoff.render_markdown();
 
         self.completed_compaction = Some(CompletedCompaction {
@@ -1326,28 +1348,58 @@ where
         }))
     }
 
-    /// Forks a compaction to run alongside the turns that follow.
+    /// Forks a compaction off `request` to run alongside the turns that follow.
+    ///
+    /// The compaction replays the session's current model, not a cheaper one:
+    /// the handoff has to carry the same understanding of the conversation the
+    /// next requests are made of.
     ///
     /// A failure to even start — an empty conversation — is not an error for
     /// the run: there is simply nothing to compact yet.
-    fn start_compaction(&mut self, focus: Option<&str>) {
-        match CompactionFork::new(&self.context, focus) {
+    fn start_compaction(&mut self, request: &LLMRequest, focus: Option<&str>) {
+        #[cfg(feature = "skills")]
+        let skills = self.skill_catalog();
+        #[cfg(not(feature = "skills"))]
+        let skills = Vec::new();
+        match CompactionFork::new(request, self.context.fork_point(), focus, &skills) {
             Ok(fork) => {
                 tracing::debug!(
                     fork_point = fork.fork_point(),
                     usage = self.budget.usage(),
                     "forking compaction alongside the run"
                 );
-                self.pending_compaction = Some(PendingCompaction::start(
-                    fork,
-                    Arc::clone(&self.fast),
-                    self.config.request_parameters.clone(),
-                ));
+                self.pending_compaction = Some(match self.tier {
+                    ModelTier::Advanced => {
+                        PendingCompaction::start(fork, Arc::clone(&self.advanced))
+                    }
+                    ModelTier::Balanced => {
+                        PendingCompaction::start(fork, Arc::clone(&self.balanced))
+                    }
+                    ModelTier::Fast => PendingCompaction::start(fork, Arc::clone(&self.fast)),
+                });
             }
             Err(error) => {
                 tracing::debug!(%error, "compaction not forked");
             }
         }
+    }
+
+    /// The session's skill catalog, offered to compaction prompts and used to
+    /// resolve skill names during restoration.
+    #[cfg(feature = "skills")]
+    fn skill_catalog(&self) -> Vec<SkillCatalogEntry> {
+        if let Some(registry) = &self.skill_registry {
+            return registry
+                .all()
+                .into_iter()
+                .map(|skill| SkillCatalogEntry {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    instructions: skill.instructions.clone(),
+                })
+                .collect();
+        }
+        Vec::new()
     }
 
     /// Folds a landed handoff into the window and restores what it named.
@@ -1364,6 +1416,9 @@ where
             return;
         };
 
+        // Compaction rewrites the cacheable prefix anyway, so this is where
+        // staged system-block updates and superseded tool results fold in.
+        self.context.reassemble();
         self.context.apply_handoff(&handoff, fork_point);
         tracing::info!(
             fork_point,
@@ -1376,7 +1431,13 @@ where
                 .budget
                 .fraction_tokens(self.config.context_policy.restore_budget);
             let budget_chars = self.budget.chars_for_tokens(tokens);
-            if let Some(block) = restore_context(&handoff, &sandbox_dir, budget_chars).await {
+            #[cfg(feature = "skills")]
+            let skills = self.skill_catalog();
+            #[cfg(not(feature = "skills"))]
+            let skills = Vec::new();
+            if let Some(block) =
+                restore_context(&handoff, &[sandbox_dir], &skills, budget_chars).await
+            {
                 self.context.push_block_alert(&block);
             }
         }
@@ -1510,8 +1571,8 @@ where
     ///
     /// Returns an error when checkpoint construction or checkpoint hooks fail.
     pub async fn export_checkpoint(&mut self) -> Result<AgentCheckpoint, AgentError> {
-        self.ensure_initialized().await;
-        let context_window = self.snapshot_context_window().await;
+        self.ensure_initialized().await?;
+        let context_window = self.snapshot_context_window().await?;
         Ok(AgentCheckpoint {
             context: self.context.checkpoint(),
             tool_surface_hash: self.tool_surface_hash(),
@@ -1542,10 +1603,15 @@ where
     ///
     /// This is a pure measurement: no source baseline is advanced and no
     /// alert is consumed, so a host may poll it as often as it likes.
-    pub async fn snapshot_context_window(&mut self) -> ContextWindowSnapshot {
-        self.ensure_initialized().await;
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model profiles cannot be fetched during
+    /// initialization.
+    pub async fn snapshot_context_window(&mut self) -> Result<ContextWindowSnapshot, AgentError> {
+        self.ensure_initialized().await?;
         let tail = self.render_tail().await;
-        self.context_window_snapshot(&tail)
+        Ok(self.context_window_snapshot(&tail))
     }
 
     /// Returns the model profile if available.
@@ -1555,27 +1621,21 @@ where
     }
 
     /// Ensures the agent is initialized (profiles fetched, static blocks set up).
-    async fn ensure_initialized(&mut self) {
+    async fn ensure_initialized(&mut self) -> Result<(), AgentError> {
         if self.initialized {
-            return;
+            return Ok(());
         }
 
-        // The reasoning tier and the fast tier both have to fit the window:
-        // compaction replays the main request's prefix through the fast
-        // model, so the smaller of the two is what the budget may spend.
-        let (profile, fast_profile) = futures_lite::future::zip(
-            async {
-                match self.tier {
-                    ModelTier::Advanced => self.advanced.profile().await,
-                    ModelTier::Balanced => self.balanced.profile().await,
-                    ModelTier::Fast => self.fast.profile().await,
-                }
-            },
-            self.fast.profile(),
-        )
-        .await;
-        self.budget
-            .set_window(profile.context_length.min(fast_profile.context_length));
+        // The window the current tier sees is the only one the budget may
+        // spend: compaction replays the main request's prefix through the
+        // same model, so no second profile is involved.
+        let profile = match self.tier {
+            ModelTier::Advanced => self.advanced.profile().await.map_err(|e| e.to_string()),
+            ModelTier::Balanced => self.balanced.profile().await.map_err(|e| e.to_string()),
+            ModelTier::Fast => self.fast.profile().await.map_err(|e| e.to_string()),
+        }
+        .map_err(AgentError::Llm)?;
+        self.budget.set_window(profile.context_length);
         self.profile = Some(profile);
 
         self.register_builtin_context_sources();
@@ -1585,6 +1645,7 @@ where
         self.populate_system_blocks();
 
         self.initialized = true;
+        Ok(())
     }
 
     /// Populates the Context's system blocks from `AgentConfig`.
@@ -1652,10 +1713,10 @@ where
     ///
     /// This is the only request boundary there is, and everything that must
     /// not happen mid-turn happens here, in order: a landed handoff is
-    /// folded in, a cold or staged prefix is rebuilt, the window is measured
-    /// against the provider's own token counts, a compaction is forked if
-    /// usage crossed [`ContextPolicy::compact_at`], and one that was already
-    /// running is awaited if usage reached [`ContextPolicy::pause_at`].
+    /// folded in, the window is measured against the provider's own token
+    /// counts, a compaction is forked if usage crossed
+    /// [`ContextPolicy::compact_at`], and one that was already running is
+    /// awaited if usage reached [`ContextPolicy::pause_at`].
     ///
     /// Returns `None` when the window is exhausted and no compaction can
     /// relieve it: the caller pauses the run rather than sending a request
@@ -1665,18 +1726,27 @@ where
     /// [`ContextPolicy::pause_at`]: crate::ContextPolicy::pause_at
     async fn prepare_request(&mut self) -> Option<LLMRequest> {
         self.apply_completed_compaction().await;
-        self.reassemble_if_prefix_is_cold();
+        self.reassemble_if_cache_is_cold();
 
+        let definitions = self.tools.active_definitions();
         let mut tail = self.render_tail().await;
         let mut messages = self.context.build_request(&tail);
-        self.budget.observe_assembled(request_chars(&messages));
+        self.budget
+            .observe_assembled(request_chars(&messages, &definitions));
 
         let usage = self.budget.usage();
         if self.config.context_policy.should_compact(usage)
             && self.pending_compaction.is_none()
             && self.completed_compaction.is_none()
         {
-            self.start_compaction(None);
+            let fork_request = LLMRequest::new(messages.clone())
+                .with_parameters(self.prompt_cache.apply(
+                    self.config.request_parameters.clone(),
+                    &messages,
+                    !definitions.is_empty(),
+                ))
+                .with_tool_definitions(definitions.clone());
+            self.start_compaction(&fork_request, None);
         }
 
         if self.config.context_policy.should_pause(usage) {
@@ -1686,13 +1756,18 @@ where
             }
             tail = self.render_tail().await;
             messages = self.context.build_request(&tail);
-            self.budget.observe_assembled(request_chars(&messages));
+            self.budget
+                .observe_assembled(request_chars(&messages, &definitions));
+            // A landed compaction is still no guarantee the rebuilt request
+            // fits; an unshrinkable request is paused rather than sent.
+            if self.config.context_policy.should_pause(self.budget.usage()) {
+                return None;
+            }
         }
 
         self.commit_tail(&tail).await;
         self.last_request_started_at = Some(Instant::now());
 
-        let definitions = self.tools.active_definitions();
         let has_tools = !definitions.is_empty();
         self.prompt_cache
             .observe_prefix(self.context.stable_prefix_fingerprint());
@@ -1706,23 +1781,24 @@ where
         )
     }
 
-    /// Rebuilds the window when the prefix cache has nothing left to lose.
+    /// Rebuilds the window once the provider's cache has gone cold anyway.
     ///
     /// Reassembly rewrites the cacheable prefix, so it is only free once the
-    /// provider's copy has expired anyway — after an idle gap longer than
-    /// [`ContextPolicy::idle_reassemble_after`]. A staged system-block
-    /// rewrite waits for exactly that moment too.
+    /// cached copy has expired — an idle gap at least as long as the
+    /// conversation's [`CacheLifetime`]. A staged system-block rewrite and
+    /// superseded tool results wait for exactly that moment; a permanent
+    /// cache lifetime means no idle gap ever justifies the rewrite.
     ///
-    /// [`ContextPolicy::idle_reassemble_after`]: crate::ContextPolicy::idle_reassemble_after
-    fn reassemble_if_prefix_is_cold(&mut self) -> crate::context::ReassemblyReport {
+    /// [`CacheLifetime`]: crate::context::CacheLifetime
+    fn reassemble_if_cache_is_cold(&mut self) -> crate::context::ReassemblyReport {
         let unchanged = crate::context::ReassemblyReport::default();
         let Some(last_request_started_at) = self.last_request_started_at else {
             return unchanged;
         };
         if !self
-            .config
-            .context_policy
-            .should_reassemble(last_request_started_at.elapsed())
+            .prompt_cache
+            .lifetime()
+            .is_cold(last_request_started_at.elapsed())
         {
             return unchanged;
         }
@@ -1732,7 +1808,7 @@ where
                 system_messages = report.system_messages_pruned,
                 deduped = report.tool_results_deduped,
                 bytes_freed = report.bytes_freed,
-                "rebuilt the context window after an idle gap"
+                "rebuilt the context window on a cold cache"
             );
         }
         report
@@ -1762,7 +1838,7 @@ where
 
     fn context_window_metrics(&self, messages: &[Message]) -> ContextWindowMetrics {
         let mut budget = self.budget;
-        budget.observe_assembled(request_chars(messages));
+        budget.observe_assembled(request_chars(messages, &self.tools.active_definitions()));
         ContextWindowMetrics {
             usage_fraction: budget.usage(),
             context_window: budget.window(),
@@ -1788,7 +1864,7 @@ where
         if metrics.has_staged_system_updates
             || self
                 .last_request_started_at
-                .is_some_and(|at| policy.should_reassemble(at.elapsed()))
+                .is_some_and(|at| self.prompt_cache.lifetime().is_cold(at.elapsed()))
         {
             return ContextWindowPhase::ReassemblyDue;
         }
@@ -1800,19 +1876,50 @@ where
     /// Intended for observability and debug UIs: the prompt is added to a
     /// forked context and the sources are rendered without committing, so a
     /// preview cannot consume a change the real request should surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model profiles cannot be fetched during
+    /// initialization.
     pub async fn preview_request_messages(
         &mut self,
         prompt: &str,
         attachments: impl IntoIterator<Item = Attachment>,
-    ) -> Vec<Message> {
-        self.ensure_initialized().await;
+    ) -> Result<Vec<Message>, AgentError> {
+        self.preview_request_messages_with(prompt, std::iter::empty(), attachments)
+            .await
+    }
+
+    /// Returns the exact request message sequence that would be sent for the
+    /// next turn, with `extra_messages` appended at the conversation tail
+    /// before the prompt.
+    ///
+    /// This is the non-mutating counterpart of pushing those messages onto the
+    /// live context and then running the turn — the shape a host gets for
+    /// per-turn hidden context injected ahead of the user's message. The
+    /// extras are not persisted: the context and the sources' committed state
+    /// are left exactly as a normal first assembly would, because sources are
+    /// only told about a request once it is actually sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model profiles cannot be fetched during
+    /// initialization.
+    pub async fn preview_request_messages_with(
+        &mut self,
+        prompt: &str,
+        extra_messages: impl IntoIterator<Item = Message>,
+        attachments: impl IntoIterator<Item = Attachment>,
+    ) -> Result<Vec<Message>, AgentError> {
+        self.ensure_initialized().await?;
         let checkpoint = self.context.checkpoint();
+        self.context.extend(extra_messages);
         self.context
             .push(Message::user(prompt).with_attachments(attachments));
         let tail = self.render_tail().await;
         let messages = self.context.build_request(&tail);
         self.context.restore(checkpoint);
-        messages
+        Ok(messages)
     }
 
     fn format_tool_hints_block(&self) -> String {
@@ -2078,9 +2185,9 @@ mod tests {
 
     use futures_core::Stream;
 
+    use crate::ContextWindowPhase;
     #[cfg(feature = "skills")]
-    use crate::{AgentCheckpoint, ContextWindowMetrics};
-    use crate::{ContextWindowPhase, ContextWindowSnapshot};
+    use crate::{AgentCheckpoint, ContextWindowMetrics, ContextWindowSnapshot};
     #[cfg(feature = "skills")]
     use aither_skills::{Skill, SkillRegistry};
     #[cfg(feature = "skills")]
@@ -2114,14 +2221,45 @@ mod tests {
             futures_lite::stream::empty()
         }
 
-        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
-            std::future::ready(ModelProfile::new(
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "mock model",
                 self.context_length,
-            ))
+            )))
+        }
+    }
+
+    /// aither#143: the provider `respond` stream's multi-KB state machine must
+    /// stay boxed at the leaf (`respond_stream`); if the box is removed these
+    /// futures embed it by value and each poll frame pays the ~32 KB temp.
+    #[test]
+    fn run_futures_stay_small_with_a_real_provider_type() {
+        let provider = aither_openai::OpenAI::new("sk-test").with_base_url("http://127.0.0.1:9");
+        let mut agent = Agent::new(provider);
+        let (tx, _rx) = async_channel::unbounded();
+        let sink = EventSink { sender: tx };
+
+        let request = LLMRequest::new(vec![Message::user("hi")]);
+        {
+            let fut = agent.collect_model_turn(request, &sink);
+            assert!(
+                std::mem::size_of_val(&fut) < 8 * 1024,
+                "collect_model_turn future is {} B",
+                std::mem::size_of_val(&fut)
+            );
+        }
+        {
+            let fut = agent.run_streaming("hi".to_string(), Vec::new(), &sink);
+            assert!(
+                std::mem::size_of_val(&fut) < 8 * 1024,
+                "run_streaming future is {} B",
+                std::mem::size_of_val(&fut)
+            );
         }
     }
 
@@ -2140,7 +2278,10 @@ mod tests {
         );
         agent.push_message(Message::user("hello"));
 
-        let snapshot = agent.snapshot_context_window().await;
+        let snapshot = agent
+            .snapshot_context_window()
+            .await
+            .expect("snapshot should initialize");
 
         assert_eq!(snapshot.phase, ContextWindowPhase::Exhausted);
         assert!(snapshot.metrics.system_block_count > 0);
@@ -2156,7 +2297,10 @@ mod tests {
         });
         agent.context_mut().set_handoff("resume here");
 
-        let snapshot = agent.snapshot_context_window().await;
+        let snapshot = agent
+            .snapshot_context_window()
+            .await
+            .expect("snapshot should initialize");
 
         assert_eq!(snapshot.phase, ContextWindowPhase::Stable);
         assert!(snapshot.metrics.has_handoff);
@@ -2175,34 +2319,12 @@ mod tests {
             config,
         );
         agent.push_message(Message::user("hello"));
-        agent.ensure_initialized().await;
+        agent.ensure_initialized().await.expect("agent initializes");
 
         // The conversation is non-empty, so a compaction is forked; the mock
         // model answers with an empty stream, so it cannot land, and the
         // request must not be sent on a window this far over the threshold.
         assert!(agent.prepare_request().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn idle_gap_reassembles_before_the_next_request() {
-        let mut agent = Agent::with_config(
-            MockLlm {
-                context_length: 1_000_000,
-            },
-            AgentConfig::default().with_idle_reassemble_after(Duration::from_secs(1)),
-        );
-        agent.push_message(Message::user("hello"));
-        agent.push_message(Message::system(
-            "<system-reminder>ephemeral</system-reminder>",
-        ));
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(5));
-
-        assert!(agent.prepare_request().await.is_some());
-
-        assert_eq!(agent.context().count_recent_system_messages(), 0);
-        assert_eq!(agent.context().len_recent(), 1);
-        assert_eq!(agent.context().recent()[0].content(), "hello");
-        assert!(agent.last_request_started_at.is_some());
     }
 
     #[tokio::test]
@@ -2213,7 +2335,7 @@ mod tests {
             },
             AgentConfig::default(),
         );
-        agent.ensure_initialized().await;
+        agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
 
         let first = agent.context().stable_prefix_fingerprint();
@@ -2423,6 +2545,7 @@ mod tests {
         );
         agent.skill_registry = Some(Arc::new(registry));
         let _ = agent.activate_skills_for_prompt("please review this patch");
+        agent.ensure_initialized().await.expect("agent initializes");
 
         let messages = agent
             .prepare_request()
@@ -2457,7 +2580,7 @@ mod tests {
         let dir = tempdir().expect("tempdir should exist");
         std::fs::write(dir.path().join("tasks.md"), "- [ ] pending\n").expect("write tasks.md");
         let mut agent = tasks_agent(dir.path());
-        agent.ensure_initialized().await;
+        agent.ensure_initialized().await.expect("agent initializes");
 
         agent.push_tool_turn_alerts().await; // baseline
         agent.push_tool_turn_alerts().await; // stale turn 1
@@ -2479,7 +2602,7 @@ mod tests {
         let dir = tempdir().expect("tempdir should exist");
         std::fs::write(dir.path().join("tasks.md"), "- [ ] pending\n").expect("write tasks.md");
         let mut agent = tasks_agent(dir.path());
-        agent.ensure_initialized().await;
+        agent.ensure_initialized().await.expect("agent initializes");
 
         assert!(
             agent.push_final_turn_alerts().await,
@@ -2494,7 +2617,7 @@ mod tests {
         let mut agent = Agent::new(MockLlm {
             context_length: 1_000_000,
         });
-        agent.ensure_initialized().await;
+        agent.ensure_initialized().await.expect("agent initializes");
         agent.push_system_alert("no native tool named foo");
 
         let request = agent
@@ -2522,12 +2645,13 @@ mod tests {
         })
         .sandbox_dir(dir.path())
         .build();
-        agent.ensure_initialized().await;
+        agent.ensure_initialized().await.expect("agent initializes");
 
         let before = agent.context().checkpoint();
         let preview = agent
             .preview_request_messages("hi", std::iter::empty())
-            .await;
+            .await
+            .expect("preview should initialize");
 
         assert!(
             preview
@@ -2540,5 +2664,455 @@ mod tests {
             before,
             "a preview must leave the window untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn preview_with_extras_leaves_uninitialized_agent_in_first_turn_state() {
+        use aither_core::llm::Role;
+
+        let mut previewed = Agent::builder(MockLlm {
+            context_length: 1_000,
+        })
+        .build();
+        let mut control = Agent::builder(MockLlm {
+            context_length: 1_000,
+        })
+        .build();
+        // A normal first assembly initializes the agent and populates the
+        // static system blocks into its context.
+        control
+            .snapshot_context_window()
+            .await
+            .expect("control agent initializes");
+
+        let messages = previewed
+            .preview_request_messages_with(
+                "hi",
+                [Message::system("hidden note")],
+                std::iter::empty(),
+            )
+            .await
+            .expect("preview should initialize");
+
+        // The extra message lands at the conversation tail ahead of the
+        // prompt, matching the run ordering when a host pushes it first.
+        let hidden_pos = messages
+            .iter()
+            .position(|message| {
+                message.role() == Role::System && message.content() == "hidden note"
+            })
+            .expect("extra message must appear in the previewed request");
+        assert_eq!(messages[hidden_pos + 1].role(), Role::User);
+        assert_eq!(messages[hidden_pos + 1].content(), "hi");
+
+        // Post-preview state is exactly what a normal first turn leaves:
+        // initialized with the static blocks populated, and neither the
+        // prompt nor the extra message persisted.
+        assert!(previewed.initialized);
+        assert_eq!(
+            previewed.context().system_blocks(),
+            control.context().system_blocks()
+        );
+        assert!(previewed.context().is_conversation_empty());
+    }
+
+    /// A mock whose `respond` replays scripted text and records requests,
+    /// so tests can drive compaction and inspect what was sent.
+    #[derive(Clone)]
+    struct ScriptedLlm {
+        context_length: u32,
+        requests: Arc<std::sync::Mutex<Vec<LLMRequest>>>,
+        responses: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    }
+
+    impl ScriptedLlm {
+        fn new(context_length: u32, responses: impl IntoIterator<Item = String>) -> Self {
+            Self {
+                context_length,
+                requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+                responses: Arc::new(std::sync::Mutex::new(responses.into_iter().collect())),
+            }
+        }
+
+        fn recorded(&self) -> Vec<LLMRequest> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+    }
+
+    impl LanguageModel for ScriptedLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.requests.lock().expect("requests lock").push(request);
+            let text = self
+                .responses
+                .lock()
+                .expect("responses lock")
+                .pop_front()
+                .unwrap_or_default();
+            futures_lite::stream::iter([Ok(Event::Text(text))])
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            let context_length = self.context_length;
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                context_length,
+            )))
+        }
+    }
+
+    const HANDOFF_JSON: &str = r#"{"current_task":"keep going","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["continue"],"recovery_hints":[],"skills":[]}"#;
+
+    /// Sizes a mock's context window so the agent's next request lands at
+    /// `usage_percent` percent of it — the only honest way to aim between the
+    /// `compact_at` and `pause_at` thresholds, since tool definitions and
+    /// system blocks weigh as much as the conversation does.
+    async fn window_for_usage(
+        config: &AgentConfig,
+        messages: &[Message],
+        usage_percent: usize,
+    ) -> (Agent<MockLlm, MockLlm, MockLlm, ()>, u32) {
+        // Probe with a huge window to measure the request the real agent
+        // will assemble, then pick the window that lands the usage exactly.
+        let mut probe = Agent::with_config(
+            MockLlm {
+                context_length: u32::MAX / 4,
+            },
+            config.clone(),
+        );
+        probe.ensure_initialized().await.expect("probe initializes");
+        for message in messages {
+            probe.context.push(message.clone());
+        }
+        let tail = probe.render_tail().await;
+        let assembled = probe.context.build_request(&tail);
+        let chars = request_chars(&assembled, &probe.tools.active_definitions());
+        let tokens = chars.div_ceil(4);
+        let window = u32::try_from((tokens * 100).div_ceil(usage_percent))
+            .expect("the aimed window fits in u32");
+        (
+            Agent::with_config(
+                MockLlm {
+                    context_length: window,
+                },
+                config.clone(),
+            ),
+            window,
+        )
+    }
+
+    /// The handoff exists but the window grew past `compact_at` again: a new
+    /// compaction must fork, not rest on the previous one.
+    #[tokio::test]
+    async fn a_landed_handoff_compacts_again_when_the_window_grows() {
+        let config = AgentConfig {
+            system_prompt: Some("x".repeat(400)),
+            ..AgentConfig::default()
+        };
+        let (mut agent, _window) = window_for_usage(&config, &[Message::user("hello")], 75).await;
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.context_mut().set_handoff("resume here");
+        agent.push_message(Message::user("hello"));
+
+        let request = agent.prepare_request().await;
+
+        assert!(
+            request.is_some(),
+            "usage between compact_at and pause_at must not withhold the request"
+        );
+        assert!(
+            agent.pending_compaction.is_some(),
+            "growth past compact_at must fork a compaction even after a handoff exists"
+        );
+    }
+
+    /// Crossing `compact_at` during a tool round starts the compaction but
+    /// still lets that turn's request out: forking must not block the turn.
+    #[tokio::test]
+    async fn a_tool_round_crossing_compact_at_forks_without_blocking() {
+        let config = AgentConfig {
+            system_prompt: Some("x".repeat(400)),
+            ..AgentConfig::default()
+        };
+        let messages = vec![
+            Message::user("run it"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![aither_core::llm::ToolCall::new(
+                    "call_1",
+                    "terminal",
+                    serde_json::json!({"description": "build"}),
+                )],
+            ),
+            Message::tool("call_1", "ok"),
+        ];
+        let (mut agent, _window) = window_for_usage(&config, &messages, 75).await;
+        agent.ensure_initialized().await.expect("agent initializes");
+        for message in messages {
+            agent.push_message(message);
+        }
+
+        let request = agent.prepare_request().await;
+
+        assert!(
+            request.is_some(),
+            "crossing compact_at alone must not withhold the turn's request"
+        );
+        assert!(
+            agent.pending_compaction.is_some(),
+            "crossing compact_at must fork the compaction"
+        );
+    }
+
+    /// At `pause_at` the boundary waits for the in-flight compaction and
+    /// proceeds with the rebuilt request once it lands.
+    #[tokio::test]
+    async fn the_pause_waits_for_an_in_flight_compaction() {
+        let config = AgentConfig {
+            system_prompt: Some("x".repeat(400)),
+            ..AgentConfig::default()
+        };
+        // Aim at 95% of the window: a handoff a fraction of the conversation
+        // size lands the rebuilt request back under compact_at.
+        let probe_window = {
+            let mut probe = Agent::with_config(
+                ScriptedLlm::new(u32::MAX / 4, [HANDOFF_JSON.to_string()]),
+                config.clone(),
+            );
+            probe.ensure_initialized().await.expect("probe initializes");
+            probe.context.push(Message::user("u".repeat(3_400)));
+            let tail = probe.render_tail().await;
+            let assembled = probe.context.build_request(&tail);
+            let chars = request_chars(&assembled, &probe.tools.active_definitions());
+            u32::try_from((chars.div_ceil(4) * 100).div_ceil(95)).expect("window fits in u32")
+        };
+        let llm = ScriptedLlm::new(probe_window, [HANDOFF_JSON.to_string()]);
+        let mut agent = Agent::with_config(llm.clone(), config);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("u".repeat(3_400)));
+
+        // Seed an in-flight compaction the way prepare_request would.
+        let tail = agent.render_tail().await;
+        let request = LLMRequest::new(agent.context.build_request(&tail));
+        let fork =
+            CompactionFork::new(&request, agent.context.fork_point(), None, &[]).expect("fork");
+        agent.pending_compaction = Some(PendingCompaction::start(fork, llm.clone()));
+
+        let request = agent.prepare_request().await;
+
+        assert!(
+            request.is_some(),
+            "a landed compaction relieves the pause and the request goes out"
+        );
+        assert!(
+            agent.context().handoff().is_some(),
+            "the landed handoff is folded into the window"
+        );
+        let compaction_request = &llm.recorded()[0];
+        assert!(
+            compaction_request
+                .messages()
+                .iter()
+                .any(|m| m.content().contains("handoff")),
+            "the compaction request carries the instruction"
+        );
+    }
+
+    /// The first request after a compaction carries the current tasks.md —
+    /// sources render fresh after every apply.
+    #[tokio::test]
+    async fn the_request_after_a_compaction_carries_tasks_md() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir should exist");
+        std::fs::write(
+            dir.path().join("tasks.md"),
+            "- [ ] fix the flaky test
+",
+        )
+        .expect("write tasks.md");
+        let mut agent = tasks_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent.completed_compaction = Some(CompletedCompaction {
+            fork_point: agent.context.fork_point(),
+            handoff: HandoffDocument {
+                current_task: "keep going".to_string(),
+                ..HandoffDocument::default()
+            },
+        });
+
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request after compaction");
+
+        assert!(
+            request
+                .messages()
+                .iter()
+                .any(|m| m.content().contains("fix the flaky test")),
+            "the post-compaction request must carry the live tasks.md"
+        );
+    }
+
+    /// Items appended while a compaction was in flight are newer than the
+    /// fork and survive the apply, in order.
+    #[tokio::test]
+    async fn items_appended_during_a_compaction_survive_in_order() {
+        let mut agent = Agent::new(MockLlm {
+            context_length: 1_000_000,
+        });
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("before the fork"));
+        let fork_point = agent.context.fork_point();
+        // Two more items land while the hypothetical compaction runs.
+        agent.push_message(Message::assistant("during one"));
+        agent.push_message(Message::user("during two"));
+        agent.completed_compaction = Some(CompletedCompaction {
+            fork_point,
+            handoff: HandoffDocument {
+                current_task: "keep going".to_string(),
+                ..HandoffDocument::default()
+            },
+        });
+
+        agent.prepare_request().await.expect("request after apply");
+
+        let conversation: Vec<String> = agent
+            .context()
+            .conversation_messages()
+            .iter()
+            .map(|m| m.content().to_string())
+            .collect();
+        assert_eq!(conversation, ["during one", "during two"]);
+    }
+
+    /// The compaction request must be the main request's prefix verbatim,
+    /// or the provider's prompt cache is useless for it.
+    #[tokio::test]
+    async fn the_compaction_request_shares_the_main_prefix() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = Agent::new(llm.clone());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("do the thing"));
+
+        // Fork the way prepare_request does, around a real assembled request.
+        let tail = agent.render_tail().await;
+        let main = LLMRequest::new(agent.context.build_request(&tail));
+        let fork = CompactionFork::new(&main, agent.context.fork_point(), None, &[]).expect("fork");
+        agent.pending_compaction = Some(PendingCompaction::start(fork, llm.clone()));
+        assert!(agent.await_pending_compaction().await);
+
+        let recorded = llm.recorded();
+        let compaction = &recorded[0];
+        // The instruction request generate() sends starts from the fork's
+        // messages; the first len-1 are the main request verbatim and the
+        // last is the instruction.
+        for (index, message) in main.messages().iter().enumerate() {
+            assert_eq!(
+                message.content(),
+                compaction.messages()[index].content(),
+                "compaction perturbed main-request message {index}"
+            );
+        }
+        assert!(compaction.messages().len() > main.messages().len());
+    }
+
+    /// A preview renders sources but does not commit them: the real request
+    /// still carries the same tasks diff.
+    #[tokio::test]
+    async fn a_preview_leaves_source_committed_state_untouched() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir should exist");
+        std::fs::write(
+            dir.path().join("tasks.md"),
+            "- [ ] pending work
+",
+        )
+        .expect("write tasks.md");
+        let mut agent = tasks_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        agent
+            .preview_request_messages("hi", std::iter::empty())
+            .await
+            .expect("preview");
+
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request after preview");
+        assert!(
+            request
+                .messages()
+                .iter()
+                .any(|m| m.content().contains("pending work")),
+            "the real request must still carry the tasks diff the preview saw"
+        );
+    }
+
+    /// Idle reassembly fires only once the conversation's cache lifetime has
+    /// passed — never earlier, and never for a permanent cache.
+    #[tokio::test]
+    async fn an_idle_gap_reassembles_only_past_the_cache_lifetime() {
+        let mut agent = Agent::new(MockLlm {
+            context_length: 1_000_000,
+        });
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent.push_message(Message::system(
+            "<system-reminder>ephemeral</system-reminder>",
+        ));
+
+        // The default lifetime is one hour: five minutes is nothing.
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(300));
+        assert!(agent.prepare_request().await.is_some());
+        assert_eq!(agent.context().count_recent_system_messages(), 1);
+
+        // Fifty-nine minutes is still inside the hour.
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3540));
+        assert!(agent.prepare_request().await.is_some());
+        assert_eq!(agent.context().count_recent_system_messages(), 1);
+
+        // Sixty-one minutes is past it: the cached prefix is gone anyway,
+        // so the compromises the append-only log forced get cleaned up.
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        assert!(agent.prepare_request().await.is_some());
+        assert_eq!(agent.context().count_recent_system_messages(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_permanent_cache_lifetime_never_reassembles() {
+        use crate::context::CacheLifetime;
+
+        let mut agent = Agent::new(MockLlm {
+            context_length: 1_000_000,
+        });
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.prompt_cache = agent
+            .prompt_cache
+            .clone()
+            .with_lifetime(CacheLifetime::Permanent);
+        agent.push_message(Message::user("hello"));
+        agent.push_message(Message::system(
+            "<system-reminder>ephemeral</system-reminder>",
+        ));
+
+        // Rewriting the prefix always costs a permanent cache, so no idle
+        // gap ever justifies it — even a day later.
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        assert!(agent.prepare_request().await.is_some());
+        assert_eq!(agent.context().count_recent_system_messages(), 1);
     }
 }

@@ -1,7 +1,5 @@
 //! Agent configuration.
 
-use std::time::Duration;
-
 use aither_core::llm::model::Parameters;
 
 use crate::context::ContextPolicy;
@@ -103,13 +101,6 @@ impl AgentConfig {
     #[must_use]
     pub const fn with_agent_kind(mut self, kind: AgentKind) -> Self {
         self.agent_kind = kind;
-        self
-    }
-
-    /// Sets the idle gap after which the window is reassembled.
-    #[must_use]
-    pub const fn with_idle_reassemble_after(mut self, idle_reassemble_after: Duration) -> Self {
-        self.context_policy.idle_reassemble_after = idle_reassemble_after;
         self
     }
 

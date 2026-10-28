@@ -371,7 +371,13 @@ pub trait LanguageModel: Sized + Send + Sync {
     /// Returns model profile and capabilities.
     ///
     /// See [`Profile`] for details on model metadata.
-    fn profile(&self) -> impl Future<Output = Profile> + Send;
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the profile cannot be determined — for example
+    /// when neither the provider nor the model registry knows the model's
+    /// context window. Implementations must not substitute a guessed value.
+    fn profile(&self) -> impl Future<Output = Result<Profile, Self::Error>> + Send;
 }
 
 macro_rules! impl_language_model {
@@ -422,7 +428,7 @@ macro_rules! impl_language_model {
                     T::categorize(self, text)
                 }
 
-                fn profile(&self) -> impl Future<Output = Profile> + Send {
+                fn profile(&self) -> impl Future<Output = Result<Profile, Self::Error>> + Send {
                     T::profile(self)
                 }
             }
@@ -469,7 +475,7 @@ impl<T: LanguageModel> LanguageModel for &T {
         T::categorize(self, text)
     }
 
-    fn profile(&self) -> impl Future<Output = Profile> + Send {
+    fn profile(&self) -> impl Future<Output = Result<Profile, Self::Error>> + Send {
         T::profile(self)
     }
 }

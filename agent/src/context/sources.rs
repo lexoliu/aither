@@ -10,6 +10,7 @@
 //! previous file contents, how many turns have passed without a change —
 //! belongs to the source instead of the agent.
 
+#[cfg(feature = "skills")]
 use std::future::Future;
 use std::path::PathBuf;
 

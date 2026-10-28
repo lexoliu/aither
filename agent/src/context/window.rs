@@ -526,8 +526,8 @@ impl Context {
     /// 3. tombstones tool results superseded by a later identical call or an
     ///    identical later result.
     ///
-    /// Reassembly invalidates the cacheable prefix, so it runs when the cache
-    /// is already cold (after an idle gap) or right before compaction.
+    /// Reassembly invalidates the cacheable prefix, so it runs as part of
+    /// applying a compaction, which rewrites the prefix anyway.
     pub fn reassemble(&mut self) -> ReassemblyReport {
         let mut report = ReassemblyReport::default();
 

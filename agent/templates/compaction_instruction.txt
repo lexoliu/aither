@@ -9,18 +9,27 @@ No additional focus hint was provided.
 Output a single JSON object with EXACTLY these top-level keys:
 - `current_task`: string
 - `key_decisions`: string[]
-- `files_paths`: string[]
+- `context_files`: {`path`: string, `lines`: {`start`: number, `end`: number} | null, `why`: string}[]
 - `errors_fixes`: string[]
 - `pending_work`: string[]
 - `recovery_hints`: string[]
+- `skills`: string[]
 
 Populate them as follows:
-- `current_task`: what the user asked for and the current state of progress
-- `key_decisions`: important decisions made, constraints discovered, patterns established
-- `files_paths`: every file path you have read, written, or plan to modify
+- `current_task`: what the user asked for, verbatim, and the current state of progress
+- `key_decisions`: important decisions made and the reasons for them, constraints discovered, patterns established
+- `context_files`: the file ranges the next turns need in view — `path` plus an optional 1-based inclusive `lines` range — with `why` each is needed; leave `lines` null for a whole file
 - `errors_fixes`: errors encountered and how they were resolved or remain pending
 - `pending_work`: remaining work in order, including the immediate next action
 - `recovery_hints`: session history and context snapshot recovery hints, plus any other important state locations
+- `skills`: names of session skills whose instructions the next turns need, chosen from this catalog — never invent a name:
+{% if skills.is_empty() %}
+  (no skills are registered for this session; leave the list empty)
+{% else %}
+{% for skill in skills %}
+  - `{{ skill.name }}`: {{ skill.description }}
+{% endfor %}
+{% endif %}
 
 Rules:
 - Be concise but complete -- every detail you omit is permanently lost.

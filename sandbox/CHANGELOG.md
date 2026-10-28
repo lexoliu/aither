@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/lexoliu/aither/compare/sandbox-v0.10.0...sandbox-v0.10.1) - 2026-10-20
+
+### Fixed
+
+- *(acp)* title and classify the tools that actually arrive natively
+
+### Other
+
+- Merge pull request #176 from lexoliu/main
+
+## [0.10.0](https://github.com/lexoliu/aither/compare/sandbox-v0.9.2...sandbox-v0.10.0) - 2026-10-18
+
+### Other
+
+- Upgrade dependencies to latest and trim feature sets ([#166](https://github.com/lexoliu/aither/pull/166))
+- Render container bridge responses like heel ipc does
+- deliver tool argv verbatim and render results for the terminal ([#160](https://github.com/lexoliu/aither/pull/160))
+- Bump zip to 9.0.5 for RUSTSEC-2026-0367/0368/0369
+
+## [0.9.2](https://github.com/lexoliu/aither/compare/sandbox-v0.9.1...sandbox-v0.9.2) - 2026-10-16
+
+### Other
+
+- Encode container IPC responses with field names
+
+## [0.9.1](https://github.com/lexoliu/aither/compare/sandbox-v0.9.0...sandbox-v0.9.1) - 2026-10-16
+
+### Other
+
+- Run a prepared command in the container acceptance test
+- Grant the container heel run execute on the prepared tools directory
+
+## [0.9.0](https://github.com/lexoliu/aither/compare/sandbox-v0.8.0...sandbox-v0.9.0) - 2026-10-15
+
+### Fixed
+
+- *(sandbox)* serve the container IPC bridge on every host
+
+### Other
+
+- Merge pull request #136 from lexoliu/fix/135-container-posix-paths
+- Merge pull request #134 from lexoliu/fix/133-windows-ipc-bridge
+
+## [0.8.0](https://github.com/lexoliu/aither/compare/sandbox-v0.7.0...sandbox-v0.8.0) - 2026-10-15
+
+### Added
+
+- *(agent)* adopt an already prepared tool environment
+
+### Other
+
+- *(sandbox)* run the shell-fixture adoption test on unix only
+- Keep the general TerminalTool methods on a plain Clone state
+- Bind a child terminal's control commands to its own jobs
+
+## [0.7.0](https://github.com/lexoliu/aither/compare/sandbox-v0.6.0...sandbox-v0.7.0) - 2026-10-13
+
+### Added
+
+- baseline tool runtime: `ToolDistribution` and `initialize_tools` prepare verified tools for local, container and SSH execution ([#107](https://github.com/lexoliu/aither/pull/107))
+- `TerminalTool::with_process_priority` — typed `ProcessPriority` (`CpuPriority`/`IoPriority`/`NiceLevel`) threaded through one-shot, persistent, background, and container executions ([#112](https://github.com/lexoliu/aither/pull/112))
+- `ContainerIpcRoute`/`BridgeAddress` — container IPC binds an explicit host-side address instead of a wildcard ([#112](https://github.com/lexoliu/aither/pull/112))
+- `aither-patch`: a sandbox-executed `apply_patch` utility ([#108](https://github.com/lexoliu/aither/pull/108))
+
+### Changed
+
+- [**breaking**] terminal execution requires a prepared tool environment
+- [**breaking**] `ContainerShellRuntime::new` takes a `ContainerIpcRoute` instead of an IPC hostname
+- upgrade the sandbox backend to heel 0.4.1
+- nested-container sandboxes relay IPC through `heel run --ipc-endpoint` instead of environment passthrough
+
+### Fixed
+
+- container IPC uses the runtime's host-side route instead of assuming that containers can reach host loopback
+
 ## [0.6.0](https://github.com/lexoliu/aither/compare/sandbox-v0.5.0...sandbox-v0.6.0) - 2026-10-10
 
 ### Added

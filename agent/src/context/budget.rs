@@ -223,13 +223,26 @@ fn to_usize(value: f64) -> usize {
 }
 
 /// The tokens a provider charged for reading a prompt.
+///
+/// Two usage shapes exist in the wild: providers that report the whole
+/// prompt in `prompt_tokens` with cache hits as an informational subset
+/// (`OpenAI`, Gemini, the Claude adapter's normalized total), and providers
+/// that report only the uncached remainder alongside the cached parts
+/// (Claude's raw API fields). A cached count larger than the reported
+/// prompt can only come from the second shape — a subset can never exceed
+/// its total — so that case sums; otherwise `prompt_tokens` already
+/// includes the cached tokens and summing would double-count them.
 fn prompt_cost(usage: &Usage) -> Option<u32> {
     let prompt = usage.prompt_tokens?;
-    Some(
+    let cached = usage
+        .cache_read_tokens
+        .unwrap_or(0)
+        .saturating_add(usage.cache_write_tokens.unwrap_or(0));
+    Some(if cached > prompt {
+        prompt.saturating_add(cached)
+    } else {
         prompt
-            .saturating_add(usage.cache_read_tokens.unwrap_or(0))
-            .saturating_add(usage.cache_write_tokens.unwrap_or(0)),
-    )
+    })
 }
 
 #[cfg(test)]
@@ -268,6 +281,17 @@ mod tests {
         budget.observe_assembled(8_000);
         // A cached request reports 100 fresh tokens over 3_900 cached ones.
         budget.calibrate(&usage(100, 3_900));
+        assert_eq!(budget.estimated_tokens(), 4_000);
+    }
+
+    #[test]
+    fn cached_subsets_are_not_double_counted() {
+        // OpenAI and Gemini report the whole prompt in `prompt_tokens` with
+        // the cached share as an informational subset; summing the two
+        // double-counts the cache reads.
+        let mut budget = ContextBudget::new(10_000);
+        budget.observe_assembled(8_000);
+        budget.calibrate(&usage(4_000, 3_900));
         assert_eq!(budget.estimated_tokens(), 4_000);
     }
 

@@ -52,7 +52,7 @@ pub enum AgentEvent {
         id: String,
         /// Tool name (may be empty in very early deltas for some providers).
         name: String,
-        /// Partial JSON arguments accumulated so far.
+        /// Incremental JSON arguments fragment for this delta.
         arguments_fragment: String,
     },
 

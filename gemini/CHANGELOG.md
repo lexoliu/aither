@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/lexoliu/aither/compare/gemini-v0.9.2...gemini-v0.10.0) - 2026-10-18
+
+### Other
+
+- Upgrade dependencies to latest and trim feature sets ([#166](https://github.com/lexoliu/aither/pull/166))
+
+## [0.8.0](https://github.com/lexoliu/aither/compare/gemini-v0.7.0...gemini-v0.8.0) - 2026-10-15
+
+### Other
+
+- release v0.7.0
+
+## [0.7.0](https://github.com/lexoliu/aither/compare/gemini-v0.6.0...gemini-v0.7.0) - 2026-10-13
+
+### Other
+
+- Fix clippy warnings on stable
+
 ## [0.6.0](https://github.com/lexoliu/aither/compare/gemini-v0.5.0...gemini-v0.6.0) - 2026-10-10
 
 ### Added

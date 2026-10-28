@@ -10,8 +10,8 @@ use crate::{
         responses_tool_choice, to_chat_messages, to_responses_input,
     },
     response::{
-        ChatCompletionChunk, ChatCompletionUsage, ResponsesOutputItem, ResponsesStreamEvent,
-        ResponsesUsage, should_skip_event,
+        ChatCompletionChunk, ChatCompletionUsage, DeltaToolCall, ResponsesOutputItem,
+        ResponsesStreamEvent, ResponsesUsage, should_skip_event,
     },
 };
 use aither_core::{
@@ -498,7 +498,7 @@ impl LanguageModel for OpenAI {
         ))
     }
 
-    fn profile(&self) -> impl Future<Output = ModelProfile> + Send {
+    fn profile(&self) -> impl Future<Output = Result<ModelProfile, Self::Error>> + Send {
         let cfg = self.inner.clone();
         async move {
             // Try to fetch context window from API, fallback to models database
@@ -508,18 +508,14 @@ impl LanguageModel for OpenAI {
                     tracing::debug!("API did not return context_length: {e}");
                     aither_models::lookup(&cfg.chat_model)
                         .and_then(aither_models::ModelEntry::max_input_tokens)
-                        .unwrap_or_else(|| {
-                            // Custom/self-hosted models are legitimately absent
-                            // from both the provider API and the registry, so
-                            // assume a conservative context window rather than
-                            // failing the whole conversation.
-                            tracing::warn!(
-                                model = %cfg.chat_model,
-                                assumed_context_length = UNKNOWN_MODEL_CONTEXT_LENGTH,
-                                "model missing context metadata from provider and aither-models"
-                            );
-                            UNKNOWN_MODEL_CONTEXT_LENGTH
-                        })
+                        .ok_or_else(|| {
+                            OpenAIError::Api(format!(
+                                "cannot determine context length for model '{model}': \
+                                 {models_url} request failed ({e}) and aither-models has no entry",
+                                model = cfg.chat_model,
+                                models_url = cfg.request_url("/models"),
+                            ))
+                        })?
                 }
             };
 
@@ -536,22 +532,16 @@ impl LanguageModel for OpenAI {
                     profile.abilities.push(*ability);
                 }
             }
-            profile
+            Ok(profile)
         }
     }
 }
 
 /// Fetch context window size from the models API.
-/// Context window assumed for models with no metadata from either the
-/// provider API or the aither-models registry (custom/self-hosted models).
-/// Conservative enough to be safe for compaction budgeting on any modern
-/// OpenAI-compatible backend.
-const UNKNOWN_MODEL_CONTEXT_LENGTH: u32 = 32_768;
-
 async fn fetch_model_context_length(cfg: &Config) -> Result<u32, OpenAIError> {
     use crate::response::ModelsListResponse;
 
-    let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+    let url = cfg.request_url("/models");
     let mut backend = client();
     let mut builder = backend
         .get(&url)
@@ -619,6 +609,40 @@ struct ToolCallAccumulator {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    /// Bytes of `arguments` already emitted as `ToolCallDelta` fragments.
+    emitted: usize,
+    /// Whether the first `ToolCallDelta` announcing id and name went out.
+    announced: bool,
+}
+
+/// Merge one `delta.tool_calls` entry into the accumulator for its index.
+///
+/// Compatible servers are expected to omit `id`/`name` on continuation
+/// deltas; some instead send them again as empty strings. Empty values are
+/// not authoritative — they must not overwrite the id or name captured
+/// from the first delta.
+fn accumulate_tool_call_delta<'a>(
+    tool_calls: &'a mut HashMap<usize, ToolCallAccumulator>,
+    call: &DeltaToolCall,
+) -> &'a mut ToolCallAccumulator {
+    let index = call.index.unwrap_or(0);
+    let acc = tool_calls.entry(index).or_default();
+    if let Some(id) = &call.id
+        && !id.is_empty()
+    {
+        acc.id = Some(id.clone());
+    }
+    if let Some(function) = &call.function {
+        if let Some(name) = &function.name
+            && !name.is_empty()
+        {
+            acc.name = Some(name.clone());
+        }
+        if let Some(args) = &function.arguments {
+            acc.arguments.push_str(args);
+        }
+    }
+    acc
 }
 
 /// Make a chat completions SSE request (single attempt).
@@ -738,26 +762,24 @@ fn chat_completions_stream_inner(
                                 // Accumulate tool calls and emit deltas
                                 if let Some(calls) = &choice.delta.tool_calls {
                                     for call in calls {
-                                        let index = call.index.unwrap_or(0);
-                                        let acc = tool_calls.entry(index).or_default();
-                                        if let Some(id) = &call.id {
-                                            acc.id = Some(id.clone());
-                                        }
-                                        if let Some(function) = &call.function {
-                                            if let Some(name) = &function.name {
-                                                acc.name = Some(name.clone());
-                                            }
-                                            if let Some(args) = &function.arguments {
-                                                acc.arguments.push_str(args);
-                                            }
-                                        }
-                                        // Emit delta for UI progress
+                                        let acc = accumulate_tool_call_delta(&mut tool_calls, call);
+                                        // Emit incremental fragments for UI
+                                        // progress; the first emission may
+                                        // precede any argument bytes, so the
+                                        // tool name surfaces as soon as both
+                                        // id and name are known.
                                         if let (Some(id), Some(name)) = (&acc.id, &acc.name) {
-                                            yield Ok(Event::ToolCallDelta {
-                                                id: id.clone(),
-                                                name: name.clone(),
-                                                arguments_fragment: acc.arguments.clone(),
-                                            });
+                                            let fragment =
+                                                acc.arguments[acc.emitted..].to_string();
+                                            if !fragment.is_empty() || !acc.announced {
+                                                acc.emitted = acc.arguments.len();
+                                                acc.announced = true;
+                                                yield Ok(Event::ToolCallDelta {
+                                                    id: id.clone(),
+                                                    name: name.clone(),
+                                                    arguments_fragment: fragment,
+                                                });
+                                            }
                                         }
                                     }
                                 }
@@ -1178,12 +1200,12 @@ fn responses_stream_inner(
                                 ResponsesStreamEvent::FunctionCallArgumentsDelta { delta, output_index, .. } => {
                                     let acc = function_calls.entry(output_index).or_default();
                                     acc.arguments.push_str(&delta);
-                                    // Emit delta for UI progress
+                                    // Emit the wire delta verbatim for UI progress
                                     if let (Some(call_id), Some(name)) = (&acc.call_id, &acc.name) {
                                         yield Ok(Event::ToolCallDelta {
                                             id: call_id.clone(),
                                             name: name.clone(),
-                                            arguments_fragment: acc.arguments.clone(),
+                                            arguments_fragment: delta,
                                         });
                                     }
                                 }
@@ -1286,9 +1308,57 @@ mod tests {
     use super::*;
     use crate::response::{
         ChatCompletionTokensDetails, ChatCompletionUsage, ChatPromptTokensDetails,
-        ResponsesInputTokenDetails, ResponsesOutputTokenDetails, ResponsesUsage,
+        DeltaToolFunction, ResponsesInputTokenDetails, ResponsesOutputTokenDetails, ResponsesUsage,
     };
     use std::time::Duration;
+
+    fn chat_delta(id: Option<&str>, name: Option<&str>, arguments: &str) -> DeltaToolCall {
+        DeltaToolCall {
+            index: Some(0),
+            id: id.map(str::to_string),
+            function: Some(DeltaToolFunction {
+                name: name.map(str::to_string),
+                arguments: Some(arguments.to_string()),
+            }),
+        }
+    }
+
+    #[test]
+    fn chat_tool_call_accumulates_name_and_arguments() {
+        let mut tool_calls = HashMap::new();
+        accumulate_tool_call_delta(
+            &mut tool_calls,
+            &chat_delta(Some("call_1"), Some("search"), ""),
+        );
+        accumulate_tool_call_delta(&mut tool_calls, &chat_delta(None, None, "{\"q\":"));
+        accumulate_tool_call_delta(&mut tool_calls, &chat_delta(None, None, "\"rust\"}"));
+
+        let acc = &tool_calls[&0];
+        assert_eq!(acc.id.as_deref(), Some("call_1"));
+        assert_eq!(acc.name.as_deref(), Some("search"));
+        assert_eq!(acc.arguments, "{\"q\":\"rust\"}");
+    }
+
+    #[test]
+    fn chat_tool_call_empty_delta_fields_do_not_overwrite() {
+        let mut tool_calls = HashMap::new();
+        accumulate_tool_call_delta(
+            &mut tool_calls,
+            &chat_delta(Some("call_1"), Some("search"), ""),
+        );
+        // Some compatible servers repeat `id`/`name` as empty strings on
+        // every continuation delta instead of omitting them.
+        accumulate_tool_call_delta(&mut tool_calls, &chat_delta(Some(""), Some(""), "{\"q\":"));
+        accumulate_tool_call_delta(
+            &mut tool_calls,
+            &chat_delta(Some(""), Some(""), "\"rust\"}"),
+        );
+
+        let acc = &tool_calls[&0];
+        assert_eq!(acc.id.as_deref(), Some("call_1"));
+        assert_eq!(acc.name.as_deref(), Some("search"));
+        assert_eq!(acc.arguments, "{\"q\":\"rust\"}");
+    }
 
     #[test]
     fn done_function_call_is_not_emitted_twice() {
@@ -1431,6 +1501,66 @@ mod tests {
         assert!(
             error.to_string().contains("blank call_id"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// Serves a single fixed HTTP response on a loopback address.
+    fn serve_once(body: &'static str) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub server");
+        let addr = listener.local_addr().expect("stub server address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Read until the request headers are complete; the stub has no body to consume.
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let Ok(n) = stream.read(&mut chunk) else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn profile_errors_when_context_length_is_unknown() {
+        // aither#181: a /models listing without context_length, for a model
+        // the aither-models registry does not know, must surface an error
+        // instead of silently assuming a context window.
+        let base_url = serve_once(
+            r#"{"object":"list","data":[{"id":"unregistered-stub-model","object":"model","created":1,"owned_by":"stub"}]}"#,
+        );
+        let model = OpenAI::builder("test-key")
+            .base_url(base_url)
+            .model("unregistered-stub-model")
+            .build();
+
+        let err = model
+            .profile()
+            .await
+            .expect_err("profile must fail when the context window is unknown");
+        let message = err.to_string();
+        assert!(
+            message.contains("unregistered-stub-model"),
+            "error must name the model: {message}"
+        );
+        assert!(
+            message.contains("/models"),
+            "error must name the endpoint that was asked: {message}"
         );
     }
 

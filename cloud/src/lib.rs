@@ -246,13 +246,13 @@ impl LanguageModel for CloudProvider {
         }
     }
 
-    async fn profile(&self) -> Profile {
+    async fn profile(&self) -> Result<Profile, Self::Error> {
         match self {
-            Self::OpenAI(inner) => inner.profile().await,
-            Self::Claude(inner) => inner.profile().await,
-            Self::Gemini(inner) => inner.profile().await,
-            Self::Copilot(inner) => inner.profile().await,
-            Self::Codex(inner) => inner.profile().await,
+            Self::OpenAI(inner) => inner.profile().await.map_err(CloudError::from),
+            Self::Claude(inner) => inner.profile().await.map_err(CloudError::from),
+            Self::Gemini(inner) => inner.profile().await.map_err(CloudError::from),
+            Self::Copilot(inner) => inner.profile().await.map_err(CloudError::from),
+            Self::Codex(inner) => inner.profile().await.map_err(CloudError::from),
         }
     }
 }

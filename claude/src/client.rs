@@ -267,7 +267,9 @@ impl LanguageModel for Claude {
         ))
     }
 
-    fn profile(&self) -> impl core::future::Future<Output = ModelProfile> + Send {
+    fn profile(
+        &self,
+    ) -> impl core::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
         let cfg = self.inner.clone();
         async move {
             // Try to fetch context window from proxy API (e.g., OpenRouter)
@@ -279,12 +281,14 @@ impl LanguageModel for Claude {
                     // Fallback to models database
                     aither_models::lookup(&cfg.model)
                         .and_then(aither_models::ModelEntry::max_input_tokens)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "Claude model '{}' missing context metadata from provider and aither-models",
-                                cfg.model
-                            )
-                        })
+                        .ok_or_else(|| {
+                            ClaudeError::Api(format!(
+                                "cannot determine context length for model '{model}': \
+                                 {models_url} request failed ({e}) and aither-models has no entry",
+                                model = cfg.model,
+                                models_url = cfg.request_url("/models"),
+                            ))
+                        })?
                 }
             };
 
@@ -302,7 +306,7 @@ impl LanguageModel for Claude {
                     profile.abilities.push(*ability);
                 }
             }
-            profile
+            Ok(profile)
         }
     }
 }

@@ -492,7 +492,7 @@ impl StreamState {
                 vec![LLMEvent::ToolCallDelta {
                     id: id.clone(),
                     name: name.clone(),
-                    arguments_fragment: input_json.clone(),
+                    arguments_fragment: partial_json,
                 }]
             }
             _ => Vec::new(),

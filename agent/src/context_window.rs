@@ -11,8 +11,8 @@ pub enum ContextWindowPhase {
     Stable,
     /// The window should be rebuilt before the next request.
     ///
-    /// Either the prompt cache has gone cold after an idle gap, or a system
-    /// block rewrite is waiting for a moment where it costs nothing.
+    /// A staged system-block rewrite is waiting for the next compaction to
+    /// fold it into the cacheable prefix.
     ReassemblyDue,
     /// A compaction is in flight alongside the run.
     Compacting,

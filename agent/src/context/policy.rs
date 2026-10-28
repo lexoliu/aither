@@ -7,9 +7,7 @@
 //! second knob, no per-level strategy and no preservation config: a single
 //! policy keeps the behaviour predictable and the prompt cache analysable.
 
-use std::time::Duration;
-
-/// Thresholds that govern context compaction, pausing and reassembly.
+/// Thresholds that govern context compaction and pausing.
 ///
 /// Fractions are of the calibrated context window
 /// ([`ContextBudget`](super::ContextBudget)), not of the raw model context
@@ -39,14 +37,6 @@ pub struct ContextPolicy {
     /// provider would reject for length.
     pub pause_at: f32,
 
-    /// Idle gap after which the next request reassembles the window.
-    ///
-    /// Once the provider's prompt cache has expired, the cached prefix is
-    /// worthless, so the cheapest moment to rewrite the window — folding in
-    /// staged system blocks and dropping superseded tool output — is the
-    /// first request after the gap.
-    pub idle_reassemble_after: Duration,
-
     /// Fraction of the window a restored-context block may occupy.
     ///
     /// After compaction the agent re-reads the files and documents the
@@ -60,7 +50,6 @@ impl Default for ContextPolicy {
         Self {
             compact_at: 0.6,
             pause_at: 0.9,
-            idle_reassemble_after: Duration::from_secs(300),
             restore_budget: 0.15,
         }
     }
@@ -77,12 +66,6 @@ impl ContextPolicy {
     #[must_use]
     pub fn should_pause(&self, usage: f32) -> bool {
         usage >= self.pause_at
-    }
-
-    /// Whether `idle` is long enough to justify a reassembly.
-    #[must_use]
-    pub fn should_reassemble(&self, idle: Duration) -> bool {
-        idle >= self.idle_reassemble_after
     }
 }
 
@@ -105,7 +88,5 @@ mod tests {
         assert!(!policy.should_compact(0.59));
         assert!(policy.should_pause(0.9));
         assert!(!policy.should_pause(0.89));
-        assert!(policy.should_reassemble(Duration::from_secs(300)));
-        assert!(!policy.should_reassemble(Duration::from_secs(299)));
     }
 }

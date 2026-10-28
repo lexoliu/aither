@@ -15,12 +15,38 @@
 //! folded into the cache key, so a rewritten window asks for a new shard
 //! instead of repeatedly missing on the old one.
 
+use std::time::Duration;
+
 use aither_core::llm::Message;
 use aither_core::llm::model::Parameters;
 use aither_core::llm::model::{
     CacheOptions, ClaudeCacheBreakpointTarget, ClaudeExplicitCacheBreakpoint,
     ClaudeExplicitCacheBreakpoints, ClaudePromptCache, ClaudePromptCacheTtl,
 };
+
+/// How long the conversation's prompt cache stays warm.
+///
+/// This is what an idle gap is measured against: reassembly rewrites the
+/// cacheable prefix, so it is only free once the provider's copy can no
+/// longer be read anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheLifetime {
+    /// The cache expires after this long without a hit.
+    Limited(Duration),
+    /// The cache never expires; rewriting the prefix is never free.
+    Permanent,
+}
+
+impl CacheLifetime {
+    /// Whether `idle` is long enough that the cached prefix is gone.
+    #[must_use]
+    pub fn is_cold(&self, idle: Duration) -> bool {
+        match self {
+            Self::Limited(lifetime) => idle >= *lifetime,
+            Self::Permanent => false,
+        }
+    }
+}
 
 /// Derives per-request cache controls for one agent session.
 #[derive(Debug, Clone)]
@@ -33,6 +59,8 @@ pub struct PromptCache {
     fingerprint: Option<u64>,
     /// How long Claude should retain the cached prefix.
     ttl: ClaudePromptCacheTtl,
+    /// How long the conversation's cache stays warm, across providers.
+    lifetime: CacheLifetime,
 }
 
 impl PromptCache {
@@ -48,14 +76,40 @@ impl PromptCache {
             epoch: 0,
             fingerprint: None,
             ttl: ClaudePromptCacheTtl::OneHour,
+            lifetime: CacheLifetime::Limited(Duration::from_secs(3600)),
         }
     }
 
     /// Overrides the Claude cache retention.
+    ///
+    /// The cache lifetime follows the retention, since Claude's advertised
+    /// TTL is exactly how long the provider promises to keep the prefix.
     #[must_use]
     pub const fn with_ttl(mut self, ttl: ClaudePromptCacheTtl) -> Self {
         self.ttl = ttl;
+        self.lifetime = CacheLifetime::Limited(match ttl {
+            ClaudePromptCacheTtl::FiveMinutes => Duration::from_secs(300),
+            ClaudePromptCacheTtl::OneHour => Duration::from_secs(3600),
+        });
         self
+    }
+
+    /// Overrides how long the conversation's cache is trusted to stay warm.
+    ///
+    /// A host whose provider retains prompts longer than the breakpoints ask
+    /// for (or forever) widens the idle-reassembly gap here; a lifetime of
+    /// [`CacheLifetime::Permanent`] means an idle gap never justifies a
+    /// reassembly.
+    #[must_use]
+    pub const fn with_lifetime(mut self, lifetime: CacheLifetime) -> Self {
+        self.lifetime = lifetime;
+        self
+    }
+
+    /// How long the conversation's cache stays warm.
+    #[must_use]
+    pub const fn lifetime(&self) -> CacheLifetime {
+        self.lifetime
     }
 
     /// The current cache key, which changes only when the prefix is rewritten.
@@ -243,6 +297,27 @@ mod tests {
                 block_index: 0,
             }),
             "breakpoint must land on the last stable message, not the tail"
+        );
+    }
+
+    #[test]
+    fn the_idle_gap_follows_the_cache_lifetime() {
+        let lifetime = CacheLifetime::Limited(Duration::from_secs(3600));
+        assert!(!lifetime.is_cold(Duration::from_secs(300)));
+        assert!(!lifetime.is_cold(Duration::from_secs(3540)));
+        assert!(lifetime.is_cold(Duration::from_secs(3660)));
+
+        // A permanent cache is never cold: rewriting the prefix always
+        // invalidates something, so an idle gap never justifies it.
+        assert!(!CacheLifetime::Permanent.is_cold(Duration::from_secs(86_400)));
+    }
+
+    #[test]
+    fn with_ttl_keeps_the_lifetime_coherent() {
+        let cache = PromptCache::new("s").with_ttl(ClaudePromptCacheTtl::FiveMinutes);
+        assert_eq!(
+            cache.lifetime(),
+            CacheLifetime::Limited(Duration::from_secs(300))
         );
     }
 

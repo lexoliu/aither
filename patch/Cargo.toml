@@ -1,0 +1,27 @@
+[package]
+name = "aither-patch"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "apply_patch: sandbox-executed compact contextual patch utility"
+publish = false
+readme = "../README.md"
+keywords = ["patch", "diff", "sandbox", "agent", "tooling"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+zenpatch = "0.5.2"
+thiserror = "2"
+
+[[bin]]
+name = "apply_patch"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

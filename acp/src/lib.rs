@@ -105,8 +105,8 @@
 //!         stream::once(Ok(Event::Text("Hello from ACP".to_string())))
 //!     }
 //!
-//!     fn profile(&self) -> impl Future<Output = Profile> + Send {
-//!         std::future::ready(Profile::new("echo", "test", "echo", "Echo model", 128_000))
+//!     fn profile(&self) -> impl Future<Output = Result<Profile, EchoError>> + Send {
+//!         std::future::ready(Ok(Profile::new("echo", "test", "echo", "Echo model", 128_000)))
 //!     }
 //! }
 //!
@@ -134,7 +134,7 @@ mod server;
 mod session;
 pub mod vendor;
 
-pub use adapter::agent_event_to_session_update;
+pub use adapter::SessionUpdateMapper;
 pub use client::{AcpClient, ClientError, ClientHandler, ResponseFuture};
 pub use protocol::*;
 pub use server::AcpServer;

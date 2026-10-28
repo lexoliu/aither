@@ -95,7 +95,7 @@ pub use hook::{
 };
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
 pub use stream::AgentStream;
-pub use terminal_agent::TerminalAgentBuilder;
+pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};
 pub use tools::AgentTools;
 
 // Model groups for budget tracking and fallback

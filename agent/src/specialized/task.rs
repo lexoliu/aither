@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use aither_core::llm::ToolContext;
 use aither_core::{
@@ -127,6 +129,145 @@ struct SubagentResult {
     result: String,
 }
 
+impl SubagentResult {
+    fn cancelled(subagent: String) -> Self {
+        Self {
+            subagent,
+            status: "cancelled",
+            result: "Cancelled by user".to_string(),
+        }
+    }
+}
+
+/// Snapshot of one in-flight subagent run.
+#[derive(Debug, Clone)]
+pub struct SubagentRunInfo {
+    /// Unique run id within the owning [`SubagentRuns`] registry.
+    pub id: u64,
+    /// Subagent type name (or file-derived id) that was launched.
+    pub subagent: String,
+    /// Task prompt the run was started with.
+    pub prompt: String,
+    /// When the run started.
+    pub started: Instant,
+}
+
+/// Live run record: public info plus the sender that cancels it.
+type RunSlot = (SubagentRunInfo, async_channel::Sender<()>);
+
+/// Shared registry of in-flight [`SubagentTool`] runs.
+///
+/// The tool records every `call` while it is executing; a cloned handle
+/// lets a host enumerate and cancel individual runs without aborting the
+/// parent agent's turn. Cancellation drops the child query future and the
+/// tool returns a `cancelled` result to the parent.
+#[derive(Clone, Debug, Default)]
+pub struct SubagentRuns {
+    runs: Arc<Mutex<HashMap<u64, RunSlot>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl SubagentRuns {
+    /// Snapshot of every in-flight run, ordered by run id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal registry lock is poisoned.
+    #[must_use]
+    pub fn list(&self) -> Vec<SubagentRunInfo> {
+        let mut infos: Vec<_> = self
+            .runs
+            .lock()
+            .expect("subagent runs lock poisoned")
+            .values()
+            .map(|(info, _)| info.clone())
+            .collect();
+        infos.sort_by_key(|info| info.id);
+        infos
+    }
+
+    /// Cancel one in-flight run.
+    ///
+    /// Returns `false` only when `id` is unknown — a run that was already
+    /// signalled but has not unwound yet still reports `true`. A cancelled
+    /// run keeps appearing in [`list`](Self::list) until the tool
+    /// observes the signal and unwinds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal registry lock is poisoned.
+    #[must_use]
+    pub fn cancel(&self, id: u64) -> bool {
+        self.runs
+            .lock()
+            .expect("subagent runs lock poisoned")
+            .get(&id)
+            .is_some_and(|(_, cancel)| cancel.try_send(()).is_ok() || cancel.is_full())
+    }
+
+    /// Cancel every in-flight run; returns how many were signalled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal registry lock is poisoned.
+    #[must_use]
+    pub fn cancel_all(&self) -> usize {
+        self.runs
+            .lock()
+            .expect("subagent runs lock poisoned")
+            .values()
+            .filter(|(_, cancel)| cancel.try_send(()).is_ok() || cancel.is_full())
+            .count()
+    }
+
+    /// Register a run; the receiver resolves once when it is cancelled.
+    fn begin(&self, subagent: &str, prompt: &str) -> (u64, async_channel::Receiver<()>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (cancel_tx, cancel_rx) = async_channel::bounded(1);
+        let info = SubagentRunInfo {
+            id,
+            subagent: subagent.to_string(),
+            prompt: prompt.to_string(),
+            started: Instant::now(),
+        };
+        self.runs
+            .lock()
+            .expect("subagent runs lock poisoned")
+            .insert(id, (info, cancel_tx));
+        (id, cancel_rx)
+    }
+
+    /// Remove a run record when its tool call finishes.
+    fn finish(&self, id: u64) {
+        self.runs
+            .lock()
+            .expect("subagent runs lock poisoned")
+            .remove(&id);
+    }
+}
+
+enum SubagentOutcome<E> {
+    Finished(Result<String, E>),
+    Cancelled,
+}
+
+/// Await the child query or a cancellation signal, whichever lands first.
+/// Dropping the query future aborts the run while the parent turn
+/// continues.
+async fn await_subagent_run<F, E>(
+    query: F,
+    cancel_rx: async_channel::Receiver<()>,
+) -> SubagentOutcome<E>
+where
+    F: std::future::Future<Output = Result<String, E>>,
+{
+    futures_lite::future::or(async { SubagentOutcome::Finished(query.await) }, async {
+        let _ = cancel_rx.recv().await;
+        SubagentOutcome::Cancelled
+    })
+    .await
+}
+
 /// A tool that spawns specialized subagents to handle complex tasks.
 ///
 /// Allows the main agent to delegate work to specialized subagents
@@ -163,6 +304,9 @@ pub struct SubagentTool<LLM> {
     mounts: Vec<SubagentFileMount>,
     /// Factory for creating child terminal tools for subagents.
     terminal_tool_factory: Option<TerminalToolFactory>,
+    /// Registry the tool reports in-flight runs to; clone it before
+    /// handing the tool to a builder to observe or cancel runs.
+    runs: SubagentRuns,
 }
 
 impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
@@ -184,6 +328,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             base_dir: None,
             mounts: Vec::new(),
             terminal_tool_factory: None,
+            runs: SubagentRuns::default(),
         }
     }
 
@@ -214,6 +359,22 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
     pub fn with_terminal_tool_factory(mut self, factory: TerminalToolFactory) -> Self {
         self.terminal_tool_factory = Some(factory);
         self
+    }
+
+    /// Attaches the shared run registry this tool reports to.
+    ///
+    /// Clone the [`SubagentRuns`] before building the agent — it is the
+    /// only handle able to list or cancel in-flight subagent runs.
+    #[must_use]
+    pub fn with_runs(mut self, runs: SubagentRuns) -> Self {
+        self.runs = runs;
+        self
+    }
+
+    /// The run registry this tool reports to.
+    #[must_use]
+    pub fn runs(&self) -> SubagentRuns {
+        self.runs.clone()
     }
 
     /// Register a subagent type.
@@ -519,21 +680,26 @@ where
 
         let mut agent = agent_builder.build();
 
-        // Run the subagent with the prompt
-        let query_result = agent.query(&args.prompt).await;
+        let (run_id, cancel_rx) = self.runs.begin(&subagent_id, &args.prompt);
+        let outcome = await_subagent_run(agent.query(&args.prompt), cancel_rx).await;
+        self.runs.finish(run_id);
         if let Some(job_registry) = child_job_registry {
             let killed = job_registry.kill_running().await;
             if killed > 0 {
                 tracing::info!(
                     subagent = %subagent_id,
                     killed,
-                    "Stopped background terminal jobs left by completed subagent"
+                    "Stopped background terminal jobs left by subagent"
                 );
             }
         }
-        let result = match query_result {
-            Ok(result) => result,
-            Err(error) => {
+        let result = match outcome {
+            SubagentOutcome::Cancelled => {
+                tracing::info!(subagent = %subagent_id, "Subagent cancelled");
+                return ToolResult::json(&SubagentResult::cancelled(subagent_id));
+            }
+            SubagentOutcome::Finished(Ok(result)) => result,
+            SubagentOutcome::Finished(Err(error)) => {
                 let history = agent.history();
                 let recent = history
                     .into_iter()
@@ -564,6 +730,9 @@ where
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    use aither_core::llm::{Event, LLMRequest, model::Profile as ModelProfile};
+    use futures_core::Stream;
 
     use super::*;
 
@@ -685,6 +854,97 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[derive(Debug)]
+    struct NeverError;
+
+    impl std::fmt::Display for NeverError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("never resolves")
+        }
+    }
+
+    impl std::error::Error for NeverError {}
+
+    /// A model whose `respond` stream never yields, so the child query
+    /// stays in flight until the run is cancelled.
+    #[derive(Clone)]
+    struct PendingLlm;
+
+    impl LanguageModel for PendingLlm {
+        type Error = NeverError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            futures_lite::stream::pending()
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "test",
+                "pending-model",
+                "pending model",
+                128_000,
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_returns_cancelled_result() {
+        let runs = SubagentRuns::default();
+        let tool = SubagentTool::new(PendingLlm)
+            .with_runs(runs.clone())
+            .with_type(
+                "explore",
+                SubagentType::new("explorer", |llm| {
+                    crate::AgentBuilder::new(llm)
+                        .agent_kind(crate::AgentKind::Chatbot)
+                        .max_iterations(5)
+                }),
+            );
+
+        let call = tokio::spawn(async move {
+            Tool::call(
+                &tool,
+                SubagentArgs {
+                    subagent: "explore".to_string(),
+                    prompt: "survey the codebase".to_string(),
+                },
+                ToolContext::new(),
+            )
+            .await
+        });
+
+        // Wait for the run to register before cancelling it.
+        let run = loop {
+            match runs.list().as_slice() {
+                [run] => break run.clone(),
+                [] => tokio::task::yield_now().await,
+                other => panic!("expected one registered run, got {}", other.len()),
+            }
+        };
+        assert_eq!(run.subagent, "explore");
+        assert_eq!(run.prompt, "survey the codebase");
+        assert!(runs.cancel(run.id));
+        assert!(runs.cancel(run.id), "re-cancel should still report true");
+
+        let result = call
+            .await
+            .expect("call task panicked")
+            .expect("subagent call failed");
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result, got {result:?}");
+        };
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["subagent"], "explore");
+        assert!(runs.list().is_empty(), "finished run must unregister");
+        assert!(!runs.cancel(run.id), "finished run cannot be cancelled");
     }
 
     #[tokio::test]
