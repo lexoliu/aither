@@ -227,6 +227,106 @@ pub struct ToolCall {
     pub input: Value,
 }
 
+/// Non-streaming `/v1/messages` response body.
+///
+/// The wire shape mirrors the terminal state an SSE stream ends in: the same
+/// content blocks arrive complete rather than as start/delta/stop triples.
+#[derive(Debug, Deserialize)]
+pub struct MessagesResponse {
+    /// Content blocks produced by the model.
+    pub content: Vec<ContentBlockType>,
+    /// Reason generation stopped.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    /// Token usage for the call.
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+/// Projects a non-streaming [`MessagesResponse`] into the same event stream a
+/// streaming response would have produced.
+#[must_use]
+pub fn response_events(response: MessagesResponse) -> Vec<LLMEvent> {
+    let mut state = StreamState::new();
+    let mut events = Vec::new();
+    for (index, block) in response.content.into_iter().enumerate() {
+        match block {
+            ContentBlockType::Text { text } => {
+                if !text.is_empty() {
+                    events.push(LLMEvent::Text(text));
+                }
+            }
+            block => {
+                ensure_block_capacity(&mut state, index);
+                let start = match &block {
+                    ContentBlockType::ToolUse { id, name, .. } => Some(LLMEvent::ToolCallDelta {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments_fragment: String::new(),
+                    }),
+                    _ => None,
+                };
+                match block {
+                    ContentBlockType::Thinking {
+                        thinking,
+                        signature,
+                    } => {
+                        if !thinking.is_empty() {
+                            events.push(LLMEvent::Reasoning(thinking.clone()));
+                        }
+                        state.blocks[index] = BlockState::Thinking {
+                            text: thinking,
+                            signature,
+                        };
+                    }
+                    ContentBlockType::RedactedThinking { data } => {
+                        state.blocks[index] = BlockState::RedactedThinking(data);
+                    }
+                    ContentBlockType::ToolUse { id, name, input } => {
+                        let input_json = input.to_string();
+                        if let Some(delta) = start {
+                            events.push(delta);
+                        }
+                        events.push(LLMEvent::ToolCallDelta {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments_fragment: input_json.clone(),
+                        });
+                        state.blocks[index] = BlockState::ToolUse {
+                            id,
+                            name,
+                            input_json,
+                        };
+                    }
+                    ContentBlockType::Text { .. } => unreachable!(),
+                }
+                events.extend(state.finish_block(index));
+            }
+        }
+    }
+    let usage_event = response.usage.and_then(|usage| {
+        state.uncached_input_tokens = Some(usage.input_tokens);
+        state.completion_tokens = Some(usage.output_tokens);
+        state.cache_write_tokens = usage.cache_write_tokens();
+        state.cache_read_tokens = usage.cache_read_input_tokens;
+        state.stop_reason = response.stop_reason;
+        state.refresh_prompt_tokens();
+        state.maybe_usage_event()
+    });
+    for call in state.tool_calls {
+        events.push(LLMEvent::ToolCall(aither_core::llm::ToolCall {
+            id: call.id,
+            name: call.name,
+            arguments: call.input,
+            reasoning_state: None,
+        }));
+    }
+    if let Some(usage_event) = usage_event {
+        events.push(usage_event);
+    }
+    events
+}
+
 /// State for tracking content blocks during streaming.
 #[derive(Debug, Default)]
 pub struct StreamState {

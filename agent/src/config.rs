@@ -40,6 +40,36 @@ impl Default for ContextAssemblerConfig {
     }
 }
 
+/// Prompt-cache keep-alive settings for an agent that waits on its own
+/// background commands.
+///
+/// Enabled on subagent runs by `SubagentTool`: while the run parks waiting
+/// for background terminal jobs, Anthropic's five-minute prompt cache entry
+/// is refreshed by re-sending the last request with `max_tokens: 0`. A
+/// `None` value disables keep-alive entirely (the default for ordinary
+/// agents, including the parent agent itself).
+#[derive(Debug, Clone)]
+pub struct CacheKeepAlive {
+    /// Lifetime of a prompt cache entry, counted from the start of the last
+    /// request — or of the last keep-alive send, which refreshes the entry.
+    pub lifetime: Duration,
+    /// How long before `lifetime` expires the keep-alive is sent.
+    pub send_before_expiry: Duration,
+    /// Number of keep-alives in one run that counts as idling frequently;
+    /// crossing it produces a single parent alert.
+    pub frequent_idle_threshold: usize,
+}
+
+impl Default for CacheKeepAlive {
+    fn default() -> Self {
+        Self {
+            lifetime: Duration::from_secs(300),
+            send_before_expiry: Duration::from_secs(30),
+            frequent_idle_threshold: 3,
+        }
+    }
+}
+
 /// Configuration for agent behavior.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -74,6 +104,10 @@ pub struct AgentConfig {
 
     /// Request-level model parameters applied to each LLM call.
     pub request_parameters: Parameters,
+
+    /// Prompt-cache keep-alive while the run waits on its own background
+    /// commands. `None` disables keep-alive.
+    pub cache_keep_alive: Option<CacheKeepAlive>,
 }
 
 impl Default for AgentConfig {
@@ -88,6 +122,7 @@ impl Default for AgentConfig {
             context_assembler: ContextAssemblerConfig::default(),
             tasks_stale_after_turns: 4,
             request_parameters: Parameters::default(),
+            cache_keep_alive: None,
         }
     }
 }
@@ -152,6 +187,14 @@ impl AgentConfig {
     #[must_use]
     pub fn with_request_parameters(mut self, parameters: Parameters) -> Self {
         self.request_parameters = parameters;
+        self
+    }
+
+    /// Enables prompt-cache keep-alive while the run waits on its own
+    /// background commands.
+    #[must_use]
+    pub const fn with_cache_keep_alive(mut self, keep_alive: CacheKeepAlive) -> Self {
+        self.cache_keep_alive = Some(keep_alive);
         self
     }
 }

@@ -433,6 +433,8 @@ pub struct ParameterSnapshot {
     pub parallel_tool_calls: Option<bool>,
     /// Requested reasoning effort.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Whether the request asks for a streaming response.
+    pub stream: Option<bool>,
     /// Tool choice policy.
     pub tool_choice: ToolChoice,
     /// Claude-specific cache controls.
@@ -452,6 +454,7 @@ impl From<&Parameters> for ParameterSnapshot {
             include_reasoning: params.include_reasoning,
             parallel_tool_calls: params.parallel_tool_calls,
             reasoning_effort: params.reasoning_effort,
+            stream: params.stream,
             tool_choice: params.tool_choice.clone(),
             cache: params.cache.claude,
             native_tools: params.native_tools.claude.clone(),

@@ -111,12 +111,13 @@ pub use stdin_watch::{
     is_waiting_on_stdin,
 };
 pub use terminal::{
-    BackgroundTaskReceiver, CompletedTask, Configured, DEFAULT_BACKGROUND_TIMEOUT_CAP,
-    DEFAULT_FOREGROUND_LIMIT, DEFAULT_LONG_JOB_ALERT_AFTER, LongRunningJob, PermissionEvent,
-    PermissionEventReceiver, PermissionEventStage, TerminalArgs, TerminalBackgroundArgs,
-    TerminalBackgroundTool, TerminalError, TerminalExecutionMode, TerminalResult, TerminalTool,
-    TerminalToolFactory, TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured,
-    open_network_audit_log, terminal_tool_factory_channel,
+    BackgroundTaskReceiver, BackgroundTaskSender, CompletedTask, Configured,
+    DEFAULT_BACKGROUND_TIMEOUT_CAP, DEFAULT_FOREGROUND_LIMIT, DEFAULT_LONG_JOB_ALERT_AFTER,
+    LongRunningJob, PermissionEvent, PermissionEventReceiver, PermissionEventStage, TerminalArgs,
+    TerminalBackgroundArgs, TerminalBackgroundTool, TerminalError, TerminalExecutionMode,
+    TerminalResult, TerminalTool, TerminalToolFactory, TerminalToolFactoryError,
+    TerminalToolFactoryReceiver, Unconfigured, background_task_channel, open_network_audit_log,
+    terminal_tool_factory_channel,
 };
 pub use tool_distribution::{
     ToolArtifact, ToolArtifactFormat, ToolArtifactLocation, ToolDistribution,

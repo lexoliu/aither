@@ -560,6 +560,73 @@ pub struct BackgroundTaskReceiver {
     running_tasks: Arc<AtomicUsize>,
 }
 
+/// Sender half of a [`BackgroundTaskReceiver`] channel.
+///
+/// A `TerminalTool` owns the sender side internally; the exposed pair lets
+/// tests and embedders drive a receiver without a live terminal backend:
+/// `task_started`/`task_finished` move the running counter the receiver's
+/// `has_running` reads, and the `send_*` methods deliver the same payloads
+/// spawned executions produce.
+#[derive(Clone, Debug)]
+pub struct BackgroundTaskSender {
+    completed_tx: Sender<CompletedTask>,
+    alert_tx: Sender<LongRunningJob>,
+    running_tasks: Arc<AtomicUsize>,
+}
+
+impl BackgroundTaskSender {
+    /// Records a task start: `has_running` on the paired receiver turns true.
+    pub fn task_started(&self) {
+        self.running_tasks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records a task end: decrements the running counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics when more tasks are finished than were started — the counter
+    /// can never go negative, so a mismatched pair is a bug in the driver.
+    pub fn task_finished(&self) {
+        let previous = self.running_tasks.fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            previous > 0,
+            "task_finished without a matching task_started"
+        );
+    }
+
+    /// Delivers a completed-task event to the receiver.
+    pub async fn send_completed(&self, task: CompletedTask) {
+        let _ = self.completed_tx.send(task).await;
+    }
+
+    /// Delivers a long-running-job alert to the receiver.
+    pub async fn send_long_running(&self, alert: LongRunningJob) {
+        let _ = self.alert_tx.send(alert).await;
+    }
+}
+
+/// Creates a standalone [`BackgroundTaskSender`]/[`BackgroundTaskReceiver`]
+/// pair disconnected from any `TerminalTool`, mirroring
+/// [`job_registry_channel`](crate::job_registry_channel).
+#[must_use]
+pub fn background_task_channel() -> (BackgroundTaskSender, BackgroundTaskReceiver) {
+    let (completed_tx, rx) = async_channel::unbounded();
+    let (alert_tx, alert_rx) = async_channel::unbounded();
+    let running_tasks = Arc::new(AtomicUsize::new(0));
+    (
+        BackgroundTaskSender {
+            completed_tx,
+            alert_tx,
+            running_tasks: running_tasks.clone(),
+        },
+        BackgroundTaskReceiver {
+            rx,
+            alert_rx,
+            running_tasks,
+        },
+    )
+}
+
 impl BackgroundTaskReceiver {
     /// Takes all completed background tasks without blocking.
     ///

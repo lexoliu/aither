@@ -477,6 +477,32 @@ where
         self
     }
 
+    /// Enables prompt-cache keep-alive while the run waits on its own
+    /// background commands.
+    ///
+    /// `SubagentTool` sets this on child agents; ordinary agents leave it
+    /// off. It is a no-op unless the run's model is an Anthropic one.
+    pub const fn cache_keep_alive(mut self, keep_alive: crate::config::CacheKeepAlive) -> Self {
+        self.config.cache_keep_alive = Some(keep_alive);
+        self
+    }
+
+    /// Connects the agent to an external background-task channel pair.
+    ///
+    /// [`terminal`](Self::terminal) and [`dyn_terminal`](Self::dyn_terminal)
+    /// wire these for sandboxed execution; hosts driving an execution
+    /// environment of their own (or simulating one) attach the pair here so
+    /// the run loop waits on it the same way.
+    pub fn background_channels(
+        mut self,
+        receiver: BackgroundTaskReceiver,
+        job_registry: JobRegistry,
+    ) -> Self {
+        self.background_receiver = Some(receiver);
+        self.job_registry = Some(job_registry);
+        self
+    }
+
     /// Returns the definitions of the tools registered on this builder so far.
     ///
     /// These are the definitions the built agent sends to the model, in the
@@ -508,6 +534,8 @@ where
             last_working_docs: None,
             tasks_staleness: crate::agent::TasksDocStaleness::default(),
             last_request_started_at: None,
+            last_request: None,
+            cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,

@@ -170,6 +170,11 @@ struct SubagentResult {
     result: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<SubagentRunModel>,
+    /// Set when the run crossed the frequent-idle threshold: the parent is
+    /// told the subagent kept needing prompt-cache keep-alives and why it
+    /// was last waiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alert: Option<String>,
 }
 
 impl SubagentResult {
@@ -179,6 +184,7 @@ impl SubagentResult {
             status: "cancelled",
             result: "Cancelled by user".to_string(),
             model: None,
+            alert: None,
         }
     }
 }
@@ -394,6 +400,9 @@ pub struct SubagentTool<LLM> {
     /// Registry the tool reports in-flight runs to; clone it before
     /// handing the tool to a builder to observe or cancel runs.
     runs: SubagentRuns,
+    /// Prompt-cache keep-alive settings applied to every child agent; `None`
+    /// disables keep-alive. The caller sets it only for Anthropic providers.
+    cache_keep_alive: Option<crate::config::CacheKeepAlive>,
 }
 
 impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
@@ -422,6 +431,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             mounts: Vec::new(),
             terminal_tool_factory: None,
             runs: SubagentRuns::default(),
+            cache_keep_alive: None,
         }
     }
 
@@ -476,6 +486,30 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
     #[must_use]
     pub fn with_runs(mut self, runs: SubagentRuns) -> Self {
         self.runs = runs;
+        self
+    }
+
+    /// Enables prompt-cache keep-alive on child agents with these settings.
+    ///
+    /// Call it only when the tool's models are served by Anthropic.
+    #[must_use]
+    pub const fn with_cache_keep_alive(
+        mut self,
+        keep_alive: crate::config::CacheKeepAlive,
+    ) -> Self {
+        self.cache_keep_alive = Some(keep_alive);
+        self
+    }
+
+    /// Sets how many keep-alives in one run count as idling frequently.
+    ///
+    /// Crossing the threshold makes the call's result carry one alert
+    /// naming the subagent and the reason for its most recent idle.
+    #[must_use]
+    pub fn with_frequent_idle_threshold(mut self, threshold: usize) -> Self {
+        self.cache_keep_alive
+            .get_or_insert_with(crate::config::CacheKeepAlive::default)
+            .frequent_idle_threshold = threshold;
         self
     }
 
@@ -926,6 +960,10 @@ where
                 .max_iterations(def.max_iterations),
             Source::Registered(subagent_type) => subagent_type.builder(selected),
         };
+        let agent_builder = match &self.cache_keep_alive {
+            Some(keep_alive) => agent_builder.cache_keep_alive(keep_alive.clone()),
+            None => agent_builder,
+        };
 
         tracing::info!(subagent = %subagent_id, model = %model.name.as_str(), "Starting subagent");
 
@@ -983,11 +1021,24 @@ where
 
         tracing::info!(subagent = %subagent_id, "Subagent completed");
 
+        let keep_alive = agent.cache_keep_alive_state();
+        let alert = keep_alive.alerted.then(|| {
+            let reason = keep_alive
+                .last_reason
+                .clone()
+                .unwrap_or_else(|| "idle without a running background job".to_string());
+            format!(
+                "Subagent '{subagent_id}' needed {} prompt-cache keep-alives during its run — subagents should not idle frequently. Reason for its most recent idle: {reason}.",
+                keep_alive.sent
+            )
+        });
+
         ToolResult::json(&SubagentResult {
             subagent: subagent_id,
             status: "completed",
             result,
             model: Some(model),
+            alert,
         })
     }
 }
@@ -1031,6 +1082,7 @@ mod tests {
                 name: "test-model".to_string(),
                 source: ModelSource::Routed,
             }),
+            alert: None,
         })
         .expect("subagent result should serialize");
         assert_eq!(
@@ -1467,6 +1519,332 @@ You are a file-defined agent.
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A model that records every request and answers with a scripted
+    /// turn sequence, so tests can watch for `max_tokens: 0` keep-alives.
+    #[derive(Clone)]
+    struct KeepAliveMockLlm {
+        author: &'static str,
+        requests: async_channel::Sender<LLMRequest>,
+        turns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LanguageModel for KeepAliveMockLlm {
+        type Error = NeverError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.requests
+                .try_send(request.clone())
+                .expect("record model request");
+            if request.parameters().max_tokens == Some(0) {
+                // A keep-alive re-send: report it as a cache read and end.
+                return futures_lite::stream::iter([Ok(Event::Usage(aither_core::llm::Usage {
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(0),
+                    total_tokens: Some(10),
+                    reasoning_tokens: None,
+                    cache_read_tokens: Some(10),
+                    cache_write_tokens: None,
+                    cost_usd: None,
+                    stop_reason: Some("max_tokens".to_string()),
+                }))]);
+            }
+            let turn = self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let event = match turn {
+                0 => Event::ToolCall(aither_core::llm::ToolCall::new(
+                    "bg-1",
+                    "terminal_background",
+                    serde_json::json!({
+                        "description": "hold the cache window",
+                        "script": "sleep 2",
+                        "timeout": 60
+                    }),
+                )),
+                _ => Event::Text("done".to_string()),
+            };
+            futures_lite::stream::iter([Ok(event)])
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            let author = self.author;
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                author,
+                "mock-model",
+                "mock model",
+                100_000,
+            )))
+        }
+    }
+
+    /// Builds a subagent tool whose child agent waits on a background
+    /// channel driven by the test — no terminal backend needed. Returns the
+    /// tool plus the sender halves and the child's job registry, so the
+    /// test can park the run and register the command it waits on.
+    fn keep_alive_tool(
+        author: &'static str,
+        requests: async_channel::Sender<LLMRequest>,
+        keep_alive: Option<crate::config::CacheKeepAlive>,
+    ) -> (
+        SubagentTool<KeepAliveMockLlm>,
+        aither_sandbox::BackgroundTaskSender,
+        aither_sandbox::JobRegistry,
+        aither_sandbox::JobRegistryService,
+    ) {
+        let (sender, receiver) = aither_sandbox::background_task_channel();
+        let (job_registry, job_service) = aither_sandbox::job_registry_channel();
+        let child_jobs = job_registry.clone();
+        let tool = SubagentTool::new(KeepAliveMockLlm {
+            author,
+            requests,
+            turns: Arc::default(),
+        });
+        let tool = match keep_alive {
+            Some(keep_alive) => tool.with_cache_keep_alive(keep_alive),
+            None => tool,
+        }
+        .with_type(
+            "worker",
+            SubagentType::new("worker for keep-alive tests", move |llm| {
+                crate::AgentBuilder::new(llm)
+                    .agent_kind(crate::AgentKind::Chatbot)
+                    .max_iterations(4)
+                    .background_channels(receiver.clone(), child_jobs.clone())
+            }),
+        );
+        (tool, sender, job_registry, job_service)
+    }
+
+    /// Registers a fake running background job carrying `script` so the
+    /// run's idle reason names it.
+    async fn register_running_job(
+        job_registry: &aither_sandbox::JobRegistry,
+        pid: u32,
+        script: &str,
+    ) {
+        job_registry
+            .register(
+                pid,
+                "amber-test-task",
+                "exec-key",
+                script,
+                aither_sandbox::TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+    }
+
+    fn keep_alive_requests(requests: &async_channel::Receiver<LLMRequest>) -> Vec<LLMRequest> {
+        let mut drained = Vec::new();
+        while let Ok(request) = requests.try_recv() {
+            drained.push(request);
+        }
+        drained
+            .into_iter()
+            .filter(|request| request.parameters().max_tokens == Some(0))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_subagent_waiting_on_background_command_gets_keep_alives() {
+        let (dir, prompt_file) = write_prompt_file("keep-alive-warm-prompt", "hold a job");
+        let (request_tx, request_rx) = async_channel::unbounded();
+        let (tool, sender, job_registry, job_service) = keep_alive_tool(
+            "Anthropic",
+            request_tx,
+            Some(crate::config::CacheKeepAlive {
+                lifetime: std::time::Duration::from_millis(400),
+                send_before_expiry: std::time::Duration::from_millis(150),
+                frequent_idle_threshold: 2,
+            }),
+        );
+        tokio::spawn(job_service.serve());
+        register_running_job(&job_registry, 4242, "sleep 2").await;
+        sender.task_started();
+
+        let call = tokio::spawn(async move {
+            Tool::call(
+                &tool,
+                SubagentArgs {
+                    subagent: "worker".to_string(),
+                    prompt_file: prompt_file.to_string_lossy().into_owned(),
+                    model: Some(ModelTier::Fast),
+                },
+                ToolContext::new(),
+            )
+            .await
+        });
+
+        // Let the run park on the job long enough for two keep-alives,
+        // then complete the task so the wait unwinds.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        sender.task_finished();
+        sender
+            .send_completed(aither_sandbox::CompletedTask {
+                task_id: "amber-test-task".to_string(),
+                script: "sleep 2".to_string(),
+                result: Ok(aither_sandbox::TerminalResult {
+                    stdout: aither_sandbox::OutputEntry::Empty,
+                    stderr: None,
+                    exit_code: 0,
+                    task_id: Some("amber-test-task".to_string()),
+                    status: None,
+                    notice: None,
+                }),
+            })
+            .await;
+
+        let result = call
+            .await
+            .expect("call task panicked")
+            .expect("subagent call failed");
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result, got {result:?}");
+        };
+        assert_eq!(value["status"], "completed");
+
+        let keep_alives = keep_alive_requests(&request_rx);
+        assert!(
+            keep_alives.len() >= 2,
+            "expected repeated keep-alives while the job ran, got {}",
+            keep_alives.len()
+        );
+        for request in &keep_alives {
+            let params = request.parameters();
+            assert_eq!(params.max_tokens, Some(0));
+            assert_eq!(
+                params.stream,
+                Some(false),
+                "keep-alive must be non-streaming"
+            );
+            assert_eq!(
+                params.reasoning_effort, None,
+                "keep-alive must preserve the last request's effort"
+            );
+            assert!(
+                !params.include_reasoning,
+                "keep-alive must preserve the last request's thinking"
+            );
+        }
+
+        // Two keep-alives crossed the configured threshold: the parent gets
+        // one alert naming the subagent and the command it waited on.
+        let alert = value["alert"].as_str().expect("threshold alert missing");
+        assert!(
+            alert.contains("worker"),
+            "alert names the subagent: {alert}"
+        );
+        assert!(
+            alert.contains("sleep 2"),
+            "alert gives the idle reason: {alert}"
+        );
+        assert!(alert.contains("should not idle frequently"), "{alert}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subagent_without_keep_alive_config_gets_no_keep_alives() {
+        let (dir, prompt_file) = write_prompt_file("keep-alive-other-prompt", "hold a job");
+        let (request_tx, request_rx) = async_channel::unbounded();
+        let (tool, sender, job_registry, job_service) =
+            keep_alive_tool("Anthropic", request_tx, None);
+        tokio::spawn(job_service.serve());
+        register_running_job(&job_registry, 4243, "sleep 2").await;
+        sender.task_started();
+
+        let call = tokio::spawn(async move {
+            Tool::call(
+                &tool,
+                SubagentArgs {
+                    subagent: "worker".to_string(),
+                    prompt_file: prompt_file.to_string_lossy().into_owned(),
+                    model: Some(ModelTier::Fast),
+                },
+                ToolContext::new(),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        sender.task_finished();
+        sender
+            .send_completed(aither_sandbox::CompletedTask {
+                task_id: "amber-test-task".to_string(),
+                script: "sleep 2".to_string(),
+                result: Ok(aither_sandbox::TerminalResult {
+                    stdout: aither_sandbox::OutputEntry::Empty,
+                    stderr: None,
+                    exit_code: 0,
+                    task_id: Some("amber-test-task".to_string()),
+                    status: None,
+                    notice: None,
+                }),
+            })
+            .await;
+
+        let result = call
+            .await
+            .expect("call task panicked")
+            .expect("subagent call failed");
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result, got {result:?}");
+        };
+        assert_eq!(value["status"], "completed");
+        assert!(
+            keep_alive_requests(&request_rx).is_empty(),
+            "no keep-alive config means no keep-alives"
+        );
+        assert!(value["alert"].is_null(), "no alert without keep-alives");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finished_subagent_gets_no_keep_alives() {
+        let (request_tx, request_rx) = async_channel::unbounded();
+        let llm = KeepAliveMockLlm {
+            author: "Anthropic",
+            requests: request_tx,
+            turns: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        };
+        let tool = SubagentTool::new(llm).with_type(
+            "worker",
+            SubagentType::new("worker", |llm| {
+                crate::AgentBuilder::new(llm)
+                    .agent_kind(crate::AgentKind::Chatbot)
+                    .max_iterations(2)
+            }),
+        );
+        let (dir, prompt_file) = write_prompt_file("keep-alive-idle", "answer directly");
+
+        let result = Tool::call(
+            &tool,
+            SubagentArgs {
+                subagent: "worker".to_string(),
+                prompt_file: prompt_file.to_string_lossy().into_owned(),
+                model: Some(ModelTier::Fast),
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect("subagent call failed");
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result, got {result:?}");
+        };
+        assert_eq!(value["status"], "completed");
+        assert!(
+            keep_alive_requests(&request_rx).is_empty(),
+            "a run that never waits on a background job gets no keep-alive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

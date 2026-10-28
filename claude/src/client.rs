@@ -23,7 +23,7 @@ use crate::{
         build_thinking, convert_native_tools, convert_tools, filter_tool_definitions,
         to_claude_messages, tool_choice_payload,
     },
-    response::{StreamState, parse_event, should_skip_event},
+    response::{MessagesResponse, StreamState, parse_event, response_events, should_skip_event},
 };
 
 /// Claude chat model client for the Anthropic Messages API.
@@ -171,12 +171,13 @@ impl LanguageModel for Claude {
             };
 
             // Build and send request
+            let stream_requested = snapshot.stream.unwrap_or(true);
             let request_body = MessagesRequest {
                 model: cfg.model.clone(),
                 max_tokens,
                 messages: claude_messages,
                 system: system_prompt,
-                stream: true,
+                stream: stream_requested,
                 temperature: snapshot.temperature,
                 top_p: snapshot.top_p,
                 top_k: snapshot.top_k,
@@ -199,7 +200,13 @@ impl LanguageModel for Claude {
                 .and_then(|b| b.header("x-api-key", cfg.api_key.clone()))
                 .and_then(|b| b.header("anthropic-version", ANTHROPIC_VERSION))
                 .and_then(|b| b.header(header::CONTENT_TYPE.as_str(), "application/json"))
-                .and_then(|b| b.header(header::ACCEPT.as_str(), "text/event-stream"))
+                .and_then(|b| {
+                    if stream_requested {
+                        b.header(header::ACCEPT.as_str(), "text/event-stream")
+                    } else {
+                        Ok(b)
+                    }
+                })
                 .and_then(|b| b.header(header::USER_AGENT.as_str(), "aither-claude/0.1"))
                 .and_then(|b| b.json_body(&request_body))
             {
@@ -209,6 +216,19 @@ impl LanguageModel for Claude {
                     return;
                 }
             };
+
+            if !stream_requested {
+                match builder.json::<MessagesResponse>().await {
+                    Ok(response) => {
+                        for event in response_events(response) {
+                            yield Ok(event);
+                        }
+                    }
+                    Err(e) => yield Err(ClaudeError::Http(e)),
+                }
+                return;
+            }
+
             let sse_stream = match builder.sse().await {
                 Ok(stream) => stream,
                 Err(e) => {
