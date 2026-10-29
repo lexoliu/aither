@@ -107,6 +107,7 @@ dependencies = [
  "askama 0.16.1",
  "async-channel",
  "async-fs",
+ "async-io",
  "async-process",
  "async-stream",
  "dunce",

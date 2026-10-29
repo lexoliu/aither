@@ -177,7 +177,9 @@ fn render_flag_prefix(flag: &str, short: Option<char>) -> String {
 }
 
 impl CommandPayload {
-    fn render_for_cli(&self) -> String {
+    /// The text a terminal caller reads for this payload.
+    #[must_use]
+    pub fn render_for_cli(&self) -> String {
         let Self::Text { content } = self;
         content.clone()
     }
@@ -316,6 +318,83 @@ impl<T> RoleEntries<T> {
             CommandRole::Main => Some(&self.main),
             CommandRole::Subagent => self.subagent.as_ref(),
         }
+    }
+}
+
+/// One command call a registry served: what it resolved to, what it was
+/// given and what it answered.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandCall<'a> {
+    /// The role of the registry that served the call.
+    pub role: CommandRole,
+    /// The resolved command name.
+    pub name: &'a str,
+    /// The arguments the command was called with.
+    pub args: &'a [String],
+    /// What the call answered.
+    pub outcome: &'a CommandEnvelope,
+}
+
+/// Watches the commands a registry serves.
+///
+/// The registry awaits the observer after the command has answered and before
+/// the answer returns to the caller, so an observer delays the call by as
+/// long as its future runs; it cannot change the answer. An observer whose
+/// work is slow starts it on an executor and returns at once.
+pub trait CommandObserver: Send + Sync + 'static {
+    /// Called once for every served call of a resolved command.
+    fn command_called(&self, call: &CommandCall<'_>) -> impl Future<Output = ()> + Send;
+}
+
+/// Object-safe twin of [`CommandObserver`].
+trait CommandObserverImpl: Send + Sync {
+    fn command_called<'a>(
+        &'a self,
+        call: &'a CommandCall<'a>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+impl<T: CommandObserver> CommandObserverImpl for T {
+    fn command_called<'a>(
+        &'a self,
+        call: &'a CommandCall<'a>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(CommandObserver::command_called(self, call))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// A type-erased [`CommandObserver`].
+#[derive(Clone)]
+pub struct AnyCommandObserver(Arc<dyn CommandObserverImpl>);
+
+impl AnyCommandObserver {
+    /// Erases `observer`.
+    #[must_use]
+    pub fn new(observer: impl CommandObserver) -> Self {
+        Self(Arc::new(observer))
+    }
+
+    /// The wrapped observer, when it is a `T`; how a host that installed an
+    /// observer finds it again through a terminal's binding.
+    #[must_use]
+    pub fn downcast_ref<T: CommandObserver>(&self) -> Option<&T> {
+        self.0.as_any().downcast_ref()
+    }
+
+    async fn command_called(&self, call: &CommandCall<'_>) {
+        self.0.command_called(call).await;
+    }
+}
+
+impl std::fmt::Debug for AnyCommandObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AnyCommandObserver")
     }
 }
 
@@ -610,6 +689,7 @@ impl std::fmt::Debug for DynTerminalTool {
 pub struct ToolRegistryBuilder {
     entries: HashMap<String, RoleEntries<Arc<ToolEntry>>>,
     bound: HashMap<String, RoleEntries<Arc<BoundEntry>>>,
+    observer: Option<AnyCommandObserver>,
 }
 
 impl ToolRegistryBuilder {
@@ -778,6 +858,13 @@ impl ToolRegistryBuilder {
         );
     }
 
+    /// Has `observer` told about every call of a resolved command the main
+    /// agent's registry serves. A subagent's registry is observed by the
+    /// observer given to [`ToolRegistry::for_subagent`].
+    pub fn observe_commands(&mut self, observer: AnyCommandObserver) {
+        self.observer = Some(observer);
+    }
+
     /// Builds an immutable main-agent registry with a concrete output
     /// directory; [`ToolRegistry::for_subagent`] derives the subagent view.
     /// Terminal-bound commands are built when a terminal serves it.
@@ -789,6 +876,7 @@ impl ToolRegistryBuilder {
             instances: HashMap::new(),
             output_dir: output_dir.into(),
             role: CommandRole::Main,
+            observer: self.observer,
         }
     }
 }
@@ -920,6 +1008,7 @@ pub struct ToolRegistry {
     instances: HashMap<String, Arc<ToolEntry>>,
     output_dir: PathBuf,
     role: CommandRole,
+    observer: Option<AnyCommandObserver>,
 }
 
 /// Detects the stdin argument from a JSON schema.
@@ -988,15 +1077,25 @@ impl ToolRegistry {
     /// left for the subagent's terminal to build. Asking a subagent registry
     /// for its subagent registry returns the same view, so nesting never
     /// escalates.
+    ///
+    /// The subagent's calls are told to `observer`, not to this registry's
+    /// observer, which belongs to the agent that launches the subagent.
     #[must_use]
-    pub fn for_subagent(&self) -> Self {
+    pub fn for_subagent(&self, observer: Option<AnyCommandObserver>) -> Self {
         Self {
             entries: self.entries.clone(),
             bound: self.bound.clone(),
             instances: HashMap::new(),
             output_dir: self.output_dir.clone(),
             role: CommandRole::Subagent,
+            observer,
         }
+    }
+
+    /// The observer told about the calls this registry serves.
+    #[must_use]
+    pub const fn observer(&self) -> Option<&AnyCommandObserver> {
+        self.observer.as_ref()
     }
 
     /// What `tool_name` resolves to in this registry's role.
@@ -1037,10 +1136,23 @@ impl ToolRegistry {
             Some(Resolved {
                 handler: Some(handler),
                 ..
-            }) => match handler(args.to_vec()).await {
-                Ok(output) => handle_large_output(output, &self.output_dir).await,
-                Err(error) => CommandEnvelope::failure(error),
-            },
+            }) => {
+                let outcome = match handler(args.to_vec()).await {
+                    Ok(output) => handle_large_output(output, &self.output_dir).await,
+                    Err(error) => CommandEnvelope::failure(error),
+                };
+                if let Some(observer) = &self.observer {
+                    observer
+                        .command_called(&CommandCall {
+                            role: self.role,
+                            name: tool_name,
+                            args,
+                            outcome: &outcome,
+                        })
+                        .await;
+                }
+                outcome
+            }
             Some(Resolved { handler: None, .. }) => {
                 CommandEnvelope::failure(reserved_for_main_text(tool_name))
             }
@@ -3231,7 +3343,7 @@ mod tests {
             answer: "anyone ran it",
         });
         let main = builder.build(tmp.path());
-        let subagent = main.for_subagent();
+        let subagent = main.for_subagent(None);
 
         let ok = run_command(&main, "reserved").await;
         assert!(ok.ok, "the main agent keeps the command: {ok:?}");
@@ -3271,7 +3383,7 @@ mod tests {
             },
         );
         let main = builder.build(tmp.path());
-        let subagent = main.for_subagent();
+        let subagent = main.for_subagent(None);
 
         let answer =
             |envelope: CommandEnvelope| envelope.payload.expect("the handler ran").render_for_cli();
@@ -3289,8 +3401,52 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let nested = ToolRegistryBuilder::new()
             .build(tmp.path())
-            .for_subagent()
-            .for_subagent();
+            .for_subagent(None)
+            .for_subagent(None);
         assert_eq!(nested.role(), CommandRole::Subagent);
+    }
+
+    /// Records the role and name of every call it is told about.
+    struct CallLog(Arc<std::sync::Mutex<Vec<(CommandRole, String)>>>);
+
+    impl CommandObserver for CallLog {
+        async fn command_called(&self, call: &CommandCall<'_>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((call.role, call.name.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn each_registry_reports_its_calls_to_its_own_observer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (main_calls, subagent_calls) = (Arc::default(), Arc::default());
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(RoleTool {
+            name: "shared",
+            answer: "anyone ran it",
+        });
+        builder.observe_commands(AnyCommandObserver::new(CallLog(Arc::clone(&main_calls))));
+        let main = builder.build(tmp.path());
+        let subagent = main.for_subagent(Some(AnyCommandObserver::new(CallLog(Arc::clone(
+            &subagent_calls,
+        )))));
+        let unobserved = main.for_subagent(None);
+
+        run_command(&main, "shared").await;
+        run_command(&subagent, "shared").await;
+        run_command(&unobserved, "shared").await;
+        run_command(&subagent, "unknown").await;
+
+        assert_eq!(
+            *main_calls.lock().unwrap(),
+            [(CommandRole::Main, "shared".to_string())]
+        );
+        assert_eq!(
+            *subagent_calls.lock().unwrap(),
+            [(CommandRole::Subagent, "shared".to_string())]
+        );
+        assert!(main.observer().is_some() && unobserved.observer().is_none());
     }
 }

@@ -59,6 +59,7 @@ mod kill_guard;
 mod naming;
 mod output;
 mod output_compress;
+mod process_tree;
 mod shell_session;
 mod stdin_watch;
 mod subagent;
@@ -86,10 +87,10 @@ pub mod permission;
 
 pub use bollard_exec::BollardContainerExec;
 pub use command::{
-    CommandEnvelope, CommandPayload, CommandRole, DynTerminalTool, DynToolHandler, IpcToolCommand,
-    ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
-    register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
-    tool_output_to_payload,
+    AnyCommandObserver, CommandCall, CommandEnvelope, CommandObserver, CommandPayload, CommandRole,
+    DynTerminalTool, DynToolHandler, IpcToolCommand, ToolCallCommand, ToolCommand, ToolRegistry,
+    ToolRegistryBuilder, cli_to_json, register_ipc_gateway_command, register_tool_command,
+    register_tool_direct, schema_to_help, tool_output_to_payload,
 };
 pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
@@ -112,6 +113,7 @@ pub use network_policy::{
 };
 pub use output::{MediaResolution, OutputFormat, OutputStore};
 pub use permission::{PermissionHandler, TerminalMode};
+pub use process_tree::{KillTreeError, kill_process_tree};
 pub use shell_session::{
     AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
     ContainerExecOutcome, ContainerIpcRoute, ContainerShellRuntime, ShellBackend,
