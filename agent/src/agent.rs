@@ -45,9 +45,9 @@ use crate::{
 };
 
 use aither_sandbox::{
-    BackgroundTaskReceiver, JobRegistry, PermissionEvent, PermissionEventReceiver,
-    PermissionEventStage, TerminalArgs, TerminalBackgroundArgs, TerminalExecutionMode,
-    TerminalMode,
+    BackgroundTaskEvent, BackgroundTaskReceiver, JobAlert, JobRegistry, PermissionEvent,
+    PermissionEventReceiver, PermissionEventStage, TerminalArgs, TerminalBackgroundArgs,
+    TerminalExecutionMode, TerminalMode,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -1036,14 +1036,7 @@ where
 
     fn push_completed_background_events(&mut self, events: &EventSink) {
         if let Some(receiver) = self.background_receiver.clone() {
-            for job in receiver.take_long_running_alerts() {
-                tracing::info!(task_id = %job.task_id, "background job crossed long-running threshold");
-                self.push_system_alert(format!(
-                    "Background job '{}' has been running for {} — check with terminal_read that it is still progressing normally, and terminal_kill it if it is stuck.",
-                    job.task_id,
-                    format_job_elapsed(job.elapsed)
-                ));
-            }
+            self.push_job_alerts();
             for task in receiver.take_completed() {
                 tracing::info!(task_id = %task.task_id, "background task completed");
                 let result_msg = Self::format_background_task_result(&task);
@@ -1098,29 +1091,75 @@ where
         let Some(receiver) = self.background_receiver.clone() else {
             return Ok(false);
         };
-        let mut had_completed = self.drain_background_receiver(&receiver, events);
         let start = Instant::now();
-        while start.elapsed() < BACKGROUND_TASK_MAX_WAIT {
-            self.push_long_running_alerts();
-            self.maybe_send_cache_keep_alive().await?;
-            if let Some(task) = receiver.recv_timeout(BACKGROUND_TASK_POLL_INTERVAL).await {
-                tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
-                self.push_completed_task_event(task, events);
-                had_completed = true;
-            } else if !self
-                .background_receiver
-                .as_ref()
-                .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running)
+        let mut iteration = iteration;
+        // The outcome of the last loop this wait resumed; the run ends with
+        // its stop events once the wait is over.
+        let mut resumed: Option<RunLoopOutcome> = None;
+        loop {
+            if !self
+                .wait_for_background_events(&receiver, start, events)
+                .await?
             {
                 break;
             }
+            let outcome = self.run_agent_loop(run_id, iteration, events).await?;
+            iteration = outcome.iteration;
+            let hook_ended = outcome.stop_reason == StopReason::EndTurn;
+            resumed = Some(outcome);
+            // A model turn that answered an alert goes back to waiting, within
+            // the same budget: a job may still run, or may have finished while
+            // the model replied and left its completion queued, which the
+            // wait collects first even once the budget is spent. A turn a hook
+            // ended stays ended.
+            if hook_ended {
+                break;
+            }
         }
-        if !had_completed {
+        let Some(outcome) = resumed else {
             return Ok(false);
-        }
-        let outcome = self.run_agent_loop(run_id, iteration, events).await?;
+        };
         self.push_stop_events(run_id, outcome, events).await?;
         Ok(true)
+    }
+
+    /// Parks until the background jobs are done, the wait budget runs out, or
+    /// a job alert that needs the model arrives; returns whether the model has
+    /// something new to see.
+    async fn wait_for_background_events(
+        &mut self,
+        receiver: &BackgroundTaskReceiver,
+        start: Instant,
+        events: &EventSink,
+    ) -> Result<bool, AgentError> {
+        let mut needs_model = self.drain_background_receiver(receiver, events);
+        while start.elapsed() < BACKGROUND_TASK_MAX_WAIT {
+            // A job blocked on stdin can never complete, so parking on it
+            // would hide its alert from the model for the whole wait. Other
+            // alerts become durable context without ending the wait.
+            if self.push_job_alerts() {
+                return Ok(true);
+            }
+            self.maybe_send_cache_keep_alive().await?;
+            match receiver
+                .recv_event_timeout(BACKGROUND_TASK_POLL_INTERVAL)
+                .await
+            {
+                Some(BackgroundTaskEvent::Completed(task)) => {
+                    tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
+                    self.push_completed_task_event(*task, events);
+                    needs_model = true;
+                }
+                Some(BackgroundTaskEvent::Alert(alert)) => {
+                    if self.push_job_alert(alert) {
+                        return Ok(true);
+                    }
+                }
+                None if !receiver.has_running() => break,
+                None => {}
+            }
+        }
+        Ok(needs_model)
     }
 
     /// Sends one prompt-cache keep-alive when the wait on background tasks
@@ -1229,17 +1268,49 @@ where
         &self.cache_keep_alive
     }
 
-    /// Pushes one durable alert per background job that crossed the
-    /// terminal's long-running threshold.
-    fn push_long_running_alerts(&mut self) {
-        if let Some(receiver) = self.background_receiver.clone() {
-            for job in receiver.take_long_running_alerts() {
+    /// Pushes one durable alert per pending background job alert: a job past
+    /// the long-running threshold, one blocked reading its stdin, or one
+    /// whose stdin watch failed. Returns whether any of them is a job blocked
+    /// on stdin, which the model must act on.
+    fn push_job_alerts(&mut self) -> bool {
+        let Some(receiver) = self.background_receiver.clone() else {
+            return false;
+        };
+        let mut wake = false;
+        for alert in receiver.take_job_alerts() {
+            wake |= self.push_job_alert(alert);
+        }
+        wake
+    }
+
+    /// Pushes one durable alert for a background job alert; returns whether
+    /// it is a job blocked on stdin, which wakes a parked wait.
+    fn push_job_alert(&mut self, alert: JobAlert) -> bool {
+        match alert {
+            JobAlert::LongRunning(job) => {
                 tracing::info!(task_id = %job.task_id, "background job crossed long-running threshold");
                 self.push_system_alert(format!(
                     "Background job '{}' has been running for {} — check with terminal_read that it is still progressing normally, and terminal_kill it if it is stuck.",
                     job.task_id,
                     format_job_elapsed(job.elapsed)
                 ));
+                false
+            }
+            JobAlert::StdinBlocked(job) => {
+                tracing::info!(task_id = %job.task_id, "background job is blocked on stdin");
+                self.push_system_alert(format!(
+                    "Background job '{}' is waiting for input on stdin — send it with terminal_input, or terminal_kill it if it needs none.",
+                    job.task_id
+                ));
+                true
+            }
+            JobAlert::StdinProbeFailed(job) => {
+                tracing::warn!(task_id = %job.task_id, error = %job.error, "stdin watch failed");
+                self.push_system_alert(format!(
+                    "Monitoring background job '{}' for stdin reads failed: {} — it cannot report being blocked on stdin.",
+                    job.task_id, job.error
+                ));
+                false
             }
         }
     }
@@ -2792,6 +2863,146 @@ mod tests {
                     && message.content().contains("no native tool named foo")
             }),
             "ad-hoc alerts must reach the next request"
+        );
+    }
+
+    /// A job blocked on stdin can never complete, so its alert must end the
+    /// post-turn wait and resume the loop — otherwise the model never sees
+    /// it until the 300 s cap runs out.
+    #[tokio::test]
+    async fn stdin_blocked_alert_wakes_the_parked_background_wait() {
+        let (sender, receiver) = aither_sandbox::background_task_channel();
+        let mut agent = Agent::new(MockLlm {
+            context_length: 1_000,
+        });
+        agent.background_receiver = Some(receiver);
+        agent.ensure_initialized().await.expect("agent initializes");
+        sender.task_started();
+
+        let (tx, _rx) = async_channel::unbounded();
+        let sink = EventSink { sender: tx };
+
+        let alerter = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            sender
+                .send_alert(JobAlert::StdinBlocked(aither_sandbox::StdinBlockedJob {
+                    task_id: "task-test".to_string(),
+                    script: "cat".to_string(),
+                }))
+                .await;
+            // The job finishes a while after the model turn the alert resumed.
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            sender.task_finished();
+        });
+
+        let started = Instant::now();
+        let woke = tokio::time::timeout(
+            Duration::from_secs(20),
+            agent.collect_final_background_events("run-test", 1, &sink),
+        )
+        .await
+        .expect("the wait must end with the job, not the 300 s cap")
+        .expect("collecting final events should succeed");
+        assert!(woke, "a stdin-blocked alert must resume the run loop");
+        assert!(
+            started.elapsed() >= Duration::from_millis(1_400),
+            "the model turn the alert woke must go back to waiting for the job, not end the run"
+        );
+        alerter.await.expect("the alerter should send");
+
+        assert!(
+            agent
+                .context()
+                .recent()
+                .iter()
+                .any(|message| message.content().contains("waiting for input on stdin")),
+            "the alert must be durable context for the resumed turn"
+        );
+    }
+
+    /// A model that finishes the background job while it answers its first
+    /// request, as a job fed through `terminal_input` does a moment later.
+    #[derive(Clone)]
+    struct FinishesJobLlm {
+        job: async_channel::Receiver<aither_sandbox::BackgroundTaskSender>,
+    }
+
+    impl LanguageModel for FinishesJobLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let job = self.job.try_recv().ok();
+            futures_lite::StreamExt::filter_map(
+                futures_lite::stream::once_future(async move {
+                    if let Some(sender) = job {
+                        sender
+                            .send_completed(aither_sandbox::CompletedTask {
+                                task_id: "task-test".to_string(),
+                                script: "cat".to_string(),
+                                result: Err(aither_sandbox::TerminalError::Execution(
+                                    "fed and finished".to_string(),
+                                )),
+                            })
+                            .await;
+                        sender.task_finished();
+                    }
+                }),
+                |()| None,
+            )
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                1_000,
+            )))
+        }
+    }
+
+    /// The job the alert woke the model for finishes while the model replies:
+    /// the wait goes back to the receiver and collects that completion before
+    /// the run ends, instead of leaving it for the next user message.
+    #[tokio::test]
+    async fn job_finishing_during_the_alerted_turn_is_collected() {
+        let (sender, receiver) = aither_sandbox::background_task_channel();
+        let (job_tx, job_rx) = async_channel::bounded(1);
+        let mut agent = Agent::new(FinishesJobLlm { job: job_rx });
+        agent.background_receiver = Some(receiver);
+        agent.ensure_initialized().await.expect("agent initializes");
+        sender.task_started();
+        sender
+            .send_alert(JobAlert::StdinBlocked(aither_sandbox::StdinBlockedJob {
+                task_id: "task-test".to_string(),
+                script: "cat".to_string(),
+            }))
+            .await;
+        job_tx.try_send(sender).expect("hand the job to the model");
+
+        let (tx, _rx) = async_channel::unbounded();
+        let sink = EventSink { sender: tx };
+        let woke = tokio::time::timeout(
+            Duration::from_secs(20),
+            agent.collect_final_background_events("run-test", 1, &sink),
+        )
+        .await
+        .expect("the wait must end once the job is collected")
+        .expect("collecting final events should succeed");
+        assert!(woke, "a stdin-blocked alert must resume the run loop");
+        assert!(
+            agent
+                .context()
+                .recent()
+                .iter()
+                .any(|message| message.content().contains("fed and finished")),
+            "the completion that landed during the resumed turn must be in context"
         );
     }
 

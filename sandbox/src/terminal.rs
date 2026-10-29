@@ -53,11 +53,11 @@ use crate::{
     },
     permission::{PermissionError, PermissionHandler, TerminalMode},
     shell_session::{
-        BridgeAddress, ContainerShellRuntime, ShellBackend, ShellRuntimeAvailability,
-        ShellSessionRegistry, SshRuntimeProfile,
+        BridgeAddress, ContainerExecOutcome, ContainerShellRuntime, ShellBackend,
+        ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile,
     },
     stdin_watch::{
-        STDIN_WATCH_INTERVAL, TERMINAL_STDIN_BLOCKED_NOTICE, detect_stdin_blocked_for_local_pid,
+        EpisodeDetector, FeedCounter, LocalStdinProbe, STDIN_WATCH_INTERVAL, StdinWatchSignal,
     },
 };
 
@@ -116,11 +116,6 @@ pub async fn open_network_audit_log(
     NetworkAuditLog::rolling_daily(dir, max_files).map_err(|error| {
         TerminalError::SandboxSetup(format!("failed to open network audit log: {error}"))
     })
-}
-
-const fn supports_stdin_blocked_notice(backend: ShellBackend) -> bool {
-    matches!(backend, ShellBackend::Container)
-        || (cfg!(target_os = "linux") && matches!(backend, ShellBackend::Local))
 }
 
 #[derive(Clone)]
@@ -454,6 +449,44 @@ pub struct LongRunningJob {
     pub elapsed: Duration,
 }
 
+/// A background job whose stdin pipe has a reader waiting for input.
+///
+/// Sent once per blocking episode: the job is not alerted again until it has
+/// been fed through `terminal_input` and blocks anew.
+#[derive(Debug, Clone)]
+pub struct StdinBlockedJob {
+    /// Task ID of the job.
+    pub task_id: String,
+    /// The script the job runs.
+    pub script: String,
+}
+
+/// A background job whose stdin watch failed; carries the probe's error.
+///
+/// Sent once: after a failure the job can no longer report being blocked on
+/// stdin.
+#[derive(Debug, Clone)]
+pub struct StdinProbeFailedJob {
+    /// Task ID of the job.
+    pub task_id: String,
+    /// The script the job runs.
+    pub script: String,
+    /// Why the watch failed.
+    pub error: String,
+}
+
+/// A system alert about a background job, delivered through the terminal's
+/// alert channel.
+#[derive(Debug, Clone)]
+pub enum JobAlert {
+    /// The job crossed the long-running threshold.
+    LongRunning(LongRunningJob),
+    /// The job is waiting for input on its stdin.
+    StdinBlocked(StdinBlockedJob),
+    /// Watching the job's stdin failed; no blocked-on-stdin alert can follow.
+    StdinProbeFailed(StdinProbeFailedJob),
+}
+
 /// Result of a terminal execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalResult {
@@ -558,7 +591,7 @@ pub struct PermissionEvent {
 #[derive(Clone)]
 pub struct BackgroundTaskReceiver {
     rx: Receiver<CompletedTask>,
-    alert_rx: Receiver<LongRunningJob>,
+    alert_rx: Receiver<JobAlert>,
     running_tasks: Arc<AtomicUsize>,
 }
 
@@ -572,7 +605,7 @@ pub struct BackgroundTaskReceiver {
 #[derive(Clone, Debug)]
 pub struct BackgroundTaskSender {
     completed_tx: Sender<CompletedTask>,
-    alert_tx: Sender<LongRunningJob>,
+    alert_tx: Sender<JobAlert>,
     running_tasks: Arc<AtomicUsize>,
 }
 
@@ -601,8 +634,8 @@ impl BackgroundTaskSender {
         let _ = self.completed_tx.send(task).await;
     }
 
-    /// Delivers a long-running-job alert to the receiver.
-    pub async fn send_long_running(&self, alert: LongRunningJob) {
+    /// Delivers a job alert to the receiver.
+    pub async fn send_alert(&self, alert: JobAlert) {
         let _ = self.alert_tx.send(alert).await;
     }
 }
@@ -642,12 +675,12 @@ impl BackgroundTaskReceiver {
         completed
     }
 
-    /// Takes all pending long-running job alerts without blocking.
+    /// Takes all pending job alerts without blocking.
     ///
-    /// Each alert names a background job that crossed the terminal's
-    /// long-running threshold; a job produces at most one.
+    /// A job produces at most one [`JobAlert::LongRunning`], and one
+    /// [`JobAlert::StdinBlocked`] per blocking episode.
     #[must_use]
-    pub fn take_long_running_alerts(&self) -> Vec<LongRunningJob> {
+    pub fn take_job_alerts(&self) -> Vec<JobAlert> {
         let mut alerts = Vec::new();
         while let Ok(alert) = self.alert_rx.try_recv() {
             alerts.push(alert);
@@ -688,6 +721,49 @@ impl BackgroundTaskReceiver {
         })
         .await
     }
+
+    /// Waits for the next completed task or job alert, bounded by `duration`.
+    ///
+    /// Returns `None` when nothing arrives in time; a closed channel never
+    /// ends the wait early.
+    pub async fn recv_event_timeout(
+        &self,
+        duration: std::time::Duration,
+    ) -> Option<BackgroundTaskEvent> {
+        futures_lite::future::or(
+            async {
+                match self.rx.recv().await {
+                    Ok(task) => Some(BackgroundTaskEvent::Completed(Box::new(task))),
+                    // A closed channel never yields again; only the timer
+                    // may end the wait, or callers would spin.
+                    Err(_) => std::future::pending().await,
+                }
+            },
+            futures_lite::future::or(
+                async {
+                    match self.alert_rx.recv().await {
+                        Ok(alert) => Some(BackgroundTaskEvent::Alert(alert)),
+                        Err(_) => std::future::pending().await,
+                    }
+                },
+                async {
+                    futures_lite::future::yield_now().await;
+                    async_io::Timer::after(duration).await;
+                    None
+                },
+            ),
+        )
+        .await
+    }
+}
+
+/// What ended a [`BackgroundTaskReceiver::recv_event_timeout`] wait.
+#[derive(Debug)]
+pub enum BackgroundTaskEvent {
+    /// A background task completed; boxed to keep the enum small.
+    Completed(Box<CompletedTask>),
+    /// A job alert arrived.
+    Alert(JobAlert),
 }
 
 impl std::fmt::Debug for BackgroundTaskReceiver {
@@ -858,9 +934,9 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     /// Channel for sending completed background tasks (cloned for each background task).
     completed_tx: Sender<CompletedTask>,
     /// Channel for receiving long-running job alerts.
-    alert_rx: Receiver<LongRunningJob>,
+    alert_rx: Receiver<JobAlert>,
     /// Channel for sending long-running job alerts (cloned for each watchdog).
-    alert_tx: Sender<LongRunningJob>,
+    alert_tx: Sender<JobAlert>,
     /// Time bounds applied to spawned executions.
     limits: TerminalLimits,
     /// Number of still-running spawned executions associated with this tool.
@@ -1594,15 +1670,13 @@ where
         let ExecutionTarget { mode, backend } = target;
         let (result_tx, result_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
-        let (stdin_blocked_tx, stdin_blocked_rx) = async_channel::bounded(1);
-        // Only a foreground call reads the detector's notice: it becomes
-        // guidance inside the kill result. A background job's stdin is
-        // served by `terminal_input`.
-        let stdin_blocked_notice = if background || !supports_stdin_blocked_notice(backend.kind()) {
-            None
-        } else {
-            Some(stdin_blocked_tx)
-        };
+        // A foreground command reads EOF from a null stdin; only a background
+        // job gets a stdin pipe, fed through `terminal_input` and watched.
+        let stdin_alerts = background.then(|| StdinAlerts {
+            tx: self.alert_tx.clone(),
+            task_id: task_id.clone(),
+            script: script.clone(),
+        });
 
         let background_startup = BackgroundStartup::new(startup_tx);
         let running_tasks = self.running_tasks.clone();
@@ -1624,7 +1698,7 @@ where
                 script,
                 mode,
                 backend,
-                stdin_blocked_notice,
+                stdin_alerts,
                 background_startup,
                 expect,
                 resolution,
@@ -1644,7 +1718,6 @@ where
         SpawnedTerminal {
             result: result_rx,
             startup: startup_rx,
-            stdin_blocked_notice: stdin_blocked_rx,
         }
     }
 }
@@ -1799,11 +1872,11 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
                     && matches!(job.status, JobStatus::Running)
                 {
                     let _ = alert_tx
-                        .send(LongRunningJob {
+                        .send(JobAlert::LongRunning(LongRunningJob {
                             task_id,
                             script: job.script,
                             elapsed: job.started_at.elapsed(),
-                        })
+                        }))
                         .await;
                 }
             })
@@ -1817,7 +1890,6 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
         spawned: &SpawnedTerminal,
         task_id: &str,
     ) -> aither_core::Result<ToolResult> {
-        let stdin_notice = spawned.stdin_blocked_notice.try_recv().ok();
         if !self.job_registry.kill_by_task_id(task_id).await
             && let Ok(result) = spawned.result.try_recv()
         {
@@ -1827,13 +1899,10 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
                 Err(err) => Err(anyhow::anyhow!(err)),
             };
         }
-        let mut notice = format!(
+        let notice = format!(
             "Killed after running {}s in the foreground. Use terminal_background to run a command longer than that.",
             self.limits.foreground.as_secs()
         );
-        if let Some(stdin_notice) = stdin_notice {
-            notice = format!("{notice}\n{stdin_notice}");
-        }
         let mut result = spawned
             .result
             .recv()
@@ -2005,7 +2074,7 @@ struct StandaloneExecution<P, E> {
     script: String,
     mode: TerminalMode,
     backend: ExecutionBackend,
-    stdin_blocked_notice: Option<Sender<String>>,
+    stdin_alerts: Option<StdinAlerts>,
     background_startup: BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
@@ -2031,7 +2100,7 @@ struct StandaloneStart<'a, P, E> {
     script: &'a str,
     mode: TerminalMode,
     backend: &'a ExecutionBackend,
-    stdin_blocked_notice: Option<Sender<String>>,
+    stdin_alerts: Option<StdinAlerts>,
     background_startup: &'a BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
@@ -2051,7 +2120,7 @@ struct LocalBackgroundExecution<'a, E> {
     script: &'a str,
     mode: TerminalMode,
     job_registry: &'a JobRegistry,
-    stdin_blocked_notice: Option<Sender<String>>,
+    stdin_alerts: Option<StdinAlerts>,
     background_startup: &'a BackgroundStartup,
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
@@ -2069,7 +2138,7 @@ struct ContainerBackgroundExecution<'a, E> {
     prepared_tools: &'a PreparedTools<ContainerPath>,
     ipc_commands: &'a [String],
     job_registry: &'a JobRegistry,
-    stdin_blocked_notice: Option<Sender<String>>,
+    stdin_alerts: Option<StdinAlerts>,
     background_startup: &'a BackgroundStartup,
     priority: ProcessPriority,
 }
@@ -2115,16 +2184,6 @@ enum ExecutionBackend {
     },
 }
 
-impl ExecutionBackend {
-    const fn kind(&self) -> ShellBackend {
-        match self {
-            Self::Local(_) => ShellBackend::Local,
-            Self::Container { .. } => ShellBackend::Container,
-            Self::Ssh { .. } => ShellBackend::Ssh,
-        }
-    }
-}
-
 struct ExecutionTarget {
     mode: TerminalMode,
     backend: ExecutionBackend,
@@ -2145,7 +2204,6 @@ struct TerminalSpawnRequest {
 struct SpawnedTerminal {
     result: Receiver<Result<TerminalResult, String>>,
     startup: Receiver<Result<(), String>>,
-    stdin_blocked_notice: Receiver<String>,
 }
 
 struct SpawnedTerminalTask<P, E> {
@@ -2162,7 +2220,7 @@ struct SpawnedTerminalTask<P, E> {
     script: String,
     mode: TerminalMode,
     backend: ExecutionBackend,
-    stdin_blocked_notice: Option<Sender<String>>,
+    stdin_alerts: Option<StdinAlerts>,
     background_startup: BackgroundStartup,
     expect: OutputFormat,
     resolution: MediaResolution,
@@ -2197,7 +2255,7 @@ where
         script,
         mode,
         backend,
-        stdin_blocked_notice,
+        stdin_alerts,
         background_startup,
         expect,
         resolution,
@@ -2226,7 +2284,7 @@ where
         script: script.clone(),
         mode,
         backend,
-        stdin_blocked_notice,
+        stdin_alerts,
         background_startup,
         network_audit,
         priority,
@@ -2279,7 +2337,7 @@ where
         script,
         mode,
         backend,
-        stdin_blocked_notice,
+        stdin_alerts,
         background_startup,
         network_audit,
         priority,
@@ -2311,7 +2369,7 @@ where
         script: &script,
         mode,
         backend: &backend,
-        stdin_blocked_notice,
+        stdin_alerts,
         background_startup: &background_startup,
         network_audit,
         priority,
@@ -2395,7 +2453,7 @@ where
                 prepared_tools: tools,
                 ipc_commands: &ipc_commands,
                 job_registry: request.job_registry,
-                stdin_blocked_notice: request.stdin_blocked_notice,
+                stdin_alerts: request.stdin_alerts,
                 background_startup: request.background_startup,
                 priority: request.priority,
             })
@@ -2432,7 +2490,7 @@ where
         script: request.script,
         mode: request.mode,
         job_registry: request.job_registry,
-        stdin_blocked_notice: request.stdin_blocked_notice,
+        stdin_alerts: request.stdin_alerts,
         background_startup: request.background_startup,
         priority: request.priority,
         #[cfg(all(unix, feature = "jobserver"))]
@@ -2682,7 +2740,7 @@ where
         .command(program)
         .args(args)
         .envs(runtime_environment)
-        .stdin(StdioConfig::Piped)
+        .stdin(local_stdin_config(context.stdin_alerts.as_ref()))
         .stdout(StdioConfig::Piped)
         .stderr(StdioConfig::Piped)
         .spawn()
@@ -2708,7 +2766,7 @@ where
         context.executor,
         context.job_registry,
         pid,
-        context.stdin_blocked_notice,
+        context.stdin_alerts,
         "missing stdout pipe for sandbox process",
         "missing stderr pipe for sandbox process",
     )
@@ -2764,7 +2822,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         .command(program)
         .args(args)
         .envs(runtime_environment)
-        .stdin(StdioConfig::Piped)
+        .stdin(local_stdin_config(context.stdin_alerts.as_ref()))
         .stdout(StdioConfig::Piped)
         .stderr(StdioConfig::Piped)
         .spawn()
@@ -2790,7 +2848,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         context.executor,
         context.job_registry,
         pid,
-        context.stdin_blocked_notice,
+        context.stdin_alerts,
         "missing stdout pipe for unsafe process",
         "missing stderr pipe for unsafe process",
     )
@@ -2799,17 +2857,124 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     Ok((pid, output))
 }
 
+/// Where a background job's stdin alerts go.
+///
+/// Its presence is what makes a command a background job: a command without
+/// one reads EOF from a null stdin.
+struct StdinAlerts {
+    tx: Sender<JobAlert>,
+    task_id: String,
+    script: String,
+}
+
+impl StdinAlerts {
+    async fn raise(&self) {
+        debug!(task_id = %self.task_id, "background job is blocked on stdin");
+        let _ = self
+            .tx
+            .send(JobAlert::StdinBlocked(StdinBlockedJob {
+                task_id: self.task_id.clone(),
+                script: self.script.clone(),
+            }))
+            .await;
+    }
+
+    /// Tells the agent this job's stdin watch died: no blocked-on-stdin
+    /// alert can come for it anymore.
+    async fn raise_failure(&self, error: String) {
+        warn!(task_id = %self.task_id, error = %error, "stdin watch failed");
+        let _ = self
+            .tx
+            .send(JobAlert::StdinProbeFailed(StdinProbeFailedJob {
+                task_id: self.task_id.clone(),
+                script: self.script.clone(),
+                error,
+            }))
+            .await;
+    }
+}
+
+const fn local_stdin_config(alerts: Option<&StdinAlerts>) -> StdioConfig {
+    if alerts.is_some() {
+        StdioConfig::Piped
+    } else {
+        StdioConfig::Null
+    }
+}
+
+/// Watches one local background job's stdin pipe for a waiting reader.
+struct LocalStdinWatch {
+    probe: LocalStdinProbe,
+    feed: FeedCounter,
+    detector: EpisodeDetector,
+    alerts: StdinAlerts,
+}
+
+impl LocalStdinWatch {
+    /// Probes the pipe every [`STDIN_WATCH_INTERVAL`] and raises one alert per
+    /// blocking episode, for as long as the future is polled.
+    async fn run(mut self) -> std::convert::Infallible {
+        loop {
+            async_io::Timer::after(STDIN_WATCH_INTERVAL).await;
+            let Self {
+                probe,
+                feed,
+                mut detector,
+                alerts,
+            } = self;
+            let fed = feed.count();
+            let (probe, observed) = blocking::unblock(move || {
+                let observed = probe.probe();
+                (probe, observed)
+            })
+            .await;
+            match observed {
+                Ok(observed) => {
+                    if detector.observe(fed, observed) {
+                        alerts.raise().await;
+                    }
+                }
+                Err(error) => {
+                    // Detection cannot run: surface it once, then park — the
+                    // job's exit still ends the race in
+                    // `wait_for_local_process_exit`.
+                    alerts.raise_failure(error.to_string()).await;
+                    std::future::pending::<()>().await;
+                }
+            }
+            self = Self {
+                probe,
+                feed,
+                detector,
+                alerts,
+            };
+        }
+    }
+}
+
 async fn collect_local_process_output<E: Executor + Clone + 'static>(
     mut child: heel::Child,
     executor: E,
     job_registry: &JobRegistry,
     pid: u32,
-    stdin_blocked_notice: Option<async_channel::Sender<String>>,
+    stdin_alerts: Option<StdinAlerts>,
     missing_stdout_message: &'static str,
     missing_stderr_message: &'static str,
 ) -> Result<std::process::Output, TerminalError> {
+    let mut stdin_watch = None;
     if let Some(stdin) = child.take_stdin() {
-        let input_tx = spawn_terminal_stdin_writer(stdin);
+        let feed = FeedCounter::default();
+        if let Some(alerts) = stdin_alerts {
+            let probe = LocalStdinProbe::new(pid, &stdin)
+                .map_err(|error| TerminalError::Execution(format!("stdin probe: {error}")))?;
+            stdin_watch = Some(LocalStdinWatch {
+                probe,
+                feed: feed.clone(),
+                detector: EpisodeDetector::default(),
+                alerts,
+            });
+        }
+        let input_tx = spawn_terminal_stdin_writer(stdin, feed);
         job_registry.attach_terminal_input(pid, input_tx).await;
     }
 
@@ -2828,7 +2993,7 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
         .spawn(drain_terminal_chunks(job_registry.clone(), pid, chunk_rx))
         .detach();
 
-    let status = match wait_for_local_process_exit(&mut child, pid, stdin_blocked_notice).await {
+    let status = match wait_for_local_process_exit(&mut child, stdin_watch).await {
         Ok(status) => status,
         Err(error) => {
             job_registry.close_stdout(pid).await;
@@ -2849,44 +3014,21 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
     Ok(output)
 }
 
+/// Waits for the child to exit, raising stdin alerts meanwhile.
 async fn wait_for_local_process_exit(
     child: &mut heel::Child,
-    pid: u32,
-    stdin_blocked_notice: Option<async_channel::Sender<String>>,
+    stdin_watch: Option<LocalStdinWatch>,
 ) -> Result<std::process::ExitStatus, TerminalError> {
-    if stdin_blocked_notice.is_none() {
-        return child
+    let exit = async {
+        child
             .wait()
             .await
-            .map_err(|error| TerminalError::Execution(error.to_string()));
-    }
-
-    let mut notice_sent = false;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| TerminalError::Execution(error.to_string()))?
-        {
-            return Ok(status);
-        }
-
-        if !notice_sent {
-            match detect_stdin_blocked_for_local_pid(pid).await {
-                Ok(true) => {
-                    if let Some(notice_tx) = stdin_blocked_notice.as_ref() {
-                        let _ = notice_tx.try_send(TERMINAL_STDIN_BLOCKED_NOTICE.to_string());
-                    }
-                    notice_sent = true;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::debug!(error = %error, pid, "stdin watchdog probe failed");
-                }
-            }
-        }
-
-        async_io::Timer::after(STDIN_WATCH_INTERVAL).await;
-    }
+            .map_err(|error| TerminalError::Execution(error.to_string()))
+    };
+    let Some(stdin_watch) = stdin_watch else {
+        return exit.await;
+    };
+    futures_lite::future::or(exit, async { match stdin_watch.run().await {} }).await
 }
 
 async fn execute_container_background<E: Executor + Clone + 'static>(
@@ -2914,10 +3056,33 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             None,
         )
         .await;
-    context
-        .job_registry
-        .attach_terminal_input(pid, input_tx)
-        .await;
+    // A foreground command gets no input channel: the dropped sender is the
+    // EOF its stdin reads.
+    let stdin_blocked = if let Some(alerts) = context.stdin_alerts {
+        context
+            .job_registry
+            .attach_terminal_input(pid, input_tx)
+            .await;
+        let (signal_tx, signal_rx) = async_channel::unbounded::<StdinWatchSignal>();
+        context
+            .executor
+            .clone()
+            .spawn(async move {
+                while let Ok(signal) = signal_rx.recv().await {
+                    match signal {
+                        StdinWatchSignal::Blocked => alerts.raise().await,
+                        StdinWatchSignal::Failed(error) => {
+                            alerts.raise_failure(error).await;
+                        }
+                    }
+                }
+            })
+            .detach();
+        Some(signal_tx)
+    } else {
+        drop(input_tx);
+        None
+    };
     context.job_registry.attach_kill_switch(pid, kill_tx).await;
     context.background_startup.report_ready().await;
 
@@ -2950,7 +3115,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             CONTAINER_EXEC_WORKING_DIR,
             kill_rx,
             input_rx,
-            context.stdin_blocked_notice,
+            stdin_blocked,
         )
         .await;
 
@@ -2958,33 +3123,37 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         bridge.stop().await;
     }
 
+    record_container_exec_outcome(context.job_registry, pid, execution).await
+}
+
+/// Records a finished container exec in the job's streams and folds it into
+/// the call's result.
+async fn record_container_exec_outcome(
+    job_registry: &JobRegistry,
+    pid: u32,
+    execution: Result<ContainerExecOutcome, String>,
+) -> Result<(u32, std::process::Output), TerminalError> {
     match execution {
-        Ok(crate::shell_session::ContainerExecOutcome::Completed(output)) => {
+        Ok(ContainerExecOutcome::Completed(output)) => {
             if !output.stdout.is_empty() {
-                context
-                    .job_registry
-                    .append_stdout(pid, output.stdout.clone())
-                    .await;
+                job_registry.append_stdout(pid, output.stdout.clone()).await;
             }
             if !output.stderr.is_empty() {
-                context
-                    .job_registry
-                    .append_stderr(pid, output.stderr.clone())
-                    .await;
+                job_registry.append_stderr(pid, output.stderr.clone()).await;
             }
-            context.job_registry.close_stdout(pid).await;
-            context.job_registry.close_stderr(pid).await;
+            job_registry.close_stdout(pid).await;
+            job_registry.close_stderr(pid).await;
             Ok((pid, output))
         }
-        Ok(crate::shell_session::ContainerExecOutcome::Killed) => {
-            context.job_registry.close_stdout(pid).await;
-            context.job_registry.close_stderr(pid).await;
+        Ok(ContainerExecOutcome::Killed) => {
+            job_registry.close_stdout(pid).await;
+            job_registry.close_stderr(pid).await;
             Err(TerminalError::Execution("container job killed".to_string()))
         }
         Err(err) => {
-            context.job_registry.fail(pid, &err, None).await;
-            context.job_registry.close_stdout(pid).await;
-            context.job_registry.close_stderr(pid).await;
+            job_registry.fail(pid, &err, None).await;
+            job_registry.close_stdout(pid).await;
+            job_registry.close_stderr(pid).await;
             Err(TerminalError::Execution(err))
         }
     }
@@ -3637,7 +3806,10 @@ fn spawn_terminal_reader<R>(
     });
 }
 
-fn spawn_terminal_stdin_writer<W>(mut writer: W) -> async_channel::Sender<Vec<u8>>
+fn spawn_terminal_stdin_writer<W>(
+    mut writer: W,
+    feed: FeedCounter,
+) -> async_channel::Sender<Vec<u8>>
 where
     W: Write + Send + 'static,
 {
@@ -3647,6 +3819,7 @@ where
             if bytes.is_empty() {
                 continue;
             }
+            feed.record();
             if let Err(error) = writer.write_all(&bytes) {
                 warn!(error = %error, "terminal stdin write failed");
                 break;
@@ -3767,8 +3940,11 @@ mod tests {
 
     use super::*;
     use crate::ToolRegistryBuilder;
+    #[cfg(unix)]
     use crate::builtin::{InputTerminalArgs, InputTerminalTool};
-    use heel::{DenyAll, NiceLevel};
+    #[cfg(unix)]
+    use heel::DenyAll;
+    use heel::NiceLevel;
 
     async fn prepared_test_registry() -> (tempfile::TempDir, ShellSessionRegistry) {
         let cache = tempfile::tempdir().unwrap();
@@ -3824,7 +4000,7 @@ mod tests {
             _working_dir: &str,
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
-            _stdin_blocked_notice: Option<Sender<String>>,
+            _stdin_blocked: Option<Sender<StdinWatchSignal>>,
         ) -> impl std::future::Future<Output = Result<crate::ContainerExecOutcome, String>> + Send
         {
             std::future::ready(Err("adoption never executes in the container".to_string()))
@@ -4679,7 +4855,7 @@ mod tests {
             script: "/bin/pwd".to_string(),
             mode: TerminalMode::Sandboxed,
             backend: ExecutionBackend::Local(tool.shell_sessions.local_tools().unwrap().clone()),
-            stdin_blocked_notice: None,
+            stdin_alerts: None,
             background_startup: BackgroundStartup::new(startup_tx),
             network_audit: None,
             priority: ProcessPriority::default(),
@@ -4915,58 +5091,235 @@ mod tests {
         panic!("descendant process {child_pid} survived terminal cancellation");
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn sandboxed_terminal_kills_stdin_blocked_command_and_reports_it() {
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreground_command_reading_stdin_gets_eof_at_once() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                local: true,
-                container: false,
-                ssh: false,
-            })
-            .with_foreground_limit(Duration::from_secs(2));
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
-        let tool = tool.with_registry(registry);
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
 
+        let started = std::time::Instant::now();
         let result = tool
             .call(
-                TerminalArgs {
-                    description: "wait for terminal input and echo it back".to_string(),
-                    script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\""
-                        .to_string(),
-                    mode: TerminalExecutionMode::Sandboxed,
-                    ssh_server_id: None,
-                    expect: OutputFormat::Text,
-                    resolution: MediaResolution::Auto,
-                    max_lines: 50,
-                    raw: false,
-                },
+                terminal_args("read all of stdin", "cat"),
                 ToolContext::new(),
             )
             .await
             .expect("terminal call should succeed");
 
         let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.status.as_deref(), Some("killed"));
-        let notice = payload
-            .notice
-            .expect("a killed foreground result carries a notice");
+        assert_eq!(payload.exit_code, 0);
+        assert!(payload.status.is_none(), "the call must not be killed");
+        assert!(matches!(payload.stdout, OutputEntry::Empty));
         assert!(
-            notice.contains(TERMINAL_STDIN_BLOCKED_NOTICE),
-            "notice should report the stdin wait: {notice}"
+            started.elapsed() < Duration::from_secs(10),
+            "cat must see EOF instead of waiting out the limit"
         );
+    }
+
+    #[cfg(unix)]
+    fn terminal_args(description: &str, script: &str) -> TerminalArgs {
+        TerminalArgs {
+            description: description.to_string(),
+            script: script.to_string(),
+            mode: TerminalExecutionMode::Sandboxed,
+            ssh_server_id: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            max_lines: 50,
+            raw: false,
+        }
+    }
+
+    /// Starts `script` as a background job and returns its task id.
+    #[cfg(unix)]
+    async fn start_background_job(
+        tool: &TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+        script: &str,
+    ) -> String {
+        let result = tool
+            .background_tool()
+            .call(
+                TerminalBackgroundArgs {
+                    terminal: terminal_args("background job", script),
+                    timeout: 30,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal_background should start the job");
+        parse_terminal_tool_result(&result)
+            .task_id
+            .expect("background job needs a task id")
+    }
+
+    /// Collects the alerts that arrive within `window`.
+    #[cfg(unix)]
+    async fn alerts_within(receiver: &BackgroundTaskReceiver, window: Duration) -> Vec<JobAlert> {
+        let deadline = std::time::Instant::now() + window;
+        let mut alerts = Vec::new();
+        while std::time::Instant::now() < deadline {
+            alerts.extend(receiver.take_job_alerts());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        alerts
+    }
+
+    /// A foreground container command must see stdin EOF at once: the input
+    /// sender is dropped before the exec runs. Catches the regression where
+    /// the sender lived until the call returned and `cat` waited out the
+    /// limit.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn container_foreground_command_reading_stdin_gets_eof_at_once() {
+        /// A container executor that asserts its stdin is already at EOF.
+        struct ForegroundStdinEofExec;
+
+        impl crate::ContainerExec for ForegroundStdinEofExec {
+            async fn exec(
+                &self,
+                _container_id: &str,
+                _script: &str,
+                _working_dir: &str,
+                _kill_rx: Receiver<()>,
+                stdin_rx: Receiver<Vec<u8>>,
+                _stdin_blocked: Option<Sender<StdinWatchSignal>>,
+            ) -> Result<ContainerExecOutcome, String> {
+                let eof = futures_lite::future::or(async { Some(stdin_rx.recv().await) }, async {
+                    async_io::Timer::after(Duration::from_secs(5)).await;
+                    None
+                })
+                .await
+                .expect("a foreground exec's stdin must be EOF at once, not left open");
+                assert!(eof.is_err(), "a foreground exec's stdin must carry no data");
+                Ok(ContainerExecOutcome::Completed(std::process::Output {
+                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(dir.path()));
+        let (job_registry, job_registry_service) = job_registry_channel();
+        tokio::spawn(async move { job_registry_service.serve().await });
+        let container_tools =
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle());
+        let runtime = ContainerShellRuntime::new(
+            "aither-test-foreground-eof",
+            crate::ContainerIpcRoute::new(
+                "host.docker.internal",
+                crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
+                    .expect("loopback binds the bridge"),
+            ),
+            crate::AnyContainerExec::new(Arc::new(ForegroundStdinEofExec)),
+        );
+        let (startup_tx, _startup_rx) = async_channel::bounded(1);
+        let (_pid, output) = execute_container_background(ContainerBackgroundExecution {
+            executor: executor_core::tokio::TokioGlobal,
+            registry: &registry,
+            task_id: "task-test",
+            execution_id: "exec-test",
+            script: "cat",
+            mode: TerminalMode::Sandboxed,
+            container_runtime: &runtime,
+            prepared_tools: &container_tools,
+            ipc_commands: &[],
+            job_registry: &job_registry,
+            stdin_alerts: None,
+            background_startup: &BackgroundStartup::new(startup_tx),
+            priority: ProcessPriority::default(),
+        })
+        .await
+        .expect("a foreground container exec should complete at EOF");
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// A job whose `reader` script blocks on stdin yields exactly one alert
+    /// until it is fed, and finishes once it is.
+    #[cfg(unix)]
+    async fn stdin_reader_alerts_once_and_resumes_when_fed(reader: &str) {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        let background_receiver = tool.background_receiver();
+        let task_id = start_background_job(&tool, reader).await;
+
+        let alerts = alerts_within(&background_receiver, Duration::from_secs(8)).await;
+        assert!(
+            matches!(
+                alerts.as_slice(),
+                [JobAlert::StdinBlocked(job)] if job.task_id == task_id
+            ),
+            "a blocked reader must yield exactly one stdin alert: {alerts:?}"
+        );
+
+        InputTerminalTool::new(tool.job_registry())
+            .call(
+                InputTerminalArgs {
+                    task_id: task_id.clone(),
+                    input: "lexo".to_string(),
+                    append_newline: true,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal_input should succeed");
+        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let terminal_result = completed.result.expect("the fed job should complete");
+        let stdout =
+            output_text(&terminal_result.stdout).expect("completed task should include stdout");
+        assert!(stdout.contains("hello lexo"), "got: {stdout}");
+        assert!(
+            background_receiver.take_job_alerts().is_empty(),
+            "a fed job that finished must not alert again"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_job_blocked_on_stdin_yields_one_alert() {
+        stdin_reader_alerts_once_and_resumes_when_fed("read name; printf 'hello %s\\n' \"$name\"")
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_grandchild_blocked_on_stdin_yields_one_alert() {
+        stdin_reader_alerts_once_and_resumes_when_fed(
+            "( ( read name; printf 'hello %s\\n' \"$name\" ); true )",
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_job_that_never_reads_stdin_yields_no_alert() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        let background_receiver = tool.background_receiver();
+        let task_id = start_background_job(&tool, "sleep 3; echo finished").await;
+
+        let alerts = alerts_within(&background_receiver, Duration::from_secs(4)).await;
+        assert!(alerts.is_empty(), "no alert expected: {alerts:?}");
+        wait_for_completed_task(&background_receiver, &task_id).await;
     }
 
     /// The nice value `level` steps below this test process lands at, capped
@@ -5166,7 +5519,7 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let alerts = loop {
-            let alerts = background_receiver.take_long_running_alerts();
+            let alerts = background_receiver.take_job_alerts();
             if !alerts.is_empty() {
                 break alerts;
             }
@@ -5177,9 +5530,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].task_id, task_id);
         assert!(
-            background_receiver.take_long_running_alerts().is_empty(),
+            matches!(&alerts[0], JobAlert::LongRunning(job) if job.task_id == task_id),
+            "expected the long-running alert for the job: {alerts:?}"
+        );
+        assert!(
+            background_receiver.take_job_alerts().is_empty(),
             "the same job must not alert twice"
         );
 
