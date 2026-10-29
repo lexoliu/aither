@@ -274,7 +274,7 @@ impl Context {
 
     /// Returns the current compaction handoff document.
     #[must_use]
-    pub fn handoff(&self) -> Option<&Handoff> {
+    pub const fn handoff(&self) -> Option<&Handoff> {
         self.handoff.as_ref()
     }
 
@@ -722,7 +722,7 @@ impl ContextCheckpoint {
 
     /// Returns the handoff document, if present.
     #[must_use]
-    pub fn handoff(&self) -> Option<&Handoff> {
+    pub const fn handoff(&self) -> Option<&Handoff> {
         self.handoff.as_ref()
     }
 
