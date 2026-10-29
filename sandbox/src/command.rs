@@ -260,7 +260,102 @@ impl std::fmt::Debug for ToolEntry {
     }
 }
 
+/// Which side of the authority boundary a command registry serves.
+///
+/// The main agent's terminal serves [`CommandRole::Main`]; every terminal built
+/// for a subagent, at any nesting depth, serves [`CommandRole::Subagent`], so a
+/// subagent can never reach a handler reserved for the main agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommandRole {
+    /// The main agent.
+    Main,
+    /// A subagent, or a subagent of one.
+    Subagent,
+}
+
+/// What a command resolves to in each role; a subagent role without an entry
+/// gets the refusal naming the command as reserved for the main agent.
+#[derive(Debug)]
+struct RoleEntries<T> {
+    main: T,
+    subagent: Option<T>,
+}
+
+impl<T: Clone> Clone for RoleEntries<T> {
+    fn clone(&self) -> Self {
+        Self {
+            main: self.main.clone(),
+            subagent: self.subagent.clone(),
+        }
+    }
+}
+
+impl<T> RoleEntries<T> {
+    /// One entry serving both roles.
+    fn shared(entry: T) -> Self
+    where
+        T: Clone,
+    {
+        Self {
+            main: entry.clone(),
+            subagent: Some(entry),
+        }
+    }
+
+    /// The entry `role` reaches; `None` when the command is reserved for the
+    /// main agent.
+    const fn for_role(&self, role: CommandRole) -> Option<&T> {
+        match role {
+            CommandRole::Main => Some(&self.main),
+            CommandRole::Subagent => self.subagent.as_ref(),
+        }
+    }
+}
+
+/// Builds a command's handler for the terminal that serves it.
+type BindHandlerFn = Box<dyn Fn(&TerminalBinding) -> ToolHandlerFn + Send + Sync>;
+
+/// A command whose handler is built per terminal, from the terminal's
+/// [`TerminalBinding`].
+struct BoundEntry {
+    bind: BindHandlerFn,
+    help: String,
+    stdin_arg: Option<String>,
+}
+
+impl std::fmt::Debug for BoundEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundEntry")
+            .field("help", &self.help)
+            .field("stdin_arg", &self.stdin_arg)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BoundEntry {
+    fn instantiate(&self, binding: &TerminalBinding) -> ToolEntry {
+        ToolEntry {
+            handler: (self.bind)(binding),
+            help: self.help.clone(),
+            stdin_arg: self.stdin_arg.clone(),
+        }
+    }
+}
+
+/// What a command name resolves to in one role.
+struct Resolved<'a> {
+    /// The handler; `None` when the command is reserved for the main agent.
+    handler: Option<&'a ToolHandlerFn>,
+    help: &'a str,
+    stdin_arg: Option<&'a str>,
+}
+
+fn reserved_for_main_text(name: &str) -> String {
+    format!("`{name}` is reserved for the main agent and is not available to subagents")
+}
+
 use crate::output::{INLINE_OUTPUT_LIMIT, generate_word_filename};
+use crate::terminal::TerminalBinding;
 
 /// Handles large outputs by saving to file in the sandbox output directory.
 ///
@@ -383,6 +478,8 @@ pub struct DynTerminalTool {
     pub(crate) working_dir: PathBuf,
     pub(crate) command_names: Vec<String>,
     pub(crate) prepared_tools: crate::ToolCatalog,
+    pub(crate) commit_ledger: Option<crate::subagent::CommitLedger>,
+    pub(crate) role: CommandRole,
 }
 
 impl DynTerminalTool {
@@ -416,6 +513,21 @@ impl DynTerminalTool {
         &self.working_dir
     }
 
+    /// Lists the commits of the subagent this bundle serves, when it was
+    /// launched with a commit grant.
+    #[must_use]
+    pub const fn commit_ledger(&self) -> Option<&crate::subagent::CommitLedger> {
+        self.commit_ledger.as_ref()
+    }
+
+    /// The role the bundle's command registry serves: [`CommandRole::Main`]
+    /// for the main agent's terminal, [`CommandRole::Subagent`] for a
+    /// subagent's.
+    #[must_use]
+    pub const fn role(&self) -> CommandRole {
+        self.role
+    }
+
     /// Whether a CLI command with `name` is registered in the shared registry.
     #[must_use]
     pub fn has_command(&self, name: &str) -> bool {
@@ -439,26 +551,42 @@ impl std::fmt::Debug for DynTerminalTool {
 }
 
 /// Builder for tool registries.
+///
+/// Every command is registered for both [`CommandRole`]s;
+/// [`Self::main_only`] reserves what it registers for the main agent (the
+/// subagent role then gets a refusal naming the command as reserved for the
+/// main agent), and [`Self::configure_role_tools`] registers one handler per
+/// role. A command whose handler depends on the terminal serving it is
+/// registered with [`Self::configure_terminal_bound_tool`] and built anew for
+/// every terminal, a subagent's included.
 #[derive(Debug, Default)]
 pub struct ToolRegistryBuilder {
-    entries: HashMap<String, ToolEntry>,
+    entries: HashMap<String, RoleEntries<Arc<ToolEntry>>>,
+    bound: HashMap<String, RoleEntries<Arc<BoundEntry>>>,
 }
 
 impl ToolRegistryBuilder {
     /// Creates an empty registry builder.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
+        Self::default()
     }
 
-    /// Configures a tool to be callable from the sandbox.
+    fn insert_entry(&mut self, name: String, entries: RoleEntries<Arc<ToolEntry>>) {
+        self.bound.remove(&name);
+        self.entries.insert(name, entries);
+    }
+
+    fn insert_bound(&mut self, name: String, entries: RoleEntries<Arc<BoundEntry>>) {
+        self.entries.remove(&name);
+        self.bound.insert(name, entries);
+    }
+
+    /// Configures a tool to be callable from the sandbox by both roles.
     ///
     /// The tool's argument schema is what the sandbox-side command line parses
     /// against — positional words bind to required fields, so a tool with a
-    /// required `query: String` accepts `websearch "rust"` as well as
-    /// `websearch --query "rust"`.
+    /// single required field accepts a single positional argument.
     ///
     /// # Panics
     /// Panics if the tool argument schema cannot be serialized.
@@ -467,58 +595,101 @@ impl ToolRegistryBuilder {
         T: Tool + Send + Sync + 'static,
         T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
     {
-        let schema = serde_json::to_value(schemars::schema_for!(T::Arguments))
-            .expect("failed to serialize tool schema");
+        let (name, entry) = tool_entry(tool);
+        self.insert_entry(name, RoleEntries::shared(Arc::new(entry)));
+    }
 
-        // Auto-detect stdin_arg from schema: optional "input" field
+    /// Configures a tool built for each terminal that serves the registry,
+    /// from that terminal's [`TerminalBinding`]: its working directory and
+    /// the launcher for the subagents it starts. A subagent's terminal builds
+    /// its own instance, so the command acts with that subagent's authority.
+    ///
+    /// # Panics
+    /// Panics if the tool argument schema cannot be serialized, and, when a
+    /// terminal binds the registry, if the built tool is not named `name`.
+    pub fn configure_terminal_bound_tool<T, F>(&mut self, name: impl Into<String>, bind: F)
+    where
+        F: Fn(&TerminalBinding) -> T + Send + Sync + 'static,
+        T: Tool + Send + Sync + 'static,
+        T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+    {
+        let name = name.into();
+        let schema = tool_schema::<T::Arguments>();
+        let help = schema_to_help(&schema);
         let stdin_arg = detect_stdin_arg(&schema);
+        let bound_name = name.clone();
+        let entry = BoundEntry {
+            bind: Box::new(move |binding| {
+                let tool = bind(binding);
+                assert_eq!(
+                    tool.name(),
+                    bound_name,
+                    "a terminal-bound command keeps the name it was registered under"
+                );
+                tool_handler(Arc::new(tool), schema.clone())
+            }),
+            help,
+            stdin_arg,
+        };
+        self.insert_bound(name, RoleEntries::shared(Arc::new(entry)));
+    }
 
-        let tool = Arc::new(tool);
-        let tool_name = tool.name().to_string();
-        let help_text = schema_to_help(&schema);
+    /// Reserves for the main agent every command `configure` registers: a
+    /// subagent's call is refused with a message naming the command as
+    /// reserved for the main agent, while help and stdin handling stay those
+    /// of the real command.
+    pub fn main_only(&mut self, configure: impl FnOnce(&mut Self)) {
+        let mut reserved = Self::new();
+        configure(&mut reserved);
+        for (name, entries) in reserved.entries {
+            self.insert_entry(
+                name,
+                RoleEntries {
+                    main: entries.main,
+                    subagent: None,
+                },
+            );
+        }
+        for (name, entries) in reserved.bound {
+            self.insert_bound(
+                name,
+                RoleEntries {
+                    main: entries.main,
+                    subagent: None,
+                },
+            );
+        }
+    }
 
-        let name_for_errors = tool_name.clone();
-        let handler: ToolHandlerFn = Box::new(move |args: Vec<String>| {
-            let tool = tool.clone();
-            let schema = schema.clone();
-            let name = name_for_errors.clone();
-            Box::pin(async move {
-                tracing::debug!(tool = %name, ?args, "configure_tool handler: raw CLI args");
-                let json_args = match cli_to_json(&schema, &args) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let message = e.to_string();
-                        return Err(tool_usage_error(message.as_str(), name.as_str()));
-                    }
-                };
-                tracing::debug!(tool = %name, json = %json_args, "configure_tool handler: parsed JSON");
-                let parsed = match serde_json::from_value(json_args) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let message = prefix_error("invalid arguments: ", &e);
-                        return Err(tool_usage_error(message.as_str(), name.as_str()));
-                    }
-                };
-                // A shell invocation has nowhere to show progress.
-                let output = tool
-                    .call(parsed, ToolContext::new())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                tool_output_to_payload(output)
-            })
-        });
-
-        self.entries.insert(
-            tool_name,
-            ToolEntry {
-                handler,
-                help: help_text,
-                stdin_arg,
+    /// Configures one command with a handler per role.
+    ///
+    /// # Panics
+    /// Panics if the tools do not share a name, or a tool argument schema
+    /// cannot be serialized.
+    pub fn configure_role_tools<M, S>(&mut self, main: M, subagent: S)
+    where
+        M: Tool + Send + Sync + 'static,
+        M::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+        S: Tool + Send + Sync + 'static,
+        S::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+    {
+        let (name, main) = tool_entry(main);
+        let (subagent_name, subagent) = tool_entry(subagent);
+        assert_eq!(
+            name, subagent_name,
+            "a command's role handlers must share its name"
+        );
+        self.insert_entry(
+            name,
+            RoleEntries {
+                main: Arc::new(main),
+                subagent: Some(Arc::new(subagent)),
             },
         );
     }
 
-    /// Configures a schema-defined handler to be callable from the sandbox.
+    /// Configures a schema-defined handler to be callable from the sandbox by
+    /// both roles.
     ///
     /// This is the dynamic counterpart to [`Self::configure_tool`]. The CLI
     /// wrapper is derived entirely from the provided [`ToolDefinition`]'s JSON
@@ -535,50 +706,11 @@ impl ToolRegistryBuilder {
             + Sync
             + 'static,
     {
-        let name = definition.name().to_string();
-        let description = definition.description().to_string();
-        let schema = definition.arguments_openai_schema();
-        let stdin_arg = detect_stdin_arg(&schema);
-        let help_text = if description.is_empty() {
-            schema_to_help(&schema)
-        } else {
-            let mut help = String::with_capacity(description.len() + 2);
-            help.push_str(description.as_str());
-            help.push_str("\n\n");
-            help.push_str(schema_to_help(&schema).as_str());
-            help
-        };
-
-        let schema_for_handler = schema;
-        let name_for_handler = name.clone();
-        let handler = Arc::new(handler);
-        let raw_handler: ToolHandlerFn = Box::new(move |args: Vec<String>| {
-            let schema = schema_for_handler.clone();
-            let name = name_for_handler.clone();
-            let handler = handler.clone();
-            Box::pin(async move {
-                let json_args = match cli_to_json(&schema, &args) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let message = error.to_string();
-                        return Err(tool_usage_error(message.as_str(), name.as_str()));
-                    }
-                };
-                handler(json_args).await
-            })
-        });
-
-        self.entries.insert(
-            name,
-            ToolEntry {
-                handler: raw_handler,
-                help: help_text,
-                stdin_arg,
-            },
-        );
+        let (name, entry) = definition_entry(definition, handler);
+        self.insert_entry(name, RoleEntries::shared(Arc::new(entry)));
     }
 
-    /// Registers a raw handler function as an IPC command.
+    /// Registers a raw handler function as an IPC command for both roles.
     ///
     /// This is useful for dynamic tools like MCP tools that are discovered at runtime.
     pub fn configure_raw_handler<F>(
@@ -595,35 +727,156 @@ impl ToolRegistryBuilder {
             + Sync
             + 'static,
     {
-        self.entries.insert(
+        self.insert_entry(
             name.into(),
-            ToolEntry {
+            RoleEntries::shared(Arc::new(ToolEntry {
                 handler: Box::new(handler),
                 help: help.into(),
                 stdin_arg: None,
-            },
+            })),
         );
     }
 
-    /// Builds an immutable registry with a concrete output directory.
+    /// Builds an immutable main-agent registry with a concrete output
+    /// directory; [`ToolRegistry::for_subagent`] derives the subagent view.
+    /// Terminal-bound commands are built when a terminal serves it.
     #[must_use]
     pub fn build(self, output_dir: impl Into<PathBuf>) -> ToolRegistry {
         ToolRegistry {
-            entries: self
-                .entries
-                .into_iter()
-                .map(|(name, entry)| (name, Arc::new(entry)))
-                .collect(),
+            entries: self.entries,
+            bound: self.bound,
+            instances: HashMap::new(),
             output_dir: output_dir.into(),
+            role: CommandRole::Main,
         }
     }
 }
 
-/// Immutable registry of tool handlers.
+/// The JSON schema of a tool's arguments.
+fn tool_schema<A: JsonSchema>() -> Value {
+    serde_json::to_value(schemars::schema_for!(A)).expect("failed to serialize tool schema")
+}
+
+/// The handler running `tool` with arguments parsed against `schema`.
+fn tool_handler<T>(tool: Arc<T>, schema: Value) -> ToolHandlerFn
+where
+    T: Tool + Send + Sync + 'static,
+    T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+{
+    let name_for_errors = tool.name().to_string();
+    Box::new(move |args: Vec<String>| {
+        let tool = tool.clone();
+        let schema = schema.clone();
+        let name = name_for_errors.clone();
+        Box::pin(async move {
+            tracing::debug!(tool = %name, ?args, "configure_tool handler: raw CLI args");
+            let json_args = match cli_to_json(&schema, &args) {
+                Ok(v) => v,
+                Err(e) => {
+                    let message = e.to_string();
+                    return Err(tool_usage_error(message.as_str(), name.as_str()));
+                }
+            };
+            tracing::debug!(tool = %name, json = %json_args, "configure_tool handler: parsed JSON");
+            let parsed = match serde_json::from_value(json_args) {
+                Ok(v) => v,
+                Err(e) => {
+                    let message = prefix_error("invalid arguments: ", &e);
+                    return Err(tool_usage_error(message.as_str(), name.as_str()));
+                }
+            };
+            // A shell invocation has nowhere to show progress.
+            let output = tool
+                .call(parsed, ToolContext::new())
+                .await
+                .map_err(|error| error.to_string())?;
+            tool_output_to_payload(output)
+        })
+    })
+}
+
+/// Builds the registry entry for a [`Tool`].
+fn tool_entry<T>(tool: T) -> (String, ToolEntry)
+where
+    T: Tool + Send + Sync + 'static,
+    T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+{
+    let schema = tool_schema::<T::Arguments>();
+    // Auto-detect stdin_arg from schema: optional "input" field
+    let stdin_arg = detect_stdin_arg(&schema);
+    let help = schema_to_help(&schema);
+    let name = tool.name().to_string();
+    (
+        name,
+        ToolEntry {
+            handler: tool_handler(Arc::new(tool), schema),
+            help,
+            stdin_arg,
+        },
+    )
+}
+
+/// Builds the registry entry for a schema-defined handler.
+fn definition_entry<F>(definition: &ToolDefinition, handler: F) -> (String, ToolEntry)
+where
+    F: Fn(Value) -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+{
+    let name = definition.name().to_string();
+    let description = definition.description().to_string();
+    let schema = definition.arguments_openai_schema();
+    let stdin_arg = detect_stdin_arg(&schema);
+    let help_text = if description.is_empty() {
+        schema_to_help(&schema)
+    } else {
+        let mut help = String::with_capacity(description.len() + 2);
+        help.push_str(description.as_str());
+        help.push_str("\n\n");
+        help.push_str(schema_to_help(&schema).as_str());
+        help
+    };
+
+    let schema_for_handler = schema;
+    let name_for_handler = name.clone();
+    let handler = Arc::new(handler);
+    let raw_handler: ToolHandlerFn = Box::new(move |args: Vec<String>| {
+        let schema = schema_for_handler.clone();
+        let name = name_for_handler.clone();
+        let handler = handler.clone();
+        Box::pin(async move {
+            let json_args = match cli_to_json(&schema, &args) {
+                Ok(value) => value,
+                Err(error) => {
+                    let message = error.to_string();
+                    return Err(tool_usage_error(message.as_str(), name.as_str()));
+                }
+            };
+            handler(json_args).await
+        })
+    });
+
+    (
+        name,
+        ToolEntry {
+            handler: raw_handler,
+            help: help_text,
+            stdin_arg,
+        },
+    )
+}
+
+/// Immutable registry of tool handlers, as one [`CommandRole`] sees them.
 #[derive(Debug, Clone)]
 pub struct ToolRegistry {
-    entries: HashMap<String, Arc<ToolEntry>>,
+    entries: HashMap<String, RoleEntries<Arc<ToolEntry>>>,
+    bound: HashMap<String, RoleEntries<Arc<BoundEntry>>>,
+    /// The terminal-bound commands built for the terminal serving this
+    /// registry, in its role.
+    instances: HashMap<String, Arc<ToolEntry>>,
     output_dir: PathBuf,
+    role: CommandRole,
 }
 
 /// Detects the stdin argument from a JSON schema.
@@ -661,26 +914,93 @@ impl ToolRegistry {
         controls.configure_tool(crate::builtin::KillTerminalTool::new(jobs.clone()));
         controls.configure_tool(crate::builtin::InputTerminalTool::new(jobs.clone()));
         controls.configure_tool(crate::builtin::ReadTerminalDeltaTool::new(jobs));
-        self.entries.extend(
-            controls
-                .entries
-                .into_iter()
-                .map(|(name, entry)| (name, Arc::new(entry))),
-        );
+        self.entries.extend(controls.entries);
         self.output_dir = output_dir;
         self
+    }
+
+    /// Builds the terminal-bound commands for the terminal `binding`
+    /// describes, in this registry's role.
+    pub(crate) fn bind(mut self, binding: &TerminalBinding) -> Self {
+        self.instances = self
+            .bound
+            .iter()
+            .filter_map(|(name, entries)| {
+                entries
+                    .for_role(self.role)
+                    .map(|entry| (name.clone(), Arc::new(entry.instantiate(binding))))
+            })
+            .collect();
+        self
+    }
+
+    /// The role this registry serves.
+    #[must_use]
+    pub const fn role(&self) -> CommandRole {
+        self.role
+    }
+
+    /// The registry a subagent's terminal serves: the same commands, each
+    /// resolved to its subagent-role handler, with terminal-bound commands
+    /// left for the subagent's terminal to build. Asking a subagent registry
+    /// for its subagent registry returns the same view, so nesting never
+    /// escalates.
+    #[must_use]
+    pub fn for_subagent(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            bound: self.bound.clone(),
+            instances: HashMap::new(),
+            output_dir: self.output_dir.clone(),
+            role: CommandRole::Subagent,
+        }
+    }
+
+    /// What `tool_name` resolves to in this registry's role.
+    ///
+    /// # Panics
+    /// Panics when `tool_name` is a terminal-bound command and no terminal
+    /// has bound this registry; a terminal binds the registry it serves.
+    fn resolve(&self, tool_name: &str) -> Option<Resolved<'_>> {
+        if let Some(bound) = self.bound.get(tool_name) {
+            let entry = bound.for_role(self.role);
+            let shown = entry.unwrap_or(&bound.main);
+            return Some(Resolved {
+                handler: entry.map(|_| {
+                    &self
+                        .instances
+                        .get(tool_name)
+                        .expect("a terminal binds the registry it serves")
+                        .handler
+                }),
+                help: &shown.help,
+                stdin_arg: shown.stdin_arg.as_deref(),
+            });
+        }
+        let entries = self.entries.get(tool_name)?;
+        let shown = entries.for_role(self.role).unwrap_or(&entries.main);
+        Some(Resolved {
+            handler: entries.for_role(self.role).map(|entry| &entry.handler),
+            help: &shown.help,
+            stdin_arg: shown.stdin_arg.as_deref(),
+        })
     }
 
     /// Queries a tool handler by name.
     ///
     /// Large outputs (> 4000 chars) are automatically saved to file.
     pub async fn query_tool_handler(&self, tool_name: &str, args: &[String]) -> CommandEnvelope {
-        let entry = self.entries.get(tool_name);
-        match entry {
-            Some(entry) => match (entry.handler)(args.to_vec()).await {
+        match self.resolve(tool_name) {
+            Some(Resolved {
+                handler: Some(handler),
+                ..
+            }) => match handler(args.to_vec()).await {
                 Ok(output) => handle_large_output(output, &self.output_dir).await,
                 Err(error) => CommandEnvelope::failure(error),
             },
+            Some(Resolved { handler: None, .. }) => {
+                CommandEnvelope::failure(reserved_for_main_text(tool_name))
+            }
             None => CommandEnvelope::failure(unknown_command_text(tool_name)),
         }
     }
@@ -688,27 +1008,55 @@ impl ToolRegistry {
     /// Returns whether a tool is registered.
     #[must_use]
     pub fn is_tool_configured(&self, tool_name: &str) -> bool {
-        self.entries.contains_key(tool_name)
+        self.entries.contains_key(tool_name) || self.bound.contains_key(tool_name)
+    }
+
+    /// Returns whether a tool is reserved for the main agent in this
+    /// registry's role, so a call to it is refused.
+    #[must_use]
+    pub fn is_reserved(&self, tool_name: &str) -> bool {
+        self.bound.get(tool_name).map_or_else(
+            || {
+                self.entries
+                    .get(tool_name)
+                    .is_some_and(|entries| entries.for_role(self.role).is_none())
+            },
+            |bound| bound.for_role(self.role).is_none(),
+        )
     }
 
     /// Returns the help text for a tool.
     #[must_use]
     pub fn tool_help(&self, tool_name: &str) -> Option<String> {
-        self.entries.get(tool_name).map(|e| e.help.clone())
+        self.resolve(tool_name)
+            .map(|resolved| resolved.help.to_string())
     }
 
     /// Returns the stdin argument for a tool.
     #[must_use]
     pub fn tool_stdin_arg(&self, tool_name: &str) -> Option<String> {
-        self.entries
-            .get(tool_name)
-            .and_then(|e| e.stdin_arg.clone())
+        self.resolve(tool_name)
+            .and_then(|resolved| resolved.stdin_arg.map(str::to_string))
     }
 
     /// Returns list of registered tool names.
     #[must_use]
     pub fn registered_tool_names(&self) -> Vec<String> {
-        self.entries.keys().cloned().collect()
+        self.entries
+            .keys()
+            .chain(self.bound.keys())
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the registered tool names this registry's role can actually
+    /// run, leaving out commands reserved for the main agent.
+    #[must_use]
+    pub fn available_tool_names(&self) -> Vec<String> {
+        self.registered_tool_names()
+            .into_iter()
+            .filter(|name| !self.is_reserved(name))
+            .collect()
     }
 }
 
@@ -2722,5 +3070,119 @@ mod tests {
             error.to_string().contains("unknown subcommand 'explode'"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Echoes which role's handler ran.
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct RoleArgs {}
+
+    struct RoleTool {
+        name: &'static str,
+        answer: &'static str,
+    }
+
+    impl aither_core::llm::Tool for RoleTool {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            self.name.into()
+        }
+        type Arguments = RoleArgs;
+        type Res = aither_core::llm::ToolResult;
+
+        fn call(
+            &self,
+            _args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(aither_core::llm::ToolResult::Text {
+                text: self.answer.to_string(),
+            }))
+        }
+    }
+
+    async fn run_command(registry: &ToolRegistry, name: &str) -> CommandEnvelope {
+        registry.query_tool_handler(name, &[]).await
+    }
+
+    #[tokio::test]
+    async fn main_only_command_is_refused_to_a_subagent_and_works_for_the_main_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = ToolRegistryBuilder::new();
+        builder.main_only(|reserved| {
+            reserved.configure_tool(RoleTool {
+                name: "reserved",
+                answer: "main ran it",
+            });
+        });
+        builder.configure_tool(RoleTool {
+            name: "shared",
+            answer: "anyone ran it",
+        });
+        let main = builder.build(tmp.path());
+        let subagent = main.for_subagent();
+
+        let ok = run_command(&main, "reserved").await;
+        assert!(ok.ok, "the main agent keeps the command: {ok:?}");
+        assert_eq!(ok.payload.unwrap().render_for_cli().unwrap(), "main ran it");
+
+        let refused = run_command(&subagent, "reserved").await;
+        assert!(!refused.ok);
+        let error = refused.error.unwrap();
+        assert!(
+            error.contains("`reserved` is reserved for the main agent"),
+            "{error}"
+        );
+        assert!(subagent.is_reserved("reserved"));
+        assert!(!subagent.available_tool_names().contains(&"reserved".into()));
+        assert!(
+            subagent
+                .registered_tool_names()
+                .contains(&"reserved".into())
+        );
+
+        let shared = run_command(&subagent, "shared").await;
+        assert!(shared.ok, "a shared command stays available: {shared:?}");
+    }
+
+    #[tokio::test]
+    async fn role_split_command_runs_each_roles_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_role_tools(
+            RoleTool {
+                name: "split",
+                answer: "main handler",
+            },
+            RoleTool {
+                name: "split",
+                answer: "subagent handler",
+            },
+        );
+        let main = builder.build(tmp.path());
+        let subagent = main.for_subagent();
+
+        let answer = |envelope: CommandEnvelope| {
+            envelope
+                .payload
+                .expect("the handler ran")
+                .render_for_cli()
+                .unwrap()
+        };
+        assert_eq!(main.role(), CommandRole::Main);
+        assert_eq!(answer(run_command(&main, "split").await), "main handler");
+        assert_eq!(subagent.role(), CommandRole::Subagent);
+        assert_eq!(
+            answer(run_command(&subagent, "split").await),
+            "subagent handler"
+        );
+    }
+
+    #[test]
+    fn a_subagent_registry_delegates_the_subagent_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = ToolRegistryBuilder::new()
+            .build(tmp.path())
+            .for_subagent()
+            .for_subagent();
+        assert_eq!(nested.role(), CommandRole::Subagent);
     }
 }

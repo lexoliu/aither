@@ -19,7 +19,7 @@ use aither_core::{
     LanguageModel,
     llm::{Tool, ToolResult, oneshot},
 };
-use aither_sandbox::TerminalToolFactory;
+use aither_sandbox::{CommitLedger, CommitListing, CommitMark, SubagentGrant, TerminalBinding};
 use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,16 @@ impl SubagentFileMount {
         Self {
             virtual_prefix: virtual_prefix.into(),
             host_root: host_root.into(),
+        }
+    }
+}
+
+impl<LLM> Clone for SubagentType<LLM> {
+    fn clone(&self) -> Self {
+        Self {
+            description: self.description.clone(),
+            model: self.model,
+            builder: Arc::clone(&self.builder),
         }
     }
 }
@@ -145,6 +155,18 @@ pub enum SubagentArgs {
         /// definition declares none, the fast model reads the prompt and
         /// routes it to one of the configured tiers.
         model: Option<ModelTier>,
+        /// Directories, usually linked git worktrees you created, the
+        /// subagent may write in addition to its own space. Each must be
+        /// inside what you can write. Everything else you can write is
+        /// read-only to the subagent, and it cannot commit in these.
+        #[serde(default)]
+        worktrees: Vec<String>,
+        /// Linked git worktrees the subagent may write and commit in. Each
+        /// must be on a branch `subagent/<id>/<name>` whose namespace
+        /// `subagent/<id>/` holds no other branch. Every commit it makes is
+        /// listed in its result.
+        #[serde(default)]
+        commit_worktrees: Vec<String>,
     },
     /// Continue a finished subagent in its own context.
     ///
@@ -162,6 +184,34 @@ pub enum SubagentArgs {
 }
 
 impl SubagentArgs {
+    /// What a start call grants beyond the subagent's own space, with
+    /// relative paths resolved against the caller's working directory.
+    fn grant(&self, working_dir: Option<&Path>) -> SubagentGrant {
+        let Self::Start {
+            worktrees,
+            commit_worktrees,
+            ..
+        } = self
+        else {
+            return SubagentGrant::new();
+        };
+        let resolve = |path: &String| {
+            let path = Path::new(path);
+            match working_dir {
+                Some(base) if path.is_relative() => base.join(path),
+                _ => path.to_path_buf(),
+            }
+        };
+        let grant = worktrees
+            .iter()
+            .map(resolve)
+            .fold(SubagentGrant::new(), SubagentGrant::with_worktree);
+        commit_worktrees
+            .iter()
+            .map(resolve)
+            .fold(grant, SubagentGrant::with_committing_worktree)
+    }
+
     /// The prompt file either call shape carries.
     fn prompt_file(&self) -> &str {
         match self {
@@ -189,7 +239,7 @@ struct SubagentRunModel {
     source: ModelSource,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 struct SubagentResult {
     subagent: String,
     status: &'static str,
@@ -206,10 +256,27 @@ struct SubagentResult {
     /// was last waiting.
     #[serde(skip_serializing_if = "Option::is_none")]
     alert: Option<String>,
+    /// Commits the subagent made in its granted worktrees during this run,
+    /// or why they could not be listed; present only for a subagent launched
+    /// with a commit grant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commits: Option<CommitListing>,
+}
+
+/// The error a failed subagent run reports to its caller.
+#[derive(Serialize)]
+struct SubagentFailure<'a, H> {
+    subagent: &'a str,
+    error: String,
+    /// Commits the subagent made before it failed; present only for a
+    /// subagent launched with a commit grant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commits: Option<CommitListing>,
+    recent_history: Vec<H>,
 }
 
 impl SubagentResult {
-    fn cancelled(subagent: String) -> Self {
+    fn cancelled(subagent: String, commits: Option<CommitListing>) -> Self {
         Self {
             subagent,
             status: "cancelled",
@@ -217,6 +284,7 @@ impl SubagentResult {
             id: None,
             model: None,
             alert: None,
+            commits,
         }
     }
 }
@@ -393,6 +461,9 @@ struct FinishedSubagent<LLM> {
     subagent: String,
     model: Option<SubagentRunModel>,
     child_job_registry: Option<aither_sandbox::JobRegistry>,
+    /// Lists the commits the subagent makes; set when it was launched with a
+    /// commit grant.
+    commit_ledger: Option<CommitLedger>,
     /// How long the provider keeps this subagent's prompt cache warm — the
     /// [`PromptCache`](crate::context::PromptCache) lifetime the subagent
     /// ran with. The continuation id expires with the cache entry.
@@ -545,8 +616,10 @@ pub struct SubagentTool<LLM> {
     base_dir: Option<PathBuf>,
     /// Ordered mount map used to resolve virtual sandbox paths into host paths.
     mounts: Vec<SubagentFileMount>,
-    /// Factory for creating child terminal tools for subagents.
-    terminal_tool_factory: Option<TerminalToolFactory>,
+    /// The terminal this tool is bound to: subagents launch from it, within
+    /// its authority, and relative grants resolve against its working
+    /// directory.
+    binding: Option<TerminalBinding>,
     /// Registry the tool reports in-flight runs to; clone it before
     /// handing the tool to a builder to observe or cancel runs.
     runs: SubagentRuns,
@@ -583,7 +656,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             types: HashMap::new(),
             base_dir: None,
             mounts: Vec::new(),
-            terminal_tool_factory: None,
+            binding: None,
             runs: SubagentRuns::default(),
             cache_keep_alive: None,
             finished: FinishedSubagents::new(),
@@ -627,11 +700,29 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         self
     }
 
-    /// Sets the terminal tool factory used for subagents.
+    /// This tool as the terminal `binding` describes serves it: subagents
+    /// launch from that terminal, with at most its authority, and relative
+    /// paths resolve against its working directory first.
+    ///
+    /// Register the tool with
+    /// [`ToolRegistryBuilder::configure_terminal_bound_tool`](aither_sandbox::ToolRegistryBuilder::configure_terminal_bound_tool)
+    /// so every terminal, a subagent's included, gets its own instance. The
+    /// instance shares the run registry; the subagents it can continue are
+    /// its own.
     #[must_use]
-    pub fn with_terminal_tool_factory(mut self, factory: TerminalToolFactory) -> Self {
-        self.terminal_tool_factory = Some(factory);
-        self
+    pub fn for_terminal(&self, binding: &TerminalBinding) -> Self {
+        Self {
+            advanced: self.advanced.clone(),
+            balanced: self.balanced.clone(),
+            fast: self.fast.clone(),
+            types: self.types.clone(),
+            base_dir: self.base_dir.clone(),
+            mounts: self.mounts.clone(),
+            binding: Some(binding.clone()),
+            runs: self.runs.clone(),
+            cache_keep_alive: self.cache_keep_alive.clone(),
+            finished: FinishedSubagents::new(),
+        }
     }
 
     /// Attaches the shared run registry this tool reports to.
@@ -702,19 +793,30 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
     }
 
     fn effective_mounts(&self) -> Vec<SubagentFileMount> {
+        // A relative path names a file in the calling terminal's working
+        // directory first: a subagent writes its prompts in its own space.
+        let caller = self
+            .binding
+            .as_ref()
+            .map(TerminalBinding::working_dir)
+            .filter(|working_dir| self.base_dir.as_deref() != Some(*working_dir))
+            .map(|working_dir| SubagentFileMount::new(PathBuf::from("."), working_dir));
         if !self.mounts.is_empty() {
-            return self.mounts.clone();
+            return caller.into_iter().chain(self.mounts.clone()).collect();
         }
 
         let base = self
             .base_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from(Path::new(".")));
-        vec![
-            SubagentFileMount::new(PathBuf::from("."), base.clone()),
-            SubagentFileMount::new(PathBuf::from("subagents"), base.join("subagents")),
-            SubagentFileMount::new(PathBuf::from("skills"), base.join("skills")),
-        ]
+        caller
+            .into_iter()
+            .chain([
+                SubagentFileMount::new(PathBuf::from("."), base.clone()),
+                SubagentFileMount::new(PathBuf::from("subagents"), base.join("subagents")),
+                SubagentFileMount::new(PathBuf::from("skills"), base.join("skills")),
+            ])
+            .collect()
     }
 
     fn strip_leading_curdir(path: &Path) -> PathBuf {
@@ -979,12 +1081,14 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         &self,
         subagent: &str,
         chosen: Option<ModelTier>,
+        grant: SubagentGrant,
         prompt: &str,
     ) -> anyhow::Result<(
         crate::Agent<LLM, LLM, LLM, ()>,
         String,
         SubagentRunModel,
         Option<aither_sandbox::JobRegistry>,
+        Option<CommitLedger>,
     )> {
         let (subagent_id, declared_model, source) = self.resolve_source(subagent).await?;
 
@@ -1013,17 +1117,26 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
 
         tracing::info!(subagent = %subagent_id, model = %model.name.as_str(), "Starting subagent");
 
-        // Add child terminal tool if factory is configured
-        let (agent_builder, child_job_registry) = if let Some(factory) = &self.terminal_tool_factory
+        // Launch the subagent's terminal from the terminal this tool serves.
+        let (agent_builder, child_job_registry, commit_ledger) = if let Some(binding) =
+            &self.binding
         {
-            let dyn_terminal = factory
-                .create()
+            let dyn_terminal = binding
+                .launcher()
+                .create(grant)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to create subagent terminal tool: {e}"))?;
             let job_registry = dyn_terminal.job_registry();
-            (agent_builder.dyn_terminal(dyn_terminal), Some(job_registry))
+            let commit_ledger = dyn_terminal.commit_ledger().cloned();
+            (
+                agent_builder.dyn_terminal(dyn_terminal),
+                Some(job_registry),
+                commit_ledger,
+            )
+        } else if grant == SubagentGrant::new() {
+            (agent_builder, None, None)
         } else {
-            (agent_builder, None)
+            anyhow::bail!("worktrees can only be granted to a subagent launched from a terminal");
         };
 
         Ok((
@@ -1031,6 +1144,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             subagent_id,
             model,
             child_job_registry,
+            commit_ledger,
         ))
     }
 
@@ -1045,10 +1159,18 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
     ) -> anyhow::Result<(FinishedSubagent<LLM>, Option<u64>)> {
         match args {
             SubagentArgs::Start {
-                subagent, model, ..
+                ref subagent,
+                model,
+                ..
             } => {
-                let (agent, subagent, model, child_job_registry) =
-                    self.start_agent(&subagent, model, prompt).await?;
+                let grant = args.grant(
+                    self.binding
+                        .as_ref()
+                        .map(TerminalBinding::working_dir)
+                        .or(self.base_dir.as_deref()),
+                );
+                let (agent, subagent, model, child_job_registry, commit_ledger) =
+                    self.start_agent(subagent, model, grant, prompt).await?;
                 let lifetime = agent.cache_lifetime();
                 Ok((
                     FinishedSubagent {
@@ -1056,6 +1178,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                         subagent,
                         model: Some(model),
                         child_job_registry,
+                        commit_ledger,
                         lifetime,
                     },
                     None,
@@ -1180,6 +1303,32 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
     }
 }
 
+impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
+    /// Records where the subagent's committing worktrees stand before its run,
+    /// since commits are listed per run. Nothing has run yet when that fails,
+    /// so a continued subagent goes back to where it came from.
+    async fn mark_commits(
+        &self,
+        finished: FinishedSubagent<LLM>,
+        resumed: Option<u64>,
+    ) -> anyhow::Result<(FinishedSubagent<LLM>, Option<CommitMark>)> {
+        let Some(ledger) = &finished.commit_ledger else {
+            return Ok((finished, None));
+        };
+        match ledger.mark().await {
+            Ok(mark) => Ok((finished, Some(mark))),
+            Err(error) => {
+                if let Some(id) = resumed {
+                    self.finished.store(Some(id), finished);
+                }
+                Err(anyhow::anyhow!(
+                    "cannot record where the subagent's worktrees stand before its run: {error}"
+                ))
+            }
+        }
+    }
+}
+
 impl<LLM> Tool for SubagentTool<LLM>
 where
     LLM: LanguageModel + Clone + Sync + 'static,
@@ -1199,17 +1348,18 @@ where
         // The task prompt comes from a file; inline prompt text is rejected.
         let prompt = self.read_prompt(args.prompt_file()).await?;
 
+        let (finished, resumed) = self.acquire(args, &prompt).await?;
         let (
             FinishedSubagent {
                 mut agent,
                 subagent: subagent_id,
                 model,
                 child_job_registry,
+                commit_ledger,
                 lifetime,
             },
-            resumed,
-        ) = self.acquire(args, &prompt).await?;
-
+            commit_mark,
+        ) = self.mark_commits(finished, resumed).await?;
         let (run_id, cancel_rx) = self.runs.begin(&subagent_id, &prompt);
         let outcome = await_subagent_run(agent.query(&prompt), cancel_rx).await;
         self.runs.finish(run_id);
@@ -1223,6 +1373,13 @@ where
                 );
             }
         }
+        // Whatever way the run ended, the commits it made are reported; a
+        // failure to list them is reported in their place and changes nothing
+        // else about the run.
+        let commits = match (&commit_ledger, &commit_mark) {
+            (Some(ledger), Some(mark)) => Some(CommitListing(ledger.since(mark).await)),
+            _ => None,
+        };
         let result = match outcome {
             SubagentOutcome::Cancelled => {
                 // The cancelled query left the agent mid-turn; it cannot be continued.
@@ -1230,7 +1387,7 @@ where
                     self.finished.release(id);
                 }
                 tracing::info!(subagent = %subagent_id, "Subagent cancelled");
-                return ToolResult::json(&SubagentResult::cancelled(subagent_id));
+                return ToolResult::json(&SubagentResult::cancelled(subagent_id, commits));
             }
             SubagentOutcome::Finished(Ok(result)) => result,
             SubagentOutcome::Finished(Err(error)) => {
@@ -1238,7 +1395,7 @@ where
                     self.finished.release(id);
                 }
                 let history = agent.history();
-                let recent = history
+                let recent_history = history
                     .into_iter()
                     .rev()
                     .take(12)
@@ -1246,11 +1403,13 @@ where
                     .into_iter()
                     .rev()
                     .collect::<Vec<_>>();
-                let recent_json = serde_json::to_string(&recent)
-                    .unwrap_or_else(|serialize_error| serialize_error.to_string());
-                return Err(anyhow::anyhow!(
-                    "Subagent '{subagent_id}' error: {error}\nRecent subagent history: {recent_json}"
-                ));
+                let failure = serde_json::to_string(&SubagentFailure {
+                    subagent: &subagent_id,
+                    error: error.to_string(),
+                    commits,
+                    recent_history,
+                })?;
+                return Err(anyhow::anyhow!(failure));
             }
         };
 
@@ -1277,6 +1436,7 @@ where
                 subagent: subagent_id.clone(),
                 model: model.clone(),
                 child_job_registry,
+                commit_ledger,
                 lifetime,
             },
         ));
@@ -1288,6 +1448,7 @@ where
             id,
             model,
             alert,
+            commits,
         })
     }
 }
@@ -1355,6 +1516,7 @@ mod tests {
                 source: ModelSource::Routed,
             }),
             alert: None,
+            commits: None,
         })
         .expect("subagent result should serialize");
         assert_eq!(
@@ -1371,8 +1533,9 @@ mod tests {
             })
         );
 
-        let cancelled = serde_json::to_value(SubagentResult::cancelled("explore".to_string()))
-            .expect("cancelled result should serialize");
+        let cancelled =
+            serde_json::to_value(SubagentResult::cancelled("explore".to_string(), None))
+                .expect("cancelled result should serialize");
         assert_eq!(
             cancelled,
             serde_json::json!({
@@ -1604,6 +1767,8 @@ mod tests {
             Tool::call(
                 &tool,
                 SubagentArgs::Start {
+                    worktrees: Vec::new(),
+                    commit_worktrees: Vec::new(),
                     subagent: "explore".to_string(),
                     prompt_file: prompt_path,
                     model: Some(ModelTier::Fast),
@@ -1641,6 +1806,333 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Runs `git` with a fixed identity in `dir` and returns what it printed.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+            .args(["-c", "commit.gpgSign=false"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A main agent's terminal whose space holds a repository and a linked
+    /// worktree on `subagent/work/main`, the worktree a subagent is granted
+    /// commit in.
+    struct CommitFixture {
+        _dirs: [tempfile::TempDir; 3],
+        terminal: aither_sandbox::TerminalTool<
+            aither_sandbox::permission::NoopPermissionHandler,
+            executor_core::tokio::TokioGlobal,
+            aither_sandbox::Configured,
+        >,
+        repository: PathBuf,
+        worktree: PathBuf,
+    }
+
+    impl CommitFixture {
+        async fn new() -> Self {
+            use aither_sandbox::permission::NoopPermissionHandler;
+            use aither_sandbox::{TerminalTool, ToolRegistryBuilder};
+            use executor_core::tokio::TokioGlobal;
+
+            let work = tempfile::tempdir().unwrap();
+            let source = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let binary = crate::test_support::compile_baseline_fixture(source.path()).await;
+            let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
+
+            let session = work.path().join("session");
+            let repository = session.join("repository");
+            std::fs::create_dir_all(&repository).unwrap();
+            git(&repository, &["init", "--initial-branch=main"]);
+            git(&repository, &["commit", "--allow-empty", "-m", "initial"]);
+            let worktree = session.join("worktree");
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "subagent/work/main",
+                    worktree.to_str().unwrap(),
+                ],
+            );
+
+            let terminal = TerminalTool::new_exact(&session, NoopPermissionHandler, TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .initialize_tools(&distribution, cache.path())
+                .await
+                .expect("tools should prepare");
+            let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+            let terminal = terminal.with_registry(registry);
+            Self {
+                _dirs: [work, source, cache],
+                terminal,
+                repository,
+                worktree,
+            }
+        }
+
+        /// A subagent tool bound to the fixture's terminal.
+        fn tool<LLM: LanguageModel + Clone + Sync + 'static>(
+            &self,
+            llm: LLM,
+            runs: &SubagentRuns,
+        ) -> SubagentTool<LLM> {
+            SubagentTool::new(llm)
+                .with_runs(runs.clone())
+                .with_type(
+                    "worker",
+                    SubagentType::new("worker", |llm| {
+                        crate::AgentBuilder::new(llm)
+                            .agent_kind(crate::AgentKind::Chatbot)
+                            .max_iterations(5)
+                    }),
+                )
+                .for_terminal(self.terminal.binding())
+        }
+
+        /// Starts a subagent granted commit in the fixture's worktree.
+        fn start(&self, tag: &str) -> (PathBuf, SubagentArgs) {
+            let (dir, prompt_file) = write_prompt_file(tag, "work in the worktree");
+            (
+                dir,
+                SubagentArgs::Start {
+                    worktrees: Vec::new(),
+                    commit_worktrees: vec![self.worktree.to_string_lossy().into_owned()],
+                    subagent: "worker".to_string(),
+                    prompt_file: prompt_file.to_string_lossy().into_owned(),
+                    model: Some(ModelTier::Fast),
+                },
+            )
+        }
+    }
+
+    /// What [`CommittingLlm`] does in the worktree before it answers.
+    #[derive(Clone, Copy)]
+    enum CommitStep {
+        /// Commits, then answers.
+        Commit,
+        /// Commits, then fails the request.
+        CommitAndFail,
+        /// Moves the repository's object store away, so no listing can read
+        /// it, then answers.
+        BreakRepository,
+    }
+
+    /// A model that acts in a worktree, standing in for a subagent's
+    /// commands, then answers or fails.
+    #[derive(Clone)]
+    struct CommittingLlm {
+        repository: PathBuf,
+        worktree: PathBuf,
+        step: CommitStep,
+    }
+
+    impl LanguageModel for CommittingLlm {
+        type Error = NeverError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let answer = match self.step {
+                CommitStep::Commit => {
+                    git(
+                        &self.worktree,
+                        &["commit", "--allow-empty", "-m", "made by the subagent"],
+                    );
+                    Ok(Event::Text("done".to_string()))
+                }
+                CommitStep::CommitAndFail => {
+                    git(
+                        &self.worktree,
+                        &["commit", "--allow-empty", "-m", "made before failing"],
+                    );
+                    Err(NeverError)
+                }
+                CommitStep::BreakRepository => {
+                    let git_dir = self.repository.join(".git");
+                    std::fs::rename(git_dir.join("objects"), git_dir.join("objects-gone")).unwrap();
+                    Ok(Event::Text("done".to_string()))
+                }
+            };
+            futures_lite::stream::iter([answer])
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "test",
+                "committing-model",
+                "commits in a worktree",
+                128_000,
+            )))
+        }
+    }
+
+    impl CommitFixture {
+        fn llm(&self, step: CommitStep) -> CommittingLlm {
+            CommittingLlm {
+                repository: self.repository.clone(),
+                worktree: self.worktree.clone(),
+                step,
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completed_run_lists_the_commits_made_in_its_granted_worktree() {
+        let fixture = CommitFixture::new().await;
+        let runs = SubagentRuns::default();
+        let tool = fixture.tool(fixture.llm(CommitStep::Commit), &runs);
+        let (dir, args) = fixture.start("completed-commits");
+
+        let result = Tool::call(&tool, args, ToolContext::new())
+            .await
+            .expect("the run completes");
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result, got {result:?}");
+        };
+        assert_eq!(value["status"], "completed", "{value}");
+        let commits = value["commits"]
+            .as_array()
+            .expect("a completed run lists its commits");
+        assert_eq!(commits.len(), 1, "{value}");
+        assert_eq!(commits[0]["subject"], "made by the subagent");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_run_lists_the_commits_made_in_its_granted_worktree() {
+        let fixture = CommitFixture::new().await;
+        let runs = SubagentRuns::default();
+        let tool = fixture.tool(fixture.llm(CommitStep::CommitAndFail), &runs);
+        let (dir, args) = fixture.start("failed-commits");
+
+        let error = Tool::call(&tool, args, ToolContext::new())
+            .await
+            .expect_err("the run fails");
+        let failure: serde_json::Value =
+            serde_json::from_str(&error.to_string()).expect("the failure is structured");
+        assert_eq!(failure["subagent"], "worker", "{failure}");
+        assert!(
+            failure["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("never resolves")),
+            "{failure}"
+        );
+        let commits = failure["commits"]
+            .as_array()
+            .expect("a failed run lists its commits");
+        assert_eq!(commits.len(), 1, "{failure}");
+        assert_eq!(commits[0]["subject"], "made before failing");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listing_failure_keeps_the_runs_outcome() {
+        let fixture = CommitFixture::new().await;
+        let runs = SubagentRuns::default();
+        let tool = fixture.tool(fixture.llm(CommitStep::BreakRepository), &runs);
+        let (dir, args) = fixture.start("broken-listing");
+
+        let result = Tool::call(&tool, args, ToolContext::new())
+            .await
+            .expect("the run's outcome survives the listing failure");
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result, got {result:?}");
+        };
+        assert_eq!(value["status"], "completed", "{value}");
+        assert_eq!(value["result"], "done", "{value}");
+        assert!(
+            value["id"].is_u64(),
+            "the subagent stays continuable: {value}"
+        );
+        assert!(
+            value["commits"]["error"].is_string(),
+            "the listing failure is reported in place of the commits: {value}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_run_lists_the_commits_made_in_its_granted_worktree() {
+        let fixture = CommitFixture::new().await;
+        let runs = SubagentRuns::default();
+        let tool = fixture.tool(PendingLlm, &runs);
+        let (dir, args) = fixture.start("cancelled-commits");
+        let call = tokio::spawn(async move { Tool::call(&tool, args, ToolContext::new()).await });
+
+        let run = loop {
+            match runs.list().as_slice() {
+                [run] => break run.clone(),
+                [] => tokio::task::yield_now().await,
+                other => panic!("expected one registered run, got {}", other.len()),
+            }
+        };
+        // The commit lands after the run began and before it is cancelled.
+        git(
+            &fixture.worktree,
+            &["commit", "--allow-empty", "-m", "made during the run"],
+        );
+        assert!(runs.cancel(run.id));
+
+        let result = call
+            .await
+            .expect("call task panicked")
+            .expect("subagent call failed");
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result, got {result:?}");
+        };
+        assert_eq!(value["status"], "cancelled");
+        let commits = value["commits"]
+            .as_array()
+            .expect("a cancelled run still lists its commits");
+        assert_eq!(commits.len(), 1, "{value}");
+        assert_eq!(commits[0]["subject"], "made during the run");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_grant_without_a_terminal_is_refused() {
+        let tool = worker_tool(SubagentTool::new(TextLlm::new("only-model")));
+        let (dir, prompt_file) = write_prompt_file("grant-without-terminal", "do it");
+        let error = Tool::call(
+            &tool,
+            SubagentArgs::Start {
+                worktrees: vec!["somewhere".to_string()],
+                commit_worktrees: Vec::new(),
+                subagent: "worker".to_string(),
+                prompt_file: prompt_file.to_string_lossy().into_owned(),
+                model: Some(ModelTier::Fast),
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect_err("a grant cannot be given without a terminal");
+        assert!(
+            error.to_string().contains("launched from a terminal"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn inline_prompt_text_is_rejected() {
         let tool = worker_tool(SubagentTool::new(TextLlm::new("only-model")));
@@ -1648,6 +2140,8 @@ mod tests {
         let error = Tool::call(
             &tool,
             SubagentArgs::Start {
+                worktrees: Vec::new(),
+                commit_worktrees: Vec::new(),
                 subagent: "worker".to_string(),
                 prompt_file: "summarize the repository layout".to_string(),
                 model: Some(ModelTier::Fast),
@@ -1670,6 +2164,8 @@ mod tests {
         let error = Tool::call(
             &tool,
             SubagentArgs::Start {
+                worktrees: Vec::new(),
+                commit_worktrees: Vec::new(),
                 subagent: "worker".to_string(),
                 prompt_file: prompt_file.to_string_lossy().into_owned(),
                 model: Some(ModelTier::Fast),
@@ -1698,6 +2194,8 @@ mod tests {
         let result = Tool::call(
             &tool,
             SubagentArgs::Start {
+                worktrees: Vec::new(),
+                commit_worktrees: Vec::new(),
                 subagent: "worker".to_string(),
                 prompt_file: prompt_file.to_string_lossy().into_owned(),
                 model: Some(ModelTier::Fast),
@@ -1729,6 +2227,8 @@ mod tests {
         let result = Tool::call(
             &tool,
             SubagentArgs::Start {
+                worktrees: Vec::new(),
+                commit_worktrees: Vec::new(),
                 subagent: "worker".to_string(),
                 prompt_file: prompt_file.to_string_lossy().into_owned(),
                 model: None,
@@ -1774,6 +2274,8 @@ You are a file-defined agent.
         let result = Tool::call(
             &tool,
             SubagentArgs::Start {
+                worktrees: Vec::new(),
+                commit_worktrees: Vec::new(),
                 subagent: def_path.to_string_lossy().into_owned(),
                 prompt_file: prompt_file.to_string_lossy().into_owned(),
                 model: None,
@@ -1947,6 +2449,8 @@ You are a file-defined agent.
             Tool::call(
                 &tool,
                 SubagentArgs::Start {
+                    worktrees: Vec::new(),
+                    commit_worktrees: Vec::new(),
                     subagent: "worker".to_string(),
                     prompt_file: prompt_file.to_string_lossy().into_owned(),
                     model: Some(ModelTier::Fast),
@@ -2038,6 +2542,8 @@ You are a file-defined agent.
             Tool::call(
                 &tool,
                 SubagentArgs::Start {
+                    worktrees: Vec::new(),
+                    commit_worktrees: Vec::new(),
                     subagent: "worker".to_string(),
                     prompt_file: prompt_file.to_string_lossy().into_owned(),
                     model: Some(ModelTier::Fast),
@@ -2102,6 +2608,8 @@ You are a file-defined agent.
         let result = Tool::call(
             &tool,
             SubagentArgs::Start {
+                worktrees: Vec::new(),
+                commit_worktrees: Vec::new(),
                 subagent: "worker".to_string(),
                 prompt_file: prompt_file.to_string_lossy().into_owned(),
                 model: Some(ModelTier::Fast),
@@ -2235,6 +2743,8 @@ You are a file-defined agent.
         let result = Tool::call(
             tool,
             SubagentArgs::Start {
+                worktrees: Vec::new(),
+                commit_worktrees: Vec::new(),
                 subagent: "worker".to_string(),
                 prompt_file: prompt_file.to_string_lossy().into_owned(),
                 model: Some(ModelTier::Fast),

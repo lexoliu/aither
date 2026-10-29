@@ -478,6 +478,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Optional sandbox directory for working-doc supervision (`tasks.md`).
     pub(crate) sandbox_dir: Option<PathBuf>,
 
+    /// Directory files are restored from after a forked compaction.
+    pub(crate) restore_dir: Option<PathBuf>,
+
     /// Start time of the most recent LLM request issued by this agent.
     pub(crate) last_request_started_at: Option<Instant>,
 
@@ -546,6 +549,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             permission_receiver: None,
             job_registry: None,
             sandbox_dir: None,
+            restore_dir: None,
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
             cache_stats: crate::CacheStats::new(),
@@ -1681,7 +1685,7 @@ where
             "applied handoff from forked compaction"
         );
 
-        if let Some(sandbox_dir) = self.sandbox_dir.clone() {
+        if let Some(restore_dir) = self.restore_dir.clone() {
             let tokens = self
                 .budget
                 .fraction_tokens(self.config.context_policy.restore_budget);
@@ -1691,7 +1695,7 @@ where
             #[cfg(not(feature = "skills"))]
             let skills = Vec::new();
             if let Some(block) =
-                restore_context(&handoff, &[sandbox_dir], &skills, budget_chars).await
+                restore_context(&handoff, &[restore_dir], &skills, budget_chars).await
             {
                 self.context.push_block_alert(&block);
             }

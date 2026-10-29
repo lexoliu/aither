@@ -63,7 +63,12 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     permission_receiver: Option<PermissionEventReceiver>,
     job_registry: Option<JobRegistry>,
     context_sources: Vec<AnyContextSource>,
+    /// Directory whose working documents (`tasks.md`) the agent supervises:
+    /// the main agent's sandbox.
     sandbox_dir: Option<std::path::PathBuf>,
+    /// Directory files are restored from after a forked compaction: the
+    /// directory the agent's terminal works in.
+    restore_dir: Option<std::path::PathBuf>,
     #[cfg(feature = "skills")]
     skill_registry: Option<Arc<SkillRegistry>>,
 }
@@ -97,6 +102,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             job_registry: None,
             context_sources: Vec::new(),
             sandbox_dir: None,
+            restore_dir: None,
             #[cfg(feature = "skills")]
             skill_registry: None,
         }
@@ -133,6 +139,7 @@ where
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            restore_dir: self.restore_dir,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
         }
@@ -161,6 +168,7 @@ where
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            restore_dir: self.restore_dir,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
         }
@@ -235,7 +243,13 @@ where
         self.background_receiver = Some(dyn_tool.background_receiver());
         self.permission_receiver = Some(dyn_tool.permission_receiver());
         self.job_registry = Some(dyn_tool.job_registry());
-        self.sandbox_dir = Some(dyn_tool.working_dir().clone());
+        // Files are restored after compaction from wherever the terminal
+        // works; working-document supervision (`tasks.md`) belongs to the
+        // main agent's terminal alone.
+        self.restore_dir = Some(dyn_tool.working_dir().clone());
+        if dyn_tool.role() == aither_sandbox::CommandRole::Main {
+            self.sandbox_dir = Some(dyn_tool.working_dir().clone());
+        }
         self.tools.register_dyn_terminal(dyn_tool);
         self
     }
@@ -270,6 +284,7 @@ where
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            restore_dir: self.restore_dir,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
         }
@@ -319,9 +334,12 @@ where
         self
     }
 
-    /// Sets sandbox directory for working document supervision.
+    /// Sets the main agent's sandbox directory: its working documents are
+    /// supervised and its files restored after compaction.
     pub fn sandbox_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.sandbox_dir = Some(path.into());
+        let path = path.into();
+        self.restore_dir = Some(path.clone());
+        self.sandbox_dir = Some(path);
         self
     }
 
@@ -459,6 +477,7 @@ where
         let permission_receiver = terminal_tool.permission_receiver();
         let job_registry = terminal_tool.job_registry();
         self.sandbox_dir = Some(terminal_tool.working_dir().clone());
+        self.restore_dir = Some(terminal_tool.working_dir().clone());
         self.tools
             .register(terminal_tool.background_tool())
             .expect("tool registration must succeed: duplicate name or missing description");
@@ -552,6 +571,7 @@ where
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             sandbox_dir: self.sandbox_dir,
+            restore_dir: self.restore_dir,
             last_request_started_at: None,
             last_request: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
@@ -747,5 +767,52 @@ mod tests {
         assert!(events.is_empty());
         assert!(agent.active_skills.is_empty());
         assert!(agent.active_allowed_tools.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_gets_no_working_document_supervision_but_keeps_file_restore() {
+        use aither_sandbox::permission::NoopPermissionHandler;
+        use aither_sandbox::{SubagentGrant, TerminalTool, ToolRegistryBuilder};
+        use executor_core::tokio::TokioGlobal;
+
+        let source = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let session = tempfile::tempdir().unwrap();
+        let binary = crate::test_support::compile_baseline_fixture(source.path()).await;
+        let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
+        let terminal = TerminalTool::new_exact(session.path(), NoopPermissionHandler, TokioGlobal)
+            .await
+            .unwrap()
+            .initialize_tools(&distribution, cache.path())
+            .await
+            .unwrap();
+        let registry =
+            std::sync::Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+        let terminal = terminal.with_registry(registry);
+        let subagent = terminal
+            .binding()
+            .launcher()
+            .create(SubagentGrant::new())
+            .await
+            .unwrap();
+        let space = subagent.working_dir().clone();
+
+        let main = AgentBuilder::new(MockLlm).dyn_terminal(terminal.clone().to_dyn());
+        assert!(
+            main.sandbox_dir.is_some(),
+            "the main agent supervises its working documents"
+        );
+        let main = AgentBuilder::new(MockLlm).terminal(terminal);
+        assert!(main.sandbox_dir.is_some());
+        let child = AgentBuilder::new(MockLlm).dyn_terminal(subagent);
+        assert!(
+            child.sandbox_dir.is_none(),
+            "a subagent's space is not supervised like the main agent's"
+        );
+        assert_eq!(
+            child.restore_dir,
+            Some(space),
+            "a subagent's files are restored after compaction"
+        );
     }
 }
