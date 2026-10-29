@@ -152,8 +152,39 @@ fn agent_with(
     Agent::builder(llm).hook(hooks.clone()).build()
 }
 
-fn executor() -> executor_core::AnyExecutor {
+pub fn executor() -> executor_core::AnyExecutor {
     executor_core::AnyExecutor::new(executor_core::tokio::TokioGlobal)
+}
+
+/// Starts `config` with the fixture's prepared tools.
+pub async fn live(config: HooksConfig, tools: &crate::test_support::PreparedFixture) -> LiveHooks {
+    LiveHooks::start(config, &tools.tools, executor())
+        .await
+        .expect("the hooks start")
+}
+
+/// The main agent's scope over lifecycle `hooks`.
+pub async fn lifecycle_hooks(
+    hooks: Vec<LifecycleHookConfig>,
+    tools: &crate::test_support::PreparedFixture,
+) -> ExternalHooks {
+    let config = HooksConfig {
+        lifecycle: hooks,
+        ..HooksConfig::default()
+    };
+    ExternalHooks::new(&live(config, tools).await)
+}
+
+/// The main agent's scope over `reviewers`.
+pub async fn reviewer_hooks(
+    reviewers: Vec<ReviewerConfig>,
+    tools: &crate::test_support::PreparedFixture,
+) -> ExternalHooks {
+    let config = HooksConfig {
+        reviewers,
+        ..HooksConfig::default()
+    };
+    ExternalHooks::new(&live(config, tools).await)
 }
 
 async fn bounded<T>(work: impl std::future::Future<Output = T>) -> T {
@@ -167,7 +198,7 @@ async fn session_start_user_message_and_stop_fire_with_typed_input_and_inject_on
     let tools = crate::test_support::prepared_fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("log");
-    let hooks = ExternalHooks::new(
+    let hooks = lifecycle_hooks(
         vec![recorder(
             dir.path(),
             &log,
@@ -177,9 +208,9 @@ async fn session_start_user_message_and_stop_fire_with_typed_input_and_inject_on
                 LifecycleKind::Stop,
             ],
         )],
-        executor(),
-        &tools.tools,
-    );
+        &tools,
+    )
+    .await;
     let mut agent = agent_with(ScriptedLlm::new(&["first answer", "second answer"]), &hooks);
 
     bounded(agent.query("hello")).await.unwrap();
@@ -242,7 +273,7 @@ async fn compaction_fires_before_and_after() {
     let tools = crate::test_support::prepared_fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("log");
-    let hooks = ExternalHooks::new(
+    let hooks = lifecycle_hooks(
         vec![recorder(
             dir.path(),
             &log,
@@ -251,9 +282,9 @@ async fn compaction_fires_before_and_after() {
                 LifecycleKind::AfterCompaction,
             ],
         )],
-        executor(),
-        &tools.tools,
-    );
+        &tools,
+    )
+    .await;
     let mut agent = agent_with(ScriptedLlm::new(&["answer", "next"]), &hooks);
 
     bounded(agent.query("hello")).await.unwrap();
@@ -311,11 +342,11 @@ async fn an_ipc_call_event_carries_the_resolved_name_arguments_and_result() {
     let tools = crate::test_support::prepared_fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("log");
-    let hooks = ExternalHooks::new(
+    let hooks = lifecycle_hooks(
         vec![recorder(dir.path(), &log, &[LifecycleKind::CommandCall])],
-        executor(),
-        &tools.tools,
-    );
+        &tools,
+    )
+    .await;
     let mut builder = ToolRegistryBuilder::new();
     builder.configure_tool(EchoTool);
     builder.observe_commands(hooks.command_observer());
@@ -369,7 +400,7 @@ async fn an_ipc_call_answers_before_a_slow_hook_finishes_and_its_context_arrives
         "slow.sh",
         "#!/bin/sh\ncat >/dev/null\nsleep 3\nprintf '{\"context\":\"slow finished\"}'\n",
     );
-    let hooks = ExternalHooks::new(
+    let hooks = lifecycle_hooks(
         vec![LifecycleHookConfig {
             name: "slow".into(),
             command: HookCommand {
@@ -378,9 +409,9 @@ async fn an_ipc_call_answers_before_a_slow_hook_finishes_and_its_context_arrives
             },
             events: vec![LifecycleKind::CommandCall],
         }],
-        executor(),
-        &tools.tools,
-    );
+        &tools,
+    )
+    .await;
     let mut builder = ToolRegistryBuilder::new();
     builder.configure_tool(EchoTool);
     builder.observe_commands(hooks.command_observer());
@@ -411,11 +442,11 @@ async fn an_ask_user_event_carries_the_questions_and_the_answers() {
     let tools = crate::test_support::prepared_fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("log");
-    let hooks = ExternalHooks::new(
+    let hooks = lifecycle_hooks(
         vec![recorder(dir.path(), &log, &[LifecycleKind::AskUser])],
-        executor(),
-        &tools.tools,
-    );
+        &tools,
+    )
+    .await;
     let (broker, queue) = ask_user::channel();
     let tool = AskUserTool::new("session", broker).with_hooks(hooks.clone());
     let user = tokio::spawn(async move {
@@ -467,8 +498,7 @@ async fn a_lifecycle_hook_cannot_block() {
         },
         events: vec![LifecycleKind::UserMessage, LifecycleKind::Stop],
     };
-    let hooks = ExternalHooks::new(
-        vec![
+    let hooks = lifecycle_hooks(vec![
             // Tries to block, with context attached.
             hook(
                 "decider",
@@ -483,10 +513,7 @@ async fn a_lifecycle_hook_cannot_block() {
             hook("rambler", "#!/bin/sh\ncat >/dev/null\necho not json\n"),
             // Says nothing.
             hook("silent", "#!/bin/sh\ncat >/dev/null\n"),
-        ],
-        executor(),
-        &tools.tools,
-    );
+        ], &tools).await;
     let mut agent = agent_with(ScriptedLlm::new(&["the run went through"]), &hooks);
 
     let answer = bounded(agent.query("hello")).await.unwrap();
@@ -708,11 +735,7 @@ printf '%s' "$2"
         let tools = crate::test_support::prepared_fixture().await;
         let route = Route::default();
         (
-            ReviewedPermission::new(
-                route.clone(),
-                ReviewerChain::new(chain),
-                HookRunner::new(&tools.tools),
-            ),
+            ReviewedPermission::new(route.clone(), reviewer_hooks(chain, &tools).await),
             route,
         )
     }
@@ -777,11 +800,14 @@ printf '%s' "$2"
         let tools = crate::test_support::prepared_fixture().await;
         let handler = ReviewedPermission::new(
             route.clone(),
-            ReviewerChain::new(vec![
-                reviewer(dir.path(), "a", &log, r#"{"decision":"pass"}"#),
-                reviewer(dir.path(), "b", &log, ""),
-            ]),
-            HookRunner::new(&tools.tools),
+            reviewer_hooks(
+                vec![
+                    reviewer(dir.path(), "a", &log, r#"{"decision":"pass"}"#),
+                    reviewer(dir.path(), "b", &log, ""),
+                ],
+                &tools,
+            )
+            .await,
         );
         assert_eq!(bounded(handler.review(&COMMAND)).await, Review::Passed);
         assert!(
@@ -926,13 +952,11 @@ printf '%s' "$2"
         let tools = crate::test_support::prepared_fixture().await;
         let handler = ReviewedPermission::new(
             route.clone(),
-            ReviewerChain::new(vec![reviewer(
-                dir.path(),
-                "net",
-                &log,
-                r#"{"decision":"pass"}"#,
-            )]),
-            HookRunner::new(&tools.tools),
+            reviewer_hooks(
+                vec![reviewer(dir.path(), "net", &log, r#"{"decision":"pass"}"#)],
+                &tools,
+            )
+            .await,
         );
         // Allowed without asking anyone: no reviewer, and the route decides.
         assert!(bounded(handler.authorize_domain("allowed.example", 443)).await);

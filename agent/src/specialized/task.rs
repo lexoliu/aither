@@ -3433,11 +3433,11 @@ You are a file-defined agent.
 
     impl ForkFixture {
         async fn new() -> Self {
-            Self::reviewed(crate::ReviewerChain::default()).await
+            Self::reviewed(Vec::new()).await
         }
 
         /// A fixture whose permission requests go through `chain` first.
-        async fn reviewed(chain: crate::ReviewerChain) -> Self {
+        async fn reviewed(reviewers: Vec<crate::external_hook::ReviewerConfig>) -> Self {
             use aither_sandbox::{TerminalTool, ToolRegistryBuilder};
             use executor_core::tokio::TokioGlobal;
 
@@ -3451,8 +3451,7 @@ You are a file-defined agent.
             let hook_tools = crate::test_support::prepared_fixture().await;
             let permission = crate::ReviewedPermission::new(
                 permission,
-                chain,
-                crate::external_hook::HookRunner::new(&hook_tools.tools),
+                crate::external_hook::tests::reviewer_hooks(reviewers, &hook_tools).await,
             );
             let terminal = TerminalTool::new_exact(session.path(), permission, TokioGlobal)
                 .await
@@ -3673,13 +3672,8 @@ You are a file-defined agent.
 
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
-        let fixture = ForkFixture::reviewed(crate::ReviewerChain::new(vec![reviewer(
-            dir.path(),
-            "guard",
-            &log,
-            answer,
-        )]))
-        .await;
+        let fixture =
+            ForkFixture::reviewed(vec![reviewer(dir.path(), "guard", &log, answer)]).await;
         let (seen_tx, seen_rx) = async_channel::unbounded();
         let main = ScriptedLlm::new("main", &seen_tx);
         let tool = fixture.tool(&main, &seen_tx);
@@ -4004,13 +3998,13 @@ You are a file-defined agent.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_subagents_actions_reach_hooks_with_the_subagent_role() {
+        use crate::external_hook::LifecycleKind;
         use crate::external_hook::tests::{logged, recorder};
-        use crate::external_hook::{ExternalHooks, LifecycleKind};
 
         let hooks_dir = unique_temp_dir("subagent-hooks");
         let tools = crate::test_support::prepared_fixture().await;
         let log = hooks_dir.join("log");
-        let main = ExternalHooks::new(
+        let main = crate::external_hook::tests::lifecycle_hooks(
             vec![recorder(
                 &hooks_dir,
                 &log,
@@ -4022,9 +4016,9 @@ You are a file-defined agent.
                     LifecycleKind::SubagentStop,
                 ],
             )],
-            executor_core::AnyExecutor::new(executor_core::tokio::TokioGlobal),
-            &tools.tools,
-        );
+            &tools,
+        )
+        .await;
         let tool =
             worker_tool(SubagentTool::new(TextLlm::new("only-model"))).with_hooks(main.clone());
         let (dir, prompt_file) = write_prompt_file("subagent-hooks", "do it");

@@ -87,7 +87,7 @@ impl AskUserArgs {
 }
 
 /// The user's answer to a single question.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QuestionAnswer {
     /// Section label (matches `Question::section`).
     pub section: String,
@@ -96,7 +96,7 @@ pub struct QuestionAnswer {
 }
 
 /// Possible answer values.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum AnswerValue {
     /// User selected from predefined options.

@@ -1,0 +1,1 @@
+The {{ kind }} hook {{ hook }} failed and no working version is left: {{ failure }}. Fix the hook; the fix applies at once. Choose Retry when it is fixed.

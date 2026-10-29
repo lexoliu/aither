@@ -1,21 +1,18 @@
 //! Lifecycle hooks: event-driven external hooks that can only add context.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use aither_sandbox::{AnyCommandObserver, CommandCall, CommandObserver, PreparedTools};
+use aither_sandbox::{AnyCommandObserver, CommandCall, CommandObserver};
 use askama::Template;
-use executor_core::{AnyExecutor, Executor};
+use executor_core::Executor;
 use serde::{Deserialize, Serialize};
 
-use super::command::CommandHookConfig;
-use super::runner::{HookCommand, HookRole, HookRunner};
+use super::live::{LiveHooks, UserPause};
+use super::runner::{HookCommand, HookRole};
 use crate::StopReason;
-use crate::ask_user::{Question, QuestionAnswer};
+use crate::ask_user::{AskUserBroker, Question, QuestionAnswer};
 use crate::hook::Hook;
 
 /// A moment in a session a lifecycle hook can subscribe to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleKind {
     /// The session's first run begins.
@@ -43,7 +40,7 @@ pub enum LifecycleKind {
 
 impl LifecycleKind {
     /// What happened, as the context alert says it.
-    const fn occasion(self) -> &'static str {
+    pub(super) const fn occasion(self) -> &'static str {
         match self {
             Self::SessionStart => "the session started",
             Self::BeforeCompaction => "a compaction was about to start",
@@ -92,11 +89,11 @@ pub struct LifecycleOutput {
 }
 
 /// Input of [`LifecycleKind::SessionStart`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionStart {}
 
 /// Input of [`LifecycleKind::BeforeCompaction`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BeforeCompaction {
     /// Messages in the conversation about to be compacted.
     pub messages: usize,
@@ -105,14 +102,14 @@ pub struct BeforeCompaction {
 }
 
 /// Input of [`LifecycleKind::AfterCompaction`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AfterCompaction {
     /// Messages left in the conversation after the compaction.
     pub messages_remaining: usize,
 }
 
 /// Input of [`LifecycleKind::Stop`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Stop {
     /// The run's final response text.
     pub final_text: String,
@@ -123,7 +120,7 @@ pub struct Stop {
 }
 
 /// Input of [`LifecycleKind::UserMessage`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct UserMessage {
     /// The message text.
     pub message: String,
@@ -132,7 +129,7 @@ pub struct UserMessage {
 }
 
 /// Input of [`LifecycleKind::SubagentStart`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SubagentStart {
     /// The subagent type.
     pub subagent: String,
@@ -141,7 +138,7 @@ pub struct SubagentStart {
 }
 
 /// How a subagent's run ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SubagentEnd {
     /// The subagent answered.
@@ -153,7 +150,7 @@ pub enum SubagentEnd {
 }
 
 /// Input of [`LifecycleKind::SubagentStop`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SubagentStop {
     /// The subagent type.
     pub subagent: String,
@@ -164,7 +161,7 @@ pub struct SubagentStop {
 }
 
 /// Input of [`LifecycleKind::AskUser`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AskUser {
     /// The questions asked.
     pub questions: Vec<Question>,
@@ -173,7 +170,7 @@ pub struct AskUser {
 }
 
 /// Input of [`LifecycleKind::CommandCall`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CommandCalled {
     /// The resolved command name.
     pub name: String,
@@ -255,19 +252,8 @@ impl InjectedContext {
     }
 }
 
-/// The hooks every scope of one host shares.
-#[derive(Debug)]
-struct Shared {
-    runner: HookRunner,
-    hooks: Vec<LifecycleHookConfig>,
-    command_hooks: Vec<CommandHookConfig>,
-    /// Runs the hooks of events that must not delay what they observe. It is
-    /// absent only in a scope without hooks, which never runs one.
-    executor: Option<AnyExecutor>,
-}
-
-/// External lifecycle hooks for one agent: the host's configured hooks, the
-/// role of the agent, and the inbox its injected context waits in.
+/// External hooks for one agent: the host's live hooks, the role of the
+/// agent, and the inbox its injected context waits in.
 ///
 /// Add it to an agent's hook chain with `hook(...)`, to the command registry
 /// with [`ToolRegistryBuilder::observe_commands`], and to a subagent tool or
@@ -283,83 +269,53 @@ struct Shared {
 /// [`ToolRegistryBuilder::observe_commands`]: aither_sandbox::ToolRegistryBuilder::observe_commands
 #[derive(Debug, Clone)]
 pub struct ExternalHooks {
-    shared: Arc<Shared>,
+    live: LiveHooks,
     role: HookRole,
+    /// Where a failing command hook or reviewer asks the user to fix it.
+    user: Option<UserPause>,
     inbox: async_channel::Sender<InjectedContext>,
     outbox: async_channel::Receiver<InjectedContext>,
 }
 
 impl ExternalHooks {
-    /// The scope of the main agent, running `hooks`; `executor` runs the
-    /// hooks of IPC calls in the background so they never delay the call.
-    /// Every hook runs with `tools`, the terminal's prepared baseline tools,
-    /// on its `PATH` ahead of the host's.
+    /// The scope of the main agent, running the hooks of `live`.
     #[must_use]
-    pub fn new(
-        hooks: Vec<LifecycleHookConfig>,
-        executor: AnyExecutor,
-        tools: &PreparedTools<PathBuf>,
-    ) -> Self {
-        Self::scope(
-            Arc::new(Shared {
-                runner: HookRunner::new(tools),
-                hooks,
-                command_hooks: Vec::new(),
-                executor: Some(executor),
-            }),
-            HookRole::Main,
-        )
+    pub fn new(live: &LiveHooks) -> Self {
+        Self::scope(live.clone(), HookRole::Main, None)
     }
 
     /// A scope with no hooks, for an agent whose host configured none.
     #[must_use]
     pub fn none() -> Self {
-        Self::scope(
-            Arc::new(Shared {
-                runner: HookRunner::without_hooks(),
-                hooks: Vec::new(),
-                command_hooks: Vec::new(),
-                executor: None,
-            }),
-            HookRole::Main,
-        )
+        Self::new(&LiveHooks::none())
     }
 
-    /// Adds the command hooks every shell command of this scope, and of the
-    /// subagent scopes made from it, is put to; see
-    /// [`command_gate`](Self::command_gate).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the scope was already cloned or used for a subagent, or is
-    /// [`none`](Self::none), which has no prepared tools for the hooks to run
-    /// with: the hooks are set once, when the host builds the main agent's
-    /// scope with [`new`](Self::new).
+    /// Asks the user through `broker`, as `session_id`, to fix a command hook
+    /// or reviewer that fails when no working version of it is left. The
+    /// session waits for the answer; without this, such a hook blocks its
+    /// command, and a reviewer passes its request on. One question is open at
+    /// a time per call of this method: the scopes made from the result for
+    /// subagents share it, other sessions' calls do not.
     #[must_use]
-    pub fn with_command_hooks(mut self, hooks: Vec<CommandHookConfig>) -> Self {
-        let shared = Arc::get_mut(&mut self.shared)
-            .expect("command hooks are set before the scope is shared");
-        assert!(
-            shared.runner.has_tools(),
-            "command hooks run in a scope made with `ExternalHooks::new`"
-        );
-        shared.command_hooks = hooks;
+    pub fn with_user_pause(mut self, broker: AskUserBroker, session_id: impl Into<String>) -> Self {
+        self.user = Some(UserPause::new(broker, session_id.into()));
         self
     }
 
-    pub(super) fn command_hooks(&self) -> &[CommandHookConfig] {
-        &self.shared.command_hooks
+    pub(super) const fn live(&self) -> &LiveHooks {
+        &self.live
     }
 
-    pub(super) fn runner(&self) -> &HookRunner {
-        &self.shared.runner
+    pub(super) const fn user(&self) -> Option<&UserPause> {
+        self.user.as_ref()
     }
 
-    fn scope(shared: Arc<Shared>, role: HookRole) -> Self {
+    fn scope(live: LiveHooks, role: HookRole, user: Option<UserPause>) -> Self {
         let (inbox, outbox) = async_channel::unbounded();
         Self {
-            shared,
+            live,
             role,
+            user,
             inbox,
             outbox,
         }
@@ -369,7 +325,7 @@ impl ExternalHooks {
     /// inbox of its own.
     #[must_use]
     pub fn for_subagent(&self) -> Self {
-        Self::scope(Arc::clone(&self.shared), HookRole::Subagent)
+        Self::scope(self.live.clone(), HookRole::Subagent, self.user.clone())
     }
 
     /// The role of the agent this scope belongs to.
@@ -395,20 +351,21 @@ impl ExternalHooks {
             role: self.role,
             payload,
         };
-        let runs = self
-            .shared
-            .hooks
+        let set = self.live.set();
+        let runs = set
+            .lifecycle
             .iter()
-            .filter(|hook| hook.events.contains(&P::KIND))
-            .map(|hook| {
+            .filter(|hook| hook.config.events.contains(&P::KIND))
+            .filter_map(|hook| Some((hook, hook.current.as_ref()?)))
+            .map(|(hook, version)| {
                 let input = &input;
                 async move {
                     let answer = self
-                        .shared
-                        .runner
-                        .run::<_, LifecycleOutput>(&hook.command, input)
+                        .live
+                        .runner()
+                        .run::<_, LifecycleOutput>(&version.command, input)
                         .await;
-                    (hook, answer)
+                    (&hook.config, answer)
                 }
             });
         for (hook, answer) in futures::future::join_all(runs).await {
@@ -468,10 +425,11 @@ impl CommandObserver for ExternalHooks {
     /// agent at its next request, once.
     async fn command_called(&self, call: &CommandCall<'_>) {
         if !self
-            .shared
-            .hooks
+            .live
+            .set()
+            .lifecycle
             .iter()
-            .any(|hook| hook.events.contains(&LifecycleKind::CommandCall))
+            .any(|hook| hook.config.events.contains(&LifecycleKind::CommandCall))
         {
             return;
         }
@@ -487,9 +445,8 @@ impl CommandObserver for ExternalHooks {
             error: call.outcome.error.clone(),
         };
         let hooks = self.clone();
-        self.shared
-            .executor
-            .as_ref()
+        self.live
+            .executor()
             .expect("a scope with hooks has an executor")
             .spawn(async move { hooks.fire(&payload).await })
             .detach();

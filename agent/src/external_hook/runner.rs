@@ -32,7 +32,7 @@ impl HookCommand {
 }
 
 /// Which side of the authority boundary a hook's input comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HookRole {
     /// The main agent.
