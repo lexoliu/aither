@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/lexoliu/aither/compare/v0.11.0...v0.12.0) - 2026-10-29
+
+### Added
+
+- *(sandbox)* distribute host programs, starting with the repo-search daemon
+- *(sandbox)* refuse name- and pattern-based kills
+
+### Fixed
+
+- *(sandbox)* spell unparsable consistently and let typos skip option strings
+- *(agent,sandbox)* resolve canonical paths without the Windows verbatim prefix
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into chore/merge-main-into-dev-0.11
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/v0.10.1...v0.11.0) - 2026-10-29
 
 ### Fixed

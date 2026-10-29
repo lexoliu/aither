@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/lexoliu/aither/compare/agent-v0.11.0...agent-v0.12.0) - 2026-10-29
+
+### Added
+
+- *(agent)* fork subagent that inherits the main agent's context and model
+- *(agent)* compact before sending on a cold cache with a compaction model
+- *(agent)* compact an idle session before its cache expires
+- *(agent,sandbox)* keep subagents inside the main agent's authority
+
+### Fixed
+
+- *(agent)* pair every tool call with a result after a cancelled run
+- *(agent,sandbox)* resolve canonical paths without the Windows verbatim prefix
+
+### Other
+
+- Merge pull request #260 from lexoliu/feat/238-fork-subagent
+- *(agent)* run the fork terminal-controls test on unix only
+- *(agent)* satisfy clippy in the fork task-id diagnostic
+- *(agent)* show the fork's messages when no task id is reported
+- *(agent)* run the fork's background job with sleep so it starts on every platform
+- Merge pull request #251 from lexoliu/feat/227-subagent-authority
+- Merge origin/dev into feat/227-subagent-authority
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/agent-v0.10.1...agent-v0.11.0) - 2026-10-29
 
 ### Added
