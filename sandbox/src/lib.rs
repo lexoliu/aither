@@ -55,11 +55,13 @@
 mod bollard_exec;
 mod command;
 mod container;
+mod kill_guard;
 mod naming;
 mod output;
 mod output_compress;
 mod shell_session;
 mod stdin_watch;
+mod subagent;
 mod terminal;
 mod tool_distribution;
 mod tool_environment;
@@ -84,7 +86,7 @@ pub mod permission;
 
 pub use bollard_exec::BollardContainerExec;
 pub use command::{
-    CommandEnvelope, CommandPayload, DynTerminalTool, DynToolHandler, IpcToolCommand,
+    CommandEnvelope, CommandPayload, CommandRole, DynTerminalTool, DynToolHandler, IpcToolCommand,
     ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
     register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
     tool_output_to_payload,
@@ -104,6 +106,7 @@ pub use job_registry::{
 pub use jobserver::{
     CommandFifo, JobBroker, JobBrokerService, JobPool, JobserverError, job_broker_channel,
 };
+pub use kill_guard::CommandRefusal;
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
 };
@@ -116,22 +119,26 @@ pub use shell_session::{
     SshServer, SshSessionAuthorizer, bootstrap_ssh_runtime,
 };
 pub use stdin_watch::StdinWatchSignal;
+pub use subagent::{
+    CommitLedger, CommitLedgerError, CommitMark, SubagentCommit, SubagentGrant, SubagentGrantError,
+};
 pub use terminal::{
     BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand,
     CompletedTask, Configured, DEFAULT_BACKGROUND_TIMEOUT_CAP, DEFAULT_FOREGROUND_LIMIT,
     DEFAULT_LONG_JOB_ALERT_AFTER, JobAlert, LongRunningJob, PermissionEvent,
     PermissionEventReceiver, PermissionEventStage, StartedBackgroundTask, StdinBlockedJob,
     StdinProbeFailedJob, TerminalArgs, TerminalBackgroundArgs, TerminalBackgroundTool,
-    TerminalError, TerminalExecutionMode, TerminalTool, TerminalToolFactory,
-    TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured, background_task_channel,
-    open_network_audit_log, terminal_tool_factory_channel,
+    TerminalBinding, TerminalError, TerminalExecutionMode, TerminalTool, TerminalToolFactory,
+    TerminalToolFactoryError, Unconfigured, background_task_channel, open_network_audit_log,
 };
 pub use tool_distribution::{
-    ToolArtifact, ToolArtifactFormat, ToolArtifactLocation, ToolDistribution,
+    HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,
+    ToolDistribution,
 };
 pub use tool_runtime::{
-    ManagedTool, PreparedEnvironment, PreparedTools, ToolBinary, ToolBundle, ToolCatalog,
-    ToolRuntimeError, ToolTarget,
+    DistributedTool, HostProgram, HostProgramBinary, HostProgramPath, ManagedTool,
+    PreparedEnvironment, PreparedTools, ToolBinary, ToolBundle, ToolCatalog, ToolRuntimeError,
+    ToolTarget,
 };
 pub use tool_transport::{
     ContainerToolTransport, SshToolTransport, ToolEnvironmentInfo, ToolTransport,

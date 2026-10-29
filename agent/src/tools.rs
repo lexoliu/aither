@@ -8,6 +8,14 @@ use aither_core::llm::tool::{
 };
 #[cfg(feature = "mcp")]
 use aither_mcp::{McpConnection, McpToolService};
+use askama::Template;
+
+/// The refusal of a main-agent tool called in a fork.
+#[derive(askama::Template)]
+#[template(path = "fork_tool_refused.txt", escape = "none")]
+struct ForkToolRefused<'a> {
+    name: &'a str,
+}
 
 /// Tools registry used by the agent.
 ///
@@ -89,6 +97,53 @@ impl AgentTools {
             )
             .expect("dynamic terminal tool registration must succeed: duplicate name or missing description");
         }
+    }
+
+    /// The tools of a fork: `definitions` exactly as the main agent's request
+    /// carried them, run by the entries and terminal controls of `terminal`
+    /// of the same name, so a control acts on the fork's own jobs. A
+    /// definition `terminal` has no entry for belongs to the main agent and
+    /// refuses when called.
+    pub(crate) fn forked(
+        definitions: &[ToolDefinition],
+        terminal: aither_sandbox::DynTerminalTool,
+    ) -> Self {
+        use futures_core::Future;
+        use std::pin::Pin;
+
+        let controls = terminal.controls();
+        let mut handlers: std::collections::HashMap<_, _> = terminal
+            .into_entries()
+            .into_iter()
+            .chain(controls)
+            .map(|entry| (entry.definition.name().to_string(), entry.handler))
+            .collect();
+        let mut tools = Self::new();
+        for definition in definitions {
+            let name = definition.name().to_string();
+            let handler = handlers.remove(&name);
+            tools
+                .eager
+                .register_dyn(
+                    definition.clone(),
+                    move |args: &str,
+                          cx: ToolContext|
+                          -> Pin<
+                        Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send>,
+                    > {
+                        let Some(handler) = handler.clone() else {
+                            let refusal = ForkToolRefused { name: &name }
+                                .render()
+                                .expect("fork tool refusal template must render");
+                            return Box::pin(async move { Err(anyhow::anyhow!(refusal)) });
+                        };
+                        let args = args.to_string();
+                        Box::pin(async move { handler(&args, cx).await.into_tool_result() })
+                    },
+                )
+                .expect("a definition from a request registers: names are unique and described");
+        }
+        tools
     }
 
     /// Returns definitions of all registered tools.

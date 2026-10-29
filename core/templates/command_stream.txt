@@ -1,2 +1,2 @@
-{% match stream %}{% when CommandStream::Inline(text) %}{{ text }}{% when CommandStream::Stored { file, preview, truncated } %}{% if !preview.is_empty() %}{{ preview }}
+{% match stream %}{% when CommandStream::Inline { text } %}{{ text }}{% when CommandStream::Stored { file, preview, truncated } %}{% if !preview.is_empty() %}{{ preview }}
 {% endif %}{% if *truncated %}[Partial view: the full output is saved to {{ file.url }} (absolute path: {{ file.path }}). Use head/tail/grep/sed on that file to read the rest.]{% else %}[Output saved to {{ file.url }} (absolute path: {{ file.path }}).]{% endif %}{% when CommandStream::Image { media_type, file } %}[Image: {{ media_type }}, saved to {{ file.url }} (absolute path: {{ file.path }}).]{% endmatch %}

@@ -188,6 +188,22 @@ pub enum MountRootError {
     #[error("relative path must be valid UTF-8: {0}")]
     /// Relative path contained a non-UTF-8 component.
     NonUtf8(PathBuf),
+    /// A container path that is not beneath the mount's container root.
+    #[error("{path} is not beneath the mounted container directory {root}")]
+    OutsideContainerRoot {
+        /// The container path.
+        path: String,
+        /// The mount root's container directory.
+        root: String,
+    },
+    /// A host path that is not beneath the mount root.
+    #[error("{} is not beneath the mount root {}", .path.display(), .root.display())]
+    OutsideRoot {
+        /// The host path.
+        path: PathBuf,
+        /// The mount root's host directory.
+        root: PathBuf,
+    },
 }
 
 impl MountRoot {
@@ -219,6 +235,58 @@ impl MountRoot {
             MountAccess::ReadOnly => MountSpec::read_only(host_path, container_path),
             MountAccess::ReadWrite => MountSpec::read_write(host_path, container_path),
         })
+    }
+
+    /// Where the host path `host`, the root itself or a path beneath it,
+    /// appears inside the container.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MountRootError::OutsideRoot`] if `host` is not beneath the
+    /// root, and the conditions of [`Self::child`] for what lies beneath it.
+    pub fn container_path(&self, host: &Path) -> Result<ContainerPath, MountRootError> {
+        let relative =
+            host.strip_prefix(&self.host_root)
+                .map_err(|_| MountRootError::OutsideRoot {
+                    path: host.to_path_buf(),
+                    root: self.host_root.clone(),
+                })?;
+        if relative.as_os_str().is_empty() {
+            return Ok(self.container_root.clone());
+        }
+        Self::container_child(&self.container_root, relative)
+    }
+
+    /// Where the container path `container`, the container root itself or a
+    /// path beneath it, lies on the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MountRootError::OutsideContainerRoot`] if `container` is not
+    /// beneath the container root, and [`MountRootError::ParentTraversal`] if
+    /// what lies beneath it contains `..`.
+    pub fn host_path(&self, container: &ContainerPath) -> Result<PathBuf, MountRootError> {
+        let relative = container
+            .as_unix_path()
+            .strip_prefix(self.container_root.as_unix_path())
+            .map_err(|_| MountRootError::OutsideContainerRoot {
+                path: container.to_string(),
+                root: self.container_root.to_string(),
+            })?;
+        let mut host = self.host_root.clone();
+        for name in relative
+            .as_str()
+            .split('/')
+            .filter(|name| !name.is_empty() && *name != ".")
+        {
+            if name == ".." {
+                return Err(MountRootError::ParentTraversal(PathBuf::from(
+                    container.as_str(),
+                )));
+            }
+            host.push(name);
+        }
+        Ok(host)
     }
 
     /// Derives a read-only mount beneath this root.

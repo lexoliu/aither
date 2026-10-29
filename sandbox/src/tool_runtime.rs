@@ -38,13 +38,65 @@ impl ManagedTool {
     }
 
     fn executable_name(self, target: &ToolTarget) -> String {
-        if target.os == "windows" {
-            let mut name = self.command().to_owned();
-            name.push_str(".exe");
-            name
-        } else {
-            self.command().to_owned()
+        executable_name(self.command(), target)
+    }
+}
+
+/// Programs the harness runs itself on the host.
+///
+/// Unlike a [`ManagedTool`], a host program is never placed on a sandbox or
+/// container `PATH` and never appears in the [`ToolCatalog`]; only the
+/// harness receives its verified path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostProgram {
+    /// The `search` daemon of repo-search.
+    RepoSearch,
+}
+
+impl HostProgram {
+    /// Every host program a distribution can provide.
+    pub const ALL: [Self; 1] = [Self::RepoSearch];
+
+    /// Name of the program's executable.
+    #[must_use]
+    pub const fn command(self) -> &'static str {
+        match self {
+            Self::RepoSearch => "search",
         }
+    }
+
+    pub(crate) fn executable_name(self, target: &ToolTarget) -> String {
+        executable_name(self.command(), target)
+    }
+}
+
+/// Either kind of distributed program, for diagnostics shared by both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistributedTool {
+    /// A sandbox command.
+    Command(ManagedTool),
+    /// A host program.
+    Host(HostProgram),
+}
+
+impl From<ManagedTool> for DistributedTool {
+    fn from(tool: ManagedTool) -> Self {
+        Self::Command(tool)
+    }
+}
+
+impl From<HostProgram> for DistributedTool {
+    fn from(program: HostProgram) -> Self {
+        Self::Host(program)
+    }
+}
+
+fn executable_name(command: &str, target: &ToolTarget) -> String {
+    if target.os == "windows" {
+        format!("{command}.exe")
+    } else {
+        command.to_owned()
     }
 }
 
@@ -129,19 +181,153 @@ impl ToolBinary {
         expected: &[u8; 32],
         bytes: Vec<u8>,
     ) -> Result<Self, ToolRuntimeError> {
-        let version = semver::Version::parse(version)?;
-        if bytes.len() > 64 * 1024 * 1024 {
-            return Err(ToolRuntimeError::ArtifactTooLarge(tool));
-        }
-        if digest(&bytes) != *expected {
-            return Err(ToolRuntimeError::Integrity { tool });
-        }
+        let (version, bytes) = verify_executable(tool.into(), version, expected, bytes)?;
         Ok(Self {
             tool,
             version,
             sha256: *expected,
-            bytes: bytes.into(),
+            bytes,
         })
+    }
+}
+
+/// Checks the version, size and digest every distributed executable must satisfy.
+fn verify_executable(
+    tool: DistributedTool,
+    version: &str,
+    expected: &[u8; 32],
+    bytes: Vec<u8>,
+) -> Result<(semver::Version, Arc<[u8]>), ToolRuntimeError> {
+    let version = semver::Version::parse(version)?;
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err(ToolRuntimeError::ArtifactTooLarge(tool));
+    }
+    if digest(&bytes) != *expected {
+        return Err(ToolRuntimeError::Integrity { tool });
+    }
+    Ok((version, bytes.into()))
+}
+
+/// A verified host program for one platform.
+///
+/// This type has no way into a [`ToolBundle`], [`PreparedTools`] or
+/// [`ToolCatalog`]: a host program cannot reach a sandbox `PATH` or the
+/// model's command list.
+#[derive(Debug, Clone)]
+pub struct HostProgramBinary {
+    program: HostProgram,
+    target: ToolTarget,
+    version: semver::Version,
+    sha256: [u8; 32],
+    bytes: Arc<[u8]>,
+}
+
+impl HostProgramBinary {
+    /// Verifies executable bytes against the distribution's trusted digest.
+    ///
+    /// # Errors
+    /// Rejects an invalid version, oversized artifact or mismatched SHA-256.
+    pub fn verify(
+        program: HostProgram,
+        target: ToolTarget,
+        version: &str,
+        expected: &[u8; 32],
+        bytes: Vec<u8>,
+    ) -> Result<Self, ToolRuntimeError> {
+        let (version, bytes) = verify_executable(program.into(), version, expected, bytes)?;
+        Ok(Self {
+            program,
+            target,
+            version,
+            sha256: *expected,
+            bytes,
+        })
+    }
+
+    /// The program this executable implements.
+    #[must_use]
+    pub const fn program(&self) -> HostProgram {
+        self.program
+    }
+
+    /// The pinned version of the program.
+    #[must_use]
+    pub const fn version(&self) -> &semver::Version {
+        &self.version
+    }
+
+    /// Writes the executable to `<root>/<sha256>/<command>`, read-only, or
+    /// verifies the copy already there, and returns its path.
+    ///
+    /// The directory holds nothing else, is not shared with any sandbox
+    /// `PATH` directory and is replaced when its contents are invalid.
+    ///
+    /// # Errors
+    /// Fails when this is not the host's platform or on I/O failure.
+    pub async fn prepare_local(&self, root: &Path) -> Result<HostProgramPath, ToolRuntimeError> {
+        if self.target != ToolTarget::native()? {
+            return Err(ToolRuntimeError::TargetMismatch);
+        }
+        let binary = self.clone();
+        let root = root.to_path_buf();
+        blocking::unblock(move || binary.prepare_local_sync(&root)).await
+    }
+
+    fn prepare_local_sync(&self, root: &Path) -> Result<HostProgramPath, ToolRuntimeError> {
+        std::fs::create_dir_all(root)?;
+        let directory = std::fs::canonicalize(root)?.join(hex::encode(self.sha256));
+        let path = directory.join(self.program.executable_name(&self.target));
+        if self.is_prepared(&path)? {
+            return Ok(HostProgramPath(path));
+        }
+        std::fs::create_dir_all(&directory)?;
+        let mut stage = tempfile::NamedTempFile::new_in(&directory)?;
+        std::io::Write::write_all(&mut stage, &self.bytes)?;
+        drop(stage.persist(&path).map_err(|error| error.error)?);
+        // After the rename: persisting may reset the file's attributes on
+        // Windows, which would clear a read-only bit set on the staged file.
+        set_executable_readonly(&path)?;
+        if self.is_prepared(&path)? {
+            Ok(HostProgramPath(path))
+        } else {
+            Err(ToolRuntimeError::InvalidCache(path))
+        }
+    }
+
+    /// Whether `path` is a regular read-only executable with the trusted digest.
+    fn is_prepared(&self, path: &Path) -> Result<bool, ToolRuntimeError> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return match cache_entry_error(path, error) {
+                    ToolRuntimeError::InvalidCache(_) => Ok(false),
+                    error => Err(error),
+                };
+            }
+        };
+        if !metadata.file_type().is_file() || digest(&std::fs::read(path)?) != self.sha256 {
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = metadata.permissions().mode();
+            Ok(mode & 0o222 == 0 && mode & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        Ok(metadata.permissions().readonly())
+    }
+}
+
+/// The verified path of a prepared host program, for the harness to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostProgramPath(PathBuf);
+
+impl HostProgramPath {
+    /// The read-only executable on the host.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
     }
 }
 
@@ -381,7 +567,9 @@ impl ToolBundle {
             }
             let bytes = std::fs::read(&path).map_err(|error| cache_entry_error(&path, error))?;
             if digest(&bytes) != binary.sha256 {
-                return Err(ToolRuntimeError::Integrity { tool: binary.tool });
+                return Err(ToolRuntimeError::Integrity {
+                    tool: binary.tool.into(),
+                });
             }
             #[cfg(unix)]
             {
@@ -736,15 +924,35 @@ pub enum ToolRuntimeError {
     /// A bundle declares the same command twice.
     #[error("duplicate managed tool: {0:?}")]
     DuplicateTool(ManagedTool),
+    /// The distribution has no artifact of a host program for the target.
+    #[error("host program `{}` has no artifact for {os}/{arch}", .program.command())]
+    MissingHostProgram {
+        /// The requested program.
+        program: HostProgram,
+        /// Operating system of the requested target.
+        os: String,
+        /// Architecture of the requested target.
+        arch: String,
+    },
+    /// The distribution has several artifacts of a host program for the target.
+    #[error("host program `{}` has several artifacts for {os}/{arch}", .program.command())]
+    DuplicateHostProgram {
+        /// The requested program.
+        program: HostProgram,
+        /// Operating system of the requested target.
+        os: String,
+        /// Architecture of the requested target.
+        arch: String,
+    },
     /// Bytes do not match the trusted artifact manifest.
     #[error("tool artifact failed SHA-256 verification: {tool:?}")]
     Integrity {
-        /// Command whose artifact failed verification.
-        tool: ManagedTool,
+        /// Program whose artifact failed verification.
+        tool: DistributedTool,
     },
     /// An artifact exceeds the executable-size limit.
     #[error("tool artifact exceeds the size limit: {0:?}")]
-    ArtifactTooLarge(ManagedTool),
+    ArtifactTooLarge(DistributedTool),
     /// A cached command is not a regular read-only executable.
     #[error("invalid prepared tool cache entry: {0}")]
     InvalidCache(PathBuf),
@@ -765,7 +973,7 @@ pub enum ToolRuntimeError {
     Manifest(#[from] serde_json::Error),
     /// Artifact source is neither a local file nor credential-free HTTPS.
     #[error("{0:?} requires a local file or credential-free HTTPS artifact source")]
-    ArtifactSource(ManagedTool),
+    ArtifactSource(DistributedTool),
     /// Distribution returned a non-success HTTP status.
     #[error("tool artifact download failed with HTTP status {0}")]
     DownloadStatus(u16),
@@ -875,7 +1083,7 @@ pub mod tests {
         assert!(matches!(
             ToolBinary::verify(ManagedTool::Ripgrep, "1.0.0", &[0; 32], b"corrupt".to_vec()),
             Err(ToolRuntimeError::Integrity {
-                tool: ManagedTool::Ripgrep
+                tool: DistributedTool::Command(ManagedTool::Ripgrep)
             })
         ));
     }
@@ -1036,7 +1244,7 @@ pub mod tests {
         assert!(matches!(
             bundle.verify_prepared(ready.bin_dir().parent().unwrap()),
             Err(ToolRuntimeError::Integrity {
-                tool: ManagedTool::Ripgrep
+                tool: DistributedTool::Command(ManagedTool::Ripgrep)
             })
         ));
         let repaired = bundle.prepare_local(cache.path()).await.unwrap();

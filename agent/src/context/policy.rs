@@ -7,6 +7,11 @@
 //! second knob, no per-level strategy and no preservation config: a single
 //! policy keeps the behaviour predictable and the prompt cache analysable.
 
+use std::time::Duration;
+
+/// The share of [`ContextPolicy::compact_at`] a fork may start from.
+const FORK_HEADROOM: f32 = 0.9;
+
 /// Thresholds that govern context compaction and pausing.
 ///
 /// Fractions are of the calibrated context window
@@ -43,6 +48,15 @@ pub struct ContextPolicy {
     /// handoff names. This caps that restoration so a handoff cannot
     /// reintroduce the pressure it was supposed to relieve.
     pub restore_budget: f32,
+
+    /// How long before the cache lifetime ends an idle session is compacted.
+    ///
+    /// The compaction then reads the conversation from the warm cache, and
+    /// the session resumes on a much smaller prefix instead of paying to write
+    /// the whole context again. Counted back from the end of the
+    /// conversation's [`CacheLifetime`](super::CacheLifetime): six minutes
+    /// compacts at 54 minutes under a one-hour lifetime.
+    pub idle_compact_before_expiry: Duration,
 }
 
 impl Default for ContextPolicy {
@@ -51,6 +65,7 @@ impl Default for ContextPolicy {
             compact_at: 0.6,
             pause_at: 0.9,
             restore_budget: 0.15,
+            idle_compact_before_expiry: Duration::from_secs(6 * 60),
         }
     }
 }
@@ -60,6 +75,20 @@ impl ContextPolicy {
     #[must_use]
     pub fn should_compact(&self, usage: f32) -> bool {
         usage >= self.compact_at
+    }
+
+    /// The window usage fraction from which a fork is refused: within 10% of
+    /// the compaction point, where the main agent and the fork would each go
+    /// on to compact the same context.
+    #[must_use]
+    pub fn fork_limit(&self) -> f32 {
+        self.compact_at * FORK_HEADROOM
+    }
+
+    /// Whether a fork may start from a context at `usage`.
+    #[must_use]
+    pub fn allows_fork(&self, usage: f32) -> bool {
+        usage < self.fork_limit()
     }
 
     /// Whether `usage` has reached the pause threshold.
@@ -79,6 +108,14 @@ mod tests {
         assert!(policy.compact_at < policy.pause_at);
         assert!(policy.pause_at < 1.0);
         assert!(policy.restore_budget < policy.compact_at);
+    }
+
+    #[test]
+    fn a_fork_is_refused_within_a_tenth_of_the_compaction_point() {
+        let policy = ContextPolicy::default();
+        assert!(policy.allows_fork(0.53));
+        assert!(!policy.allows_fork(0.54));
+        assert!(!policy.allows_fork(0.7));
     }
 
     #[test]

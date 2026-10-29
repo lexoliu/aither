@@ -35,7 +35,7 @@ use crate::{
     },
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
-    event::{AgentEvent, RunPauseReason},
+    event::{AgentEvent, RunPauseReason, TimedEvent},
     hook::{
         CheckpointContext, CheckpointReason, Hook, PostToolAction, PreToolAction, StopContext,
         StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
@@ -112,18 +112,21 @@ struct ModelTurn {
 /// after the consumer dropped the stream are discarded.
 #[derive(Clone)]
 struct EventSink {
-    sender: async_channel::Sender<AgentEvent>,
+    sender: async_channel::Sender<TimedEvent>,
 }
 
 impl EventSink {
     fn emit(&self, event: AgentEvent) {
-        let _ = self.sender.try_send(event);
+        let _ = self.sender.try_send(TimedEvent {
+            at: jiff::Timestamp::now(),
+            event,
+        });
     }
 }
 
 /// One step of the merged run/event stream in [`Agent::run`].
 enum RunStep {
-    Event(Option<AgentEvent>),
+    Event(Option<TimedEvent>),
     Finished(Result<(), AgentError>),
 }
 
@@ -307,6 +310,13 @@ pub struct KnowledgeAndTimeTemplate {
     pub websearch_command: bool,
 }
 
+/// The result given to a tool call whose run was cancelled before it finished.
+#[derive(Template)]
+#[template(path = "tool_call_cancelled.txt", escape = "none")]
+struct ToolCallCancelledTemplate<'a> {
+    tool: &'a str,
+}
+
 #[derive(Template)]
 #[template(path = "background_terminal_result.txt", escape = "none")]
 struct BackgroundTerminalResultTemplate<'a> {
@@ -412,6 +422,9 @@ impl PermissionPauseTracker {
 /// - `Balanced`: LLM for moderate tasks like subagents (defaults to Advanced)
 /// - `Fast`: LLM for quick tasks like compaction (defaults to Balanced)
 /// - `H`: Composed hooks for customizing behavior (defaults to `()`)
+/// - `Compactor`: The optional compaction model, see
+///   [`AgentBuilder::compaction_model`](crate::builder::AgentBuilder::compaction_model)
+///   (defaults to `Advanced`; unused while none is set)
 ///
 /// # Model Tier Selection
 ///
@@ -420,7 +433,8 @@ impl PermissionPauseTracker {
 /// - Explore subagent: `ModelTier::Balanced` (cheaper but capable)
 /// - Quick tasks: `ModelTier::Fast`
 ///
-/// The `Fast` tier is always used for compaction, regardless of main tier.
+/// Compaction runs on the session's own tier, so it reads the conversation's
+/// prompt cache, unless a compaction model is set.
 ///
 /// # Example
 ///
@@ -443,7 +457,7 @@ impl PermissionPauseTracker {
 ///     .build();
 /// ```
 #[derive(Debug)]
-pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
+pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compactor = Advanced> {
     /// Primary LLM for main reasoning (most capable).
     /// The advanced reasoning model, behind an Arc so a forked compaction
     /// can own it while the run continues.
@@ -458,6 +472,18 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Shared rather than owned because compaction runs as a future that
     /// outlives the borrow of `self` taken by the turn it races against.
     pub(crate) fast: Arc<Fast>,
+
+    /// The model compaction runs on, when it is not the session's own.
+    ///
+    /// A different model cannot read the conversation's prompt cache, so with
+    /// one set compaction is never run early to catch the cache warm (see
+    /// [`Agent::compact_when_idle`]), and an idle gap past the cache lifetime
+    /// reassembles the window instead.
+    pub(crate) compaction_model: Option<Arc<Compactor>>,
+
+    /// Whether the idle compaction already ran since the last request, so one
+    /// idle gap compacts once.
+    pub(crate) idle_compacted: bool,
 
     /// Which model tier to use for main reasoning.
     pub(crate) tier: ModelTier,
@@ -483,11 +509,19 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Sources rendered into the volatile tail of every request.
     pub(crate) context_sources: Vec<AnyContextSource>,
 
+    /// Whether the window was rewritten since the sources last heard a
+    /// request begin, which wipes every durable alert they pushed before.
+    pub(crate) reassembled: bool,
+
     /// Compaction running alongside the current turn, if any.
     pub(crate) pending_compaction: Option<PendingCompaction>,
 
     /// Compaction that finished and is waiting for a request boundary.
     pub(crate) completed_compaction: Option<CompletedCompaction>,
+
+    /// Results of the tool calls of the turn in flight, in completion order,
+    /// until they are moved into the context.
+    pub(crate) tool_results: VecDeque<ToolExecutionResult>,
 
     /// Cached model profile (for the selected tier).
     pub(crate) profile: Option<ModelProfile>,
@@ -505,6 +539,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Optional sandbox directory for working-doc supervision (`tasks.md`).
     pub(crate) sandbox_dir: Option<PathBuf>,
 
+    /// Directory files are restored from after a forked compaction.
+    pub(crate) restore_dir: Option<PathBuf>,
+
     /// Start time of the most recent LLM request issued by this agent.
     pub(crate) last_request_started_at: Option<Instant>,
 
@@ -514,6 +551,10 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
 
     /// Prompt-cache keep-alive bookkeeping for the current run.
     pub(crate) cache_keep_alive: CacheKeepAliveState,
+
+    /// Where every request this agent sends is published for the `fork`
+    /// subagent kind to start from; `None` when no fork reads this agent.
+    pub(crate) fork_source: Option<crate::fork::ForkSource>,
 
     /// Rolling KV-cache statistics accumulated from emitted `Usage` events.
     ///
@@ -538,7 +579,7 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     pub(crate) active_allowed_tools: Option<HashSet<String>>,
 }
 
-impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
+impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
     /// Creates a new agent with default configuration.
     ///
     /// All model tiers (advanced/balanced/fast) use the same model.
@@ -556,6 +597,8 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             advanced: Arc::new(llm.clone()),
             balanced: Arc::new(llm.clone()),
             fast: Arc::new(llm),
+            compaction_model: None,
+            idle_compacted: false,
             tier: ModelTier::default(),
             tools: AgentTools::new(),
             hooks: (),
@@ -564,8 +607,10 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             budget: ContextBudget::default(),
             prompt_cache: PromptCache::new(uuid::Uuid::new_v4().to_string()),
             context_sources: Vec::new(),
+            reassembled: false,
             pending_compaction: None,
             completed_compaction: None,
+            tool_results: VecDeque::new(),
             profile: None,
             initialized: false,
             last_request_started_at: None,
@@ -573,8 +618,10 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             permission_receiver: None,
             job_registry: None,
             sandbox_dir: None,
+            restore_dir: None,
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
+            fork_source: None,
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -593,13 +640,15 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
     }
 }
 
-impl<Advanced, Balanced, Fast, H> Agent<Advanced, Balanced, Fast, H>
+impl<Advanced, Balanced, Fast, H, Compactor> Agent<Advanced, Balanced, Fast, H, Compactor>
 where
     Advanced: LanguageModel + 'static,
     Balanced: LanguageModel + 'static,
     // Compaction runs as an owned future that outlives the turn it races
     // against, so the fast model it borrows must outlive the agent.
     Fast: LanguageModel + 'static,
+    // Owned by the compaction future for the same reason.
+    Compactor: LanguageModel + 'static,
     H: Hook,
 {
     /// Response stream of the active tier, boxed so the provider's concrete
@@ -694,6 +743,7 @@ where
         for event in self.activate_skills_for_prompt(&prompt) {
             events.emit(event);
         }
+        self.settle_interrupted_tool_calls();
         self.context
             .push(Message::user(&prompt).with_attachments(attachments));
 
@@ -747,7 +797,7 @@ where
         turn: usize,
         events: &EventSink,
     ) -> Result<TurnControl, AgentError> {
-        let Some(request) = self.prepare_request().await else {
+        let Some(request) = self.prepare_request().await? else {
             events.emit(AgentEvent::run_paused(
                 RunPauseReason::ContextExhausted,
                 String::new(),
@@ -778,8 +828,8 @@ where
             model_turn.reasoning,
         ));
         Self::push_tool_start_events(&tool_calls, events);
-        let results = self.execute_tool_calls(&tool_calls, turn, events).await;
-        self.apply_tool_results(results, events)?;
+        self.execute_tool_calls(&tool_calls, turn, events).await;
+        self.apply_tool_results(events)?;
         self.push_tool_turn_alerts().await;
         self.push_turn_boundary_events(run_id, turn, &response_text, events)
             .await
@@ -860,6 +910,39 @@ where
         })
     }
 
+    /// Gives every tool call in the context a result.
+    ///
+    /// A run stream dropped while tools execute leaves the assistant message
+    /// carrying the calls with no results behind it, and providers reject a
+    /// request holding such calls. Runs at the start of the next run (and of a
+    /// manual compaction), so the repair needs nothing from the host and only
+    /// appends: the prefix, thinking blocks included, stays byte-identical.
+    /// Calls whose results had already landed keep them; the rest get a
+    /// cancelled result.
+    fn settle_interrupted_tool_calls(&mut self) {
+        let mut parked = std::mem::take(&mut self.tool_results);
+        let mut unresolved: Vec<ToolCall> = Vec::new();
+        for message in self.context.recent() {
+            unresolved.extend(message.tool_calls().iter().cloned());
+            if let Some(id) = message.tool_call_id() {
+                unresolved.retain(|call| call.id != id);
+            }
+        }
+        for call in unresolved {
+            let finished = parked
+                .iter()
+                .position(|result| matches!(result, Ok((id, _, _)) if *id == call.id))
+                .and_then(|index| parked.remove(index));
+            let content = match finished {
+                Some(Ok((_, _, result))) => result.render_for_model(),
+                _ => ToolCallCancelledTemplate { tool: &call.name }
+                    .render()
+                    .expect("tool call cancelled template must render"),
+            };
+            self.context.push(Message::tool(&call.id, content));
+        }
+    }
+
     fn push_tool_start_events(tool_calls: &[ToolCall], events: &EventSink) {
         for call in tool_calls {
             let args = call.arguments.to_string();
@@ -874,17 +957,25 @@ where
         }
     }
 
+    /// Runs `tool_calls` concurrently, parking each result in
+    /// `self.tool_results` the moment it lands.
+    ///
+    /// The results live on the agent rather than in this future so a run
+    /// stream dropped mid-execution still leaves the finished ones for
+    /// [`Self::settle_interrupted_tool_calls`] to pair.
     async fn execute_tool_calls(
-        &self,
+        &mut self,
         tool_calls: &[ToolCall],
         turn: usize,
         events: &EventSink,
-    ) -> Vec<Result<(String, String, aither_core::llm::ToolResult), AgentError>> {
+    ) {
         let permission_receiver = self.permission_receiver.clone();
         let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(tool_calls);
+        let message_count = self.context.len_recent();
+        let (hooks, tools) = (&self.hooks, &self.tools);
+        let results = &mut self.tool_results;
         let tool_futures = tool_calls.iter().map(|call| {
             let args_json = call.arguments.to_string();
-            let message_count = self.context.len_recent();
             async move {
                 let tool_ctx = ToolUseContext {
                     tool_name: &call.name,
@@ -892,16 +983,15 @@ where
                     turn,
                     message_count,
                 };
-                let (result, duration) = self
-                    .call_tool_with_hooks(call, &args_json, &tool_ctx)
-                    .await?;
+                let (result, duration) =
+                    Self::call_tool_with_hooks(hooks, tools, call, &args_json, &tool_ctx).await?;
                 let result_ctx = ToolResultContext {
                     tool_name: &call.name,
                     arguments: &args_json,
                     result: &result,
                     duration,
                 };
-                let tool_result = match self.hooks.post_tool_use(&result_ctx).await {
+                let tool_result = match hooks.post_tool_use(&result_ctx).await {
                     PostToolAction::Abort(reason) => {
                         return Err(AgentError::HookRejected {
                             hook: "post_tool_use",
@@ -916,7 +1006,6 @@ where
         });
 
         let mut pending = tool_futures.collect::<futures::stream::FuturesUnordered<_>>();
-        let mut results = Vec::new();
         while !pending.is_empty() {
             let next = match &permission_receiver {
                 Some(receiver) => {
@@ -928,28 +1017,23 @@ where
                 }
                 None => pending.next().await.map(ExecutionSignal::Tool),
             };
-            Self::handle_execution_signal(
-                next,
-                &mut permission_pause_tracker,
-                &mut results,
-                events,
-            );
+            Self::handle_execution_signal(next, &mut permission_pause_tracker, results, events);
         }
         if let Some(receiver) = &permission_receiver {
             for event in receiver.take_pending() {
                 emit_permission_event(&mut permission_pause_tracker, &event, events);
             }
         }
-        results
     }
 
     async fn call_tool_with_hooks(
-        &self,
+        hooks: &H,
+        tools: &AgentTools,
         call: &ToolCall,
         args_json: &str,
         tool_ctx: &ToolUseContext<'_>,
     ) -> Result<(aither_core::llm::ToolResult, Duration), AgentError> {
-        match self.hooks.pre_tool_use(tool_ctx).await {
+        match hooks.pre_tool_use(tool_ctx).await {
             PreToolAction::Abort(reason) => Err(AgentError::HookRejected {
                 hook: "pre_tool_use",
                 reason,
@@ -960,8 +1044,7 @@ where
             PreToolAction::Allow => {
                 let start = Instant::now();
                 // The agent loop has nowhere to show a tool's progress.
-                let result = self
-                    .tools
+                let result = tools
                     .call(&call.name, args_json, aither_core::llm::ToolContext::new())
                     .await
                     .unwrap_or_else(|error| {
@@ -977,11 +1060,11 @@ where
     fn handle_execution_signal(
         signal: Option<ToolExecutionSignal>,
         tracker: &mut PermissionPauseTracker,
-        results: &mut Vec<ToolExecutionResult>,
+        results: &mut VecDeque<ToolExecutionResult>,
         events: &EventSink,
     ) {
         match signal {
-            Some(ExecutionSignal::Tool(result)) => results.push(result),
+            Some(ExecutionSignal::Tool(result)) => results.push_back(result),
             Some(ExecutionSignal::Permission(event)) => {
                 emit_permission_event(tracker, &event, events);
             }
@@ -989,11 +1072,11 @@ where
         }
     }
 
-    fn apply_tool_results(
-        &mut self,
-        results: Vec<Result<(String, String, aither_core::llm::ToolResult), AgentError>>,
-        events: &EventSink,
-    ) -> Result<(), AgentError> {
+    /// Moves the parked tool results into the context.
+    ///
+    /// Results not reached because one failed stay parked for
+    /// [`Self::settle_interrupted_tool_calls`].
+    fn apply_tool_results(&mut self, events: &EventSink) -> Result<(), AgentError> {
         let mut has_tool_error = false;
         let mut unknown_tools: Vec<String> = Vec::new();
         let known_tools: Vec<String> = self
@@ -1002,7 +1085,7 @@ where
             .into_iter()
             .map(|definition| definition.name().to_string())
             .collect();
-        for result in results {
+        while let Some(result) = self.tool_results.pop_front() {
             let (call_id, call_name, tool_result) = result?;
             let is_terminal_call = matches!(call_name.as_str(), "terminal" | "terminal_background");
             if !known_tools.contains(&call_name) && !unknown_tools.contains(&call_name) {
@@ -1433,7 +1516,7 @@ where
 
         let mut final_text = String::new();
         while let Some(event) = stream.next().await {
-            match event? {
+            match event?.event {
                 AgentEvent::Text(chunk) => final_text.push_str(&chunk),
                 AgentEvent::Complete {
                     final_text: text, ..
@@ -1470,7 +1553,7 @@ where
         &mut self,
         prompt: &str,
         attachments: impl IntoIterator<Item = Attachment>,
-    ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
+    ) -> impl Stream<Item = Result<TimedEvent, AgentError>> + '_ {
         let prompt = prompt.to_string();
         let attachments: Vec<Attachment> = attachments.into_iter().collect();
 
@@ -1586,6 +1669,7 @@ where
         focus: Option<&str>,
     ) -> Result<Option<CompactResult>, AgentError> {
         self.ensure_initialized().await?;
+        self.settle_interrupted_tool_calls();
 
         let messages = self.context.conversation_messages();
         if messages.is_empty() {
@@ -1594,9 +1678,17 @@ where
 
         let messages_compacted = messages.len();
         let tail = self.render_tail().await;
-        let request = LLMRequest::new(self.context.build_request(&tail))
-            .with_parameters(self.config.request_parameters.clone())
-            .with_tool_definitions(self.tools.active_definitions());
+        let definitions = self.tools.active_definitions();
+        let messages = self.context.build_request(&tail);
+        // The same cache controls as the requests that wrote the prefix, so a
+        // compaction on the session's own model is served from that cache.
+        let request = LLMRequest::new(messages.clone())
+            .with_parameters(self.prompt_cache.apply(
+                self.config.request_parameters.clone(),
+                &messages,
+                !definitions.is_empty(),
+            ))
+            .with_tool_definitions(definitions);
         #[cfg(feature = "skills")]
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
@@ -1610,12 +1702,10 @@ where
         )
         .map_err(|error| AgentError::Llm(error.to_string()))?;
         let fork_point = fork.fork_point();
-        let handoff = match self.tier {
-            ModelTier::Advanced => fork.run(Arc::clone(&self.advanced)).await,
-            ModelTier::Balanced => fork.run(Arc::clone(&self.balanced)).await,
-            ModelTier::Fast => fork.run(Arc::clone(&self.fast)).await,
-        }
-        .map_err(|error| AgentError::Llm(error.to_string()))?;
+        let handoff = self
+            .compaction_future(fork)
+            .await
+            .map_err(|error| AgentError::Llm(error.to_string()))?;
         let summary = handoff.render_markdown();
 
         self.completed_compaction = Some(CompletedCompaction {
@@ -1631,11 +1721,108 @@ where
         }))
     }
 
+    /// Runs `fork` to completion on the compaction model: the configured one,
+    /// or else the session's own tier.
+    async fn compaction_future(
+        &self,
+        fork: CompactionFork,
+    ) -> Result<HandoffDocument, crate::context::CompactionError> {
+        if let Some(model) = &self.compaction_model {
+            return fork.run(Arc::clone(model)).await;
+        }
+        match self.tier {
+            ModelTier::Advanced => fork.run(Arc::clone(&self.advanced)).await,
+            ModelTier::Balanced => fork.run(Arc::clone(&self.balanced)).await,
+            ModelTier::Fast => fork.run(Arc::clone(&self.fast)).await,
+        }
+    }
+
+    /// Starts `fork` in the background on the compaction model: the
+    /// configured one, or else the session's own tier.
+    fn start_pending_compaction(&self, fork: CompactionFork) -> PendingCompaction {
+        if let Some(model) = &self.compaction_model {
+            return PendingCompaction::start(fork, Arc::clone(model));
+        }
+        match self.tier {
+            ModelTier::Advanced => PendingCompaction::start(fork, Arc::clone(&self.advanced)),
+            ModelTier::Balanced => PendingCompaction::start(fork, Arc::clone(&self.balanced)),
+            ModelTier::Fast => PendingCompaction::start(fork, Arc::clone(&self.fast)),
+        }
+    }
+
+    /// How long from now the idle compaction is due: `Some(Duration::ZERO)`
+    /// when it is due now, `None` when none is pending.
+    ///
+    /// The window is compacted once, shortly before the conversation's cache
+    /// lifetime ends ([`ContextPolicy::idle_compact_before_expiry`] ahead of
+    /// it), counted from the entry's last use, so the compaction reads the
+    /// still-warm cache. None is pending when:
+    ///
+    /// - a compaction model is set, which cannot read that cache;
+    /// - the lifetime is [`CacheLifetime::Permanent`];
+    /// - nothing has been sent yet, or the conversation is empty;
+    /// - it already ran since the last request;
+    /// - the cache has expired already, when compacting would only pay to
+    ///   write the whole context again.
+    ///
+    /// The agent has no timer of its own: the host sleeps this long while the
+    /// session is idle, then calls [`compact_when_idle`](Self::compact_when_idle).
+    ///
+    /// [`ContextPolicy::idle_compact_before_expiry`]: crate::ContextPolicy::idle_compact_before_expiry
+    #[must_use]
+    pub fn idle_compaction_due_in(&self) -> Option<Duration> {
+        if self.compaction_model.is_some()
+            || self.idle_compacted
+            || self.pending_compaction.is_some()
+            || self.completed_compaction.is_some()
+            || self.context.is_conversation_empty()
+        {
+            return None;
+        }
+        let CacheLifetime::Limited(lifetime) = self.prompt_cache.lifetime() else {
+            return None;
+        };
+        let idle = self.cache_entry_started_at()?.elapsed();
+        if idle >= lifetime {
+            return None;
+        }
+        let due_at = lifetime.saturating_sub(self.config.context_policy.idle_compact_before_expiry);
+        Some(due_at.saturating_sub(idle))
+    }
+
+    /// Compacts the idle session once its cache is about to expire.
+    ///
+    /// Runs one compaction through the normal fork and apply path when
+    /// [`idle_compaction_due_in`](Self::idle_compaction_due_in) says it is due
+    /// now, and returns `None` otherwise, so a host may call it whenever its
+    /// idle timer fires. One idle gap compacts once: the next request re-arms
+    /// it. Nothing is kept across the handoff, so no thinking produced under
+    /// the old prefix is replayed after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the compaction failure; the window is left as it was.
+    pub async fn compact_when_idle(&mut self) -> Result<Option<CompactResult>, AgentError> {
+        if self.idle_compaction_due_in() != Some(Duration::ZERO) {
+            return Ok(None);
+        }
+        let result = self.compact(None).await?;
+        self.idle_compacted = true;
+        if let Some(result) = &result {
+            tracing::info!(
+                compacted = result.messages_compacted,
+                "compacted the idle context shortly before its cache expires"
+            );
+        }
+        Ok(result)
+    }
+
     /// Forks a compaction off `request` to run alongside the turns that follow.
     ///
-    /// The compaction replays the session's current model, not a cheaper one:
-    /// the handoff has to carry the same understanding of the conversation the
-    /// next requests are made of.
+    /// The compaction replays the session's current model unless a compaction
+    /// model is set: the handoff has to carry the same understanding of the
+    /// conversation the next requests are made of, and only that model reads
+    /// the cache the run just paid for.
     ///
     /// A failure to even start — an empty conversation — is not an error for
     /// the run: there is simply nothing to compact yet.
@@ -1657,15 +1844,7 @@ where
                     usage = self.budget.usage(),
                     "forking compaction alongside the run"
                 );
-                self.pending_compaction = Some(match self.tier {
-                    ModelTier::Advanced => {
-                        PendingCompaction::start(fork, Arc::clone(&self.advanced))
-                    }
-                    ModelTier::Balanced => {
-                        PendingCompaction::start(fork, Arc::clone(&self.balanced))
-                    }
-                    ModelTier::Fast => PendingCompaction::start(fork, Arc::clone(&self.fast)),
-                });
+                self.pending_compaction = Some(self.start_pending_compaction(fork));
             }
             Err(error) => {
                 tracing::debug!(%error, "compaction not forked");
@@ -1709,13 +1888,14 @@ where
         // staged system-block updates and superseded tool results fold in.
         self.context.reassemble();
         self.context.apply_handoff(&handoff, fork_point);
+        self.reassembled = true;
         tracing::info!(
             fork_point,
             kept = self.context.len_recent(),
             "applied handoff from forked compaction"
         );
 
-        if let Some(sandbox_dir) = self.sandbox_dir.clone() {
+        if let Some(restore_dir) = self.restore_dir.clone() {
             let tokens = self
                 .budget
                 .fraction_tokens(self.config.context_policy.restore_budget);
@@ -1725,7 +1905,7 @@ where
             #[cfg(not(feature = "skills"))]
             let skills = Vec::new();
             if let Some(block) =
-                restore_context(&handoff, &[sandbox_dir], &skills, budget_chars).await
+                restore_context(&handoff, &[restore_dir], &skills, budget_chars).await
             {
                 self.context.push_block_alert(&block);
             }
@@ -1804,6 +1984,20 @@ where
         let block = Block::new("system-reminder", content);
         self.budget.append(block.len());
         self.context.push_block_alert(&block);
+    }
+
+    /// Collects the durable alerts sources raise as a request begins.
+    ///
+    /// Tells the sources whether the window was reassembled since the last
+    /// time, which is when their earlier alerts stopped being in it.
+    async fn push_request_alerts(&mut self) {
+        let reassembled = std::mem::take(&mut self.reassembled);
+        for index in 0..self.context_sources.len() {
+            if let Some(block) = self.context_sources[index].on_request(reassembled).await {
+                self.budget.append(block.len());
+                self.context.push_block_alert(&block);
+            }
+        }
     }
 
     /// Collects the durable alerts sources raise after a tool turn.
@@ -2007,15 +2201,24 @@ where
     /// [`ContextPolicy::compact_at`], and one that was already running is
     /// awaited if usage reached [`ContextPolicy::pause_at`].
     ///
+    /// With a compaction model set, a cache that went cold since the last
+    /// request is rebuilt first (`rebuild_if_cache_is_cold`).
+    ///
     /// Returns `None` when the window is exhausted and no compaction can
     /// relieve it: the caller pauses the run rather than sending a request
     /// the provider would reject for length.
     ///
+    /// # Errors
+    ///
+    /// Returns the compaction failure when the cold-cache compaction fails;
+    /// nothing is sent on an uncompacted context.
+    ///
     /// [`ContextPolicy::compact_at`]: crate::ContextPolicy::compact_at
     /// [`ContextPolicy::pause_at`]: crate::ContextPolicy::pause_at
-    async fn prepare_request(&mut self) -> Option<LLMRequest> {
+    async fn prepare_request(&mut self) -> Result<Option<LLMRequest>, AgentError> {
         self.apply_completed_compaction().await;
-        self.reassemble_if_cache_is_cold();
+        self.rebuild_if_cache_is_cold().await?;
+        self.push_request_alerts().await;
 
         let definitions = self.tools.active_definitions();
         let mut tail = self.render_tail().await;
@@ -2041,8 +2244,9 @@ where
         if self.config.context_policy.should_pause(usage) {
             tracing::warn!(usage, "context window exhausted; waiting for compaction");
             if !self.await_pending_compaction().await {
-                return None;
+                return Ok(None);
             }
+            self.push_request_alerts().await;
             tail = self.render_tail().await;
             messages = self.context.build_request(&tail);
             self.budget
@@ -2050,12 +2254,14 @@ where
             // A landed compaction is still no guarantee the rebuilt request
             // fits; an unshrinkable request is paused rather than sent.
             if self.config.context_policy.should_pause(self.budget.usage()) {
-                return None;
+                return Ok(None);
             }
         }
 
         self.commit_tail(&tail).await;
         self.last_request_started_at = Some(Instant::now());
+        self.idle_compacted = false;
+        self.publish_fork_snapshot(&tail, &definitions);
 
         let has_tools = !definitions.is_empty();
         self.prompt_cache
@@ -2067,10 +2273,90 @@ where
             .with_parameters(parameters)
             .with_tool_definitions(definitions);
         self.last_request = Some(request.clone());
-        Some(request)
+        Ok(Some(request))
+    }
+
+    /// Publishes the request about to be sent for a fork to start from.
+    fn publish_fork_snapshot(
+        &self,
+        tail: &[Block],
+        definitions: &[aither_core::llm::tool::ToolDefinition],
+    ) {
+        let Some(source) = &self.fork_source else {
+            return;
+        };
+        let mut context = self.context.clone();
+        context.push_tail(tail);
+        source.publish(crate::fork::ForkSnapshot {
+            tier: self.tier,
+            context,
+            prompt_cache: self.prompt_cache.clone(),
+            budget: self.budget,
+            profile: self
+                .profile
+                .clone()
+                .expect("a request is only sent by an initialized agent, which has its profile"),
+            request_parameters: self.config.request_parameters.clone(),
+            context_policy: self.config.context_policy,
+            definitions: definitions.to_vec(),
+            usage: self.budget.usage(),
+        });
+    }
+
+    /// Rebuilds the prefix once, before a send, when the provider's cache has
+    /// gone cold.
+    ///
+    /// Only with a compaction model set (otherwise the session is compacted
+    /// shortly before the cache expires, see [`Agent::compact_when_idle`], and
+    /// a send never rebuilds). The cache is cold when the conversation's
+    /// [`CacheLifetime`] has passed since the entry was last used; a permanent
+    /// lifetime never is, and nothing runs while the session is idle.
+    ///
+    /// The compaction model reads the context uncached whatever the timing, so
+    /// compacting now costs no more than later, and the send then pays its
+    /// cache write on the compacted context instead of the whole one. The
+    /// compaction's apply already reassembles the window, so the prefix is
+    /// rewritten once: reassembly alone runs only when there is no
+    /// conversation to compact. Nothing is kept across the handoff, so no
+    /// thinking produced under the old prefix is replayed after it.
+    ///
+    /// A forked compaction already in flight lands and rebuilds the prefix
+    /// itself, so it is left alone.
+    ///
+    /// [`CacheLifetime`]: crate::context::CacheLifetime
+    async fn rebuild_if_cache_is_cold(&mut self) -> Result<(), AgentError> {
+        if self.compaction_model.is_none() || self.pending_compaction.is_some() {
+            return Ok(());
+        }
+        let Some(entry_started_at) = self.cache_entry_started_at() else {
+            return Ok(());
+        };
+        if !self
+            .prompt_cache
+            .lifetime()
+            .is_cold(entry_started_at.elapsed())
+        {
+            return Ok(());
+        }
+        if self.context.is_conversation_empty() {
+            self.reassemble_if_cache_is_cold();
+            return Ok(());
+        }
+        // Boxed: the compaction future is large and sits on every run's path
+        // (see `run_futures_stay_small_with_a_real_provider_type`).
+        if let Some(result) = Box::pin(self.compact(None)).await? {
+            tracing::info!(
+                compacted = result.messages_compacted,
+                "compacted the context before sending on a cold cache"
+            );
+        }
+        Ok(())
     }
 
     /// Rebuilds the window once the provider's cache has gone cold anyway.
+    ///
+    /// Reached only for a session with a compaction model and nothing to
+    /// compact (`rebuild_if_cache_is_cold`).
     ///
     /// Reassembly rewrites the cacheable prefix, so it is only free once the
     /// cached copy has expired — an idle gap at least as long as the
@@ -2092,6 +2378,7 @@ where
             return unchanged;
         }
         let report = self.context.reassemble();
+        self.reassembled |= report.system_messages_pruned > 0;
         if report.changed() {
             tracing::debug!(
                 system_messages = report.system_messages_pruned,
@@ -2151,9 +2438,10 @@ where
             return ContextWindowPhase::Compacting;
         }
         if metrics.has_staged_system_updates
-            || self
-                .cache_entry_started_at()
-                .is_some_and(|at| self.prompt_cache.lifetime().is_cold(at.elapsed()))
+            || (self.compaction_model.is_some()
+                && self
+                    .cache_entry_started_at()
+                    .is_some_and(|at| self.prompt_cache.lifetime().is_cold(at.elapsed())))
         {
             return ContextWindowPhase::ReassemblyDue;
         }
@@ -2413,7 +2701,9 @@ mod tests {
     use futures_core::Stream;
 
     fn inline(text: &str) -> CommandStream {
-        CommandStream::Inline(text.to_string())
+        CommandStream::Inline {
+            text: text.to_string(),
+        }
     }
 
     fn completed(result: Result<CompletedCommand, TerminalError>) -> CompletedTask {
@@ -2550,6 +2840,40 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn events_carry_their_emission_time() {
+        use futures_lite::StreamExt;
+
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 1000,
+            },
+            AgentConfig::default(),
+        );
+        let before = jiff::Timestamp::now();
+        let events: Vec<TimedEvent> = {
+            let stream = agent.run("hello", std::iter::empty());
+            futures_lite::pin!(stream);
+            let mut events = Vec::new();
+            while let Some(item) = stream.next().await {
+                if let Ok(event) = item {
+                    events.push(event);
+                }
+            }
+            events
+        };
+        let after = jiff::Timestamp::now();
+
+        assert!(matches!(
+            events.first().map(|timed| &timed.event),
+            Some(AgentEvent::RunStart { .. })
+        ));
+        for timed in &events {
+            assert!(before <= timed.at && timed.at <= after);
+        }
+        assert!(events.windows(2).all(|pair| pair[0].at <= pair[1].at));
+    }
+
     /// aither#143: the provider `respond` stream's multi-KB state machine must
     /// stay boxed at the leaf (`respond_stream`); if the box is removed these
     /// futures embed it by value and each poll frame pays the ~32 KB temp.
@@ -2640,7 +2964,13 @@ mod tests {
         // The conversation is non-empty, so a compaction is forked; the mock
         // model answers with an empty stream, so it cannot land, and the
         // request must not be sent on a window this far over the threshold.
-        assert!(agent.prepare_request().await.is_none());
+        assert!(
+            agent
+                .prepare_request()
+                .await
+                .expect("request boundary")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2862,6 +3192,7 @@ mod tests {
         let messages = agent
             .prepare_request()
             .await
+            .expect("request boundary")
             .expect("a fresh window must accept a request")
             .messages()
             .to_vec();
@@ -2935,6 +3266,7 @@ mod tests {
         let request = agent
             .prepare_request()
             .await
+            .expect("request boundary")
             .expect("a fresh window must accept a request");
 
         assert!(
@@ -3275,7 +3607,7 @@ mod tests {
         agent.context_mut().set_handoff("resume here");
         agent.push_message(Message::user("hello"));
 
-        let request = agent.prepare_request().await;
+        let request = agent.prepare_request().await.expect("request boundary");
 
         assert!(
             request.is_some(),
@@ -3313,7 +3645,7 @@ mod tests {
             agent.push_message(message);
         }
 
-        let request = agent.prepare_request().await;
+        let request = agent.prepare_request().await.expect("request boundary");
 
         assert!(
             request.is_some(),
@@ -3359,7 +3691,7 @@ mod tests {
             .expect("fork");
         agent.pending_compaction = Some(PendingCompaction::start(fork, llm.clone()));
 
-        let request = agent.prepare_request().await;
+        let request = agent.prepare_request().await.expect("request boundary");
 
         assert!(
             request.is_some(),
@@ -3406,6 +3738,7 @@ mod tests {
         let request = agent
             .prepare_request()
             .await
+            .expect("request boundary")
             .expect("request after compaction");
 
         assert!(
@@ -3438,7 +3771,11 @@ mod tests {
             },
         });
 
-        agent.prepare_request().await.expect("request after apply");
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after apply");
 
         let conversation: Vec<String> = agent
             .context()
@@ -3481,8 +3818,8 @@ mod tests {
         assert!(compaction.messages().len() > main.messages().len());
     }
 
-    /// A preview renders sources but does not commit them: the real request
-    /// still carries the same tasks diff.
+    /// A preview does not consume the session start: the real request still
+    /// carries the document.
     #[tokio::test]
     async fn a_preview_leaves_source_committed_state_untouched() {
         use tempfile::tempdir;
@@ -3505,6 +3842,7 @@ mod tests {
         let request = agent
             .prepare_request()
             .await
+            .expect("request boundary")
             .expect("request after preview");
         assert!(
             request
@@ -3516,12 +3854,15 @@ mod tests {
     }
 
     /// Idle reassembly fires only once the conversation's cache lifetime has
-    /// passed — never earlier, and never for a permanent cache.
+    /// passed — never earlier, and never for a permanent cache. It runs only
+    /// with a compaction model: otherwise idle compaction takes the idle gap.
     #[tokio::test]
     async fn an_idle_gap_reassembles_only_past_the_cache_lifetime() {
-        let mut agent = Agent::new(MockLlm {
+        let mut agent = Agent::builder(MockLlm {
             context_length: 1_000_000,
-        });
+        })
+        .compaction_model(ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]))
+        .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
         agent.push_message(Message::system(
@@ -3530,18 +3871,36 @@ mod tests {
 
         // The default lifetime is one hour: five minutes is nothing.
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(300));
-        assert!(agent.prepare_request().await.is_some());
+        assert!(
+            agent
+                .prepare_request()
+                .await
+                .expect("request boundary")
+                .is_some()
+        );
         assert_eq!(agent.context().count_recent_system_messages(), 1);
 
         // Fifty-nine minutes is still inside the hour.
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3540));
-        assert!(agent.prepare_request().await.is_some());
+        assert!(
+            agent
+                .prepare_request()
+                .await
+                .expect("request boundary")
+                .is_some()
+        );
         assert_eq!(agent.context().count_recent_system_messages(), 1);
 
         // Sixty-one minutes is past it: the cached prefix is gone anyway,
         // so the compromises the append-only log forced get cleaned up.
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
-        assert!(agent.prepare_request().await.is_some());
+        assert!(
+            agent
+                .prepare_request()
+                .await
+                .expect("request boundary")
+                .is_some()
+        );
         assert_eq!(agent.context().count_recent_system_messages(), 0);
     }
 
@@ -3549,9 +3908,13 @@ mod tests {
     async fn a_permanent_cache_lifetime_never_reassembles() {
         use crate::context::CacheLifetime;
 
-        let mut agent = Agent::new(MockLlm {
+        let mut agent = Agent::builder(MockLlm {
             context_length: 1_000_000,
-        });
+        })
+        .compaction_model(MockLlm {
+            context_length: 1_000_000,
+        })
+        .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.prompt_cache = agent
             .prompt_cache
@@ -3565,7 +3928,734 @@ mod tests {
         // Rewriting the prefix always costs a permanent cache, so no idle
         // gap ever justifies it — even a day later.
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
-        assert!(agent.prepare_request().await.is_some());
+        assert!(
+            agent
+                .prepare_request()
+                .await
+                .expect("request boundary")
+                .is_some()
+        );
         assert_eq!(agent.context().count_recent_system_messages(), 1);
+    }
+
+    /// An agent that has sent one request, with `llm` as its model.
+    async fn agent_after_one_request(
+        llm: ScriptedLlm,
+    ) -> Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, (), ScriptedLlm> {
+        let mut agent = Agent::new(llm);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("the first request goes out");
+        agent
+    }
+
+    /// The idle compaction fires once, shortly before the cache lifetime ends,
+    /// and not again while the session stays idle.
+    #[tokio::test]
+    async fn an_idle_session_compacts_once_before_its_cache_expires() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_after_one_request(llm.clone()).await;
+
+        // Fifty-three minutes of a one-hour lifetime: not yet due.
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3180));
+        let due_in = agent
+            .idle_compaction_due_in()
+            .expect("a compaction is pending");
+        assert!(due_in > Duration::from_secs(30) && due_in <= Duration::from_secs(60));
+        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(llm.recorded().is_empty());
+
+        // Fifty-four minutes: due now.
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
+        assert_eq!(agent.idle_compaction_due_in(), Some(Duration::ZERO));
+        let result = agent
+            .compact_when_idle()
+            .await
+            .expect("the compaction succeeds")
+            .expect("the compaction ran");
+        assert_eq!(result.messages_compacted, 1);
+        assert_eq!(llm.recorded().len(), 1);
+        assert!(agent.context().handoff().is_some());
+
+        // Still idle: nothing more, however long the gap grows inside the hour.
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3300));
+        assert_eq!(agent.idle_compaction_due_in(), None);
+        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert_eq!(llm.recorded().len(), 1, "one compaction per idle gap");
+
+        // The next request re-arms it for the next gap.
+        agent.push_message(Message::user("again"));
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after idle");
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
+        assert_eq!(agent.idle_compaction_due_in(), Some(Duration::ZERO));
+    }
+
+    /// An expired cache is not worth compacting for: the context is written
+    /// again either way.
+    #[tokio::test]
+    async fn an_expired_cache_is_not_idle_compacted() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_after_one_request(llm.clone()).await;
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        assert_eq!(agent.idle_compaction_due_in(), None);
+        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(llm.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_permanent_cache_lifetime_never_idle_compacts() {
+        use crate::context::CacheLifetime;
+
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_after_one_request(llm.clone()).await;
+        agent.prompt_cache = agent
+            .prompt_cache
+            .clone()
+            .with_lifetime(CacheLifetime::Permanent);
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        assert_eq!(agent.idle_compaction_due_in(), None);
+        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(llm.recorded().is_empty());
+    }
+
+    /// With a compaction model, compaction requests go to it and idle
+    /// compaction never runs, since it cannot read the conversation's cache.
+    #[tokio::test]
+    async fn a_compaction_model_takes_the_compaction_requests_and_disables_idle_compaction() {
+        let main = ScriptedLlm::new(1_000_000, []);
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = Agent::builder(main.clone())
+            .compaction_model(compactor.clone())
+            .build();
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("first request");
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
+        assert_eq!(agent.idle_compaction_due_in(), None);
+        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(main.recorded().is_empty() && compactor.recorded().is_empty());
+
+        agent.compact(None).await.expect("compaction succeeds");
+        assert_eq!(compactor.recorded().len(), 1, "the compaction model ran it");
+        assert!(main.recorded().is_empty(), "the session's model did not");
+
+        // The forked compaction goes to the compaction model as well.
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = Agent::builder(ScriptedLlm::new(1_000_000, []))
+            .compaction_model(compactor.clone())
+            .build();
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        let tail = agent.render_tail().await;
+        let request = LLMRequest::new(agent.context.build_request(&tail));
+        agent.start_compaction(&request, None);
+        assert!(agent.await_pending_compaction().await);
+        assert_eq!(compactor.recorded().len(), 1);
+    }
+
+    /// Idle reassembly and idle compaction exclude each other: an idle gap
+    /// past the cache lifetime reassembles only when idle compaction is off.
+    #[tokio::test]
+    async fn idle_reassembly_runs_only_when_idle_compaction_is_off() {
+        async fn system_reminders_after_a_gap(compaction_model: Option<ScriptedLlm>) -> usize {
+            let llm = ScriptedLlm::new(1_000_000, []);
+            let builder = Agent::builder(llm);
+            let mut agent = if let Some(model) = compaction_model {
+                builder.compaction_model(model).build()
+            } else {
+                builder.build()
+            };
+            agent.ensure_initialized().await.expect("agent initializes");
+            agent.push_message(Message::user("hello"));
+            agent.push_message(Message::system(
+                "<system-reminder>ephemeral</system-reminder>",
+            ));
+            agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+            assert!(
+                agent
+                    .prepare_request()
+                    .await
+                    .expect("request boundary")
+                    .is_some()
+            );
+            agent.context().count_recent_system_messages()
+        }
+
+        assert_eq!(system_reminders_after_a_gap(None).await, 1);
+        assert_eq!(
+            system_reminders_after_a_gap(Some(ScriptedLlm::new(
+                1_000_000,
+                [HANDOFF_JSON.to_string()]
+            )))
+            .await,
+            0
+        );
+    }
+
+    /// An agent with `compactor` as its compaction model that has sent one
+    /// request carrying two conversation messages and a stale reminder.
+    async fn agent_with_compactor_after_one_request(
+        main: ScriptedLlm,
+        compactor: Option<ScriptedLlm>,
+    ) -> Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, (), ScriptedLlm> {
+        let builder = Agent::builder(main);
+        let mut agent = match compactor {
+            Some(compactor) => builder.compaction_model(compactor).build(),
+            None => builder.build(),
+        };
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("an old question"));
+        agent.push_message(Message::assistant("an old answer"));
+        agent.push_message(Message::user("the next question"));
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("the first request goes out");
+        agent
+    }
+
+    fn mentions(request: &LLMRequest, text: &str) -> bool {
+        request
+            .messages()
+            .iter()
+            .any(|m| m.content().contains(text))
+    }
+
+    /// A send after the cache lifetime is preceded by exactly one compaction
+    /// on the compaction model, and the request carries the compacted context.
+    #[tokio::test]
+    async fn a_send_on_a_cold_cache_compacts_first() {
+        let main = ScriptedLlm::new(1_000_000, []);
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent =
+            agent_with_compactor_after_one_request(main.clone(), Some(compactor.clone())).await;
+        assert!(compactor.recorded().is_empty());
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after the gap");
+
+        assert_eq!(compactor.recorded().len(), 1, "one compaction preceded it");
+        assert!(main.recorded().is_empty(), "on the compaction model only");
+        assert!(mentions(&request, "keep going"), "the handoff is sent");
+        assert!(
+            !mentions(&request, "an old answer"),
+            "the old context is gone"
+        );
+        assert!(agent.completed_compaction.is_none());
+
+        // The send restarts the cache entry: the next one is warm.
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("next request");
+        assert_eq!(compactor.recorded().len(), 1);
+    }
+
+    /// The compaction's apply is the one rebuild of the prefix: the window is
+    /// reassembled once, not reassembled and then compacted.
+    #[tokio::test]
+    async fn a_cold_send_rebuilds_the_prefix_once() {
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_with_compactor_after_one_request(
+            ScriptedLlm::new(1_000_000, []),
+            Some(compactor.clone()),
+        )
+        .await;
+        agent.push_message(Message::system(
+            "<system-reminder>ephemeral</system-reminder>",
+        ));
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after the gap");
+
+        assert_eq!(agent.context().count_recent_system_messages(), 0);
+        assert_eq!(
+            compactor.recorded().len(),
+            1,
+            "compacted once, not also rebuilt on its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_on_a_warm_cache_does_not_compact() {
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_with_compactor_after_one_request(
+            ScriptedLlm::new(1_000_000, []),
+            Some(compactor.clone()),
+        )
+        .await;
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3540));
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request inside the lifetime");
+
+        assert!(compactor.recorded().is_empty());
+        assert!(mentions(&request, "an old answer"));
+    }
+
+    #[tokio::test]
+    async fn without_a_compaction_model_a_cold_send_does_not_compact() {
+        let main = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_with_compactor_after_one_request(main.clone(), None).await;
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after the gap");
+
+        assert!(main.recorded().is_empty());
+        assert!(mentions(&request, "an old answer"));
+    }
+
+    #[tokio::test]
+    async fn a_permanent_cache_lifetime_never_compacts_on_send() {
+        use crate::context::CacheLifetime;
+
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_with_compactor_after_one_request(
+            ScriptedLlm::new(1_000_000, []),
+            Some(compactor.clone()),
+        )
+        .await;
+        agent.prompt_cache = agent
+            .prompt_cache
+            .clone()
+            .with_lifetime(CacheLifetime::Permanent);
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after the gap");
+
+        assert!(compactor.recorded().is_empty());
+        assert!(mentions(&request, "an old answer"));
+    }
+
+    /// A failing compaction model fails the send instead of sending the
+    /// whole uncompacted context.
+    #[tokio::test]
+    async fn a_failed_cold_compaction_fails_the_send() {
+        let compactor = ScriptedLlm::new(1_000_000, ["not a handoff".to_string()]);
+        let mut agent = agent_with_compactor_after_one_request(
+            ScriptedLlm::new(1_000_000, []),
+            Some(compactor),
+        )
+        .await;
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        assert!(agent.prepare_request().await.is_err());
+    }
+
+    /// Messages of `request` that carry the whole tasks.md.
+    fn full_document_messages(request: &LLMRequest) -> usize {
+        request
+            .messages()
+            .iter()
+            .filter(|m| m.content().contains("Contents of tasks.md"))
+            .count()
+    }
+
+    /// Messages of `request` that carry a tasks.md diff.
+    fn document_diff_messages(request: &LLMRequest) -> usize {
+        request
+            .messages()
+            .iter()
+            .filter(|m| m.content().contains("Changes to tasks.md"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn the_first_request_carries_the_whole_tasks_document() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] first\n").expect("write tasks.md");
+        let mut agent = tasks_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("first request");
+
+        assert_eq!(full_document_messages(&request), 1);
+        assert_eq!(document_diff_messages(&request), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_tasks_document_adds_nothing_to_a_later_request() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] first\n").expect("write tasks.md");
+        let mut agent = tasks_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        let first = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("first request");
+
+        agent.push_message(Message::assistant("working"));
+        agent.push_message(Message::user("go on"));
+        let later = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("later request");
+
+        // The earlier request is an exact prefix of the later one apart from
+        // the volatile tail, and no new tasks.md text joined the conversation.
+        assert_eq!(full_document_messages(&later), 1);
+        assert_eq!(document_diff_messages(&later), 0);
+        assert_eq!(
+            later.messages().len(),
+            first.messages().len() + 2,
+            "only the two pushed messages may be new"
+        );
+        let tail = agent.render_tail().await;
+        assert!(
+            tail.iter().all(|block| block.tag() != "tasks_document"),
+            "the tail must never carry the document"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tasks_change_adds_its_diff_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] first\n").expect("write tasks.md");
+        let mut agent = tasks_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("first request");
+
+        std::fs::write(dir.path().join("tasks.md"), "- [x] first\n- [ ] second\n")
+            .expect("rewrite tasks.md");
+        let changed = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after change");
+        assert_eq!(document_diff_messages(&changed), 1);
+        assert_eq!(
+            full_document_messages(&changed),
+            1,
+            "only the session start's"
+        );
+
+        let after = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after that");
+        assert_eq!(
+            document_diff_messages(&after),
+            1,
+            "the diff stays in the conversation once and is not repeated"
+        );
+        assert_eq!(after.messages().len(), changed.messages().len());
+    }
+
+    #[tokio::test]
+    async fn a_cold_cache_reassembly_resends_the_whole_document() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] first\n").expect("write tasks.md");
+        let mut agent = tasks_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("first request");
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after idle");
+
+        assert_eq!(full_document_messages(&request), 1);
+    }
+
+    #[tokio::test]
+    async fn the_request_after_a_compaction_carries_the_whole_document_once() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] first\n").expect("write tasks.md");
+        let mut agent = tasks_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("first request");
+
+        agent.push_message(Message::assistant("done"));
+        agent.completed_compaction = Some(CompletedCompaction {
+            fork_point: agent.context.fork_point(),
+            handoff: HandoffDocument {
+                current_task: "keep going".to_string(),
+                ..HandoffDocument::default()
+            },
+        });
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after compaction");
+
+        assert_eq!(
+            full_document_messages(&request),
+            1,
+            "the compaction dropped the earlier copy; exactly one is sent again"
+        );
+        let next = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after that");
+        assert_eq!(full_document_messages(&next), 1);
+        assert_eq!(next.messages().len(), request.messages().len());
+    }
+
+    /// A model whose first request calls every tool in `calls`; later requests
+    /// answer with text. Every request is recorded.
+    #[derive(Clone)]
+    struct ToolCallingLlm {
+        calls: Vec<(&'static str, &'static str)>,
+        requests: Arc<std::sync::Mutex<Vec<LLMRequest>>>,
+    }
+
+    impl LanguageModel for ToolCallingLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let mut requests = self.requests.lock().expect("requests lock");
+            let events: Vec<_> = if requests.is_empty() {
+                self.calls
+                    .iter()
+                    .map(|(id, name)| {
+                        Ok(Event::ToolCall(aither_core::llm::ToolCall::new(
+                            *id,
+                            *name,
+                            serde_json::json!({}),
+                        )))
+                    })
+                    .collect()
+            } else {
+                vec![Ok(Event::Text("done".to_string()))]
+            };
+            requests.push(request);
+            drop(requests);
+            futures_lite::stream::iter(events)
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                100_000,
+            )))
+        }
+    }
+
+    /// Arguments for the tools of the cancellation tests.
+    #[derive(Debug, schemars::JsonSchema, serde::Deserialize)]
+    struct NoArgs {}
+
+    /// Returns at once.
+    struct QuickTool;
+
+    impl aither_core::llm::Tool for QuickTool {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "quick".into()
+        }
+
+        fn description(&self) -> std::borrow::Cow<'static, str> {
+            "Returns at once".into()
+        }
+
+        type Arguments = NoArgs;
+        type Res = aither_core::llm::ToolResult;
+
+        fn call(
+            &self,
+            _args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(aither_core::llm::ToolResult::text("quick finished")))
+        }
+    }
+
+    /// Announces it started, then blocks until released.
+    struct BlockingTool {
+        started: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+    }
+
+    impl aither_core::llm::Tool for BlockingTool {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "blocking".into()
+        }
+
+        fn description(&self) -> std::borrow::Cow<'static, str> {
+            "Blocks until released".into()
+        }
+
+        type Arguments = NoArgs;
+        type Res = aither_core::llm::ToolResult;
+
+        async fn call(
+            &self,
+            _args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
+        ) -> aither_core::Result<Self::Res> {
+            self.started.send(()).await.expect("test listens");
+            let _ = self.release.recv().await;
+            Ok(aither_core::llm::ToolResult::text("blocking finished"))
+        }
+    }
+
+    /// Runs `calls` on a fresh agent, drops the run stream once the blocking
+    /// tool is executing, then sends a second prompt and returns the second
+    /// request's messages.
+    async fn messages_after_cancelled_run(
+        calls: Vec<(&'static str, &'static str)>,
+    ) -> Vec<Message> {
+        let llm = ToolCallingLlm {
+            calls,
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let mut agent = Agent::new(llm.clone());
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (_release_tx, release_rx) = async_channel::bounded(1);
+        agent
+            .register_tool(BlockingTool {
+                started: started_tx,
+                release: release_rx,
+            })
+            .expect("registers");
+        agent.register_tool(QuickTool).expect("registers");
+
+        {
+            let stream = agent.run("go", std::iter::empty());
+            futures_lite::pin!(stream);
+            let mut running = false;
+            while !running {
+                tokio::select! {
+                    _ = started_rx.recv() => running = true,
+                    event = stream.next() => {
+                        event.expect("run is alive").expect("no error");
+                    }
+                }
+            }
+        }
+
+        {
+            let stream = agent.run("again", std::iter::empty());
+            futures_lite::pin!(stream);
+            while let Some(event) = stream.next().await {
+                event.expect("second run succeeds");
+            }
+        }
+        let requests = llm.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2, "one request per run");
+        requests[1].messages().to_vec()
+    }
+
+    fn assert_every_call_has_a_result(messages: &[Message]) {
+        for (index, message) in messages.iter().enumerate() {
+            for call in message.tool_calls() {
+                assert!(
+                    messages[index + 1..]
+                        .iter()
+                        .any(|later| later.tool_call_id() == Some(call.id.as_str())),
+                    "tool call {} has no result in the request",
+                    call.id
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_run_leaves_cancelled_results_for_running_tools() {
+        let messages = messages_after_cancelled_run(vec![("call_slow", "blocking")]).await;
+
+        assert_every_call_has_a_result(&messages);
+        let result = messages
+            .iter()
+            .position(|message| message.tool_call_id() == Some("call_slow"))
+            .expect("the cancelled call has a result");
+        assert!(
+            messages[result].content().contains("cancelled"),
+            "{}",
+            messages[result].content()
+        );
+        let prompt = messages
+            .iter()
+            .position(|message| message.content() == "again")
+            .expect("the new prompt is sent");
+        assert!(result < prompt, "the result precedes the new prompt");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_run_keeps_results_of_tools_that_finished() {
+        let messages =
+            messages_after_cancelled_run(vec![("call_slow", "blocking"), ("call_quick", "quick")])
+                .await;
+
+        assert_every_call_has_a_result(&messages);
+        let quick = messages
+            .iter()
+            .find(|message| message.tool_call_id() == Some("call_quick"))
+            .expect("the finished call has a result");
+        assert_eq!(quick.content(), "quick finished");
+        let slow = messages
+            .iter()
+            .find(|message| message.tool_call_id() == Some("call_slow"))
+            .expect("the cancelled call has a result");
+        assert!(slow.content().contains("cancelled"), "{}", slow.content());
     }
 }

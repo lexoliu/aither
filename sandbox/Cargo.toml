@@ -27,6 +27,8 @@ executor-core = { version = "0.7", features = ["tokio"] }
 
 # Async runtime
 async-fs = "2"
+# Canonical paths without the Windows verbatim prefix git cannot read
+dunce = { version = "1.0.5", default-features = false }
 async-process = "2"
 async-io = "2"
 bollard = "0.21"
@@ -52,6 +54,8 @@ strsim = "0.11.1"
 human-hash = "0.4"
 askama = "0.16"
 shell-words = "1.1"
+# Shell syntax tree for refusing name- and pattern-based kills before a command runs.
+brush-parser = { version = "0.3.0", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 # Shared jobserver token pools for bounding command parallelism (unix only).
@@ -83,6 +87,8 @@ hex = "0.4.3"
 semver = { version = "1.0.28", features = ["serde"] }
 tar = { version = "0.4.46", default-features = false }
 flate2 = "1.1.10"
+# Pure-Rust xz decoding for `tar.xz` artifacts.
+lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz"] }
 zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 url = { version = "2.5.8", features = ["serde"] }
@@ -101,6 +107,7 @@ jobserver = ["dep:polling", "dep:rustix"]
 [dev-dependencies]
 magika = { version = "1", features = ["_test"] }
 tempfile = "3"
+lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
 tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
 
 [lints]

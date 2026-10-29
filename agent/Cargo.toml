@@ -12,6 +12,7 @@ keywords = ["ai", "agent", "llm", "planning"]
 categories = ["api-bindings"]
 
 [dependencies]
+dunce = { version = "1.0.5", default-features = false }
 aither-core.workspace = true
 aither-attachments.workspace = true
 aither-sandbox.workspace = true
@@ -45,6 +46,7 @@ sha2 = "0.11"
 similar = "3"
 uuid = { version = "1", features = ["v4"] }
 num-traits = "0.2"
+jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
 
 [dev-dependencies]
 hex = "0.4"

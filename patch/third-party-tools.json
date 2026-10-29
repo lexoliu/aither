@@ -246,5 +246,49 @@
         "format": "executable"
       }
     }
+  ],
+  "host_programs": [
+    {
+      "tool": "repo_search",
+      "version": "0.0.3",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.3/repo-search-aarch64-apple-darwin.tar.xz",
+      "sha256": "1914358c615573d9636061c0c5ac0e726f3ddd2bcbb2400ec747e9caea3e8de0",
+      "encoding": {
+        "format": "tar_xz",
+        "executable": "repo-search-aarch64-apple-darwin/search"
+      }
+    },
+    {
+      "tool": "repo_search",
+      "version": "0.0.3",
+      "target": {
+        "os": "linux",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.3/repo-search-aarch64-unknown-linux-gnu.tar.xz",
+      "sha256": "3013da4eb463f687951745b28d9a4df541b6f81e8bf7c2f6f26f9de56abceaa2",
+      "encoding": {
+        "format": "tar_xz",
+        "executable": "repo-search-aarch64-unknown-linux-gnu/search"
+      }
+    },
+    {
+      "tool": "repo_search",
+      "version": "0.0.3",
+      "target": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.3/repo-search-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "f1c61cd30ab4dd17b0a36a6e4354acf1493e3024bf92a86890da845362578b8b",
+      "encoding": {
+        "format": "tar_xz",
+        "executable": "repo-search-x86_64-unknown-linux-gnu/search"
+      }
+    }
   ]
 }

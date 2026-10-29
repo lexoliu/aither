@@ -49,10 +49,17 @@ use aither_mcp::McpConnection;
 ///     .build();
 /// ```
 #[must_use]
-pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
+pub struct AgentBuilder<
+    Advanced,
+    Balanced = Advanced,
+    Fast = Balanced,
+    H = (),
+    Compactor = Advanced,
+> {
     advanced: Advanced,
     balanced: Balanced,
     fast: Fast,
+    compaction_model: Option<Compactor>,
     tier: ModelTier,
     tools: AgentTools,
     hooks: H,
@@ -63,12 +70,30 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     permission_receiver: Option<PermissionEventReceiver>,
     job_registry: Option<JobRegistry>,
     context_sources: Vec<AnyContextSource>,
+    /// Directory whose working documents (`tasks.md`) the agent supervises:
+    /// the main agent's sandbox.
     sandbox_dir: Option<std::path::PathBuf>,
+    /// Directory files are restored from after a forked compaction: the
+    /// directory the agent's terminal works in.
+    restore_dir: Option<std::path::PathBuf>,
+    /// Where the built agent publishes each request for a fork to start from.
+    fork_source: Option<crate::fork::ForkSource>,
+    /// The window state a fork inherits, which replaces initialization.
+    inherited: Option<Inherited>,
     #[cfg(feature = "skills")]
     skill_registry: Option<Arc<SkillRegistry>>,
 }
 
-impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Balanced, Fast, H> {
+/// What a fork carries over from the main agent besides its context.
+#[derive(Clone)]
+struct Inherited {
+    budget: crate::context::ContextBudget,
+    profile: Option<aither_core::llm::model::Profile>,
+}
+
+impl<Advanced, Balanced, Fast, H, Compactor> std::fmt::Debug
+    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentBuilder")
             .field("tier", &self.tier)
@@ -77,7 +102,7 @@ impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Bal
     }
 }
 
-impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
+impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
     /// Creates a new agent builder with default configuration.
     ///
     /// All model tiers (advanced/balanced/fast) use the same model.
@@ -86,6 +111,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             advanced: llm.clone(),
             balanced: llm.clone(),
             fast: llm,
+            compaction_model: None,
             tier: ModelTier::default(),
             tools: AgentTools::new(),
             hooks: (),
@@ -97,17 +123,21 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             job_registry: None,
             context_sources: Vec::new(),
             sandbox_dir: None,
+            restore_dir: None,
+            fork_source: None,
+            inherited: None,
             #[cfg(feature = "skills")]
             skill_registry: None,
         }
     }
 }
 
-impl<Advanced, Balanced, Fast, H> AgentBuilder<Advanced, Balanced, Fast, H>
+impl<Advanced, Balanced, Fast, H, Compactor> AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
 where
     Advanced: LanguageModel,
     Balanced: LanguageModel,
     Fast: LanguageModel,
+    Compactor: LanguageModel,
     H: Hook,
 {
     /// Sets the balanced model for moderate tasks (e.g., subagents).
@@ -117,11 +147,12 @@ where
     pub fn balanced_model<B2: LanguageModel>(
         self,
         model: B2,
-    ) -> AgentBuilder<Advanced, B2, Fast, H> {
+    ) -> AgentBuilder<Advanced, B2, Fast, H, Compactor> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: model,
             fast: self.fast,
+            compaction_model: self.compaction_model,
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,
@@ -133,6 +164,9 @@ where
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            restore_dir: self.restore_dir,
+            fork_source: self.fork_source,
+            inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
         }
@@ -145,11 +179,12 @@ where
     pub fn fast_model<F2: LanguageModel>(
         self,
         model: F2,
-    ) -> AgentBuilder<Advanced, Balanced, F2, H> {
+    ) -> AgentBuilder<Advanced, Balanced, F2, H, Compactor> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: self.balanced,
             fast: model,
+            compaction_model: self.compaction_model,
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,
@@ -161,6 +196,45 @@ where
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            restore_dir: self.restore_dir,
+            fork_source: self.fork_source,
+            inherited: self.inherited,
+            #[cfg(feature = "skills")]
+            skill_registry: self.skill_registry,
+        }
+    }
+
+    /// Sets the model compaction runs on, instead of the session's own.
+    ///
+    /// Without one, compaction reads the conversation's prompt cache on the
+    /// session's model, and an idle session is compacted shortly before the
+    /// cache expires ([`Agent::compact_when_idle`]). A different model cannot
+    /// read that cache, so with one set compaction requests go to it, idle
+    /// compaction never runs, and an idle gap past the cache lifetime
+    /// reassembles the window instead.
+    pub fn compaction_model<C2: LanguageModel>(
+        self,
+        model: C2,
+    ) -> AgentBuilder<Advanced, Balanced, Fast, H, C2> {
+        AgentBuilder {
+            advanced: self.advanced,
+            balanced: self.balanced,
+            fast: self.fast,
+            compaction_model: Some(model),
+            tier: self.tier,
+            tools: self.tools,
+            hooks: self.hooks,
+            config: self.config,
+            context: self.context,
+            prompt_cache: self.prompt_cache,
+            background_receiver: self.background_receiver,
+            permission_receiver: self.permission_receiver,
+            job_registry: self.job_registry,
+            context_sources: self.context_sources,
+            sandbox_dir: self.sandbox_dir,
+            restore_dir: self.restore_dir,
+            fork_source: self.fork_source,
+            inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
         }
@@ -235,8 +309,57 @@ where
         self.background_receiver = Some(dyn_tool.background_receiver());
         self.permission_receiver = Some(dyn_tool.permission_receiver());
         self.job_registry = Some(dyn_tool.job_registry());
-        self.sandbox_dir = Some(dyn_tool.working_dir().clone());
+        // Files are restored after compaction from wherever the terminal
+        // works; working-document supervision (`tasks.md`) belongs to the
+        // main agent's terminal alone.
+        self.restore_dir = Some(dyn_tool.working_dir().clone());
+        if dyn_tool.role() == aither_sandbox::CommandRole::Main {
+            self.sandbox_dir = Some(dyn_tool.working_dir().clone());
+        }
         self.tools.register_dyn_terminal(dyn_tool);
+        self
+    }
+
+    /// Publishes every request the built agent sends to `source`, which is
+    /// where the `fork` subagent kind starts from.
+    ///
+    /// Take the source from
+    /// [`SubagentTool::fork_source`](crate::specialized::SubagentTool::fork_source).
+    pub fn fork_source(mut self, source: crate::fork::ForkSource) -> Self {
+        self.fork_source = Some(source);
+        self
+    }
+
+    /// Makes the built agent a fork of the main agent that sent `fork`.
+    ///
+    /// The agent starts from the main agent's request: its window, with the
+    /// live tail as the last message, its tool definitions as the model saw
+    /// them, its request parameters and its prompt-cache identity, so its
+    /// first request is the main agent's followed by the prompt it is given
+    /// and reads the main agent's cache. Nothing is initialized on top of
+    /// that, since initialization would rewrite the window.
+    ///
+    /// The tools run in `terminal`, the fork's own terminal. A tool of the
+    /// main agent that `terminal` does not provide stays in the definitions,
+    /// to keep the request identical, and refuses when called.
+    pub fn forked_from(
+        mut self,
+        fork: &crate::fork::ForkSnapshot,
+        terminal: aither_sandbox::DynTerminalTool,
+    ) -> Self {
+        self.context = fork.context.clone();
+        self.prompt_cache = fork.prompt_cache.clone();
+        self.config.request_parameters = fork.request_parameters.clone();
+        self.config.context_policy = fork.context_policy;
+        self.inherited = Some(Inherited {
+            budget: fork.budget,
+            profile: Some(fork.profile.clone()),
+        });
+        self.background_receiver = Some(terminal.background_receiver());
+        self.permission_receiver = Some(terminal.permission_receiver());
+        self.job_registry = Some(terminal.job_registry());
+        self.restore_dir = Some(terminal.working_dir().clone());
+        self.tools = AgentTools::forked(&fork.definitions, terminal);
         self
     }
 
@@ -254,11 +377,15 @@ where
     ///     .build();
     /// // Type: Agent<LLM, HCons<ConfirmationHook, HCons<LoggingHook, ()>>>
     /// ```
-    pub fn hook<NH: Hook>(self, hook: NH) -> AgentBuilder<Advanced, Balanced, Fast, HCons<NH, H>> {
+    pub fn hook<NH: Hook>(
+        self,
+        hook: NH,
+    ) -> AgentBuilder<Advanced, Balanced, Fast, HCons<NH, H>, Compactor> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: self.balanced,
             fast: self.fast,
+            compaction_model: self.compaction_model,
             tier: self.tier,
             tools: self.tools,
             hooks: HCons::new(hook, self.hooks),
@@ -270,6 +397,9 @@ where
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            restore_dir: self.restore_dir,
+            fork_source: self.fork_source,
+            inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
         }
@@ -319,9 +449,12 @@ where
         self
     }
 
-    /// Sets sandbox directory for working document supervision.
+    /// Sets the main agent's sandbox directory: its working documents are
+    /// supervised and its files restored after compaction.
     pub fn sandbox_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.sandbox_dir = Some(path.into());
+        let path = path.into();
+        self.restore_dir = Some(path.clone());
+        self.sandbox_dir = Some(path);
         self
     }
 
@@ -459,6 +592,7 @@ where
         let permission_receiver = terminal_tool.permission_receiver();
         let job_registry = terminal_tool.job_registry();
         self.sandbox_dir = Some(terminal_tool.working_dir().clone());
+        self.restore_dir = Some(terminal_tool.working_dir().clone());
         self.tools
             .register(terminal_tool.background_tool())
             .expect("tool registration must succeed: duplicate name or missing description");
@@ -531,27 +665,38 @@ where
     }
 
     /// Builds the agent.
-    pub fn build(self) -> Agent<Advanced, Balanced, Fast, H> {
+    pub fn build(self) -> Agent<Advanced, Balanced, Fast, H, Compactor> {
         Agent {
             advanced: std::sync::Arc::new(self.advanced),
             balanced: std::sync::Arc::new(self.balanced),
             fast: std::sync::Arc::new(self.fast),
+            compaction_model: self.compaction_model.map(std::sync::Arc::new),
+            idle_compacted: false,
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,
-            budget: crate::context::ContextBudget::default(),
+            budget: self
+                .inherited
+                .as_ref()
+                .map_or_else(crate::context::ContextBudget::default, |inherited| {
+                    inherited.budget
+                }),
             prompt_cache: self.prompt_cache,
             context_sources: self.context_sources,
+            reassembled: false,
             pending_compaction: None,
             completed_compaction: None,
+            tool_results: std::collections::VecDeque::new(),
             config: self.config,
             context: self.context,
-            profile: None,
-            initialized: false,
+            initialized: self.inherited.is_some(),
+            profile: self.inherited.and_then(|inherited| inherited.profile),
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             sandbox_dir: self.sandbox_dir,
+            restore_dir: self.restore_dir,
+            fork_source: self.fork_source,
             last_request_started_at: None,
             last_request: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
@@ -747,5 +892,52 @@ mod tests {
         assert!(events.is_empty());
         assert!(agent.active_skills.is_empty());
         assert!(agent.active_allowed_tools.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_gets_no_working_document_supervision_but_keeps_file_restore() {
+        use aither_sandbox::permission::NoopPermissionHandler;
+        use aither_sandbox::{SubagentGrant, TerminalTool, ToolRegistryBuilder};
+        use executor_core::tokio::TokioGlobal;
+
+        let source = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let session = tempfile::tempdir().unwrap();
+        let binary = crate::test_support::compile_baseline_fixture(source.path()).await;
+        let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
+        let terminal = TerminalTool::new_exact(session.path(), NoopPermissionHandler, TokioGlobal)
+            .await
+            .unwrap()
+            .initialize_tools(&distribution, cache.path())
+            .await
+            .unwrap();
+        let registry =
+            std::sync::Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+        let terminal = terminal.with_registry(registry);
+        let subagent = terminal
+            .binding()
+            .launcher()
+            .create(SubagentGrant::new())
+            .await
+            .unwrap();
+        let space = subagent.working_dir().clone();
+
+        let main = AgentBuilder::new(MockLlm).dyn_terminal(terminal.clone().to_dyn());
+        assert!(
+            main.sandbox_dir.is_some(),
+            "the main agent supervises its working documents"
+        );
+        let main = AgentBuilder::new(MockLlm).terminal(terminal);
+        assert!(main.sandbox_dir.is_some());
+        let child = AgentBuilder::new(MockLlm).dyn_terminal(subagent);
+        assert!(
+            child.sandbox_dir.is_none(),
+            "a subagent's space is not supervised like the main agent's"
+        );
+        assert_eq!(
+            child.restore_dir,
+            Some(space),
+            "a subagent's files are restored after compaction"
+        );
     }
 }

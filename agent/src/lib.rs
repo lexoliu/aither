@@ -41,6 +41,7 @@ pub mod context;
 mod context_window;
 mod error;
 mod event;
+mod fork;
 mod fs_util;
 mod hook;
 mod model_group;
@@ -48,6 +49,8 @@ mod output_urls;
 mod stream;
 mod subagent_file;
 mod terminal_agent;
+#[cfg(test)]
+mod test_support;
 pub mod tool_request;
 mod tools;
 pub mod working_docs;
@@ -88,7 +91,8 @@ pub use context::{
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;
-pub use event::AgentEvent;
+pub use event::{AgentEvent, TimedEvent};
+pub use fork::{ForkSnapshot, ForkSource};
 pub use hook::{
     CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction, StopContext,
     StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,

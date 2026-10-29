@@ -188,8 +188,10 @@ struct TerminalReadTemplate<'a> {
 }
 
 fn render_terminal_delta(delta: &crate::job_registry::TerminalDelta) -> String {
-    let delta_text = CommandStream::Inline(String::from_utf8_lossy(&delta.bytes).into_owned())
-        .render_for_model();
+    let delta_text = CommandStream::Inline {
+        text: String::from_utf8_lossy(&delta.bytes).into_owned(),
+    }
+    .render_for_model();
     let status_text = job_status_text(&delta.status);
     TerminalReadTemplate {
         delta: &delta_text,
