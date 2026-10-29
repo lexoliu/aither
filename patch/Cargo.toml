@@ -7,7 +7,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "apply_patch: sandbox-executed compact contextual patch utility"
-publish = false
 readme = "../README.md"
 keywords = ["patch", "diff", "sandbox", "agent", "tooling"]
 categories = ["command-line-utilities"]
