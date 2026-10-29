@@ -486,6 +486,10 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Sources rendered into the volatile tail of every request.
     pub(crate) context_sources: Vec<AnyContextSource>,
 
+    /// Whether the window was rewritten since the sources last heard a
+    /// request begin, which wipes every durable alert they pushed before.
+    pub(crate) reassembled: bool,
+
     /// Compaction running alongside the current turn, if any.
     pub(crate) pending_compaction: Option<PendingCompaction>,
 
@@ -567,6 +571,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             budget: ContextBudget::default(),
             prompt_cache: PromptCache::new(uuid::Uuid::new_v4().to_string()),
             context_sources: Vec::new(),
+            reassembled: false,
             pending_compaction: None,
             completed_compaction: None,
             profile: None,
@@ -1712,6 +1717,7 @@ where
         // staged system-block updates and superseded tool results fold in.
         self.context.reassemble();
         self.context.apply_handoff(&handoff, fork_point);
+        self.reassembled = true;
         tracing::info!(
             fork_point,
             kept = self.context.len_recent(),
@@ -1807,6 +1813,20 @@ where
         let block = Block::new("system-reminder", content);
         self.budget.append(block.len());
         self.context.push_block_alert(&block);
+    }
+
+    /// Collects the durable alerts sources raise as a request begins.
+    ///
+    /// Tells the sources whether the window was reassembled since the last
+    /// time, which is when their earlier alerts stopped being in it.
+    async fn push_request_alerts(&mut self) {
+        let reassembled = std::mem::take(&mut self.reassembled);
+        for index in 0..self.context_sources.len() {
+            if let Some(block) = self.context_sources[index].on_request(reassembled).await {
+                self.budget.append(block.len());
+                self.context.push_block_alert(&block);
+            }
+        }
     }
 
     /// Collects the durable alerts sources raise after a tool turn.
@@ -2019,6 +2039,7 @@ where
     async fn prepare_request(&mut self) -> Option<LLMRequest> {
         self.apply_completed_compaction().await;
         self.reassemble_if_cache_is_cold();
+        self.push_request_alerts().await;
 
         let definitions = self.tools.active_definitions();
         let mut tail = self.render_tail().await;
@@ -2046,6 +2067,7 @@ where
             if !self.await_pending_compaction().await {
                 return None;
             }
+            self.push_request_alerts().await;
             tail = self.render_tail().await;
             messages = self.context.build_request(&tail);
             self.budget
@@ -2095,6 +2117,7 @@ where
             return unchanged;
         }
         let report = self.context.reassemble();
+        self.reassembled |= report.system_messages_pruned > 0;
         if report.changed() {
             tracing::debug!(
                 system_messages = report.system_messages_pruned,
@@ -3518,8 +3541,8 @@ mod tests {
         assert!(compaction.messages().len() > main.messages().len());
     }
 
-    /// A preview renders sources but does not commit them: the real request
-    /// still carries the same tasks diff.
+    /// A preview does not consume the session start: the real request still
+    /// carries the document.
     #[tokio::test]
     async fn a_preview_leaves_source_committed_state_untouched() {
         use tempfile::tempdir;
@@ -3604,5 +3627,141 @@ mod tests {
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
         assert!(agent.prepare_request().await.is_some());
         assert_eq!(agent.context().count_recent_system_messages(), 1);
+    }
+
+    /// Messages of `request` that carry the whole tasks.md.
+    fn full_document_messages(request: &LLMRequest) -> usize {
+        request
+            .messages()
+            .iter()
+            .filter(|m| m.content().contains("Contents of tasks.md"))
+            .count()
+    }
+
+    /// Messages of `request` that carry a tasks.md diff.
+    fn document_diff_messages(request: &LLMRequest) -> usize {
+        request
+            .messages()
+            .iter()
+            .filter(|m| m.content().contains("Changes to tasks.md"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn the_first_request_carries_the_whole_tasks_document() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] first\n").expect("write tasks.md");
+        let mut agent = tasks_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+
+        let request = agent.prepare_request().await.expect("first request");
+
+        assert_eq!(full_document_messages(&request), 1);
+        assert_eq!(document_diff_messages(&request), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_tasks_document_adds_nothing_to_a_later_request() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] first\n").expect("write tasks.md");
+        let mut agent = tasks_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        let first = agent.prepare_request().await.expect("first request");
+
+        agent.push_message(Message::assistant("working"));
+        agent.push_message(Message::user("go on"));
+        let later = agent.prepare_request().await.expect("later request");
+
+        // The earlier request is an exact prefix of the later one apart from
+        // the volatile tail, and no new tasks.md text joined the conversation.
+        assert_eq!(full_document_messages(&later), 1);
+        assert_eq!(document_diff_messages(&later), 0);
+        assert_eq!(
+            later.messages().len(),
+            first.messages().len() + 2,
+            "only the two pushed messages may be new"
+        );
+        let tail = agent.render_tail().await;
+        assert!(
+            tail.iter().all(|block| block.tag() != "tasks_document"),
+            "the tail must never carry the document"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tasks_change_adds_its_diff_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] first\n").expect("write tasks.md");
+        let mut agent = tasks_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent.prepare_request().await.expect("first request");
+
+        std::fs::write(dir.path().join("tasks.md"), "- [x] first\n- [ ] second\n")
+            .expect("rewrite tasks.md");
+        let changed = agent.prepare_request().await.expect("request after change");
+        assert_eq!(document_diff_messages(&changed), 1);
+        assert_eq!(
+            full_document_messages(&changed),
+            1,
+            "only the session start's"
+        );
+
+        let after = agent.prepare_request().await.expect("request after that");
+        assert_eq!(
+            document_diff_messages(&after),
+            1,
+            "the diff stays in the conversation once and is not repeated"
+        );
+        assert_eq!(after.messages().len(), changed.messages().len());
+    }
+
+    #[tokio::test]
+    async fn a_cold_cache_reassembly_resends_the_whole_document() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] first\n").expect("write tasks.md");
+        let mut agent = tasks_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent.prepare_request().await.expect("first request");
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        let request = agent.prepare_request().await.expect("request after idle");
+
+        assert_eq!(full_document_messages(&request), 1);
+    }
+
+    #[tokio::test]
+    async fn the_request_after_a_compaction_carries_the_whole_document_once() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "- [ ] first\n").expect("write tasks.md");
+        let mut agent = tasks_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent.prepare_request().await.expect("first request");
+
+        agent.push_message(Message::assistant("done"));
+        agent.completed_compaction = Some(CompletedCompaction {
+            fork_point: agent.context.fork_point(),
+            handoff: HandoffDocument {
+                current_task: "keep going".to_string(),
+                ..HandoffDocument::default()
+            },
+        });
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request after compaction");
+
+        assert_eq!(
+            full_document_messages(&request),
+            1,
+            "the compaction dropped the earlier copy; exactly one is sent again"
+        );
+        let next = agent.prepare_request().await.expect("request after that");
+        assert_eq!(full_document_messages(&next), 1);
+        assert_eq!(next.messages().len(), request.messages().len());
     }
 }

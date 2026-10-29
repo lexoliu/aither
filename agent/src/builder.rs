@@ -542,6 +542,7 @@ where
             budget: crate::context::ContextBudget::default(),
             prompt_cache: self.prompt_cache,
             context_sources: self.context_sources,
+            reassembled: false,
             pending_compaction: None,
             completed_compaction: None,
             config: self.config,

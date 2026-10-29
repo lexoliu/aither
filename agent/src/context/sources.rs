@@ -22,8 +22,10 @@ use crate::working_docs::{self, WorkingDocsSnapshot};
 #[derive(Template)]
 #[template(path = "tasks_document.txt", escape = "none")]
 struct TasksDocumentTemplate {
+    /// The whole document, at session start and after a reassembly.
     tasks: Option<String>,
-    recent_changes: Option<String>,
+    /// The diff of a change seen since the document was last shown.
+    changes: Option<String>,
 }
 
 #[derive(Template)]
@@ -52,7 +54,7 @@ fn block(tag: &str, template: &impl Template) -> Block {
     )
 }
 
-/// Surfaces `tasks.md` and nags when it stops being maintained.
+/// Brings `tasks.md` into the conversation and nags when it stops being maintained.
 ///
 /// The document is the canonical task list: it outlives compaction, which the
 /// conversation does not, so a model that stops updating it loses the only
@@ -61,14 +63,20 @@ fn block(tag: &str, template: &impl Template) -> Block {
 /// the actual signal — and the counter resets on any content change, as well
 /// as while the checklist has no unchecked items, because a finished
 /// checklist is not stale. The alert fires once per stale episode.
+///
+/// The document enters the conversation as durable alerts, never as a block
+/// re-rendered into every request: whole at the start of the session and
+/// after a reassembly wiped the earlier alerts, and otherwise only as the
+/// diff of a change, once, when the change is seen.
 #[derive(Debug)]
 pub struct TasksDocument {
     /// Sandbox root holding `tasks.md`.
     sandbox_dir: PathBuf,
     /// Tool turns without a change before alerting.
     stale_after_turns: usize,
-    /// Snapshot rendered into the previous request, for the change summary.
-    rendered: Option<WorkingDocsSnapshot>,
+    /// What the conversation last received of the document; `None` until the
+    /// session start has shown it.
+    shown: Option<WorkingDocsSnapshot>,
     /// Content observed at the previous tool turn (`None` = file absent).
     last_content: Option<String>,
     /// Whether a baseline observation exists yet.
@@ -86,7 +94,7 @@ impl TasksDocument {
         Self {
             sandbox_dir: sandbox_dir.into(),
             stale_after_turns,
-            rendered: None,
+            shown: None,
             last_content: None,
             seen: false,
             stale_turns: 0,
@@ -96,27 +104,20 @@ impl TasksDocument {
 }
 
 impl ContextSource for TasksDocument {
-    async fn render(&self) -> Option<Block> {
+    async fn on_request(&mut self, reassembled: bool) -> Option<Block> {
         let docs = working_docs::read_snapshot(&self.sandbox_dir).await;
-        let recent_changes = self
-            .rendered
-            .as_ref()
-            .and_then(|previous| working_docs::tasks_md_diff(previous, &docs));
-        let tasks = docs.tasks_md;
-        if tasks.is_none() && recent_changes.is_none() {
+        let (tasks, changes) = match self.shown.as_ref() {
+            Some(shown) if !reassembled => (None, working_docs::tasks_md_diff(shown, &docs)),
+            _ => (docs.tasks_md.clone(), None),
+        };
+        self.shown = Some(docs);
+        if tasks.is_none() && changes.is_none() {
             return None;
         }
         Some(block(
             "tasks_document",
-            &TasksDocumentTemplate {
-                tasks,
-                recent_changes,
-            },
+            &TasksDocumentTemplate { tasks, changes },
         ))
-    }
-
-    async fn commit(&mut self, _block: &Block) {
-        self.rendered = Some(working_docs::read_snapshot(&self.sandbox_dir).await);
     }
 
     async fn on_tool_turn_end(&mut self) -> Option<Block> {
@@ -305,22 +306,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_rendered_block_carries_the_document_and_its_changes() {
+    async fn the_document_is_never_rendered_into_the_tail() {
         let root = tempfile::tempdir().expect("tempdir");
         write_tasks(root.path(), "- [ ] first\n").await;
+        let source = TasksDocument::new(root.path(), 4);
+        assert!(source.render().await.is_none());
+    }
 
+    #[tokio::test]
+    async fn the_session_start_carries_the_whole_document() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(root.path(), "- [ ] first\n").await;
         let mut source = TasksDocument::new(root.path(), 4);
-        let block = source.render().await.expect("renders the document");
+
+        let block = source.on_request(false).await.expect("shows the document");
+        assert!(block.content().contains("Contents of tasks.md"));
         assert!(block.content().contains("- [ ] first"));
-        source.commit(&block).await;
+        assert!(!block.content().contains("Changes to tasks.md"));
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_document_adds_nothing_after_the_start() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(root.path(), "- [ ] first\n").await;
+        let mut source = TasksDocument::new(root.path(), 4);
+
+        assert!(source.on_request(false).await.is_some());
+        assert!(source.on_request(false).await.is_none());
+        assert!(source.on_request(false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_change_is_shown_once_as_its_diff() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(root.path(), "- [ ] first\n").await;
+        let mut source = TasksDocument::new(root.path(), 4);
+        source.on_request(false).await.expect("session start");
 
         write_tasks(root.path(), "- [x] first\n- [ ] second\n").await;
-        let block = source.render().await.expect("renders the document");
+        let block = source.on_request(false).await.expect("shows the diff");
+        assert!(block.content().contains("Changes to tasks.md"));
+        assert!(block.content().contains("+ - [ ] second"));
         assert!(
-            block.content().contains("Changes to tasks.md"),
-            "a changed document must report its diff: {}",
+            !block.content().contains("Contents of tasks.md"),
+            "a change must not resend the document: {}",
             block.content()
         );
+        assert!(source.on_request(false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reassembly_shows_the_whole_document_again() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(root.path(), "- [ ] first\n").await;
+        let mut source = TasksDocument::new(root.path(), 4);
+        source.on_request(false).await.expect("session start");
+
+        let block = source.on_request(true).await.expect("shows the document");
+        assert!(block.content().contains("Contents of tasks.md"));
+        assert!(source.on_request(false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_absent_document_is_never_shown() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut source = TasksDocument::new(root.path(), 4);
+        assert!(source.on_request(false).await.is_none());
+        assert!(source.on_request(true).await.is_none());
     }
 
     #[tokio::test]
