@@ -1496,8 +1496,14 @@ where
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
         let skills = Vec::new();
-        let fork = CompactionFork::new(&request, self.context.fork_point(), focus, &skills)
-            .map_err(|error| AgentError::Llm(error.to_string()))?;
+        let fork = CompactionFork::new(
+            &request,
+            self.context.fork_point(),
+            self.context.handoff_file_index(),
+            focus,
+            &skills,
+        )
+        .map_err(|error| AgentError::Llm(error.to_string()))?;
         let fork_point = fork.fork_point();
         let handoff = match self.tier {
             ModelTier::Advanced => fork.run(Arc::clone(&self.advanced)).await,
@@ -1533,7 +1539,13 @@ where
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
         let skills = Vec::new();
-        match CompactionFork::new(request, self.context.fork_point(), focus, &skills) {
+        match CompactionFork::new(
+            request,
+            self.context.fork_point(),
+            self.context.handoff_file_index(),
+            focus,
+            &skills,
+        ) {
             Ok(fork) => {
                 tracing::debug!(
                     fork_point = fork.fork_point(),
@@ -3052,8 +3064,8 @@ mod tests {
         // Seed an in-flight compaction the way prepare_request would.
         let tail = agent.render_tail().await;
         let request = LLMRequest::new(agent.context.build_request(&tail));
-        let fork =
-            CompactionFork::new(&request, agent.context.fork_point(), None, &[]).expect("fork");
+        let fork = CompactionFork::new(&request, agent.context.fork_point(), &[], None, &[])
+            .expect("fork");
         agent.pending_compaction = Some(PendingCompaction::start(fork, llm.clone()));
 
         let request = agent.prepare_request().await;
@@ -3158,7 +3170,8 @@ mod tests {
         // Fork the way prepare_request does, around a real assembled request.
         let tail = agent.render_tail().await;
         let main = LLMRequest::new(agent.context.build_request(&tail));
-        let fork = CompactionFork::new(&main, agent.context.fork_point(), None, &[]).expect("fork");
+        let fork =
+            CompactionFork::new(&main, agent.context.fork_point(), &[], None, &[]).expect("fork");
         agent.pending_compaction = Some(PendingCompaction::start(fork, llm.clone()));
         assert!(agent.await_pending_compaction().await);
 

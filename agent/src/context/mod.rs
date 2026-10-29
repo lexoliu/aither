@@ -31,8 +31,8 @@ pub mod window;
 pub use budget::ContextBudget;
 pub use cache::{CacheLifetime, PromptCache};
 pub use compaction::{
-    CompactionError, CompactionFork, CompletedCompaction, ContextFile, HandoffDocument, LineRange,
-    PendingCompaction, SkillCatalogEntry, build_file_index,
+    CompactionError, CompactionFork, CompletedCompaction, ContextFile, Handoff, HandoffDocument,
+    LineRange, PendingCompaction, SkillCatalogEntry, build_file_index,
 };
 pub use policy::ContextPolicy;
 pub use reassembly::restore_context;
