@@ -35,7 +35,7 @@ use crate::{
     },
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
-    event::{AgentEvent, RunPauseReason},
+    event::{AgentEvent, RunPauseReason, TimedEvent},
     hook::{
         CheckpointContext, CheckpointReason, Hook, PostToolAction, PreToolAction, StopContext,
         StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
@@ -112,18 +112,21 @@ struct ModelTurn {
 /// after the consumer dropped the stream are discarded.
 #[derive(Clone)]
 struct EventSink {
-    sender: async_channel::Sender<AgentEvent>,
+    sender: async_channel::Sender<TimedEvent>,
 }
 
 impl EventSink {
     fn emit(&self, event: AgentEvent) {
-        let _ = self.sender.try_send(event);
+        let _ = self.sender.try_send(TimedEvent {
+            at: jiff::Timestamp::now(),
+            event,
+        });
     }
 }
 
 /// One step of the merged run/event stream in [`Agent::run`].
 enum RunStep {
-    Event(Option<AgentEvent>),
+    Event(Option<TimedEvent>),
     Finished(Result<(), AgentError>),
 }
 
@@ -1433,7 +1436,7 @@ where
 
         let mut final_text = String::new();
         while let Some(event) = stream.next().await {
-            match event? {
+            match event?.event {
                 AgentEvent::Text(chunk) => final_text.push_str(&chunk),
                 AgentEvent::Complete {
                     final_text: text, ..
@@ -1470,7 +1473,7 @@ where
         &mut self,
         prompt: &str,
         attachments: impl IntoIterator<Item = Attachment>,
-    ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
+    ) -> impl Stream<Item = Result<TimedEvent, AgentError>> + '_ {
         let prompt = prompt.to_string();
         let attachments: Vec<Attachment> = attachments.into_iter().collect();
 
@@ -2548,6 +2551,40 @@ mod tests {
                 self.context_length,
             )))
         }
+    }
+
+    #[tokio::test]
+    async fn events_carry_their_emission_time() {
+        use futures_lite::StreamExt;
+
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 1000,
+            },
+            AgentConfig::default(),
+        );
+        let before = jiff::Timestamp::now();
+        let events: Vec<TimedEvent> = {
+            let stream = agent.run("hello", std::iter::empty());
+            futures_lite::pin!(stream);
+            let mut events = Vec::new();
+            while let Some(item) = stream.next().await {
+                if let Ok(event) = item {
+                    events.push(event);
+                }
+            }
+            events
+        };
+        let after = jiff::Timestamp::now();
+
+        assert!(matches!(
+            events.first().map(|timed| &timed.event),
+            Some(AgentEvent::RunStart { .. })
+        ));
+        for timed in &events {
+            assert!(before <= timed.at && timed.at <= after);
+        }
+        assert!(events.windows(2).all(|pair| pair[0].at <= pair[1].at));
     }
 
     /// aither#143: the provider `respond` stream's multi-KB state machine must

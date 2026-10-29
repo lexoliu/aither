@@ -35,6 +35,7 @@ use std::hash::{Hash, Hasher};
 
 use askama::Template;
 use indexmap::IndexMap;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use aither_core::llm::{Message, Role};
@@ -71,6 +72,9 @@ pub struct ContextItem {
     seq: u64,
     /// The message itself.
     message: Message,
+    /// When the item was committed to the window. Bookkeeping only: it is
+    /// never rendered into a request.
+    committed_at: Timestamp,
 }
 
 impl ContextItem {
@@ -78,6 +82,12 @@ impl ContextItem {
     #[must_use]
     pub const fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// The UTC time the item was committed to the window.
+    #[must_use]
+    pub const fn committed_at(&self) -> Timestamp {
+        self.committed_at
     }
 
     /// The message this item carries.
@@ -308,7 +318,11 @@ impl Context {
     pub fn push(&mut self, message: Message) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.items.push(ContextItem { seq, message });
+        self.items.push(ContextItem {
+            seq,
+            message,
+            committed_at: Timestamp::now(),
+        });
         seq
     }
 
@@ -920,6 +934,51 @@ mod tests {
         assert_eq!(report.staged_updates_applied, 1);
         assert!(context.build_messages()[0].content().contains("v2"));
         assert_ne!(context.stable_prefix_fingerprint(), fingerprint);
+    }
+
+    #[test]
+    fn items_record_their_commit_time() {
+        let mut context = Context::new();
+        let before = Timestamp::now();
+        context.push(Message::user("one"));
+        let after = Timestamp::now();
+
+        let committed = context.checkpoint().items()[0].committed_at();
+        assert!(before <= committed && committed <= after);
+    }
+
+    #[test]
+    fn checkpoint_round_trip_keeps_every_commit_time_and_the_request() {
+        let mut context = Context::new();
+        context.insert_system_named("base_system", "be useful");
+        context.push(Message::user("first"));
+        context.push(Message::assistant("answer"));
+        context.push(Message::user("second"));
+        let original_times: Vec<Timestamp> = context
+            .checkpoint()
+            .items()
+            .iter()
+            .map(ContextItem::committed_at)
+            .collect();
+
+        let json = serde_json::to_string(&context.checkpoint()).expect("serialize checkpoint");
+        let checkpoint: ContextCheckpoint =
+            serde_json::from_str(&json).expect("deserialize checkpoint");
+
+        let mut restored = Context::new();
+        restored.insert_system_named("base_system", "be useful");
+        restored.restore(checkpoint);
+
+        let restored_times: Vec<Timestamp> = restored
+            .checkpoint()
+            .items()
+            .iter()
+            .map(ContextItem::committed_at)
+            .collect();
+        assert_eq!(original_times, restored_times);
+
+        let tail = [Block::new("tasks", "<tasks>v1</tasks>")];
+        assert_eq!(context.build_request(&tail), restored.build_request(&tail));
     }
 
     #[test]

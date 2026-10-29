@@ -117,6 +117,7 @@ dependencies = [
  "heck",
  "hex",
  "indexmap 2.14.2",
+ "jiff",
  "num-traits",
  "schemars 1.2.3",
  "serde",
