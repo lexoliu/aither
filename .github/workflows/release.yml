@@ -34,9 +34,9 @@ jobs:
       # `cargo publish` verifies each tarball by compiling it; aither-search
       # builds lance/prost, which needs protoc. CI installs it too.
       - uses: arduino/setup-protoc@v3
-      # Our own builds — release-pr's semver-check rustdoc and every crate's
-      # publish verification — share the ci-ubuntu cache: CI keeps it warm
-      # between releases, a release-scoped key would go cold and never hit.
+      # Every crate's publish verification shares the ci-ubuntu cache: CI
+      # keeps it warm between releases, a release-scoped key would go cold and
+      # never hit.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
@@ -66,7 +66,19 @@ jobs:
           tar -xzf "${asset}" -C "${CARGO_HOME}/bin"
           release-plz --version
       - uses: release-plz/git-config@v0.1.2
+      # release-pr semver-checks every changed library against its registry
+      # version, one cargo-semver-checks process per crate. Each builds a
+      # placeholder project for the current and the baseline crate, and that
+      # placeholder is its own workspace, so without a target dir set every
+      # one compiles the full dependency tree from scratch into its own
+      # throwaway target/. One shared target dir builds each dependency once
+      # per run; cargo's build-dir lock serialises the processes on it. It is
+      # not the cached ./target: these builds run in release-plz's copy of the
+      # repository with RUSTFLAGS=--cap-lints=allow, so CI's artifacts never
+      # match them.
       - name: Open or update the release pull request
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/../release-pr-target
         run: >-
           release-plz release-pr
           --git-token "${GITHUB_TOKEN}"
