@@ -779,7 +779,7 @@ where
         turn: usize,
         events: &EventSink,
     ) -> Result<TurnControl, AgentError> {
-        let Some(request) = self.prepare_request().await else {
+        let Some(request) = self.prepare_request().await? else {
             events.emit(AgentEvent::run_paused(
                 RunPauseReason::ContextExhausted,
                 String::new(),
@@ -2149,17 +2149,23 @@ where
     /// [`ContextPolicy::compact_at`], and one that was already running is
     /// awaited if usage reached [`ContextPolicy::pause_at`].
     ///
+    /// With a compaction model set, a cache that went cold since the last
+    /// request is rebuilt first (`rebuild_if_cache_is_cold`).
+    ///
     /// Returns `None` when the window is exhausted and no compaction can
     /// relieve it: the caller pauses the run rather than sending a request
     /// the provider would reject for length.
     ///
+    /// # Errors
+    ///
+    /// Returns the compaction failure when the cold-cache compaction fails;
+    /// nothing is sent on an uncompacted context.
+    ///
     /// [`ContextPolicy::compact_at`]: crate::ContextPolicy::compact_at
     /// [`ContextPolicy::pause_at`]: crate::ContextPolicy::pause_at
-    async fn prepare_request(&mut self) -> Option<LLMRequest> {
+    async fn prepare_request(&mut self) -> Result<Option<LLMRequest>, AgentError> {
         self.apply_completed_compaction().await;
-        if self.compaction_model.is_some() {
-            self.reassemble_if_cache_is_cold();
-        }
+        self.rebuild_if_cache_is_cold().await?;
         self.push_request_alerts().await;
 
         let definitions = self.tools.active_definitions();
@@ -2186,7 +2192,7 @@ where
         if self.config.context_policy.should_pause(usage) {
             tracing::warn!(usage, "context window exhausted; waiting for compaction");
             if !self.await_pending_compaction().await {
-                return None;
+                return Ok(None);
             }
             self.push_request_alerts().await;
             tail = self.render_tail().await;
@@ -2196,7 +2202,7 @@ where
             // A landed compaction is still no guarantee the rebuilt request
             // fits; an unshrinkable request is paused rather than sent.
             if self.config.context_policy.should_pause(self.budget.usage()) {
-                return None;
+                return Ok(None);
             }
         }
 
@@ -2214,14 +2220,63 @@ where
             .with_parameters(parameters)
             .with_tool_definitions(definitions);
         self.last_request = Some(request.clone());
-        Some(request)
+        Ok(Some(request))
+    }
+
+    /// Rebuilds the prefix once, before a send, when the provider's cache has
+    /// gone cold.
+    ///
+    /// Only with a compaction model set (otherwise the session is compacted
+    /// shortly before the cache expires, see [`Agent::compact_when_idle`], and
+    /// a send never rebuilds). The cache is cold when the conversation's
+    /// [`CacheLifetime`] has passed since the entry was last used; a permanent
+    /// lifetime never is, and nothing runs while the session is idle.
+    ///
+    /// The compaction model reads the context uncached whatever the timing, so
+    /// compacting now costs no more than later, and the send then pays its
+    /// cache write on the compacted context instead of the whole one. The
+    /// compaction's apply already reassembles the window, so the prefix is
+    /// rewritten once: reassembly alone runs only when there is no
+    /// conversation to compact. Nothing is kept across the handoff, so no
+    /// thinking produced under the old prefix is replayed after it.
+    ///
+    /// A forked compaction already in flight lands and rebuilds the prefix
+    /// itself, so it is left alone.
+    ///
+    /// [`CacheLifetime`]: crate::context::CacheLifetime
+    async fn rebuild_if_cache_is_cold(&mut self) -> Result<(), AgentError> {
+        if self.compaction_model.is_none() || self.pending_compaction.is_some() {
+            return Ok(());
+        }
+        let Some(entry_started_at) = self.cache_entry_started_at() else {
+            return Ok(());
+        };
+        if !self
+            .prompt_cache
+            .lifetime()
+            .is_cold(entry_started_at.elapsed())
+        {
+            return Ok(());
+        }
+        if self.context.is_conversation_empty() {
+            self.reassemble_if_cache_is_cold();
+            return Ok(());
+        }
+        // Boxed: the compaction future is large and sits on every run's path
+        // (see `run_futures_stay_small_with_a_real_provider_type`).
+        if let Some(result) = Box::pin(self.compact(None)).await? {
+            tracing::info!(
+                compacted = result.messages_compacted,
+                "compacted the context before sending on a cold cache"
+            );
+        }
+        Ok(())
     }
 
     /// Rebuilds the window once the provider's cache has gone cold anyway.
     ///
-    /// Only with a compaction model set: otherwise the session is compacted
-    /// shortly before the cache expires ([`Agent::compact_when_idle`]), and an
-    /// idle gap never reassembles.
+    /// Reached only for a session with a compaction model and nothing to
+    /// compact (`rebuild_if_cache_is_cold`).
     ///
     /// Reassembly rewrites the cacheable prefix, so it is only free once the
     /// cached copy has expired — an idle gap at least as long as the
@@ -2829,7 +2884,13 @@ mod tests {
         // The conversation is non-empty, so a compaction is forked; the mock
         // model answers with an empty stream, so it cannot land, and the
         // request must not be sent on a window this far over the threshold.
-        assert!(agent.prepare_request().await.is_none());
+        assert!(
+            agent
+                .prepare_request()
+                .await
+                .expect("request boundary")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3051,6 +3112,7 @@ mod tests {
         let messages = agent
             .prepare_request()
             .await
+            .expect("request boundary")
             .expect("a fresh window must accept a request")
             .messages()
             .to_vec();
@@ -3124,6 +3186,7 @@ mod tests {
         let request = agent
             .prepare_request()
             .await
+            .expect("request boundary")
             .expect("a fresh window must accept a request");
 
         assert!(
@@ -3464,7 +3527,7 @@ mod tests {
         agent.context_mut().set_handoff("resume here");
         agent.push_message(Message::user("hello"));
 
-        let request = agent.prepare_request().await;
+        let request = agent.prepare_request().await.expect("request boundary");
 
         assert!(
             request.is_some(),
@@ -3502,7 +3565,7 @@ mod tests {
             agent.push_message(message);
         }
 
-        let request = agent.prepare_request().await;
+        let request = agent.prepare_request().await.expect("request boundary");
 
         assert!(
             request.is_some(),
@@ -3548,7 +3611,7 @@ mod tests {
             .expect("fork");
         agent.pending_compaction = Some(PendingCompaction::start(fork, llm.clone()));
 
-        let request = agent.prepare_request().await;
+        let request = agent.prepare_request().await.expect("request boundary");
 
         assert!(
             request.is_some(),
@@ -3595,6 +3658,7 @@ mod tests {
         let request = agent
             .prepare_request()
             .await
+            .expect("request boundary")
             .expect("request after compaction");
 
         assert!(
@@ -3627,7 +3691,11 @@ mod tests {
             },
         });
 
-        agent.prepare_request().await.expect("request after apply");
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after apply");
 
         let conversation: Vec<String> = agent
             .context()
@@ -3694,6 +3762,7 @@ mod tests {
         let request = agent
             .prepare_request()
             .await
+            .expect("request boundary")
             .expect("request after preview");
         assert!(
             request
@@ -3712,9 +3781,7 @@ mod tests {
         let mut agent = Agent::builder(MockLlm {
             context_length: 1_000_000,
         })
-        .compaction_model(MockLlm {
-            context_length: 1_000_000,
-        })
+        .compaction_model(ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]))
         .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
@@ -3724,18 +3791,36 @@ mod tests {
 
         // The default lifetime is one hour: five minutes is nothing.
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(300));
-        assert!(agent.prepare_request().await.is_some());
+        assert!(
+            agent
+                .prepare_request()
+                .await
+                .expect("request boundary")
+                .is_some()
+        );
         assert_eq!(agent.context().count_recent_system_messages(), 1);
 
         // Fifty-nine minutes is still inside the hour.
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3540));
-        assert!(agent.prepare_request().await.is_some());
+        assert!(
+            agent
+                .prepare_request()
+                .await
+                .expect("request boundary")
+                .is_some()
+        );
         assert_eq!(agent.context().count_recent_system_messages(), 1);
 
         // Sixty-one minutes is past it: the cached prefix is gone anyway,
         // so the compromises the append-only log forced get cleaned up.
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
-        assert!(agent.prepare_request().await.is_some());
+        assert!(
+            agent
+                .prepare_request()
+                .await
+                .expect("request boundary")
+                .is_some()
+        );
         assert_eq!(agent.context().count_recent_system_messages(), 0);
     }
 
@@ -3763,7 +3848,13 @@ mod tests {
         // Rewriting the prefix always costs a permanent cache, so no idle
         // gap ever justifies it — even a day later.
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
-        assert!(agent.prepare_request().await.is_some());
+        assert!(
+            agent
+                .prepare_request()
+                .await
+                .expect("request boundary")
+                .is_some()
+        );
         assert_eq!(agent.context().count_recent_system_messages(), 1);
     }
 
@@ -3777,6 +3868,7 @@ mod tests {
         agent
             .prepare_request()
             .await
+            .expect("request boundary")
             .expect("the first request goes out");
         agent
     }
@@ -3817,7 +3909,11 @@ mod tests {
 
         // The next request re-arms it for the next gap.
         agent.push_message(Message::user("again"));
-        agent.prepare_request().await.expect("request after idle");
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after idle");
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
         assert_eq!(agent.idle_compaction_due_in(), Some(Duration::ZERO));
     }
@@ -3861,7 +3957,11 @@ mod tests {
             .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
-        agent.prepare_request().await.expect("first request");
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("first request");
 
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
         assert_eq!(agent.idle_compaction_due_in(), None);
@@ -3904,15 +4004,196 @@ mod tests {
                 "<system-reminder>ephemeral</system-reminder>",
             ));
             agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
-            assert!(agent.prepare_request().await.is_some());
+            assert!(
+                agent
+                    .prepare_request()
+                    .await
+                    .expect("request boundary")
+                    .is_some()
+            );
             agent.context().count_recent_system_messages()
         }
 
         assert_eq!(system_reminders_after_a_gap(None).await, 1);
         assert_eq!(
-            system_reminders_after_a_gap(Some(ScriptedLlm::new(1_000_000, []))).await,
+            system_reminders_after_a_gap(Some(ScriptedLlm::new(
+                1_000_000,
+                [HANDOFF_JSON.to_string()]
+            )))
+            .await,
             0
         );
+    }
+
+    /// An agent with `compactor` as its compaction model that has sent one
+    /// request carrying two conversation messages and a stale reminder.
+    async fn agent_with_compactor_after_one_request(
+        main: ScriptedLlm,
+        compactor: Option<ScriptedLlm>,
+    ) -> Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, (), ScriptedLlm> {
+        let builder = Agent::builder(main);
+        let mut agent = match compactor {
+            Some(compactor) => builder.compaction_model(compactor).build(),
+            None => builder.build(),
+        };
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("an old question"));
+        agent.push_message(Message::assistant("an old answer"));
+        agent.push_message(Message::user("the next question"));
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("the first request goes out");
+        agent
+    }
+
+    fn mentions(request: &LLMRequest, text: &str) -> bool {
+        request
+            .messages()
+            .iter()
+            .any(|m| m.content().contains(text))
+    }
+
+    /// A send after the cache lifetime is preceded by exactly one compaction
+    /// on the compaction model, and the request carries the compacted context.
+    #[tokio::test]
+    async fn a_send_on_a_cold_cache_compacts_first() {
+        let main = ScriptedLlm::new(1_000_000, []);
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent =
+            agent_with_compactor_after_one_request(main.clone(), Some(compactor.clone())).await;
+        assert!(compactor.recorded().is_empty());
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after the gap");
+
+        assert_eq!(compactor.recorded().len(), 1, "one compaction preceded it");
+        assert!(main.recorded().is_empty(), "on the compaction model only");
+        assert!(mentions(&request, "keep going"), "the handoff is sent");
+        assert!(
+            !mentions(&request, "an old answer"),
+            "the old context is gone"
+        );
+        assert!(agent.completed_compaction.is_none());
+
+        // The send restarts the cache entry: the next one is warm.
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("next request");
+        assert_eq!(compactor.recorded().len(), 1);
+    }
+
+    /// The compaction's apply is the one rebuild of the prefix: the window is
+    /// reassembled once, not reassembled and then compacted.
+    #[tokio::test]
+    async fn a_cold_send_rebuilds_the_prefix_once() {
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_with_compactor_after_one_request(
+            ScriptedLlm::new(1_000_000, []),
+            Some(compactor.clone()),
+        )
+        .await;
+        agent.push_message(Message::system(
+            "<system-reminder>ephemeral</system-reminder>",
+        ));
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after the gap");
+
+        assert_eq!(agent.context().count_recent_system_messages(), 0);
+        assert_eq!(
+            compactor.recorded().len(),
+            1,
+            "compacted once, not also rebuilt on its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_on_a_warm_cache_does_not_compact() {
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_with_compactor_after_one_request(
+            ScriptedLlm::new(1_000_000, []),
+            Some(compactor.clone()),
+        )
+        .await;
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3540));
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request inside the lifetime");
+
+        assert!(compactor.recorded().is_empty());
+        assert!(mentions(&request, "an old answer"));
+    }
+
+    #[tokio::test]
+    async fn without_a_compaction_model_a_cold_send_does_not_compact() {
+        let main = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_with_compactor_after_one_request(main.clone(), None).await;
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after the gap");
+
+        assert!(main.recorded().is_empty());
+        assert!(mentions(&request, "an old answer"));
+    }
+
+    #[tokio::test]
+    async fn a_permanent_cache_lifetime_never_compacts_on_send() {
+        use crate::context::CacheLifetime;
+
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_with_compactor_after_one_request(
+            ScriptedLlm::new(1_000_000, []),
+            Some(compactor.clone()),
+        )
+        .await;
+        agent.prompt_cache = agent
+            .prompt_cache
+            .clone()
+            .with_lifetime(CacheLifetime::Permanent);
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after the gap");
+
+        assert!(compactor.recorded().is_empty());
+        assert!(mentions(&request, "an old answer"));
+    }
+
+    /// A failing compaction model fails the send instead of sending the
+    /// whole uncompacted context.
+    #[tokio::test]
+    async fn a_failed_cold_compaction_fails_the_send() {
+        let compactor = ScriptedLlm::new(1_000_000, ["not a handoff".to_string()]);
+        let mut agent = agent_with_compactor_after_one_request(
+            ScriptedLlm::new(1_000_000, []),
+            Some(compactor),
+        )
+        .await;
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        assert!(agent.prepare_request().await.is_err());
     }
 
     /// Messages of `request` that carry the whole tasks.md.
@@ -3941,7 +4222,11 @@ mod tests {
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
 
-        let request = agent.prepare_request().await.expect("first request");
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("first request");
 
         assert_eq!(full_document_messages(&request), 1);
         assert_eq!(document_diff_messages(&request), 0);
@@ -3954,11 +4239,19 @@ mod tests {
         let mut agent = tasks_agent(dir.path());
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
-        let first = agent.prepare_request().await.expect("first request");
+        let first = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("first request");
 
         agent.push_message(Message::assistant("working"));
         agent.push_message(Message::user("go on"));
-        let later = agent.prepare_request().await.expect("later request");
+        let later = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("later request");
 
         // The earlier request is an exact prefix of the later one apart from
         // the volatile tail, and no new tasks.md text joined the conversation.
@@ -3983,11 +4276,19 @@ mod tests {
         let mut agent = tasks_agent(dir.path());
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
-        agent.prepare_request().await.expect("first request");
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("first request");
 
         std::fs::write(dir.path().join("tasks.md"), "- [x] first\n- [ ] second\n")
             .expect("rewrite tasks.md");
-        let changed = agent.prepare_request().await.expect("request after change");
+        let changed = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after change");
         assert_eq!(document_diff_messages(&changed), 1);
         assert_eq!(
             full_document_messages(&changed),
@@ -3995,7 +4296,11 @@ mod tests {
             "only the session start's"
         );
 
-        let after = agent.prepare_request().await.expect("request after that");
+        let after = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after that");
         assert_eq!(
             document_diff_messages(&after),
             1,
@@ -4011,10 +4316,18 @@ mod tests {
         let mut agent = tasks_agent(dir.path());
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
-        agent.prepare_request().await.expect("first request");
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("first request");
 
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
-        let request = agent.prepare_request().await.expect("request after idle");
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after idle");
 
         assert_eq!(full_document_messages(&request), 1);
     }
@@ -4026,7 +4339,11 @@ mod tests {
         let mut agent = tasks_agent(dir.path());
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
-        agent.prepare_request().await.expect("first request");
+        agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("first request");
 
         agent.push_message(Message::assistant("done"));
         agent.completed_compaction = Some(CompletedCompaction {
@@ -4039,6 +4356,7 @@ mod tests {
         let request = agent
             .prepare_request()
             .await
+            .expect("request boundary")
             .expect("request after compaction");
 
         assert_eq!(
@@ -4046,7 +4364,11 @@ mod tests {
             1,
             "the compaction dropped the earlier copy; exactly one is sent again"
         );
-        let next = agent.prepare_request().await.expect("request after that");
+        let next = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after that");
         assert_eq!(full_document_messages(&next), 1);
         assert_eq!(next.messages().len(), request.messages().len());
     }
