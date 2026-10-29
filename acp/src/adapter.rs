@@ -256,7 +256,10 @@ fn format_tool_title(name: &str, arguments: &str) -> String {
             if let Ok(args) =
                 serde_json::from_str::<aither_agent::specialized::SubagentArgs>(arguments)
             {
-                return format!("Running {} subagent", truncate_title(&args.subagent));
+                return args.subagent.as_deref().map_or_else(
+                    || "Continuing subagent".to_string(),
+                    |subagent| format!("Running {} subagent", truncate_title(subagent)),
+                );
             }
             "Running subagent".to_string()
         }

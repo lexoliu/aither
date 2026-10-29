@@ -269,6 +269,16 @@ pub struct CacheKeepAliveState {
     pub(crate) last_reason: Option<String>,
 }
 
+impl CacheKeepAliveState {
+    /// Starts the per-run counters afresh; a continued agent reports only
+    /// the idling of its current run.
+    fn begin_run(&mut self) {
+        self.sent = 0;
+        self.alerted = false;
+        self.last_reason = None;
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct EmittedCheckpoint {
     phase: ContextWindowPhase,
@@ -646,6 +656,7 @@ where
         events: &EventSink,
     ) -> Result<(), AgentError> {
         let run_id = uuid::Uuid::new_v4().to_string();
+        self.cache_keep_alive.begin_run();
         events.emit(AgentEvent::run_start(
             run_id.clone(),
             self.config.max_iterations,
@@ -1083,11 +1094,7 @@ where
         let Some(keep_alive) = self.config.cache_keep_alive.clone() else {
             return Ok(());
         };
-        let entry_started_at = self
-            .cache_keep_alive
-            .last_sent_at
-            .or(self.last_request_started_at);
-        let Some(entry_started_at) = entry_started_at else {
+        let Some(entry_started_at) = self.cache_entry_started_at() else {
             return Ok(());
         };
         if entry_started_at.elapsed() + keep_alive.send_before_expiry < keep_alive.lifetime {
@@ -1141,6 +1148,18 @@ where
             "waiting on background command {}",
             running.join(", ")
         ))
+    }
+
+    /// When the provider's prompt-cache entry for this agent's context was
+    /// last started or refreshed: the later of the last request's start and
+    /// the last keep-alive send. `None` before the first request.
+    #[must_use]
+    pub fn cache_entry_started_at(&self) -> Option<Instant> {
+        self.cache_keep_alive
+            .last_sent_at
+            .into_iter()
+            .chain(self.last_request_started_at)
+            .max()
     }
 
     /// Keep-alive bookkeeping for the current run.
