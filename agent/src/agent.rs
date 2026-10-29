@@ -2416,7 +2416,9 @@ mod tests {
     use futures_core::Stream;
 
     fn inline(text: &str) -> CommandStream {
-        CommandStream::Inline(text.to_string())
+        CommandStream::Inline {
+            text: text.to_string(),
+        }
     }
 
     fn completed(result: Result<CompletedCommand, TerminalError>) -> CompletedTask {

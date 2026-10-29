@@ -2013,7 +2013,9 @@ You are a file-defined agent.
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
                 result: Ok(aither_sandbox::CompletedCommand {
-                    stdout: aither_core::llm::CommandStream::Inline(String::new()),
+                    stdout: aither_core::llm::CommandStream::Inline {
+                        text: String::new(),
+                    },
                     stderr: None,
                     exit_code: 0,
                 }),
@@ -2091,7 +2093,9 @@ You are a file-defined agent.
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
                 result: Ok(aither_sandbox::CompletedCommand {
-                    stdout: aither_core::llm::CommandStream::Inline(String::new()),
+                    stdout: aither_core::llm::CommandStream::Inline {
+                        text: String::new(),
+                    },
                     stderr: None,
                     exit_code: 0,
                 }),

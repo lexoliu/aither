@@ -23,7 +23,10 @@ pub struct StoredFile {
 #[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "snake_case"))]
 pub enum CommandStream {
     /// Output small enough to keep in the result.
-    Inline(String),
+    Inline {
+        /// The output text.
+        text: String,
+    },
     /// Output written to a file.
     Stored {
         /// Where the full output is stored.
@@ -99,7 +102,7 @@ impl CommandStream {
     /// Returns `true` when the stream holds no output.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        matches!(self, Self::Inline(text) if text.is_empty())
+        matches!(self, Self::Inline { text } if text.is_empty())
     }
 
     /// Renders the stream as the newline-terminated block the model reads;
@@ -179,7 +182,9 @@ mod tests {
     fn placeholder_only_when_both_streams_are_empty() {
         assert_eq!(
             result(
-                CommandStream::Inline(String::new()),
+                CommandStream::Inline {
+                    text: String::new()
+                },
                 None,
                 CommandOutcome::Exited { code: 0 }
             ),
@@ -187,8 +192,12 @@ mod tests {
         );
         assert_eq!(
             result(
-                CommandStream::Inline(String::new()),
-                Some(CommandStream::Inline("oops".to_string())),
+                CommandStream::Inline {
+                    text: String::new()
+                },
+                Some(CommandStream::Inline {
+                    text: "oops".to_string()
+                }),
                 CommandOutcome::Exited { code: 2 },
             ),
             "stderr:\noops\nExit code: 2.\n"
@@ -220,7 +229,9 @@ mod tests {
     fn running_and_killed_outcomes_render_their_facts() {
         assert_eq!(
             result(
-                CommandStream::Inline(String::new()),
+                CommandStream::Inline {
+                    text: String::new()
+                },
                 None,
                 CommandOutcome::Running {
                     task_id: "t1".to_string(),
@@ -231,7 +242,9 @@ mod tests {
         );
         assert_eq!(
             result(
-                CommandStream::Inline("partial\n".to_string()),
+                CommandStream::Inline {
+                    text: "partial\n".to_string()
+                },
                 None,
                 CommandOutcome::Killed {
                     task_id: "t2".to_string(),

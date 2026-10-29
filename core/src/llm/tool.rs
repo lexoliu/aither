@@ -1610,7 +1610,9 @@ mod tests {
     #[test]
     fn command_result_renders_its_text() {
         let result = ToolResult::Command(Box::new(CommandResult {
-            stdout: CommandStream::Inline("hi\n".to_string()),
+            stdout: CommandStream::Inline {
+                text: "hi\n".to_string(),
+            },
             stderr: None,
             outcome: CommandOutcome::Exited { code: 3 },
         }));
@@ -1619,6 +1621,52 @@ mod tests {
             result.command().map(|command| &command.outcome),
             Some(&CommandOutcome::Exited { code: 3 })
         );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn command_result_round_trips_through_serde() {
+        let file = || crate::llm::StoredFile {
+            url: "outputs/x.txt".to_string(),
+            path: "/sandbox/outputs/x.txt".to_string(),
+        };
+        let results = [
+            CommandResult {
+                stdout: CommandStream::Inline {
+                    text: "hi\n".to_string(),
+                },
+                stderr: Some(CommandStream::Inline {
+                    text: "oops".to_string(),
+                }),
+                outcome: CommandOutcome::Exited { code: 1 },
+            },
+            CommandResult {
+                stdout: CommandStream::Stored {
+                    file: file(),
+                    preview: "head".to_string(),
+                    truncated: true,
+                },
+                stderr: None,
+                outcome: CommandOutcome::Exited { code: 0 },
+            },
+            CommandResult {
+                stdout: CommandStream::Image {
+                    media_type: "image/png".to_string(),
+                    file: file(),
+                },
+                stderr: None,
+                outcome: CommandOutcome::Running {
+                    task_id: "t1".to_string(),
+                    output: file(),
+                },
+            },
+        ];
+        for command in results {
+            let result = ToolResult::Command(Box::new(command));
+            let json = serde_json::to_string(&result).expect("a command result serializes");
+            let back: ToolResult = serde_json::from_str(&json).expect("it deserializes back");
+            assert_eq!(back, result, "{json}");
+        }
     }
 
     #[tokio::test]
