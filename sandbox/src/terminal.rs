@@ -7081,10 +7081,12 @@ mod tests {
     }
 
     /// Records the script every container exec runs.
+    #[cfg(unix)]
     struct RecordingExec {
         scripts: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
+    #[cfg(unix)]
     impl crate::ContainerExec for RecordingExec {
         fn exec(
             &self,
