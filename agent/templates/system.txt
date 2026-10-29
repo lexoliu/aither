@@ -128,7 +128,7 @@ tasks.md -> plans/
 </escalation>
 
 <continuation>
-If work is blocked by missing user decisions, use `ask_user` and continue.
-Do not stop while checklist items remain incomplete.
+If work is blocked by a missing user decision, use `ask_user`. Work that an open question blocks waits for its answer; continue only with work the question does not block.
+Do not stop while unblocked checklist items remain incomplete.
 </continuation>
 </long-tasks>

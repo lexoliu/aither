@@ -1283,6 +1283,30 @@ mod tests {
             "Shell runtime: user_local_machine. Local backend: available. SSH backend: unavailable."
         );
     }
+    #[test]
+    fn continuation_block_holds_work_an_open_question_blocks() {
+        let prompt = SystemPrompt {
+            os: String::new(),
+            os_version: String::new(),
+            arch: "",
+            user_cwd: String::new(),
+            sandbox_dir: String::new(),
+            tools: String::new(),
+            host_profile: "heel",
+            host_runtime_context: String::new(),
+            skills: String::new(),
+            has_skills: false,
+            subagents: String::new(),
+            has_subagents: false,
+            is_macos: false,
+            has_websearch_command: false,
+        }
+        .render()
+        .unwrap();
+        assert!(prompt.contains("<continuation>\nIf work is blocked by a missing user decision, use `ask_user`. Work that an open question blocks waits for its answer; continue only with work the question does not block.\nDo not stop while unblocked checklist items remain incomplete.\n</continuation>"));
+        assert!(!prompt.contains("use `ask_user` and continue"));
+    }
+
     use std::borrow::Cow;
 
     use crate::test_support::{compile_baseline_fixture, fixture_distribution};
