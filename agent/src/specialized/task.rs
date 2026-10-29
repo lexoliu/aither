@@ -3423,7 +3423,7 @@ You are a file-defined agent.
     struct ForkFixture {
         _dirs: [tempfile::TempDir; 3],
         terminal: aither_sandbox::TerminalTool<
-            RecordingPermission,
+            crate::ReviewedPermission<RecordingPermission>,
             executor_core::tokio::TokioGlobal,
             aither_sandbox::Configured,
         >,
@@ -3432,6 +3432,11 @@ You are a file-defined agent.
 
     impl ForkFixture {
         async fn new() -> Self {
+            Self::reviewed(crate::ReviewerChain::default()).await
+        }
+
+        /// A fixture whose permission requests go through `chain` first.
+        async fn reviewed(chain: crate::ReviewerChain) -> Self {
             use aither_sandbox::{TerminalTool, ToolRegistryBuilder};
             use executor_core::tokio::TokioGlobal;
 
@@ -3442,6 +3447,7 @@ You are a file-defined agent.
             let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
             let permission = RecordingPermission::default();
             let asked = permission.asked.clone();
+            let permission = crate::ReviewedPermission::new(permission, chain);
             let terminal = TerminalTool::new_exact(session.path(), permission, TokioGlobal)
                 .await
                 .expect("terminal tool should initialize")
@@ -3648,6 +3654,80 @@ You are a file-defined agent.
 
         let _ = std::fs::remove_dir_all(fork_dir);
         let _ = std::fs::remove_dir_all(worker_dir);
+    }
+
+    /// Runs a subagent whose model asks for an out-of-sandbox command, behind
+    /// a chain of one reviewer printing `answer`. Returns what the existing
+    /// route was asked, what the reviewer read, and the text the subagent's
+    /// model got back for its command.
+    #[cfg(unix)]
+    async fn subagent_request_behind_reviewer(answer: &str) -> (usize, String, String) {
+        use crate::external_hook::tests::{logged, reviewers::reviewer};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let fixture = ForkFixture::reviewed(crate::ReviewerChain::new(vec![reviewer(
+            dir.path(),
+            "guard",
+            &log,
+            answer,
+        )]))
+        .await;
+        let (seen_tx, seen_rx) = async_channel::unbounded();
+        let main = ScriptedLlm::new("main", &seen_tx);
+        let tool = fixture.tool(&main, &seen_tx);
+        main.then([
+            vec![unsafe_terminal_call("call-1")],
+            vec![Event::Text("finished".to_string())],
+        ]);
+        let (worker_dir, worker) =
+            start_fork("worker-reviewed", "worker", Some(ModelTier::Advanced));
+        Tool::call(&tool, worker, ToolContext::new())
+            .await
+            .expect("worker call");
+        let requests = drain(&seen_rx);
+        let (_, after_command) = requests.last().expect("the worker sent requests");
+        let seen_by_model = after_command
+            .messages()
+            .iter()
+            .map(|message| message.content().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reviewed = logged(&log);
+        assert_eq!(reviewed.len(), 1, "the reviewer saw the request once");
+        assert_eq!(reviewed[0]["role"], "subagent");
+        assert_eq!(reviewed[0]["script"], "echo forked");
+        let asked = fixture.asked.lock().unwrap().len();
+        let _ = std::fs::remove_dir_all(worker_dir);
+        (asked, reviewed[0].to_string(), seen_by_model)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagents_request_every_reviewer_passes_reaches_the_main_agent() {
+        let (asked, _, _) = subagent_request_behind_reviewer(r#"{"decision":"pass"}"#).await;
+        assert_eq!(asked, 1, "the main agent's permission handler was asked");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reviewer_approving_a_subagents_request_grants_it_without_asking() {
+        let (asked, _, seen) = subagent_request_behind_reviewer(r#"{"decision":"approve"}"#).await;
+        assert_eq!(asked, 0, "the main agent was not asked");
+        assert!(seen.contains("forked"), "the command ran: {seen}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reviewer_denying_a_subagents_request_tells_its_model_why() {
+        let (asked, _, seen) =
+            subagent_request_behind_reviewer(r#"{"decision":"deny","reason":"no escalation"}"#)
+                .await;
+        assert_eq!(asked, 0, "the main agent was not asked");
+        assert!(
+            seen.contains("The permission reviewer guard denied this request: no escalation"),
+            "{seen}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
