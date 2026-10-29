@@ -310,6 +310,13 @@ pub struct KnowledgeAndTimeTemplate {
     pub websearch_command: bool,
 }
 
+/// The result given to a tool call whose run was cancelled before it finished.
+#[derive(Template)]
+#[template(path = "tool_call_cancelled.txt", escape = "none")]
+struct ToolCallCancelledTemplate<'a> {
+    tool: &'a str,
+}
+
 #[derive(Template)]
 #[template(path = "background_terminal_result.txt", escape = "none")]
 struct BackgroundTerminalResultTemplate<'a> {
@@ -512,6 +519,10 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Compaction that finished and is waiting for a request boundary.
     pub(crate) completed_compaction: Option<CompletedCompaction>,
 
+    /// Results of the tool calls of the turn in flight, in completion order,
+    /// until they are moved into the context.
+    pub(crate) tool_results: VecDeque<ToolExecutionResult>,
+
     /// Cached model profile (for the selected tier).
     pub(crate) profile: Option<ModelProfile>,
 
@@ -595,6 +606,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             reassembled: false,
             pending_compaction: None,
             completed_compaction: None,
+            tool_results: VecDeque::new(),
             profile: None,
             initialized: false,
             last_request_started_at: None,
@@ -726,6 +738,7 @@ where
         for event in self.activate_skills_for_prompt(&prompt) {
             events.emit(event);
         }
+        self.settle_interrupted_tool_calls();
         self.context
             .push(Message::user(&prompt).with_attachments(attachments));
 
@@ -810,8 +823,8 @@ where
             model_turn.reasoning,
         ));
         Self::push_tool_start_events(&tool_calls, events);
-        let results = self.execute_tool_calls(&tool_calls, turn, events).await;
-        self.apply_tool_results(results, events)?;
+        self.execute_tool_calls(&tool_calls, turn, events).await;
+        self.apply_tool_results(events)?;
         self.push_tool_turn_alerts().await;
         self.push_turn_boundary_events(run_id, turn, &response_text, events)
             .await
@@ -892,6 +905,39 @@ where
         })
     }
 
+    /// Gives every tool call in the context a result.
+    ///
+    /// A run stream dropped while tools execute leaves the assistant message
+    /// carrying the calls with no results behind it, and providers reject a
+    /// request holding such calls. Runs at the start of the next run (and of a
+    /// manual compaction), so the repair needs nothing from the host and only
+    /// appends: the prefix, thinking blocks included, stays byte-identical.
+    /// Calls whose results had already landed keep them; the rest get a
+    /// cancelled result.
+    fn settle_interrupted_tool_calls(&mut self) {
+        let mut parked = std::mem::take(&mut self.tool_results);
+        let mut unresolved: Vec<ToolCall> = Vec::new();
+        for message in self.context.recent() {
+            unresolved.extend(message.tool_calls().iter().cloned());
+            if let Some(id) = message.tool_call_id() {
+                unresolved.retain(|call| call.id != id);
+            }
+        }
+        for call in unresolved {
+            let finished = parked
+                .iter()
+                .position(|result| matches!(result, Ok((id, _, _)) if *id == call.id))
+                .and_then(|index| parked.remove(index));
+            let content = match finished {
+                Some(Ok((_, _, result))) => result.render_for_model(),
+                _ => ToolCallCancelledTemplate { tool: &call.name }
+                    .render()
+                    .expect("tool call cancelled template must render"),
+            };
+            self.context.push(Message::tool(&call.id, content));
+        }
+    }
+
     fn push_tool_start_events(tool_calls: &[ToolCall], events: &EventSink) {
         for call in tool_calls {
             let args = call.arguments.to_string();
@@ -906,17 +952,25 @@ where
         }
     }
 
+    /// Runs `tool_calls` concurrently, parking each result in
+    /// `self.tool_results` the moment it lands.
+    ///
+    /// The results live on the agent rather than in this future so a run
+    /// stream dropped mid-execution still leaves the finished ones for
+    /// [`Self::settle_interrupted_tool_calls`] to pair.
     async fn execute_tool_calls(
-        &self,
+        &mut self,
         tool_calls: &[ToolCall],
         turn: usize,
         events: &EventSink,
-    ) -> Vec<Result<(String, String, aither_core::llm::ToolResult), AgentError>> {
+    ) {
         let permission_receiver = self.permission_receiver.clone();
         let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(tool_calls);
+        let message_count = self.context.len_recent();
+        let (hooks, tools) = (&self.hooks, &self.tools);
+        let results = &mut self.tool_results;
         let tool_futures = tool_calls.iter().map(|call| {
             let args_json = call.arguments.to_string();
-            let message_count = self.context.len_recent();
             async move {
                 let tool_ctx = ToolUseContext {
                     tool_name: &call.name,
@@ -924,16 +978,15 @@ where
                     turn,
                     message_count,
                 };
-                let (result, duration) = self
-                    .call_tool_with_hooks(call, &args_json, &tool_ctx)
-                    .await?;
+                let (result, duration) =
+                    Self::call_tool_with_hooks(hooks, tools, call, &args_json, &tool_ctx).await?;
                 let result_ctx = ToolResultContext {
                     tool_name: &call.name,
                     arguments: &args_json,
                     result: &result,
                     duration,
                 };
-                let tool_result = match self.hooks.post_tool_use(&result_ctx).await {
+                let tool_result = match hooks.post_tool_use(&result_ctx).await {
                     PostToolAction::Abort(reason) => {
                         return Err(AgentError::HookRejected {
                             hook: "post_tool_use",
@@ -948,7 +1001,6 @@ where
         });
 
         let mut pending = tool_futures.collect::<futures::stream::FuturesUnordered<_>>();
-        let mut results = Vec::new();
         while !pending.is_empty() {
             let next = match &permission_receiver {
                 Some(receiver) => {
@@ -960,28 +1012,23 @@ where
                 }
                 None => pending.next().await.map(ExecutionSignal::Tool),
             };
-            Self::handle_execution_signal(
-                next,
-                &mut permission_pause_tracker,
-                &mut results,
-                events,
-            );
+            Self::handle_execution_signal(next, &mut permission_pause_tracker, results, events);
         }
         if let Some(receiver) = &permission_receiver {
             for event in receiver.take_pending() {
                 emit_permission_event(&mut permission_pause_tracker, &event, events);
             }
         }
-        results
     }
 
     async fn call_tool_with_hooks(
-        &self,
+        hooks: &H,
+        tools: &AgentTools,
         call: &ToolCall,
         args_json: &str,
         tool_ctx: &ToolUseContext<'_>,
     ) -> Result<(aither_core::llm::ToolResult, Duration), AgentError> {
-        match self.hooks.pre_tool_use(tool_ctx).await {
+        match hooks.pre_tool_use(tool_ctx).await {
             PreToolAction::Abort(reason) => Err(AgentError::HookRejected {
                 hook: "pre_tool_use",
                 reason,
@@ -992,8 +1039,7 @@ where
             PreToolAction::Allow => {
                 let start = Instant::now();
                 // The agent loop has nowhere to show a tool's progress.
-                let result = self
-                    .tools
+                let result = tools
                     .call(&call.name, args_json, aither_core::llm::ToolContext::new())
                     .await
                     .unwrap_or_else(|error| {
@@ -1009,11 +1055,11 @@ where
     fn handle_execution_signal(
         signal: Option<ToolExecutionSignal>,
         tracker: &mut PermissionPauseTracker,
-        results: &mut Vec<ToolExecutionResult>,
+        results: &mut VecDeque<ToolExecutionResult>,
         events: &EventSink,
     ) {
         match signal {
-            Some(ExecutionSignal::Tool(result)) => results.push(result),
+            Some(ExecutionSignal::Tool(result)) => results.push_back(result),
             Some(ExecutionSignal::Permission(event)) => {
                 emit_permission_event(tracker, &event, events);
             }
@@ -1021,11 +1067,11 @@ where
         }
     }
 
-    fn apply_tool_results(
-        &mut self,
-        results: Vec<Result<(String, String, aither_core::llm::ToolResult), AgentError>>,
-        events: &EventSink,
-    ) -> Result<(), AgentError> {
+    /// Moves the parked tool results into the context.
+    ///
+    /// Results not reached because one failed stay parked for
+    /// [`Self::settle_interrupted_tool_calls`].
+    fn apply_tool_results(&mut self, events: &EventSink) -> Result<(), AgentError> {
         let mut has_tool_error = false;
         let mut unknown_tools: Vec<String> = Vec::new();
         let known_tools: Vec<String> = self
@@ -1034,7 +1080,7 @@ where
             .into_iter()
             .map(|definition| definition.name().to_string())
             .collect();
-        for result in results {
+        while let Some(result) = self.tool_results.pop_front() {
             let (call_id, call_name, tool_result) = result?;
             let is_terminal_call = matches!(call_name.as_str(), "terminal" | "terminal_background");
             if !known_tools.contains(&call_name) && !unknown_tools.contains(&call_name) {
@@ -1618,6 +1664,7 @@ where
         focus: Option<&str>,
     ) -> Result<Option<CompactResult>, AgentError> {
         self.ensure_initialized().await?;
+        self.settle_interrupted_tool_calls();
 
         let messages = self.context.conversation_messages();
         if messages.is_empty() {
@@ -4371,5 +4418,211 @@ mod tests {
             .expect("request after that");
         assert_eq!(full_document_messages(&next), 1);
         assert_eq!(next.messages().len(), request.messages().len());
+    }
+
+    /// A model whose first request calls every tool in `calls`; later requests
+    /// answer with text. Every request is recorded.
+    #[derive(Clone)]
+    struct ToolCallingLlm {
+        calls: Vec<(&'static str, &'static str)>,
+        requests: Arc<std::sync::Mutex<Vec<LLMRequest>>>,
+    }
+
+    impl LanguageModel for ToolCallingLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let mut requests = self.requests.lock().expect("requests lock");
+            let events: Vec<_> = if requests.is_empty() {
+                self.calls
+                    .iter()
+                    .map(|(id, name)| {
+                        Ok(Event::ToolCall(aither_core::llm::ToolCall::new(
+                            *id,
+                            *name,
+                            serde_json::json!({}),
+                        )))
+                    })
+                    .collect()
+            } else {
+                vec![Ok(Event::Text("done".to_string()))]
+            };
+            requests.push(request);
+            drop(requests);
+            futures_lite::stream::iter(events)
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                100_000,
+            )))
+        }
+    }
+
+    /// Arguments for the tools of the cancellation tests.
+    #[derive(Debug, schemars::JsonSchema, serde::Deserialize)]
+    struct NoArgs {}
+
+    /// Returns at once.
+    struct QuickTool;
+
+    impl aither_core::llm::Tool for QuickTool {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "quick".into()
+        }
+
+        fn description(&self) -> std::borrow::Cow<'static, str> {
+            "Returns at once".into()
+        }
+
+        type Arguments = NoArgs;
+        type Res = aither_core::llm::ToolResult;
+
+        fn call(
+            &self,
+            _args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(aither_core::llm::ToolResult::text("quick finished")))
+        }
+    }
+
+    /// Announces it started, then blocks until released.
+    struct BlockingTool {
+        started: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+    }
+
+    impl aither_core::llm::Tool for BlockingTool {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "blocking".into()
+        }
+
+        fn description(&self) -> std::borrow::Cow<'static, str> {
+            "Blocks until released".into()
+        }
+
+        type Arguments = NoArgs;
+        type Res = aither_core::llm::ToolResult;
+
+        async fn call(
+            &self,
+            _args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
+        ) -> aither_core::Result<Self::Res> {
+            self.started.send(()).await.expect("test listens");
+            let _ = self.release.recv().await;
+            Ok(aither_core::llm::ToolResult::text("blocking finished"))
+        }
+    }
+
+    /// Runs `calls` on a fresh agent, drops the run stream once the blocking
+    /// tool is executing, then sends a second prompt and returns the second
+    /// request's messages.
+    async fn messages_after_cancelled_run(
+        calls: Vec<(&'static str, &'static str)>,
+    ) -> Vec<Message> {
+        let llm = ToolCallingLlm {
+            calls,
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let mut agent = Agent::new(llm.clone());
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (_release_tx, release_rx) = async_channel::bounded(1);
+        agent
+            .register_tool(BlockingTool {
+                started: started_tx,
+                release: release_rx,
+            })
+            .expect("registers");
+        agent.register_tool(QuickTool).expect("registers");
+
+        {
+            let stream = agent.run("go", std::iter::empty());
+            futures_lite::pin!(stream);
+            let mut running = false;
+            while !running {
+                tokio::select! {
+                    _ = started_rx.recv() => running = true,
+                    event = stream.next() => {
+                        event.expect("run is alive").expect("no error");
+                    }
+                }
+            }
+        }
+
+        {
+            let stream = agent.run("again", std::iter::empty());
+            futures_lite::pin!(stream);
+            while let Some(event) = stream.next().await {
+                event.expect("second run succeeds");
+            }
+        }
+        let requests = llm.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2, "one request per run");
+        requests[1].messages().to_vec()
+    }
+
+    fn assert_every_call_has_a_result(messages: &[Message]) {
+        for (index, message) in messages.iter().enumerate() {
+            for call in message.tool_calls() {
+                assert!(
+                    messages[index + 1..]
+                        .iter()
+                        .any(|later| later.tool_call_id() == Some(call.id.as_str())),
+                    "tool call {} has no result in the request",
+                    call.id
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_run_leaves_cancelled_results_for_running_tools() {
+        let messages = messages_after_cancelled_run(vec![("call_slow", "blocking")]).await;
+
+        assert_every_call_has_a_result(&messages);
+        let result = messages
+            .iter()
+            .position(|message| message.tool_call_id() == Some("call_slow"))
+            .expect("the cancelled call has a result");
+        assert!(
+            messages[result].content().contains("cancelled"),
+            "{}",
+            messages[result].content()
+        );
+        let prompt = messages
+            .iter()
+            .position(|message| message.content() == "again")
+            .expect("the new prompt is sent");
+        assert!(result < prompt, "the result precedes the new prompt");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_run_keeps_results_of_tools_that_finished() {
+        let messages =
+            messages_after_cancelled_run(vec![("call_slow", "blocking"), ("call_quick", "quick")])
+                .await;
+
+        assert_every_call_has_a_result(&messages);
+        let quick = messages
+            .iter()
+            .find(|message| message.tool_call_id() == Some("call_quick"))
+            .expect("the finished call has a result");
+        assert_eq!(quick.content(), "quick finished");
+        let slow = messages
+            .iter()
+            .find(|message| message.tool_call_id() == Some("call_slow"))
+            .expect("the cancelled call has a result");
+        assert!(slow.content().contains("cancelled"), "{}", slow.content());
     }
 }
