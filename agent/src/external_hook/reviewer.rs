@@ -8,7 +8,9 @@ use aither_sandbox::permission::{
 use askama::Template;
 use serde::{Deserialize, Serialize};
 
-use super::runner::{HookCommand, HookRole, HookRunner};
+use super::lifecycle::ExternalHooks;
+use super::live::Run;
+use super::runner::{HookCommand, HookRole};
 
 /// A reviewer as the host configures it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,47 +60,46 @@ struct ReviewerDenialTemplate<'a> {
     reason: &'a str,
 }
 
-/// An ordered chain of reviewers; the host's configuration of them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ReviewerChain {
-    reviewers: Vec<ReviewerConfig>,
-}
-
-impl ReviewerChain {
-    /// A chain running `reviewers` in order.
-    #[must_use]
-    pub const fn new(reviewers: Vec<ReviewerConfig>) -> Self {
-        Self { reviewers }
-    }
-
-    /// Runs the reviewers in order, through `runner`, until one approves or
-    /// denies.
+impl ExternalHooks {
+    /// Runs the reviewers in order until one approves or denies.
     ///
     /// A reviewer that fails to run, runs past its deadline or prints an
-    /// invalid answer is reported through `tracing` and counts as a pass, so
-    /// a failure never grants anything.
-    async fn review(&self, runner: &HookRunner, request: &ReviewRequest<'_>) -> Review {
-        for reviewer in &self.reviewers {
-            match runner
-                .run::<_, ReviewAnswer>(&reviewer.command, request)
-                .await
-            {
-                Ok(Some(ReviewAnswer::Approve {})) => return Review::Approved,
-                Ok(Some(ReviewAnswer::Deny { reason })) => {
+    /// invalid answer is replaced by its previous version when it has one;
+    /// when no working version is left the user is asked to fix it. Where the
+    /// user cannot be asked the failure is reported through `tracing` and
+    /// counts as a pass, so a failure never grants anything.
+    async fn review(&self, request: PermissionRequest<'_>) -> Review {
+        let request = ReviewRequest {
+            role: self.role(),
+            request,
+        };
+        let set = self.live().set();
+        for reviewer in &set.reviewers {
+            let answer = self
+                .live()
+                .run_hook(
+                    self.user(),
+                    reviewer,
+                    &request,
+                    |answer: Option<ReviewAnswer>| Ok(answer.unwrap_or(ReviewAnswer::Pass {})),
+                )
+                .await;
+            match answer {
+                Run::Answered(ReviewAnswer::Approve {}) => return Review::Approved,
+                Run::Answered(ReviewAnswer::Deny { reason }) => {
                     return Review::Denied(
                         ReviewerDenialTemplate {
-                            reviewer: &reviewer.name,
+                            reviewer: &reviewer.config.name,
                             reason: &reason,
                         }
                         .render()
                         .expect("reviewer denial template must render"),
                     );
                 }
-                Ok(Some(ReviewAnswer::Pass {}) | None) => {}
-                Err(error) => tracing::warn!(
-                    reviewer = %reviewer.name,
-                    %error,
+                Run::Answered(ReviewAnswer::Pass {}) | Run::Gone => {}
+                Run::Failed(failure) => tracing::warn!(
+                    reviewer = %reviewer.config.name,
+                    %failure,
                     "permission reviewer failed; it counts as a pass"
                 ),
             }
@@ -107,40 +108,37 @@ impl ReviewerChain {
     }
 }
 
-/// A permission handler with the host's reviewer chain in front of the
-/// existing route.
+/// A permission handler with the host's reviewers in front of the existing
+/// route.
 ///
-/// The chain is the handler's [`review`](PermissionHandler::review) step, which
-/// the terminal runs before it asks `inner` anything: the first reviewer to
-/// approve grants the request without reaching `inner`, the first to deny
-/// refuses it, and a request every reviewer passes goes to `inner` unchanged,
-/// including its wait query. A command that needs a mode beyond the sandbox
-/// and a network domain that `inner` would have to ask about are both
-/// reviewed; a domain `inner` allows silently is not, and a domain a reviewer
-/// approves is remembered by `inner` as if its user had approved it. A subagent's terminal gets
-/// [`for_subagent`](PermissionHandler::for_subagent), the same chain labelled
-/// with the subagent role, over the same `inner` route and the same runner.
+/// The reviewers are the handler's [`review`](PermissionHandler::review) step,
+/// which the terminal runs before it asks `inner` anything: the first
+/// reviewer to approve grants the request without reaching `inner`, the first
+/// to deny refuses it, and a request every reviewer passes goes to `inner`
+/// unchanged, including its wait query. A command that needs a mode beyond
+/// the sandbox and a network domain that `inner` would have to ask about are
+/// both reviewed; a domain `inner` allows silently is not, and a domain a
+/// reviewer approves is remembered by `inner` as if its user had approved it.
+/// A subagent's terminal gets [`for_subagent`](PermissionHandler::for_subagent),
+/// the same reviewers labelled with the subagent role, over the same `inner`
+/// route.
 ///
-/// Reviewers run through a [`HookRunner`] like every other hook, so they find
-/// the terminal's prepared baseline tools on their `PATH`.
+/// The reviewers are those of the [`ExternalHooks`] scope the handler is made
+/// with, so they follow the host's live changes like every other hook.
 #[derive(Debug)]
 pub struct ReviewedPermission<P> {
     inner: Arc<P>,
-    chain: Arc<ReviewerChain>,
-    runner: Arc<HookRunner>,
-    role: HookRole,
+    hooks: ExternalHooks,
 }
 
 impl<P> ReviewedPermission<P> {
-    /// The main agent's handler: `chain` in front of `inner`, its reviewers
-    /// run by `runner`.
+    /// The main agent's handler: the reviewers of `hooks` in front of
+    /// `inner`.
     #[must_use]
-    pub fn new(inner: P, chain: ReviewerChain, runner: HookRunner) -> Self {
+    pub fn new(inner: P, hooks: ExternalHooks) -> Self {
         Self {
             inner: Arc::new(inner),
-            chain: Arc::new(chain),
-            runner: Arc::new(runner),
-            role: HookRole::Main,
+            hooks,
         }
     }
 }
@@ -148,15 +146,7 @@ impl<P> ReviewedPermission<P> {
 impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P> {
     /// Runs the chain; the first reviewer to decide ends it.
     async fn review(&self, request: &PermissionRequest<'_>) -> Review {
-        self.chain
-            .review(
-                &self.runner,
-                &ReviewRequest {
-                    role: self.role,
-                    request: *request,
-                },
-            )
-            .await
+        self.hooks.review(*request).await
     }
 
     async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
@@ -174,9 +164,7 @@ impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P>
     fn for_subagent(&self) -> Option<Self> {
         Some(Self {
             inner: Arc::clone(&self.inner),
-            chain: Arc::clone(&self.chain),
-            runner: Arc::clone(&self.runner),
-            role: HookRole::Subagent,
+            hooks: self.hooks.for_subagent(),
         })
     }
 

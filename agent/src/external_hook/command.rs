@@ -5,7 +5,8 @@ use askama::Template;
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::ExternalHooks;
-use super::runner::{HookCommand, HookRole, HookRunError};
+use super::live::Run;
+use super::runner::{HookCommand, HookRole};
 
 /// A command hook as the host configures it.
 ///
@@ -73,33 +74,30 @@ struct FailedTemplate<'a> {
 }
 
 impl CommandHookConfig {
-    /// The gate's decision for this hook's answer; a hook that gave no valid
-    /// answer blocks, with a reason naming the failure.
-    fn decide(&self, answer: Result<Option<CommandHookOutput>, HookRunError>) -> GateDecision {
+    /// The gate's decision for this hook's answer.
+    fn decide(&self, answer: Run<CommandHookOutput>) -> GateDecision {
         let blocked = |reason: askama::Result<String>| GateDecision::Block {
             reason: reason.expect("command hook templates must render"),
         };
-        let failed = |failure: &str| {
-            tracing::warn!(hook = %self.name, %failure, "command hook failed; the command is blocked");
-            blocked(
-                FailedTemplate {
-                    hook: &self.name,
-                    failure,
-                }
-                .render(),
-            )
-        };
         match answer {
-            Ok(Some(CommandHookOutput::Allow {})) => GateDecision::Allow,
-            Ok(Some(CommandHookOutput::Block { reason })) => blocked(
+            Run::Answered(CommandHookOutput::Allow {}) | Run::Gone => GateDecision::Allow,
+            Run::Answered(CommandHookOutput::Block { reason }) => blocked(
                 BlockedTemplate {
                     hook: &self.name,
                     reason: &reason,
                 }
                 .render(),
             ),
-            Ok(None) => failed("it printed no answer"),
-            Err(error) => failed(&error.to_string()),
+            Run::Failed(failure) => {
+                tracing::warn!(hook = %self.name, %failure, "command hook failed; the command is blocked");
+                blocked(
+                    FailedTemplate {
+                        hook: &self.name,
+                        failure: &failure,
+                    }
+                    .render(),
+                )
+            }
         }
     }
 }
@@ -109,23 +107,34 @@ impl ExternalHooks {
     /// any hook blocks it or fails.
     ///
     /// A hook that cannot run, runs past its deadline, exits unsuccessfully or
-    /// prints nothing or an invalid answer blocks the command with a reason
-    /// naming the failure: a gate that cannot answer lets nothing through.
-    /// Of several blocking hooks the first configured one is reported.
+    /// prints nothing or an invalid answer is replaced by its previous version
+    /// when it has one (see [`LiveHooks`](super::LiveHooks)); when no working
+    /// version is left, the user is asked to fix it and the command waits, or
+    /// is blocked with a reason naming the failure if the user cannot be
+    /// asked: a gate that cannot answer lets nothing through. Of several
+    /// blocking hooks the first configured one is reported.
     pub async fn check_command(&self, command: &str) -> GateDecision {
         let input = CommandHookInput {
             event: CommandHookEvent::BeforeCommand,
             role: self.role(),
             command,
         };
-        let runs = self.command_hooks().iter().map(|hook| {
+        let set = self.live().set();
+        let runs = set.command.iter().map(|hook| {
             let input = &input;
             async move {
                 let answer = self
-                    .runner()
-                    .run::<_, CommandHookOutput>(&hook.command, input)
+                    .live()
+                    .run_hook(
+                        self.user(),
+                        hook,
+                        input,
+                        |answer: Option<CommandHookOutput>| {
+                            answer.ok_or_else(|| "it printed no answer".to_string())
+                        },
+                    )
                     .await;
-                hook.decide(answer)
+                hook.config.decide(answer)
             }
         });
         futures::future::join_all(runs)

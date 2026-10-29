@@ -122,16 +122,23 @@ async fn terminal(
         .initialize_tools(&tools.distribution, tools.cache.path())
         .await
         .expect("the managed tools are prepared");
+    let host_tools = terminal
+        .shell_sessions()
+        .host_tools(&tools.distribution, tools.cache.path())
+        .await
+        .expect("the host tools are prepared");
     let hooks = ExternalHooks::new(
-        Vec::new(),
-        executor_core::AnyExecutor::new(TokioGlobal),
-        &terminal
-            .shell_sessions()
-            .host_tools(&tools.distribution, tools.cache.path())
-            .await
-            .expect("the host tools are prepared"),
-    )
-    .with_command_hooks(command_hooks);
+        &LiveHooks::start(
+            HooksConfig {
+                command: command_hooks,
+                ..HooksConfig::default()
+            },
+            &host_tools,
+            executor_core::AnyExecutor::new(TokioGlobal),
+        )
+        .await
+        .expect("the hooks start"),
+    );
     let mut builder = ToolRegistryBuilder::new();
     builder.gate_commands(hooks.command_gate());
     let registry = Arc::new(builder.build(terminal.outputs_dir()));

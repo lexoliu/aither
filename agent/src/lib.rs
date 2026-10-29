@@ -98,7 +98,8 @@ pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindow
 pub use error::AgentError;
 pub use event::{AgentEvent, TimedEvent};
 pub use external_hook::{
-    ExternalHooks, LifecycleHookConfig, ReviewedPermission, ReviewerChain, ReviewerConfig,
+    ExternalHooks, HookTestTool, HooksConfig, LifecycleHookConfig, LiveHooks, ReviewedPermission,
+    ReviewerConfig,
 };
 pub use fork::{ForkSnapshot, ForkSource};
 pub use hook::{

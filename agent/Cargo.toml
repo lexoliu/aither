@@ -33,6 +33,8 @@ async-channel = "2"
 async-io = "2"
 async-process = "2"
 arc-swap = "1"
+blocking = { version = "1.7.0", default-features = false }
+notify = { version = "8.2", default-features = false, features = ["macos_fsevent"] }
 event-listener = "5"
 aither-websearch = { workspace = true, optional = true }
 aither-webfetch = { workspace = true, optional = true }
