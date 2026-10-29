@@ -83,8 +83,8 @@ pub use config::{AgentConfig, AgentKind};
 pub use context::ActiveSkills;
 pub use context::{
     AnyContextSource, BackgroundJobs, Block, CompactionError, CompletedCompaction, Context,
-    ContextBudget, ContextCheckpoint, ContextItem, ContextPolicy, ContextSource, HandoffDocument,
-    PromptCache, ReassemblyReport, TasksDocument,
+    ContextBudget, ContextCheckpoint, ContextItem, ContextPolicy, ContextSource, Handoff,
+    HandoffDocument, PromptCache, ReassemblyReport, TasksDocument,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;

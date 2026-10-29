@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use aither_core::llm::{Message, Role};
 
-use super::compaction::HandoffDocument;
+use super::compaction::{Handoff, HandoffDocument};
 use super::source::Block;
 
 #[derive(Serialize)]
@@ -106,7 +106,7 @@ pub struct Context {
     /// Compaction handoff document from the previous compaction.
     ///
     /// Rendered immediately after the stable system prefix.
-    handoff: Option<String>,
+    handoff: Option<Handoff>,
 
     /// Append-only conversation items.
     items: Vec<ContextItem>,
@@ -259,13 +259,12 @@ impl Context {
 
     /// Sets or replaces the compaction handoff document.
     pub fn set_handoff(&mut self, handoff: impl Into<String>) {
-        let handoff = handoff.into();
-        self.handoff = Some(serialize_xml("handoff", &TextBlock { content: &handoff }));
+        self.handoff = Some(Handoff::Text(handoff.into()));
     }
 
     /// Sets the compaction handoff document from a structured artifact.
     pub fn set_handoff_document(&mut self, handoff: &HandoffDocument) {
-        self.handoff = Some(serialize_xml("handoff", handoff));
+        self.handoff = Some(Handoff::Document(handoff.clone()));
     }
 
     /// Clears the compaction handoff document.
@@ -275,8 +274,14 @@ impl Context {
 
     /// Returns the current compaction handoff document.
     #[must_use]
-    pub fn handoff(&self) -> Option<&str> {
-        self.handoff.as_deref()
+    pub fn handoff(&self) -> Option<&Handoff> {
+        self.handoff.as_ref()
+    }
+
+    /// The file index of the current handoff, empty when there is none.
+    #[must_use]
+    pub fn handoff_file_index(&self) -> &[String] {
+        self.handoff.as_ref().map_or(&[], Handoff::file_index)
     }
 
     // ── Conversation ──────────────────────────────────────────────────
@@ -413,7 +418,7 @@ impl Context {
         }
 
         if let Some(handoff) = &self.handoff {
-            messages.push(Message::system(handoff));
+            messages.push(Message::system(handoff.to_xml()));
         }
 
         messages.extend(self.items.iter().map(|item| item.message.clone()));
@@ -442,7 +447,10 @@ impl Context {
             .values()
             .map(|content| content.len() + 1)
             .sum();
-        let handoff = self.handoff.as_ref().map_or(0, String::len);
+        let handoff = self
+            .handoff
+            .as_ref()
+            .map_or(0, |handoff| handoff.to_xml().len());
         blocks + handoff
     }
 
@@ -688,7 +696,7 @@ impl ReassemblyReport {
 /// A snapshot of non-persistent context state that can be restored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCheckpoint {
-    handoff: Option<String>,
+    handoff: Option<Handoff>,
     items: Vec<ContextItem>,
     #[serde(default)]
     next_seq: u64,
@@ -697,7 +705,7 @@ pub struct ContextCheckpoint {
 impl ContextCheckpoint {
     /// Creates a structured runtime checkpoint.
     #[must_use]
-    pub fn new(handoff: Option<String>, items: Vec<ContextItem>) -> Self {
+    pub fn new(handoff: Option<Handoff>, items: Vec<ContextItem>) -> Self {
         let next_seq = items.last().map_or(0, |item| item.seq + 1);
         Self {
             handoff,
@@ -714,8 +722,8 @@ impl ContextCheckpoint {
 
     /// Returns the handoff document, if present.
     #[must_use]
-    pub fn handoff(&self) -> Option<&str> {
-        self.handoff.as_deref()
+    pub fn handoff(&self) -> Option<&Handoff> {
+        self.handoff.as_ref()
     }
 
     /// Returns the checkpointed conversation items.
@@ -728,6 +736,17 @@ impl ContextCheckpoint {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.handoff.is_none() && self.items.is_empty()
+    }
+}
+
+impl Handoff {
+    /// Renders this handoff as the system message body of a request.
+    #[must_use]
+    pub fn to_xml(&self) -> String {
+        match self {
+            Self::Text(text) => serialize_xml("handoff", &TextBlock { content: text }),
+            Self::Document(document) => serialize_xml("handoff", document),
+        }
     }
 }
 
@@ -910,7 +929,11 @@ mod tests {
 
         assert_eq!(context.len_recent(), 1);
         assert_eq!(context.recent()[0].content(), "new request");
-        assert!(context.handoff().is_some_and(|text| text.contains("task")));
+        assert!(
+            context
+                .handoff()
+                .is_some_and(|handoff| handoff.to_xml().contains("task"))
+        );
     }
 
     #[test]
