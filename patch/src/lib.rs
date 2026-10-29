@@ -2,7 +2,7 @@
 //!
 //! The crate applies the compact contextual patch format (`*** Begin Patch` …
 //! `*** End Patch`) used by terminal-first agents. Parsing and hunk matching
-//! reuse the `zenpatch` crate; file-level semantics — literal path resolution,
+//! are implemented here; file-level semantics — literal path resolution,
 //! unconditional deletes, moves, mode preservation, and all-or-nothing
 //! validation — live here so the executable stays a pure filesystem utility.
 //!
@@ -11,18 +11,17 @@
 //! and no privileged helper.
 
 mod error;
+mod matcher;
+mod parse;
 
-use std::{collections::HashMap, fs, io, path::Path};
-
-use zenpatch::{
-    applier::{
-        backtracking_patcher::apply_patch_backtracking_mode, whitespace_mode::WhitespaceMode,
-    },
-    data::{action_type::ActionType, patch_action::PatchAction},
-    error::ZenpatchError,
-    parser::text_to_patch::text_to_patch,
-    vfs::Vfs,
+use std::{
+    collections::{HashMap, HashSet},
+    fs, io,
+    path::Path,
 };
+
+use matcher::{Whitespace, apply_hunks};
+use parse::{Action, parse};
 
 pub use error::PatchError;
 
@@ -82,51 +81,45 @@ pub fn apply_patch_text(patch: &str, base: &Path) -> Result<Vec<FileOutcome>, Pa
     if patch.trim().is_empty() {
         return Err(PatchError::EmptyInput);
     }
-    let actions = text_to_patch(patch)?;
-    if actions.is_empty() {
-        return Err(ZenpatchError::InvalidPatchFormat(
-            "patch contains no file operations".to_owned(),
-        )
-        .into());
-    }
+    let actions = parse(patch)?;
 
-    // Read every file the patch touches up front. VFS keys are the literal
-    // patch paths, so a hunk can only ever land on the file it names.
-    let mut vfs = Vfs::new();
+    // Read every file the patch touches up front. Keys are the literal patch
+    // paths, so a hunk can only ever land on the file it names.
+    let mut files: HashMap<String, String> = HashMap::new();
     let mut modes: HashMap<String, fs::Permissions> = HashMap::new();
-    // Paths an earlier action produces on the VFS: an Update or Delete that
+    // Paths an earlier action produces in memory: an Update or Delete that
     // follows them must not read the disk, and their existence check must
     // defer to the in-memory result.
-    let mut produced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut produced: HashSet<String> = HashSet::new();
     for action in &actions {
-        match action.type_ {
-            ActionType::Add => {
-                if !produced.contains(&action.path) {
-                    ensure_absent(base, &action.path)?;
+        match action {
+            Action::Add { path, .. } => {
+                if !produced.contains(path) {
+                    ensure_absent(base, path)?;
                 }
-                produced.insert(action.path.clone());
+                produced.insert(path.clone());
             }
-            ActionType::Update => {
-                if !produced.contains(&action.path) {
-                    load_file(base, &action.path, &mut vfs, &mut modes)?;
+            Action::Update { path, new_path, .. } => {
+                if !produced.contains(path) {
+                    load_file(base, path, &mut files, &mut modes)?;
+                }
+                if let Some(new_path) = new_path {
+                    ensure_absent(base, new_path)?;
+                    produced.insert(new_path.clone());
                 }
             }
-            ActionType::Delete => {
-                if !produced.contains(&action.path) {
-                    load_file(base, &action.path, &mut vfs, &mut modes)?;
+            Action::Delete { path, .. } => {
+                if !produced.contains(path) {
+                    load_file(base, path, &mut files, &mut modes)?;
                 }
-                produced.remove(&action.path);
+                produced.remove(path);
             }
-        }
-        if let Some(new_path) = &action.new_path {
-            ensure_absent(base, new_path)?;
-            produced.insert(new_path.clone());
         }
     }
 
     // Validate every hunk in memory first; nothing is written unless the whole
     // patch applies cleanly.
-    let patched = apply_actions(&actions, &vfs)?;
+    let patched = apply_actions(&actions, &files)?;
     let outcomes = file_outcomes(&actions);
     commit(base, &patched, &modes, &outcomes)?;
     Ok(outcomes)
@@ -144,7 +137,7 @@ fn ensure_absent(base: &Path, path: &str) -> Result<(), PatchError> {
     }
 }
 
-/// Reads `path` into the VFS and remembers its mode for later restores.
+/// Reads `path` into `files` and remembers its mode for later restores.
 ///
 /// `fs::metadata`/`fs::read` follow symlinks, so patching a symlink updates
 /// its target — the same behavior `sed -i` style editors exhibit when they
@@ -152,10 +145,10 @@ fn ensure_absent(base: &Path, path: &str) -> Result<(), PatchError> {
 fn load_file(
     base: &Path,
     path: &str,
-    vfs: &mut Vfs,
+    files: &mut HashMap<String, String>,
     modes: &mut HashMap<String, fs::Permissions>,
 ) -> Result<(), PatchError> {
-    if vfs.contains_key(path) {
+    if files.contains_key(path) {
         return Ok(());
     }
     let full = base.join(path);
@@ -174,87 +167,72 @@ fn load_file(
         source,
     })?;
     let content = String::from_utf8(bytes).map_err(|_| PatchError::NotUtf8(path.to_owned()))?;
-    vfs.insert(path.to_owned(), content);
+    files.insert(path.to_owned(), content);
     modes.insert(path.to_owned(), meta.permissions());
     Ok(())
 }
 
-/// Runs every action against an in-memory copy of the VFS.
+/// Runs every action against an in-memory copy of the files.
 ///
-/// Add and Delete semantics are owned here rather than delegated: a bare
-/// `*** Delete File:` directive removes the file unconditionally, and every
-/// key is the literal patch path with no suffix-match redirection. Update
-/// hunks go through `zenpatch`'s backtracking matcher — strict whitespace
-/// first, lenient on conflict — which counts possible solutions and fails on
-/// ambiguity instead of silently picking an occurrence.
-fn apply_actions(actions: &[PatchAction], vfs: &Vfs) -> Result<Vfs, PatchError> {
-    let mut out = vfs.clone();
+/// Add and Delete semantics live here: a bare `*** Delete File:` directive
+/// removes the file unconditionally, and every key is the literal patch path.
+/// Update hunks are matched strictly first and leniently on failure; a hunk
+/// matching more than one place is an error rather than a guess.
+fn apply_actions(
+    actions: &[Action],
+    files: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, PatchError> {
+    let mut out = files.clone();
     for action in actions {
-        match action.type_ {
-            ActionType::Add => {
-                if out.contains_key(&action.path) {
-                    return Err(ZenpatchError::FileExists(action.path.clone()).into());
+        match action {
+            Action::Add { path, lines } => {
+                if out.contains_key(path) {
+                    return Err(PatchError::AlreadyExists(path.clone()));
                 }
                 let mut content = String::new();
-                for line in action.chunks.iter().flat_map(|chunk| &chunk.ins_lines) {
+                for line in lines {
                     content.push_str(line);
                     content.push('\n');
                 }
-                out.insert(action.path.clone(), content);
+                out.insert(path.clone(), content);
             }
-            ActionType::Delete => {
+            Action::Delete { path, expected } => {
                 let existing = out
-                    .get(&action.path)
-                    .ok_or_else(|| ZenpatchError::FileNotFound(action.path.clone()))?;
+                    .get(path)
+                    .ok_or_else(|| PatchError::FileNotFound(path.clone()))?;
                 // Content lines under a Delete directive are a safety check:
                 // they must reproduce the file exactly when present.
-                let expected: Vec<String> = action
-                    .chunks
-                    .iter()
-                    .flat_map(|chunk| chunk.del_lines.clone())
-                    .collect();
-                if !expected.is_empty()
-                    && expected != existing.lines().map(String::from).collect::<Vec<_>>()
+                if !expected.is_empty() && !expected.iter().map(String::as_str).eq(existing.lines())
                 {
-                    return Err(ZenpatchError::PatchConflict(format!(
-                        "in {}: content to delete does not match the file's content",
-                        action.path
-                    ))
-                    .into());
+                    return Err(PatchError::DeleteMismatch(path.clone()));
                 }
-                out.remove(&action.path);
+                out.remove(path);
             }
-            ActionType::Update => {
+            Action::Update {
+                path,
+                new_path,
+                hunks,
+            } => {
                 let original = out
-                    .get(&action.path)
-                    .ok_or_else(|| ZenpatchError::FileNotFound(action.path.clone()))?
+                    .get(path)
+                    .ok_or_else(|| PatchError::FileNotFound(path.clone()))?
                     .clone();
-                let original_lines: Vec<String> = original.lines().map(String::from).collect();
-                let applied = match apply_patch_backtracking_mode(
-                    &original_lines,
-                    &action.chunks,
-                    WhitespaceMode::Strict,
-                ) {
-                    Err(ZenpatchError::PatchConflict(_) | ZenpatchError::AmbiguousPatch(_)) => {
-                        apply_patch_backtracking_mode(
-                            &original_lines,
-                            &action.chunks,
-                            WhitespaceMode::Lenient,
-                        )
-                        .map_err(|error| error.with_path(&action.path))?
+                let lines: Vec<String> = original.lines().map(String::from).collect();
+                let applied = match apply_hunks(path, &lines, hunks, Whitespace::Strict) {
+                    Err(PatchError::Conflict { .. } | PatchError::Ambiguous { .. }) => {
+                        apply_hunks(path, &lines, hunks, Whitespace::Lenient)?
                     }
-                    Ok(lines) => lines,
-                    Err(error) => return Err(error.with_path(&action.path).into()),
+                    other => other?,
                 };
                 let updated = rejoin(&original, &applied);
-                if let Some(new_path) = &action.new_path {
+                if let Some(new_path) = new_path {
                     if out.contains_key(new_path) {
-                        return Err(ZenpatchError::FileExists(new_path.clone()).into());
+                        return Err(PatchError::AlreadyExists(new_path.clone()));
                     }
-                    out.remove(&action.path);
+                    out.remove(path);
                     out.insert(new_path.clone(), updated);
                 } else {
-                    out.insert(action.path.clone(), updated);
+                    out.insert(path.clone(), updated);
                 }
             }
         }
@@ -263,16 +241,16 @@ fn apply_actions(actions: &[PatchAction], vfs: &Vfs) -> Result<Vfs, PatchError> 
 }
 
 /// Maps each action to the change it reports on success.
-fn file_outcomes(actions: &[PatchAction]) -> Vec<FileOutcome> {
+fn file_outcomes(actions: &[Action]) -> Vec<FileOutcome> {
     actions
         .iter()
-        .map(|action| match action.type_ {
-            ActionType::Add => FileOutcome::Added(action.path.clone()),
-            ActionType::Delete => FileOutcome::Deleted(action.path.clone()),
-            ActionType::Update => action.new_path.as_ref().map_or_else(
-                || FileOutcome::Modified(action.path.clone()),
+        .map(|action| match action {
+            Action::Add { path, .. } => FileOutcome::Added(path.clone()),
+            Action::Delete { path, .. } => FileOutcome::Deleted(path.clone()),
+            Action::Update { path, new_path, .. } => new_path.as_ref().map_or_else(
+                || FileOutcome::Modified(path.clone()),
                 |to| FileOutcome::Renamed {
-                    from: action.path.clone(),
+                    from: path.clone(),
                     to: to.clone(),
                 },
             ),
@@ -280,7 +258,7 @@ fn file_outcomes(actions: &[PatchAction]) -> Vec<FileOutcome> {
         .collect()
 }
 
-/// Writes the validated VFS diff to disk.
+/// Writes the validated results to disk.
 ///
 /// Reached only after every hunk applied in memory. Update writes truncate in
 /// place, which keeps the existing mode; moves restore the original file's
@@ -288,7 +266,7 @@ fn file_outcomes(actions: &[PatchAction]) -> Vec<FileOutcome> {
 /// drops the link, not its target).
 fn commit(
     base: &Path,
-    patched: &Vfs,
+    patched: &HashMap<String, String>,
     modes: &HashMap<String, fs::Permissions>,
     outcomes: &[FileOutcome],
 ) -> Result<(), PatchError> {

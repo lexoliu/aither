@@ -1,0 +1,269 @@
+*** Begin Patch
+*** Update File: evaluator/evaluator.go
+@@
+ func evalIndexExpression(node *ast.IndexExpression, env *object.Environment) object.Object {
+ 	tok := node.Token
+ 	left := Eval(node.Left, env)
+ 	if isError(left) {
+ 		return left
+ 	}
+ 	index := Eval(node.Index, env)
+ 	if isError(index) {
+ 		return index
+ 	}
+ 	end := Eval(node.End, env)
+ 	if isError(end) {
+ 		return end
+ 	}
++	step := Eval(node.Step, env)
++	if isError(step) {
++		return step
++	}
+ 
+ 	switch {
+ 	case left.Type() == object.ARRAY_OBJ && index.Type() == object.NUMBER_OBJ:
+-		return evalArrayIndexExpression(tok, left, index, end, node.IsRange)
++		return evalArrayIndexExpression(tok, left, index, end, step, node.IsRange)
+ 	case left.Type() == object.HASH_OBJ && index.Type() == object.STRING_OBJ:
+ 		return evalHashIndexExpression(tok, left, index)
+ 	case left.Type() == object.STRING_OBJ && index.Type() == object.NUMBER_OBJ:
+-		return evalStringIndexExpression(tok, left, index, end, node.IsRange)
++		return evalStringIndexExpression(tok, left, index, end, step, node.IsRange)
+ 	default:
+ 		return newError(tok, "index operator not supported: %s on %s", index.Inspect(), left.Type())
+ 	}
+ }
+ 
+-func evalStringIndexExpression(tok token.Token, array, index object.Object, end object.Object, isRange bool) object.Object {
+-	// TODO this gotta be refactored so that
+-	// evalStringIndexExpression and evalArrayIndexExpression
+-	// reuse most of their code, now it's a bit messy as
+-	// the code is duplicated in both places
+-	stringObject := array.(*object.String)
+-	idx := index.(*object.Number).Int()
+-	max := len(stringObject.Value) - 1
++// resolveSliceEnd computes the boundary index for a stepped
++// slice (in the style of [start:end:step]):
++//
++// - step > 0: end is the exclusive upper bound ([start, end))
++// - step < 0: end is the exclusive lower bound ((end, start]),
++//   so the returned value represents the lowest index to scan.
++func resolveSliceEnd(tok token.Token, end object.Object, length int, step int) (int, object.Object) {
++	// no end specified: we iterate over all the remaining
++	// elements in the direction of the step
++	if end == nil || end == NULL {
++		if step > 0 {
++			return length, nil
++		}
++
++		return 0, nil
++	}
++
++	endNum, ok := end.(*object.Number)
++
++	// if the end index is not a number nor null, then we have an error
++	// (null would mean no end, so it's valid)
++	if !ok {
++		return 0, newError(tok, `index ranges can only be numerical: got "%s" (type %s)`, end.Inspect(), end.Type())
++	}
++
++	if step > 0 {
++		// negative ends are relative to the end of the list
++		max := endNum.Int()
++		if max < 0 {
++			max = int(math.Max(float64(length+max), 0))
++		} else if max > length {
++			max = length
++		}
++
++		return max, nil
++	}
++
++	// backwards iteration: negative ends are relative to the end
++	// of the list, and we stop right after reaching them
++	min := endNum.Int()
++	if min < 0 {
++		min = int(math.Max(float64(length+min), 0))
++	} else if min > length-1 {
++		min = length - 1
++	}
++
++	return min, nil
++}
++
++// sliceIndexes returns the list of indexes selected by
++// a range ([start:end] or [start:end:step]) over a list
++// of the given length.
++//
++// The third element returned is an error object, in case
++// the range could not be resolved (eg. non-numerical end).
++func sliceIndexes(tok token.Token, index, end, step object.Object, length int) ([]int, object.Object) {
++	idx := index.(*object.Number).Int()
++	stepNum := 1
++
++	// if a step was specified, it has to be a number
++	if step != nil && step != NULL {
++		stepInt, ok := step.(*object.Number)
++		if !ok {
++			return nil, newError(tok, `index ranges can only be numerical: got "%s" (type %s)`, step.Inspect(), step.Type())
++		}
++
++		stepNum = stepInt.Int()
++		if stepNum == 0 {
++			return nil, newError(tok, "slice step cannot be 0")
++		}
++	}
++
++	// A range's minimum value is 0:
++	// negative starts count backwards from the first
++	// index, which is equivalent to starting at 0
++	if idx < 0 {
++		idx = 0
++	}
++
++	max, errObj := resolveSliceEnd(tok, end, length, stepNum)
++	if errObj != nil {
++		return nil, errObj
++	}
++
++	// when moving forwards, the range only selects
++	// indexes between start (inclusive) and end (exclusive),
++	// while when moving backwards it selects indexes
++	// between start (inclusive) and end (inclusive)
++	indexes := []int{}
++	if stepNum > 0 {
++		for i := idx; i < max && i < length; i += stepNum {
++			indexes = append(indexes, i)
++		}
++	} else {
++		for i := idx; i >= max && i >= 0; i += stepNum {
++			indexes = append(indexes, i)
++		}
++	}
++
++	return indexes, nil
++}
++
++func evalStringIndexExpression(tok token.Token, array, index object.Object, end, step object.Object, isRange bool) object.Object {
++	// TODO this gotta be refactored so that
++	// evalStringIndexExpression and evalArrayIndexExpression
++	// reuse most of their code, now it's a bit messy as
++	// the code is duplicated in both places
++	stringObject := array.(*object.String)
++	idx := index.(*object.Number).Int()
++	runes := []rune(stringObject.Value)
++	max := len(runes) - 1
+ 
+ 	if isRange {
+-		max++
+-		// A range's minimum value is 0
+-		if idx < 0 {
+-			idx = 0
+-		}
+-		endIdx, ok := end.(*object.Number)
+-
+-		// check if the range end is a number
+-		if ok {
+-			// if it's lower than zero, then the end is len(x) - end,
+-			// else it's the end value itself
+-			if endIdx.Int() < 0 {
+-				max = int(math.Max(float64(max+endIdx.Int()), 0))
+-			} else if endIdx.Int() < max {
+-				max = endIdx.Int()
+-			}
+-		} else if end != NULL {
+-			// if the end index is not a number nor null, then we have an error
+-			// (null would mean no end, so it's valid)
+-			return newError(tok, `index ranges can only be numerical: got "%s" (type %s)`, end.Inspect(), end.Type())
+-		}
+-
+-		// if the start is higher than the end, let's return
+-		// a skeleton
+-		if idx > max {
+-			return &object.String{Token: tok, Value: ""}
+-		}
+-
+-		return &object.String{Token: tok, Value: string(stringObject.Value[idx:max])}
++		indexes, errObj := sliceIndexes(tok, index, end, step, len(runes))
++		if errObj != nil {
++			return errObj
++		}
++
++		// select the characters at the given indexes,
++		// in the order they were scanned
++		chars := make([]rune, 0, len(indexes))
++		for _, i := range indexes {
++			chars = append(chars, runes[i])
++		}
++
++		return &object.String{Token: tok, Value: string(chars)}
+ 	}
+ 
+ 	// Out of bounds? Return an empty string
+ 	if idx > max {
+ 		return &object.String{Token: tok, Value: ""}
+ 	}
+@@
+ 		// Our index was negative, so the actual index is length of the string + the index
+ 		// eg 3 + (-2) = 1
+ 		// "123"[-2]   = "2"
+ 		idx = length + idx
+ 	}
+ 
+-	return &object.String{Token: tok, Value: string(stringObject.Value[idx])}
++	return &object.String{Token: tok, Value: string(runes[idx])}
+ }
+ 
+-func evalArrayIndexExpression(tok token.Token, array, index object.Object, end object.Object, isRange bool) object.Object {
++func evalArrayIndexExpression(tok token.Token, array, index object.Object, end, step object.Object, isRange bool) object.Object {
+ 	arrayObject := array.(*object.Array)
+ 	idx := index.(*object.Number).Int()
+ 	max := len(arrayObject.Elements) - 1
+ 
+ 	if isRange {
+-		max++
+-		// A range's minimum value is 0
+-		if idx < 0 {
+-			idx = 0
+-		}
+-		endIdx, ok := end.(*object.Number)
+-
+-		// check if the range end is a number
+-		if ok {
+-			// if it's lower than zero, then the end is len(x) - end,
+-			// else it's the end value itself
+-			if endIdx.Int() < 0 {
+-				max = int(math.Max(float64(max+endIdx.Int()), 0))
+-			} else if endIdx.Int() < max {
+-				max = endIdx.Int()
+-			}
+-		} else if end != NULL {
+-			// if the end index is not a number nor null, then we have an error
+-			// (null would mean no end, so it's valid)
+-			return newError(tok, `index ranges can only be numerical: got "%s" (type %s)`, end.Inspect(), end.Type())
+-		}
+-
+-		// if the start is higher than the end, let's return
+-		// a skeleton
+-		if idx > max {
+-			return &object.Array{Token: tok, Elements: []object.Object{}}
+-		}
+-
+-		return &object.Array{Token: tok, Elements: arrayObject.Elements[idx:max]}
++		indexes, errObj := sliceIndexes(tok, index, end, step, len(arrayObject.Elements))
++		if errObj != nil {
++			return errObj
++		}
++
++		// select the elements at the given indexes,
++		// in the order they were scanned
++		elements := make([]object.Object, 0, len(indexes))
++		for _, i := range indexes {
++			elements = append(elements, arrayObject.Elements[i])
++		}
++
++		return &object.Array{Token: tok, Elements: elements}
+ 	}
+ 
+ 	// Out of bounds? Return a null element
+*** End Patch

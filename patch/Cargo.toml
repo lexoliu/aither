@@ -13,7 +13,6 @@ keywords = ["patch", "diff", "sandbox", "agent", "tooling"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-zenpatch = "0.5.2"
 thiserror = "2"
 
 [[bin]]
