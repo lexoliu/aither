@@ -7,6 +7,8 @@
 //! second knob, no per-level strategy and no preservation config: a single
 //! policy keeps the behaviour predictable and the prompt cache analysable.
 
+use std::time::Duration;
+
 /// Thresholds that govern context compaction and pausing.
 ///
 /// Fractions are of the calibrated context window
@@ -43,6 +45,15 @@ pub struct ContextPolicy {
     /// handoff names. This caps that restoration so a handoff cannot
     /// reintroduce the pressure it was supposed to relieve.
     pub restore_budget: f32,
+
+    /// How long before the cache lifetime ends an idle session is compacted.
+    ///
+    /// The compaction then reads the conversation from the warm cache, and
+    /// the session resumes on a much smaller prefix instead of paying to write
+    /// the whole context again. Counted back from the end of the
+    /// conversation's [`CacheLifetime`](super::CacheLifetime): six minutes
+    /// compacts at 54 minutes under a one-hour lifetime.
+    pub idle_compact_before_expiry: Duration,
 }
 
 impl Default for ContextPolicy {
@@ -51,6 +62,7 @@ impl Default for ContextPolicy {
             compact_at: 0.6,
             pause_at: 0.9,
             restore_budget: 0.15,
+            idle_compact_before_expiry: Duration::from_secs(6 * 60),
         }
     }
 }

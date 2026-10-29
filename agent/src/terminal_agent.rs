@@ -812,6 +812,15 @@ where
             .await
     }
 
+    /// Sets the model compaction runs on, instead of the session's own.
+    ///
+    /// See [`AgentBuilder::compaction_model`].
+    #[must_use]
+    pub fn compaction_model(mut self, model: LLM) -> Self {
+        self.inner = self.inner.compaction_model(model);
+        self
+    }
+
     /// Sets the maximum number of iterations.
     #[must_use]
     pub fn max_iterations(mut self, limit: usize) -> Self {
