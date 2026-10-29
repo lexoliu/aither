@@ -990,6 +990,160 @@ mod tests {
             fn feed(&mut self, bytes: &[u8]) {
                 self.input.write_all(bytes).expect("feed stdin");
             }
+
+            /// What `/proc` shows of the job's tree, for a failure message.
+            #[cfg(target_os = "linux")]
+            fn dump(&self) -> String {
+                use std::os::unix::fs::MetadataExt;
+                proc_dump::render(
+                    self.child.id(),
+                    self.input.metadata().ok().map(|meta| meta.ino()),
+                )
+            }
+
+            /// The dump is Linux-only; other platforms report the probe alone.
+            #[cfg(not(target_os = "linux"))]
+            #[allow(clippy::unused_self)]
+            fn dump(&self) -> String {
+                String::from("(no /proc on this platform)")
+            }
+        }
+
+        /// A rendering of a job's process tree from `/proc`, so a probe that
+        /// finds no reader says what the probe could see.
+        #[cfg(target_os = "linux")]
+        mod proc_dump {
+            use std::{fmt::Write as _, fs, io, path::Path};
+
+            /// `read_to_string` of `path`, trimmed, or the error as `<EACCES>`.
+            fn text(path: impl AsRef<Path>) -> String {
+                match fs::read_to_string(path) {
+                    Ok(text) => text.trim().to_owned(),
+                    Err(error) => failure(&error),
+                }
+            }
+
+            fn failure(error: &io::Error) -> String {
+                error.raw_os_error().map_or_else(
+                    || format!("<{:?}>", error.kind()),
+                    |errno| format!("<{}>", errno_name(errno)),
+                )
+            }
+
+            fn errno_name(errno: i32) -> String {
+                match errno {
+                    libc::EACCES => "EACCES".to_owned(),
+                    libc::EPERM => "EPERM".to_owned(),
+                    libc::ENOENT => "ENOENT".to_owned(),
+                    libc::ESRCH => "ESRCH".to_owned(),
+                    libc::EIO => "EIO".to_owned(),
+                    other => format!("errno {other}"),
+                }
+            }
+
+            /// The state letter of `/proc/.../stat`, after the `(comm)` field.
+            fn state_of(stat: &str) -> String {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .map_or_else(|| stat.to_owned(), str::to_owned)
+            }
+
+            /// The lines of `fdinfo` starting with one of `keys`, on one line.
+            fn fdinfo(path: &Path, keys: &[&str]) -> String {
+                match fs::read_to_string(path) {
+                    Ok(info) => info
+                        .lines()
+                        .filter(|line| keys.iter().any(|key| line.starts_with(key)))
+                        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    Err(error) => failure(&error),
+                }
+            }
+
+            /// The tree rooted at `root`, with the job pipe's inode when known.
+            pub(super) fn render(root: u32, pipe_inode: Option<u64>) -> String {
+                let mut out = String::new();
+                let _ = writeln!(out, "job pipe inode: {pipe_inode:?}, root pid {root}");
+                process(&mut out, root, 0);
+                out
+            }
+
+            fn process(out: &mut String, pid: u32, depth: usize) {
+                let indent = "  ".repeat(depth);
+                let dir = format!("/proc/{pid}");
+                let uid = fs::read_to_string(format!("{dir}/status")).map_or_else(
+                    |error| failure(&error),
+                    |status| {
+                        status
+                            .lines()
+                            .find_map(|line| line.strip_prefix("Uid:"))
+                            .map_or_else(|| "<none>".to_owned(), |uid| uid.trim().to_owned())
+                    },
+                );
+                let exe = fs::read_link(format!("{dir}/exe"))
+                    .map_or_else(|error| failure(&error), |path| path.display().to_string());
+                let _ = writeln!(
+                    out,
+                    "{indent}pid {pid} comm={} exe={exe} uid={uid} state={}",
+                    text(format!("{dir}/comm")),
+                    state_of(&text(format!("{dir}/stat"))),
+                );
+                let mut tids = Vec::new();
+                match fs::read_dir(format!("{dir}/task")) {
+                    Ok(entries) => tids.extend(entries.flatten().map(|entry| entry.file_name())),
+                    Err(error) => {
+                        let _ = writeln!(out, "{indent}  tasks={}", failure(&error));
+                    }
+                }
+                tids.sort();
+                let mut children = Vec::new();
+                for tid in &tids {
+                    let task = format!("{dir}/task/{}", tid.to_string_lossy());
+                    let _ = writeln!(
+                        out,
+                        "{indent}  tid {} state={} wchan={}",
+                        tid.to_string_lossy(),
+                        state_of(&text(format!("{task}/stat"))),
+                        text(format!("{task}/wchan")),
+                    );
+                    for child in text(format!("{task}/children")).split_whitespace() {
+                        match child.parse::<u32>() {
+                            Ok(child) => children.push(child),
+                            Err(_) => {
+                                let _ = writeln!(out, "{indent}  children={child}");
+                            }
+                        }
+                    }
+                }
+                match fs::read_dir(format!("{dir}/fd")) {
+                    Ok(entries) => {
+                        let mut fds: Vec<_> =
+                            entries.flatten().map(|entry| entry.file_name()).collect();
+                        fds.sort_by_key(|fd| {
+                            fd.to_string_lossy().parse::<u32>().unwrap_or(u32::MAX)
+                        });
+                        for fd in fds {
+                            let name = fd.to_string_lossy();
+                            let target = fs::read_link(format!("{dir}/fd/{name}")).map_or_else(
+                                |error| failure(&error),
+                                |path| path.display().to_string(),
+                            );
+                            let info = fdinfo(
+                                Path::new(&format!("{dir}/fdinfo/{name}")),
+                                &["flags", "pos"],
+                            );
+                            let _ = writeln!(out, "{indent}  fd {name} -> {target} {info}");
+                        }
+                    }
+                    Err(error) => {
+                        let _ = writeln!(out, "{indent}  fds={}", failure(&error));
+                    }
+                }
+                for child in children {
+                    process(out, child, depth + 1);
+                }
+            }
         }
 
         /// Probes every 100 ms until `wanted` accepts a probe or 10 s pass.
@@ -1017,7 +1171,8 @@ mod tests {
             assert_ne!(
                 seen,
                 Probe::Clear,
-                "a grandchild blocked in read is a reader"
+                "a grandchild blocked in read is a reader\n{}",
+                job.dump()
             );
         }
 
@@ -1214,7 +1369,7 @@ mod tests {
                     let (job, pid_file) = spawn_wrapped(script, dir.path());
                     let probe = job.probe();
                     let seen = probe_until(&probe, |seen| seen != Probe::Clear);
-                    assert_ne!(seen, Probe::Clear, "probe of {script}");
+                    assert_ne!(seen, Probe::Clear, "probe of {script}\n{}", job.dump());
                     let deadline = Instant::now() + Duration::from_secs(10);
                     let container = loop {
                         let seen = run_container_probe(&pid_file);
@@ -1225,7 +1380,8 @@ mod tests {
                     };
                     assert!(
                         matches!(container, Ok(Probe::BlockedAtCpu(_))),
-                        "container probe of {script}: {container:?}"
+                        "container probe of {script}: {container:?}\n{}",
+                        job.dump()
                     );
                 }
             }
