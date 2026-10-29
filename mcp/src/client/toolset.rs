@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aither_core::llm::tool::{ToolDefinition, ToolResult, ToolResultPart};
-use aither_sandbox::{CommandPayload, ToolRegistryBuilder};
+use aither_sandbox::ToolRegistryBuilder;
+use askama::Template;
 use async_lock::Mutex;
 use async_process::Command;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -381,39 +382,6 @@ impl McpConnection {
     }
 }
 
-fn call_result_to_terminal_payload(
-    result: CallToolResult,
-) -> Result<Option<CommandPayload>, String> {
-    let CallToolResult { content, is_error } = result;
-    let all_text = content
-        .iter()
-        .all(|item| matches!(item, crate::Content::Text(_)));
-
-    if all_text {
-        let text = content
-            .into_iter()
-            .filter_map(|item| match item {
-                crate::Content::Text(text_content) => Some(text_content.text),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if is_error {
-            Err(text)
-        } else {
-            Ok(Some(CommandPayload::Text { content: text }))
-        }
-    } else {
-        let value = serde_json::to_value(CallToolResult { content, is_error })
-            .map_err(|error| format!("failed to encode MCP tool result: {error}"))?;
-        if is_error {
-            Err(value.to_string())
-        } else {
-            Ok(Some(CommandPayload::Json { value }))
-        }
-    }
-}
-
 /// Converts an MCP `tools/call` result into a [`ToolResult`].
 ///
 /// Content blocks are preserved one-to-one: text stays text, images decode
@@ -425,8 +393,7 @@ fn call_result_to_terminal_payload(
 /// # Errors
 ///
 /// Returns [`McpError::Transport`] when an image or resource blob carries
-/// invalid base64, or [`McpError::Serialization`] when a resource cannot be
-/// re-encoded.
+/// invalid base64.
 pub fn call_result_to_tool_result(result: CallToolResult) -> Result<ToolResult, McpError> {
     let CallToolResult { content, is_error } = result;
     if is_error {
@@ -461,10 +428,22 @@ fn resource_to_part(resource: EmbeddedResource) -> Result<ToolResultPart, McpErr
     } else if let Some(text) = resource.text {
         Ok(ToolResultPart::Text { text })
     } else {
-        Ok(ToolResultPart::Json {
-            value: serde_json::to_value(&resource)?,
+        Ok(ToolResultPart::Text {
+            text: EmbeddedResourceTemplate {
+                uri: &resource.uri,
+                mime_type: resource.mime_type.as_deref(),
+            }
+            .render()
+            .expect("embedded resource template must render"),
         })
     }
+}
+
+#[derive(askama::Template)]
+#[template(path = "embedded_resource.txt", escape = "none")]
+struct EmbeddedResourceTemplate<'a> {
+    uri: &'a str,
+    mime_type: Option<&'a str>,
 }
 
 fn decode_base64(data: &str) -> Result<Vec<u8>, McpError> {
@@ -483,7 +462,7 @@ fn error_message_text(content: &[Content]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     if text.is_empty() {
-        serde_json::to_string(content).unwrap_or_else(|_| "MCP tool error".to_string())
+        "MCP tool returned an error.".to_string()
     } else {
         text
     }
@@ -514,7 +493,7 @@ pub fn register_terminal_commands(
                         .await
                         .map_err(|error| error.to_string())?
                 };
-                call_result_to_terminal_payload(result)
+                call_result_to_tool_result(result).map_err(|error| error.to_string())
             })
         });
     }

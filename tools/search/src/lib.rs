@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use askama::Template;
+
 use aither_core::llm::ToolContext;
 use aither_core::{
     EmbeddingModel,
@@ -247,6 +249,28 @@ pub enum SearchAction {
     Index,
     /// Query the existing search index.
     Query,
+}
+
+impl std::fmt::Display for SearchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Hybrid => "hybrid",
+            Self::Text => "text",
+            Self::Regex => "regex",
+            Self::Fulltext => "fulltext",
+            Self::Fuzzy => "fuzzy",
+            Self::Semantic => "semantic",
+        })
+    }
+}
+
+impl std::fmt::Display for SearchOutputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Files => "files",
+            Self::Chunks => "chunks",
+        })
+    }
 }
 
 /// Search strategy used for querying the index.
@@ -575,20 +599,53 @@ struct FileMatchRow {
     matched_by: Vec<SearchMode>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct ChunkResult {
-    file_path: String,
     relative_path: String,
     modified_at: String,
     chunk_id: i64,
     score: f64,
     matched_by: Vec<SearchMode>,
     snippet: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Template)]
+#[template(path = "index_result.txt", escape = "none")]
+struct IndexResultTemplate<'a> {
+    indexed_root: &'a str,
+    roots: &'a str,
+    files_indexed: usize,
+    chunks_indexed: usize,
+    semantic_indexed: bool,
+    indexed_at: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "query_files.txt", escape = "none")]
+struct QueryFilesTemplate<'a> {
+    query: &'a str,
+    search_mode: SearchMode,
+    output_mode: SearchOutputMode,
+    indexed_roots: &'a str,
+    total_matches: usize,
+    returned: usize,
+    results: &'a [FileResult],
+}
+
+#[derive(Template)]
+#[template(path = "query_chunks.txt", escape = "none")]
+struct QueryChunksTemplate<'a> {
+    query: &'a str,
+    search_mode: SearchMode,
+    output_mode: SearchOutputMode,
+    indexed_roots: &'a str,
+    total_matches: usize,
+    returned: usize,
+    results: &'a [ChunkResult],
+}
+
+#[derive(Debug, Clone)]
 struct FileResult {
     file_path: String,
     relative_path: String,
@@ -669,15 +726,18 @@ where
         false
     };
 
-    Ok(ToolResult::json_value(serde_json::json!({
-        "action": "index",
-        "indexed_root": canonical_string,
-        "roots": meta.roots,
-        "files_indexed": meta.files_indexed,
-        "chunks_indexed": meta.chunks_indexed,
-        "semantic_indexed": semantic_indexed,
-        "indexed_at": meta.indexed_at,
-    })))
+    Ok(ToolResult::text(
+        IndexResultTemplate {
+            indexed_root: &canonical_string,
+            roots: &meta.roots.join(", "),
+            files_indexed: meta.files_indexed,
+            chunks_indexed: meta.chunks_indexed,
+            semantic_indexed,
+            indexed_at: &meta.indexed_at,
+        }
+        .render()
+        .expect("index result template must render"),
+    ))
 }
 
 async fn load_meta(meta_path: &Path) -> Result<SearchIndexMeta, SearchToolError> {
@@ -1390,31 +1450,35 @@ fn finalize_rows(
     let rows = &rows[start..end];
 
     let query = args.query.clone().expect("validated");
-    let value = if args.output_mode == SearchOutputMode::Chunks {
+    let indexed_roots = meta.roots.join(", ");
+    if args.output_mode == SearchOutputMode::Chunks {
         let items = rows
             .iter()
             .map(|row| ChunkResult {
-                file_path: row.file_path.clone(),
                 relative_path: row.relative_path.clone(),
                 modified_at: row.modified_at.clone(),
                 chunk_id: row.chunk_id,
                 score: (row.score * 100.0).round() / 100.0,
                 matched_by: row.matched_by.clone(),
-                snippet: truncate_text(row.content.as_str(), 240),
+                snippet: snippet_of(row.content.as_str()),
                 content: args.include_content.then_some(row.content.clone()),
             })
             .collect::<Vec<_>>();
-        serde_json::json!({
-            "action": "query",
-            "query": query,
-            "search_mode": args.search_mode,
-            "output_mode": args.output_mode,
-            "indexed_roots": meta.roots,
-            "total_matches": total_matches,
-            "returned": items.len(),
-            "results": items,
-        })
-    } else {
+        return ToolResult::text(
+            QueryChunksTemplate {
+                query: &query,
+                search_mode: args.search_mode,
+                output_mode: args.output_mode,
+                indexed_roots: &indexed_roots,
+                total_matches,
+                returned: items.len(),
+                results: &items,
+            }
+            .render()
+            .expect("search query template must render"),
+        );
+    }
+    let items = {
         let mut grouped = HashMap::<String, FileResult>::new();
         for row in rows {
             let entry = grouped
@@ -1433,13 +1497,12 @@ fn finalize_rows(
             }
             if entry.highlights.len() < 3 {
                 entry.highlights.push(ChunkResult {
-                    file_path: row.file_path.clone(),
                     relative_path: row.relative_path.clone(),
                     modified_at: row.modified_at.clone(),
                     chunk_id: row.chunk_id,
                     score: (row.score * 100.0).round() / 100.0,
                     matched_by: row.matched_by.clone(),
-                    snippet: truncate_text(row.content.as_str(), 240),
+                    snippet: snippet_of(row.content.as_str()),
                     content: args.include_content.then_some(row.content.clone()),
                 });
             }
@@ -1452,19 +1515,30 @@ fn finalize_rows(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| left.file_path.cmp(&right.file_path))
         });
-        serde_json::json!({
-            "action": "query",
-            "query": query,
-            "search_mode": args.search_mode,
-            "output_mode": args.output_mode,
-            "indexed_roots": meta.roots,
-            "total_matches": total_matches,
-            "returned": items.len(),
-            "results": items,
-        })
+        items
     };
 
-    ToolResult::json_value(value)
+    ToolResult::text(
+        QueryFilesTemplate {
+            query: &query,
+            search_mode: args.search_mode,
+            output_mode: args.output_mode,
+            indexed_roots: &indexed_roots,
+            total_matches,
+            returned: items.len(),
+            results: &items,
+        }
+        .render()
+        .expect("search query template must render"),
+    )
+}
+
+/// One-line, length-bounded excerpt of a chunk for result listings.
+fn snippet_of(content: &str) -> String {
+    truncate_text(
+        &content.split_whitespace().collect::<Vec<_>>().join(" "),
+        240,
+    )
 }
 
 fn truncate_text(input: &str, max_chars: usize) -> String {
@@ -1482,6 +1556,70 @@ fn truncate_text(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_results_put_the_one_line_snippet_on_its_own_indented_line() {
+        let chunk = ChunkResult {
+            relative_path: "src/lib.rs".to_string(),
+            modified_at: "2026-01-01".to_string(),
+            chunk_id: 3,
+            score: 0.5,
+            matched_by: vec![SearchMode::Text],
+            snippet: snippet_of("fn main() {\n    run();\n}"),
+            content: None,
+        };
+        let rendered = QueryChunksTemplate {
+            query: "main",
+            search_mode: SearchMode::Text,
+            output_mode: SearchOutputMode::Chunks,
+            indexed_roots: "/repo",
+            total_matches: 1,
+            returned: 1,
+            results: &[chunk],
+        }
+        .render()
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "Query 'main' (text, chunks): 1 matches, showing 1. Indexed roots: /repo.\n- src/lib.rs#3 (text, score 0.5, modified 2026-01-01):\n    fn main() { run(); }\n"
+        );
+    }
+
+    #[test]
+    fn file_results_render_requested_content_under_each_highlight() {
+        let highlight = ChunkResult {
+            relative_path: "src/lib.rs".to_string(),
+            modified_at: "2026-01-01".to_string(),
+            chunk_id: 3,
+            score: 0.5,
+            matched_by: vec![SearchMode::Text],
+            snippet: "fn main()".to_string(),
+            content: Some("fn main() {\n    run();\n}".to_string()),
+        };
+        let file = FileResult {
+            file_path: "/repo/src/lib.rs".to_string(),
+            relative_path: "src/lib.rs".to_string(),
+            modified_at: "2026-01-01".to_string(),
+            match_count: 1,
+            top_score: 0.5,
+            highlights: vec![highlight],
+        };
+        let rendered = QueryFilesTemplate {
+            query: "main",
+            search_mode: SearchMode::Text,
+            output_mode: SearchOutputMode::Files,
+            indexed_roots: "/repo",
+            total_matches: 1,
+            returned: 1,
+            results: &[file],
+        }
+        .render()
+        .unwrap();
+        assert!(
+            rendered.contains("        fn main()\nfn main() {\n    run();\n}\n"),
+            "{rendered}"
+        );
+    }
 
     #[derive(Debug, Clone)]
     struct NoopEmbedding;

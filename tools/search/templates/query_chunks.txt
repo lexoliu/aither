@@ -1,0 +1,5 @@
+Query '{{ query }}' ({{ search_mode }}, {{ output_mode }}): {{ total_matches }} matches, showing {{ returned }}. Indexed roots: {{ indexed_roots }}.
+{% for chunk in results %}- {{ chunk.relative_path }}#{{ chunk.chunk_id }} ({{ chunk.matched_by|join(", ") }}, score {{ chunk.score }}, modified {{ chunk.modified_at }}):
+    {{ chunk.snippet }}
+{% if let Some(content) = chunk.content %}{{ content }}
+{% endif %}{% endfor %}

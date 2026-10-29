@@ -1,8 +1,9 @@
 use std::{borrow::Cow, path::PathBuf};
 
 use aither_core::llm::ToolContext;
-use aither_core::llm::{Tool, ToolResult, tool::json};
+use aither_core::llm::{Tool, ToolResult};
 use anyhow::{Context, Result, bail};
+use askama::Template;
 use async_process::Command;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -25,7 +26,9 @@ pub struct CommandArgs {
     pub cwd: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// What a finished command wrote, rendered for the model by `templates/output.txt`.
+#[derive(Debug, Clone, Template)]
+#[template(path = "output.txt", escape = "none")]
 pub struct CommandOutput {
     pub program: String,
     pub status: i32,
@@ -127,6 +130,39 @@ impl Tool for CommandTool {
             stderr: self.truncate(String::from_utf8_lossy(&output.stderr).to_string()),
         };
 
-        Ok(ToolResult::text(json(&response)?))
+        Ok(ToolResult::text(response.render()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_is_prose_with_labelled_streams() {
+        let output = CommandOutput {
+            program: "ls".into(),
+            status: 1,
+            stdout: "a\nb".into(),
+            stderr: "denied".into(),
+        };
+        assert_eq!(
+            output.render().unwrap(),
+            "ls exited with status 1.\nstdout:\na\nb\nstderr:\ndenied\n"
+        );
+    }
+
+    #[test]
+    fn silent_command_says_so() {
+        let output = CommandOutput {
+            program: "true".into(),
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            output.render().unwrap(),
+            "true exited with status 0.\n(no output)\n"
+        );
     }
 }

@@ -168,13 +168,40 @@ pub enum CompactionError {
     Empty,
 }
 
+/// Joins an index entry's path to its description.
+const INDEX_SEPARATOR: &str = " — ";
+
+/// The handoff a [`Context`](crate::context::Context) carries between
+/// compactions: the structured document a compaction produced, or the plain
+/// text a host set directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Handoff {
+    /// Free text set by the host; it has no file index.
+    Text(String),
+    /// A document produced by a compaction.
+    Document(HandoffDocument),
+}
+
+impl Handoff {
+    /// The file index entries this handoff carries.
+    #[must_use]
+    pub fn file_index(&self) -> &[String] {
+        match self {
+            Self::Text(_) => &[],
+            Self::Document(document) => &document.file_index,
+        }
+    }
+}
+
 /// Builds the mechanical file index for a handoff from conversation messages.
 ///
 /// Scans tool results for `outputs/` URLs and `artifacts/` paths and pairs
-/// each with the description of the tool call that produced it. Later
-/// mentions of the same path win.
+/// each with the description of the tool call that produced it. `previous` is
+/// the file index of the handoff being replaced: its entries are kept, so a
+/// file indexed by an earlier compaction stays indexed. Later mentions of the
+/// same path win.
 #[must_use]
-pub fn build_file_index(messages: &[Message]) -> Vec<String> {
+pub fn build_file_index(previous: &[String], messages: &[Message]) -> Vec<String> {
     use std::collections::HashMap;
 
     let mut call_description: HashMap<&str, &str> = HashMap::new();
@@ -186,7 +213,17 @@ pub fn build_file_index(messages: &[Message]) -> Vec<String> {
         }
     }
 
-    let mut index: indexmap::IndexMap<String, Option<&str>> = indexmap::IndexMap::new();
+    let mut index: indexmap::IndexMap<String, Option<String>> = indexmap::IndexMap::new();
+    for entry in previous {
+        match entry.split_once(INDEX_SEPARATOR) {
+            Some((path, description)) => {
+                index.insert(path.to_string(), Some(description.to_string()));
+            }
+            None => {
+                index.insert(entry.clone(), None);
+            }
+        }
+    }
     for message in messages {
         let Message::Tool {
             content,
@@ -195,16 +232,18 @@ pub fn build_file_index(messages: &[Message]) -> Vec<String> {
         else {
             continue;
         };
-        let description = call_description.get(tool_call_id.as_str()).copied();
+        let description = call_description
+            .get(tool_call_id.as_str())
+            .map(|description| (*description).to_string());
         for url in crate::output_urls::extract_referenced_urls(content) {
-            index.insert(url, description);
+            index.insert(url, description.clone());
         }
         for word in content.split_whitespace() {
             let word = word.trim_matches(|c: char| {
                 c == '"' || c == '\'' || c == '`' || c == ',' || c == ')' || c == ']' || c == ';'
             });
             if word.starts_with("artifacts/") && word.len() > "artifacts/".len() {
-                index.insert(word.to_string(), description);
+                index.insert(word.to_string(), description.clone());
             }
         }
     }
@@ -212,7 +251,7 @@ pub fn build_file_index(messages: &[Message]) -> Vec<String> {
     index
         .into_iter()
         .map(|(path, description)| match description {
-            Some(description) => format!("{path} — {description}"),
+            Some(description) => format!("{path}{INDEX_SEPARATOR}{description}"),
             None => path,
         })
         .collect()
@@ -223,6 +262,8 @@ pub fn build_file_index(messages: &[Message]) -> Vec<String> {
 pub struct CompactionFork {
     /// Sequence number of the first item the handoff will *not* describe.
     fork_point: u64,
+    /// The file index of the handoff this compaction replaces.
+    previous_file_index: Vec<String>,
     /// The main request, source blocks, tools and cache parameters included,
     /// with the handoff instruction appended to its messages. Replaying it is
     /// what lets the provider serve the compaction from the same prefix
@@ -232,7 +273,8 @@ pub struct CompactionFork {
 
 impl CompactionFork {
     /// Forks `request` — the exact request the run is about to send — into a
-    /// compaction request, optionally focused by `focus`.
+    /// compaction request, optionally focused by `focus`. `previous_file_index`
+    /// is the file index of the handoff the result will replace.
     ///
     /// The instruction is *appended* and the tool definitions and parameters
     /// are reused untouched: everything up to the instruction is byte-for-
@@ -251,6 +293,7 @@ impl CompactionFork {
     pub fn new(
         request: &LLMRequest,
         fork_point: u64,
+        previous_file_index: &[String],
         focus: Option<&str>,
         skills: &[SkillCatalogEntry],
     ) -> Result<Self, CompactionError> {
@@ -269,6 +312,7 @@ impl CompactionFork {
         messages.push(Message::user(instruction));
         Ok(Self {
             fork_point,
+            previous_file_index: previous_file_index.to_vec(),
             request: LLMRequest::new(messages)
                 .with_parameters(request.parameters().clone())
                 .with_tool_definitions(request.tool_definitions().to_vec()),
@@ -303,12 +347,16 @@ impl CompactionFork {
     /// Panics if the compiled-in retry template fails to render, which would
     /// mean the binary was built against a broken template.
     pub async fn run<M: LanguageModel>(self, model: M) -> Result<HandoffDocument, CompactionError> {
-        let Self { request, .. } = self;
+        let Self {
+            request,
+            previous_file_index,
+            ..
+        } = self;
         let conversation = request.messages().to_vec();
         let reason = match model.generate::<HandoffDocument>(request.clone()).await {
             Ok(document) => match document.validate() {
                 Ok(mut document) => {
-                    document.file_index = build_file_index(&conversation);
+                    document.file_index = build_file_index(&previous_file_index, &conversation);
                     return Ok(document);
                 }
                 Err(error) => error.to_string(),
@@ -334,7 +382,7 @@ impl CompactionFork {
             .with_tool_definitions(definitions);
         let response = collect_text(&model, retry_request).await?;
         let mut document = parse_handoff(&response)?.validate()?;
-        document.file_index = build_file_index(&conversation);
+        document.file_index = build_file_index(&previous_file_index, &conversation);
         Ok(document)
     }
 }
@@ -481,7 +529,7 @@ mod tests {
             Message::tool("call_2", "wrote artifacts/slides.md"),
         ];
 
-        let index = build_file_index(&messages);
+        let index = build_file_index(&[], &messages);
         assert_eq!(index.len(), 2);
         assert!(
             index[0].contains("outputs/amber-oak-swift-river.txt")
@@ -514,9 +562,69 @@ mod tests {
             Message::tool("call_2", "updated artifacts/report.md"),
         ];
 
-        let index = build_file_index(&messages);
+        let index = build_file_index(&[], &messages);
         assert_eq!(index.len(), 1);
         assert!(index[0].contains("final revision"));
+    }
+
+    fn read_file_messages(id: &str, description: &str, path: &str) -> Vec<Message> {
+        vec![
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    id,
+                    "terminal",
+                    serde_json::json!({"description": description}),
+                )],
+            ),
+            Message::tool(id, format!("saved {path}")),
+        ]
+    }
+
+    /// Compacts `context` the way a run does: indexes the conversation seeded
+    /// with the current handoff's index, then folds the result into the window.
+    fn compact(context: &mut crate::context::Context) -> HandoffDocument {
+        let handoff = HandoffDocument {
+            current_task: "task".to_string(),
+            file_index: build_file_index(context.handoff_file_index(), &context.build_request(&[])),
+            ..HandoffDocument::default()
+        };
+        context.apply_handoff(&handoff, u64::MAX);
+        handoff
+    }
+
+    #[test]
+    fn the_second_handoff_keeps_files_indexed_by_the_first() {
+        let mut context = crate::context::Context::new();
+        for message in read_file_messages("call_1", "Fetch notes", "artifacts/notes.md") {
+            context.push(message);
+        }
+        let first = compact(&mut context);
+        assert_eq!(first.file_index, ["artifacts/notes.md — Fetch notes"]);
+
+        for message in read_file_messages("call_2", "Write deck", "artifacts/slides.md") {
+            context.push(message);
+        }
+        let second = compact(&mut context);
+        assert_eq!(
+            second.file_index,
+            [
+                "artifacts/notes.md — Fetch notes",
+                "artifacts/slides.md — Write deck"
+            ]
+        );
+
+        for message in read_file_messages("call_3", "Revised notes", "artifacts/notes.md") {
+            context.push(message);
+        }
+        let third = compact(&mut context);
+        assert_eq!(
+            third.file_index,
+            [
+                "artifacts/notes.md — Revised notes",
+                "artifacts/slides.md — Write deck"
+            ]
+        );
     }
 
     #[test]
@@ -559,7 +667,7 @@ mod tests {
     fn forking_an_empty_context_is_an_error() {
         let request = LLMRequest::new(vec![Message::system("only the prefix")]);
         assert!(matches!(
-            CompactionFork::new(&request, 0, None, &[]),
+            CompactionFork::new(&request, 0, &[], None, &[]),
             Err(CompactionError::Empty)
         ));
     }
@@ -584,7 +692,8 @@ mod tests {
             description: "read PDFs".to_string(),
             instructions: "how to read PDFs".to_string(),
         }];
-        let fork = CompactionFork::new(&main, 7, Some("the failing test"), &skills).expect("fork");
+        let fork =
+            CompactionFork::new(&main, 7, &[], Some("the failing test"), &skills).expect("fork");
 
         assert_eq!(fork.fork_point(), 7);
         assert_eq!(

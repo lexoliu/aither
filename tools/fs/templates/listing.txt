@@ -1,0 +1,2 @@
+{% if entries.is_empty() %}The directory is empty.{% else %}{% for entry in entries %}{{ entry.name }}{% if entry.is_dir %}/{% endif %}
+{% endfor %}{% endif %}

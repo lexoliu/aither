@@ -31,8 +31,8 @@ pub mod window;
 pub use budget::ContextBudget;
 pub use cache::{CacheLifetime, PromptCache};
 pub use compaction::{
-    CompactionError, CompactionFork, CompletedCompaction, ContextFile, HandoffDocument, LineRange,
-    PendingCompaction, SkillCatalogEntry, build_file_index,
+    CompactionError, CompactionFork, CompletedCompaction, ContextFile, Handoff, HandoffDocument,
+    LineRange, PendingCompaction, SkillCatalogEntry, build_file_index,
 };
 pub use policy::ContextPolicy;
 pub use reassembly::restore_context;
@@ -40,4 +40,4 @@ pub use source::{AnyContextSource, Block, ContextSource};
 #[cfg(feature = "skills")]
 pub use sources::ActiveSkills;
 pub use sources::{BackgroundJobs, TasksDocument};
-pub use window::{Context, ContextCheckpoint, ContextItem, ReassemblyReport, serialize_xml};
+pub use window::{Context, ContextCheckpoint, ContextItem, ReassemblyReport};

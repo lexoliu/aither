@@ -1,0 +1,7 @@
+{{ program }} exited with status {{ status }}.
+{% if stdout.is_empty() && stderr.is_empty() %}(no output)
+{% endif %}{% if !stdout.is_empty() %}stdout:
+{{ stdout }}
+{% endif %}{% if !stderr.is_empty() %}stderr:
+{{ stderr }}
+{% endif %}

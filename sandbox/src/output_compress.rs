@@ -47,23 +47,19 @@ struct JsonTsvOutput<'a> {
 #[template(path = "folded_code_output.txt", escape = "none")]
 struct FoldedCodeOutput<'a> {
     folded: &'a str,
-    url: &'a str,
-    path: &'a str,
 }
 
 /// Renders the folded view of cut source code for the model, or `None` when
 /// `text` is not recognisable source code or folding does not shrink it.
 ///
-/// `url` and `path` name the stored unfolded text, whose line numbers the
-/// folded view carries.
+/// The folded view carries the line numbers of the unfolded `text`, which the
+/// caller stores.
 #[must_use]
-pub fn folded_code_content(text: &str, url: &str, path: &str) -> Option<String> {
+pub fn folded_code_content(text: &str) -> Option<String> {
     let folded = fold::fold_source_code(text)?;
     Some(
         FoldedCodeOutput {
             folded: folded.trim_end_matches('\n'),
-            url,
-            path,
         }
         .render()
         .expect("folded code output template must render"),

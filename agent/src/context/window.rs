@@ -33,18 +33,27 @@
 
 use std::hash::{Hash, Hasher};
 
+use askama::Template;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use aither_core::llm::{Message, Role};
 
-use super::compaction::HandoffDocument;
+use super::compaction::{Handoff, HandoffDocument};
 use super::source::Block;
 
-#[derive(Serialize)]
-struct TextBlock<'a> {
-    #[serde(rename = "$text")]
+/// A block of text wrapped in the one delimiting tag the model sees.
+#[derive(Template)]
+#[template(path = "tagged_block.txt", escape = "none")]
+struct TaggedBlockTemplate<'a> {
+    tag: &'a str,
     content: &'a str,
+}
+
+impl TaggedBlockTemplate<'_> {
+    fn into_text(self) -> String {
+        self.render().expect("tagged block template must render")
+    }
 }
 
 /// Tombstone text left in place of a superseded tool result.
@@ -106,7 +115,7 @@ pub struct Context {
     /// Compaction handoff document from the previous compaction.
     ///
     /// Rendered immediately after the stable system prefix.
-    handoff: Option<String>,
+    handoff: Option<Handoff>,
 
     /// Append-only conversation items.
     items: Vec<ContextItem>,
@@ -127,19 +136,28 @@ impl Context {
 
     /// Inserts or replaces a persistent system block.
     ///
-    /// Identity is derived from the `snake_case` type name of `T`.
-    pub fn insert_system<T: Serialize>(&mut self, value: &T) {
+    /// The block renders through `value`'s typed template; identity is
+    /// derived from the `snake_case` type name of `T`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the template fails to render.
+    pub fn insert_system<T: Template>(&mut self, value: &T) {
         let tag = snake_case_type_name::<T>();
-        let xml = serialize_xml(&tag, value);
-        self.system_blocks.insert(tag, xml);
+        let rendered = value.render().expect("system block template must render");
+        self.system_blocks.insert(tag, rendered);
     }
 
     /// Inserts or replaces a persistent system block with an explicit tag.
     pub fn insert_system_named(&mut self, tag: impl Into<String>, content: impl Into<String>) {
         let tag = tag.into();
         let content = content.into();
-        let xml = serialize_xml(&tag, &TextBlock { content: &content });
-        self.system_blocks.insert(tag, xml);
+        let wrapped = TaggedBlockTemplate {
+            tag: &tag,
+            content: &content,
+        }
+        .into_text();
+        self.system_blocks.insert(tag, wrapped);
     }
 
     /// Inserts or replaces a persistent system block with raw text.
@@ -259,13 +277,12 @@ impl Context {
 
     /// Sets or replaces the compaction handoff document.
     pub fn set_handoff(&mut self, handoff: impl Into<String>) {
-        let handoff = handoff.into();
-        self.handoff = Some(serialize_xml("handoff", &TextBlock { content: &handoff }));
+        self.handoff = Some(Handoff::Text(handoff.into()));
     }
 
     /// Sets the compaction handoff document from a structured artifact.
     pub fn set_handoff_document(&mut self, handoff: &HandoffDocument) {
-        self.handoff = Some(serialize_xml("handoff", handoff));
+        self.handoff = Some(Handoff::Document(handoff.clone()));
     }
 
     /// Clears the compaction handoff document.
@@ -275,8 +292,14 @@ impl Context {
 
     /// Returns the current compaction handoff document.
     #[must_use]
-    pub fn handoff(&self) -> Option<&str> {
-        self.handoff.as_deref()
+    pub const fn handoff(&self) -> Option<&Handoff> {
+        self.handoff.as_ref()
+    }
+
+    /// The file index of the current handoff, empty when there is none.
+    #[must_use]
+    pub fn handoff_file_index(&self) -> &[String] {
+        self.handoff.as_ref().map_or(&[], Handoff::file_index)
     }
 
     // ── Conversation ──────────────────────────────────────────────────
@@ -296,16 +319,20 @@ impl Context {
         }
     }
 
-    /// Appends a durable alert, serialized as an XML system message.
+    /// Appends a durable alert, rendered from its typed template as a system
+    /// message.
     ///
     /// The alert enters the conversation and stays there until reassembly or
     /// compaction prunes it — the channel for content that must reach the
     /// *next* request rather than being re-rendered by a
     /// [`ContextSource`](super::ContextSource) every time.
-    pub fn push_alert<T: Serialize>(&mut self, value: &T) -> u64 {
-        let tag = snake_case_type_name::<T>();
-        let xml = serialize_xml(&tag, value);
-        self.push(Message::system(xml))
+    ///
+    /// # Panics
+    ///
+    /// Panics if the template fails to render.
+    pub fn push_alert<T: Template>(&mut self, value: &T) -> u64 {
+        let rendered = value.render().expect("alert template must render");
+        self.push(Message::system(rendered))
     }
 
     /// Appends a durable alert rendered by a context source.
@@ -413,7 +440,7 @@ impl Context {
         }
 
         if let Some(handoff) = &self.handoff {
-            messages.push(Message::system(handoff));
+            messages.push(Message::system(handoff.render()));
         }
 
         messages.extend(self.items.iter().map(|item| item.message.clone()));
@@ -442,7 +469,10 @@ impl Context {
             .values()
             .map(|content| content.len() + 1)
             .sum();
-        let handoff = self.handoff.as_ref().map_or(0, String::len);
+        let handoff = self
+            .handoff
+            .as_ref()
+            .map_or(0, |handoff| handoff.render().len());
         blocks + handoff
     }
 
@@ -688,7 +718,7 @@ impl ReassemblyReport {
 /// A snapshot of non-persistent context state that can be restored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCheckpoint {
-    handoff: Option<String>,
+    handoff: Option<Handoff>,
     items: Vec<ContextItem>,
     #[serde(default)]
     next_seq: u64,
@@ -697,7 +727,7 @@ pub struct ContextCheckpoint {
 impl ContextCheckpoint {
     /// Creates a structured runtime checkpoint.
     #[must_use]
-    pub fn new(handoff: Option<String>, items: Vec<ContextItem>) -> Self {
+    pub fn new(handoff: Option<Handoff>, items: Vec<ContextItem>) -> Self {
         let next_seq = items.last().map_or(0, |item| item.seq + 1);
         Self {
             handoff,
@@ -714,8 +744,8 @@ impl ContextCheckpoint {
 
     /// Returns the handoff document, if present.
     #[must_use]
-    pub fn handoff(&self) -> Option<&str> {
-        self.handoff.as_deref()
+    pub const fn handoff(&self) -> Option<&Handoff> {
+        self.handoff.as_ref()
     }
 
     /// Returns the checkpointed conversation items.
@@ -728,6 +758,22 @@ impl ContextCheckpoint {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.handoff.is_none() && self.items.is_empty()
+    }
+}
+
+impl Handoff {
+    /// Renders this handoff as the system message body of a request.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let content = match self {
+            Self::Text(text) => text.clone(),
+            Self::Document(document) => document.render_markdown(),
+        };
+        TaggedBlockTemplate {
+            tag: "handoff",
+            content: &content,
+        }
+        .into_text()
     }
 }
 
@@ -764,39 +810,16 @@ fn snake_case_type_name<T>() -> String {
     heck::AsSnakeCase(short).to_string()
 }
 
-/// Serializes `value` into an XML element named `tag`.
-///
-/// # Panics
-///
-/// Panics if `value` cannot be represented as XML, which is a bug in the
-/// serialized type rather than a runtime condition.
-pub fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> String {
-    let mut buffer = String::new();
-    let serializer = quick_xml::se::Serializer::with_root(&mut buffer, Some(tag))
-        .unwrap_or_else(|error| panic!("failed to create XML serializer for tag '{tag}': {error}"));
-
-    value
-        .serialize(serializer)
-        .unwrap_or_else(|error| panic!("failed to serialize XML for tag '{tag}': {error}"));
-
-    buffer
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use aither_core::llm::ToolCall;
 
-    #[derive(Serialize)]
-    struct Memory {
-        #[serde(rename = "$text")]
-        content: String,
-    }
-
-    #[derive(Serialize)]
-    struct Workspace {
-        sandbox: String,
-        cwd: String,
+    #[derive(Template)]
+    #[template(path = "tagged_block.txt", escape = "none")]
+    struct Memory<'a> {
+        tag: &'a str,
+        content: &'a str,
     }
 
     fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -814,16 +837,30 @@ mod tests {
     }
 
     #[test]
-    fn serialize_xml_renders_struct_fields() {
-        let xml = serialize_xml(
-            "workspace",
-            &Workspace {
-                sandbox: "/tmp/sandbox".to_string(),
-                cwd: "/home/user".to_string(),
-            },
+    fn typed_system_blocks_render_from_their_template() {
+        let mut context = Context::new();
+        context.insert_system(&Memory {
+            tag: "memory",
+            content: "remember this",
+        });
+        context.insert_system_named("persona", "be brief");
+
+        let messages = context.build_request(&[]);
+        assert_eq!(
+            messages[0].content(),
+            "<memory>remember this</memory>\n<persona>be brief</persona>"
         );
-        assert!(xml.contains("<workspace>"));
-        assert!(xml.contains("/tmp/sandbox"));
+    }
+
+    #[test]
+    fn alerts_render_from_their_template() {
+        let mut context = Context::new();
+        context.push_alert(&Memory {
+            tag: "alert",
+            content: "look here",
+        });
+        let messages = context.build_request(&[]);
+        assert_eq!(messages[0].content(), "<alert>look here</alert>");
     }
 
     #[test]
@@ -910,7 +947,11 @@ mod tests {
 
         assert_eq!(context.len_recent(), 1);
         assert_eq!(context.recent()[0].content(), "new request");
-        assert!(context.handoff().is_some_and(|text| text.contains("task")));
+        assert!(
+            context
+                .handoff()
+                .is_some_and(|handoff| handoff.render().contains("task"))
+        );
     }
 
     #[test]

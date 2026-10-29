@@ -5,6 +5,8 @@ use std::borrow::Cow;
 use aither_agent::tool_request::{
     ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
+use askama::Template;
+
 use aither_core::llm::ToolContext;
 use aither_core::llm::{IntoToolResult, Tool, ToolResult};
 use schemars::JsonSchema;
@@ -46,15 +48,6 @@ pub enum BrowserScreenshotMode {
     Viewport,
     /// Capture the full page.
     FullPage,
-}
-
-/// Output format for browser reads.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum BrowserReadFormat {
-    /// JSON-structured output.
-    #[default]
-    Json,
 }
 
 /// Options controlling browser read capture depth.
@@ -283,9 +276,6 @@ pub enum BrowserArgs {
         /// Screenshot mode.
         #[serde(default)]
         screenshot: BrowserScreenshotMode,
-        /// Output format.
-        #[serde(default)]
-        format: BrowserReadFormat,
     },
 }
 
@@ -358,9 +348,63 @@ impl From<Result<BrowserResult, BrowserToolError>> for BrowserToolOutput {
 impl IntoToolResult for BrowserToolOutput {
     fn into_tool_result(self) -> aither_core::Result<ToolResult> {
         match self.0 {
-            Ok(result) => ToolResult::json(&result),
+            Ok(result) => Ok(ToolResult::text(
+                BrowserResultTemplate { result: &result }
+                    .render()
+                    .expect("browser result template must render"),
+            )),
             Err(error) => Ok(ToolResult::error(error.to_string())),
         }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "result.txt", escape = "none")]
+struct BrowserResultTemplate<'a> {
+    result: &'a BrowserResult,
+}
+
+impl std::fmt::Display for BrowserInteractiveElement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} <{}>", self.role, self.tag_name)?;
+        if let Some(label) = self.accessible_name.as_deref().or(self.text.as_deref()) {
+            write!(f, " \"{label}\"")?;
+        }
+        if let Some(href) = &self.href {
+            write!(f, " -> {href}")?;
+        }
+        if let Some(input_type) = &self.input_type {
+            write!(f, " (type: {input_type})")?;
+        }
+        if self.disabled {
+            f.write_str(" (disabled)")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for BrowserAccessibilityNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for _ in 0..self.depth {
+            f.write_str("  ")?;
+        }
+        write!(f, "- {}", self.role)?;
+        if let Some(name) = &self.name {
+            write!(f, " \"{name}\"")?;
+        }
+        if let Some(value) = &self.value {
+            write!(f, " = {value}")?;
+        }
+        if let Some(description) = &self.description {
+            write!(f, " ({description})")?;
+        }
+        for property in &self.properties {
+            write!(f, " [{}: {}]", property.name, property.value)?;
+        }
+        if self.ignored {
+            f.write_str(" (ignored)")?;
+        }
+        Ok(())
     }
 }
 

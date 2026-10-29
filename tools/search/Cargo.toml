@@ -13,6 +13,7 @@ categories = ["api-bindings"]
 
 [dependencies]
 aither-core.workspace = true
+askama = "0.16"
 aither-rag.workspace = true
 arrow-array = "58.4"
 arrow-schema = "58.4"

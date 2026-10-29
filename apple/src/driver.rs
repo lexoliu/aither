@@ -559,13 +559,7 @@ fn render_tool_result(result: &ToolResult) -> Result<(String, bool), AppleError>
             "binary tool results cannot be represented by the native text tool output".into(),
         ));
     }
-    match result.render_for_model() {
-        Ok(text) => Ok((text, result.is_error())),
-        Err(error) => Err(AppleError::Native {
-            code: "tool_result_encoding".into(),
-            message: error.to_string(),
-        }),
-    }
+    Ok((result.render_for_model(), result.is_error()))
 }
 
 #[cfg(test)]
@@ -597,23 +591,20 @@ mod tests {
             ToolResult::Tsv {
                 text: "a\tb".into(),
             },
-            ToolResult::Json {
-                value: serde_json::json!({"a":1}),
-            },
             ToolResult::Parts {
                 parts: vec![
                     ToolResultPart::Text {
                         text: "first".into(),
                     },
-                    ToolResultPart::Json {
-                        value: serde_json::json!({"b":2}),
+                    ToolResultPart::Text {
+                        text: "second".into(),
                     },
                 ],
             },
         ] {
             assert_eq!(
                 render_tool_result(&value).unwrap(),
-                (value.render_for_model().unwrap(), false)
+                (value.render_for_model(), false)
             );
         }
         for value in [

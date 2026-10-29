@@ -1,0 +1,5 @@
+Subagent '{{ subagent }}' error: {{ error }}
+
+Recent subagent history:
+{% for entry in history %}- {{ entry.role }}:{% if !entry.content.is_empty() %} {{ entry.content }}{% endif %}{% if !entry.tool_names.is_empty() %} [called {{ entry.tool_names|join(", ") }}]{% endif %}
+{% endfor %}

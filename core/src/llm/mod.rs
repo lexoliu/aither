@@ -112,7 +112,10 @@ pub use researcher::{
 };
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
-pub use tool::{IntoToolResult, Tool, ToolContext, ToolResult};
+pub use tool::{
+    CommandOutcome, CommandResult, CommandStream, IntoToolResult, StoredFile, Tool, ToolContext,
+    ToolResult,
+};
 
 use crate::llm::model::Profile;
 

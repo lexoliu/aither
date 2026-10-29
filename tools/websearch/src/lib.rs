@@ -42,9 +42,9 @@ pub use providers::*;
 use std::borrow::Cow;
 
 use aither_core::llm::ToolContext;
-use aither_core::llm::tool::json;
 use aither_core::llm::{Tool, ToolResult};
 use anyhow::Result;
+use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +77,17 @@ pub struct SearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
+}
+
+/// Search results as the model reads them, rendered by `templates/results.txt`.
+#[derive(Template)]
+#[template(path = "results.txt", escape = "none")]
+struct ResultsTemplate<'a> {
+    results: &'a [SearchResult],
+}
+
+fn render_results(results: &[SearchResult]) -> Result<String> {
+    Ok(ResultsTemplate { results }.render()?)
 }
 
 pub trait SearchProvider: Send + Sync {
@@ -150,7 +161,7 @@ where
         for attempt in 0..MAX_RETRIES {
             match self.provider.search(&arguments.query, limit).await {
                 Ok(results) if !results.is_empty() => {
-                    return Ok(ToolResult::text(json(&results)?));
+                    return Ok(ToolResult::text(render_results(&results)?));
                 }
                 Ok(_empty) if attempt < MAX_RETRIES - 1 => {
                     // Empty results, retry after delay
@@ -158,7 +169,7 @@ where
                 }
                 Ok(empty) => {
                     // Final attempt still empty, return empty results
-                    return Ok(ToolResult::text(json(&empty)?));
+                    return Ok(ToolResult::text(render_results(&empty)?));
                 }
                 Err(e) if is_non_retryable(&e) => {
                     // Non-retryable error (e.g., CAPTCHA), fail immediately
@@ -176,5 +187,31 @@ where
         }
 
         unreachable!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn results_are_a_numbered_list() {
+        let results = vec![
+            SearchResult {
+                title: "Rust".into(),
+                url: "https://rust-lang.org".into(),
+                snippet: "A language".into(),
+            },
+            SearchResult {
+                title: "Cargo".into(),
+                url: "https://doc.rust-lang.org/cargo".into(),
+                snippet: "The package manager".into(),
+            },
+        ];
+        assert_eq!(
+            render_results(&results).unwrap(),
+            "1. Rust\n   https://rust-lang.org\n   A language\n2. Cargo\n   https://doc.rust-lang.org/cargo\n   The package manager\n"
+        );
+        assert_eq!(render_results(&[]).unwrap(), "No results.");
     }
 }

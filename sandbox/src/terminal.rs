@@ -24,7 +24,9 @@ use std::{
 };
 
 use aither_core::llm::ToolContext;
-use aither_core::llm::{IntoToolResult, Tool, ToolResult};
+use aither_core::llm::{
+    CommandOutcome, CommandResult, CommandStream, IntoToolResult, StoredFile, Tool, ToolResult,
+};
 use askama::Template;
 use async_channel::{Receiver, Sender};
 use async_io::Async;
@@ -48,16 +50,16 @@ use crate::{
     command::ToolRegistry,
     job_registry::{JobRegistry, JobStatus, job_registry_channel},
     output::{
-        Content, INLINE_OUTPUT_LIMIT, MediaResolution, OutputEntry, OutputFormat, OutputStore,
-        save_raw_to_file,
+        INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, empty_stream,
+        save_raw_to_file, stored_path,
     },
     permission::{PermissionError, PermissionHandler, TerminalMode},
     shell_session::{
-        BridgeAddress, ContainerShellRuntime, ShellBackend, ShellRuntimeAvailability,
-        ShellSessionRegistry, SshRuntimeProfile,
+        BridgeAddress, ContainerExecOutcome, ContainerShellRuntime, ShellBackend,
+        ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile,
     },
     stdin_watch::{
-        STDIN_WATCH_INTERVAL, TERMINAL_STDIN_BLOCKED_NOTICE, detect_stdin_blocked_for_local_pid,
+        EpisodeDetector, FeedCounter, LocalStdinProbe, STDIN_WATCH_INTERVAL, StdinWatchSignal,
     },
 };
 
@@ -116,11 +118,6 @@ pub async fn open_network_audit_log(
     NetworkAuditLog::rolling_daily(dir, max_files).map_err(|error| {
         TerminalError::SandboxSetup(format!("failed to open network audit log: {error}"))
     })
-}
-
-const fn supports_stdin_blocked_notice(backend: ShellBackend) -> bool {
-    matches!(backend, ShellBackend::Container)
-        || (cfg!(target_os = "linux") && matches!(backend, ShellBackend::Local))
 }
 
 #[derive(Clone)]
@@ -454,34 +451,82 @@ pub struct LongRunningJob {
     pub elapsed: Duration,
 }
 
-/// Result of a terminal execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TerminalResult {
+/// A background job whose stdin pipe has a reader waiting for input.
+///
+/// Sent once per blocking episode: the job is not alerted again until it has
+/// been fed through `terminal_input` and blocks anew.
+#[derive(Debug, Clone)]
+pub struct StdinBlockedJob {
+    /// Task ID of the job.
+    pub task_id: String,
+    /// The script the job runs.
+    pub script: String,
+}
+
+/// A background job whose stdin watch failed; carries the probe's error.
+///
+/// Sent once: after a failure the job can no longer report being blocked on
+/// stdin.
+#[derive(Debug, Clone)]
+pub struct StdinProbeFailedJob {
+    /// Task ID of the job.
+    pub task_id: String,
+    /// The script the job runs.
+    pub script: String,
+    /// Why the watch failed.
+    pub error: String,
+}
+
+/// A system alert about a background job, delivered through the terminal's
+/// alert channel.
+#[derive(Debug, Clone)]
+pub enum JobAlert {
+    /// The job crossed the long-running threshold.
+    LongRunning(LongRunningJob),
+    /// The job is waiting for input on its stdin.
+    StdinBlocked(StdinBlockedJob),
+    /// Watching the job's stdin failed; no blocked-on-stdin alert can follow.
+    StdinProbeFailed(StdinProbeFailedJob),
+}
+
+/// A command that ran to completion.
+#[derive(Debug, Clone)]
+pub struct CompletedCommand {
     /// stdout output.
-    pub stdout: OutputEntry,
+    pub stdout: CommandStream,
 
     /// stderr output (if non-empty).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stderr: Option<OutputEntry>,
+    pub stderr: Option<CommandStream>,
 
     /// Exit code of the script.
     pub exit_code: i32,
+}
 
-    /// Task ID for background execution or a killed foreground command.
-    /// Four random words like "amber-forest-thunder-pearl".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
+impl From<CompletedCommand> for CommandResult {
+    fn from(command: CompletedCommand) -> Self {
+        Self {
+            stdout: command.stdout,
+            stderr: command.stderr,
+            outcome: CommandOutcome::Exited {
+                code: command.exit_code,
+            },
+        }
+    }
+}
 
-    /// Status of the execution: `running` for a live background job,
-    /// `killed` when the run was terminated at its bound.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-
-    /// Model-facing explanation of how the command ended, present only when
-    /// the run did not finish normally (for example when the foreground
-    /// limit killed it).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub notice: Option<String>,
+/// A background job that has just been started by `terminal_background`.
+///
+/// Sent through the terminal's started-task channel once per launched job;
+/// the agent turns it into a durable reminder and a `background_task_started`
+/// event.
+#[derive(Debug, Clone)]
+pub struct StartedBackgroundTask {
+    /// Task ID of the job (four random words like "amber-forest-thunder-pearl").
+    pub task_id: String,
+    /// First lines of the redirected output; empty when nothing was written yet.
+    pub output_preview: String,
+    /// File receiving the full redirected output.
+    pub output_file: StoredFile,
 }
 
 #[derive(Clone)]
@@ -527,7 +572,7 @@ pub struct CompletedTask {
     /// The original script that was executed.
     pub script: String,
     /// The result of execution.
-    pub result: Result<TerminalResult, TerminalError>,
+    pub result: Result<CompletedCommand, TerminalError>,
 }
 
 /// Stage of a permission-lifecycle event for `terminal`.
@@ -558,7 +603,8 @@ pub struct PermissionEvent {
 #[derive(Clone)]
 pub struct BackgroundTaskReceiver {
     rx: Receiver<CompletedTask>,
-    alert_rx: Receiver<LongRunningJob>,
+    alert_rx: Receiver<JobAlert>,
+    started_rx: Receiver<StartedBackgroundTask>,
     running_tasks: Arc<AtomicUsize>,
 }
 
@@ -572,7 +618,8 @@ pub struct BackgroundTaskReceiver {
 #[derive(Clone, Debug)]
 pub struct BackgroundTaskSender {
     completed_tx: Sender<CompletedTask>,
-    alert_tx: Sender<LongRunningJob>,
+    alert_tx: Sender<JobAlert>,
+    started_tx: Sender<StartedBackgroundTask>,
     running_tasks: Arc<AtomicUsize>,
 }
 
@@ -601,9 +648,14 @@ impl BackgroundTaskSender {
         let _ = self.completed_tx.send(task).await;
     }
 
-    /// Delivers a long-running-job alert to the receiver.
-    pub async fn send_long_running(&self, alert: LongRunningJob) {
+    /// Delivers a job alert to the receiver.
+    pub async fn send_alert(&self, alert: JobAlert) {
         let _ = self.alert_tx.send(alert).await;
+    }
+
+    /// Delivers a background-task-started event to the receiver.
+    pub async fn send_started(&self, task: StartedBackgroundTask) {
+        let _ = self.started_tx.send(task).await;
     }
 }
 
@@ -614,16 +666,19 @@ impl BackgroundTaskSender {
 pub fn background_task_channel() -> (BackgroundTaskSender, BackgroundTaskReceiver) {
     let (completed_tx, rx) = async_channel::unbounded();
     let (alert_tx, alert_rx) = async_channel::unbounded();
+    let (started_tx, started_rx) = async_channel::unbounded();
     let running_tasks = Arc::new(AtomicUsize::new(0));
     (
         BackgroundTaskSender {
             completed_tx,
             alert_tx,
+            started_tx,
             running_tasks: running_tasks.clone(),
         },
         BackgroundTaskReceiver {
             rx,
             alert_rx,
+            started_rx,
             running_tasks,
         },
     )
@@ -642,17 +697,30 @@ impl BackgroundTaskReceiver {
         completed
     }
 
-    /// Takes all pending long-running job alerts without blocking.
+    /// Takes all pending job alerts without blocking.
     ///
-    /// Each alert names a background job that crossed the terminal's
-    /// long-running threshold; a job produces at most one.
+    /// A job produces at most one [`JobAlert::LongRunning`], and one
+    /// [`JobAlert::StdinBlocked`] per blocking episode.
     #[must_use]
-    pub fn take_long_running_alerts(&self) -> Vec<LongRunningJob> {
+    pub fn take_job_alerts(&self) -> Vec<JobAlert> {
         let mut alerts = Vec::new();
         while let Ok(alert) = self.alert_rx.try_recv() {
             alerts.push(alert);
         }
         alerts
+    }
+
+    /// Takes all freshly started background tasks without blocking.
+    ///
+    /// Each entry names a job `terminal_background` has just launched; a job
+    /// produces exactly one.
+    #[must_use]
+    pub fn take_started(&self) -> Vec<StartedBackgroundTask> {
+        let mut started = Vec::new();
+        while let Ok(task) = self.started_rx.try_recv() {
+            started.push(task);
+        }
+        started
     }
 
     /// Checks if there are any completed tasks waiting.
@@ -688,6 +756,49 @@ impl BackgroundTaskReceiver {
         })
         .await
     }
+
+    /// Waits for the next completed task or job alert, bounded by `duration`.
+    ///
+    /// Returns `None` when nothing arrives in time; a closed channel never
+    /// ends the wait early.
+    pub async fn recv_event_timeout(
+        &self,
+        duration: std::time::Duration,
+    ) -> Option<BackgroundTaskEvent> {
+        futures_lite::future::or(
+            async {
+                match self.rx.recv().await {
+                    Ok(task) => Some(BackgroundTaskEvent::Completed(Box::new(task))),
+                    // A closed channel never yields again; only the timer
+                    // may end the wait, or callers would spin.
+                    Err(_) => std::future::pending().await,
+                }
+            },
+            futures_lite::future::or(
+                async {
+                    match self.alert_rx.recv().await {
+                        Ok(alert) => Some(BackgroundTaskEvent::Alert(alert)),
+                        Err(_) => std::future::pending().await,
+                    }
+                },
+                async {
+                    futures_lite::future::yield_now().await;
+                    async_io::Timer::after(duration).await;
+                    None
+                },
+            ),
+        )
+        .await
+    }
+}
+
+/// What ended a [`BackgroundTaskReceiver::recv_event_timeout`] wait.
+#[derive(Debug)]
+pub enum BackgroundTaskEvent {
+    /// A background task completed; boxed to keep the enum small.
+    Completed(Box<CompletedTask>),
+    /// A job alert arrived.
+    Alert(JobAlert),
 }
 
 impl std::fmt::Debug for BackgroundTaskReceiver {
@@ -695,6 +806,7 @@ impl std::fmt::Debug for BackgroundTaskReceiver {
         f.debug_struct("BackgroundTaskReceiver")
             .field("pending", &self.rx.len())
             .field("pending_alerts", &self.alert_rx.len())
+            .field("pending_started", &self.started_rx.len())
             .field("running_tasks", &self.running_tasks.load(Ordering::Acquire))
             .finish()
     }
@@ -858,9 +970,13 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     /// Channel for sending completed background tasks (cloned for each background task).
     completed_tx: Sender<CompletedTask>,
     /// Channel for receiving long-running job alerts.
-    alert_rx: Receiver<LongRunningJob>,
+    alert_rx: Receiver<JobAlert>,
     /// Channel for sending long-running job alerts (cloned for each watchdog).
-    alert_tx: Sender<LongRunningJob>,
+    alert_tx: Sender<JobAlert>,
+    /// Channel for receiving freshly started background tasks.
+    started_rx: Receiver<StartedBackgroundTask>,
+    /// Channel for announcing freshly started background tasks.
+    started_tx: Sender<StartedBackgroundTask>,
     /// Time bounds applied to spawned executions.
     limits: TerminalLimits,
     /// Number of still-running spawned executions associated with this tool.
@@ -898,6 +1014,8 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             completed_tx: self.completed_tx.clone(),
             alert_rx: self.alert_rx.clone(),
             alert_tx: self.alert_tx.clone(),
+            started_rx: self.started_rx.clone(),
+            started_tx: self.started_tx.clone(),
             limits: self.limits,
             running_tasks: self.running_tasks.clone(),
             permission_rx: self.permission_rx.clone(),
@@ -998,6 +1116,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
         // Create channel for background task completion (unbounded to not block spawned tasks)
         let (completed_tx, completed_rx) = async_channel::unbounded();
         let (alert_tx, alert_rx) = async_channel::unbounded();
+        let (started_tx, started_rx) = async_channel::unbounded();
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (permission_tx, permission_rx) = async_channel::unbounded();
 
@@ -1012,6 +1131,8 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             completed_tx,
             alert_rx,
             alert_tx,
+            started_rx,
+            started_tx,
             limits: TerminalLimits::default(),
             running_tasks,
             permission_rx,
@@ -1061,6 +1182,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
         // Create channel for background task completion (unbounded to not block spawned tasks)
         let (completed_tx, completed_rx) = async_channel::unbounded();
         let (alert_tx, alert_rx) = async_channel::unbounded();
+        let (started_tx, started_rx) = async_channel::unbounded();
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (permission_tx, permission_rx) = async_channel::unbounded();
 
@@ -1075,6 +1197,8 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             completed_tx,
             alert_rx,
             alert_tx,
+            started_rx,
+            started_tx,
             limits: TerminalLimits::default(),
             running_tasks,
             permission_rx,
@@ -1107,6 +1231,8 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             completed_tx: self.completed_tx,
             alert_rx: self.alert_rx,
             alert_tx: self.alert_tx,
+            started_rx: self.started_rx,
+            started_tx: self.started_tx,
             limits: self.limits,
             running_tasks: self.running_tasks,
             permission_rx: self.permission_rx,
@@ -1336,6 +1462,7 @@ where
         BackgroundTaskReceiver {
             rx: self.completed_rx.clone(),
             alert_rx: self.alert_rx.clone(),
+            started_rx: self.started_rx.clone(),
             running_tasks: self.running_tasks.clone(),
         }
     }
@@ -1381,6 +1508,7 @@ where
     pub fn child(&self) -> Self {
         let (completed_tx, completed_rx) = async_channel::unbounded();
         let (alert_tx, alert_rx) = async_channel::unbounded();
+        let (started_tx, started_rx) = async_channel::unbounded();
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (permission_tx, permission_rx) = async_channel::unbounded();
         let (job_registry, job_registry_service) = job_registry_channel();
@@ -1397,6 +1525,8 @@ where
             completed_tx,
             alert_rx,
             alert_tx,
+            started_rx,
+            started_tx,
             limits: self.limits,
             running_tasks,
             permission_rx,
@@ -1594,15 +1724,13 @@ where
         let ExecutionTarget { mode, backend } = target;
         let (result_tx, result_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
-        let (stdin_blocked_tx, stdin_blocked_rx) = async_channel::bounded(1);
-        // Only a foreground call reads the detector's notice: it becomes
-        // guidance inside the kill result. A background job's stdin is
-        // served by `terminal_input`.
-        let stdin_blocked_notice = if background || !supports_stdin_blocked_notice(backend.kind()) {
-            None
-        } else {
-            Some(stdin_blocked_tx)
-        };
+        // A foreground command reads EOF from a null stdin; only a background
+        // job gets a stdin pipe, fed through `terminal_input` and watched.
+        let stdin_alerts = background.then(|| StdinAlerts {
+            tx: self.alert_tx.clone(),
+            task_id: task_id.clone(),
+            script: script.clone(),
+        });
 
         let background_startup = BackgroundStartup::new(startup_tx);
         let running_tasks = self.running_tasks.clone();
@@ -1624,7 +1752,7 @@ where
                 script,
                 mode,
                 backend,
-                stdin_blocked_notice,
+                stdin_alerts,
                 background_startup,
                 expect,
                 resolution,
@@ -1644,7 +1772,6 @@ where
         SpawnedTerminal {
             result: result_rx,
             startup: startup_rx,
-            stdin_blocked_notice: stdin_blocked_rx,
         }
     }
 }
@@ -1681,7 +1808,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         // foreground clock only measures the command's own runtime.
         wait_for_background_startup(&spawned.startup).await?;
         match wait_for_foreground_result(&spawned.result, self.limits.foreground).await {
-            Some(Ok(result)) => ToolResult::json(&result),
+            Some(Ok(result)) => CommandResult::from(result).into_tool_result(),
             Some(Err(err)) => Err(anyhow::anyhow!(err)),
             None => {
                 self.finish_killed_foreground(&spawned, &prepared.task_id)
@@ -1765,6 +1892,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
             &prepared.store_dir,
             &prepared.task_id,
             prepared.max_lines,
+            &self.started_tx,
         )
         .await
     }
@@ -1799,11 +1927,11 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
                     && matches!(job.status, JobStatus::Running)
                 {
                     let _ = alert_tx
-                        .send(LongRunningJob {
+                        .send(JobAlert::LongRunning(LongRunningJob {
                             task_id,
                             script: job.script,
                             elapsed: job.started_at.elapsed(),
-                        })
+                        }))
                         .await;
                 }
             })
@@ -1817,41 +1945,32 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
         spawned: &SpawnedTerminal,
         task_id: &str,
     ) -> aither_core::Result<ToolResult> {
-        let stdin_notice = spawned.stdin_blocked_notice.try_recv().ok();
         if !self.job_registry.kill_by_task_id(task_id).await
             && let Ok(result) = spawned.result.try_recv()
         {
             // The command finished between the limit expiring and the kill.
             return match result {
-                Ok(result) => ToolResult::json(&result),
+                Ok(result) => CommandResult::from(result).into_tool_result(),
                 Err(err) => Err(anyhow::anyhow!(err)),
             };
         }
-        let mut notice = format!(
+        let notice = format!(
             "Killed after running {}s in the foreground. Use terminal_background to run a command longer than that.",
             self.limits.foreground.as_secs()
         );
-        if let Some(stdin_notice) = stdin_notice {
-            notice = format!("{notice}\n{stdin_notice}");
+        let partial = spawned.result.recv().await.ok().and_then(Result::ok);
+        let (stdout, stderr) = partial.map_or((empty_stream(), None), |partial| {
+            (partial.stdout, partial.stderr)
+        });
+        CommandResult {
+            stdout,
+            stderr,
+            outcome: CommandOutcome::Killed {
+                task_id: task_id.to_string(),
+                notice,
+            },
         }
-        let mut result = spawned
-            .result
-            .recv()
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(TerminalResult {
-                stdout: OutputEntry::Empty,
-                stderr: None,
-                exit_code: -1,
-                task_id: None,
-                status: None,
-                notice: None,
-            });
-        result.task_id = Some(task_id.to_string());
-        result.status = Some("killed".to_string());
-        result.notice = Some(notice);
-        ToolResult::json(&result)
+        .into_tool_result()
     }
 }
 
@@ -1938,9 +2057,9 @@ async fn wait_for_background_startup(
 /// Returns `None` when the limit expired (or the channel was dropped, which
 /// the caller treats the same way — the job is finished or killed).
 async fn wait_for_foreground_result(
-    result_rx: &Receiver<Result<TerminalResult, String>>,
+    result_rx: &Receiver<Result<CompletedCommand, String>>,
     limit: Duration,
-) -> Option<Result<TerminalResult, String>> {
+) -> Option<Result<CompletedCommand, String>> {
     futures_lite::future::or(async { result_rx.recv().await.ok() }, async {
         async_io::Timer::after(limit).await;
         result_rx.try_recv().ok()
@@ -1953,17 +2072,43 @@ async fn background_terminal_result(
     store_dir: &Path,
     task_id: &str,
     max_lines: usize,
+    started_tx: &Sender<StartedBackgroundTask>,
 ) -> aither_core::Result<ToolResult> {
-    let stdout =
+    let redirect =
         start_background_output_redirect(job_registry, store_dir, task_id, max_lines).await?;
-    ToolResult::json(&TerminalResult {
+    let _ = started_tx
+        .send(StartedBackgroundTask {
+            task_id: task_id.to_string(),
+            output_preview: redirect.preview.clone(),
+            output_file: redirect.file.clone(),
+        })
+        .await;
+    let stdout = if redirect.truncated {
+        CommandStream::Stored {
+            file: redirect.file.clone(),
+            preview: redirect.preview,
+            truncated: true,
+        }
+    } else {
+        CommandStream::Inline(redirect.preview)
+    };
+    CommandResult {
         stdout,
         stderr: None,
-        exit_code: 0,
-        task_id: Some(task_id.to_string()),
-        status: Some("running".to_string()),
-        notice: None,
-    })
+        outcome: CommandOutcome::Running {
+            task_id: task_id.to_string(),
+            output: redirect.file,
+        },
+    }
+    .into_tool_result()
+}
+
+/// Output file a background job was redirected to, with what it holds so far.
+struct BackgroundRedirect {
+    file: StoredFile,
+    /// First lines already written; empty when nothing was.
+    preview: String,
+    truncated: bool,
 }
 
 async fn start_background_output_redirect(
@@ -1971,24 +2116,33 @@ async fn start_background_output_redirect(
     store_dir: &Path,
     task_id: &str,
     max_lines: usize,
-) -> Result<OutputEntry, anyhow::Error> {
+) -> Result<BackgroundRedirect, anyhow::Error> {
     let (url, output_path) = save_raw_to_file(store_dir, &[]).await?;
-    let output_path_string = output_path.display().to_string();
+    let file = StoredFile {
+        url,
+        path: output_path.display().to_string(),
+    };
     let snapshot = job_registry
         .start_output_redirect(task_id, output_path)
         .await
         .map_err(anyhow::Error::msg)?;
     let (preview, truncated) = preview_first_lines(&snapshot, max_lines);
-    let text = if preview.is_empty() {
-        "(no output yet)".to_string()
-    } else {
-        preview
-    };
-    Ok(OutputEntry::Stored {
-        path: output_path_string,
-        url,
-        content: Some(Content::Text { text, truncated }),
+    Ok(BackgroundRedirect {
+        file,
+        preview: background_preview(&preview),
+        truncated,
     })
+}
+
+/// The preview of what a background job has written so far: empty when it
+/// wrote only whitespace, otherwise the text with its trailing whitespace cut
+/// and the first line's indentation kept.
+fn background_preview(preview: &str) -> String {
+    if preview.trim().is_empty() {
+        String::new()
+    } else {
+        preview.trim_end().to_string()
+    }
 }
 
 struct StandaloneExecution<P, E> {
@@ -2005,7 +2159,7 @@ struct StandaloneExecution<P, E> {
     script: String,
     mode: TerminalMode,
     backend: ExecutionBackend,
-    stdin_blocked_notice: Option<Sender<String>>,
+    stdin_alerts: Option<StdinAlerts>,
     background_startup: BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
@@ -2031,7 +2185,7 @@ struct StandaloneStart<'a, P, E> {
     script: &'a str,
     mode: TerminalMode,
     backend: &'a ExecutionBackend,
-    stdin_blocked_notice: Option<Sender<String>>,
+    stdin_alerts: Option<StdinAlerts>,
     background_startup: &'a BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
@@ -2051,7 +2205,7 @@ struct LocalBackgroundExecution<'a, E> {
     script: &'a str,
     mode: TerminalMode,
     job_registry: &'a JobRegistry,
-    stdin_blocked_notice: Option<Sender<String>>,
+    stdin_alerts: Option<StdinAlerts>,
     background_startup: &'a BackgroundStartup,
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
@@ -2069,7 +2223,7 @@ struct ContainerBackgroundExecution<'a, E> {
     prepared_tools: &'a PreparedTools<ContainerPath>,
     ipc_commands: &'a [String],
     job_registry: &'a JobRegistry,
-    stdin_blocked_notice: Option<Sender<String>>,
+    stdin_alerts: Option<StdinAlerts>,
     background_startup: &'a BackgroundStartup,
     priority: ProcessPriority,
 }
@@ -2115,16 +2269,6 @@ enum ExecutionBackend {
     },
 }
 
-impl ExecutionBackend {
-    const fn kind(&self) -> ShellBackend {
-        match self {
-            Self::Local(_) => ShellBackend::Local,
-            Self::Container { .. } => ShellBackend::Container,
-            Self::Ssh { .. } => ShellBackend::Ssh,
-        }
-    }
-}
-
 struct ExecutionTarget {
     mode: TerminalMode,
     backend: ExecutionBackend,
@@ -2143,9 +2287,8 @@ struct TerminalSpawnRequest {
 }
 
 struct SpawnedTerminal {
-    result: Receiver<Result<TerminalResult, String>>,
+    result: Receiver<Result<CompletedCommand, String>>,
     startup: Receiver<Result<(), String>>,
-    stdin_blocked_notice: Receiver<String>,
 }
 
 struct SpawnedTerminalTask<P, E> {
@@ -2162,14 +2305,14 @@ struct SpawnedTerminalTask<P, E> {
     script: String,
     mode: TerminalMode,
     backend: ExecutionBackend,
-    stdin_blocked_notice: Option<Sender<String>>,
+    stdin_alerts: Option<StdinAlerts>,
     background_startup: BackgroundStartup,
     expect: OutputFormat,
     resolution: MediaResolution,
     store_dir: PathBuf,
     max_lines: usize,
     raw: bool,
-    result_tx: Sender<Result<TerminalResult, String>>,
+    result_tx: Sender<Result<CompletedCommand, String>>,
     completed_tx: Sender<CompletedTask>,
     running_tasks: Arc<AtomicUsize>,
     network_audit: Option<NetworkAuditLog>,
@@ -2197,7 +2340,7 @@ where
         script,
         mode,
         backend,
-        stdin_blocked_notice,
+        stdin_alerts,
         background_startup,
         expect,
         resolution,
@@ -2226,7 +2369,7 @@ where
         script: script.clone(),
         mode,
         backend,
-        stdin_blocked_notice,
+        stdin_alerts,
         background_startup,
         network_audit,
         priority,
@@ -2260,7 +2403,7 @@ where
 /// Standalone script execution that can be spawned in a background task.
 async fn execute_script_standalone<P, E>(
     request: StandaloneExecution<P, E>,
-) -> Result<TerminalResult, TerminalError>
+) -> Result<CompletedCommand, TerminalError>
 where
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
@@ -2279,7 +2422,7 @@ where
         script,
         mode,
         backend,
-        stdin_blocked_notice,
+        stdin_alerts,
         background_startup,
         network_audit,
         priority,
@@ -2311,7 +2454,7 @@ where
         script: &script,
         mode,
         backend: &backend,
-        stdin_blocked_notice,
+        stdin_alerts,
         background_startup: &background_startup,
         network_audit,
         priority,
@@ -2343,7 +2486,7 @@ where
 
     debug!(exit_code, "background script completed");
 
-    let output_path = result.stdout.stored_path(&store_dir);
+    let output_path = stored_path(&result.stdout);
     job_registry.complete(pid, exit_code, output_path).await;
 
     Ok(result)
@@ -2395,7 +2538,7 @@ where
                 prepared_tools: tools,
                 ipc_commands: &ipc_commands,
                 job_registry: request.job_registry,
-                stdin_blocked_notice: request.stdin_blocked_notice,
+                stdin_alerts: request.stdin_alerts,
                 background_startup: request.background_startup,
                 priority: request.priority,
             })
@@ -2432,7 +2575,7 @@ where
         script: request.script,
         mode: request.mode,
         job_registry: request.job_registry,
-        stdin_blocked_notice: request.stdin_blocked_notice,
+        stdin_alerts: request.stdin_alerts,
         background_startup: request.background_startup,
         priority: request.priority,
         #[cfg(all(unix, feature = "jobserver"))]
@@ -2473,7 +2616,7 @@ where
 
 async fn save_completed_process_output(
     request: CompletedProcessOutput<'_>,
-) -> Result<TerminalResult, TerminalError> {
+) -> Result<CompletedCommand, TerminalError> {
     let CompletedProcessOutput {
         job_registry,
         pid,
@@ -2502,13 +2645,10 @@ async fn save_completed_process_output(
     let stderr = save_completed_stderr(job_registry, pid, store_dir, &output.stderr).await?;
     let exit_code = output.status.code().unwrap_or(-1);
 
-    Ok(TerminalResult {
+    Ok(CompletedCommand {
         stdout,
         stderr,
         exit_code,
-        task_id: None,
-        status: None,
-        notice: None,
     })
 }
 
@@ -2526,7 +2666,7 @@ async fn save_completed_stdout(
     pid: u32,
     stdout: &[u8],
     format: CompletedStdoutFormat<'_>,
-) -> Result<OutputEntry, TerminalError> {
+) -> Result<CommandStream, TerminalError> {
     let byte_limit = Some(INLINE_OUTPUT_LIMIT);
     let data_to_save = if format.background_output {
         Cow::Borrowed(stdout)
@@ -2583,7 +2723,7 @@ async fn save_completed_stderr(
     pid: u32,
     store_dir: &Path,
     stderr: &[u8],
-) -> Result<Option<OutputEntry>, TerminalError> {
+) -> Result<Option<CommandStream>, TerminalError> {
     if stderr.is_empty() {
         return Ok(None);
     }
@@ -2682,7 +2822,7 @@ where
         .command(program)
         .args(args)
         .envs(runtime_environment)
-        .stdin(StdioConfig::Piped)
+        .stdin(local_stdin_config(context.stdin_alerts.as_ref()))
         .stdout(StdioConfig::Piped)
         .stderr(StdioConfig::Piped)
         .spawn()
@@ -2708,7 +2848,7 @@ where
         context.executor,
         context.job_registry,
         pid,
-        context.stdin_blocked_notice,
+        context.stdin_alerts,
         "missing stdout pipe for sandbox process",
         "missing stderr pipe for sandbox process",
     )
@@ -2764,7 +2904,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         .command(program)
         .args(args)
         .envs(runtime_environment)
-        .stdin(StdioConfig::Piped)
+        .stdin(local_stdin_config(context.stdin_alerts.as_ref()))
         .stdout(StdioConfig::Piped)
         .stderr(StdioConfig::Piped)
         .spawn()
@@ -2790,7 +2930,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         context.executor,
         context.job_registry,
         pid,
-        context.stdin_blocked_notice,
+        context.stdin_alerts,
         "missing stdout pipe for unsafe process",
         "missing stderr pipe for unsafe process",
     )
@@ -2799,17 +2939,124 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     Ok((pid, output))
 }
 
+/// Where a background job's stdin alerts go.
+///
+/// Its presence is what makes a command a background job: a command without
+/// one reads EOF from a null stdin.
+struct StdinAlerts {
+    tx: Sender<JobAlert>,
+    task_id: String,
+    script: String,
+}
+
+impl StdinAlerts {
+    async fn raise(&self) {
+        debug!(task_id = %self.task_id, "background job is blocked on stdin");
+        let _ = self
+            .tx
+            .send(JobAlert::StdinBlocked(StdinBlockedJob {
+                task_id: self.task_id.clone(),
+                script: self.script.clone(),
+            }))
+            .await;
+    }
+
+    /// Tells the agent this job's stdin watch died: no blocked-on-stdin
+    /// alert can come for it anymore.
+    async fn raise_failure(&self, error: String) {
+        warn!(task_id = %self.task_id, error = %error, "stdin watch failed");
+        let _ = self
+            .tx
+            .send(JobAlert::StdinProbeFailed(StdinProbeFailedJob {
+                task_id: self.task_id.clone(),
+                script: self.script.clone(),
+                error,
+            }))
+            .await;
+    }
+}
+
+const fn local_stdin_config(alerts: Option<&StdinAlerts>) -> StdioConfig {
+    if alerts.is_some() {
+        StdioConfig::Piped
+    } else {
+        StdioConfig::Null
+    }
+}
+
+/// Watches one local background job's stdin pipe for a waiting reader.
+struct LocalStdinWatch {
+    probe: LocalStdinProbe,
+    feed: FeedCounter,
+    detector: EpisodeDetector,
+    alerts: StdinAlerts,
+}
+
+impl LocalStdinWatch {
+    /// Probes the pipe every [`STDIN_WATCH_INTERVAL`] and raises one alert per
+    /// blocking episode, for as long as the future is polled.
+    async fn run(mut self) -> std::convert::Infallible {
+        loop {
+            async_io::Timer::after(STDIN_WATCH_INTERVAL).await;
+            let Self {
+                probe,
+                feed,
+                mut detector,
+                alerts,
+            } = self;
+            let fed = feed.count();
+            let (probe, observed) = blocking::unblock(move || {
+                let observed = probe.probe();
+                (probe, observed)
+            })
+            .await;
+            match observed {
+                Ok(observed) => {
+                    if detector.observe(fed, observed) {
+                        alerts.raise().await;
+                    }
+                }
+                Err(error) => {
+                    // Detection cannot run: surface it once, then park — the
+                    // job's exit still ends the race in
+                    // `wait_for_local_process_exit`.
+                    alerts.raise_failure(error.to_string()).await;
+                    std::future::pending::<()>().await;
+                }
+            }
+            self = Self {
+                probe,
+                feed,
+                detector,
+                alerts,
+            };
+        }
+    }
+}
+
 async fn collect_local_process_output<E: Executor + Clone + 'static>(
     mut child: heel::Child,
     executor: E,
     job_registry: &JobRegistry,
     pid: u32,
-    stdin_blocked_notice: Option<async_channel::Sender<String>>,
+    stdin_alerts: Option<StdinAlerts>,
     missing_stdout_message: &'static str,
     missing_stderr_message: &'static str,
 ) -> Result<std::process::Output, TerminalError> {
+    let mut stdin_watch = None;
     if let Some(stdin) = child.take_stdin() {
-        let input_tx = spawn_terminal_stdin_writer(stdin);
+        let feed = FeedCounter::default();
+        if let Some(alerts) = stdin_alerts {
+            let probe = LocalStdinProbe::new(pid, &stdin)
+                .map_err(|error| TerminalError::Execution(format!("stdin probe: {error}")))?;
+            stdin_watch = Some(LocalStdinWatch {
+                probe,
+                feed: feed.clone(),
+                detector: EpisodeDetector::default(),
+                alerts,
+            });
+        }
+        let input_tx = spawn_terminal_stdin_writer(stdin, feed);
         job_registry.attach_terminal_input(pid, input_tx).await;
     }
 
@@ -2828,7 +3075,7 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
         .spawn(drain_terminal_chunks(job_registry.clone(), pid, chunk_rx))
         .detach();
 
-    let status = match wait_for_local_process_exit(&mut child, pid, stdin_blocked_notice).await {
+    let status = match wait_for_local_process_exit(&mut child, stdin_watch).await {
         Ok(status) => status,
         Err(error) => {
             job_registry.close_stdout(pid).await;
@@ -2849,44 +3096,21 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
     Ok(output)
 }
 
+/// Waits for the child to exit, raising stdin alerts meanwhile.
 async fn wait_for_local_process_exit(
     child: &mut heel::Child,
-    pid: u32,
-    stdin_blocked_notice: Option<async_channel::Sender<String>>,
+    stdin_watch: Option<LocalStdinWatch>,
 ) -> Result<std::process::ExitStatus, TerminalError> {
-    if stdin_blocked_notice.is_none() {
-        return child
+    let exit = async {
+        child
             .wait()
             .await
-            .map_err(|error| TerminalError::Execution(error.to_string()));
-    }
-
-    let mut notice_sent = false;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| TerminalError::Execution(error.to_string()))?
-        {
-            return Ok(status);
-        }
-
-        if !notice_sent {
-            match detect_stdin_blocked_for_local_pid(pid).await {
-                Ok(true) => {
-                    if let Some(notice_tx) = stdin_blocked_notice.as_ref() {
-                        let _ = notice_tx.try_send(TERMINAL_STDIN_BLOCKED_NOTICE.to_string());
-                    }
-                    notice_sent = true;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::debug!(error = %error, pid, "stdin watchdog probe failed");
-                }
-            }
-        }
-
-        async_io::Timer::after(STDIN_WATCH_INTERVAL).await;
-    }
+            .map_err(|error| TerminalError::Execution(error.to_string()))
+    };
+    let Some(stdin_watch) = stdin_watch else {
+        return exit.await;
+    };
+    futures_lite::future::or(exit, async { match stdin_watch.run().await {} }).await
 }
 
 async fn execute_container_background<E: Executor + Clone + 'static>(
@@ -2914,10 +3138,33 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             None,
         )
         .await;
-    context
-        .job_registry
-        .attach_terminal_input(pid, input_tx)
-        .await;
+    // A foreground command gets no input channel: the dropped sender is the
+    // EOF its stdin reads.
+    let stdin_blocked = if let Some(alerts) = context.stdin_alerts {
+        context
+            .job_registry
+            .attach_terminal_input(pid, input_tx)
+            .await;
+        let (signal_tx, signal_rx) = async_channel::unbounded::<StdinWatchSignal>();
+        context
+            .executor
+            .clone()
+            .spawn(async move {
+                while let Ok(signal) = signal_rx.recv().await {
+                    match signal {
+                        StdinWatchSignal::Blocked => alerts.raise().await,
+                        StdinWatchSignal::Failed(error) => {
+                            alerts.raise_failure(error).await;
+                        }
+                    }
+                }
+            })
+            .detach();
+        Some(signal_tx)
+    } else {
+        drop(input_tx);
+        None
+    };
     context.job_registry.attach_kill_switch(pid, kill_tx).await;
     context.background_startup.report_ready().await;
 
@@ -2950,7 +3197,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             CONTAINER_EXEC_WORKING_DIR,
             kill_rx,
             input_rx,
-            context.stdin_blocked_notice,
+            stdin_blocked,
         )
         .await;
 
@@ -2958,33 +3205,37 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         bridge.stop().await;
     }
 
+    record_container_exec_outcome(context.job_registry, pid, execution).await
+}
+
+/// Records a finished container exec in the job's streams and folds it into
+/// the call's result.
+async fn record_container_exec_outcome(
+    job_registry: &JobRegistry,
+    pid: u32,
+    execution: Result<ContainerExecOutcome, String>,
+) -> Result<(u32, std::process::Output), TerminalError> {
     match execution {
-        Ok(crate::shell_session::ContainerExecOutcome::Completed(output)) => {
+        Ok(ContainerExecOutcome::Completed(output)) => {
             if !output.stdout.is_empty() {
-                context
-                    .job_registry
-                    .append_stdout(pid, output.stdout.clone())
-                    .await;
+                job_registry.append_stdout(pid, output.stdout.clone()).await;
             }
             if !output.stderr.is_empty() {
-                context
-                    .job_registry
-                    .append_stderr(pid, output.stderr.clone())
-                    .await;
+                job_registry.append_stderr(pid, output.stderr.clone()).await;
             }
-            context.job_registry.close_stdout(pid).await;
-            context.job_registry.close_stderr(pid).await;
+            job_registry.close_stdout(pid).await;
+            job_registry.close_stderr(pid).await;
             Ok((pid, output))
         }
-        Ok(crate::shell_session::ContainerExecOutcome::Killed) => {
-            context.job_registry.close_stdout(pid).await;
-            context.job_registry.close_stderr(pid).await;
+        Ok(ContainerExecOutcome::Killed) => {
+            job_registry.close_stdout(pid).await;
+            job_registry.close_stderr(pid).await;
             Err(TerminalError::Execution("container job killed".to_string()))
         }
         Err(err) => {
-            context.job_registry.fail(pid, &err, None).await;
-            context.job_registry.close_stdout(pid).await;
-            context.job_registry.close_stderr(pid).await;
+            job_registry.fail(pid, &err, None).await;
+            job_registry.close_stdout(pid).await;
+            job_registry.close_stderr(pid).await;
             Err(TerminalError::Execution(err))
         }
     }
@@ -3637,7 +3888,10 @@ fn spawn_terminal_reader<R>(
     });
 }
 
-fn spawn_terminal_stdin_writer<W>(mut writer: W) -> async_channel::Sender<Vec<u8>>
+fn spawn_terminal_stdin_writer<W>(
+    mut writer: W,
+    feed: FeedCounter,
+) -> async_channel::Sender<Vec<u8>>
 where
     W: Write + Send + 'static,
 {
@@ -3647,6 +3901,7 @@ where
             if bytes.is_empty() {
                 continue;
             }
+            feed.record();
             if let Err(error) = writer.write_all(&bytes) {
                 warn!(error = %error, "terminal stdin write failed");
                 break;
@@ -3767,8 +4022,11 @@ mod tests {
 
     use super::*;
     use crate::ToolRegistryBuilder;
+    #[cfg(unix)]
     use crate::builtin::{InputTerminalArgs, InputTerminalTool};
-    use heel::{DenyAll, NiceLevel};
+    #[cfg(unix)]
+    use heel::DenyAll;
+    use heel::NiceLevel;
 
     async fn prepared_test_registry() -> (tempfile::TempDir, ShellSessionRegistry) {
         let cache = tempfile::tempdir().unwrap();
@@ -3824,7 +4082,7 @@ mod tests {
             _working_dir: &str,
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
-            _stdin_blocked_notice: Option<Sender<String>>,
+            _stdin_blocked: Option<Sender<StdinWatchSignal>>,
         ) -> impl std::future::Future<Output = Result<crate::ContainerExecOutcome, String>> + Send
         {
             std::future::ready(Err("adoption never executes in the container".to_string()))
@@ -3969,9 +4227,8 @@ mod tests {
             )
             .await
             .expect("baseline commands should run");
-        let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.exit_code, 0, "{payload:?}");
-        let stdout = output_text(&payload.stdout).unwrap_or_default();
+        let stdout = render_terminal_result(&result);
+        assert!(!stdout.contains("Exit code:"), "{stdout}");
         for command in ["apply_patch", "rg", "ast-grep", "jq"] {
             assert!(
                 stdout.contains(&format!("{command} 1.0.0")),
@@ -4072,13 +4329,14 @@ mod tests {
         ));
     }
 
-    fn parse_terminal_tool_result(result: &ToolResult) -> TerminalResult {
-        serde_json::from_str(
-            &result
-                .render_for_model()
-                .expect("terminal result should render"),
-        )
-        .expect("terminal tool output should decode")
+    fn render_terminal_result(result: &ToolResult) -> String {
+        result.render_for_model()
+    }
+
+    fn started_task_id(receiver: &BackgroundTaskReceiver) -> String {
+        let started = receiver.take_started();
+        assert_eq!(started.len(), 1, "expected one started-task event");
+        started[0].task_id.clone()
     }
 
     #[cfg(unix)]
@@ -4122,19 +4380,11 @@ mod tests {
         assert!(dir.path().join(".config").is_dir());
     }
 
-    fn output_text(output: &OutputEntry) -> Option<&str> {
+    fn output_text(output: &CommandStream) -> Option<&str> {
         match output {
-            OutputEntry::Inline { content } | OutputEntry::Loaded { content, .. } => {
-                match content {
-                    Content::Text { text, .. } => Some(text.as_str()),
-                    Content::Image { .. } => None,
-                }
-            }
-            OutputEntry::Stored { content, .. } => match content.as_ref() {
-                Some(Content::Text { text, .. }) => Some(text.as_str()),
-                Some(Content::Image { .. }) | None => None,
-            },
-            OutputEntry::Empty => None,
+            CommandStream::Inline(text) => Some(text.as_str()),
+            CommandStream::Stored { preview, .. } => Some(preview.as_str()),
+            CommandStream::Image { .. } => None,
         }
     }
 
@@ -4198,61 +4448,67 @@ mod tests {
         assert_eq!(args.mode, TerminalExecutionMode::Default);
     }
 
-    #[tokio::test]
-    async fn test_terminal_result_serialization() {
-        use crate::output::Content;
+    #[test]
+    fn background_preview_keeps_leading_indentation() {
+        assert_eq!(
+            background_preview("  col a  col b\nrow\n\n"),
+            "  col a  col b\nrow"
+        );
+        assert_eq!(background_preview(" \n\t\n"), "");
+    }
 
-        let result = TerminalResult {
-            stdout: OutputEntry::Stored {
-                url: "outputs/bold-oak-calm-river.txt".to_string(),
-                path: "/tmp/outputs/bold-oak-calm-river.txt".to_string(),
-                content: Some(Content::Text {
-                    text: "preview text".to_string(),
-                    truncated: true,
-                }),
-            },
-            stderr: None,
-            exit_code: 0,
-            task_id: None,
-            status: None,
-            notice: None,
-        };
+    fn inline(text: &str) -> CommandStream {
+        CommandStream::Inline(text.to_string())
+    }
 
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("bold-oak-calm-river.txt"));
-        assert!(!json.contains("stderr")); // should be skipped when None
-        assert!(!json.contains("task_id")); // should be skipped when None
+    fn completed(
+        stdout: CommandStream,
+        stderr: Option<CommandStream>,
+        exit_code: i32,
+    ) -> CommandResult {
+        CompletedCommand {
+            stdout,
+            stderr,
+            exit_code,
+        }
+        .into()
+    }
 
-        // Test inline output (no URL)
-        let result_inline = TerminalResult {
-            stdout: OutputEntry::Inline {
-                content: Content::Text {
-                    text: "done".to_string(),
-                    truncated: false,
-                },
-            },
-            stderr: None,
-            exit_code: 0,
-            task_id: None,
-            status: None,
-            notice: None,
-        };
-        let json_inline = serde_json::to_string(&result_inline).unwrap();
-        assert!(!json_inline.contains("\"url\""));
-        assert!(json_inline.contains("\"content\""));
+    #[test]
+    fn completed_command_exit_zero_is_the_bare_output() {
+        let result = completed(inline("done"), None, 0)
+            .into_tool_result()
+            .unwrap();
+        assert_eq!(result.render_for_model(), "done\n");
+        assert_eq!(
+            result.command().map(|command| &command.outcome),
+            Some(&CommandOutcome::Exited { code: 0 })
+        );
+    }
 
-        // Test background task result
-        let result_background = TerminalResult {
-            stdout: OutputEntry::Empty,
-            stderr: None,
-            exit_code: 0,
-            task_id: Some("amber-forest-thunder-pearl".to_string()),
-            status: Some("running".to_string()),
-            notice: None,
-        };
-        let json_bg = serde_json::to_string(&result_background).unwrap();
-        assert!(json_bg.contains("\"task_id\":\"amber-forest-thunder-pearl\""));
-        assert!(json_bg.contains("\"status\":\"running\""));
+    #[test]
+    fn completed_command_without_any_output_says_so() {
+        assert_eq!(
+            completed(empty_stream(), None, 0).render_for_model(),
+            "(no output)\n"
+        );
+    }
+
+    #[test]
+    fn completed_command_non_zero_exit_with_stderr() {
+        let result = completed(inline("partial"), Some(inline("oops")), 2);
+        assert_eq!(
+            result.render_for_model(),
+            "partial\nstderr:\noops\nExit code: 2.\n"
+        );
+    }
+
+    #[test]
+    fn completed_command_stderr_only_has_no_contradicting_placeholder() {
+        assert_eq!(
+            completed(empty_stream(), Some(inline("oops")), 2).render_for_model(),
+            "stderr:\noops\nExit code: 2.\n"
+        );
     }
 
     #[tokio::test]
@@ -4558,11 +4814,12 @@ mod tests {
             )
             .await
             .expect("terminal call should succeed");
-        let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.status.as_deref(), Some("running"));
-        let task_id = payload
-            .task_id
-            .expect("terminal_background should return a task id");
+        let rendered = render_terminal_result(&result);
+        assert!(
+            rendered.contains("Started in background as task '"),
+            "{rendered}"
+        );
+        let task_id = started_task_id(&child.background_receiver());
 
         let input = query_control(
             child.registry(),
@@ -4600,19 +4857,21 @@ mod tests {
         let parent_kill =
             query_control(parent.registry(), "terminal_kill", &["--task-id", &task_id]).await;
         assert!(
-            parent_kill.to_string().contains("\"killed\":false"),
+            parent_kill
+                .to_string()
+                .contains("No running background task"),
             "parent terminal_kill must not reach the child's task: {parent_kill}"
         );
 
         let kill = query_control(child.registry(), "terminal_kill", &["--task-id", &task_id]).await;
         assert!(
-            kill.to_string().contains("\"killed\":true"),
+            kill.to_string().contains("terminated"),
             "child terminal_kill should stop its task: {kill}"
         );
         let stopped =
             query_control(child.registry(), "terminal_read", &["--task-id", &task_id]).await;
         assert!(
-            stopped.to_string().contains("\"kind\":\"killed\""),
+            stopped.to_string().contains("was killed"),
             "child task should be reported killed: {stopped}"
         );
     }
@@ -4679,7 +4938,7 @@ mod tests {
             script: "/bin/pwd".to_string(),
             mode: TerminalMode::Sandboxed,
             backend: ExecutionBackend::Local(tool.shell_sessions.local_tools().unwrap().clone()),
-            stdin_blocked_notice: None,
+            stdin_alerts: None,
             background_startup: BackgroundStartup::new(startup_tx),
             network_audit: None,
             priority: ProcessPriority::default(),
@@ -4703,7 +4962,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn failed_command_returns_json_with_nonzero_exit_code() {
+    async fn failed_command_reports_nonzero_exit_code() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
         let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
@@ -4746,15 +5005,13 @@ mod tests {
             !result.is_error(),
             "non-zero exit must not produce ToolResult::Error, got: {result:?}"
         );
-        let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.exit_code, 42, "exit code should round-trip");
-        assert!(
-            payload.task_id.is_none(),
-            "foreground completion must not carry a task id"
+        assert_eq!(
+            render_terminal_result(&result),
+            "(no output)\nExit code: 42.\n"
         );
-        assert!(
-            payload.status.is_none(),
-            "foreground completion must not carry a running status"
+        assert_eq!(
+            result.command().map(|command| &command.outcome),
+            Some(&CommandOutcome::Exited { code: 42 })
         );
     }
 
@@ -4806,12 +5063,12 @@ mod tests {
             .await
             .expect("terminal call should succeed");
 
-        let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.status.as_deref(), Some("running"));
-        let task_id = payload
-            .task_id
-            .clone()
-            .expect("terminal_background should return a task id");
+        let rendered = render_terminal_result(&result);
+        assert!(
+            rendered.contains("Started in background as task '"),
+            "{rendered}"
+        );
+        let task_id = started_task_id(&tool.background_receiver());
 
         input_tool
             .call(
@@ -4882,8 +5139,11 @@ mod tests {
             )
             .await
             .expect("terminal call should succeed");
-        let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.status.as_deref(), Some("running"));
+        let rendered = render_terminal_result(&result);
+        assert!(
+            rendered.contains("Started in background as task '"),
+            "{rendered}"
+        );
 
         let mut child_pid = None;
         for _ in 0..100 {
@@ -4915,58 +5175,238 @@ mod tests {
         panic!("descendant process {child_pid} survived terminal cancellation");
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn sandboxed_terminal_kills_stdin_blocked_command_and_reports_it() {
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreground_command_reading_stdin_gets_eof_at_once() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                local: true,
-                container: false,
-                ssh: false,
-            })
-            .with_foreground_limit(Duration::from_secs(2));
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
-        let tool = tool.with_registry(registry);
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
 
+        let started = std::time::Instant::now();
         let result = tool
             .call(
-                TerminalArgs {
-                    description: "wait for terminal input and echo it back".to_string(),
-                    script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\""
-                        .to_string(),
-                    mode: TerminalExecutionMode::Sandboxed,
-                    ssh_server_id: None,
-                    expect: OutputFormat::Text,
-                    resolution: MediaResolution::Auto,
-                    max_lines: 50,
-                    raw: false,
-                },
+                terminal_args("read all of stdin", "cat"),
                 ToolContext::new(),
             )
             .await
             .expect("terminal call should succeed");
 
-        let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.status.as_deref(), Some("killed"));
-        let notice = payload
-            .notice
-            .expect("a killed foreground result carries a notice");
+        let command = result.command().expect("terminal returns a command result");
         assert!(
-            notice.contains(TERMINAL_STDIN_BLOCKED_NOTICE),
-            "notice should report the stdin wait: {notice}"
+            matches!(command.outcome, CommandOutcome::Exited { code: 0 }),
+            "the call must exit 0, not be killed: {:?}",
+            command.outcome
         );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cat must see EOF instead of waiting out the limit"
+        );
+    }
+
+    #[cfg(unix)]
+    fn terminal_args(description: &str, script: &str) -> TerminalArgs {
+        TerminalArgs {
+            description: description.to_string(),
+            script: script.to_string(),
+            mode: TerminalExecutionMode::Sandboxed,
+            ssh_server_id: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            max_lines: 50,
+            raw: false,
+        }
+    }
+
+    /// Starts `script` as a background job and returns its task id.
+    #[cfg(unix)]
+    async fn start_background_job(
+        tool: &TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+        script: &str,
+    ) -> String {
+        let result = tool
+            .background_tool()
+            .call(
+                TerminalBackgroundArgs {
+                    terminal: terminal_args("background job", script),
+                    timeout: 30,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal_background should start the job");
+        match result.command().map(|command| &command.outcome) {
+            Some(CommandOutcome::Running { task_id, .. }) => task_id.clone(),
+            other => panic!("background job needs a task id, got {other:?}"),
+        }
+    }
+
+    /// Collects the alerts that arrive within `window`.
+    #[cfg(unix)]
+    async fn alerts_within(receiver: &BackgroundTaskReceiver, window: Duration) -> Vec<JobAlert> {
+        let deadline = std::time::Instant::now() + window;
+        let mut alerts = Vec::new();
+        while std::time::Instant::now() < deadline {
+            alerts.extend(receiver.take_job_alerts());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        alerts
+    }
+
+    /// A foreground container command must see stdin EOF at once: the input
+    /// sender is dropped before the exec runs. Catches the regression where
+    /// the sender lived until the call returned and `cat` waited out the
+    /// limit.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn container_foreground_command_reading_stdin_gets_eof_at_once() {
+        /// A container executor that asserts its stdin is already at EOF.
+        struct ForegroundStdinEofExec;
+
+        impl crate::ContainerExec for ForegroundStdinEofExec {
+            async fn exec(
+                &self,
+                _container_id: &str,
+                _script: &str,
+                _working_dir: &str,
+                _kill_rx: Receiver<()>,
+                stdin_rx: Receiver<Vec<u8>>,
+                _stdin_blocked: Option<Sender<StdinWatchSignal>>,
+            ) -> Result<ContainerExecOutcome, String> {
+                let eof = futures_lite::future::or(async { Some(stdin_rx.recv().await) }, async {
+                    async_io::Timer::after(Duration::from_secs(5)).await;
+                    None
+                })
+                .await
+                .expect("a foreground exec's stdin must be EOF at once, not left open");
+                assert!(eof.is_err(), "a foreground exec's stdin must carry no data");
+                Ok(ContainerExecOutcome::Completed(std::process::Output {
+                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(dir.path()));
+        let (job_registry, job_registry_service) = job_registry_channel();
+        tokio::spawn(async move { job_registry_service.serve().await });
+        let container_tools =
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle());
+        let runtime = ContainerShellRuntime::new(
+            "aither-test-foreground-eof",
+            crate::ContainerIpcRoute::new(
+                "host.docker.internal",
+                crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
+                    .expect("loopback binds the bridge"),
+            ),
+            crate::AnyContainerExec::new(Arc::new(ForegroundStdinEofExec)),
+        );
+        let (startup_tx, _startup_rx) = async_channel::bounded(1);
+        let (_pid, output) = execute_container_background(ContainerBackgroundExecution {
+            executor: executor_core::tokio::TokioGlobal,
+            registry: &registry,
+            task_id: "task-test",
+            execution_id: "exec-test",
+            script: "cat",
+            mode: TerminalMode::Sandboxed,
+            container_runtime: &runtime,
+            prepared_tools: &container_tools,
+            ipc_commands: &[],
+            job_registry: &job_registry,
+            stdin_alerts: None,
+            background_startup: &BackgroundStartup::new(startup_tx),
+            priority: ProcessPriority::default(),
+        })
+        .await
+        .expect("a foreground container exec should complete at EOF");
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// A job whose `reader` script blocks on stdin yields exactly one alert
+    /// until it is fed, and finishes once it is.
+    #[cfg(unix)]
+    async fn stdin_reader_alerts_once_and_resumes_when_fed(reader: &str) {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        let background_receiver = tool.background_receiver();
+        let task_id = start_background_job(&tool, reader).await;
+
+        let alerts = alerts_within(&background_receiver, Duration::from_secs(8)).await;
+        assert!(
+            matches!(
+                alerts.as_slice(),
+                [JobAlert::StdinBlocked(job)] if job.task_id == task_id
+            ),
+            "a blocked reader must yield exactly one stdin alert: {alerts:?}"
+        );
+
+        InputTerminalTool::new(tool.job_registry())
+            .call(
+                InputTerminalArgs {
+                    task_id: task_id.clone(),
+                    input: "lexo".to_string(),
+                    append_newline: true,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal_input should succeed");
+        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let terminal_result = completed.result.expect("the fed job should complete");
+        let stdout =
+            output_text(&terminal_result.stdout).expect("completed task should include stdout");
+        assert!(stdout.contains("hello lexo"), "got: {stdout}");
+        assert!(
+            background_receiver.take_job_alerts().is_empty(),
+            "a fed job that finished must not alert again"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_job_blocked_on_stdin_yields_one_alert() {
+        stdin_reader_alerts_once_and_resumes_when_fed("read name; printf 'hello %s\\n' \"$name\"")
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_grandchild_blocked_on_stdin_yields_one_alert() {
+        stdin_reader_alerts_once_and_resumes_when_fed(
+            "( ( read name; printf 'hello %s\\n' \"$name\" ); true )",
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_job_that_never_reads_stdin_yields_no_alert() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        let background_receiver = tool.background_receiver();
+        let task_id = start_background_job(&tool, "sleep 3; echo finished").await;
+
+        let alerts = alerts_within(&background_receiver, Duration::from_secs(4)).await;
+        assert!(alerts.is_empty(), "no alert expected: {alerts:?}");
+        wait_for_completed_task(&background_receiver, &task_id).await;
     }
 
     /// The nice value `level` steps below this test process lands at, capped
@@ -5045,14 +5485,11 @@ mod tests {
             )
             .await
             .expect("terminal call should succeed");
-        let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.status.as_deref(), Some("killed"));
-        let notice = payload
-            .notice
-            .expect("a killed foreground result carries a notice");
+        let rendered = render_terminal_result(&result);
+        assert!(rendered.contains("Task ID: '"), "{rendered}");
         assert!(
-            notice.contains("terminal_background"),
-            "notice should point to terminal_background: {notice}"
+            rendered.contains("terminal_background"),
+            "rendered result should point to terminal_background: {rendered}"
         );
 
         let child_pid = async_fs::read_to_string(&child_pid_path)
@@ -5110,9 +5547,12 @@ mod tests {
             .call(args(1), ToolContext::new())
             .await
             .expect("a timeout within the cap should start the job");
-        let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.status.as_deref(), Some("running"));
-        let task_id = payload.task_id.expect("background job needs a task id");
+        let rendered = render_terminal_result(&result);
+        assert!(
+            rendered.contains("Started in background as task '"),
+            "{rendered}"
+        );
+        let task_id = started_task_id(&background_receiver);
 
         let completed = wait_for_completed_task(&background_receiver, &task_id).await;
         let info = tool
@@ -5140,7 +5580,7 @@ mod tests {
         .await;
         let background_receiver = tool.background_receiver();
 
-        let result = tool
+        let _result = tool
             .background_tool()
             .call(
                 TerminalBackgroundArgs {
@@ -5160,13 +5600,11 @@ mod tests {
             )
             .await
             .expect("terminal_background should start the job");
-        let task_id = parse_terminal_tool_result(&result)
-            .task_id
-            .expect("background job needs a task id");
+        let task_id = started_task_id(&background_receiver);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let alerts = loop {
-            let alerts = background_receiver.take_long_running_alerts();
+            let alerts = background_receiver.take_job_alerts();
             if !alerts.is_empty() {
                 break alerts;
             }
@@ -5177,9 +5615,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].task_id, task_id);
         assert!(
-            background_receiver.take_long_running_alerts().is_empty(),
+            matches!(&alerts[0], JobAlert::LongRunning(job) if job.task_id == task_id),
+            "expected the long-running alert for the job: {alerts:?}"
+        );
+        assert!(
+            background_receiver.take_job_alerts().is_empty(),
             "the same job must not alert twice"
         );
 
@@ -5286,8 +5727,8 @@ mod tests {
             release_probe(dir.path());
         };
         let (result, ()) = futures::join!(call, probe);
-        let payload = parse_terminal_tool_result(&result.expect("terminal call should succeed"));
-        assert_eq!(payload.exit_code, 0);
+        let rendered = render_terminal_result(&result.expect("terminal call should succeed"));
+        assert!(!rendered.contains("Exit code:"), "{rendered}");
     }
 
     #[cfg(unix)]
@@ -5321,12 +5762,12 @@ mod tests {
             )
             .await
             .expect("terminal call should succeed");
-        let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.status.as_deref(), Some("running"));
-        let task_id = payload
-            .task_id
-            .clone()
-            .expect("terminal_background should return a task id");
+        let rendered = render_terminal_result(&result);
+        assert!(
+            rendered.contains("Started in background as task '"),
+            "{rendered}"
+        );
+        let task_id = started_task_id(&tool.background_receiver());
 
         let pid = probe_pid(dir.path()).await;
         assert_eq!(
@@ -5373,12 +5814,25 @@ mod tests {
             )
             .await
             .expect("terminal call should succeed");
-        let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.status.as_deref(), Some("running"));
-        let task_id = payload
-            .task_id
-            .clone()
-            .expect("terminal_background should return a background task id");
+        let rendered = render_terminal_result(&result);
+        let mut started = tool.background_receiver().take_started();
+        assert_eq!(started.len(), 1, "expected one started-task event");
+        let started = started.remove(0);
+        let task_id = started.task_id;
+        assert_eq!(
+            rendered,
+            format!(
+                "Started in background as task '{task_id}'; output is being written to {} (absolute path: {}).\n",
+                started.output_file.url, started.output_file.path
+            )
+        );
+        assert_eq!(
+            result.command().map(|command| &command.outcome),
+            Some(&CommandOutcome::Running {
+                task_id: task_id.clone(),
+                output: started.output_file.clone(),
+            })
+        );
 
         let pid = probe_pid(dir.path()).await;
         assert_eq!(
@@ -5502,9 +5956,10 @@ mod tests {
             arguments: Self::Arguments,
             _cx: ToolContext,
         ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
-            std::future::ready(ToolResult::json(&serde_json::json!({
-                "marker": arguments.marker,
-            })))
+            std::future::ready(Ok(ToolResult::text(format!(
+                "marker: {}",
+                arguments.marker
+            ))))
         }
     }
 
@@ -5563,9 +6018,7 @@ mod tests {
         let rendered: String =
             rmp_serde::from_slice(payload).expect("response should decode as msgpack");
         assert_eq!(
-            rendered,
-            serde_json::to_string_pretty(&serde_json::json!({ "marker": "pong" }))
-                .expect("value should render"),
+            rendered, "marker: pong",
             "probe_echo should answer with the CLI-rendered payload, as `heel ipc` prints it"
         );
 
@@ -5798,13 +6251,10 @@ mod tests {
             )
             .await
             .expect("container terminal call should succeed");
-        let payload = parse_terminal_tool_result(&result);
-        let stdout = output_text(&payload.stdout).unwrap_or_default();
-        assert_eq!(
-            payload.exit_code,
-            0,
-            "container command failed; stdout: {stdout}; stderr: {:?}",
-            payload.stderr.as_ref().and_then(output_text)
+        let stdout = render_terminal_result(&result);
+        assert!(
+            !stdout.contains("Exit code:"),
+            "container command failed; stdout: {stdout}"
         );
         // The CI job runs the test with --nocapture so the container's output
         // — the applied nice level and the live probe reply — lands in the
