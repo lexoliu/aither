@@ -88,7 +88,12 @@ pub trait ContextSource: Send + Sync + 'static {
     /// Returning `None` omits the source entirely — the right answer when
     /// there is nothing to say, since an empty block still costs tokens and
     /// still invites the model to reason about it.
-    fn render(&self) -> impl Future<Output = Option<Block>> + Send;
+    ///
+    /// The default renders nothing, for a source that only raises durable
+    /// alerts.
+    fn render(&self) -> impl Future<Output = Option<Block>> + Send {
+        async { None }
+    }
 
     /// Reports the block that was actually sent.
     ///
@@ -98,6 +103,21 @@ pub trait ContextSource: Send + Sync + 'static {
     fn commit(&mut self, block: &Block) -> impl Future<Output = ()> + Send {
         let _ = block;
         async {}
+    }
+
+    /// Produces a durable alert as a request is being assembled.
+    ///
+    /// Unlike [`render`](Self::render), the returned block is appended to the
+    /// conversation once and stays there, so a source can insert content at
+    /// the moment it changes instead of re-rendering it into every request.
+    /// `reassembled` is `true` when the window was rewritten since the
+    /// previous request (a cold-cache reassembly or an applied compaction):
+    /// every durable alert from before it is gone, and a source that needs
+    /// the model to still know something must say it again. The first call
+    /// of an agent is the start of the session.
+    fn on_request(&mut self, reassembled: bool) -> impl Future<Output = Option<Block>> + Send {
+        let _ = reassembled;
+        async { None }
     }
 
     /// Produces a durable alert after a turn that executed tools.
@@ -126,6 +146,11 @@ trait ContextSourceImpl: Send + Sync {
 
     fn commit<'a>(&'a mut self, block: &'a Block) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
+    fn on_request<'a>(
+        &'a mut self,
+        reassembled: bool,
+    ) -> Pin<Box<dyn Future<Output = Option<Block>> + Send + 'a>>;
+
     fn on_tool_turn_end<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Option<Block>> + Send + 'a>>;
@@ -140,6 +165,13 @@ impl<T: ContextSource> ContextSourceImpl for T {
 
     fn commit<'a>(&'a mut self, block: &'a Block) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(ContextSource::commit(self, block))
+    }
+
+    fn on_request<'a>(
+        &'a mut self,
+        reassembled: bool,
+    ) -> Pin<Box<dyn Future<Output = Option<Block>> + Send + 'a>> {
+        Box::pin(ContextSource::on_request(self, reassembled))
     }
 
     fn on_tool_turn_end<'a>(
@@ -184,6 +216,14 @@ impl AnyContextSource {
     /// See [`ContextSource::commit`].
     pub fn commit<'a>(&'a mut self, block: &'a Block) -> impl Future<Output = ()> + Send + 'a {
         self.inner.commit(block)
+    }
+
+    /// See [`ContextSource::on_request`].
+    pub fn on_request(
+        &mut self,
+        reassembled: bool,
+    ) -> impl Future<Output = Option<Block>> + Send + '_ {
+        self.inner.on_request(reassembled)
     }
 
     /// See [`ContextSource::on_tool_turn_end`].
