@@ -202,8 +202,9 @@ jobs:
   # `cargo hack` expands both flags into one `cargo check` per feature
   # combination, and over a 25-crate workspace that list cannot finish inside
   # one job's timeout — every run was being cancelled at 45 minutes.
-  # `--partition k/8` slices the generated command list into eighths, so the
-  # same two invocations run in eight parallel jobs with identical coverage.
+  # `--partition k/8` cuts each invocation's command list into eight
+  # contiguous slices of equal length, so every job runs slice k of every
+  # invocation below and the eight jobs together run each command once.
   # Feature-pair coverage is a release-grade gate: it runs only on pull
   # requests bound for main, not on routine dev pushes and PRs.
   feature-checks:
@@ -215,6 +216,16 @@ jobs:
       fail-fast: false
       matrix:
         part: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      # Aliases that only union other features.
+      AGGREGATE_FEATURES: all-providers,all-tools,full
+      # Features whose dependency graph costs minutes per distinct feature set:
+      # llama rebuilds llama.cpp, search re-checks the lance/datafusion/arrow
+      # stack. Their combinations sit next to each other in cargo-hack's order,
+      # so slicing one list by count put all of search's pairs in one job.
+      # Slicing them as their own list spreads them over all eight jobs.
+      # `--at-least-one-of` needs two or more features.
+      HEAVY_FEATURES: search,llama
     steps:
       - uses: actions/checkout@v4
       - name: Reclaim runner disk
@@ -231,13 +242,21 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack check --each-feature --no-dev-deps --partition ${{ matrix.part }}/8
+      # `--each-feature` is `--all-features`, `--no-default-features` and every
+      # feature alone. The depth-2 powerset below already runs the latter two
+      # for every non-aggregate feature, so only `--all-features` and the
+      # aggregates alone are left to run here.
+      - run: cargo hack check --all-features --no-dev-deps --partition ${{ matrix.part }}/8
+      - run: cargo hack check --each-feature --include-features "$AGGREGATE_FEATURES" --no-dev-deps --partition ${{ matrix.part }}/8
       # The full powerset of this crate's 20 features is 89,766 `cargo check`
       # runs, which no CI job can finish. Depth 2 covers every pair of features
-      # — where feature-interaction bugs actually live — in 152 runs. The three
+      # — where feature-interaction bugs actually live — in 209 runs. The three
       # aggregate aliases are unions of features already covered individually
-      # and pairwise, and are what makes the full powerset explode.
-      - run: cargo hack check --feature-powerset --depth 2 --exclude-features all-providers,all-tools,full --no-dev-deps --partition ${{ matrix.part }}/8
+      # and pairwise, and are what makes the full powerset explode. The two
+      # steps split that one list into the combinations with a heavy feature
+      # and those without one, so together they run each combination once.
+      - run: cargo hack check --feature-powerset --depth 2 --exclude-features "$AGGREGATE_FEATURES" --at-least-one-of "$HEAVY_FEATURES" --no-dev-deps --partition ${{ matrix.part }}/8
+      - run: cargo hack check --feature-powerset --depth 2 --exclude-features "$AGGREGATE_FEATURES,$HEAVY_FEATURES" --no-dev-deps --partition ${{ matrix.part }}/8
 
   # ------------------------------------------------------------------ coverage
   # Instrumented builds cost roughly double, and coverage of a crate that is
