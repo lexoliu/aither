@@ -3733,7 +3733,14 @@ You are a file-defined agent.
                 let (_, rest) = message.content().split_once("task_id=")?;
                 Some(rest.split(')').next()?.to_string())
             })
-            .expect("a terminal result reported a task id")
+            .unwrap_or_else(|| {
+                let contents: Vec<&str> = request
+                    .messages()
+                    .iter()
+                    .map(|message| message.content())
+                    .collect();
+                panic!("no terminal result reported a task id; messages: {contents:#?}")
+            })
     }
 
     fn control_call(id: &str, name: &str, task_id: &str) -> Event {
