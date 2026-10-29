@@ -42,7 +42,7 @@ pub enum CommandRefusal {
     },
     /// The command, or a shell string inside it, is not valid shell, so it
     /// cannot be checked.
-    Unparseable {
+    Unparsable {
         /// What the parser reported.
         reason: String,
     },
@@ -55,8 +55,8 @@ struct KillByNameTemplate<'a> {
 }
 
 #[derive(Template)]
-#[template(path = "unparseable_command_refused.txt")]
-struct UnparseableTemplate<'a> {
+#[template(path = "unparsable_command_refused.txt")]
+struct UnparsableTemplate<'a> {
     reason: &'a str,
 }
 
@@ -64,7 +64,7 @@ impl Display for CommandRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rendered = match self {
             Self::KillByName { program } => KillByNameTemplate { program }.render(),
-            Self::Unparseable { reason } => UnparseableTemplate { reason }.render(),
+            Self::Unparsable { reason } => UnparsableTemplate { reason }.render(),
         };
         f.write_str(&rendered.map_err(|_| fmt::Error)?)
     }
@@ -76,7 +76,7 @@ impl std::error::Error for CommandRefusal {}
 ///
 /// # Errors
 /// Returns [`CommandRefusal::KillByName`] when a refused program is invoked,
-/// and [`CommandRefusal::Unparseable`] when the script is not valid shell.
+/// and [`CommandRefusal::Unparsable`] when the script is not valid shell.
 pub fn check(script: &str) -> Result<(), CommandRefusal> {
     script_check(
         script,
@@ -87,8 +87,8 @@ pub fn check(script: &str) -> Result<(), CommandRefusal> {
     )
 }
 
-fn unparseable(reason: impl Display) -> CommandRefusal {
-    CommandRefusal::Unparseable {
+fn unparsable(reason: impl Display) -> CommandRefusal {
+    CommandRefusal::Unparsable {
         reason: reason.to_string(),
     }
 }
@@ -112,7 +112,7 @@ impl Cx<'_> {
 
 fn script_check(script: &str, cx: Cx<'_>) -> Result<(), CommandRefusal> {
     if cx.depth > MAX_DEPTH {
-        return Err(unparseable(format!(
+        return Err(unparsable(format!(
             "shell strings are nested more than {MAX_DEPTH} levels deep"
         )));
     }
@@ -122,7 +122,7 @@ fn script_check(script: &str, cx: Cx<'_>) -> Result<(), CommandRefusal> {
         &SourceInfo::default(),
     )
     .parse_program()
-    .map_err(unparseable)?;
+    .map_err(unparsable)?;
     for list in &program.complete_commands {
         compound_list(list, cx)?;
     }
@@ -413,7 +413,7 @@ fn io_redirect(redirect: &IoRedirect, cx: Cx<'_>) -> Result<(), CommandRefusal> 
                 // valid word cannot hold a substitution worth following.
                 match text(&document.doc.value, cx) {
                     Err(refusal @ CommandRefusal::KillByName { .. }) => return Err(refusal),
-                    Err(CommandRefusal::Unparseable { .. }) | Ok(_) => {}
+                    Err(CommandRefusal::Unparsable { .. }) | Ok(_) => {}
                 }
             }
             Ok(())
@@ -432,7 +432,7 @@ fn word(word: &ast::Word, cx: Cx<'_>) -> Result<String, CommandRefusal> {
 
 fn text(source: &str, cx: Cx<'_>) -> Result<String, CommandRefusal> {
     let pieces =
-        brush_parser::word::parse(source, &ParserOptions::default()).map_err(unparseable)?;
+        brush_parser::word::parse(source, &ParserOptions::default()).map_err(unparsable)?;
     let mut literal = String::new();
     pieces_text(&pieces, &mut literal, cx)?;
     Ok(literal)
@@ -1046,8 +1046,8 @@ mod tests {
             "fi",
         ] {
             assert!(
-                matches!(check(script), Err(CommandRefusal::Unparseable { .. })),
-                "`{script}` must be refused as unparseable"
+                matches!(check(script), Err(CommandRefusal::Unparsable { .. })),
+                "`{script}` must be refused as unparsable"
             );
         }
     }
@@ -1057,7 +1057,7 @@ mod tests {
         let script = format!("{}pkill foo", "eval ".repeat(MAX_DEPTH + 2));
         assert!(matches!(
             check(&script),
-            Err(CommandRefusal::Unparseable { .. })
+            Err(CommandRefusal::Unparsable { .. })
         ));
     }
 
@@ -1069,7 +1069,7 @@ mod tests {
         .to_string();
         assert!(kill.contains("pkill"), "{kill}");
         assert!(kill.contains("PID"), "{kill}");
-        let parse = CommandRefusal::Unparseable {
+        let parse = CommandRefusal::Unparsable {
             reason: "syntax error".to_string(),
         }
         .to_string();
