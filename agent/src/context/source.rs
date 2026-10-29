@@ -18,11 +18,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use serde::Serialize;
-
-use super::window::serialize_xml;
-
-/// A single piece of rendered context, identified by its XML tag.
+/// A single piece of rendered context, identified by its tag.
 ///
 /// The tag is both the delimiter the model sees and the identity the agent
 /// uses to replace a block it rendered earlier, so it must be stable for a
@@ -41,14 +37,6 @@ impl Block {
             tag: tag.into(),
             content: content.into(),
         }
-    }
-
-    /// Creates a block by serializing `value` into an XML element named `tag`.
-    #[must_use]
-    pub fn xml<T: Serialize>(tag: impl Into<String>, value: &T) -> Self {
-        let tag = tag.into();
-        let content = serialize_xml(&tag, value);
-        Self { tag, content }
     }
 
     /// The block's stable identity.
@@ -248,19 +236,5 @@ mod tests {
             Some("counter_alert".to_string())
         );
         assert!(source.on_final_turn().await.is_none());
-    }
-
-    #[test]
-    fn xml_blocks_wrap_their_payload_in_the_tag() {
-        #[derive(Serialize)]
-        struct Payload {
-            #[serde(rename = "$text")]
-            text: &'static str,
-        }
-
-        let block = Block::xml("tasks_document", &Payload { text: "- [ ] work" });
-        assert_eq!(block.tag(), "tasks_document");
-        assert!(block.content().starts_with("<tasks_document>"));
-        assert!(block.content().contains("- [ ] work"));
     }
 }

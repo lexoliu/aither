@@ -34,9 +34,9 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use aither_core::llm::tool::ToolResultPart;
 use aither_core::llm::{IntoToolResult, Tool, ToolContext, ToolResult};
 use askama::Template;
-use base64::Engine as _;
 use heel::IpcCommand;
 use heel::ipc::IpcError;
 use schemars::JsonSchema;
@@ -48,7 +48,10 @@ use serde_json::Value;
 // Tool Registry
 // ============================================================================
 
-/// Payload exchanged between IPC command handlers and terminal command wrappers.
+/// Payload an IPC command returns over the wire.
+///
+/// Binary results never reach it: [`tool_output_to_payload`] writes them to
+/// the output directory and the payload names the stored file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandPayload {
@@ -57,18 +60,15 @@ pub enum CommandPayload {
         /// Text content.
         content: String,
     },
-    /// Structured JSON output.
-    Json {
-        /// JSON value.
-        value: Value,
-    },
-    /// Binary output encoded as base64 with a MIME type.
-    Binary {
-        /// MIME type of the binary payload.
-        mime: String,
-        /// Base64-encoded bytes.
-        data_base64: String,
-    },
+}
+
+#[derive(Template)]
+#[template(path = "stored_binary_part.txt", escape = "none")]
+struct StoredBinaryPartTemplate<'a> {
+    mime: &'a str,
+    byte_count: usize,
+    url: &'a str,
+    path: &'a str,
 }
 
 #[derive(Template)]
@@ -177,22 +177,31 @@ fn render_flag_prefix(flag: &str, short: Option<char>) -> String {
 }
 
 impl CommandPayload {
-    fn render_for_cli(&self) -> Result<String, String> {
-        match self {
-            Self::Text { content } => Ok(content.clone()),
-            Self::Json { value } => serde_json::to_string_pretty(value)
-                .map_err(|error| prefix_error("failed to encode JSON output: ", &error)),
-            Self::Binary { mime, data_base64 } => {
-                let mut rendered = String::new();
-                rendered.push_str("[binary payload: ");
-                rendered.push_str(mime);
-                rendered.push_str(", ");
-                rendered.push_str(data_base64.len().to_string().as_str());
-                rendered.push_str(" base64 chars]");
-                Ok(rendered)
-            }
-        }
+    fn render_for_cli(&self) -> String {
+        let Self::Text { content } = self;
+        content.clone()
     }
+}
+
+/// Writes a binary payload into `output_dir` and renders the line that
+/// references the stored file, the way terminal output references stored
+/// images.
+async fn stored_binary_text(
+    mime: &str,
+    content: &[u8],
+    output_dir: &Path,
+) -> Result<String, String> {
+    let (url, path) = crate::output::save_binary_to_file(output_dir, content, mime)
+        .await
+        .map_err(|error| prefix_error("failed to store binary tool result: ", &error))?;
+    Ok(StoredBinaryPartTemplate {
+        mime,
+        byte_count: content.len(),
+        url: &url,
+        path: &path.display().to_string(),
+    }
+    .render()
+    .expect("stored binary part template must render"))
 }
 
 /// Command result envelope returned to IPC callers.
@@ -237,9 +246,7 @@ impl CommandEnvelope {
 
 /// Type-erased tool handler function.
 type ToolHandlerFn = Box<
-    dyn Fn(
-            Vec<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
+    dyn Fn(Vec<String>) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -266,15 +273,14 @@ use crate::output::{INLINE_OUTPUT_LIMIT, generate_word_filename};
 ///
 /// Returns the output as-is if small enough, or saves to file and returns
 /// a reference message if the output exceeds the limit.
-async fn handle_large_output(output: Option<CommandPayload>, output_dir: &Path) -> CommandEnvelope {
-    let Some(output) = output else {
-        return CommandEnvelope::success_empty();
-    };
-
-    let rendered = match output.render_for_cli() {
-        Ok(rendered) => rendered,
+async fn handle_large_output(output: ToolResult, output_dir: &Path) -> CommandEnvelope {
+    let output = match tool_output_to_payload(output, output_dir).await {
+        Ok(Some(output)) => output,
+        Ok(None) => return CommandEnvelope::success_empty(),
         Err(error) => return CommandEnvelope::failure(error),
     };
+
+    let rendered = output.render_for_cli();
 
     if rendered.is_empty() {
         return CommandEnvelope::success_empty();
@@ -307,26 +313,42 @@ async fn handle_large_output(output: Option<CommandPayload>, output_dir: &Path) 
     })
 }
 
-fn tool_output_to_payload(output: impl IntoToolResult) -> Result<Option<CommandPayload>, String> {
-    match output
+/// Converts a finished tool result into a command payload for IPC dispatch.
+///
+/// Everything becomes text for the model: text-like results pass through, a
+/// command result renders its prose, and every binary payload, a lone one
+/// included, is written to `output_dir` and replaced by a line naming the
+/// stored file. A typed tool error becomes the command's error.
+///
+/// # Errors
+///
+/// Returns an error when the conversion fails, a binary payload cannot be
+/// stored, or the result is a typed tool error (surfaced as the command
+/// error).
+pub async fn tool_output_to_payload(
+    output: impl IntoToolResult,
+    output_dir: &Path,
+) -> Result<Option<CommandPayload>, String> {
+    let text = match output
         .into_tool_result()
         .map_err(|error| prefix_error("failed to convert tool result: ", &error))?
     {
-        ToolResult::Done => Ok(None),
-        ToolResult::Text { text } | ToolResult::Tsv { text } => {
-            Ok(Some(CommandPayload::Text { content: text }))
+        ToolResult::Done => return Ok(None),
+        ToolResult::Error { message } => return Err(message),
+        ToolResult::Binary { mime, content } => {
+            stored_binary_text(&mime, &content, output_dir).await?
         }
-        ToolResult::Json { value } => Ok(Some(CommandPayload::Json { value })),
-        ToolResult::Binary { mime, content } => Ok(Some(CommandPayload::Binary {
-            mime,
-            data_base64: base64::engine::general_purpose::STANDARD.encode(content),
-        })),
         ToolResult::Parts { parts } => {
             let mut rendered = String::new();
             for part in &parts {
-                let text = part
-                    .render_for_model()
-                    .map_err(|error| prefix_error("failed to render tool result part: ", &error))?;
+                let text = match part {
+                    ToolResultPart::Binary { mime, content } => {
+                        stored_binary_text(mime, content, output_dir).await?
+                    }
+                    ToolResultPart::Text { .. } | ToolResultPart::Tsv { .. } => {
+                        part.render_for_model()
+                    }
+                };
                 if text.is_empty() {
                     continue;
                 }
@@ -335,14 +357,13 @@ fn tool_output_to_payload(output: impl IntoToolResult) -> Result<Option<CommandP
                 }
                 rendered.push_str(&text);
             }
-            if rendered.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(CommandPayload::Text { content: rendered }))
-            }
+            rendered
         }
-        ToolResult::Error { message } => Err(message),
-    }
+        result @ (ToolResult::Text { .. } | ToolResult::Tsv { .. } | ToolResult::Command(_)) => {
+            result.render_for_model()
+        }
+    };
+    Ok((!text.is_empty()).then_some(CommandPayload::Text { content: text }))
 }
 
 // ============================================================================
@@ -504,7 +525,9 @@ impl ToolRegistryBuilder {
                     .call(parsed, ToolContext::new())
                     .await
                     .map_err(|error| error.to_string())?;
-                tool_output_to_payload(output)
+                output
+                    .into_tool_result()
+                    .map_err(|error| prefix_error("failed to convert tool result: ", &error))
             })
         });
 
@@ -527,10 +550,7 @@ impl ToolRegistryBuilder {
     /// `Tool` implementations.
     pub fn configure_definition_handler<F>(&mut self, definition: &ToolDefinition, handler: F)
     where
-        F: Fn(
-                Value,
-            )
-                -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
+        F: Fn(Value) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
             + Send
             + Sync
             + 'static,
@@ -587,10 +607,7 @@ impl ToolRegistryBuilder {
         help: impl Into<String>,
         handler: F,
     ) where
-        F: Fn(
-                Vec<String>,
-            )
-                -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
+        F: Fn(Vec<String>) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
             + Send
             + Sync
             + 'static,
@@ -753,10 +770,9 @@ pub fn envelope_to_cli(envelope: CommandEnvelope) -> Result<String, IpcError> {
                 .unwrap_or_else(|| "command failed".to_string()),
         ));
     }
-    envelope
+    Ok(envelope
         .payload
-        .map_or_else(|| Ok(String::new()), |payload| payload.render_for_cli())
-        .map_err(IpcError::remote)
+        .map_or_else(String::new, |payload| payload.render_for_cli()))
 }
 
 /// Rebuilds the command line a `heel ipc` request carries.
@@ -973,6 +989,7 @@ pub fn register_ipc_gateway_command(
 pub struct ToolCommand<T: Tool> {
     tool: T,
     schema: Value,
+    output_dir: PathBuf,
 }
 
 impl<T: Tool + std::fmt::Debug> std::fmt::Debug for ToolCommand<T> {
@@ -987,14 +1004,19 @@ impl<T: Tool> ToolCommand<T>
 where
     T::Arguments: DeserializeOwned + JsonSchema,
 {
-    /// Creates a new command wrapper for the given tool.
+    /// Creates a new command wrapper for the given tool. Binary results are
+    /// stored in `output_dir`.
     ///
     /// # Panics
     /// Panics if the tool argument schema cannot be serialized.
-    pub fn new(tool: T) -> Self {
+    pub fn new(tool: T, output_dir: impl Into<PathBuf>) -> Self {
         let schema = schemars::schema_for!(T::Arguments);
         let schema = serde_json::to_value(schema).expect("failed to serialize tool schema");
-        Self { tool, schema }
+        Self {
+            tool,
+            schema,
+            output_dir: output_dir.into(),
+        }
     }
 
     /// Returns the tool name.
@@ -1018,11 +1040,10 @@ where
         let parsed: T::Arguments = serde_json::from_value(json_args)?;
         // A CLI invocation has nowhere to show progress.
         let output = self.tool.call(parsed, ToolContext::new()).await?;
-        let payload = tool_output_to_payload(output).map_err(anyhow::Error::msg)?;
-        payload.map_or_else(
-            || Ok(String::new()),
-            |payload| payload.render_for_cli().map_err(anyhow::Error::msg),
-        )
+        let payload = tool_output_to_payload(output, &self.output_dir)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        Ok(payload.map_or_else(String::new, |payload| payload.render_for_cli()))
     }
 }
 
@@ -1036,6 +1057,7 @@ pub struct IpcToolCommand<T: Tool> {
     name: String,
     stdin_arg: Option<String>,
     help: String,
+    output_dir: PathBuf,
 }
 
 impl<T: Tool + std::fmt::Debug> std::fmt::Debug for IpcToolCommand<T> {
@@ -1055,6 +1077,7 @@ impl<T: Tool + Clone> Clone for IpcToolCommand<T> {
             name: self.name.clone(),
             stdin_arg: self.stdin_arg.clone(),
             help: self.help.clone(),
+            output_dir: self.output_dir.clone(),
         }
     }
 }
@@ -1064,11 +1087,12 @@ where
     T: Tool + Send + Sync + 'static,
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
-    /// Creates a new IPC command wrapper for the given tool.
+    /// Creates a new IPC command wrapper for the given tool. Binary results
+    /// are stored in `output_dir`.
     ///
     /// # Panics
     /// Panics if the tool argument schema cannot be serialized.
-    pub fn new(tool: T) -> Self {
+    pub fn new(tool: T, output_dir: impl Into<PathBuf>) -> Self {
         let schema = serde_json::to_value(schemars::schema_for!(T::Arguments))
             .expect("failed to serialize tool schema");
         let name = tool.name().to_string();
@@ -1081,6 +1105,7 @@ where
             name,
             stdin_arg,
             help,
+            output_dir: output_dir.into(),
         }
     }
 }
@@ -1139,11 +1164,10 @@ where
 
         // A shell invocation has nowhere to show progress.
         match self.tool.call(parsed, ToolContext::new()).await {
-            Ok(output) => match tool_output_to_payload(output) {
-                Ok(Some(payload)) => payload.render_for_cli().map_err(IpcError::remote),
-                Ok(None) => Ok(String::new()),
-                Err(error) => Err(IpcError::remote(error)),
-            },
+            Ok(output) => tool_output_to_payload(output, &self.output_dir)
+                .await
+                .map(|payload| payload.map_or_else(String::new, |payload| payload.render_for_cli()))
+                .map_err(IpcError::remote),
             Err(e) => Err(IpcError::remote(e.to_string())),
         }
     }
@@ -1161,14 +1185,18 @@ where
 /// use heel::IpcRouter;
 ///
 /// let router = IpcRouter::new();
-/// let router = register_tool_direct(router, my_tool);
+/// let router = register_tool_direct(router, my_tool, outputs_dir);
 /// ```
-pub fn register_tool_direct<T>(router: heel::IpcRouter, tool: T) -> heel::IpcRouter
+pub fn register_tool_direct<T>(
+    router: heel::IpcRouter,
+    tool: T,
+    output_dir: impl Into<PathBuf>,
+) -> heel::IpcRouter
 where
     T: Tool + Send + Sync + Clone + Default + 'static,
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
-    router.register(IpcToolCommand::new(tool))
+    router.register(IpcToolCommand::new(tool, output_dir))
 }
 
 /// Converts CLI arguments to JSON using schema information.
@@ -1918,6 +1946,67 @@ mod tests {
     use schemars::JsonSchema;
     use serde::Deserialize;
 
+    fn single_stored_file(dir: &Path) -> PathBuf {
+        let mut files = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        files.remove(0)
+    }
+
+    #[tokio::test]
+    async fn binary_tool_result_parts_are_stored_and_referenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = vec![0x89, 0x50, 0x4E, 0x47];
+        let payload = tool_output_to_payload(
+            ToolResult::parts(vec![
+                ToolResultPart::text("see below"),
+                ToolResultPart::image(png.clone(), "image/png"),
+            ]),
+            dir.path(),
+        )
+        .await
+        .unwrap()
+        .expect("mixed parts produce a payload");
+
+        let CommandPayload::Text { content } = payload;
+        let file = single_stored_file(dir.path());
+        assert_eq!(file.extension().unwrap(), "png");
+        assert_eq!(std::fs::read(&file).unwrap(), png);
+        let name = file.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            content,
+            format!(
+                "see below\n[image/png, 4 bytes, stored at outputs/{name} ({})]",
+                file.display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn lone_binary_tool_result_is_stored_and_referenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = vec![0x89, 0x50, 0x4E, 0x47];
+        let payload =
+            tool_output_to_payload(ToolResult::image(png.clone(), "image/png"), dir.path())
+                .await
+                .unwrap()
+                .expect("a lone image produces a payload");
+
+        let CommandPayload::Text { content } = payload;
+        let file = single_stored_file(dir.path());
+        assert_eq!(std::fs::read(&file).unwrap(), png);
+        let name = file.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            content,
+            format!(
+                "[image/png, 4 bytes, stored at outputs/{name} ({})]",
+                file.display()
+            )
+        );
+    }
+
     #[derive(Debug, Deserialize, JsonSchema)]
     struct SimpleArgs {
         #[schemars(description = "The input file path")]
@@ -2554,9 +2643,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let output_dir = tmp.path().join("not-a-directory");
         std::fs::write(&output_dir, "occupied").unwrap();
-        let output = Some(CommandPayload::Text {
-            content: "x".repeat(INLINE_OUTPUT_LIMIT + 1),
-        });
+        let output = ToolResult::text("x".repeat(INLINE_OUTPUT_LIMIT + 1));
 
         let result = handle_large_output(output, &output_dir).await;
         assert!(!result.ok);
@@ -2611,13 +2698,11 @@ mod tests {
                 _cx: aither_core::llm::ToolContext,
             ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send
             {
-                // Return the parsed args as JSON so we can inspect
-                std::future::ready(ToolResult::json(&serde_json::json!({
-                    "question": args.question,
-                    "option": args.option,
-                    "multi_select": args.multi_select,
-                    "questions": args.questions,
-                })))
+                // Return the parsed args as text so we can inspect
+                std::future::ready(Ok(ToolResult::text(format!(
+                    "question={:?} option={:?} multi_select={:?} questions={:?}",
+                    args.question, args.option, args.multi_select, args.questions
+                ))))
             }
         }
 
@@ -2638,12 +2723,14 @@ mod tests {
 
         let rendered = cmd.handle(args).await.expect("command should succeed");
         tracing::debug!("result: {rendered}");
-        let parsed: Value = serde_json::from_str(&rendered).expect("rendered output is JSON");
-        let options = parsed["option"].as_array().expect("option should be array");
-        assert_eq!(options.len(), 3, "expected 3 options, got: {options:?}");
-        assert_eq!(options[0], "原味");
-        assert_eq!(options[1], "番茄味");
-        assert_eq!(options[2], "芝士味");
+        assert!(
+            rendered.contains("option=[\"原味\", \"番茄味\", \"芝士味\"]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("question=Some(\"你喜欢哪种薯条？\")"),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

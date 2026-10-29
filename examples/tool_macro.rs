@@ -13,7 +13,7 @@ use aither::llm::ToolContext;
 use aither::llm::tool::Progress;
 use aither_derive::tool;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 // Basic tool example - no parameters needed. The function's rustdoc is the
 // tool description.
@@ -23,27 +23,17 @@ pub async fn time() -> Result<&'static str> {
     Ok("2023-10-01T12:00:00Z")
 }
 
-/// Return type for search results
-#[derive(Debug, Serialize)]
-pub struct SearchResult {
-    title: String,
-    url: String,
-}
-
 // Tool with multiple simple parameters
 /// Search the web for the given keywords.
 #[tool]
-pub async fn search(keywords: Vec<String>, max_results: u32) -> Result<Vec<SearchResult>> {
+pub async fn search(keywords: Vec<String>, max_results: u32) -> Result<String> {
     // Simulate a search result
     let results = keywords
         .into_iter()
         .take(max_results as usize)
-        .map(|keyword| SearchResult {
-            title: format!("Result for {keyword}"),
-            url: format!("https://example.com/search?q={keyword}"),
-        })
-        .collect();
-    Ok(results)
+        .map(|keyword| format!("Result for {keyword}\n  https://example.com/search?q={keyword}"))
+        .collect::<Vec<_>>();
+    Ok(results.join("\n"))
 }
 
 /// Arguments for image generation with comprehensive documentation
@@ -71,7 +61,7 @@ pub async fn generate_image(args: GenerateImageArgs) -> aither::Result<String> {
 // no-op when the caller does not listen for progress.
 /// Fetch every URL, reporting each one as it completes.
 #[tool]
-pub async fn crawl(urls: Vec<String>, mut cx: ToolContext) -> Result<u32> {
+pub async fn crawl(urls: Vec<String>, mut cx: ToolContext) -> Result<String> {
     let total = u32::try_from(urls.len())?;
     for (done, url) in (1..=total).zip(&urls) {
         // Simulate fetching `url`
@@ -80,7 +70,7 @@ pub async fn crawl(urls: Vec<String>, mut cx: ToolContext) -> Result<u32> {
             .with_message(format!("fetched {url}"));
         cx.report_progress(progress).await?;
     }
-    Ok(total)
+    Ok(format!("Fetched {total} URLs."))
 }
 
 fn main() {

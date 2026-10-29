@@ -1,2 +1,0 @@
-{{ preview }}
-[Preview only: {{ reason }}. Full output ({{ line_count }} lines, {{ byte_count }} bytes) saved to {{ url }}. Use head/tail/grep/sed on that file to read the rest.]

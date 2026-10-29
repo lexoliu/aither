@@ -1,0 +1,1 @@
+<tasks_stale>{{ content }}</tasks_stale>

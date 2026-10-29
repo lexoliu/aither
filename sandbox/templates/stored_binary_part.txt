@@ -1,0 +1,1 @@
+[{{ mime }}, {{ byte_count }} bytes, stored at {{ url }} ({{ path }})]

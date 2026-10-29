@@ -333,7 +333,7 @@ where
     }
 
     /// Inserts or replaces a typed persistent system block.
-    pub fn system<T: serde::Serialize>(mut self, value: T) -> Self {
+    pub fn system<T: askama::Template>(mut self, value: T) -> Self {
         self.context.insert_system(&value);
         self
     }

@@ -87,6 +87,7 @@ pub use command::{
     CommandEnvelope, CommandPayload, DynTerminalTool, DynToolHandler, IpcToolCommand,
     ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
     register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
+    tool_output_to_payload,
 };
 pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
@@ -106,7 +107,7 @@ pub use jobserver::{
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
 };
-pub use output::{Content, MediaResolution, OutputEntry, OutputFormat, OutputStore, PendingUrl};
+pub use output::{MediaResolution, OutputFormat, OutputStore};
 pub use permission::{PermissionHandler, TerminalMode};
 pub use shell_session::{
     AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
@@ -116,13 +117,14 @@ pub use shell_session::{
 };
 pub use stdin_watch::StdinWatchSignal;
 pub use terminal::{
-    BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedTask, Configured,
-    DEFAULT_BACKGROUND_TIMEOUT_CAP, DEFAULT_FOREGROUND_LIMIT, DEFAULT_LONG_JOB_ALERT_AFTER,
-    JobAlert, LongRunningJob, PermissionEvent, PermissionEventReceiver, PermissionEventStage,
-    StdinBlockedJob, StdinProbeFailedJob, TerminalArgs, TerminalBackgroundArgs,
-    TerminalBackgroundTool, TerminalError, TerminalExecutionMode, TerminalResult, TerminalTool,
-    TerminalToolFactory, TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured,
-    background_task_channel, open_network_audit_log, terminal_tool_factory_channel,
+    BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand,
+    CompletedTask, Configured, DEFAULT_BACKGROUND_TIMEOUT_CAP, DEFAULT_FOREGROUND_LIMIT,
+    DEFAULT_LONG_JOB_ALERT_AFTER, JobAlert, LongRunningJob, PermissionEvent,
+    PermissionEventReceiver, PermissionEventStage, StartedBackgroundTask, StdinBlockedJob,
+    StdinProbeFailedJob, TerminalArgs, TerminalBackgroundArgs, TerminalBackgroundTool,
+    TerminalError, TerminalExecutionMode, TerminalTool, TerminalToolFactory,
+    TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured, background_task_channel,
+    open_network_audit_log, terminal_tool_factory_channel,
 };
 pub use tool_distribution::{
     ToolArtifact, ToolArtifactFormat, ToolArtifactLocation, ToolDistribution,

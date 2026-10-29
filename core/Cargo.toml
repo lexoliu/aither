@@ -14,6 +14,7 @@ categories = ["api-bindings", "no-std"]
 [dependencies]
 aither-derive = { workspace = true, optional = true}
 anyhow = { version = "1.0", default-features = false }
+askama = { version = "0.16", default-features = false, features = ["alloc", "derive"] }
 futures-core = { version = "0.3.34", default-features = false}
 futures-lite = { version = "2.6"}
 mime = "0.3"

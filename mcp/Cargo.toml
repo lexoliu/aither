@@ -13,13 +13,14 @@ categories = ["api-bindings"]
 
 [features]
 default = ["client", "server", "http"]
-client = ["dep:aither-sandbox"]
+client = ["dep:aither-sandbox", "dep:askama"]
 server = []
 http = ["client", "dep:zenwave"]
 
 [dependencies]
 aither-core.workspace = true
 aither-sandbox = { workspace = true, optional = true }
+askama = { version = "0.16", optional = true }
 # `hyper-rustls` rather than the workspace default: `default-backend` also
 # enables `native-tls`, and a crate consumed by a cross-compiled daemon must
 # not drag openssl-sys into its feature-unified graph.

@@ -14,29 +14,42 @@
 use std::future::Future;
 use std::path::PathBuf;
 
-use serde::Serialize;
+use askama::Template;
 
 use super::source::{Block, ContextSource};
 use crate::working_docs::{self, WorkingDocsSnapshot};
 
-#[derive(Serialize)]
-struct TasksXml {
-    #[serde(skip_serializing_if = "Option::is_none")]
+#[derive(Template)]
+#[template(path = "tasks_document.txt", escape = "none")]
+struct TasksDocumentTemplate {
     tasks: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     recent_changes: Option<String>,
 }
 
-#[derive(Serialize)]
-struct TasksStale {
-    #[serde(rename = "$text")]
+#[derive(Template)]
+#[template(path = "tasks_stale.txt", escape = "none")]
+struct TasksStaleTemplate {
     content: String,
 }
 
-#[derive(Serialize)]
-struct SystemReminder {
-    #[serde(rename = "$text")]
+#[derive(Template)]
+#[template(path = "system_reminder.txt", escape = "none")]
+struct SystemReminderTemplate {
     content: String,
+}
+
+/// Renders a typed template into a block under `tag`.
+///
+/// # Panics
+///
+/// Panics if the template fails to render, which is a bug in the template.
+fn block(tag: &str, template: &impl Template) -> Block {
+    Block::new(
+        tag,
+        template
+            .render()
+            .expect("context block template must render"),
+    )
 }
 
 /// Surfaces `tasks.md` and nags when it stops being maintained.
@@ -93,9 +106,9 @@ impl ContextSource for TasksDocument {
         if tasks.is_none() && recent_changes.is_none() {
             return None;
         }
-        Some(Block::xml(
+        Some(block(
             "tasks_document",
-            &TasksXml {
+            &TasksDocumentTemplate {
                 tasks,
                 recent_changes,
             },
@@ -146,7 +159,7 @@ impl ContextSource for TasksDocument {
                 "tasks.md has unchecked items but has not been updated for {threshold} tool turns. Mark finished items and keep the checklist in sync with actual progress."
             )
         };
-        Some(Block::xml("tasks_stale", &TasksStale { content }))
+        Some(block("tasks_stale", &TasksStaleTemplate { content }))
     }
 
     async fn on_final_turn(&mut self) -> Option<Block> {
@@ -154,9 +167,9 @@ impl ContextSource for TasksDocument {
         if !docs.has_unchecked_items() {
             return None;
         }
-        Some(Block::xml(
+        Some(block(
             "system_reminder",
-            &SystemReminder {
+            &SystemReminderTemplate {
                 content: "tasks.md still has unchecked items. Continue working through the checklist. If user input is required, call ask_user and then proceed.".to_string(),
             },
         ))
@@ -183,9 +196,9 @@ impl ContextSource for BackgroundJobs {
         if running.is_empty() {
             return None;
         }
-        Some(Block::xml(
+        Some(block(
             "system_reminder",
-            &SystemReminder {
+            &SystemReminderTemplate {
                 content: format!(
                     "Running background terminals:\n{running}Use terminal_read for incremental output, read redirected output files via terminal commands like head/tail/grep/cat when needed, terminal_input for stdin, and terminal_kill to stop tasks."
                 ),
@@ -195,15 +208,14 @@ impl ContextSource for BackgroundJobs {
 }
 
 #[cfg(feature = "skills")]
-#[derive(Serialize)]
-struct SkillInstructionXml {
-    name: String,
-    description: String,
-    instructions: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    allowed_tools: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resource_paths: Option<Vec<String>>,
+#[derive(Template)]
+#[template(path = "skill_instruction.txt", escape = "none")]
+struct SkillInstructionTemplate<'a> {
+    name: &'a str,
+    description: &'a str,
+    instructions: &'a str,
+    allowed_tools: Option<&'a [String]>,
+    resource_paths: Option<&'a [String]>,
 }
 
 /// Surfaces the instructions of the skills activated for the current run.
@@ -257,20 +269,19 @@ impl ActiveSkills {
         for skill in &self.skills {
             let mut resource_paths = skill.resources.keys().cloned().collect::<Vec<_>>();
             resource_paths.sort();
-            let block = Block::xml(
-                "skill_instruction",
-                &SkillInstructionXml {
-                    name: skill.name.clone(),
-                    description: skill.description.clone(),
-                    instructions: skill.instructions.clone(),
-                    allowed_tools: skill.allowed_tools.clone(),
-                    resource_paths: (!resource_paths.is_empty()).then_some(resource_paths),
-                },
-            );
+            let instruction = SkillInstructionTemplate {
+                name: &skill.name,
+                description: &skill.description,
+                instructions: &skill.instructions,
+                allowed_tools: skill.allowed_tools.as_deref(),
+                resource_paths: (!resource_paths.is_empty()).then_some(resource_paths.as_slice()),
+            }
+            .render()
+            .expect("skill instruction template must render");
             if !rendered.is_empty() {
                 rendered.push('\n');
             }
-            rendered.push_str(block.content());
+            rendered.push_str(&instruction);
         }
         Some(Block::new("skill_instructions", rendered))
     }
@@ -306,7 +317,7 @@ mod tests {
         write_tasks(root.path(), "- [x] first\n- [ ] second\n").await;
         let block = source.render().await.expect("renders the document");
         assert!(
-            block.content().contains("recent_changes"),
+            block.content().contains("Changes to tasks.md"),
             "a changed document must report its diff: {}",
             block.content()
         );

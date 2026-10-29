@@ -1,0 +1,1 @@
+Workspace access to '{{ path }}' was {{ outcome }}.

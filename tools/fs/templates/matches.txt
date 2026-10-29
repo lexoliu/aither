@@ -1,0 +1,2 @@
+{% if matches.is_empty() %}No files match.{% else %}{% for m in matches %}{{ m }}
+{% endfor %}{% endif %}

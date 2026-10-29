@@ -32,15 +32,8 @@
 //! ### Simple Parameters
 //!
 //! ```rust
-//! use serde::Serialize;
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
-//!
-//! #[derive(Debug, Serialize)]
-//! pub struct SearchResult {
-//!     title: String,
-//!     url: String,
-//! }
 //!
 //! /// Search the web for content.
 //! #[derive(JsonSchema, Deserialize)]
@@ -50,8 +43,8 @@
 //! }
 //!
 //! #[tool]
-//! pub async fn search(args: SearchArgs) -> Result<Vec<SearchResult>> {
-//!     Ok(vec![])
+//! pub async fn search(args: SearchArgs) -> Result<String> {
+//!     Ok(format!("No results for {}.", args.keywords.join(", ")))
 //! }
 //! ```
 //!
@@ -103,18 +96,18 @@
 //! }
 //!
 //! #[tool]
-//! pub async fn index(args: IndexArgs, mut cx: ToolContext) -> Result<usize> {
+//! pub async fn index(args: IndexArgs, mut cx: ToolContext) -> Result<String> {
 //!     for (done, _document) in args.documents.iter().enumerate() {
 //!         cx.report_progress(Progress::new(done as f64 + 1.0)).await?;
 //!     }
-//!     Ok(args.documents.len())
+//!     Ok(format!("Indexed {} documents.", args.documents.len()))
 //! }
 //! ```
 //!
 //! ## Requirements
 //!
 //! - Functions must be `async`
-//! - Return type must be `Result<T>` where `T: serde::Serialize`
+//! - Return type must be `Result<T>` where `T: IntoToolResult`
 //! - Parameters must implement `serde::Deserialize` and `schemars::JsonSchema`
 //! - No `self` parameters (static functions only)
 //! - No lifetime or generic parameters
@@ -231,8 +224,8 @@ impl Parse for ToolArgs {
 /// }
 ///
 /// #[tool(rename = "calculator")]
-/// pub async fn complex_math_function(args: CalcArgs) -> Result<f64> {
-///     Ok(42.0)
+/// pub async fn complex_math_function(args: CalcArgs) -> Result<String> {
+///     Ok("42".to_string())
 /// }
 /// ```
 ///
@@ -247,7 +240,7 @@ impl Parse for ToolArgs {
 /// # Requirements
 ///
 /// - Function must be `async`
-/// - Return type must be `Result<T>` where `T` implements `serde::Serialize`
+/// - Return type must be `Result<T>` where `T: IntoToolResult`
 /// - Parameters must implement `serde::Deserialize` and `schemars::JsonSchema`
 /// - No `self` parameters (only free functions are supported)
 /// - No lifetime parameters or generics

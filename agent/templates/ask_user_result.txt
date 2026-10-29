@@ -1,0 +1,3 @@
+{% if answers.is_empty() %}The user provided no answers.{% else %}The user answered:
+{% for answer in answers %}- {% if !answer.section.is_empty() %}{{ answer.section }}: {% endif %}{{ answer.answer }}
+{% endfor %}{% endif %}

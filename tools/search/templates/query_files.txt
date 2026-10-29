@@ -1,0 +1,6 @@
+Query '{{ query }}' ({{ search_mode }}, {{ output_mode }}): {{ total_matches }} matches, showing {{ returned }}. Indexed roots: {{ indexed_roots }}.
+{% for file in results %}- {{ file.relative_path }} ({{ file.match_count }} matches, best score {{ file.top_score }}, modified {{ file.modified_at }}):
+{% for h in file.highlights %}    - {{ h.matched_by|join(", ") }}, score {{ h.score }}:
+        {{ h.snippet }}
+{% if let Some(content) = h.content %}{{ content }}
+{% endif %}{% endfor %}{% endfor %}

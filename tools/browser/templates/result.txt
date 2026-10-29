@@ -1,0 +1,12 @@
+{% if !result.running %}The browser is not running.{% else %}The browser is running{% if let Some(endpoint) = result.cdp_endpoint %} (CDP endpoint: {{ endpoint }}){% endif %}.{% if let Some(page) = result.page %}
+
+Page: {{ page.page.title }} ({{ page.page.url }})
+{% if let Some(heading) = page.page.main_heading %}Main heading: {{ heading }}
+{% endif %}{% if !page.page.headings.is_empty() %}Headings: {{ page.page.headings|join(", ") }}
+{% endif %}{% if !page.page.text_excerpt.is_empty() %}{{ page.page.text_excerpt }}
+{% endif %}{% if !page.page.interactive_elements.is_empty() %}Interactive elements:
+{% for el in page.page.interactive_elements %}- {{ el }}
+{% endfor %}{% endif %}{% if !page.page.accessibility.nodes.is_empty() %}Accessibility tree ({{ page.page.accessibility.total_nodes }} nodes, {{ page.page.accessibility.interesting_nodes }} interesting):
+{% for node in page.page.accessibility.nodes %}{{ node }}
+{% endfor %}{% endif %}{% if let Some(shot) = page.screenshot %}Screenshot saved to {{ shot.artifact_path }} ({{ shot.width }}x{{ shot.height }}).
+{% endif %}{% endif %}{% endif %}

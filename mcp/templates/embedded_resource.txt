@@ -1,0 +1,1 @@
+Embedded resource '{{ uri }}'{% if let Some(mime) = mime_type %} ({{ mime }}){% endif %} returned no content.

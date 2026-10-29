@@ -219,10 +219,12 @@ use core::fmt::{Debug, Display};
 use core::{future::Future, pin::Pin};
 pub use mime::Mime;
 use schemars::{JsonSchema, Schema, schema_for};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 
+mod command;
 mod context;
 
+pub use command::{CommandOutcome, CommandResult, CommandStream, StoredFile};
 pub use context::{Progress, ProgressError, ProgressSink, ToolContext};
 
 /// Final structured result from a tool execution.
@@ -262,12 +264,6 @@ pub enum ToolResult {
         text: String,
     },
 
-    /// Structured JSON output.
-    Json {
-        /// JSON content.
-        value: Value,
-    },
-
     /// Binary or media payload.
     Binary {
         /// MIME type of the payload (for example `image/png`).
@@ -281,6 +277,13 @@ pub enum ToolResult {
         /// Tool-level error message.
         message: String,
     },
+
+    /// Typed record of a command run by a terminal-like tool.
+    ///
+    /// [`ToolResult::render_for_model`] renders the model's prose from it;
+    /// hosts read the fields and never parse that prose.
+    /// Boxed: the record is much larger than every other variant.
+    Command(Box<CommandResult>),
 
     /// Several content items produced by one tool call.
     ///
@@ -314,12 +317,6 @@ pub enum ToolResultPart {
         text: String,
     },
 
-    /// Structured JSON output.
-    Json {
-        /// JSON content.
-        value: Value,
-    },
-
     /// Binary or media payload.
     Binary {
         /// MIME type of the payload (for example `image/png`).
@@ -340,23 +337,6 @@ impl ToolResult {
     #[must_use]
     pub fn tsv(s: impl Into<String>) -> Self {
         Self::Tsv { text: s.into() }
-    }
-
-    /// Creates a JSON result from a serializable value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if serialization fails.
-    pub fn json<T: Serialize>(value: &T) -> Result<Self> {
-        Ok(Self::Json {
-            value: serde_json::to_value(value)?,
-        })
-    }
-
-    /// Creates a JSON result from an already-materialized JSON value.
-    #[must_use]
-    pub const fn json_value(value: Value) -> Self {
-        Self::Json { value }
     }
 
     /// Creates an image result.
@@ -417,7 +397,16 @@ impl ToolResult {
         match self {
             Self::Text { text } | Self::Tsv { text } => Some(text),
             Self::Error { message } => Some(message),
-            Self::Done | Self::Json { .. } | Self::Binary { .. } | Self::Parts { .. } => None,
+            Self::Done | Self::Binary { .. } | Self::Command(_) | Self::Parts { .. } => None,
+        }
+    }
+
+    /// Returns the typed command record if this is a command result.
+    #[must_use]
+    pub fn command(&self) -> Option<&CommandResult> {
+        match self {
+            Self::Command(command) => Some(command.as_ref()),
+            _ => None,
         }
     }
 
@@ -429,41 +418,22 @@ impl ToolResult {
             Self::Done
             | Self::Text { .. }
             | Self::Tsv { .. }
-            | Self::Json { .. }
             | Self::Binary { .. }
+            | Self::Command(_)
             | Self::Parts { .. } => None,
         }
     }
 
     /// Projects the result into a textual representation safe to re-inject into model context.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if JSON serialization fails.
-    pub fn render_for_model(&self) -> Result<String> {
+    #[must_use]
+    pub fn render_for_model(&self) -> String {
         match self {
-            Self::Done => Ok(String::new()),
-            Self::Text { text } | Self::Tsv { text } => Ok(text.clone()),
-            Self::Json { value } => Ok(serde_json::to_string(value)?),
-            Self::Binary { mime, content } => Ok(render_binary_placeholder(mime, content)),
-            Self::Error { message } => Ok(message.clone()),
-            Self::Parts { parts } => join_part_renders(parts, false),
-        }
-    }
-
-    /// Renders the result for CLI display.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if JSON serialization fails.
-    pub fn render_for_cli(&self) -> Result<String> {
-        match self {
-            Self::Done => Ok(String::new()),
-            Self::Text { text } | Self::Tsv { text } => Ok(text.clone()),
-            Self::Json { value } => Ok(serde_json::to_string_pretty(value)?),
-            Self::Binary { mime, content } => Ok(render_binary_placeholder(mime, content)),
-            Self::Error { message } => Ok(message.clone()),
-            Self::Parts { parts } => join_part_renders(parts, true),
+            Self::Done => String::new(),
+            Self::Text { text } | Self::Tsv { text } => text.clone(),
+            Self::Command(command) => command.render_for_model(),
+            Self::Binary { mime, content } => render_binary_placeholder(mime, content),
+            Self::Error { message } => message.clone(),
+            Self::Parts { parts } => join_part_renders(parts),
         }
     }
 
@@ -482,7 +452,7 @@ impl ToolResult {
             Self::Done
             | Self::Text { .. }
             | Self::Tsv { .. }
-            | Self::Json { .. }
+            | Self::Command(_)
             | Self::Error { .. } => None,
         }
     }
@@ -501,7 +471,7 @@ impl ToolResult {
             Self::Done
             | Self::Text { .. }
             | Self::Tsv { .. }
-            | Self::Json { .. }
+            | Self::Command(_)
             | Self::Error { .. } => None,
         }
     }
@@ -518,23 +488,6 @@ impl ToolResultPart {
     #[must_use]
     pub fn tsv(s: impl Into<String>) -> Self {
         Self::Tsv { text: s.into() }
-    }
-
-    /// Creates a JSON part from a serializable value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if serialization fails.
-    pub fn json<T: Serialize>(value: &T) -> Result<Self> {
-        Ok(Self::Json {
-            value: serde_json::to_value(value)?,
-        })
-    }
-
-    /// Creates a JSON part from an already-materialized JSON value.
-    #[must_use]
-    pub const fn json_value(value: Value) -> Self {
-        Self::Json { value }
     }
 
     /// Creates an image part.
@@ -560,37 +513,16 @@ impl ToolResultPart {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text { text } | Self::Tsv { text } => Some(text),
-            Self::Json { .. } | Self::Binary { .. } => None,
+            Self::Binary { .. } => None,
         }
     }
 
     /// Projects the part into a textual representation safe to re-inject into model context.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if JSON serialization fails.
-    pub fn render_for_model(&self) -> Result<String> {
-        self.render(false)
-    }
-
-    /// Renders the part for CLI display.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if JSON serialization fails.
-    pub fn render_for_cli(&self) -> Result<String> {
-        self.render(true)
-    }
-
-    fn render(&self, pretty: bool) -> Result<String> {
+    #[must_use]
+    pub fn render_for_model(&self) -> String {
         match self {
-            Self::Text { text } | Self::Tsv { text } => Ok(text.clone()),
-            Self::Json { value } => Ok(if pretty {
-                serde_json::to_string_pretty(value)?
-            } else {
-                serde_json::to_string(value)?
-            }),
-            Self::Binary { mime, content } => Ok(render_binary_placeholder(mime, content)),
+            Self::Text { text } | Self::Tsv { text } => text.clone(),
+            Self::Binary { mime, content } => render_binary_placeholder(mime, content),
         }
     }
 
@@ -599,7 +531,7 @@ impl ToolResultPart {
     pub fn mime(&self) -> Option<Mime> {
         match self {
             Self::Binary { mime, .. } => mime.parse().ok(),
-            Self::Text { .. } | Self::Tsv { .. } | Self::Json { .. } => None,
+            Self::Text { .. } | Self::Tsv { .. } => None,
         }
     }
 
@@ -608,7 +540,7 @@ impl ToolResultPart {
     pub fn content(&self) -> Option<&[u8]> {
         match self {
             Self::Binary { content, .. } => Some(content),
-            Self::Text { .. } | Self::Tsv { .. } | Self::Json { .. } => None,
+            Self::Text { .. } | Self::Tsv { .. } => None,
         }
     }
 
@@ -617,7 +549,6 @@ impl ToolResultPart {
     pub fn into_result(self) -> ToolResult {
         match self {
             Self::Text { text } | Self::Tsv { text } => ToolResult::Text { text },
-            Self::Json { value } => ToolResult::Json { value },
             Self::Binary { mime, content } => ToolResult::Binary { mime, content },
         }
     }
@@ -633,14 +564,10 @@ fn render_binary_placeholder(mime: &str, content: &[u8]) -> String {
     rendered
 }
 
-fn join_part_renders(parts: &[ToolResultPart], pretty: bool) -> Result<String> {
+fn join_part_renders(parts: &[ToolResultPart]) -> String {
     let mut rendered = String::new();
     for part in parts {
-        let text = if pretty {
-            part.render_for_cli()?
-        } else {
-            part.render_for_model()?
-        };
+        let text = part.render_for_model();
         if text.is_empty() {
             continue;
         }
@@ -649,14 +576,14 @@ fn join_part_renders(parts: &[ToolResultPart], pretty: bool) -> Result<String> {
         }
         rendered.push_str(&text);
     }
-    Ok(rendered)
+    rendered
 }
 
 /// Conversion trait for values returned by [`Tool::call`].
 ///
-/// The conversion itself is fallible so tool authors can return types like
-/// `Result<T: Serialize, E: Error>` and still surface serialization failures as
-/// framework errors while preserving typed tool errors inside [`ToolResult`].
+/// Tool authors can return `Result<T: IntoToolResult, E: Display>`; an `Err`
+/// becomes a typed tool error inside [`ToolResult`]. Structured data is
+/// rendered to text by the tool itself, never by a serializer.
 pub trait IntoToolResult {
     /// Converts the value into a final [`ToolResult`].
     ///
@@ -669,6 +596,12 @@ pub trait IntoToolResult {
 impl IntoToolResult for ToolResult {
     fn into_tool_result(self) -> Result<ToolResult> {
         Ok(self)
+    }
+}
+
+impl IntoToolResult for CommandResult {
+    fn into_tool_result(self) -> Result<ToolResult> {
+        Ok(ToolResult::Command(Box::new(self)))
     }
 }
 
@@ -696,12 +629,6 @@ impl IntoToolResult for Cow<'_, str> {
     }
 }
 
-impl IntoToolResult for Value {
-    fn into_tool_result(self) -> Result<ToolResult> {
-        Ok(ToolResult::json_value(self))
-    }
-}
-
 impl<T> IntoToolResult for Option<T>
 where
     T: IntoToolResult,
@@ -719,12 +646,12 @@ impl IntoToolResult for Vec<ToolResultPart> {
 
 impl<T, E> IntoToolResult for core::result::Result<T, E>
 where
-    T: Serialize,
+    T: IntoToolResult,
     E: Display,
 {
     fn into_tool_result(self) -> Result<ToolResult> {
         match self {
-            Ok(value) => serialize_success_value(&value),
+            Ok(value) => value.into_tool_result(),
             Err(error) => Ok(ToolResult::error(error.to_string())),
         }
     }
@@ -736,115 +663,6 @@ fn parse_media_type_or_octet_stream(media_type: &str) -> String {
         .unwrap_or(mime::APPLICATION_OCTET_STREAM)
         .essence_str()
         .to_string()
-}
-
-fn serialize_success_value<T: Serialize>(value: &T) -> Result<ToolResult> {
-    let value = serde_json::to_value(value)?;
-    if let Some(tsv) = json_value_to_tsv(&value) {
-        return Ok(ToolResult::tsv(tsv));
-    }
-
-    match value {
-        Value::String(text) => Ok(ToolResult::text(text)),
-        other => Ok(ToolResult::json_value(other)),
-    }
-}
-
-/// Converts a JSON value into TSV when it represents an object or non-empty array.
-#[must_use]
-pub fn json_value_to_tsv(value: &Value) -> Option<String> {
-    let rows = match value {
-        Value::Array(arr) if !arr.is_empty() => arr
-            .iter()
-            .map(|value| flatten_json_value(value, ""))
-            .collect::<Vec<_>>(),
-        Value::Object(_) => alloc::vec![flatten_json_value(value, "")],
-        Value::Array(_) | Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {
-            return None;
-        }
-    };
-
-    if rows.is_empty() {
-        return None;
-    }
-
-    let mut columns: Vec<String> = Vec::new();
-    let mut seen: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
-    for row in &rows {
-        for (key, _) in row {
-            if seen.insert(key.clone()) {
-                columns.push(key.clone());
-            }
-        }
-    }
-
-    if columns.is_empty() {
-        return None;
-    }
-
-    let mut tsv = String::new();
-    for (index, column) in columns.iter().enumerate() {
-        if index > 0 {
-            tsv.push('\t');
-        }
-        tsv.push_str(&escape_tsv_field(column));
-    }
-    tsv.push('\n');
-
-    for row in &rows {
-        let row_map: alloc::collections::BTreeMap<&str, &str> = row
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect::<alloc::collections::BTreeMap<&str, &str>>();
-        for (index, column) in columns.iter().enumerate() {
-            if index > 0 {
-                tsv.push('\t');
-            }
-            if let Some(value) = row_map.get(column.as_str()) {
-                tsv.push_str(&escape_tsv_field(value));
-            }
-        }
-        tsv.push('\n');
-    }
-
-    Some(tsv)
-}
-
-fn flatten_json_value(value: &Value, prefix: &str) -> Vec<(String, String)> {
-    let mut flattened = Vec::new();
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                let full_key = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                flattened.extend(flatten_json_value(child, &full_key));
-            }
-        }
-        Value::Array(_) => {
-            let serialized = serde_json::to_string(value).unwrap_or_default();
-            flattened.push((prefix.to_string(), serialized));
-        }
-        Value::String(text) => {
-            flattened.push((prefix.to_string(), text.clone()));
-        }
-        Value::Number(number) => {
-            flattened.push((prefix.to_string(), number.to_string()));
-        }
-        Value::Bool(boolean) => {
-            flattened.push((prefix.to_string(), boolean.to_string()));
-        }
-        Value::Null => {
-            flattened.push((prefix.to_string(), String::new()));
-        }
-    }
-    flattened
-}
-
-fn escape_tsv_field(value: &str) -> String {
-    value.replace(['\t', '\n', '\r'], " ")
 }
 
 /// Tools that can be called by language models.
@@ -925,37 +743,6 @@ pub trait Tool: Send + Sync {
         arguments: Self::Arguments,
         cx: ToolContext,
     ) -> impl Future<Output = Result<Self::Res>> + Send;
-}
-
-/// Utility to convert a serializable value to a pretty-printed JSON string.
-///
-/// # Example
-/// ```rust,ignore
-/// use aither::llm::tool::json;
-/// use serde::Serialize;
-/// #[derive(Serialize)]
-/// struct Data {
-///     name: String,
-///     value: u32,
-/// }
-/// let data = Data {
-///     name: "example".to_string(),
-///     value: 42,
-/// };
-/// let json_str = json(&data);
-/// println!("{}", json_str);
-/// ```
-///
-/// # Errors
-///
-/// Returns an error if the value cannot be serialized to JSON, which happens
-/// for types such as maps with non-string keys.
-pub fn json<T: Serialize>(value: &T) -> Result<String> {
-    let value = serde_json::to_value(value)?;
-
-    Ok(value
-        .as_str()
-        .map_or_else(|| format!("{value:#}"), ToString::to_string))
 }
 
 trait ToolImpl: Send + Sync + Any {
@@ -1075,6 +862,14 @@ impl<T: Tool> RegisteredTool<T> {
     }
 }
 
+/// Error the model reads when it sends arguments that do not parse.
+#[derive(askama::Template)]
+#[template(path = "invalid_arguments.txt", escape = "none")]
+struct InvalidArguments<'a> {
+    tool: &'a str,
+    error: &'a serde_json::Error,
+}
+
 impl<T: Tool + 'static> ToolImpl for RegisteredTool<T> {
     fn call(
         &self,
@@ -1087,18 +882,16 @@ impl<T: Tool + 'static> ToolImpl for RegisteredTool<T> {
             serde_json::from_str::<ToolArgument<T::Arguments>>(args).map(|wrapper| wrapper.value)
         };
 
-        let Ok(arguments) = result else {
-            // Cold path: spelling the schema out for the model is worth the
-            // allocation only when it has actually got the call wrong.
-            let name = self.definition.name().to_string();
-            let schema_str =
-                serde_json::to_string_pretty(&self.definition.arguments_openai_schema())
-                    .unwrap_or_else(|_| "{}".to_string());
-            return Box::pin(async move {
-                Err(anyhow::Error::msg(format!(
-                    "Invalid arguments for tool '{name}'. Expected schema:\n{schema_str}"
-                )))
-            });
+        let arguments = match result {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                let message = InvalidArguments {
+                    tool: self.definition.name(),
+                    error: &error,
+                }
+                .to_string();
+                return Box::pin(async move { Err(anyhow::Error::msg(message)) });
+            }
         };
 
         Box::pin(async move {
@@ -1652,7 +1445,7 @@ mod tests {
     use super::*;
     use alloc::{format, string::ToString, vec};
     use schemars::JsonSchema;
-    use serde::{Deserialize, Serialize};
+    use serde::Deserialize;
 
     /// Performs basic mathematical operations.
     #[derive(JsonSchema, Deserialize, Debug, PartialEq)]
@@ -1753,18 +1546,6 @@ mod tests {
     }
 
     #[test]
-    fn json_utility() {
-        let value = serde_json::json!({
-            "name": "test",
-            "value": 42
-        });
-
-        let json_str = json(&value).expect("a JSON value always serializes");
-        assert!(json_str.contains("\"name\": \"test\""));
-        assert!(json_str.contains("\"value\": 42"));
-    }
-
-    #[test]
     fn tool_definition_creation() {
         let calculator = Calculator;
         let definition = ToolDefinition::new(&calculator);
@@ -1808,6 +1589,36 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().as_text(), Some("8"));
+    }
+
+    #[tokio::test]
+    async fn invalid_arguments_report_the_parse_error_without_schema() {
+        let mut tools = Tools::new();
+        tools.register(Calculator).expect("calculator registers");
+
+        let error = tools
+            .call("calculator", r#"{"operation": "add"}"#, ToolContext::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Invalid arguments for tool 'calculator': missing field `a` at line 1 column 20"
+        );
+    }
+
+    #[test]
+    fn command_result_renders_its_text() {
+        let result = ToolResult::Command(Box::new(CommandResult {
+            stdout: CommandStream::Inline("hi\n".to_string()),
+            stderr: None,
+            outcome: CommandOutcome::Exited { code: 3 },
+        }));
+        assert_eq!(result.render_for_model(), "hi\nExit code: 3.\n");
+        assert_eq!(
+            result.command().map(|command| &command.outcome),
+            Some(&CommandOutcome::Exited { code: 3 })
+        );
     }
 
     #[tokio::test]
@@ -1928,18 +1739,6 @@ mod tests {
         assert_eq!(greet_result.unwrap().as_text(), Some("Hello, Alice!"));
     }
 
-    #[derive(Debug, Serialize)]
-    struct TableRow {
-        name: &'static str,
-        count: u32,
-    }
-
-    #[derive(Debug, Serialize)]
-    struct NestedTableRow {
-        user: TableRow,
-        ok: bool,
-    }
-
     #[derive(Debug)]
     struct ToolFailure(&'static str);
 
@@ -1988,68 +1787,13 @@ mod tests {
     }
 
     #[test]
-    fn into_tool_result_result_ok_object_is_tsv() {
-        let result = core::result::Result::<TableRow, ToolFailure>::Ok(TableRow {
-            name: "alpha",
-            count: 3,
-        })
-        .into_tool_result()
-        .unwrap();
-
-        assert_eq!(result, ToolResult::tsv("count\tname\n3\talpha\n"));
-    }
-
-    #[test]
-    fn into_tool_result_result_ok_array_of_objects_is_tsv() {
-        let result = core::result::Result::<Vec<TableRow>, ToolFailure>::Ok(vec![
-            TableRow {
-                name: "alpha",
-                count: 3,
-            },
-            TableRow {
-                name: "beta",
-                count: 5,
-            },
-        ])
-        .into_tool_result()
-        .unwrap();
-
-        assert_eq!(result, ToolResult::tsv("count\tname\n3\talpha\n5\tbeta\n"));
-    }
-
-    #[test]
-    fn into_tool_result_result_ok_scalar_is_json() {
-        let result = core::result::Result::<bool, ToolFailure>::Ok(true)
-            .into_tool_result()
-            .unwrap();
-        assert_eq!(result, ToolResult::json_value(Value::Bool(true)));
-    }
-
-    #[test]
     fn into_tool_result_result_err_is_typed_error() {
-        let result = core::result::Result::<TableRow, ToolFailure>::Err(ToolFailure("boom"))
+        let result = core::result::Result::<String, ToolFailure>::Err(ToolFailure("boom"))
             .into_tool_result()
             .unwrap();
         assert_eq!(result, ToolResult::error("boom"));
         assert!(result.is_error());
         assert_eq!(result.error_message(), Some("boom"));
-    }
-
-    #[test]
-    fn json_value_to_tsv_flattens_nested_objects() {
-        let value = serde_json::to_value(NestedTableRow {
-            user: TableRow {
-                name: "alpha",
-                count: 3,
-            },
-            ok: true,
-        })
-        .unwrap();
-
-        assert_eq!(
-            json_value_to_tsv(&value),
-            Some("ok\tuser.count\tuser.name\ntrue\t3\talpha\n".to_string())
-        );
     }
 
     #[tokio::test]
@@ -2306,12 +2050,12 @@ mod tests {
     fn parts_render_joins_text_and_marks_binary() {
         let result = ToolResult::parts(vec![
             ToolResultPart::text("header"),
-            ToolResultPart::json_value(serde_json::json!({"n": 1})),
+            ToolResultPart::tsv("n\n1\n"),
             ToolResultPart::image(vec![0x89], "image/png"),
         ]);
         assert_eq!(
-            result.render_for_model().unwrap(),
-            "header\n{\"n\":1}\n[binary tool result: image/png, 1 bytes]"
+            result.render_for_model(),
+            "header\nn\n1\n\n[binary tool result: image/png, 1 bytes]"
         );
         assert!(result.mime().is_none() && result.content().is_none());
     }
@@ -2330,7 +2074,7 @@ mod tests {
     fn parts_serde_roundtrip_uses_kind_tag() {
         let result = ToolResult::parts(vec![
             ToolResultPart::text("note"),
-            ToolResultPart::json_value(serde_json::json!({"k": true})),
+            ToolResultPart::tsv("k\ntrue\n"),
         ]);
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(value["kind"], "parts");

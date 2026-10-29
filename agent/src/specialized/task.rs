@@ -22,7 +22,7 @@ use aither_core::{
 use aither_sandbox::TerminalToolFactory;
 use askama::Template;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::AgentBuilder;
 use crate::context::CacheLifetime;
@@ -170,55 +170,42 @@ impl SubagentArgs {
     }
 }
 
-/// How the model that ran a subagent was selected.
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum ModelSource {
-    /// The call's `model` argument or the subagent definition chose it.
-    Chosen,
-    /// The fast model routed the prompt to it.
-    Routed,
+#[derive(Template)]
+#[template(path = "subagent_result.txt", escape = "none")]
+struct SubagentResultTemplate<'a> {
+    subagent: &'a str,
+    outcome: SubagentReport<'a>,
 }
 
-/// The model that ran a subagent, reported back to the caller.
-#[derive(Debug, Clone, Serialize)]
-struct SubagentRunModel {
-    /// Profile name of the model that ran.
-    name: String,
-    /// Whether the model was chosen or routed.
-    source: ModelSource,
+/// What the result text reports about a subagent run.
+enum SubagentReport<'a> {
+    /// The user cancelled the run.
+    Cancelled,
+    /// The run produced a result.
+    Completed {
+        model: Option<&'a str>,
+        result: &'a str,
+        /// Id to continue this subagent with while its prompt cache is warm.
+        id: u64,
+        /// Set when the run crossed the frequent-idle threshold: the subagent
+        /// kept needing prompt-cache keep-alives and this says why.
+        alert: Option<&'a str>,
+    },
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct SubagentResult {
-    subagent: String,
-    status: &'static str,
-    result: String,
-    /// Id to continue this subagent with (`subagent resume --id`) while
-    /// its prompt cache is warm; absent only when the run cannot be
-    /// continued at all, like a cancelled one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<SubagentRunModel>,
-    /// Set when the run crossed the frequent-idle threshold: the parent is
-    /// told the subagent kept needing prompt-cache keep-alives and why it
-    /// was last waiting.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    alert: Option<String>,
+struct HistoryEntry {
+    role: aither_core::llm::Role,
+    content: String,
+    /// Names of the tools the message called.
+    tool_names: Vec<String>,
 }
 
-impl SubagentResult {
-    fn cancelled(subagent: String) -> Self {
-        Self {
-            subagent,
-            status: "cancelled",
-            result: "Cancelled by user".to_string(),
-            id: None,
-            model: None,
-            alert: None,
-        }
-    }
+#[derive(Template)]
+#[template(path = "subagent_error.txt", escape = "none")]
+struct SubagentErrorTemplate<'a> {
+    subagent: &'a str,
+    error: &'a str,
+    history: &'a [HistoryEntry],
 }
 
 /// Structured response the fast model returns when routing a prompt.
@@ -391,7 +378,7 @@ where
 struct FinishedSubagent<LLM> {
     agent: crate::Agent<LLM, LLM, LLM, ()>,
     subagent: String,
-    model: Option<SubagentRunModel>,
+    model: Option<String>,
     child_job_registry: Option<aither_sandbox::JobRegistry>,
     /// How long the provider keeps this subagent's prompt cache warm — the
     /// [`PromptCache`](crate::context::PromptCache) lifetime the subagent
@@ -983,7 +970,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
     ) -> anyhow::Result<(
         crate::Agent<LLM, LLM, LLM, ()>,
         String,
-        SubagentRunModel,
+        String,
         Option<aither_sandbox::JobRegistry>,
     )> {
         let (subagent_id, declared_model, source) = self.resolve_source(subagent).await?;
@@ -1011,7 +998,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             None => agent_builder,
         };
 
-        tracing::info!(subagent = %subagent_id, model = %model.name.as_str(), "Starting subagent");
+        tracing::info!(subagent = %subagent_id, model = %model, "Starting subagent");
 
         // Add child terminal tool if factory is configured
         let (agent_builder, child_job_registry) = if let Some(factory) = &self.terminal_tool_factory
@@ -1078,7 +1065,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         &self,
         prompt: &str,
         chosen: Option<ModelTier>,
-    ) -> anyhow::Result<(ModelTier, SubagentRunModel)> {
+    ) -> anyhow::Result<(ModelTier, String)> {
         if let Some(tier) = chosen {
             let profile = self.model_for(tier).profile().await.map_err(|error| {
                 anyhow::anyhow!(
@@ -1086,23 +1073,10 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                     tier_label(tier)
                 )
             })?;
-            return Ok((
-                tier,
-                SubagentRunModel {
-                    name: profile.name,
-                    source: ModelSource::Chosen,
-                },
-            ));
+            return Ok((tier, profile.name));
         }
 
-        let (tier, name) = self.route_model(prompt).await?;
-        Ok((
-            tier,
-            SubagentRunModel {
-                name,
-                source: ModelSource::Routed,
-            },
-        ))
+        self.route_model(prompt).await
     }
 
     /// Asks the fast model which configured tier fits `prompt`.
@@ -1230,47 +1204,32 @@ where
                     self.finished.release(id);
                 }
                 tracing::info!(subagent = %subagent_id, "Subagent cancelled");
-                return ToolResult::json(&SubagentResult::cancelled(subagent_id));
+                return Ok(ToolResult::text(
+                    SubagentResultTemplate {
+                        subagent: &subagent_id,
+                        outcome: SubagentReport::Cancelled,
+                    }
+                    .render()
+                    .expect("subagent result template must render"),
+                ));
             }
             SubagentOutcome::Finished(Ok(result)) => result,
             SubagentOutcome::Finished(Err(error)) => {
                 if let Some(id) = resumed {
                     self.finished.release(id);
                 }
-                let history = agent.history();
-                let recent = history
-                    .into_iter()
-                    .rev()
-                    .take(12)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>();
-                let recent_json = serde_json::to_string(&recent)
-                    .unwrap_or_else(|serialize_error| serialize_error.to_string());
-                return Err(anyhow::anyhow!(
-                    "Subagent '{subagent_id}' error: {error}\nRecent subagent history: {recent_json}"
-                ));
+                let error_text = failure_text(&subagent_id, &error.to_string(), &agent);
+                return Err(anyhow::anyhow!(error_text));
             }
         };
 
         tracing::info!(subagent = %subagent_id, "Subagent completed");
 
-        let keep_alive = agent.cache_keep_alive_state();
-        let alert = keep_alive.alerted.then(|| {
-            let reason = keep_alive
-                .last_reason
-                .clone()
-                .unwrap_or_else(|| "idle without a running background job".to_string());
-            format!(
-                "Subagent '{subagent_id}' needed {} prompt-cache keep-alives during its run — subagents should not idle frequently. Reason for its most recent idle: {reason}.",
-                keep_alive.sent
-            )
-        });
+        let alert = idle_alert(&subagent_id, agent.cache_keep_alive_state());
 
         // A finished subagent stays continuable on every provider until
         // its prompt-cache lifetime passes.
-        let id = Some(self.finished.store(
+        let id = self.finished.store(
             resumed,
             FinishedSubagent {
                 agent,
@@ -1279,17 +1238,67 @@ where
                 child_job_registry,
                 lifetime,
             },
-        ));
+        );
 
-        ToolResult::json(&SubagentResult {
-            subagent: subagent_id,
-            status: "completed",
-            result,
-            id,
-            model,
-            alert,
-        })
+        Ok(ToolResult::text(
+            SubagentResultTemplate {
+                subagent: &subagent_id,
+                outcome: SubagentReport::Completed {
+                    model: model.as_deref(),
+                    result: &result,
+                    id,
+                    alert: alert.as_deref(),
+                },
+            }
+            .render()
+            .expect("subagent result template must render"),
+        ))
     }
+}
+
+/// The error text for a failed run, with the tail of its history.
+fn failure_text<LLM: LanguageModel + 'static>(
+    subagent: &str,
+    error: &str,
+    agent: &crate::Agent<LLM, LLM, LLM, ()>,
+) -> String {
+    let history = agent.history();
+    let skipped = history.len().saturating_sub(12);
+    let recent = history
+        .iter()
+        .skip(skipped)
+        .map(|message| HistoryEntry {
+            role: message.role(),
+            content: message.content().to_string(),
+            tool_names: message
+                .tool_calls()
+                .iter()
+                .map(|call| call.name.clone())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    SubagentErrorTemplate {
+        subagent,
+        error,
+        history: &recent,
+    }
+    .render()
+    .expect("subagent error template must render")
+}
+
+/// The alert telling the parent a run kept needing prompt-cache keep-alives,
+/// once it crossed the frequent-idle threshold.
+fn idle_alert(subagent: &str, keep_alive: &crate::agent::CacheKeepAliveState) -> Option<String> {
+    keep_alive.alerted.then(|| {
+        let reason = keep_alive
+            .last_reason
+            .clone()
+            .unwrap_or_else(|| "idle without a running background job".to_string());
+        format!(
+            "Subagent '{subagent}' needed {} prompt-cache keep-alives during its run — subagents should not idle frequently. Reason for its most recent idle: {reason}.",
+            keep_alive.sent
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1344,43 +1353,73 @@ mod tests {
     }
 
     #[test]
-    fn subagent_result_serializes_as_structured_json() {
-        let value = serde_json::to_value(SubagentResult {
-            subagent: "research".to_string(),
-            status: "completed",
-            result: "done".to_string(),
-            id: Some(7),
-            model: Some(SubagentRunModel {
-                name: "test-model".to_string(),
-                source: ModelSource::Routed,
-            }),
-            alert: None,
-        })
-        .expect("subagent result should serialize");
+    fn subagent_error_history_names_tool_calls() {
+        let history = [
+            HistoryEntry {
+                role: aither_core::llm::Role::User,
+                content: "go".to_string(),
+                tool_names: Vec::new(),
+            },
+            HistoryEntry {
+                role: aither_core::llm::Role::Assistant,
+                content: String::new(),
+                tool_names: vec!["terminal".to_string(), "terminal_read".to_string()],
+            },
+        ];
+        let rendered = SubagentErrorTemplate {
+            subagent: "research",
+            error: "boom",
+            history: &history,
+        }
+        .render()
+        .expect("subagent error should render");
         assert_eq!(
-            value,
-            serde_json::json!({
-                "subagent": "research",
-                "status": "completed",
-                "result": "done",
-                "id": 7,
-                "model": {
-                    "name": "test-model",
-                    "source": "routed",
-                },
-            })
+            rendered,
+            "Subagent 'research' error: boom\n\nRecent subagent history:\n- User: go\n- Assistant: [called terminal, terminal_read]\n"
+        );
+    }
+
+    #[test]
+    fn subagent_result_renders_as_prose() {
+        let completed = SubagentResultTemplate {
+            subagent: "research",
+            outcome: SubagentReport::Completed {
+                model: Some("test-model"),
+                result: "done",
+                id: 7,
+                alert: None,
+            },
+        }
+        .render()
+        .expect("subagent result should render");
+        assert_eq!(
+            completed,
+            "Subagent 'research' completed (model: test-model).\n\ndone\n\nContinue this subagent with `subagent resume --id 7` while its prompt cache is still warm."
         );
 
-        let cancelled = serde_json::to_value(SubagentResult::cancelled("explore".to_string()))
-            .expect("cancelled result should serialize");
+        let without_model = SubagentResultTemplate {
+            subagent: "research",
+            outcome: SubagentReport::Completed {
+                model: None,
+                result: "done",
+                id: 7,
+                alert: Some("It idled too often."),
+            },
+        }
+        .render()
+        .expect("subagent result should render");
         assert_eq!(
-            cancelled,
-            serde_json::json!({
-                "subagent": "explore",
-                "status": "cancelled",
-                "result": "Cancelled by user",
-            })
+            without_model,
+            "Subagent 'research' completed.\n\ndone\n\nContinue this subagent with `subagent resume --id 7` while its prompt cache is still warm.\n\nIt idled too often."
         );
+
+        let cancelled = SubagentResultTemplate {
+            subagent: "explore",
+            outcome: SubagentReport::Cancelled,
+        }
+        .render()
+        .expect("cancelled result should render");
+        assert_eq!(cancelled, "Subagent 'explore' was cancelled by the user.");
     }
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
@@ -1630,11 +1669,10 @@ mod tests {
             .await
             .expect("call task panicked")
             .expect("subagent call failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
+        let ToolResult::Text { text } = result else {
+            panic!("expected text result, got {result:?}");
         };
-        assert_eq!(value["status"], "cancelled");
-        assert_eq!(value["subagent"], "explore");
+        assert_eq!(text, "Subagent 'explore' was cancelled by the user.");
         assert!(runs.list().is_empty(), "finished run must unregister");
         assert!(!runs.cancel(run.id), "finished run cannot be cancelled");
 
@@ -1706,13 +1744,13 @@ mod tests {
         )
         .await
         .expect("subagent call failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
+        let ToolResult::Text { text } = result else {
+            panic!("expected text result, got {result:?}");
         };
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["result"], "fast-model");
-        assert_eq!(value["model"]["name"], "fast-model");
-        assert_eq!(value["model"]["source"], "chosen");
+        assert_eq!(
+            text,
+            "Subagent 'worker' completed (model: fast-model).\n\nfast-model\n\nContinue this subagent with `subagent resume --id 1` while its prompt cache is still warm."
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1737,13 +1775,13 @@ mod tests {
         )
         .await
         .expect("subagent call failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
+        let ToolResult::Text { text } = result else {
+            panic!("expected text result, got {result:?}");
         };
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["result"], "balanced-model");
-        assert_eq!(value["model"]["name"], "balanced-model");
-        assert_eq!(value["model"]["source"], "routed");
+        assert_eq!(
+            text,
+            "Subagent 'worker' completed (model: balanced-model).\n\nbalanced-model\n\nContinue this subagent with `subagent resume --id 1` while its prompt cache is still warm."
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1782,13 +1820,13 @@ You are a file-defined agent.
         )
         .await
         .expect("subagent call failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
+        let ToolResult::Text { text } = result else {
+            panic!("expected text result, got {result:?}");
         };
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["result"], "fast-model");
-        assert_eq!(value["model"]["name"], "fast-model");
-        assert_eq!(value["model"]["source"], "chosen");
+        assert_eq!(
+            text,
+            "Subagent 'file-agent' completed (model: fast-model).\n\nfast-model\n\nContinue this subagent with `subagent resume --id 1` while its prompt cache is still warm."
+        );
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(root);
@@ -1964,13 +2002,10 @@ You are a file-defined agent.
             .send_completed(aither_sandbox::CompletedTask {
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
-                result: Ok(aither_sandbox::TerminalResult {
-                    stdout: aither_sandbox::OutputEntry::Empty,
+                result: Ok(aither_sandbox::CompletedCommand {
+                    stdout: aither_core::llm::CommandStream::Inline(String::new()),
                     stderr: None,
                     exit_code: 0,
-                    task_id: Some("amber-test-task".to_string()),
-                    status: None,
-                    notice: None,
                 }),
             })
             .await;
@@ -1979,10 +2014,8 @@ You are a file-defined agent.
             .await
             .expect("call task panicked")
             .expect("subagent call failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
-        };
-        assert_eq!(value["status"], "completed");
+        let text = result.render_for_model();
+        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
 
         let keep_alives = keep_alive_requests(&request_rx);
         assert!(
@@ -2010,16 +2043,15 @@ You are a file-defined agent.
 
         // Two keep-alives crossed the configured threshold: the parent gets
         // one alert naming the subagent and the command it waited on.
-        let alert = value["alert"].as_str().expect("threshold alert missing");
         assert!(
-            alert.contains("worker"),
-            "alert names the subagent: {alert}"
+            text.contains("Subagent 'worker' needed"),
+            "alert names the subagent: {text}"
         );
         assert!(
-            alert.contains("sleep 2"),
-            "alert gives the idle reason: {alert}"
+            text.contains("sleep 2"),
+            "alert gives the idle reason: {text}"
         );
-        assert!(alert.contains("should not idle frequently"), "{alert}");
+        assert!(text.contains("should not idle frequently"), "{text}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2053,13 +2085,10 @@ You are a file-defined agent.
             .send_completed(aither_sandbox::CompletedTask {
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
-                result: Ok(aither_sandbox::TerminalResult {
-                    stdout: aither_sandbox::OutputEntry::Empty,
+                result: Ok(aither_sandbox::CompletedCommand {
+                    stdout: aither_core::llm::CommandStream::Inline(String::new()),
                     stderr: None,
                     exit_code: 0,
-                    task_id: Some("amber-test-task".to_string()),
-                    status: None,
-                    notice: None,
                 }),
             })
             .await;
@@ -2068,15 +2097,16 @@ You are a file-defined agent.
             .await
             .expect("call task panicked")
             .expect("subagent call failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
-        };
-        assert_eq!(value["status"], "completed");
+        let text = result.render_for_model();
+        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
         assert!(
             keep_alive_requests(&request_rx).is_empty(),
             "no keep-alive config means no keep-alives"
         );
-        assert!(value["alert"].is_null(), "no alert without keep-alives");
+        assert!(
+            !text.contains("keep-alives during its run"),
+            "no alert without keep-alives: {text}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2110,10 +2140,8 @@ You are a file-defined agent.
         )
         .await
         .expect("subagent call failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
-        };
-        assert_eq!(value["status"], "completed");
+        let text = result.render_for_model();
+        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
         assert!(
             keep_alive_requests(&request_rx).is_empty(),
             "a run that never waits on a background job gets no keep-alive"
@@ -2231,7 +2259,21 @@ You are a file-defined agent.
         }
     }
 
-    async fn first_run(tool: &SubagentTool<EchoLlm>, prompt_file: &Path) -> serde_json::Value {
+    /// The continuation id a result text names.
+    fn continuation_id(text: &str) -> u64 {
+        let tail = text
+            .split("subagent resume --id ")
+            .nth(1)
+            .unwrap_or_else(|| panic!("result names a continuation id: {text}"));
+        tail.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .expect("continuation id is a number")
+    }
+
+    /// Runs the first call and returns its result text and continuation id.
+    async fn first_run(tool: &SubagentTool<EchoLlm>, prompt_file: &Path) -> (String, u64) {
         let result = Tool::call(
             tool,
             SubagentArgs::Start {
@@ -2243,10 +2285,9 @@ You are a file-defined agent.
         )
         .await
         .expect("subagent call failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
-        };
-        value
+        let text = result.render_for_model();
+        let id = continuation_id(&text);
+        (text, id)
     }
 
     #[tokio::test]
@@ -2259,10 +2300,9 @@ You are a file-defined agent.
             }),
         );
         let (dir, first_prompt) = write_prompt_file("resume-first", "first question marker");
-        let first = first_run(&tool, &first_prompt).await;
-        assert_eq!(first["status"], "completed");
-        assert_eq!(first["result"], "reply-0");
-        let id = first["id"].as_u64().expect("result names an id");
+        let (first, id) = first_run(&tool, &first_prompt).await;
+        assert!(first.starts_with("Subagent 'worker' completed"), "{first}");
+        assert!(first.contains("\n\nreply-0\n\n"), "{first}");
         while requests.try_recv().is_ok() {}
 
         let follow_up = dir.join("follow-up.txt");
@@ -2270,13 +2310,14 @@ You are a file-defined agent.
         let result = Tool::call(&tool, resume_args(&follow_up, id), ToolContext::new())
             .await
             .expect("continuing failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
-        };
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["result"], "reply-1");
-        assert_eq!(value["id"], id, "a continued subagent keeps its id");
-        assert_eq!(value["subagent"], "worker");
+        let text = result.render_for_model();
+        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
+        assert!(text.contains("\n\nreply-1\n\n"), "{text}");
+        assert_eq!(
+            continuation_id(&text),
+            id,
+            "a continued subagent keeps its id"
+        );
 
         let request = requests.try_recv().expect("continuation sent a request");
         let sent = serde_json::to_string(request.messages()).expect("serialize messages");
@@ -2320,8 +2361,7 @@ You are a file-defined agent.
     async fn claude_subagent_expires_after_its_five_minute_lifetime() {
         let (tool, _requests) = resume_tool(None, Some(crate::config::CacheKeepAlive::default()));
         let (dir, prompt_file) = write_prompt_file("resume-expired", "first");
-        let first = first_run(&tool, &prompt_file).await;
-        let id = first["id"].as_u64().expect("result names an id");
+        let (_, id) = first_run(&tool, &prompt_file).await;
 
         age_finished_subagent(&tool, id, std::time::Duration::from_secs(301));
         let error = Tool::call(&tool, resume_args(&prompt_file, id), ToolContext::new())
@@ -2340,8 +2380,7 @@ You are a file-defined agent.
     async fn claude_subagent_continues_just_inside_its_five_minute_lifetime() {
         let (tool, _requests) = resume_tool(None, Some(crate::config::CacheKeepAlive::default()));
         let (dir, prompt_file) = write_prompt_file("resume-inside", "first");
-        let first = first_run(&tool, &prompt_file).await;
-        let id = first["id"].as_u64().expect("result names an id");
+        let (_, id) = first_run(&tool, &prompt_file).await;
 
         age_finished_subagent(&tool, id, std::time::Duration::from_secs(290));
         Tool::call(&tool, resume_args(&prompt_file, id), ToolContext::new())
@@ -2356,8 +2395,7 @@ You are a file-defined agent.
     async fn non_claude_subagent_keeps_the_default_lifetime() {
         let (tool, _requests) = resume_tool(None, None);
         let (dir, prompt_file) = write_prompt_file("resume-default-lifetime", "first");
-        let first = first_run(&tool, &prompt_file).await;
-        let id = first["id"].as_u64().expect("result names an id");
+        let (_, id) = first_run(&tool, &prompt_file).await;
 
         age_finished_subagent(&tool, id, std::time::Duration::from_secs(301));
         Tool::call(&tool, resume_args(&prompt_file, id), ToolContext::new())
@@ -2444,11 +2482,8 @@ You are a file-defined agent.
     async fn finished_subagent_without_keep_alive_still_continues() {
         let (tool, requests) = resume_tool(None, None);
         let (dir, first_prompt) = write_prompt_file("resume-no-keepalive", "first marker");
-        let first = first_run(&tool, &first_prompt).await;
-        assert_eq!(first["status"], "completed");
-        let id = first["id"]
-            .as_u64()
-            .expect("a provider without keep-alive still gets an id");
+        let (first, id) = first_run(&tool, &first_prompt).await;
+        assert!(first.starts_with("Subagent 'worker' completed"), "{first}");
         while requests.try_recv().is_ok() {}
 
         let follow_up = dir.join("follow-up.txt");
@@ -2456,12 +2491,10 @@ You are a file-defined agent.
         let result = Tool::call(&tool, resume_args(&follow_up, id), ToolContext::new())
             .await
             .expect("continuing failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
-        };
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["result"], "reply-1");
-        assert_eq!(value["id"], id);
+        let text = result.render_for_model();
+        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
+        assert!(text.contains("\n\nreply-1\n\n"), "{text}");
+        assert_eq!(continuation_id(&text), id);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2471,8 +2504,7 @@ You are a file-defined agent.
     async fn permanent_cache_lifetime_never_expires() {
         let (tool, _requests) = resume_tool(Some(CacheLifetime::Permanent), None);
         let (dir, first_prompt) = write_prompt_file("resume-permanent", "first");
-        let first = first_run(&tool, &first_prompt).await;
-        let id = first["id"].as_u64().expect("result names an id");
+        let (_, id) = first_run(&tool, &first_prompt).await;
 
         // Well past the lifetime the expiry test uses; a permanent cache
         // never goes cold.
@@ -2482,11 +2514,9 @@ You are a file-defined agent.
         let result = Tool::call(&tool, resume_args(&follow_up, id), ToolContext::new())
             .await
             .expect("a permanent lifetime never expires");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
-        };
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["id"], id);
+        let text = result.render_for_model();
+        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
+        assert_eq!(continuation_id(&text), id);
 
         let _ = std::fs::remove_dir_all(dir);
     }

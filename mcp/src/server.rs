@@ -489,15 +489,7 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
 
         match tools.call(name, &args_str, cx).await {
             Ok(output) => {
-                let content = match contents_for(&output) {
-                    Ok(content) => content,
-                    Err(error) => {
-                        return JsonRpcResponse::error(
-                            id,
-                            JsonRpcError::internal_error(error.to_string()),
-                        );
-                    }
-                };
+                let content = contents_for(&output);
                 let result = CallToolResult {
                     content,
                     is_error: output.is_error(),
@@ -532,10 +524,10 @@ fn parse_call_params(params: Option<serde_json::Value>) -> Result<CallToolParams
 /// [`ToolResult::Parts`] emits one content item per part so a call that
 /// returns text alongside a screenshot keeps both; every other result maps
 /// to a single item.
-fn contents_for(output: &ToolResult) -> aither_core::Result<Vec<Content>> {
+fn contents_for(output: &ToolResult) -> Vec<Content> {
     match output {
         ToolResult::Parts { parts } => parts.iter().map(content_for_part).collect(),
-        output => Ok(vec![content_for(output)?]),
+        output => vec![content_for(output)],
     }
 }
 
@@ -543,28 +535,28 @@ fn contents_for(output: &ToolResult) -> aither_core::Result<Vec<Content>> {
 /// as [`Content::Image`] carrying the standard-base64 bytes and the MIME
 /// essence; every other payload keeps the text representation
 /// `render_for_model` produces.
-fn content_for(output: &ToolResult) -> aither_core::Result<Content> {
+fn content_for(output: &ToolResult) -> Content {
     if let ToolResult::Binary { mime, content } = output
         && let Some(image) = image_content(mime, content)
     {
-        return Ok(image);
+        return image;
     }
-    Ok(Content::Text(TextContent {
-        text: output.render_for_model()?,
+    Content::Text(TextContent {
+        text: output.render_for_model(),
         annotations: None,
-    }))
+    })
 }
 
-fn content_for_part(part: &ToolResultPart) -> aither_core::Result<Content> {
+fn content_for_part(part: &ToolResultPart) -> Content {
     if let ToolResultPart::Binary { mime, content } = part
         && let Some(image) = image_content(mime, content)
     {
-        return Ok(image);
+        return image;
     }
-    Ok(Content::Text(TextContent {
-        text: part.render_for_model()?,
+    Content::Text(TextContent {
+        text: part.render_for_model(),
         annotations: None,
-    }))
+    })
 }
 
 fn image_content(mime: &str, content: &[u8]) -> Option<Content> {
