@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use aither_core::llm::ToolResult;
 
+use crate::external_hook::{InjectedContext, LifecyclePayload};
 use crate::{ContextCheckpoint, context_window::ContextWindowSnapshot};
 
 /// Context provided to hooks before a tool is called.
@@ -111,7 +112,8 @@ pub struct CheckpointContext<'a> {
 }
 
 /// Reason why the agent stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// Query completed successfully.
     Complete,
@@ -219,6 +221,26 @@ pub trait Hook: Send + Sync {
     ) -> impl std::future::Future<Output = Option<String>> + Send {
         async { None }
     }
+
+    /// Called when a lifecycle event of the session happens.
+    ///
+    /// For observation: the event cannot be blocked or changed. A hook that
+    /// has context to add keeps it and hands it over from
+    /// [`take_injected_context`](Self::take_injected_context).
+    fn on_lifecycle<P: LifecyclePayload>(
+        &self,
+        _payload: &P,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+
+    /// Hands over the context lifecycle events injected since the last call.
+    ///
+    /// The agent calls it where it collects system alerts and delivers each
+    /// piece once, as a system alert.
+    fn take_injected_context(&self) -> Vec<InjectedContext> {
+        Vec::new()
+    }
 }
 
 /// No-op implementation for unit type (base case for `HCons`).
@@ -296,6 +318,19 @@ where
             return Some(err);
         }
         self.tail.on_checkpoint(ctx).await
+    }
+
+    async fn on_lifecycle<P: LifecyclePayload>(&self, payload: &P) {
+        futures::join!(
+            self.head.on_lifecycle(payload),
+            self.tail.on_lifecycle(payload)
+        );
+    }
+
+    fn take_injected_context(&self) -> Vec<InjectedContext> {
+        let mut context = self.head.take_injected_context();
+        context.extend(self.tail.take_injected_context());
+        context
     }
 }
 

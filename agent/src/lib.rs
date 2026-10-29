@@ -42,6 +42,7 @@ pub mod context;
 mod context_window;
 mod error;
 mod event;
+pub mod external_hook;
 mod fork;
 mod fs_util;
 mod hook;
@@ -96,6 +97,7 @@ pub use context::{
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;
 pub use event::{AgentEvent, TimedEvent};
+pub use external_hook::{ExternalHooks, LifecycleHookConfig};
 pub use fork::{ForkSnapshot, ForkSource};
 pub use hook::{
     CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction, StopContext,

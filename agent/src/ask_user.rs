@@ -9,6 +9,7 @@ use aither_core::llm::tool::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::external_hook::{self, ExternalHooks};
 use crate::tool_request::{
     ToolRequest, ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
@@ -151,6 +152,7 @@ pub fn channel() -> (AskUserBroker, AskUserQueue) {
 pub struct AskUserTool {
     broker: AskUserBroker,
     session_id: String,
+    hooks: Option<ExternalHooks>,
 }
 
 impl AskUserTool {
@@ -160,7 +162,15 @@ impl AskUserTool {
         Self {
             broker,
             session_id: session_id.into(),
+            hooks: None,
         }
+    }
+
+    /// Tells `hooks` which questions were asked and how the user answered.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: ExternalHooks) -> Self {
+        self.hooks = Some(hooks);
+        self
     }
 }
 
@@ -177,6 +187,11 @@ impl Tool for AskUserTool {
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
+        let questions = if self.hooks.is_some() {
+            args.clone().into_questions()
+        } else {
+            Vec::new()
+        };
         let response = self
             .broker
             .request(AskUserRequestPayload {
@@ -184,6 +199,14 @@ impl Tool for AskUserTool {
                 request: args,
             })
             .await?;
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .fire(&external_hook::AskUser {
+                    questions,
+                    answers: response.clone(),
+                })
+                .await;
+        }
         Ok(ToolResult::text(
             AskUserResultTemplate { answers: &response }
                 .render()

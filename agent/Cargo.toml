@@ -30,6 +30,8 @@ heck = "0.5"
 tracing = "0.1"
 async-fs = "2"
 async-channel = "2"
+async-io = "2"
+async-process = "2"
 arc-swap = "1"
 event-listener = "5"
 aither-websearch = { workspace = true, optional = true }
@@ -53,7 +55,6 @@ hex = "0.4"
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 url = "2.5.8"
-async-process = "=2.5.0"
 aither-openai.workspace = true
 
 [features]

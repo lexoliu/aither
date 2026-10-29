@@ -47,7 +47,7 @@ use crate::jobserver::{JobBroker, JobPool, job_broker_channel};
 use crate::{
     ContainerPath, MountRoot, PreparedTools, ToolDistribution, ToolRuntimeError,
     builtin::builtin_router,
-    command::{CommandRole, ToolRegistry},
+    command::{AnyCommandObserver, CommandRole, ToolRegistry},
     job_registry::{JobRegistry, JobStatus, job_registry_channel},
     output::{
         INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, empty_stream,
@@ -910,6 +910,7 @@ pub struct TerminalToolFactory {
 #[derive(Debug)]
 struct TerminalToolRequest {
     grant: SubagentGrant,
+    observer: Option<AnyCommandObserver>,
     reply: Sender<Result<crate::command::DynTerminalTool, SubagentGrantError>>,
 }
 
@@ -934,7 +935,8 @@ impl TerminalToolFactory {
     /// The tool serves the subagent registry and runs in a space of its own
     /// inside the launching terminal's working directory; `grant` is
     /// everything it may write beyond that space, and must lie inside what the
-    /// launching terminal can write.
+    /// launching terminal can write. The commands it calls are told to
+    /// `observer`.
     ///
     /// # Errors
     /// Returns an error when the launching terminal is gone or does not
@@ -942,10 +944,15 @@ impl TerminalToolFactory {
     pub async fn create(
         &self,
         grant: SubagentGrant,
+        observer: Option<AnyCommandObserver>,
     ) -> Result<crate::command::DynTerminalTool, TerminalToolFactoryError> {
         let (reply, reply_rx) = async_channel::bounded(1);
         self.tx
-            .send(TerminalToolRequest { grant, reply })
+            .send(TerminalToolRequest {
+                grant,
+                observer,
+                reply,
+            })
             .await
             .map_err(|_| TerminalToolFactoryError::Unavailable)?;
         Ok(reply_rx
@@ -969,9 +976,14 @@ async fn serve_launches<P, E>(
     E: Executor + Clone + 'static,
 {
     let mut history = LaunchHistory::default();
-    while let Ok(TerminalToolRequest { grant, reply }) = requests.recv().await {
+    while let Ok(TerminalToolRequest {
+        grant,
+        observer,
+        reply,
+    }) = requests.recv().await
+    {
         let tool = source
-            .subagent(&mut history, grant)
+            .subagent(&mut history, grant, observer)
             .await
             .map(TerminalTool::to_dyn);
         if reply.send(tool).await.is_err() {
@@ -987,6 +999,7 @@ pub struct TerminalBinding {
     launcher: TerminalToolFactory,
     working_dir: PathBuf,
     role: CommandRole,
+    observer: Option<AnyCommandObserver>,
 }
 
 impl TerminalBinding {
@@ -1008,6 +1021,12 @@ impl TerminalBinding {
     #[must_use]
     pub const fn role(&self) -> CommandRole {
         self.role
+    }
+
+    /// The observer told about the commands this terminal's registry serves.
+    #[must_use]
+    pub const fn observer(&self) -> Option<&AnyCommandObserver> {
+        self.observer.as_ref()
     }
 }
 
@@ -1448,6 +1467,7 @@ where
             launcher: TerminalToolFactory { tx: launcher },
             working_dir: self.working_dir.clone(),
             role: self.registry.registry.role(),
+            observer: self.registry.registry.observer().cloned(),
         };
         let source = self.clone();
         self.executor
@@ -1735,6 +1755,7 @@ where
         &self,
         history: &mut LaunchHistory,
         grant: SubagentGrant,
+        observer: Option<AnyCommandObserver>,
     ) -> Result<TerminalTool<P, E, Configured>, SubagentGrantError> {
         // Grants are compared by real path, so every path of the subagent's
         // view is canonical.
@@ -1787,7 +1808,7 @@ where
         let registry = Arc::new(
             self.registry
                 .registry()
-                .for_subagent()
+                .for_subagent(observer)
                 .with_terminal_controls(job_registry.clone(), self.outputs_dir()),
         );
         let launching = TerminalTool {
@@ -5269,7 +5290,7 @@ mod tests {
         let parent_registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
         let parent = tool.with_registry(parent_registry);
         let child = parent
-            .subagent(&mut LaunchHistory::default(), SubagentGrant::new())
+            .subagent(&mut LaunchHistory::default(), SubagentGrant::new(), None)
             .await
             .expect("an empty grant is always given");
         assert_eq!(
@@ -5341,7 +5362,7 @@ mod tests {
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
         let parent = tool.with_registry(registry);
         let child = parent
-            .subagent(&mut LaunchHistory::default(), SubagentGrant::new())
+            .subagent(&mut LaunchHistory::default(), SubagentGrant::new(), None)
             .await
             .expect("an empty grant is always given");
 
@@ -6804,7 +6825,7 @@ mod tests {
             .expect("prepared tools should be adopted");
         let parent = tool.with_registry(Arc::new(ToolRegistryBuilder::new().build(dir.path())));
         let child = parent
-            .subagent(&mut LaunchHistory::default(), SubagentGrant::new())
+            .subagent(&mut LaunchHistory::default(), SubagentGrant::new(), None)
             .await
             .expect("an empty grant is always given");
         // The acceptance container does not really mount the host workspace,
@@ -6952,7 +6973,9 @@ mod tests {
         parent: &ConfiguredTestTool,
         grant: SubagentGrant,
     ) -> Result<ConfiguredTestTool, SubagentGrantError> {
-        parent.subagent(&mut LaunchHistory::default(), grant).await
+        parent
+            .subagent(&mut LaunchHistory::default(), grant, None)
+            .await
     }
 
     #[cfg(unix)]
@@ -7446,7 +7469,7 @@ mod tests {
                 .worktree
                 .into_iter()
                 .fold(SubagentGrant::new(), SubagentGrant::with_worktree);
-            let launched = self.binding.launcher().create(grant).await?;
+            let launched = self.binding.launcher().create(grant, None).await?;
             Ok(ToolResult::Text {
                 text: launched.working_dir().display().to_string(),
             })

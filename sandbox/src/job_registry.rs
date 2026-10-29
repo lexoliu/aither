@@ -1001,10 +1001,8 @@ async fn kill_job(jobs: &mut HashMap<u32, JobState>, pid: u32) -> bool {
             return true;
         }
 
-        #[cfg(unix)]
-        {
-            let result = unsafe { libc::kill(-pid.cast_signed(), libc::SIGKILL) };
-            if result == 0 {
+        match crate::process_tree::kill_process_tree(pid).await {
+            Ok(()) => {
                 if let Err(error) = finalize_output_redirect(job).await {
                     tracing::warn!(
                         pid = %pid,
@@ -1019,46 +1017,9 @@ async fn kill_job(jobs: &mut HashMap<u32, JobState>, pid: u32) -> bool {
                 tracing::info!(pid = %pid, "killed job");
                 return true;
             }
-            let error = std::io::Error::last_os_error();
-            tracing::warn!(pid = %pid, error = %error, "failed to kill job");
-            return false;
-        }
-
-        #[cfg(windows)]
-        {
-            let output = async_process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output()
-                .await;
-            match output {
-                Ok(output) if output.status.success() => {
-                    if let Err(error) = finalize_output_redirect(job).await {
-                        tracing::warn!(
-                            pid = %pid,
-                            error = %error,
-                            "failed to flush redirected output after kill"
-                        );
-                    }
-                    job.info.status = JobStatus::Killed;
-                    job.finished_at = Some(Instant::now());
-                    job.stdout_closed = true;
-                    job.stderr_closed = true;
-                    tracing::info!(pid = %pid, "killed job (Windows)");
-                    return true;
-                }
-                Ok(output) => {
-                    tracing::warn!(
-                        pid = %pid,
-                        status = %output.status,
-                        stderr = %String::from_utf8_lossy(&output.stderr),
-                        "taskkill reported failure"
-                    );
-                    return false;
-                }
-                Err(err) => {
-                    tracing::warn!(pid = %pid, error = %err, "failed to kill job (Windows)");
-                    return false;
-                }
+            Err(error) => {
+                tracing::warn!(pid = %pid, error = %error, "failed to kill job");
+                return false;
             }
         }
     }
