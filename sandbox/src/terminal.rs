@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -232,7 +232,13 @@ fn shell_launch(script: &str) -> (String, Vec<String>) {
     }
 }
 
-fn build_terminal_launch(script: &str) -> Result<TerminalLaunch, TerminalError> {
+/// Turns `script` into the process to launch. A shell launch with a `report`
+/// file records the shell's final directory there when it exits; a direct
+/// command cannot change directory, so it reports nothing.
+fn build_terminal_launch(
+    script: &str,
+    report: Option<&Path>,
+) -> Result<TerminalLaunch, TerminalError> {
     let script = script.trim();
     if script.is_empty() {
         return Err(TerminalError::Execution(
@@ -241,17 +247,49 @@ fn build_terminal_launch(script: &str) -> Result<TerminalLaunch, TerminalError> 
     }
 
     if script_requires_shell(script) {
-        let (program, args) = shell_launch(script);
-        return Ok(TerminalLaunch::Shell { program, args });
+        return shell_launch_reporting(script, report);
     }
 
     let (program, args) = parse_direct_command(script)?;
     if looks_like_env_assignment(&program) || is_shell_builtin(&program) {
-        let (program, args) = shell_launch(script);
-        return Ok(TerminalLaunch::Shell { program, args });
+        return shell_launch_reporting(script, report);
     }
 
     Ok(TerminalLaunch::Direct { program, args })
+}
+
+#[derive(Template)]
+#[template(path = "carry_cwd.sh", escape = "none")]
+struct CarryCwdTemplate<'a> {
+    escaped_report: &'a str,
+    script: &'a str,
+}
+
+fn shell_launch_reporting(
+    script: &str,
+    report: Option<&Path>,
+) -> Result<TerminalLaunch, TerminalError> {
+    let Some(report) = report else {
+        let (program, args) = shell_launch(script);
+        return Ok(TerminalLaunch::Shell { program, args });
+    };
+    let script = carry_cwd_script(script, &report.to_string_lossy())?;
+    let (program, args) = shell_launch(&script);
+    Ok(TerminalLaunch::Shell { program, args })
+}
+
+/// `script` followed by nothing but a trap that writes the shell's final
+/// directory to `report`, a path as the shell sees it.
+fn carry_cwd_script(script: &str, report: &str) -> Result<String, TerminalError> {
+    let escaped_report = shell_escape(report);
+    CarryCwdTemplate {
+        escaped_report: &escaped_report,
+        script,
+    }
+    .render()
+    .map_err(|error| {
+        TerminalError::Execution(format!("failed to render directory report: {error}"))
+    })
 }
 
 async fn ensure_mode_allowed<P: PermissionHandler>(
@@ -308,7 +346,8 @@ async fn ensure_mode_allowed<P: PermissionHandler>(
 ///
 /// ## Execution Modes
 ///
-/// `terminal` is stateless. Each call selects its own runtime mode.
+/// Each call selects its own runtime mode and starts a fresh shell; only a
+/// successful `cd` carries over to the next call.
 /// A call runs in the foreground and is killed — with its whole process
 /// tree — after 10 seconds. Run long-running commands with
 /// `terminal_background`, which takes an explicit job timeout.
@@ -1016,6 +1055,44 @@ struct SubagentAuthority {
     container: Option<ContainerConfinement>,
 }
 
+/// The main agent's working directory, carried from one foreground command
+/// to the next. `None` inside means the terminal's own working directory.
+#[derive(Clone, Default)]
+struct CarriedDir(Arc<Mutex<Option<PathBuf>>>);
+
+impl CarriedDir {
+    fn get(&self) -> Option<PathBuf> {
+        self.0.lock().expect("carried directory lock").clone()
+    }
+
+    fn set(&self, dir: Option<PathBuf>) {
+        *self.0.lock().expect("carried directory lock") = dir;
+    }
+}
+
+/// A foreground command that reports the directory it ended in.
+#[derive(Clone)]
+struct CwdCarry {
+    /// Where the command starts.
+    start: Option<PathBuf>,
+    /// The file the command's shell writes its final directory to when it
+    /// exits.
+    report: PathBuf,
+    /// Set for a container command: the workspace mount that maps the host
+    /// paths above into the container and back.
+    container: Option<ContainerCarry>,
+}
+
+/// How a container command spells its directory report.
+#[derive(Clone)]
+struct ContainerCarry {
+    mount: MountRoot,
+    /// Where the container sees the report file.
+    report: ContainerPath,
+    /// Where the command starts inside the container.
+    start: ContainerPath,
+}
+
 /// The terminal tool for executing scripts in a sandbox.
 pub struct TerminalTool<P, E, State = Unconfigured> {
     /// Shared working directory (four random words, e.g., `amber-forest-thunder-pearl/`)
@@ -1053,6 +1130,10 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     readable_paths: Vec<PathBuf>,
     /// Set on a subagent's terminal, never on the main agent's.
     subagent: Option<SubagentAuthority>,
+    /// The working directory the next foreground command starts in; held on
+    /// the main agent's terminal only, a subagent's commands always start in
+    /// its own space.
+    carried_dir: Option<CarriedDir>,
     /// Rolling audit log recording every sandboxed network policy decision.
     network_audit: Option<NetworkAuditLog>,
     /// Scheduling priority applied to every sandboxed execution.
@@ -1087,6 +1168,7 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             writable_paths: self.writable_paths.clone(),
             readable_paths: self.readable_paths.clone(),
             subagent: self.subagent.clone(),
+            carried_dir: self.carried_dir.clone(),
             network_audit: self.network_audit.clone(),
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1205,6 +1287,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
             subagent: None,
+            carried_dir: Some(CarriedDir::default()),
             network_audit: None,
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1272,6 +1355,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
             subagent: None,
+            carried_dir: Some(CarriedDir::default()),
             network_audit: None,
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1304,6 +1388,7 @@ impl<P, E, State> TerminalTool<P, E, State> {
             writable_paths: self.writable_paths,
             readable_paths: self.readable_paths,
             subagent: self.subagent,
+            carried_dir: self.carried_dir,
             network_audit: self.network_audit,
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1710,6 +1795,7 @@ where
                 committing: granted.committing,
                 container,
             }),
+            carried_dir: None,
             network_audit: self.network_audit.clone(),
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1948,6 +2034,7 @@ where
             max_lines,
             raw,
             background,
+            carry,
         } = request;
         let ExecutionTarget { mode, backend } = target;
         let (result_tx, result_rx) = async_channel::bounded(1);
@@ -1977,6 +2064,7 @@ where
                 task_id,
                 execution_id,
                 background,
+                carry,
                 script,
                 mode,
                 backend,
@@ -2020,6 +2108,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
         let prepared = self.prepare_execution(&arguments).await?;
+        let carry = self.cwd_carry(&prepared).await;
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
             task_id: prepared.task_id.clone(),
@@ -2030,17 +2119,128 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             max_lines: prepared.max_lines,
             raw: arguments.raw,
             background: false,
+            carry: carry.clone(),
         });
         // Registration precedes `report_ready` on every backend, so once
         // startup returns the job is killable through the registry and the
         // foreground clock only measures the command's own runtime.
         wait_for_background_startup(&spawned.startup).await?;
-        match wait_for_foreground_result(&spawned.result, self.limits.foreground).await {
+        let outcome = wait_for_foreground_result(&spawned.result, self.limits.foreground).await;
+        if let Some(carry) = &carry {
+            let succeeded = matches!(&outcome, Some(Ok(result)) if result.exit_code == 0);
+            self.record_carried_dir(carry, succeeded).await;
+        }
+        match outcome {
             Some(Ok(result)) => CommandResult::from(result).into_tool_result(),
             Some(Err(err)) => Err(anyhow::anyhow!(err)),
             None => {
                 self.finish_killed_foreground(&spawned, &prepared.task_id)
                     .await
+            }
+        }
+    }
+}
+
+impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool<P, E, Configured> {
+    /// The directory report of a foreground command on the main agent's
+    /// terminal; `None` for a subagent, for an ssh command and for a container
+    /// whose workspace mount is not declared.
+    async fn cwd_carry(&self, prepared: &ExecutionPreparation) -> Option<CwdCarry> {
+        let carried = self.carried_dir.as_ref()?;
+        let mount = match &prepared.target.backend {
+            ExecutionBackend::Local(_) if !cfg!(windows) => None,
+            ExecutionBackend::Container { runtime, .. } => Some(runtime.workspace_mount()?.clone()),
+            _ => return None,
+        };
+        let start = carried.get();
+        // A directory removed since it was recorded no longer carries.
+        let start = match start {
+            Some(dir)
+                if async_fs::metadata(&dir)
+                    .await
+                    .is_ok_and(|meta| meta.is_dir()) =>
+            {
+                Some(dir)
+            }
+            Some(_) => {
+                carried.set(None);
+                None
+            }
+            None => None,
+        };
+        let report = self.working_dir.join(format!(".cwd-{}", prepared.task_id));
+        let container = match mount {
+            None => None,
+            Some(mount) => {
+                // The report must lie in the mounted workspace for the host
+                // to read it back.
+                let container_report = mount.container_path(&report).ok()?;
+                let container_start = start
+                    .as_ref()
+                    .and_then(|start| mount.container_path(start).ok())
+                    .unwrap_or_else(|| {
+                        ContainerPath::new(CONTAINER_EXEC_WORKING_DIR)
+                            .expect("the exec directory is absolute")
+                    });
+                Some(ContainerCarry {
+                    mount,
+                    report: container_report,
+                    start: container_start,
+                })
+            }
+        };
+        Some(CwdCarry {
+            start,
+            report,
+            container,
+        })
+    }
+
+    /// Makes the directory a finished foreground command ended in the start
+    /// of the next one, when the command succeeded and the directory lies
+    /// inside the paths this terminal may read. The report file is consumed
+    /// either way.
+    async fn record_carried_dir(&self, carry: &CwdCarry, succeeded: bool) {
+        let reported = async_fs::read_to_string(&carry.report).await;
+        let _ = async_fs::remove_file(&carry.report).await;
+        let Some(carried) = &self.carried_dir else {
+            return;
+        };
+        if !succeeded {
+            return;
+        }
+        // A direct command or a shell that did not exit normally writes none.
+        let Ok(reported) = reported else {
+            return;
+        };
+        let reported = reported.trim_end_matches('\n');
+        if reported.is_empty() {
+            return;
+        }
+        if let Some(container) = &carry.container {
+            // A container is an unconfined main agent: what bounds its
+            // directory is the workspace mount.
+            if let Ok(dir) = ContainerPath::new(reported)
+                .map_err(drop)
+                .and_then(|dir| container.mount.host_path(&dir).map_err(drop))
+            {
+                carried.set(Some(dir));
+            }
+            return;
+        }
+        let Ok(dir) = canonical_path(Path::new(reported)).await else {
+            return;
+        };
+        for grant in std::iter::once(&self.working_dir)
+            .chain(&self.writable_paths)
+            .chain(&self.readable_paths)
+        {
+            if canonical_path(grant)
+                .await
+                .is_ok_and(|grant| dir.starts_with(grant))
+            {
+                carried.set(Some(dir));
+                return;
             }
         }
     }
@@ -2114,6 +2314,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
             max_lines: prepared.max_lines,
             raw: arguments.terminal.raw,
             background: true,
+            carry: None,
         });
         wait_for_background_startup(&spawned.startup).await?;
         self.spawn_kill_watchdog(&prepared.task_id, timeout);
@@ -2389,6 +2590,7 @@ struct StandaloneExecution<P, E> {
     task_id: String,
     execution_id: String,
     background: bool,
+    carry: Option<CwdCarry>,
     script: String,
     mode: TerminalMode,
     backend: ExecutionBackend,
@@ -2415,6 +2617,7 @@ struct StandaloneStart<'a, P, E> {
     job_registry: &'a JobRegistry,
     task_id: &'a str,
     execution_id: &'a str,
+    carry: Option<&'a CwdCarry>,
     script: &'a str,
     mode: TerminalMode,
     backend: &'a ExecutionBackend,
@@ -2435,6 +2638,7 @@ struct LocalBackgroundExecution<'a, E> {
     registry: &'a Arc<ToolRegistry>,
     task_id: &'a str,
     execution_id: &'a str,
+    carry: Option<&'a CwdCarry>,
     script: &'a str,
     mode: TerminalMode,
     job_registry: &'a JobRegistry,
@@ -2455,6 +2659,7 @@ struct ContainerBackgroundExecution<'a, E> {
     container_runtime: &'a ContainerShellRuntime,
     prepared_tools: &'a PreparedTools<ContainerPath>,
     confinement: Option<&'a ContainerConfinement>,
+    carry: Option<&'a ContainerCarry>,
     ipc_commands: &'a [String],
     job_registry: &'a JobRegistry,
     stdin_alerts: Option<StdinAlerts>,
@@ -2521,6 +2726,7 @@ struct TerminalSpawnRequest {
     max_lines: usize,
     raw: bool,
     background: bool,
+    carry: Option<CwdCarry>,
 }
 
 struct SpawnedTerminal {
@@ -2539,6 +2745,7 @@ struct SpawnedTerminalTask<P, E> {
     task_id: String,
     execution_id: String,
     background: bool,
+    carry: Option<CwdCarry>,
     script: String,
     mode: TerminalMode,
     backend: ExecutionBackend,
@@ -2574,6 +2781,7 @@ where
         task_id,
         execution_id,
         background,
+        carry,
         script,
         mode,
         backend,
@@ -2603,6 +2811,7 @@ where
         task_id: task_id.clone(),
         execution_id,
         background,
+        carry,
         script: script.clone(),
         mode,
         backend,
@@ -2656,6 +2865,7 @@ where
         task_id,
         execution_id,
         background,
+        carry,
         script,
         mode,
         backend,
@@ -2688,6 +2898,7 @@ where
         job_registry: &job_registry,
         task_id: &task_id,
         execution_id: &execution_id,
+        carry: carry.as_ref(),
         script: &script,
         mode,
         backend: &backend,
@@ -2778,6 +2989,7 @@ where
                 container_runtime: runtime,
                 prepared_tools: tools,
                 confinement: confinement.as_ref(),
+                carry: request.carry.and_then(|carry| carry.container.as_ref()),
                 ipc_commands: &ipc_commands,
                 job_registry: request.job_registry,
                 stdin_alerts: request.stdin_alerts,
@@ -2814,6 +3026,7 @@ where
         registry: request.registry,
         task_id: request.task_id,
         execution_id: request.execution_id,
+        carry: request.carry,
         script: request.script,
         mode: request.mode,
         job_registry: request.job_registry,
@@ -3053,15 +3266,21 @@ where
         .await
         .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
 
-    let launch = build_terminal_launch(context.script)?;
+    let launch = build_terminal_launch(
+        context.script,
+        context.carry.map(|carry| carry.report.as_path()),
+    )?;
     let (program, args) = match &launch {
         TerminalLaunch::Direct { program, args } | TerminalLaunch::Shell { program, args } => {
             (program, args)
         }
     };
 
-    let child = sandbox
-        .command(program)
+    let mut command = sandbox.command(program);
+    if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
+        command = command.current_dir(start);
+    }
+    let child = command
         .args(args)
         .envs(runtime_environment)
         .stdin(local_stdin_config(context.stdin_alerts.as_ref()))
@@ -3135,15 +3354,21 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         .await
         .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
 
-    let launch = build_terminal_launch(context.script)?;
+    let launch = build_terminal_launch(
+        context.script,
+        context.carry.map(|carry| carry.report.as_path()),
+    )?;
     let (program, args) = match &launch {
         TerminalLaunch::Direct { program, args } | TerminalLaunch::Shell { program, args } => {
             (program, args)
         }
     };
 
-    let child = sandbox
-        .command(program)
+    let mut command = sandbox.command(program);
+    if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
+        command = command.current_dir(start);
+    }
+    let child = command
         .args(args)
         .envs(runtime_environment)
         .stdin(local_stdin_config(context.stdin_alerts.as_ref()))
@@ -3420,6 +3645,13 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         )?)
     };
     let script = context.prepared_tools.wrap_script(context.script)?;
+    let script = match context.carry {
+        Some(carry) => carry_cwd_script(&script, carry.report.as_str())?,
+        None => script,
+    };
+    let working_dir = context
+        .carry
+        .map_or(CONTAINER_EXEC_WORKING_DIR, |carry| carry.start.as_str());
     let wrapped_script = wrap_container_script(
         &script,
         context.ipc_commands,
@@ -3429,7 +3661,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         }),
         context.priority,
         context.prepared_tools.bin_dir(),
-        CONTAINER_EXEC_WORKING_DIR,
+        working_dir,
         context.confinement,
     )?;
 
@@ -3437,7 +3669,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         .exec_boxed(
             container_runtime.container_id(),
             &wrapped_script,
-            CONTAINER_EXEC_WORKING_DIR,
+            working_dir,
             kill_rx,
             input_rx,
             stdin_blocked,
@@ -5235,6 +5467,7 @@ mod tests {
             task_id: "task-test".to_string(),
             execution_id: "exec-test".to_string(),
             background: false,
+            carry: None,
             script: "/bin/pwd".to_string(),
             mode: TerminalMode::Sandboxed,
             backend: ExecutionBackend::Local(tool.shell_sessions.local_tools().unwrap().clone()),
@@ -5623,6 +5856,7 @@ mod tests {
             background_startup: &BackgroundStartup::new(startup_tx),
             priority: ProcessPriority::default(),
             confinement: None,
+            carry: None,
         })
         .await
         .expect("a foreground container exec should complete at EOF");
@@ -6750,6 +6984,211 @@ mod tests {
             exit_code_of(&child, &touch(&granted.join("g.txt"))).await,
             0,
             "a subagent writes the worktrees it was granted"
+        );
+    }
+
+    /// Runs `script` in `tool` and returns its trimmed standard output.
+    #[cfg(unix)]
+    async fn stdout_of(tool: &ConfiguredTestTool, script: &str) -> String {
+        let result = tool
+            .call(terminal_args("carry probe", script), ToolContext::new())
+            .await
+            .expect("terminal call should succeed");
+        render_terminal_result(&result).trim().to_string()
+    }
+
+    /// The directory `pwd` prints for the next command.
+    #[cfg(unix)]
+    async fn pwd_of(tool: &ConfiguredTestTool) -> PathBuf {
+        PathBuf::from(stdout_of(tool, "pwd").await)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_successful_cd_carries_to_the_next_foreground_command() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        assert_eq!(pwd_of(&tool).await, root);
+
+        assert_eq!(exit_code_of(&tool, "mkdir sub && cd sub").await, 0);
+        assert_eq!(pwd_of(&tool).await, root.join("sub"));
+        // Relative to the carried directory, and a later `cd` carries on.
+        assert_eq!(exit_code_of(&tool, "mkdir -p a/b && cd a/b").await, 0);
+        assert_eq!(pwd_of(&tool).await, root.join("sub/a/b"));
+        // A direct command starts in the carried directory too.
+        assert_eq!(
+            PathBuf::from(stdout_of(&tool, "/bin/pwd").await),
+            root.join("sub/a/b")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failure_an_outside_cd_and_a_background_cd_leave_the_directory() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        stdout_of(&tool, "mkdir sub other && cd sub").await;
+        let sub = root.join("sub");
+        assert_eq!(pwd_of(&tool).await, sub);
+
+        assert_eq!(
+            exit_code_of(&tool, "cd ../other; exit 3").await,
+            3,
+            "the command fails"
+        );
+        assert_eq!(pwd_of(&tool).await, sub, "a failed command carries nothing");
+
+        // Readable to the sandbox, yet in none of the terminal's grants.
+        assert_eq!(
+            exit_code_of(&tool, "cd /usr").await,
+            0,
+            "the cd itself succeeds"
+        );
+        assert_eq!(
+            pwd_of(&tool).await,
+            sub,
+            "a directory outside the readable paths carries nothing"
+        );
+
+        start_background_job(&tool, "cd ../other && pwd").await;
+        for _ in 0..500 {
+            if tool.running_tasks.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            async_io::Timer::after(Duration::from_millis(20)).await;
+        }
+        assert_eq!(tool.running_tasks.load(Ordering::Acquire), 0);
+        assert_eq!(pwd_of(&tool).await, sub, "a background cd carries nothing");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exported_variable_does_not_reach_the_next_command() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        assert_eq!(
+            stdout_of(
+                &tool,
+                "export CARRY_PROBE=set; mkdir sub; cd sub; echo $CARRY_PROBE"
+            )
+            .await,
+            "set"
+        );
+        assert_eq!(
+            stdout_of(&tool, "printenv CARRY_PROBE; echo rc=$?").await,
+            "rc=1"
+        );
+        assert_eq!(
+            pwd_of(&tool).await,
+            dunce::canonicalize(dir.path()).unwrap().join("sub")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagents_cd_does_not_carry_over() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, parent) = authority_terminal(dir.path()).await;
+        let child = launch(&parent, SubagentGrant::new())
+            .await
+            .expect("a subagent without grants launches");
+        let space = child.working_dir().clone();
+
+        assert_eq!(exit_code_of(&child, "mkdir sub && cd sub").await, 0);
+        assert_eq!(
+            pwd_of(&child).await,
+            space,
+            "the subagent starts in its space"
+        );
+        // Nor does it disturb the main agent's directory.
+        assert_eq!(
+            pwd_of(&parent).await,
+            dunce::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_directory_report_is_written_by_the_rendered_script() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let report = dir.path().join("it's report");
+        let script = carry_cwd_script("mkdir sub && cd sub", &report.to_string_lossy())
+            .expect("the trailer should render");
+        let status = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .current_dir(dir.path())
+            .status()
+            .expect("sh should run");
+        assert!(status.success());
+        let written = std::fs::read_to_string(&report).expect("the trap writes the report");
+        assert_eq!(
+            PathBuf::from(written.trim_end()),
+            dunce::canonicalize(dir.path().join("sub")).unwrap()
+        );
+        // The script's own exit status survives the trap.
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &carry_cwd_script("exit 7", &report.to_string_lossy()).unwrap(),
+            ])
+            .status()
+            .expect("sh should run");
+        assert_eq!(status.code(), Some(7));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_container_directory_report_maps_through_the_workspace_mount() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let mount = MountRoot::new(
+            dir.path(),
+            ContainerPath::new("/workspace").expect("absolute"),
+        );
+        let report = tool.working_dir().join(".cwd-container");
+        let carry = CwdCarry {
+            start: None,
+            report: report.clone(),
+            container: Some(ContainerCarry {
+                mount: mount.clone(),
+                report: mount
+                    .container_path(&report)
+                    .expect("report is in the mount"),
+                start: ContainerPath::new("/workspace").unwrap(),
+            }),
+        };
+        assert_eq!(
+            carry.container.as_ref().unwrap().report.as_str(),
+            format!(
+                "/workspace/{}",
+                report.file_name().unwrap().to_string_lossy()
+            )
+        );
+        let carried = tool.carried_dir.as_ref().unwrap();
+
+        // A directory inside the mount, spelled as the container sees it.
+        std::fs::write(&report, "/workspace/sub/dir\n").unwrap();
+        tool.record_carried_dir(&carry, true).await;
+        assert_eq!(carried.get(), Some(dir.path().join("sub/dir")));
+        assert!(!report.exists(), "the report is consumed");
+
+        // Outside the mount, after a failure and an empty report: unchanged.
+        std::fs::write(&report, "/etc\n").unwrap();
+        tool.record_carried_dir(&carry, true).await;
+        assert_eq!(carried.get(), Some(dir.path().join("sub/dir")));
+        std::fs::write(&report, "/workspace/other\n").unwrap();
+        tool.record_carried_dir(&carry, false).await;
+        assert_eq!(carried.get(), Some(dir.path().join("sub/dir")));
+
+        // The mapping back to the container for the next start.
+        assert_eq!(
+            mount
+                .container_path(&dir.path().join("sub/dir"))
+                .unwrap()
+                .as_str(),
+            "/workspace/sub/dir"
         );
     }
 
