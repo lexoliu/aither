@@ -132,11 +132,13 @@ pub use terminal::{
     TerminalToolFactoryError, Unconfigured, background_task_channel, open_network_audit_log,
 };
 pub use tool_distribution::{
-    ToolArtifact, ToolArtifactFormat, ToolArtifactLocation, ToolDistribution,
+    HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,
+    ToolDistribution,
 };
 pub use tool_runtime::{
-    ManagedTool, PreparedEnvironment, PreparedTools, ToolBinary, ToolBundle, ToolCatalog,
-    ToolRuntimeError, ToolTarget,
+    DistributedTool, HostProgram, HostProgramBinary, HostProgramPath, ManagedTool,
+    PreparedEnvironment, PreparedTools, ToolBinary, ToolBundle, ToolCatalog, ToolRuntimeError,
+    ToolTarget,
 };
 pub use tool_transport::{
     ContainerToolTransport, SshToolTransport, ToolEnvironmentInfo, ToolTransport,

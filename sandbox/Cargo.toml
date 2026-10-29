@@ -87,6 +87,8 @@ hex = "0.4.3"
 semver = { version = "1.0.28", features = ["serde"] }
 tar = { version = "0.4.46", default-features = false }
 flate2 = "1.1.10"
+# Pure-Rust xz decoding for `tar.xz` artifacts.
+lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz"] }
 zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 url = { version = "2.5.8", features = ["serde"] }
@@ -105,6 +107,7 @@ jobserver = ["dep:polling", "dep:rustix"]
 [dev-dependencies]
 magika = { version = "1", features = ["_test"] }
 tempfile = "3"
+lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
 tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
 
 [lints]
