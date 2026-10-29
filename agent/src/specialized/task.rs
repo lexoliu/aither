@@ -3723,6 +3723,7 @@ You are a file-defined agent.
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
     /// The task id the background-started reminder in `request` reports.
     fn reported_task_id(request: &LLMRequest) -> String {
         request
@@ -3743,6 +3744,7 @@ You are a file-defined agent.
             })
     }
 
+    #[cfg(unix)]
     fn control_call(id: &str, name: &str, task_id: &str) -> Event {
         Event::ToolCall(aither_core::llm::ToolCall::new(
             id,
@@ -3751,6 +3753,9 @@ You are a file-defined agent.
         ))
     }
 
+    // Windows runs terminal scripts through `cmd.exe`, which has no `sleep`
+    // to keep the fork's job alive (#217).
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_forks_terminal_controls_reach_its_own_jobs_and_not_the_main_agents() {
         let fixture = ForkFixture::new().await;
