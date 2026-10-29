@@ -47,7 +47,9 @@ use crate::jobserver::{JobBroker, JobPool, job_broker_channel};
 use crate::{
     ContainerPath, MountRoot, PreparedTools, ToolDistribution, ToolRuntimeError,
     builtin::builtin_router,
-    command::{AnyCommandObserver, CommandRole, ToolRegistry},
+    command::{
+        AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandRole, GateDecision, ToolRegistry,
+    },
     job_registry::{JobRegistry, JobStatus, job_registry_channel},
     output::{
         INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, empty_stream,
@@ -911,6 +913,7 @@ pub struct TerminalToolFactory {
 struct TerminalToolRequest {
     grant: SubagentGrant,
     observer: Option<AnyCommandObserver>,
+    gate: Option<AnyCommandGate>,
     reply: Sender<Result<crate::command::DynTerminalTool, SubagentGrantError>>,
 }
 
@@ -936,7 +939,7 @@ impl TerminalToolFactory {
     /// inside the launching terminal's working directory; `grant` is
     /// everything it may write beyond that space, and must lie inside what the
     /// launching terminal can write. The commands it calls are told to
-    /// `observer`.
+    /// `observer`, and every shell command it runs is put to `gate`.
     ///
     /// # Errors
     /// Returns an error when the launching terminal is gone or does not
@@ -945,12 +948,14 @@ impl TerminalToolFactory {
         &self,
         grant: SubagentGrant,
         observer: Option<AnyCommandObserver>,
+        gate: Option<AnyCommandGate>,
     ) -> Result<crate::command::DynTerminalTool, TerminalToolFactoryError> {
         let (reply, reply_rx) = async_channel::bounded(1);
         self.tx
             .send(TerminalToolRequest {
                 grant,
                 observer,
+                gate,
                 reply,
             })
             .await
@@ -979,11 +984,12 @@ async fn serve_launches<P, E>(
     while let Ok(TerminalToolRequest {
         grant,
         observer,
+        gate,
         reply,
     }) = requests.recv().await
     {
         let tool = source
-            .subagent(&mut history, grant, observer)
+            .subagent(&mut history, grant, observer, gate)
             .await
             .map(TerminalTool::to_dyn);
         if reply.send(tool).await.is_err() {
@@ -1455,6 +1461,24 @@ where
     }
 }
 
+#[cfg(test)]
+impl<P, E> TerminalTool<P, E, Configured>
+where
+    P: PermissionHandler + 'static,
+    E: Executor + Clone + 'static,
+{
+    /// A subagent terminal with an empty grant, told to no observer or gate.
+    async fn subagent_without_grant(&self) -> Result<Self, SubagentGrantError> {
+        self.subagent(
+            &mut LaunchHistory::default(),
+            SubagentGrant::new(),
+            None,
+            None,
+        )
+        .await
+    }
+}
+
 impl<P, E> TerminalTool<P, E, Launching>
 where
     P: PermissionHandler + 'static,
@@ -1756,6 +1780,7 @@ where
         history: &mut LaunchHistory,
         grant: SubagentGrant,
         observer: Option<AnyCommandObserver>,
+        gate: Option<AnyCommandGate>,
     ) -> Result<TerminalTool<P, E, Configured>, SubagentGrantError> {
         // Grants are compared by real path, so every path of the subagent's
         // view is canonical.
@@ -1808,7 +1833,7 @@ where
         let registry = Arc::new(
             self.registry
                 .registry()
-                .for_subagent(observer)
+                .for_subagent(observer, gate)
                 .with_terminal_controls(job_registry.clone(), self.outputs_dir()),
         );
         let launching = TerminalTool {
@@ -2308,6 +2333,13 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
         // The one entry every foreground, background and subagent command on
         // every backend passes through, ahead of permission and execution.
         crate::kill_guard::check(&arguments.script)?;
+        // Ahead of target resolution and permission, so a blocked command
+        // never asks the user for anything. The decision carries no grant.
+        if let Some(gate) = self.registry.registry().gate()
+            && let GateDecision::Block { reason } = gate.check(&arguments.script).await
+        {
+            return Err(CommandBlocked { reason }.into());
+        }
         let target =
             self.resolve_execution_target(arguments.mode, arguments.ssh_server_id.as_deref())?;
         if let ExecutionBackend::Local(tools) = &target.backend {
@@ -4800,6 +4832,52 @@ mod tests {
         assert_eq!(authorizer.installs.load(AtomicOrdering::SeqCst), 0);
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_container_home_still_gives_the_host_runnable_tools() {
+        let container = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: false,
+            container: true,
+            ssh: false,
+        })
+        .with_container_runtime(test_container_runtime("aither-host-tools"))
+        .with_test_container_tools(
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle()),
+            "aither-host-tools".to_string(),
+        );
+        assert!(
+            matches!(
+                container.local_tools(),
+                Err(ToolRuntimeError::NotInitialized(_))
+            ),
+            "the container's own tools are not host-runnable"
+        );
+
+        let artifacts = tempfile::tempdir().unwrap();
+        let distribution = script_distribution(
+            artifacts.path(),
+            b"#!/bin/sh\nprintf '%s\\n' 'tool 1.0.0'\n",
+        )
+        .await;
+        let cache = tempfile::tempdir().unwrap();
+        let host = container
+            .host_tools(&distribution, cache.path())
+            .await
+            .expect("the distribution prepares the host target");
+        let runtimes = std::fs::canonicalize(cache.path().join("runtimes")).unwrap();
+        assert!(host.bin_dir().starts_with(runtimes));
+        for command in ["apply_patch", "rg", "ast-grep", "jq"] {
+            let output = std::process::Command::new(host.bin_dir().join(command))
+                .output()
+                .expect("the host runs the prepared tool");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "tool 1.0.0\n",
+                "{command}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn adoption_rejects_a_registry_changed_after_preparation() {
         let authorizer = Arc::new(CountingSshAuthorizer::default());
@@ -5290,7 +5368,7 @@ mod tests {
         let parent_registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
         let parent = tool.with_registry(parent_registry);
         let child = parent
-            .subagent(&mut LaunchHistory::default(), SubagentGrant::new(), None)
+            .subagent_without_grant()
             .await
             .expect("an empty grant is always given");
         assert_eq!(
@@ -5362,7 +5440,7 @@ mod tests {
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
         let parent = tool.with_registry(registry);
         let child = parent
-            .subagent(&mut LaunchHistory::default(), SubagentGrant::new(), None)
+            .subagent_without_grant()
             .await
             .expect("an empty grant is always given");
 
@@ -6825,7 +6903,7 @@ mod tests {
             .expect("prepared tools should be adopted");
         let parent = tool.with_registry(Arc::new(ToolRegistryBuilder::new().build(dir.path())));
         let child = parent
-            .subagent(&mut LaunchHistory::default(), SubagentGrant::new(), None)
+            .subagent_without_grant()
             .await
             .expect("an empty grant is always given");
         // The acceptance container does not really mount the host workspace,
@@ -6974,7 +7052,7 @@ mod tests {
         grant: SubagentGrant,
     ) -> Result<ConfiguredTestTool, SubagentGrantError> {
         parent
-            .subagent(&mut LaunchHistory::default(), grant, None)
+            .subagent(&mut LaunchHistory::default(), grant, None, None)
             .await
     }
 
@@ -7469,7 +7547,7 @@ mod tests {
                 .worktree
                 .into_iter()
                 .fold(SubagentGrant::new(), SubagentGrant::with_worktree);
-            let launched = self.binding.launcher().create(grant, None).await?;
+            let launched = self.binding.launcher().create(grant, None, None).await?;
             Ok(ToolResult::Text {
                 text: launched.working_dir().display().to_string(),
             })

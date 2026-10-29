@@ -164,6 +164,7 @@ async fn bounded<T>(work: impl std::future::Future<Output = T>) -> T {
 
 #[tokio::test]
 async fn session_start_user_message_and_stop_fire_with_typed_input_and_inject_once() {
+    let tools = crate::test_support::prepared_fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("log");
     let hooks = ExternalHooks::new(
@@ -177,6 +178,7 @@ async fn session_start_user_message_and_stop_fire_with_typed_input_and_inject_on
             ],
         )],
         executor(),
+        &tools.tools,
     );
     let mut agent = agent_with(ScriptedLlm::new(&["first answer", "second answer"]), &hooks);
 
@@ -237,6 +239,7 @@ async fn session_start_user_message_and_stop_fire_with_typed_input_and_inject_on
 
 #[tokio::test]
 async fn compaction_fires_before_and_after() {
+    let tools = crate::test_support::prepared_fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("log");
     let hooks = ExternalHooks::new(
@@ -249,6 +252,7 @@ async fn compaction_fires_before_and_after() {
             ],
         )],
         executor(),
+        &tools.tools,
     );
     let mut agent = agent_with(ScriptedLlm::new(&["answer", "next"]), &hooks);
 
@@ -304,11 +308,13 @@ impl Tool for EchoTool {
 
 #[tokio::test]
 async fn an_ipc_call_event_carries_the_resolved_name_arguments_and_result() {
+    let tools = crate::test_support::prepared_fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("log");
     let hooks = ExternalHooks::new(
         vec![recorder(dir.path(), &log, &[LifecycleKind::CommandCall])],
         executor(),
+        &tools.tools,
     );
     let mut builder = ToolRegistryBuilder::new();
     builder.configure_tool(EchoTool);
@@ -356,6 +362,7 @@ async fn wait_for_context(hooks: &ExternalHooks, count: usize) {
 
 #[tokio::test]
 async fn an_ipc_call_answers_before_a_slow_hook_finishes_and_its_context_arrives_once() {
+    let tools = crate::test_support::prepared_fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let slow = script(
         dir.path(),
@@ -372,6 +379,7 @@ async fn an_ipc_call_answers_before_a_slow_hook_finishes_and_its_context_arrives
             events: vec![LifecycleKind::CommandCall],
         }],
         executor(),
+        &tools.tools,
     );
     let mut builder = ToolRegistryBuilder::new();
     builder.configure_tool(EchoTool);
@@ -400,11 +408,13 @@ async fn an_ipc_call_answers_before_a_slow_hook_finishes_and_its_context_arrives
 
 #[tokio::test]
 async fn an_ask_user_event_carries_the_questions_and_the_answers() {
+    let tools = crate::test_support::prepared_fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("log");
     let hooks = ExternalHooks::new(
         vec![recorder(dir.path(), &log, &[LifecycleKind::AskUser])],
         executor(),
+        &tools.tools,
     );
     let (broker, queue) = ask_user::channel();
     let tool = AskUserTool::new("session", broker).with_hooks(hooks.clone());
@@ -442,6 +452,7 @@ async fn an_ask_user_event_carries_the_questions_and_the_answers() {
 
 #[tokio::test]
 async fn a_lifecycle_hook_cannot_block() {
+    let tools = crate::test_support::prepared_fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let hook = |name: &str, body: &str| LifecycleHookConfig {
         name: name.into(),
@@ -474,6 +485,7 @@ async fn a_lifecycle_hook_cannot_block() {
             hook("silent", "#!/bin/sh\ncat >/dev/null\n"),
         ],
         executor(),
+        &tools.tools,
     );
     let mut agent = agent_with(ScriptedLlm::new(&["the run went through"]), &hooks);
 
@@ -500,6 +512,7 @@ fn pid_is_alive(pid: &str) -> bool {
 
 #[tokio::test]
 async fn a_hook_past_its_deadline_is_killed_with_its_process_group() {
+    let tools = crate::test_support::prepared_fixture().await;
     let dir = tempfile::tempdir().unwrap();
     let pids = dir.path().join("pids");
     let hung = script(
@@ -518,7 +531,8 @@ async fn a_hook_past_its_deadline_is_killed_with_its_process_group() {
 
     let started = Instant::now();
     let error = bounded(
-        HookRunner.run::<_, LifecycleOutput>(&command, &serde_json::json!({"event": "stop"})),
+        HookRunner::new(&tools.tools)
+            .run::<_, LifecycleOutput>(&command, &serde_json::json!({"event": "stop"})),
     )
     .await
     .expect_err("the hook outlives its deadline");
@@ -546,15 +560,16 @@ async fn a_hook_past_its_deadline_is_killed_with_its_process_group() {
 
 #[tokio::test]
 async fn a_hook_that_fails_in_every_way_is_reported_and_ignored() {
+    let tools = crate::test_support::prepared_fixture().await;
     let dir = tempfile::tempdir().unwrap();
+    let runner = HookRunner::new(&tools.tools);
+    let runner = &runner;
     let run = |command: Vec<String>| {
         let command = HookCommand {
             command,
             deadline_ms: 20_000,
         };
-        async move {
-            bounded(HookRunner.run::<_, LifecycleOutput>(&command, &serde_json::json!({}))).await
-        }
+        async move { bounded(runner.run::<_, LifecycleOutput>(&command, &serde_json::json!({}))).await }
     };
     assert!(matches!(run(vec![]).await, Err(HookRunError::EmptyCommand)));
     assert!(matches!(

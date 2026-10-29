@@ -1268,6 +1268,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             .as_ref()
             .map_or_else(ExternalHooks::none, ExternalHooks::for_subagent);
         let command_observer = self.hooks.is_some().then(|| child_hooks.command_observer());
+        let command_gate = self.hooks.is_some().then(|| child_hooks.command_gate());
 
         // Launch the subagent's terminal from the terminal this tool serves.
         let (agent_builder, child_job_registry, commit_ledger) = if let Some(binding) =
@@ -1275,7 +1276,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         {
             let dyn_terminal = binding
                 .launcher()
-                .create(grant, command_observer)
+                .create(grant, command_observer, command_gate)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to create subagent terminal tool: {e}"))?;
             let job_registry = dyn_terminal.job_registry();
@@ -3920,6 +3921,7 @@ You are a file-defined agent.
         use crate::external_hook::{ExternalHooks, LifecycleKind};
 
         let hooks_dir = unique_temp_dir("subagent-hooks");
+        let tools = crate::test_support::prepared_fixture().await;
         let log = hooks_dir.join("log");
         let main = ExternalHooks::new(
             vec![recorder(
@@ -3934,6 +3936,7 @@ You are a file-defined agent.
                 ],
             )],
             executor_core::AnyExecutor::new(executor_core::tokio::TokioGlobal),
+            &tools.tools,
         );
         let tool =
             worker_tool(SubagentTool::new(TextLlm::new("only-model"))).with_hooks(main.clone());

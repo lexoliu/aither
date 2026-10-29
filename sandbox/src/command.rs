@@ -346,6 +346,110 @@ pub trait CommandObserver: Send + Sync + 'static {
     fn command_called(&self, call: &CommandCall<'_>) -> impl Future<Output = ()> + Send;
 }
 
+/// What a [`CommandGate`] decided about one shell command.
+///
+/// There is no grant to give: an allowed command runs under the permissions
+/// it would have had without a gate, and the permission path still decides
+/// anything beyond the sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateDecision {
+    /// The command may go on to the permission path and run.
+    Allow,
+    /// The command does not run; `reason` reaches the model as its result.
+    Block {
+        /// Why the command was refused.
+        reason: String,
+    },
+}
+
+/// A command the gate blocked, as the refusal the model reads in place of
+/// the command's result.
+#[derive(Debug)]
+pub struct CommandBlocked {
+    pub reason: String,
+}
+
+#[derive(Template)]
+#[template(path = "command_blocked.txt")]
+struct CommandBlockedTemplate<'a> {
+    reason: &'a str,
+}
+
+impl std::fmt::Display for CommandBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rendered = CommandBlockedTemplate {
+            reason: &self.reason,
+        }
+        .render()
+        .map_err(|_| std::fmt::Error)?;
+        f.write_str(&rendered)
+    }
+}
+
+impl std::error::Error for CommandBlocked {}
+
+/// Decides whether a shell command may run, before it does.
+///
+/// Every command of the `terminal` and `terminal_background` tools, the
+/// main agent's and every subagent's, is put to the gate of its terminal's
+/// registry in full, ahead of the permission path.
+pub trait CommandGate: Send + Sync + 'static {
+    /// Decides on `command`, the full script text.
+    fn check(&self, command: &str) -> impl Future<Output = GateDecision> + Send;
+}
+
+/// Object-safe twin of [`CommandGate`].
+trait CommandGateImpl: Send + Sync {
+    fn check<'a>(
+        &'a self,
+        command: &'a str,
+    ) -> Pin<Box<dyn Future<Output = GateDecision> + Send + 'a>>;
+
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+impl<T: CommandGate> CommandGateImpl for T {
+    fn check<'a>(
+        &'a self,
+        command: &'a str,
+    ) -> Pin<Box<dyn Future<Output = GateDecision> + Send + 'a>> {
+        Box::pin(CommandGate::check(self, command))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// A type-erased [`CommandGate`].
+#[derive(Clone)]
+pub struct AnyCommandGate(Arc<dyn CommandGateImpl>);
+
+impl AnyCommandGate {
+    /// Erases `gate`.
+    #[must_use]
+    pub fn new(gate: impl CommandGate) -> Self {
+        Self(Arc::new(gate))
+    }
+
+    /// The wrapped gate, when it is a `T`.
+    #[must_use]
+    pub fn downcast_ref<T: CommandGate>(&self) -> Option<&T> {
+        self.0.as_any().downcast_ref()
+    }
+
+    /// Puts `command` to the gate.
+    pub async fn check(&self, command: &str) -> GateDecision {
+        self.0.check(command).await
+    }
+}
+
+impl std::fmt::Debug for AnyCommandGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AnyCommandGate")
+    }
+}
+
 /// Object-safe twin of [`CommandObserver`].
 trait CommandObserverImpl: Send + Sync {
     fn command_called<'a>(
@@ -690,6 +794,7 @@ pub struct ToolRegistryBuilder {
     entries: HashMap<String, RoleEntries<Arc<ToolEntry>>>,
     bound: HashMap<String, RoleEntries<Arc<BoundEntry>>>,
     observer: Option<AnyCommandObserver>,
+    gate: Option<AnyCommandGate>,
 }
 
 impl ToolRegistryBuilder {
@@ -865,6 +970,13 @@ impl ToolRegistryBuilder {
         self.observer = Some(observer);
     }
 
+    /// Has `gate` decide on every shell command the main agent's terminal
+    /// runs. A subagent's terminal is gated by the gate given to
+    /// [`ToolRegistry::for_subagent`].
+    pub fn gate_commands(&mut self, gate: AnyCommandGate) {
+        self.gate = Some(gate);
+    }
+
     /// Builds an immutable main-agent registry with a concrete output
     /// directory; [`ToolRegistry::for_subagent`] derives the subagent view.
     /// Terminal-bound commands are built when a terminal serves it.
@@ -877,6 +989,7 @@ impl ToolRegistryBuilder {
             output_dir: output_dir.into(),
             role: CommandRole::Main,
             observer: self.observer,
+            gate: self.gate,
         }
     }
 }
@@ -1009,6 +1122,7 @@ pub struct ToolRegistry {
     output_dir: PathBuf,
     role: CommandRole,
     observer: Option<AnyCommandObserver>,
+    gate: Option<AnyCommandGate>,
 }
 
 /// Detects the stdin argument from a JSON schema.
@@ -1079,9 +1193,14 @@ impl ToolRegistry {
     /// escalates.
     ///
     /// The subagent's calls are told to `observer`, not to this registry's
-    /// observer, which belongs to the agent that launches the subagent.
+    /// observer, which belongs to the agent that launches the subagent; the
+    /// same holds for `gate`.
     #[must_use]
-    pub fn for_subagent(&self, observer: Option<AnyCommandObserver>) -> Self {
+    pub fn for_subagent(
+        &self,
+        observer: Option<AnyCommandObserver>,
+        gate: Option<AnyCommandGate>,
+    ) -> Self {
         Self {
             entries: self.entries.clone(),
             bound: self.bound.clone(),
@@ -1089,7 +1208,15 @@ impl ToolRegistry {
             output_dir: self.output_dir.clone(),
             role: CommandRole::Subagent,
             observer,
+            gate,
         }
+    }
+
+    /// The gate every shell command of the terminal serving this registry
+    /// is put to.
+    #[must_use]
+    pub const fn gate(&self) -> Option<&AnyCommandGate> {
+        self.gate.as_ref()
     }
 
     /// The observer told about the calls this registry serves.
@@ -3343,7 +3470,7 @@ mod tests {
             answer: "anyone ran it",
         });
         let main = builder.build(tmp.path());
-        let subagent = main.for_subagent(None);
+        let subagent = main.for_subagent(None, None);
 
         let ok = run_command(&main, "reserved").await;
         assert!(ok.ok, "the main agent keeps the command: {ok:?}");
@@ -3383,7 +3510,7 @@ mod tests {
             },
         );
         let main = builder.build(tmp.path());
-        let subagent = main.for_subagent(None);
+        let subagent = main.for_subagent(None, None);
 
         let answer =
             |envelope: CommandEnvelope| envelope.payload.expect("the handler ran").render_for_cli();
@@ -3401,8 +3528,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let nested = ToolRegistryBuilder::new()
             .build(tmp.path())
-            .for_subagent(None)
-            .for_subagent(None);
+            .for_subagent(None, None)
+            .for_subagent(None, None);
         assert_eq!(nested.role(), CommandRole::Subagent);
     }
 
@@ -3429,10 +3556,13 @@ mod tests {
         });
         builder.observe_commands(AnyCommandObserver::new(CallLog(Arc::clone(&main_calls))));
         let main = builder.build(tmp.path());
-        let subagent = main.for_subagent(Some(AnyCommandObserver::new(CallLog(Arc::clone(
-            &subagent_calls,
-        )))));
-        let unobserved = main.for_subagent(None);
+        let subagent = main.for_subagent(
+            Some(AnyCommandObserver::new(CallLog(Arc::clone(
+                &subagent_calls,
+            )))),
+            None,
+        );
+        let unobserved = main.for_subagent(None, None);
 
         run_command(&main, "shared").await;
         run_command(&subagent, "shared").await;
