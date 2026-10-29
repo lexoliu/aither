@@ -49,10 +49,17 @@ use aither_mcp::McpConnection;
 ///     .build();
 /// ```
 #[must_use]
-pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
+pub struct AgentBuilder<
+    Advanced,
+    Balanced = Advanced,
+    Fast = Balanced,
+    H = (),
+    Compactor = Advanced,
+> {
     advanced: Advanced,
     balanced: Balanced,
     fast: Fast,
+    compaction_model: Option<Compactor>,
     tier: ModelTier,
     tools: AgentTools,
     hooks: H,
@@ -73,7 +80,9 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     skill_registry: Option<Arc<SkillRegistry>>,
 }
 
-impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Balanced, Fast, H> {
+impl<Advanced, Balanced, Fast, H, Compactor> std::fmt::Debug
+    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentBuilder")
             .field("tier", &self.tier)
@@ -82,7 +91,7 @@ impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Bal
     }
 }
 
-impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
+impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
     /// Creates a new agent builder with default configuration.
     ///
     /// All model tiers (advanced/balanced/fast) use the same model.
@@ -91,6 +100,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             advanced: llm.clone(),
             balanced: llm.clone(),
             fast: llm,
+            compaction_model: None,
             tier: ModelTier::default(),
             tools: AgentTools::new(),
             hooks: (),
@@ -109,11 +119,12 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
     }
 }
 
-impl<Advanced, Balanced, Fast, H> AgentBuilder<Advanced, Balanced, Fast, H>
+impl<Advanced, Balanced, Fast, H, Compactor> AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
 where
     Advanced: LanguageModel,
     Balanced: LanguageModel,
     Fast: LanguageModel,
+    Compactor: LanguageModel,
     H: Hook,
 {
     /// Sets the balanced model for moderate tasks (e.g., subagents).
@@ -123,11 +134,12 @@ where
     pub fn balanced_model<B2: LanguageModel>(
         self,
         model: B2,
-    ) -> AgentBuilder<Advanced, B2, Fast, H> {
+    ) -> AgentBuilder<Advanced, B2, Fast, H, Compactor> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: model,
             fast: self.fast,
+            compaction_model: self.compaction_model,
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,
@@ -152,11 +164,46 @@ where
     pub fn fast_model<F2: LanguageModel>(
         self,
         model: F2,
-    ) -> AgentBuilder<Advanced, Balanced, F2, H> {
+    ) -> AgentBuilder<Advanced, Balanced, F2, H, Compactor> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: self.balanced,
             fast: model,
+            compaction_model: self.compaction_model,
+            tier: self.tier,
+            tools: self.tools,
+            hooks: self.hooks,
+            config: self.config,
+            context: self.context,
+            prompt_cache: self.prompt_cache,
+            background_receiver: self.background_receiver,
+            permission_receiver: self.permission_receiver,
+            job_registry: self.job_registry,
+            context_sources: self.context_sources,
+            sandbox_dir: self.sandbox_dir,
+            restore_dir: self.restore_dir,
+            #[cfg(feature = "skills")]
+            skill_registry: self.skill_registry,
+        }
+    }
+
+    /// Sets the model compaction runs on, instead of the session's own.
+    ///
+    /// Without one, compaction reads the conversation's prompt cache on the
+    /// session's model, and an idle session is compacted shortly before the
+    /// cache expires ([`Agent::compact_when_idle`]). A different model cannot
+    /// read that cache, so with one set compaction requests go to it, idle
+    /// compaction never runs, and an idle gap past the cache lifetime
+    /// reassembles the window instead.
+    pub fn compaction_model<C2: LanguageModel>(
+        self,
+        model: C2,
+    ) -> AgentBuilder<Advanced, Balanced, Fast, H, C2> {
+        AgentBuilder {
+            advanced: self.advanced,
+            balanced: self.balanced,
+            fast: self.fast,
+            compaction_model: Some(model),
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,
@@ -268,11 +315,15 @@ where
     ///     .build();
     /// // Type: Agent<LLM, HCons<ConfirmationHook, HCons<LoggingHook, ()>>>
     /// ```
-    pub fn hook<NH: Hook>(self, hook: NH) -> AgentBuilder<Advanced, Balanced, Fast, HCons<NH, H>> {
+    pub fn hook<NH: Hook>(
+        self,
+        hook: NH,
+    ) -> AgentBuilder<Advanced, Balanced, Fast, HCons<NH, H>, Compactor> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: self.balanced,
             fast: self.fast,
+            compaction_model: self.compaction_model,
             tier: self.tier,
             tools: self.tools,
             hooks: HCons::new(hook, self.hooks),
@@ -550,11 +601,13 @@ where
     }
 
     /// Builds the agent.
-    pub fn build(self) -> Agent<Advanced, Balanced, Fast, H> {
+    pub fn build(self) -> Agent<Advanced, Balanced, Fast, H, Compactor> {
         Agent {
             advanced: std::sync::Arc::new(self.advanced),
             balanced: std::sync::Arc::new(self.balanced),
             fast: std::sync::Arc::new(self.fast),
+            compaction_model: self.compaction_model.map(std::sync::Arc::new),
+            idle_compacted: false,
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,

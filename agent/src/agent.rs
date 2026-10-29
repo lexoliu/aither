@@ -415,6 +415,9 @@ impl PermissionPauseTracker {
 /// - `Balanced`: LLM for moderate tasks like subagents (defaults to Advanced)
 /// - `Fast`: LLM for quick tasks like compaction (defaults to Balanced)
 /// - `H`: Composed hooks for customizing behavior (defaults to `()`)
+/// - `Compactor`: The optional compaction model, see
+///   [`AgentBuilder::compaction_model`](crate::builder::AgentBuilder::compaction_model)
+///   (defaults to `Advanced`; unused while none is set)
 ///
 /// # Model Tier Selection
 ///
@@ -423,7 +426,8 @@ impl PermissionPauseTracker {
 /// - Explore subagent: `ModelTier::Balanced` (cheaper but capable)
 /// - Quick tasks: `ModelTier::Fast`
 ///
-/// The `Fast` tier is always used for compaction, regardless of main tier.
+/// Compaction runs on the session's own tier, so it reads the conversation's
+/// prompt cache, unless a compaction model is set.
 ///
 /// # Example
 ///
@@ -446,7 +450,7 @@ impl PermissionPauseTracker {
 ///     .build();
 /// ```
 #[derive(Debug)]
-pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
+pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compactor = Advanced> {
     /// Primary LLM for main reasoning (most capable).
     /// The advanced reasoning model, behind an Arc so a forked compaction
     /// can own it while the run continues.
@@ -461,6 +465,18 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Shared rather than owned because compaction runs as a future that
     /// outlives the borrow of `self` taken by the turn it races against.
     pub(crate) fast: Arc<Fast>,
+
+    /// The model compaction runs on, when it is not the session's own.
+    ///
+    /// A different model cannot read the conversation's prompt cache, so with
+    /// one set compaction is never run early to catch the cache warm (see
+    /// [`Agent::compact_when_idle`]), and an idle gap past the cache lifetime
+    /// reassembles the window instead.
+    pub(crate) compaction_model: Option<Arc<Compactor>>,
+
+    /// Whether the idle compaction already ran since the last request, so one
+    /// idle gap compacts once.
+    pub(crate) idle_compacted: bool,
 
     /// Which model tier to use for main reasoning.
     pub(crate) tier: ModelTier,
@@ -548,7 +564,7 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     pub(crate) active_allowed_tools: Option<HashSet<String>>,
 }
 
-impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
+impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
     /// Creates a new agent with default configuration.
     ///
     /// All model tiers (advanced/balanced/fast) use the same model.
@@ -566,6 +582,8 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             advanced: Arc::new(llm.clone()),
             balanced: Arc::new(llm.clone()),
             fast: Arc::new(llm),
+            compaction_model: None,
+            idle_compacted: false,
             tier: ModelTier::default(),
             tools: AgentTools::new(),
             hooks: (),
@@ -605,13 +623,15 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
     }
 }
 
-impl<Advanced, Balanced, Fast, H> Agent<Advanced, Balanced, Fast, H>
+impl<Advanced, Balanced, Fast, H, Compactor> Agent<Advanced, Balanced, Fast, H, Compactor>
 where
     Advanced: LanguageModel + 'static,
     Balanced: LanguageModel + 'static,
     // Compaction runs as an owned future that outlives the turn it races
     // against, so the fast model it borrows must outlive the agent.
     Fast: LanguageModel + 'static,
+    // Owned by the compaction future for the same reason.
+    Compactor: LanguageModel + 'static,
     H: Hook,
 {
     /// Response stream of the active tier, boxed so the provider's concrete
@@ -1606,9 +1626,17 @@ where
 
         let messages_compacted = messages.len();
         let tail = self.render_tail().await;
-        let request = LLMRequest::new(self.context.build_request(&tail))
-            .with_parameters(self.config.request_parameters.clone())
-            .with_tool_definitions(self.tools.active_definitions());
+        let definitions = self.tools.active_definitions();
+        let messages = self.context.build_request(&tail);
+        // The same cache controls as the requests that wrote the prefix, so a
+        // compaction on the session's own model is served from that cache.
+        let request = LLMRequest::new(messages.clone())
+            .with_parameters(self.prompt_cache.apply(
+                self.config.request_parameters.clone(),
+                &messages,
+                !definitions.is_empty(),
+            ))
+            .with_tool_definitions(definitions);
         #[cfg(feature = "skills")]
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
@@ -1622,12 +1650,10 @@ where
         )
         .map_err(|error| AgentError::Llm(error.to_string()))?;
         let fork_point = fork.fork_point();
-        let handoff = match self.tier {
-            ModelTier::Advanced => fork.run(Arc::clone(&self.advanced)).await,
-            ModelTier::Balanced => fork.run(Arc::clone(&self.balanced)).await,
-            ModelTier::Fast => fork.run(Arc::clone(&self.fast)).await,
-        }
-        .map_err(|error| AgentError::Llm(error.to_string()))?;
+        let handoff = self
+            .compaction_future(fork)
+            .await
+            .map_err(|error| AgentError::Llm(error.to_string()))?;
         let summary = handoff.render_markdown();
 
         self.completed_compaction = Some(CompletedCompaction {
@@ -1643,11 +1669,108 @@ where
         }))
     }
 
+    /// Runs `fork` to completion on the compaction model: the configured one,
+    /// or else the session's own tier.
+    async fn compaction_future(
+        &self,
+        fork: CompactionFork,
+    ) -> Result<HandoffDocument, crate::context::CompactionError> {
+        if let Some(model) = &self.compaction_model {
+            return fork.run(Arc::clone(model)).await;
+        }
+        match self.tier {
+            ModelTier::Advanced => fork.run(Arc::clone(&self.advanced)).await,
+            ModelTier::Balanced => fork.run(Arc::clone(&self.balanced)).await,
+            ModelTier::Fast => fork.run(Arc::clone(&self.fast)).await,
+        }
+    }
+
+    /// Starts `fork` in the background on the compaction model: the
+    /// configured one, or else the session's own tier.
+    fn start_pending_compaction(&self, fork: CompactionFork) -> PendingCompaction {
+        if let Some(model) = &self.compaction_model {
+            return PendingCompaction::start(fork, Arc::clone(model));
+        }
+        match self.tier {
+            ModelTier::Advanced => PendingCompaction::start(fork, Arc::clone(&self.advanced)),
+            ModelTier::Balanced => PendingCompaction::start(fork, Arc::clone(&self.balanced)),
+            ModelTier::Fast => PendingCompaction::start(fork, Arc::clone(&self.fast)),
+        }
+    }
+
+    /// How long from now the idle compaction is due: `Some(Duration::ZERO)`
+    /// when it is due now, `None` when none is pending.
+    ///
+    /// The window is compacted once, shortly before the conversation's cache
+    /// lifetime ends ([`ContextPolicy::idle_compact_before_expiry`] ahead of
+    /// it), counted from the entry's last use, so the compaction reads the
+    /// still-warm cache. None is pending when:
+    ///
+    /// - a compaction model is set, which cannot read that cache;
+    /// - the lifetime is [`CacheLifetime::Permanent`];
+    /// - nothing has been sent yet, or the conversation is empty;
+    /// - it already ran since the last request;
+    /// - the cache has expired already, when compacting would only pay to
+    ///   write the whole context again.
+    ///
+    /// The agent has no timer of its own: the host sleeps this long while the
+    /// session is idle, then calls [`compact_when_idle`](Self::compact_when_idle).
+    ///
+    /// [`ContextPolicy::idle_compact_before_expiry`]: crate::ContextPolicy::idle_compact_before_expiry
+    #[must_use]
+    pub fn idle_compaction_due_in(&self) -> Option<Duration> {
+        if self.compaction_model.is_some()
+            || self.idle_compacted
+            || self.pending_compaction.is_some()
+            || self.completed_compaction.is_some()
+            || self.context.is_conversation_empty()
+        {
+            return None;
+        }
+        let CacheLifetime::Limited(lifetime) = self.prompt_cache.lifetime() else {
+            return None;
+        };
+        let idle = self.cache_entry_started_at()?.elapsed();
+        if idle >= lifetime {
+            return None;
+        }
+        let due_at = lifetime.saturating_sub(self.config.context_policy.idle_compact_before_expiry);
+        Some(due_at.saturating_sub(idle))
+    }
+
+    /// Compacts the idle session once its cache is about to expire.
+    ///
+    /// Runs one compaction through the normal fork and apply path when
+    /// [`idle_compaction_due_in`](Self::idle_compaction_due_in) says it is due
+    /// now, and returns `None` otherwise, so a host may call it whenever its
+    /// idle timer fires. One idle gap compacts once: the next request re-arms
+    /// it. Nothing is kept across the handoff, so no thinking produced under
+    /// the old prefix is replayed after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the compaction failure; the window is left as it was.
+    pub async fn compact_when_idle(&mut self) -> Result<Option<CompactResult>, AgentError> {
+        if self.idle_compaction_due_in() != Some(Duration::ZERO) {
+            return Ok(None);
+        }
+        let result = self.compact(None).await?;
+        self.idle_compacted = true;
+        if let Some(result) = &result {
+            tracing::info!(
+                compacted = result.messages_compacted,
+                "compacted the idle context shortly before its cache expires"
+            );
+        }
+        Ok(result)
+    }
+
     /// Forks a compaction off `request` to run alongside the turns that follow.
     ///
-    /// The compaction replays the session's current model, not a cheaper one:
-    /// the handoff has to carry the same understanding of the conversation the
-    /// next requests are made of.
+    /// The compaction replays the session's current model unless a compaction
+    /// model is set: the handoff has to carry the same understanding of the
+    /// conversation the next requests are made of, and only that model reads
+    /// the cache the run just paid for.
     ///
     /// A failure to even start — an empty conversation — is not an error for
     /// the run: there is simply nothing to compact yet.
@@ -1669,15 +1792,7 @@ where
                     usage = self.budget.usage(),
                     "forking compaction alongside the run"
                 );
-                self.pending_compaction = Some(match self.tier {
-                    ModelTier::Advanced => {
-                        PendingCompaction::start(fork, Arc::clone(&self.advanced))
-                    }
-                    ModelTier::Balanced => {
-                        PendingCompaction::start(fork, Arc::clone(&self.balanced))
-                    }
-                    ModelTier::Fast => PendingCompaction::start(fork, Arc::clone(&self.fast)),
-                });
+                self.pending_compaction = Some(self.start_pending_compaction(fork));
             }
             Err(error) => {
                 tracing::debug!(%error, "compaction not forked");
@@ -2042,7 +2157,9 @@ where
     /// [`ContextPolicy::pause_at`]: crate::ContextPolicy::pause_at
     async fn prepare_request(&mut self) -> Option<LLMRequest> {
         self.apply_completed_compaction().await;
-        self.reassemble_if_cache_is_cold();
+        if self.compaction_model.is_some() {
+            self.reassemble_if_cache_is_cold();
+        }
         self.push_request_alerts().await;
 
         let definitions = self.tools.active_definitions();
@@ -2085,6 +2202,7 @@ where
 
         self.commit_tail(&tail).await;
         self.last_request_started_at = Some(Instant::now());
+        self.idle_compacted = false;
 
         let has_tools = !definitions.is_empty();
         self.prompt_cache
@@ -2100,6 +2218,10 @@ where
     }
 
     /// Rebuilds the window once the provider's cache has gone cold anyway.
+    ///
+    /// Only with a compaction model set: otherwise the session is compacted
+    /// shortly before the cache expires ([`Agent::compact_when_idle`]), and an
+    /// idle gap never reassembles.
     ///
     /// Reassembly rewrites the cacheable prefix, so it is only free once the
     /// cached copy has expired — an idle gap at least as long as the
@@ -2181,9 +2303,10 @@ where
             return ContextWindowPhase::Compacting;
         }
         if metrics.has_staged_system_updates
-            || self
-                .cache_entry_started_at()
-                .is_some_and(|at| self.prompt_cache.lifetime().is_cold(at.elapsed()))
+            || (self.compaction_model.is_some()
+                && self
+                    .cache_entry_started_at()
+                    .is_some_and(|at| self.prompt_cache.lifetime().is_cold(at.elapsed())))
         {
             return ContextWindowPhase::ReassemblyDue;
         }
@@ -3582,12 +3705,17 @@ mod tests {
     }
 
     /// Idle reassembly fires only once the conversation's cache lifetime has
-    /// passed — never earlier, and never for a permanent cache.
+    /// passed — never earlier, and never for a permanent cache. It runs only
+    /// with a compaction model: otherwise idle compaction takes the idle gap.
     #[tokio::test]
     async fn an_idle_gap_reassembles_only_past_the_cache_lifetime() {
-        let mut agent = Agent::new(MockLlm {
+        let mut agent = Agent::builder(MockLlm {
             context_length: 1_000_000,
-        });
+        })
+        .compaction_model(MockLlm {
+            context_length: 1_000_000,
+        })
+        .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
         agent.push_message(Message::system(
@@ -3615,9 +3743,13 @@ mod tests {
     async fn a_permanent_cache_lifetime_never_reassembles() {
         use crate::context::CacheLifetime;
 
-        let mut agent = Agent::new(MockLlm {
+        let mut agent = Agent::builder(MockLlm {
             context_length: 1_000_000,
-        });
+        })
+        .compaction_model(MockLlm {
+            context_length: 1_000_000,
+        })
+        .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.prompt_cache = agent
             .prompt_cache
@@ -3633,6 +3765,154 @@ mod tests {
         agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
         assert!(agent.prepare_request().await.is_some());
         assert_eq!(agent.context().count_recent_system_messages(), 1);
+    }
+
+    /// An agent that has sent one request, with `llm` as its model.
+    async fn agent_after_one_request(
+        llm: ScriptedLlm,
+    ) -> Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, (), ScriptedLlm> {
+        let mut agent = Agent::new(llm);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent
+            .prepare_request()
+            .await
+            .expect("the first request goes out");
+        agent
+    }
+
+    /// The idle compaction fires once, shortly before the cache lifetime ends,
+    /// and not again while the session stays idle.
+    #[tokio::test]
+    async fn an_idle_session_compacts_once_before_its_cache_expires() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_after_one_request(llm.clone()).await;
+
+        // Fifty-three minutes of a one-hour lifetime: not yet due.
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3180));
+        let due_in = agent
+            .idle_compaction_due_in()
+            .expect("a compaction is pending");
+        assert!(due_in > Duration::from_secs(30) && due_in <= Duration::from_secs(60));
+        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(llm.recorded().is_empty());
+
+        // Fifty-four minutes: due now.
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
+        assert_eq!(agent.idle_compaction_due_in(), Some(Duration::ZERO));
+        let result = agent
+            .compact_when_idle()
+            .await
+            .expect("the compaction succeeds")
+            .expect("the compaction ran");
+        assert_eq!(result.messages_compacted, 1);
+        assert_eq!(llm.recorded().len(), 1);
+        assert!(agent.context().handoff().is_some());
+
+        // Still idle: nothing more, however long the gap grows inside the hour.
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3300));
+        assert_eq!(agent.idle_compaction_due_in(), None);
+        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert_eq!(llm.recorded().len(), 1, "one compaction per idle gap");
+
+        // The next request re-arms it for the next gap.
+        agent.push_message(Message::user("again"));
+        agent.prepare_request().await.expect("request after idle");
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
+        assert_eq!(agent.idle_compaction_due_in(), Some(Duration::ZERO));
+    }
+
+    /// An expired cache is not worth compacting for: the context is written
+    /// again either way.
+    #[tokio::test]
+    async fn an_expired_cache_is_not_idle_compacted() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_after_one_request(llm.clone()).await;
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        assert_eq!(agent.idle_compaction_due_in(), None);
+        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(llm.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_permanent_cache_lifetime_never_idle_compacts() {
+        use crate::context::CacheLifetime;
+
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = agent_after_one_request(llm.clone()).await;
+        agent.prompt_cache = agent
+            .prompt_cache
+            .clone()
+            .with_lifetime(CacheLifetime::Permanent);
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        assert_eq!(agent.idle_compaction_due_in(), None);
+        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(llm.recorded().is_empty());
+    }
+
+    /// With a compaction model, compaction requests go to it and idle
+    /// compaction never runs, since it cannot read the conversation's cache.
+    #[tokio::test]
+    async fn a_compaction_model_takes_the_compaction_requests_and_disables_idle_compaction() {
+        let main = ScriptedLlm::new(1_000_000, []);
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = Agent::builder(main.clone())
+            .compaction_model(compactor.clone())
+            .build();
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent.prepare_request().await.expect("first request");
+
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
+        assert_eq!(agent.idle_compaction_due_in(), None);
+        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(main.recorded().is_empty() && compactor.recorded().is_empty());
+
+        agent.compact(None).await.expect("compaction succeeds");
+        assert_eq!(compactor.recorded().len(), 1, "the compaction model ran it");
+        assert!(main.recorded().is_empty(), "the session's model did not");
+
+        // The forked compaction goes to the compaction model as well.
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = Agent::builder(ScriptedLlm::new(1_000_000, []))
+            .compaction_model(compactor.clone())
+            .build();
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        let tail = agent.render_tail().await;
+        let request = LLMRequest::new(agent.context.build_request(&tail));
+        agent.start_compaction(&request, None);
+        assert!(agent.await_pending_compaction().await);
+        assert_eq!(compactor.recorded().len(), 1);
+    }
+
+    /// Idle reassembly and idle compaction exclude each other: an idle gap
+    /// past the cache lifetime reassembles only when idle compaction is off.
+    #[tokio::test]
+    async fn idle_reassembly_runs_only_when_idle_compaction_is_off() {
+        async fn system_reminders_after_a_gap(compaction_model: Option<ScriptedLlm>) -> usize {
+            let llm = ScriptedLlm::new(1_000_000, []);
+            let builder = Agent::builder(llm);
+            let mut agent = if let Some(model) = compaction_model {
+                builder.compaction_model(model).build()
+            } else {
+                builder.build()
+            };
+            agent.ensure_initialized().await.expect("agent initializes");
+            agent.push_message(Message::user("hello"));
+            agent.push_message(Message::system(
+                "<system-reminder>ephemeral</system-reminder>",
+            ));
+            agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+            assert!(agent.prepare_request().await.is_some());
+            agent.context().count_recent_system_messages()
+        }
+
+        assert_eq!(system_reminders_after_a_gap(None).await, 1);
+        assert_eq!(
+            system_reminders_after_a_gap(Some(ScriptedLlm::new(1_000_000, []))).await,
+            0
+        );
     }
 
     /// Messages of `request` that carry the whole tasks.md.
