@@ -10,12 +10,16 @@
 //! [`Hook`]: crate::Hook
 
 mod lifecycle;
+mod reviewer;
 mod runner;
 
 pub use lifecycle::{
     AfterCompaction, AskUser, BeforeCompaction, CommandCalled, ExternalHooks, HookInput,
     InjectedContext, LifecycleHookConfig, LifecycleKind, LifecycleOutput, LifecyclePayload,
     SessionStart, Stop, SubagentEnd, SubagentStart, SubagentStop, UserMessage,
+};
+pub use reviewer::{
+    ReviewAnswer, ReviewRequest, ReviewedPermission, ReviewerChain, ReviewerConfig,
 };
 pub use runner::{HookCommand, HookRole, HookRunError, HookRunner};
 

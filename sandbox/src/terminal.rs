@@ -53,7 +53,7 @@ use crate::{
         INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, empty_stream,
         save_raw_to_file, stored_path,
     },
-    permission::{PermissionError, PermissionHandler, TerminalMode},
+    permission::{PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode},
     shell_session::{
         BridgeAddress, ContainerExecOutcome, ContainerShellRuntime, ShellBackend,
         ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile,
@@ -132,7 +132,7 @@ struct PermissionNetworkPolicy<P> {
 impl<P: PermissionHandler + 'static> NetworkPolicy for PermissionNetworkPolicy<P> {
     async fn check(&self, request: &DomainRequest) -> bool {
         self.permission_handler
-            .check_domain(request.host(), request.port())
+            .authorize_domain(request.host(), request.port())
             .await
     }
 }
@@ -1814,7 +1814,10 @@ where
         let launching = TerminalTool {
             working_dir: space,
             shell_sessions: self.shell_sessions.clone(),
-            permission_handler: self.permission_handler.clone(), // Arc clone - shares handler
+            permission_handler: self
+                .permission_handler
+                .for_subagent()
+                .map_or_else(|| self.permission_handler.clone(), Arc::new),
             executor: self.executor.clone(),
             output_store: self.output_store.clone(),
             job_registry,
@@ -2029,6 +2032,21 @@ where
         mode: TerminalMode,
         script: &str,
     ) -> anyhow::Result<()> {
+        if mode.requires_approval() {
+            match self
+                .permission_handler
+                .review(&PermissionRequest::Command { mode, script })
+                .await
+            {
+                Review::Approved => return Ok(()),
+                Review::Denied(reason) => {
+                    return Err(anyhow::Error::new(TerminalError::from(
+                        PermissionError::Denied(reason),
+                    )));
+                }
+                Review::Passed => {}
+            }
+        }
         let permission_waits = self
             .permission_handler
             .will_wait_for_approval(mode, script)
@@ -5230,6 +5248,176 @@ mod tests {
         let request = DomainRequest::new("example.com", 443);
         assert!(policy.check(&request).await);
         assert_eq!(handler.domain_checks.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    /// A handler whose review step answers `review` and whose own route
+    /// waits for a person.
+    struct ReviewingHandler {
+        review: Review,
+        waits: AtomicUsize,
+        checks: AtomicUsize,
+    }
+
+    impl ReviewingHandler {
+        fn new(review: Review) -> Self {
+            Self {
+                review,
+                waits: AtomicUsize::new(0),
+                checks: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl PermissionHandler for ReviewingHandler {
+        fn review(
+            &self,
+            _request: &PermissionRequest<'_>,
+        ) -> impl std::future::Future<Output = Review> + Send {
+            std::future::ready(self.review.clone())
+        }
+
+        fn check(
+            &self,
+            _mode: TerminalMode,
+            _script: &str,
+        ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
+            self.checks.fetch_add(1, AtomicOrdering::Relaxed);
+            std::future::ready(Ok(true))
+        }
+
+        fn will_wait_for_approval(
+            &self,
+            _mode: TerminalMode,
+            _script: &str,
+        ) -> impl std::future::Future<Output = bool> + Send {
+            self.waits.fetch_add(1, AtomicOrdering::Relaxed);
+            std::future::ready(true)
+        }
+    }
+
+    async fn permission_stages(
+        review: Review,
+    ) -> (Result<(), String>, Vec<PermissionEventStage>, [usize; 2]) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool = TerminalTool::new_exact(
+            dir.path(),
+            ReviewingHandler::new(review),
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let tool = tool.with_registry(registry);
+        let result = tool
+            .ensure_permission_allowed(TerminalMode::Unsafe, "make install")
+            .await
+            .map_err(|error| error.to_string());
+        let stages = tool
+            .permission_receiver()
+            .take_pending()
+            .into_iter()
+            .map(|event| event.stage)
+            .collect();
+        let handler = &tool.permission_handler;
+        (
+            result,
+            stages,
+            [
+                handler.waits.load(AtomicOrdering::Relaxed),
+                handler.checks.load(AtomicOrdering::Relaxed),
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn a_request_a_reviewer_approves_emits_no_permission_event() {
+        let (result, stages, [waits, checks]) = permission_stages(Review::Approved).await;
+        result.expect("approved");
+        assert_eq!(stages, Vec::<PermissionEventStage>::new());
+        assert_eq!([waits, checks], [0, 0], "the route is not asked");
+    }
+
+    #[tokio::test]
+    async fn a_request_a_reviewer_denies_emits_no_permission_event() {
+        let (result, stages, [waits, checks]) =
+            permission_stages(Review::Denied("not today".into())).await;
+        assert!(result.unwrap_err().contains("not today"));
+        assert_eq!(stages, Vec::<PermissionEventStage>::new());
+        assert_eq!([waits, checks], [0, 0], "the route is not asked");
+    }
+
+    #[tokio::test]
+    async fn a_request_every_reviewer_passes_waits_then_resolves() {
+        let (result, stages, [waits, checks]) = permission_stages(Review::Passed).await;
+        result.expect("the route allows");
+        assert_eq!(
+            stages,
+            [
+                PermissionEventStage::Waiting,
+                PermissionEventStage::Resolved
+            ]
+        );
+        assert_eq!([waits, checks], [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn permission_network_policy_reviews_a_domain_before_asking() {
+        struct Domains(Review, AtomicUsize);
+        impl PermissionHandler for Domains {
+            fn check(
+                &self,
+                _mode: TerminalMode,
+                _script: &str,
+            ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send
+            {
+                std::future::ready(Ok(true))
+            }
+            fn review(
+                &self,
+                request: &PermissionRequest<'_>,
+            ) -> impl std::future::Future<Output = Review> + Send {
+                assert_eq!(
+                    *request,
+                    PermissionRequest::Domain {
+                        domain: "example.com",
+                        port: 443
+                    }
+                );
+                std::future::ready(self.0.clone())
+            }
+            fn domain_needs_approval(
+                &self,
+                _domain: &str,
+                _port: u16,
+            ) -> impl std::future::Future<Output = bool> + Send {
+                std::future::ready(true)
+            }
+            fn check_domain(
+                &self,
+                _domain: &str,
+                _port: u16,
+            ) -> impl std::future::Future<Output = bool> + Send {
+                self.1.fetch_add(1, AtomicOrdering::Relaxed);
+                std::future::ready(true)
+            }
+        }
+        let request = DomainRequest::new("example.com", 443);
+        for (review, allowed, asked) in [
+            (Review::Approved, true, 0),
+            (Review::Denied("no".into()), false, 0),
+            (Review::Passed, true, 1),
+        ] {
+            let handler = Arc::new(Domains(review, AtomicUsize::new(0)));
+            let policy = PermissionNetworkPolicy {
+                permission_handler: handler.clone(),
+            };
+            assert_eq!(policy.check(&request).await, allowed);
+            assert_eq!(handler.1.load(AtomicOrdering::Relaxed), asked);
+        }
     }
 
     #[test]
