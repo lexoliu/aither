@@ -1,9 +1,11 @@
 //! Runs one external hook command: typed JSON on stdin, typed JSON on stdout,
 //! under a deadline, in a process group of its own.
 
+use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
+use aither_sandbox::{PreparedTools, ToolRuntimeError};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -45,6 +47,9 @@ pub enum HookRunError {
     /// The configured command has no program.
     #[error("the hook command is empty")]
     EmptyCommand,
+    /// The prepared tool directory cannot be put on the hook's `PATH`.
+    #[error("the prepared tools cannot be put on the hook's PATH: {0}")]
+    ToolPath(#[source] ToolRuntimeError),
     /// The input could not be serialized.
     #[error("the hook input cannot be serialized: {0}")]
     Input(#[source] serde_json::Error),
@@ -81,13 +86,38 @@ pub enum HookRunError {
 
 /// Runs hook commands.
 ///
-/// Stateless: it holds nothing between runs, so every kind of hook shares one.
-/// The process work uses `async-process` and `async-io`, so it runs under any
+/// Holds nothing between runs but the directory of the terminal's prepared
+/// baseline tools, so every kind of hook shares one. Every hook runs with that
+/// directory on its `PATH` ahead of the host's, so `rg`, `ast-grep`, `jq` and
+/// `apply_patch` are the verified ones whatever the host has installed. The
+/// process work uses `async-process` and `async-io`, so it runs under any
 /// executor.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct HookRunner;
+#[derive(Debug, Clone)]
+pub struct HookRunner {
+    /// The terminal's prepared tools; absent only in a scope without hooks.
+    tools: Option<PreparedTools<PathBuf>>,
+}
 
 impl HookRunner {
+    /// A runner whose hooks find the baseline tools in `tools`, the same
+    /// directory the terminal puts on the `PATH` of its commands.
+    #[must_use]
+    pub fn new(tools: &PreparedTools<PathBuf>) -> Self {
+        Self {
+            tools: Some(tools.clone()),
+        }
+    }
+
+    /// The runner of a scope without hooks, which never runs one.
+    pub(super) const fn without_hooks() -> Self {
+        Self { tools: None }
+    }
+
+    /// Whether hooks run with the prepared tools on their `PATH`.
+    pub(super) const fn has_tools(&self) -> bool {
+        self.tools.is_some()
+    }
+
     /// Runs `hook` with `input` serialized to JSON on its stdin and returns
     /// the answer it prints on stdout; `None` when it prints nothing.
     ///
@@ -126,6 +156,14 @@ impl HookRunner {
             .ok_or(HookRunError::EmptyCommand)?;
         let mut command = std::process::Command::new(program);
         command.args(args);
+        if let Some(tools) = &self.tools {
+            command.env(
+                "PATH",
+                tools
+                    .prepend_path(std::env::var_os("PATH").as_deref())
+                    .map_err(HookRunError::ToolPath)?,
+            );
+        }
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = async_process::Command::from(command)

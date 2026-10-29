@@ -72,14 +72,15 @@ impl ReviewerChain {
         Self { reviewers }
     }
 
-    /// Runs the reviewers in order until one approves or denies.
+    /// Runs the reviewers in order, through `runner`, until one approves or
+    /// denies.
     ///
     /// A reviewer that fails to run, runs past its deadline or prints an
     /// invalid answer is reported through `tracing` and counts as a pass, so
     /// a failure never grants anything.
-    async fn review(&self, request: &ReviewRequest<'_>) -> Review {
+    async fn review(&self, runner: &HookRunner, request: &ReviewRequest<'_>) -> Review {
         for reviewer in &self.reviewers {
-            match HookRunner
+            match runner
                 .run::<_, ReviewAnswer>(&reviewer.command, request)
                 .await
             {
@@ -118,21 +119,27 @@ impl ReviewerChain {
 /// reviewed; a domain `inner` allows silently is not, and a domain a reviewer
 /// approves is remembered by `inner` as if its user had approved it. A subagent's terminal gets
 /// [`for_subagent`](PermissionHandler::for_subagent), the same chain labelled
-/// with the subagent role, over the same `inner` route.
+/// with the subagent role, over the same `inner` route and the same runner.
+///
+/// Reviewers run through a [`HookRunner`] like every other hook, so they find
+/// the terminal's prepared baseline tools on their `PATH`.
 #[derive(Debug)]
 pub struct ReviewedPermission<P> {
     inner: Arc<P>,
     chain: Arc<ReviewerChain>,
+    runner: Arc<HookRunner>,
     role: HookRole,
 }
 
 impl<P> ReviewedPermission<P> {
-    /// The main agent's handler: `chain` in front of `inner`.
+    /// The main agent's handler: `chain` in front of `inner`, its reviewers
+    /// run by `runner`.
     #[must_use]
-    pub fn new(inner: P, chain: ReviewerChain) -> Self {
+    pub fn new(inner: P, chain: ReviewerChain, runner: HookRunner) -> Self {
         Self {
             inner: Arc::new(inner),
             chain: Arc::new(chain),
+            runner: Arc::new(runner),
             role: HookRole::Main,
         }
     }
@@ -142,10 +149,13 @@ impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P>
     /// Runs the chain; the first reviewer to decide ends it.
     async fn review(&self, request: &PermissionRequest<'_>) -> Review {
         self.chain
-            .review(&ReviewRequest {
-                role: self.role,
-                request: *request,
-            })
+            .review(
+                &self.runner,
+                &ReviewRequest {
+                    role: self.role,
+                    request: *request,
+                },
+            )
             .await
     }
 
@@ -165,6 +175,7 @@ impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P>
         Some(Self {
             inner: Arc::clone(&self.inner),
             chain: Arc::clone(&self.chain),
+            runner: Arc::clone(&self.runner),
             role: HookRole::Subagent,
         })
     }

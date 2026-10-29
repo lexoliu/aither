@@ -1268,6 +1268,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             .as_ref()
             .map_or_else(ExternalHooks::none, ExternalHooks::for_subagent);
         let command_observer = self.hooks.is_some().then(|| child_hooks.command_observer());
+        let command_gate = self.hooks.is_some().then(|| child_hooks.command_gate());
 
         // Launch the subagent's terminal from the terminal this tool serves.
         let (agent_builder, child_job_registry, commit_ledger) = if let Some(binding) =
@@ -1275,7 +1276,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         {
             let dyn_terminal = binding
                 .launcher()
-                .create(grant, command_observer)
+                .create(grant, command_observer, command_gate)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to create subagent terminal tool: {e}"))?;
             let job_registry = dyn_terminal.job_registry();
@@ -3420,6 +3421,7 @@ You are a file-defined agent.
 
     /// A main agent's terminal whose permission requests are recorded.
     struct ForkFixture {
+        _hook_tools: crate::test_support::PreparedFixture,
         _dirs: [tempfile::TempDir; 3],
         terminal: aither_sandbox::TerminalTool<
             crate::ReviewedPermission<RecordingPermission>,
@@ -3446,7 +3448,12 @@ You are a file-defined agent.
             let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
             let permission = RecordingPermission::default();
             let asked = permission.asked.clone();
-            let permission = crate::ReviewedPermission::new(permission, chain);
+            let hook_tools = crate::test_support::prepared_fixture().await;
+            let permission = crate::ReviewedPermission::new(
+                permission,
+                chain,
+                crate::external_hook::HookRunner::new(&hook_tools.tools),
+            );
             let terminal = TerminalTool::new_exact(session.path(), permission, TokioGlobal)
                 .await
                 .expect("terminal tool should initialize")
@@ -3456,6 +3463,7 @@ You are a file-defined agent.
             let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
             Self {
                 _dirs: [session, source, cache],
+                _hook_tools: hook_tools,
                 terminal: terminal.with_registry(registry),
                 asked,
             }
@@ -4000,6 +4008,7 @@ You are a file-defined agent.
         use crate::external_hook::{ExternalHooks, LifecycleKind};
 
         let hooks_dir = unique_temp_dir("subagent-hooks");
+        let tools = crate::test_support::prepared_fixture().await;
         let log = hooks_dir.join("log");
         let main = ExternalHooks::new(
             vec![recorder(
@@ -4014,6 +4023,7 @@ You are a file-defined agent.
                 ],
             )],
             executor_core::AnyExecutor::new(executor_core::tokio::TokioGlobal),
+            &tools.tools,
         );
         let tool =
             worker_tool(SubagentTool::new(TextLlm::new("only-model"))).with_hooks(main.clone());

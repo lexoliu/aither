@@ -1,12 +1,14 @@
 //! Lifecycle hooks: event-driven external hooks that can only add context.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use aither_sandbox::{AnyCommandObserver, CommandCall, CommandObserver};
+use aither_sandbox::{AnyCommandObserver, CommandCall, CommandObserver, PreparedTools};
 use askama::Template;
 use executor_core::{AnyExecutor, Executor};
 use serde::{Deserialize, Serialize};
 
+use super::command::CommandHookConfig;
 use super::runner::{HookCommand, HookRole, HookRunner};
 use crate::StopReason;
 use crate::ask_user::{Question, QuestionAnswer};
@@ -258,6 +260,7 @@ impl InjectedContext {
 struct Shared {
     runner: HookRunner,
     hooks: Vec<LifecycleHookConfig>,
+    command_hooks: Vec<CommandHookConfig>,
     /// Runs the hooks of events that must not delay what they observe. It is
     /// absent only in a scope without hooks, which never runs one.
     executor: Option<AnyExecutor>,
@@ -289,12 +292,19 @@ pub struct ExternalHooks {
 impl ExternalHooks {
     /// The scope of the main agent, running `hooks`; `executor` runs the
     /// hooks of IPC calls in the background so they never delay the call.
+    /// Every hook runs with `tools`, the terminal's prepared baseline tools,
+    /// on its `PATH` ahead of the host's.
     #[must_use]
-    pub fn new(hooks: Vec<LifecycleHookConfig>, executor: AnyExecutor) -> Self {
+    pub fn new(
+        hooks: Vec<LifecycleHookConfig>,
+        executor: AnyExecutor,
+        tools: &PreparedTools<PathBuf>,
+    ) -> Self {
         Self::scope(
             Arc::new(Shared {
-                runner: HookRunner,
+                runner: HookRunner::new(tools),
                 hooks,
+                command_hooks: Vec::new(),
                 executor: Some(executor),
             }),
             HookRole::Main,
@@ -306,12 +316,43 @@ impl ExternalHooks {
     pub fn none() -> Self {
         Self::scope(
             Arc::new(Shared {
-                runner: HookRunner,
+                runner: HookRunner::without_hooks(),
                 hooks: Vec::new(),
+                command_hooks: Vec::new(),
                 executor: None,
             }),
             HookRole::Main,
         )
+    }
+
+    /// Adds the command hooks every shell command of this scope, and of the
+    /// subagent scopes made from it, is put to; see
+    /// [`command_gate`](Self::command_gate).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the scope was already cloned or used for a subagent, or is
+    /// [`none`](Self::none), which has no prepared tools for the hooks to run
+    /// with: the hooks are set once, when the host builds the main agent's
+    /// scope with [`new`](Self::new).
+    #[must_use]
+    pub fn with_command_hooks(mut self, hooks: Vec<CommandHookConfig>) -> Self {
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("command hooks are set before the scope is shared");
+        assert!(
+            shared.runner.has_tools(),
+            "command hooks run in a scope made with `ExternalHooks::new`"
+        );
+        shared.command_hooks = hooks;
+        self
+    }
+
+    pub(super) fn command_hooks(&self) -> &[CommandHookConfig] {
+        &self.shared.command_hooks
+    }
+
+    pub(super) fn runner(&self) -> &HookRunner {
+        &self.shared.runner
     }
 
     fn scope(shared: Arc<Shared>, role: HookRole) -> Self {
