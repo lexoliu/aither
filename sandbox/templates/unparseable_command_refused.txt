@@ -1,0 +1,1 @@
+Refused before running: the command is not valid shell ({{ reason }}), so it cannot be checked for kills by name or pattern. Fix the syntax and run it again.

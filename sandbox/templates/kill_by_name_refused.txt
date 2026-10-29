@@ -1,0 +1,1 @@
+Refused before running: `{{ program }}` signals processes by name or pattern, and may hit processes this session did not start. Look up the PID of the process you started and kill that PID, for example `kill <pid>`.
