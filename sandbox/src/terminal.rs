@@ -262,7 +262,7 @@ fn build_terminal_launch(
 #[template(path = "carry_cwd.sh", escape = "none")]
 struct CarryCwdTemplate<'a> {
     escaped_report: &'a str,
-    script: &'a str,
+    escaped_script: &'a str,
 }
 
 fn shell_launch_reporting(
@@ -278,13 +278,22 @@ fn shell_launch_reporting(
     Ok(TerminalLaunch::Shell { program, args })
 }
 
-/// `script` followed by nothing but a trap that writes the shell's final
-/// directory to `report`, a path as the shell sees it.
+/// `script`, run through `eval`, followed by a trailer that writes the
+/// shell's final directory to `report`, a path as the shell sees it, and
+/// exits with the script's status.
+///
+/// The report is not written from an `EXIT` trap: setting one makes a
+/// non-interactive bash catch SIGTERM, and a child it has just forked still
+/// carries that handler until it resets its signals, so a `kill` sent in that
+/// window is swallowed and the process it names runs on. `eval` keeps the
+/// trailer out of reach of the script's own syntax, such as an unterminated
+/// here-document. A script that ends through `exit` writes no report.
 fn carry_cwd_script(script: &str, report: &str) -> Result<String, TerminalError> {
     let escaped_report = shell_escape(report);
+    let escaped_script = shell_escape(script);
     CarryCwdTemplate {
         escaped_report: &escaped_report,
-        script,
+        escaped_script: &escaped_script,
     }
     .render()
     .map_err(|error| {
@@ -2218,7 +2227,8 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
         if !succeeded {
             return;
         }
-        // A direct command or a shell that did not exit normally writes none.
+        // A direct command, or a shell that ended through `exit` or a
+        // signal, writes none.
         let Ok(reported) = reported else {
             return;
         };
@@ -7131,20 +7141,43 @@ mod tests {
             .status()
             .expect("sh should run");
         assert!(status.success());
-        let written = std::fs::read_to_string(&report).expect("the trap writes the report");
+        let written = std::fs::read_to_string(&report).expect("the trailer writes the report");
         assert_eq!(
             PathBuf::from(written.trim_end()),
             dunce::canonicalize(dir.path().join("sub")).unwrap()
         );
-        // The script's own exit status survives the trap.
-        let status = std::process::Command::new("sh")
+        // The script's own exit status survives the trailer, whether the
+        // script ends through `exit` or its last command fails.
+        for (script, code) in [("exit 7", 7), ("cd sub; (exit 5)", 5)] {
+            let status = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &carry_cwd_script(script, &report.to_string_lossy()).unwrap(),
+                ])
+                .current_dir(dir.path())
+                .status()
+                .expect("sh should run");
+            assert_eq!(status.code(), Some(code), "{script}");
+        }
+        // The script's own syntax cannot swallow the trailer: an unterminated
+        // here-document holding a quote still ends before the report.
+        std::fs::remove_file(&report).expect("the report exists");
+        let output = std::process::Command::new("sh")
             .args([
                 "-c",
-                &carry_cwd_script("exit 7", &report.to_string_lossy()).unwrap(),
+                &carry_cwd_script("cd sub; cat <<EOF\nit's", &report.to_string_lossy()).unwrap(),
             ])
-            .status()
+            .current_dir(dir.path())
+            .output()
             .expect("sh should run");
-        assert_eq!(status.code(), Some(7));
+        assert!(output.status.success());
+        // bash ends the unterminated body with a newline, dash does not.
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), "it's");
+        let written = std::fs::read_to_string(&report).expect("the trailer writes the report");
+        assert_eq!(
+            PathBuf::from(written.trim_end()),
+            dunce::canonicalize(dir.path().join("sub")).unwrap()
+        );
     }
 
     #[cfg(unix)]
