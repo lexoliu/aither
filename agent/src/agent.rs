@@ -45,7 +45,7 @@ use crate::{
 };
 
 use aither_sandbox::{
-    BackgroundTaskReceiver, JobRegistry, PermissionEvent, PermissionEventReceiver,
+    BackgroundTaskReceiver, JobAlert, JobRegistry, PermissionEvent, PermissionEventReceiver,
     PermissionEventStage, TerminalArgs, TerminalBackgroundArgs, TerminalExecutionMode,
     TerminalMode,
 };
@@ -976,14 +976,7 @@ where
 
     fn push_completed_background_events(&mut self, events: &EventSink) {
         if let Some(receiver) = self.background_receiver.clone() {
-            for job in receiver.take_long_running_alerts() {
-                tracing::info!(task_id = %job.task_id, "background job crossed long-running threshold");
-                self.push_system_alert(format!(
-                    "Background job '{}' has been running for {} — check with terminal_read that it is still progressing normally, and terminal_kill it if it is stuck.",
-                    job.task_id,
-                    format_job_elapsed(job.elapsed)
-                ));
-            }
+            self.push_job_alerts();
             for task in receiver.take_completed() {
                 tracing::info!(task_id = %task.task_id, "background task completed");
                 let result_msg = Self::format_background_task_result(&task);
@@ -1041,7 +1034,7 @@ where
         let mut had_completed = self.drain_background_receiver(&receiver, events);
         let start = Instant::now();
         while start.elapsed() < BACKGROUND_TASK_MAX_WAIT {
-            self.push_long_running_alerts();
+            self.push_job_alerts();
             self.maybe_send_cache_keep_alive().await?;
             if let Some(task) = receiver.recv_timeout(BACKGROUND_TASK_POLL_INTERVAL).await {
                 tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
@@ -1148,17 +1141,29 @@ where
         &self.cache_keep_alive
     }
 
-    /// Pushes one durable alert per background job that crossed the
-    /// terminal's long-running threshold.
-    fn push_long_running_alerts(&mut self) {
-        if let Some(receiver) = self.background_receiver.clone() {
-            for job in receiver.take_long_running_alerts() {
-                tracing::info!(task_id = %job.task_id, "background job crossed long-running threshold");
-                self.push_system_alert(format!(
-                    "Background job '{}' has been running for {} — check with terminal_read that it is still progressing normally, and terminal_kill it if it is stuck.",
-                    job.task_id,
-                    format_job_elapsed(job.elapsed)
-                ));
+    /// Pushes one durable alert per pending background job alert: a job past
+    /// the long-running threshold, or one blocked reading its stdin.
+    fn push_job_alerts(&mut self) {
+        let Some(receiver) = self.background_receiver.clone() else {
+            return;
+        };
+        for alert in receiver.take_job_alerts() {
+            match alert {
+                JobAlert::LongRunning(job) => {
+                    tracing::info!(task_id = %job.task_id, "background job crossed long-running threshold");
+                    self.push_system_alert(format!(
+                        "Background job '{}' has been running for {} — check with terminal_read that it is still progressing normally, and terminal_kill it if it is stuck.",
+                        job.task_id,
+                        format_job_elapsed(job.elapsed)
+                    ));
+                }
+                JobAlert::StdinBlocked(job) => {
+                    tracing::info!(task_id = %job.task_id, "background job is blocked on stdin");
+                    self.push_system_alert(format!(
+                        "Background job '{}' is waiting for input on stdin — send it with terminal_input, or terminal_kill it if it needs none.",
+                        job.task_id
+                    ));
+                }
             }
         }
     }

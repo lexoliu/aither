@@ -21,10 +21,11 @@ pub enum ContainerExecOutcome {
 pub trait ContainerExec: Send + Sync {
     /// Execute a terminal command payload inside the container, returning stdout/stderr and exit code.
     ///
-    /// Implementations should send a human-readable message to
-    /// `stdin_blocked_notice` when they detect the process is blocked on stdin
-    /// (for example via `/proc/<pid>/syscall`), allowing callers to auto-promote
-    /// foreground execution into background mode.
+    /// `stdin_rx` is the command's stdin; a closed channel is EOF. When
+    /// `stdin_blocked` is given, implementations send one `()` each time a
+    /// process of the command's tree starts waiting to read the stdin pipe
+    /// with nothing buffered, and send again only after the command was fed
+    /// and blocks anew.
     fn exec(
         &self,
         container_id: &str,
@@ -32,7 +33,7 @@ pub trait ContainerExec: Send + Sync {
         working_dir: &str,
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
-        stdin_blocked_notice: Option<Sender<String>>,
+        stdin_blocked: Option<Sender<()>>,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
 }
 
@@ -47,7 +48,7 @@ pub trait ContainerExecImpl: Send + Sync {
         working_dir: &'a str,
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
-        stdin_blocked_notice: Option<Sender<String>>,
+        stdin_blocked: Option<Sender<()>>,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
 }
 
@@ -86,7 +87,7 @@ impl ContainerExec for AnyContainerExec {
         working_dir: &str,
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
-        stdin_blocked_notice: Option<Sender<String>>,
+        stdin_blocked: Option<Sender<()>>,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
         let inner = Arc::clone(&self.inner);
         let container_id = container_id.to_string();
@@ -101,7 +102,7 @@ impl ContainerExec for AnyContainerExec {
                     &working_dir,
                     kill_rx,
                     stdin_rx,
-                    stdin_blocked_notice,
+                    stdin_blocked,
                 )
                 .await
         }
@@ -263,7 +264,7 @@ impl<T: ContainerExec> ContainerExecImpl for T {
         working_dir: &'a str,
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
-        stdin_blocked_notice: Option<Sender<String>>,
+        stdin_blocked: Option<Sender<()>>,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>> {
         Box::pin(self.exec(
             container_id,
@@ -271,7 +272,7 @@ impl<T: ContainerExec> ContainerExecImpl for T {
             working_dir,
             kill_rx,
             stdin_rx,
-            stdin_blocked_notice,
+            stdin_blocked,
         ))
     }
 }
