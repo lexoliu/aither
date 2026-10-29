@@ -208,6 +208,9 @@ pub struct ContainerShellRuntime {
     exec: Arc<dyn ContainerExecImpl>,
     container_id: String,
     ipc_route: ContainerIpcRoute,
+    /// The host directory the container mounts as its workspace, declared by
+    /// whoever mounts it.
+    workspace_mount: Option<crate::MountRoot>,
 }
 
 impl std::fmt::Debug for ContainerShellRuntime {
@@ -215,6 +218,7 @@ impl std::fmt::Debug for ContainerShellRuntime {
         f.debug_struct("ContainerShellRuntime")
             .field("container_id", &self.container_id)
             .field("ipc_route", &self.ipc_route)
+            .field("workspace_mount", &self.workspace_mount)
             .finish_non_exhaustive()
     }
 }
@@ -239,7 +243,24 @@ impl ContainerShellRuntime {
             exec: exec.inner,
             container_id,
             ipc_route,
+            workspace_mount: None,
         }
+    }
+
+    /// Declares the host directory the container mounts as its workspace and
+    /// where it appears inside. A subagent's commands are confined in the
+    /// container through it, so a container session without it cannot launch
+    /// subagents.
+    #[must_use]
+    pub fn with_workspace_mount(mut self, mount: crate::MountRoot) -> Self {
+        self.workspace_mount = Some(mount);
+        self
+    }
+
+    /// The workspace mount, when declared.
+    #[must_use]
+    pub const fn workspace_mount(&self) -> Option<&crate::MountRoot> {
+        self.workspace_mount.as_ref()
     }
 
     #[must_use]

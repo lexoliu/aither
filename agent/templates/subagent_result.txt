@@ -4,4 +4,4 @@
 
 Continue this subagent with `subagent resume --id {{ id }}` while its prompt cache is still warm.{% if let Some(alert) = alert %}
 
-{{ alert }}{% endif %}{% endmatch %}
+{{ alert }}{% endif %}{% endmatch %}{% include "subagent_commits.txt" %}

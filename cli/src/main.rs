@@ -566,12 +566,17 @@ async fn build_agent(
 
     // Create SubagentTool and register as a terminal IPC command
     // Set base_dir to sandbox directory so paths like .subagents/ resolve correctly
+    // Every terminal, a subagent's included, gets its own `subagent` command,
+    // which launches with that terminal's authority.
     let subagent_tool = SubagentTool::new(cloud)
         .with_builtins()
-        .with_base_dir(builder.sandbox_dir().to_string())
-        .with_terminal_tool_factory(builder.terminal_tool_factory());
+        .with_base_dir(builder.sandbox_dir().to_string());
     let subagent_desc = format_subagent_description(&subagent_tool);
-    builder = builder.tool_with_desc(subagent_tool, subagent_desc);
+    builder = builder.terminal_bound_tool_with_desc(
+        "subagent",
+        move |binding| subagent_tool.for_terminal(binding),
+        subagent_desc,
+    );
 
     // Add system prompt
     let builder = if let Some(ref system) = args.system {

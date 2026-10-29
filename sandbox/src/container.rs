@@ -188,6 +188,14 @@ pub enum MountRootError {
     #[error("relative path must be valid UTF-8: {0}")]
     /// Relative path contained a non-UTF-8 component.
     NonUtf8(PathBuf),
+    /// A host path that is not beneath the mount root.
+    #[error("{} is not beneath the mount root {}", .path.display(), .root.display())]
+    OutsideRoot {
+        /// The host path.
+        path: PathBuf,
+        /// The mount root's host directory.
+        root: PathBuf,
+    },
 }
 
 impl MountRoot {
@@ -219,6 +227,26 @@ impl MountRoot {
             MountAccess::ReadOnly => MountSpec::read_only(host_path, container_path),
             MountAccess::ReadWrite => MountSpec::read_write(host_path, container_path),
         })
+    }
+
+    /// Where the host path `host`, the root itself or a path beneath it,
+    /// appears inside the container.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MountRootError::OutsideRoot`] if `host` is not beneath the
+    /// root, and the conditions of [`Self::child`] for what lies beneath it.
+    pub fn container_path(&self, host: &Path) -> Result<ContainerPath, MountRootError> {
+        let relative =
+            host.strip_prefix(&self.host_root)
+                .map_err(|_| MountRootError::OutsideRoot {
+                    path: host.to_path_buf(),
+                    root: self.host_root.clone(),
+                })?;
+        if relative.as_os_str().is_empty() {
+            return Ok(self.container_root.clone());
+        }
+        Self::container_child(&self.container_root, relative)
     }
 
     /// Derives a read-only mount beneath this root.

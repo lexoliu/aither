@@ -48,6 +48,8 @@ mod output_urls;
 mod stream;
 mod subagent_file;
 mod terminal_agent;
+#[cfg(test)]
+mod test_support;
 pub mod tool_request;
 mod tools;
 pub mod working_docs;

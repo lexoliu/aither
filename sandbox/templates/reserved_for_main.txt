@@ -1,0 +1,1 @@
+`{{ name }}` is reserved for the main agent and is not available to subagents

@@ -27,7 +27,13 @@
 //! let agent = TerminalAgentBuilder::new(llm, terminal_tool)
 //!     .tool(WebSearchTool::default())  // Becomes `websearch` terminal command
 //!     .tool(WebFetchTool::new())       // Becomes `webfetch` terminal command
-//!     .tool(SubagentTool::new(llm))    // Becomes `subagent` terminal command
+//!     // Becomes the `subagent` terminal command, launching from whichever
+//!     // terminal runs it.
+//!     .terminal_bound_tool_with_desc(
+//!         "subagent",
+//!         move |binding| subagents.for_terminal(binding),
+//!         "Spawn or continue a subagent",
+//!     )
 //!     .build();
 //! ```
 
@@ -56,9 +62,8 @@ use aither_core::llm::ToolResult;
 use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalDeltaTool};
 use aither_sandbox::{
     ContainerShellRuntime, PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry,
-    SshServer, SshSessionAuthorizer, TerminalTool, TerminalToolFactory,
-    TerminalToolFactoryReceiver, ToolDistribution, ToolRegistryBuilder, ToolRuntimeError,
-    Unconfigured, terminal_tool_factory_channel,
+    SshServer, SshSessionAuthorizer, TerminalTool, ToolDistribution, ToolRegistryBuilder,
+    ToolRuntimeError, Unconfigured,
 };
 
 /// System prompt template for terminal-first agents.
@@ -176,8 +181,6 @@ where
     inner: AgentBuilder<LLM, LLM, LLM, H>,
     terminal_tool: TerminalTool<P, E, Unconfigured>,
     registry_builder: ToolRegistryBuilder,
-    terminal_tool_factory: TerminalToolFactory,
-    terminal_tool_factory_receiver: Option<TerminalToolFactoryReceiver>,
     tool_descriptions: Vec<(String, String)>,
     skills: Vec<SkillInfo>,
     subagents: Vec<SubagentInfo>,
@@ -214,8 +217,6 @@ where
     /// `terminal` (registered via `.tool()`). The native control tools address
     /// the same background jobs as `terminal` and are not advertised as commands.
     pub fn new(llm: LLM, mut terminal_tool: TerminalTool<P, E, Unconfigured>) -> Self {
-        let (terminal_tool_factory, terminal_tool_factory_receiver) =
-            terminal_tool_factory_channel();
         let registry_builder = ToolRegistryBuilder::new();
         let tool_descriptions = Vec::new();
 
@@ -240,8 +241,6 @@ where
             inner,
             terminal_tool,
             registry_builder,
-            terminal_tool_factory,
-            terminal_tool_factory_receiver: Some(terminal_tool_factory_receiver),
             tool_descriptions,
             skills: Vec::new(),
             subagents: Vec::new(),
@@ -268,8 +267,6 @@ where
             inner: inner(self.inner),
             terminal_tool: self.terminal_tool,
             registry_builder: self.registry_builder,
-            terminal_tool_factory: self.terminal_tool_factory,
-            terminal_tool_factory_receiver: self.terminal_tool_factory_receiver,
             tool_descriptions: self.tool_descriptions,
             skills: self.skills,
             subagents: self.subagents,
@@ -288,10 +285,15 @@ where
             crate::AgentError::Config(path_error_text(prefix.as_str(), path, &error))
         })?;
 
-        fs::canonicalize(path).await.map_err(|error| {
-            let prefix = join_text(&["failed to canonicalize ", kind, " directory '"]);
-            crate::AgentError::Config(path_error_text(prefix.as_str(), path, &error))
-        })
+        fs::canonicalize(path)
+            .await
+            // Without the Windows verbatim prefix, so these roots compare with
+            // the canonical paths subagent grants resolve.
+            .map(|canonical| dunce::simplified(&canonical).to_path_buf())
+            .map_err(|error| {
+                let prefix = join_text(&["failed to canonicalize ", kind, " directory '"]);
+                crate::AgentError::Config(path_error_text(prefix.as_str(), path, &error))
+            })
     }
 
     async fn register_readable_dir(
@@ -452,6 +454,34 @@ where
         let name = tool.name().to_string();
         self.tool_descriptions.push((name, description.into()));
         self.registry_builder.configure_tool(tool);
+        self
+    }
+
+    /// Registers a command built for each terminal that serves it, from that
+    /// terminal's [`TerminalBinding`](aither_sandbox::TerminalBinding), with
+    /// an explicit description.
+    ///
+    /// The main agent's terminal and every subagent's terminal get their own
+    /// instance, so a command that launches subagents (`SubagentTool`
+    /// through [`SubagentTool::for_terminal`](crate::specialized::SubagentTool::for_terminal))
+    /// launches them with the authority of the terminal it runs in.
+    #[must_use]
+    pub fn terminal_bound_tool_with_desc<T, F>(
+        mut self,
+        name: impl Into<String>,
+        bind: F,
+        description: impl Into<String>,
+    ) -> Self
+    where
+        F: Fn(&aither_sandbox::TerminalBinding) -> T + Send + Sync + 'static,
+        T: Tool + Send + Sync + 'static,
+        T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+    {
+        let name = name.into();
+        self.tool_descriptions
+            .push((name.clone(), description.into()));
+        self.registry_builder
+            .configure_terminal_bound_tool(name, bind);
         self
     }
 
@@ -829,12 +859,6 @@ where
         self.tool_descriptions.iter().any(|(n, _)| n == name)
     }
 
-    /// Returns a factory for spawning child terminal tools (for subagents).
-    #[must_use]
-    pub fn terminal_tool_factory(&self) -> TerminalToolFactory {
-        self.terminal_tool_factory.clone()
-    }
-
     /// Returns a mutable reference to the tool registry builder.
     pub const fn tool_registry_mut(&mut self) -> &mut ToolRegistryBuilder {
         &mut self.registry_builder
@@ -866,11 +890,6 @@ where
 
         // Configure terminal tool
         let terminal_tool = self.terminal_tool.with_registry(registry);
-
-        // Start factory service for subagents if requested
-        if let Some(receiver) = self.terminal_tool_factory_receiver {
-            terminal_tool.start_factory_service(receiver);
-        }
 
         let inner = if self.inner.has_system_named("knowledge_and_time") {
             self.inner
@@ -1200,6 +1219,7 @@ mod tests {
     }
     use std::borrow::Cow;
 
+    use crate::test_support::{compile_baseline_fixture, fixture_distribution};
     use aither_core::LanguageModel;
     use aither_core::llm::{Event, LLMRequest, Tool, model::Profile as ModelProfile};
     use aither_sandbox::permission::NoopPermissionHandler;
@@ -1342,63 +1362,6 @@ mod tests {
         assert!(prompt.contains("<shell-modes>"));
         assert!(!prompt.contains("<shell-runtime>"));
         assert!(prompt.contains("<unsafe>"));
-    }
-
-    /// Compiles the baseline-tool fixture, which reports version 1.0.0 for
-    /// every command, into `source`.
-    async fn compile_baseline_fixture(source: &std::path::Path) -> std::path::PathBuf {
-        let fixture = source.join("baseline_tool.rs");
-        async_fs::write(
-            &fixture,
-            include_bytes!("../templates/test_baseline_tool.rs"),
-        )
-        .await
-        .unwrap();
-        let path = source
-            .join("baseline-tool")
-            .with_extension(std::env::consts::EXE_EXTENSION);
-        let compiled = async_process::Command::new("rustc")
-            .arg("--crate-name")
-            .arg("baseline_tool")
-            .arg(&fixture)
-            .arg("-o")
-            .arg(&path)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .unwrap();
-        assert!(compiled.status.success(), "{compiled:?}");
-        path
-    }
-
-    /// A trusted manifest serving `binary` for every managed tool, pinned to `version`.
-    async fn fixture_distribution(
-        binary: &std::path::Path,
-        version: &str,
-    ) -> aither_sandbox::ToolDistribution {
-        use aither_sandbox::{
-            ManagedTool, ToolArtifact, ToolArtifactFormat, ToolDistribution, ToolTarget,
-        };
-        use sha2::Digest as _;
-        #[derive(serde::Serialize)]
-        struct Manifest {
-            artifacts: Vec<ToolArtifact>,
-        }
-        let bytes = async_fs::read(binary).await.unwrap();
-        let artifacts = ManagedTool::ALL
-            .into_iter()
-            .map(|tool| ToolArtifact {
-                tool,
-                version: version.into(),
-                target: ToolTarget::native().unwrap(),
-                url: aither_sandbox::ToolArtifactLocation::Download(
-                    url::Url::from_file_path(binary).unwrap(),
-                ),
-                sha256: hex::encode(sha2::Sha256::digest(&bytes)),
-                encoding: ToolArtifactFormat::Executable,
-            })
-            .collect();
-        ToolDistribution::from_json(&serde_json::to_vec(&Manifest { artifacts }).unwrap()).unwrap()
     }
 
     async fn noop_terminal(

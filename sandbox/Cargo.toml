@@ -27,6 +27,8 @@ executor-core = { version = "0.7", features = ["tokio"] }
 
 # Async runtime
 async-fs = "2"
+# Canonical paths without the Windows verbatim prefix git cannot read
+dunce = { version = "1.0.5", default-features = false }
 async-process = "2"
 async-io = "2"
 bollard = "0.21"
