@@ -2090,7 +2090,9 @@ async fn background_terminal_result(
             truncated: true,
         }
     } else {
-        CommandStream::Inline(redirect.preview)
+        CommandStream::Inline {
+            text: redirect.preview,
+        }
     };
     CommandResult {
         stdout,
@@ -4382,7 +4384,7 @@ mod tests {
 
     fn output_text(output: &CommandStream) -> Option<&str> {
         match output {
-            CommandStream::Inline(text) => Some(text.as_str()),
+            CommandStream::Inline { text } => Some(text.as_str()),
             CommandStream::Stored { preview, .. } => Some(preview.as_str()),
             CommandStream::Image { .. } => None,
         }
@@ -4458,7 +4460,9 @@ mod tests {
     }
 
     fn inline(text: &str) -> CommandStream {
-        CommandStream::Inline(text.to_string())
+        CommandStream::Inline {
+            text: text.to_string(),
+        }
     }
 
     fn completed(

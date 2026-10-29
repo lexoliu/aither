@@ -66,7 +66,9 @@ impl MediaResolution {
 /// An output stream holding no output.
 #[must_use]
 pub const fn empty_stream() -> CommandStream {
-    CommandStream::Inline(String::new())
+    CommandStream::Inline {
+        text: String::new(),
+    }
 }
 
 /// Returns the file a stream was stored in, for streams written to disk.
@@ -76,7 +78,7 @@ pub fn stored_path(stream: &CommandStream) -> Option<PathBuf> {
         CommandStream::Stored { file, .. } | CommandStream::Image { file, .. } => {
             Some(PathBuf::from(&file.path))
         }
-        CommandStream::Inline(_) => None,
+        CommandStream::Inline { .. } => None,
     }
 }
 
@@ -155,7 +157,9 @@ async fn cut_text_output(
             cut = rendered_len,
             "cut form is not smaller than the output, returning it inline"
         );
-        return Ok(CommandStream::Inline(text.to_owned()));
+        return Ok(CommandStream::Inline {
+            text: text.to_owned(),
+        });
     }
 
     fs::write(&path, data).await?;
@@ -403,9 +407,9 @@ async fn save_text_output(
     format: OutputFormat,
 ) -> std::io::Result<CommandStream> {
     if data.len() <= INLINE_OUTPUT_LIMIT {
-        Ok(CommandStream::Inline(
-            String::from_utf8_lossy(data).into_owned(),
-        ))
+        Ok(CommandStream::Inline {
+            text: String::from_utf8_lossy(data).into_owned(),
+        })
     } else {
         save_large_output(dir, data, format).await
     }
@@ -448,7 +452,9 @@ pub async fn save_text_with_line_limit(
     let exceeds_lines = line_count > max_lines;
 
     if !exceeds_bytes && !exceeds_lines {
-        return Ok(CommandStream::Inline(text.into_owned()));
+        return Ok(CommandStream::Inline {
+            text: text.into_owned(),
+        });
     }
 
     // Cut: store the full output and hand the model a preview within its
@@ -936,7 +942,7 @@ mod tests {
         .await
         .unwrap();
 
-        let CommandStream::Inline(text) = entry else {
+        let CommandStream::Inline { text } = entry else {
             panic!("expected the original inline");
         };
         assert_eq!(text, data);
@@ -1061,7 +1067,7 @@ mod tests {
         .await
         .unwrap();
 
-        let CommandStream::Inline(text) = entry else {
+        let CommandStream::Inline { text } = entry else {
             panic!("expected the source inline");
         };
         assert_eq!(text, data);
