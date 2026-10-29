@@ -20,7 +20,8 @@ use aither_core::{
     llm::{Tool, ToolResult, oneshot},
 };
 use aither_sandbox::{
-    CommitLedger, CommitLedgerError, CommitMark, SubagentCommit, SubagentGrant, TerminalBinding,
+    CommandRole, CommitLedger, CommitLedgerError, CommitMark, SubagentCommit, SubagentGrant,
+    TerminalBinding,
 };
 use askama::Template;
 use schemars::JsonSchema;
@@ -28,6 +29,7 @@ use serde::Deserialize;
 
 use crate::AgentBuilder;
 use crate::context::CacheLifetime;
+use crate::fork::{ForkSnapshot, ForkSource};
 use crate::fs_util::path_exists;
 use crate::model_group::ModelTier;
 use crate::subagent_file::SubagentDefinition;
@@ -49,8 +51,25 @@ pub struct SubagentType<LLM> {
     pub description: String,
     /// Model tier this subagent runs on when the caller does not choose one.
     pub model: Option<ModelTier>,
-    /// Builder function that creates the configured agent builder.
-    builder: SubagentBuilder<LLM>,
+    /// How the subagent's agent is made.
+    origin: Origin<LLM>,
+}
+
+/// How a subagent type makes its agent.
+enum Origin<LLM> {
+    /// A fresh agent from a configured builder.
+    Builder(SubagentBuilder<LLM>),
+    /// A copy of the main agent's request and model.
+    Fork,
+}
+
+impl<LLM> Clone for Origin<LLM> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Builder(builder) => Self::Builder(Arc::clone(builder)),
+            Self::Fork => Self::Fork,
+        }
+    }
 }
 
 /// Maps a path the subagent sees onto the host directory it really refers to.
@@ -81,7 +100,7 @@ impl<LLM> Clone for SubagentType<LLM> {
         Self {
             description: self.description.clone(),
             model: self.model,
-            builder: Arc::clone(&self.builder),
+            origin: self.origin.clone(),
         }
     }
 }
@@ -106,7 +125,24 @@ impl<LLM: Clone> SubagentType<LLM> {
         Self {
             description: description.into(),
             model: None,
-            builder: Arc::new(builder),
+            origin: Origin::Builder(Arc::new(builder)),
+        }
+    }
+
+    /// A subagent that continues the main agent's own context.
+    ///
+    /// It runs on exactly the main agent's model and its first request is the
+    /// main agent's request followed by the prompt, so it reads the main
+    /// agent's warm prompt cache. It runs with the authority of any other
+    /// subagent: its own space, and what it cannot do there goes to the main
+    /// agent. The main agent must publish its requests to the tool's
+    /// [`fork_source`](SubagentTool::fork_source), and a start is refused
+    /// while the main agent's context is within 10% of its compaction point.
+    pub fn fork(description: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+            model: None,
+            origin: Origin::Fork,
         }
     }
 
@@ -116,11 +152,6 @@ impl<LLM: Clone> SubagentType<LLM> {
     pub const fn with_model(mut self, model: ModelTier) -> Self {
         self.model = Some(model);
         self
-    }
-
-    /// Get the agent builder for this subagent type.
-    pub fn builder(&self, llm: LLM) -> AgentBuilder<LLM, LLM, LLM, ()> {
-        (self.builder)(llm)
     }
 }
 
@@ -269,6 +300,49 @@ struct SubagentErrorTemplate<'a> {
     /// launched without a commit grant.
     commits: Option<&'a CommitListing>,
     history: &'a [HistoryEntry],
+}
+
+#[derive(Template)]
+#[template(path = "fork_refused.txt", escape = "none")]
+struct ForkRefusedTemplate<'a> {
+    reason: &'a ForkRefusal,
+}
+
+/// Why a fork was not started.
+enum ForkRefusal {
+    /// The caller chose a model; a fork has the main agent's.
+    ModelGiven,
+    /// The caller is a subagent.
+    NotMain,
+    /// The tool is not bound to a terminal to launch from.
+    NoTerminal,
+    /// The main agent has published no request.
+    NothingSent,
+    /// The model the tool resolves the main agent's tier to is not the one
+    /// the main agent runs on.
+    OtherModel {
+        /// The model the main agent ran its request on.
+        main: String,
+        /// The model the tool would run the fork on.
+        fork: String,
+    },
+    /// The main agent's context is within 10% of its compaction point.
+    NearCompaction {
+        /// Window usage, in percent.
+        usage: f32,
+        /// Compaction point, in percent.
+        compaction: f32,
+    },
+}
+
+impl ForkRefusal {
+    fn into_error(self) -> anyhow::Error {
+        anyhow::anyhow!(
+            ForkRefusedTemplate { reason: &self }
+                .render()
+                .expect("fork refusal template must render")
+        )
+    }
 }
 
 /// Structured response the fast model returns when routing a prompt.
@@ -612,6 +686,11 @@ pub struct SubagentTool<LLM> {
     /// Finished subagents the parent can continue; each lives until its
     /// own prompt-cache lifetime passes.
     finished: FinishedSubagents<LLM>,
+    /// The main agent's latest request, which a fork starts from.
+    fork_source: ForkSource,
+    /// Whether this tool serves the main agent's terminal, the only one a
+    /// fork can continue the context of.
+    serves_main: bool,
 }
 
 impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
@@ -642,6 +721,8 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             runs: SubagentRuns::default(),
             cache_keep_alive: None,
             finished: FinishedSubagents::new(),
+            fork_source: ForkSource::default(),
+            serves_main: true,
         }
     }
 
@@ -704,7 +785,18 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             runs: self.runs.clone(),
             cache_keep_alive: self.cache_keep_alive.clone(),
             finished: FinishedSubagents::new(),
+            fork_source: self.fork_source.clone(),
+            serves_main: binding.role() == CommandRole::Main,
         }
+    }
+
+    /// Where the main agent publishes its requests for the `fork` subagent
+    /// kind; give it to the main agent's builder with
+    /// [`AgentBuilder::fork_source`](crate::AgentBuilder::fork_source) before
+    /// handing the tool over, like [`runs`](Self::runs).
+    #[must_use]
+    pub fn fork_source(&self) -> ForkSource {
+        self.fork_source.clone()
     }
 
     /// Attaches the shared run registry this tool reports to.
@@ -1057,6 +1149,37 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         self.with_type(def.id, subagent)
     }
 
+    /// The main agent's request a fork starts from.
+    ///
+    /// # Errors
+    ///
+    /// Refuses, starting nothing, when the caller is not the main agent or
+    /// chose a model, when no request was published, and when the main
+    /// agent's context is within 10% of its compaction point.
+    fn fork_snapshot(&self, chosen: Option<ModelTier>) -> anyhow::Result<Arc<ForkSnapshot>> {
+        if chosen.is_some() {
+            return Err(ForkRefusal::ModelGiven.into_error());
+        }
+        if !self.serves_main {
+            return Err(ForkRefusal::NotMain.into_error());
+        }
+        if self.binding.is_none() {
+            return Err(ForkRefusal::NoTerminal.into_error());
+        }
+        let snapshot = self
+            .fork_source
+            .latest()
+            .ok_or_else(|| ForkRefusal::NothingSent.into_error())?;
+        if !snapshot.policy().allows_fork(snapshot.usage()) {
+            return Err(ForkRefusal::NearCompaction {
+                usage: snapshot.usage() * 100.0,
+                compaction: snapshot.policy().compact_at * 100.0,
+            }
+            .into_error());
+        }
+        Ok(snapshot)
+    }
+
     /// Builds a fresh agent for `subagent`, selecting its model from `chosen`
     /// or by routing `prompt`.
     async fn start_agent(
@@ -1074,9 +1197,32 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
     )> {
         let (subagent_id, declared_model, source) = self.resolve_source(subagent).await?;
 
+        // A fork is checked before anything is started, and runs on the
+        // main agent's model.
+        let fork = match &source {
+            Source::Registered(SubagentType {
+                origin: Origin::Fork,
+                ..
+            }) => Some(self.fork_snapshot(chosen)?),
+            _ => None,
+        };
+
         // A model given by the caller or the definition runs as given;
         // otherwise the fast model routes the prompt to a configured tier.
-        let (tier, model) = self.select_model(prompt, chosen.or(declared_model)).await?;
+        let (tier, model) = match &fork {
+            Some(fork) => {
+                let resolved = self.select_model(prompt, Some(fork.tier())).await?;
+                if resolved.1 != fork.model() {
+                    return Err(ForkRefusal::OtherModel {
+                        main: fork.model().to_string(),
+                        fork: resolved.1,
+                    }
+                    .into_error());
+                }
+                resolved
+            }
+            None => self.select_model(prompt, chosen.or(declared_model)).await?,
+        };
         let selected = self.model_for(tier).clone();
 
         let agent_builder = match source {
@@ -1084,19 +1230,15 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                 .agent_kind(crate::AgentKind::Chatbot)
                 .system_prompt(&def.system_prompt)
                 .max_iterations(def.max_iterations),
-            Source::Registered(subagent_type) => subagent_type.builder(selected),
+            Source::Registered(SubagentType {
+                origin: Origin::Builder(builder),
+                ..
+            }) => builder(selected),
+            Source::Registered(SubagentType {
+                origin: Origin::Fork,
+                ..
+            }) => crate::AgentBuilder::new(selected),
         };
-        // Keep-alive is configured only for the Claude client, whose
-        // subagents run on the five-minute cache: in-run waits are covered
-        // by the keep-alive and a finished subagent is continuable until
-        // that entry expires.
-        let agent_builder = match &self.cache_keep_alive {
-            Some(keep_alive) => agent_builder
-                .cache_keep_alive(keep_alive.clone())
-                .claude_cache_ttl(aither_core::llm::model::ClaudePromptCacheTtl::FiveMinutes),
-            None => agent_builder,
-        };
-
         tracing::info!(subagent = %subagent_id, model = %model, "Starting subagent");
 
         // Launch the subagent's terminal from the terminal this tool serves.
@@ -1110,15 +1252,27 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                 .map_err(|e| anyhow::anyhow!("failed to create subagent terminal tool: {e}"))?;
             let job_registry = dyn_terminal.job_registry();
             let commit_ledger = dyn_terminal.commit_ledger().cloned();
-            (
-                agent_builder.dyn_terminal(dyn_terminal),
-                Some(job_registry),
-                commit_ledger,
-            )
+            let agent_builder = match &fork {
+                Some(fork) => agent_builder.forked_from(fork, dyn_terminal),
+                None => agent_builder.dyn_terminal(dyn_terminal),
+            };
+            (agent_builder, Some(job_registry), commit_ledger)
         } else if grant == SubagentGrant::new() {
             (agent_builder, None, None)
         } else {
             anyhow::bail!("worktrees can only be granted to a subagent launched from a terminal");
+        };
+
+        // Keep-alive is configured only for the Claude client, whose
+        // subagents run on the five-minute cache: in-run waits are covered
+        // by the keep-alive and a finished subagent is continuable until
+        // that entry expires. A fork applies it last, over the cache it
+        // inherits from the main agent.
+        let agent_builder = match &self.cache_keep_alive {
+            Some(keep_alive) => agent_builder
+                .cache_keep_alive(keep_alive.clone())
+                .claude_cache_ttl(aither_core::llm::model::ClaudePromptCacheTtl::FiveMinutes),
+            None => agent_builder,
         };
 
         Ok((
@@ -1268,7 +1422,12 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         for def in crate::builtin_subagents() {
             self = self.with_definition(def);
         }
-        self
+        self.with_type(
+            "fork",
+            SubagentType::fork(
+                "Continues your own context on your model; use it for work that depends on what you have read and decided",
+            ),
+        )
     }
 }
 
@@ -3095,6 +3254,586 @@ You are a file-defined agent.
         let text = result.render_for_model();
         assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
         assert_eq!(continuation_id(&text), id);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Handoff a scripted model answers a compaction request with.
+    const FORK_HANDOFF_JSON: &str = r#"{"current_task":"keep going","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["continue"],"recovery_hints":[],"skills":[]}"#;
+
+    /// A model that records every request with its own name and answers with
+    /// scripted turns, shared by its clones, so a test can tell which model a
+    /// request went to and what it carried.
+    #[derive(Clone)]
+    struct ScriptedLlm {
+        name: &'static str,
+        seen: async_channel::Sender<(&'static str, LLMRequest)>,
+        turns: Arc<Mutex<std::collections::VecDeque<Turn>>>,
+    }
+
+    /// A scripted answer, which may depend on the request it answers.
+    type Turn = Box<dyn FnOnce(&LLMRequest) -> Vec<Event> + Send>;
+
+    impl ScriptedLlm {
+        fn new(
+            name: &'static str,
+            seen: &async_channel::Sender<(&'static str, LLMRequest)>,
+        ) -> Self {
+            Self {
+                name,
+                seen: seen.clone(),
+                turns: Arc::default(),
+            }
+        }
+
+        /// Queues the turns the model answers its next requests with.
+        fn then(&self, turns: impl IntoIterator<Item = Vec<Event>>) {
+            self.turns.lock().unwrap().extend(
+                turns
+                    .into_iter()
+                    .map(|events| Box::new(move |_: &LLMRequest| events) as Turn),
+            );
+        }
+
+        /// Queues a turn computed from the request it answers.
+        fn then_with(&self, turn: impl FnOnce(&LLMRequest) -> Vec<Event> + Send + 'static) {
+            self.turns.lock().unwrap().push_back(Box::new(turn));
+        }
+    }
+
+    impl LanguageModel for ScriptedLlm {
+        type Error = NeverError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let compaction = request.parameters().structured_outputs;
+            let events = if compaction {
+                vec![Event::Text(FORK_HANDOFF_JSON.to_string())]
+            } else {
+                let turn = self.turns.lock().unwrap().pop_front();
+                turn.map_or_else(
+                    || vec![Event::Text("done".to_string())],
+                    |turn| turn(&request),
+                )
+            };
+            self.seen
+                .try_send((self.name, request))
+                .expect("record model request");
+            futures_lite::stream::iter(events.into_iter().map(Ok))
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                self.name,
+                "test",
+                self.name,
+                "scripted model",
+                1_000_000,
+            )))
+        }
+    }
+
+    /// Records the permission requests that reach it and denies them.
+    #[derive(Clone, Default)]
+    struct RecordingPermission {
+        asked: Arc<Mutex<Vec<(aither_sandbox::TerminalMode, String)>>>,
+    }
+
+    impl aither_sandbox::permission::PermissionHandler for RecordingPermission {
+        fn check(
+            &self,
+            mode: aither_sandbox::TerminalMode,
+            script: &str,
+        ) -> impl std::future::Future<
+            Output = Result<bool, aither_sandbox::permission::PermissionError>,
+        > + Send {
+            self.asked.lock().unwrap().push((mode, script.to_string()));
+            std::future::ready(Ok(false))
+        }
+    }
+
+    /// A main agent's terminal whose permission requests are recorded.
+    struct ForkFixture {
+        _dirs: [tempfile::TempDir; 3],
+        terminal: aither_sandbox::TerminalTool<
+            RecordingPermission,
+            executor_core::tokio::TokioGlobal,
+            aither_sandbox::Configured,
+        >,
+        asked: Arc<Mutex<Vec<(aither_sandbox::TerminalMode, String)>>>,
+    }
+
+    impl ForkFixture {
+        async fn new() -> Self {
+            use aither_sandbox::{TerminalTool, ToolRegistryBuilder};
+            use executor_core::tokio::TokioGlobal;
+
+            let session = tempfile::tempdir().unwrap();
+            let source = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let binary = crate::test_support::compile_baseline_fixture(source.path()).await;
+            let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
+            let permission = RecordingPermission::default();
+            let asked = permission.asked.clone();
+            let terminal = TerminalTool::new_exact(session.path(), permission, TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .initialize_tools(&distribution, cache.path())
+                .await
+                .expect("tools should prepare");
+            let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+            Self {
+                _dirs: [session, source, cache],
+                terminal: terminal.with_registry(registry),
+                asked,
+            }
+        }
+
+        /// The subagent tool of the fixture's terminal: the main model is the
+        /// advanced tier, the other tiers answer under their own names.
+        fn tool(
+            &self,
+            main: &ScriptedLlm,
+            seen: &async_channel::Sender<(&'static str, LLMRequest)>,
+        ) -> SubagentTool<ScriptedLlm> {
+            SubagentTool::new(main.clone())
+                .with_balanced_model(ScriptedLlm::new("balanced", seen))
+                .with_fast_model(ScriptedLlm::new("fast", seen))
+                .with_builtins()
+                .with_type(
+                    "worker",
+                    SubagentType::new("worker", |llm| {
+                        crate::AgentBuilder::new(llm)
+                            .agent_kind(crate::AgentKind::Chatbot)
+                            .max_iterations(5)
+                    }),
+                )
+                .for_terminal(self.terminal.binding())
+        }
+
+        /// A main agent on `llm` with this terminal, publishing to `source`.
+        fn main_agent(
+            &self,
+            llm: ScriptedLlm,
+            source: ForkSource,
+            policy: crate::ContextPolicy,
+        ) -> crate::Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, ()> {
+            let jobs = self.terminal.job_registry();
+            crate::AgentBuilder::new(llm)
+                .config(
+                    crate::AgentConfig::new()
+                        .with_system_prompt("You are the main agent.")
+                        .with_context_policy(policy),
+                )
+                .agent_kind(crate::AgentKind::Chatbot)
+                .dyn_terminal(self.terminal.clone().to_dyn())
+                .tool(aither_sandbox::builtin::KillTerminalTool::new(jobs.clone()))
+                .tool(aither_sandbox::builtin::InputTerminalTool::new(
+                    jobs.clone(),
+                ))
+                .tool(aither_sandbox::builtin::ReadTerminalDeltaTool::new(jobs))
+                .fork_source(source)
+                .build()
+        }
+    }
+
+    fn start_fork(tag: &str, subagent: &str, model: Option<ModelTier>) -> (PathBuf, SubagentArgs) {
+        let (dir, prompt_file) = write_prompt_file(tag, "carry on from here");
+        (
+            dir,
+            SubagentArgs::Start {
+                worktrees: Vec::new(),
+                commit_worktrees: Vec::new(),
+                subagent: subagent.to_string(),
+                prompt_file: prompt_file.to_string_lossy().into_owned(),
+                model,
+            },
+        )
+    }
+
+    fn unsafe_terminal_call(id: &str) -> Event {
+        Event::ToolCall(aither_core::llm::ToolCall::new(
+            id,
+            "terminal",
+            serde_json::json!({
+                "description": "probe the permission path",
+                "script": "echo forked",
+                "mode": "unsafe",
+            }),
+        ))
+    }
+
+    fn drain(
+        seen: &async_channel::Receiver<(&'static str, LLMRequest)>,
+    ) -> Vec<(&'static str, LLMRequest)> {
+        std::iter::from_fn(|| seen.try_recv().ok()).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forks_first_request_is_the_main_agents_request_then_the_fork_prompt() {
+        let fixture = ForkFixture::new().await;
+        let (seen_tx, seen_rx) = async_channel::unbounded();
+        let main = ScriptedLlm::new("main", &seen_tx);
+        main.then([
+            vec![
+                Event::ReasoningState(aither_core::llm::ReasoningState::new("test", "opaque")),
+                unsafe_terminal_call("call-1"),
+            ],
+            vec![Event::Text("main answer".to_string())],
+            vec![Event::Text("fork answer".to_string())],
+        ]);
+        let tool = fixture.tool(&main, &seen_tx);
+        let mut agent = fixture.main_agent(
+            main.clone(),
+            tool.fork_source(),
+            crate::ContextPolicy::default(),
+        );
+        agent.query("look into it").await.expect("main run");
+        let main_requests = drain(&seen_rx);
+        let (_, last_main) = main_requests.last().expect("the main agent sent requests");
+        assert_eq!(main_requests.len(), 2, "one tool round, then the answer");
+
+        let (dir, args) = start_fork("fork-first-request", "fork", None);
+        let result = Tool::call(&tool, args, ToolContext::new())
+            .await
+            .expect("fork call");
+        let text = result.render_for_model();
+        assert!(text.starts_with("Subagent 'fork' completed"), "{text}");
+        assert!(text.contains("fork answer"), "{text}");
+
+        let forked = drain(&seen_rx);
+        let [(model, first)] = forked.as_slice() else {
+            panic!("the fork sent one request, got {}", forked.len());
+        };
+        assert_eq!(*model, "main", "a fork runs on the main agent's model");
+
+        let shared = last_main.messages();
+        assert!(
+            shared.iter().any(|message| !message.reasoning().is_empty()),
+            "the inherited history carries the main agent's thinking"
+        );
+        assert_eq!(
+            &first.messages()[..shared.len()],
+            shared,
+            "the fork's request starts with the main agent's, unchanged"
+        );
+        assert_eq!(
+            &first.messages()[shared.len()..],
+            [aither_core::llm::Message::user("carry on from here")],
+            "and continues with the fork prompt alone"
+        );
+        assert_eq!(first.tool_definitions(), last_main.tool_definitions());
+        assert_eq!(
+            first.parameters().cache.openai,
+            last_main.parameters().cache.openai,
+            "the fork reads the main agent's cache"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forks_permission_request_reaches_the_main_agent_like_a_subagents() {
+        let fixture = ForkFixture::new().await;
+        let (seen_tx, seen_rx) = async_channel::unbounded();
+        let main = ScriptedLlm::new("main", &seen_tx);
+        main.then([vec![Event::Text("main answer".to_string())]]);
+        let tool = fixture.tool(&main, &seen_tx);
+        let mut agent = fixture.main_agent(
+            main.clone(),
+            tool.fork_source(),
+            crate::ContextPolicy::default(),
+        );
+        agent.query("look into it").await.expect("main run");
+        assert!(fixture.asked.lock().unwrap().is_empty());
+
+        let probe = || {
+            [
+                vec![unsafe_terminal_call("call-1")],
+                vec![Event::Text("finished".to_string())],
+            ]
+        };
+        main.then(probe());
+        let (fork_dir, fork) = start_fork("fork-permission", "fork", None);
+        Tool::call(&tool, fork, ToolContext::new())
+            .await
+            .expect("fork call");
+        let asked_by_fork = std::mem::take(&mut *fixture.asked.lock().unwrap());
+
+        main.then(probe());
+        let (worker_dir, worker) =
+            start_fork("worker-permission", "worker", Some(ModelTier::Advanced));
+        Tool::call(&tool, worker, ToolContext::new())
+            .await
+            .expect("worker call");
+        let asked_by_worker = std::mem::take(&mut *fixture.asked.lock().unwrap());
+
+        assert_eq!(
+            asked_by_fork,
+            [(
+                aither_sandbox::TerminalMode::Unsafe,
+                "echo forked".to_string()
+            )],
+            "the main agent's permission handler was asked"
+        );
+        assert_eq!(asked_by_fork, asked_by_worker);
+        drain(&seen_rx);
+
+        let _ = std::fs::remove_dir_all(fork_dir);
+        let _ = std::fs::remove_dir_all(worker_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fork_near_the_compaction_point_is_refused_until_the_main_agent_compacts() {
+        let fixture = ForkFixture::new().await;
+        let (seen_tx, seen_rx) = async_channel::unbounded();
+        let big = "word ".repeat(40_000);
+
+        // Measure the usage a main run reaches, then aim the compaction
+        // point so that usage lands within 10% below it.
+        let probe = ScriptedLlm::new("main", &seen_tx);
+        let probe_tool = fixture.tool(&probe, &seen_tx);
+        fixture
+            .main_agent(
+                probe.clone(),
+                probe_tool.fork_source(),
+                crate::ContextPolicy::default(),
+            )
+            .query(&big)
+            .await
+            .expect("measuring run");
+        let usage = probe_tool
+            .fork_source()
+            .latest()
+            .expect("the measuring run published its request")
+            .usage();
+        let compact_at = usage / 0.95;
+        let policy = crate::ContextPolicy {
+            compact_at,
+            restore_budget: compact_at / 4.0,
+            ..crate::ContextPolicy::default()
+        };
+        drain(&seen_rx);
+
+        let main = ScriptedLlm::new("main", &seen_tx);
+        main.then([
+            vec![Event::Text("main answer".to_string())],
+            vec![Event::Text("main answer again".to_string())],
+            vec![Event::Text("fork answer".to_string())],
+        ]);
+        let tool = fixture.tool(&main, &seen_tx);
+        let mut agent = fixture.main_agent(main.clone(), tool.fork_source(), policy);
+        agent.query(&big).await.expect("main run");
+        drain(&seen_rx);
+
+        let spaces = || {
+            std::fs::read_dir(fixture.terminal.working_dir())
+                .unwrap()
+                .count()
+        };
+        let before = spaces();
+        let (dir, args) = start_fork("fork-refused", "fork", None);
+        let error = Tool::call(&tool, args.clone(), ToolContext::new())
+            .await
+            .expect_err("a fork this close to compaction is refused");
+        let text = error.to_string();
+        assert!(text.contains("Run `compact` first, then fork"), "{text}");
+        assert!(drain(&seen_rx).is_empty(), "nothing was sent to a model");
+        assert_eq!(spaces(), before, "no subagent terminal was launched");
+        assert!(tool.runs().list().is_empty());
+
+        agent.compact(None).await.expect("compaction");
+        agent
+            .query("continue")
+            .await
+            .expect("main run after compaction");
+        drain(&seen_rx);
+        let result = Tool::call(&tool, args, ToolContext::new())
+            .await
+            .expect("a fork after the compaction starts");
+        assert!(
+            result
+                .render_for_model()
+                .starts_with("Subagent 'fork' completed")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_fork_is_refused_where_there_is_no_main_request_to_continue() {
+        let (seen_tx, _seen_rx) = async_channel::unbounded();
+        let main = ScriptedLlm::new("main", &seen_tx);
+        let tool = SubagentTool::new(main).with_builtins();
+        let (dir, args) = start_fork("fork-unbound", "fork", None);
+        let error = Tool::call(&tool, args, ToolContext::new())
+            .await
+            .expect_err("a tool bound to no terminal cannot fork");
+        assert!(error.to_string().contains("needs the terminal"), "{error}");
+
+        let (dir_model, with_model) = start_fork("fork-model", "fork", Some(ModelTier::Fast));
+        let error = Tool::call(&tool, with_model, ToolContext::new())
+            .await
+            .expect_err("a fork cannot choose a model");
+        assert!(error.to_string().contains("main agent's model"), "{error}");
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir_model);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fork_on_another_model_than_the_main_agents_is_refused() {
+        let fixture = ForkFixture::new().await;
+        let (seen_tx, seen_rx) = async_channel::unbounded();
+        let main = ScriptedLlm::new("main", &seen_tx);
+        main.then([vec![Event::Text("main answer".to_string())]]);
+        // The tool resolves the main agent's tier to another model.
+        let other = ScriptedLlm::new("other", &seen_tx);
+        let tool = fixture.tool(&other, &seen_tx);
+        let mut agent = fixture.main_agent(
+            main.clone(),
+            tool.fork_source(),
+            crate::ContextPolicy::default(),
+        );
+        agent.query("look into it").await.expect("main run");
+        drain(&seen_rx);
+
+        let spaces = || {
+            std::fs::read_dir(fixture.terminal.working_dir())
+                .unwrap()
+                .count()
+        };
+        let before = spaces();
+        let (dir, args) = start_fork("fork-other-model", "fork", None);
+        let error = Tool::call(&tool, args, ToolContext::new())
+            .await
+            .expect_err("a fork on another model is refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("'main'") && text.contains("'other'"),
+            "{text}"
+        );
+        assert!(drain(&seen_rx).is_empty(), "nothing was sent to a model");
+        assert_eq!(spaces(), before, "no subagent terminal was launched");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The task id the background-started reminder in `request` reports.
+    fn reported_task_id(request: &LLMRequest) -> String {
+        request
+            .messages()
+            .iter()
+            .rev()
+            .find_map(|message| {
+                let (_, rest) = message.content().split_once("task_id=")?;
+                Some(rest.split(')').next()?.to_string())
+            })
+            .expect("a terminal result reported a task id")
+    }
+
+    fn control_call(id: &str, name: &str, task_id: &str) -> Event {
+        Event::ToolCall(aither_core::llm::ToolCall::new(
+            id,
+            name,
+            serde_json::json!({ "task_id": task_id }),
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forks_terminal_controls_reach_its_own_jobs_and_not_the_main_agents() {
+        let fixture = ForkFixture::new().await;
+        let (seen_tx, seen_rx) = async_channel::unbounded();
+        let main = ScriptedLlm::new("main", &seen_tx);
+        main.then([vec![Event::Text("main answer".to_string())]]);
+        let tool = fixture.tool(&main, &seen_tx);
+        let mut agent = fixture.main_agent(
+            main.clone(),
+            tool.fork_source(),
+            crate::ContextPolicy::default(),
+        );
+        agent.query("look into it").await.expect("main run");
+
+        let main_jobs = fixture.terminal.job_registry();
+        main_jobs
+            .register(
+                4242,
+                "main-job",
+                "exec-key",
+                "long running main job",
+                aither_sandbox::TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+
+        main.then([vec![Event::ToolCall(aither_core::llm::ToolCall::new(
+            "bg-1",
+            "terminal_background",
+            serde_json::json!({
+                "description": "start a job",
+                "script": "cat",
+                "timeout": 60,
+            }),
+        ))]]);
+        main.then_with(|request| {
+            vec![control_call(
+                "read-1",
+                "terminal_read",
+                &reported_task_id(request),
+            )]
+        });
+        main.then_with(|request| {
+            vec![control_call(
+                "kill-1",
+                "terminal_kill",
+                &reported_task_id(request),
+            )]
+        });
+        main.then([vec![control_call("kill-2", "terminal_kill", "main-job")]]);
+        main.then([vec![Event::Text("finished".to_string())]]);
+
+        let (dir, args) = start_fork("fork-controls", "fork", None);
+        Tool::call(&tool, args, ToolContext::new())
+            .await
+            .expect("fork call");
+
+        let requests = drain(&seen_rx);
+        let (_, last) = requests.last().expect("the fork sent requests");
+        let results: Vec<&str> = last
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                aither_core::llm::Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            results.iter().any(|text| text.contains("next cursor")),
+            "terminal_read read the fork's job: {results:?}"
+        );
+        assert!(
+            results.iter().any(|text| text.contains("terminated")),
+            "terminal_kill stopped the fork's job: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|text| text.contains("No running background task 'main-job'")),
+            "the main agent's job is out of reach: {results:?}"
+        );
+        assert!(
+            main_jobs
+                .list()
+                .await
+                .iter()
+                .any(|job| job.task_id == "main-job"
+                    && job.status == aither_sandbox::JobStatus::Running),
+            "the main agent's job still runs"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

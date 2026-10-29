@@ -563,6 +563,24 @@ impl DynTerminalTool {
         self.command_names.iter().any(|n| n == name)
     }
 
+    /// The terminal controls (`terminal_kill`, `terminal_input`,
+    /// `terminal_read`) bound to this bundle's own background jobs.
+    ///
+    /// They are not part of [`into_entries`](Self::into_entries): an agent
+    /// that runs its own terminal controls on these gets control over this
+    /// terminal's jobs and no other's.
+    #[must_use]
+    pub fn controls(&self) -> Vec<DynTerminalToolEntry> {
+        use crate::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalDeltaTool};
+        use crate::terminal::erase_terminal_tool;
+
+        vec![
+            erase_terminal_tool(KillTerminalTool::new(self.job_registry.clone())),
+            erase_terminal_tool(InputTerminalTool::new(self.job_registry.clone())),
+            erase_terminal_tool(ReadTerminalDeltaTool::new(self.job_registry.clone())),
+        ]
+    }
+
     /// Consumes the bundle and returns every native terminal tool entry.
     #[must_use]
     pub fn into_entries(self) -> Vec<DynTerminalToolEntry> {

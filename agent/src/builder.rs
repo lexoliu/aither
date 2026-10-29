@@ -76,8 +76,19 @@ pub struct AgentBuilder<
     /// Directory files are restored from after a forked compaction: the
     /// directory the agent's terminal works in.
     restore_dir: Option<std::path::PathBuf>,
+    /// Where the built agent publishes each request for a fork to start from.
+    fork_source: Option<crate::fork::ForkSource>,
+    /// The window state a fork inherits, which replaces initialization.
+    inherited: Option<Inherited>,
     #[cfg(feature = "skills")]
     skill_registry: Option<Arc<SkillRegistry>>,
+}
+
+/// What a fork carries over from the main agent besides its context.
+#[derive(Clone)]
+struct Inherited {
+    budget: crate::context::ContextBudget,
+    profile: Option<aither_core::llm::model::Profile>,
 }
 
 impl<Advanced, Balanced, Fast, H, Compactor> std::fmt::Debug
@@ -113,6 +124,8 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             context_sources: Vec::new(),
             sandbox_dir: None,
             restore_dir: None,
+            fork_source: None,
+            inherited: None,
             #[cfg(feature = "skills")]
             skill_registry: None,
         }
@@ -152,6 +165,8 @@ where
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
             restore_dir: self.restore_dir,
+            fork_source: self.fork_source,
+            inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
         }
@@ -182,6 +197,8 @@ where
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
             restore_dir: self.restore_dir,
+            fork_source: self.fork_source,
+            inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
         }
@@ -216,6 +233,8 @@ where
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
             restore_dir: self.restore_dir,
+            fork_source: self.fork_source,
+            inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
         }
@@ -301,6 +320,49 @@ where
         self
     }
 
+    /// Publishes every request the built agent sends to `source`, which is
+    /// where the `fork` subagent kind starts from.
+    ///
+    /// Take the source from
+    /// [`SubagentTool::fork_source`](crate::specialized::SubagentTool::fork_source).
+    pub fn fork_source(mut self, source: crate::fork::ForkSource) -> Self {
+        self.fork_source = Some(source);
+        self
+    }
+
+    /// Makes the built agent a fork of the main agent that sent `fork`.
+    ///
+    /// The agent starts from the main agent's request: its window, with the
+    /// live tail as the last message, its tool definitions as the model saw
+    /// them, its request parameters and its prompt-cache identity, so its
+    /// first request is the main agent's followed by the prompt it is given
+    /// and reads the main agent's cache. Nothing is initialized on top of
+    /// that, since initialization would rewrite the window.
+    ///
+    /// The tools run in `terminal`, the fork's own terminal. A tool of the
+    /// main agent that `terminal` does not provide stays in the definitions,
+    /// to keep the request identical, and refuses when called.
+    pub fn forked_from(
+        mut self,
+        fork: &crate::fork::ForkSnapshot,
+        terminal: aither_sandbox::DynTerminalTool,
+    ) -> Self {
+        self.context = fork.context.clone();
+        self.prompt_cache = fork.prompt_cache.clone();
+        self.config.request_parameters = fork.request_parameters.clone();
+        self.config.context_policy = fork.context_policy;
+        self.inherited = Some(Inherited {
+            budget: fork.budget,
+            profile: Some(fork.profile.clone()),
+        });
+        self.background_receiver = Some(terminal.background_receiver());
+        self.permission_receiver = Some(terminal.permission_receiver());
+        self.job_registry = Some(terminal.job_registry());
+        self.restore_dir = Some(terminal.working_dir().clone());
+        self.tools = AgentTools::forked(&fork.definitions, terminal);
+        self
+    }
+
     /// Adds a hook to intercept agent operations.
     ///
     /// Hooks are composed using the `HCons` pattern, allowing multiple
@@ -336,6 +398,8 @@ where
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
             restore_dir: self.restore_dir,
+            fork_source: self.fork_source,
+            inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
         }
@@ -611,7 +675,12 @@ where
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,
-            budget: crate::context::ContextBudget::default(),
+            budget: self
+                .inherited
+                .as_ref()
+                .map_or_else(crate::context::ContextBudget::default, |inherited| {
+                    inherited.budget
+                }),
             prompt_cache: self.prompt_cache,
             context_sources: self.context_sources,
             reassembled: false,
@@ -620,13 +689,14 @@ where
             tool_results: std::collections::VecDeque::new(),
             config: self.config,
             context: self.context,
-            profile: None,
-            initialized: false,
+            initialized: self.inherited.is_some(),
+            profile: self.inherited.and_then(|inherited| inherited.profile),
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             sandbox_dir: self.sandbox_dir,
             restore_dir: self.restore_dir,
+            fork_source: self.fork_source,
             last_request_started_at: None,
             last_request: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),

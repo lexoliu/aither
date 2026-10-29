@@ -466,6 +466,15 @@ impl Context {
         messages
     }
 
+    /// Appends the rendered live `tail`, if any, to the conversation as a
+    /// message, so a context copied from a request carries exactly the
+    /// messages that request had.
+    pub(crate) fn push_tail(&mut self, tail: &[Block]) {
+        if let Some(message) = render_tail(tail) {
+            self.push(message);
+        }
+    }
+
     /// Builds the request message list with no live tail.
     ///
     /// Used for measurement and for the compaction fork, which must reproduce

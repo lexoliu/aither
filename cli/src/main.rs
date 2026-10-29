@@ -572,6 +572,9 @@ async fn build_agent(
         .with_builtins()
         .with_base_dir(builder.sandbox_dir().to_string());
     let subagent_desc = format_subagent_description(&subagent_tool);
+    // The agent publishes each request here so a `fork` subagent can start
+    // from it.
+    builder = builder.fork_source(subagent_tool.fork_source());
     builder = builder.terminal_bound_tool_with_desc(
         "subagent",
         move |binding| subagent_tool.for_terminal(binding),
