@@ -19,5 +19,6 @@ pub use lifecycle::{
 };
 pub use runner::{HookCommand, HookRole, HookRunError, HookRunner};
 
-#[cfg(test)]
+// The hook fixtures are `sh` scripts made executable with Unix permissions.
+#[cfg(all(test, unix))]
 pub(crate) mod tests;

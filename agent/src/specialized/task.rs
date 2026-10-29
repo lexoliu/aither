@@ -3912,6 +3912,8 @@ You are a file-defined agent.
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // The hook fixtures are `sh` scripts (`external_hook::tests`).
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_subagents_actions_reach_hooks_with_the_subagent_role() {
         use crate::external_hook::tests::{logged, recorder};
