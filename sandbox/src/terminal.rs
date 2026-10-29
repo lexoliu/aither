@@ -2065,6 +2065,9 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
         if arguments.description.trim().is_empty() {
             return Err(anyhow::anyhow!("terminal description must not be empty"));
         }
+        // The one entry every foreground, background and subagent command on
+        // every backend passes through, ahead of permission and execution.
+        crate::kill_guard::check(&arguments.script)?;
         let target =
             self.resolve_execution_target(arguments.mode, arguments.ssh_server_id.as_deref())?;
         if let ExecutionBackend::Local(tools) = &target.backend {
@@ -7231,6 +7234,126 @@ mod tests {
         assert!(
             matches!(error, SubagentGrantError::NoContainerMount),
             "{error}"
+        );
+    }
+
+    /// A configured local terminal in `dir`, for the kill-guard tests.
+    #[cfg(unix)]
+    async fn kill_guard_tool(
+        dir: &Path,
+    ) -> (
+        tempfile::TempDir,
+        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+    ) {
+        let (cache, shell_sessions) = prepared_test_registry().await;
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir,
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
+            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                local: true,
+                container: false,
+                ssh: false,
+            });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        (cache, tool.with_registry(registry))
+    }
+
+    /// Name- and pattern-based kills are refused before anything of the
+    /// command runs, in the foreground and the background alike.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn name_based_kills_are_refused_before_they_run() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = kill_guard_tool(dir.path()).await;
+        let marker = dir.path().join("ran");
+        for killer in [
+            "pkill -f anything",
+            "killall anything",
+            "/usr/bin/pkill -f anything",
+            "/usr/bin/killall anything",
+            "sudo pkill anything",
+            "env FOO=1 nice timeout 5 /usr/bin/killall anything",
+            "echo anything | xargs pkill",
+            "sh -c 'killall anything'",
+            "echo $(pkill anything)",
+            "(pkill anything)",
+        ] {
+            let script = format!("touch {}; {killer}", marker.display());
+            let error = tool
+                .call(
+                    terminal_args("name-based kill", &script),
+                    ToolContext::new(),
+                )
+                .await
+                .expect_err("a name-based kill must be refused");
+            assert!(
+                error.to_string().contains("kill that PID"),
+                "`{killer}` refusal must tell the agent to kill by PID: {error}"
+            );
+            let error = tool
+                .background_tool()
+                .call(
+                    TerminalBackgroundArgs {
+                        terminal: terminal_args("name-based kill", &script),
+                        timeout: 30,
+                    },
+                    ToolContext::new(),
+                )
+                .await
+                .expect_err("a background name-based kill must be refused");
+            assert!(
+                error.to_string().contains("kill that PID"),
+                "`{killer}` background refusal must tell the agent to kill by PID: {error}"
+            );
+            assert!(
+                !marker.exists(),
+                "`{killer}` must be refused before any part of the command runs"
+            );
+        }
+    }
+
+    /// Words that only mention a killer, and kills by PID, still run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_by_pid_and_mentions_of_killers_still_run() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = kill_guard_tool(dir.path()).await;
+
+        let result = tool
+            .call(
+                terminal_args("mention a killer", "echo pkill killall"),
+                ToolContext::new(),
+            )
+            .await
+            .expect("a mention of a killer must not be refused");
+        assert!(
+            render_terminal_result(&result).contains("pkill killall"),
+            "{}",
+            render_terminal_result(&result)
+        );
+
+        let result = tool
+            .call(
+                terminal_args(
+                    "kill by pid",
+                    "sleep 300 & pid=$!; kill $pid; wait $pid; echo \"status=$?\"",
+                ),
+                ToolContext::new(),
+            )
+            .await
+            .expect("kill by PID must not be refused");
+        assert!(
+            render_terminal_result(&result).contains("status=143"),
+            "kill <pid> must terminate the process it names: {}",
+            render_terminal_result(&result)
         );
     }
 }

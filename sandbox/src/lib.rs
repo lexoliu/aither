@@ -55,6 +55,7 @@
 mod bollard_exec;
 mod command;
 mod container;
+mod kill_guard;
 mod naming;
 mod output;
 mod output_compress;
@@ -105,6 +106,7 @@ pub use job_registry::{
 pub use jobserver::{
     CommandFifo, JobBroker, JobBrokerService, JobPool, JobserverError, job_broker_channel,
 };
+pub use kill_guard::CommandRefusal;
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
 };

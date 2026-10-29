@@ -54,6 +54,8 @@ strsim = "0.11.1"
 human-hash = "0.4"
 askama = "0.16"
 shell-words = "1.1"
+# Shell syntax tree for refusing name- and pattern-based kills before a command runs.
+brush-parser = { version = "0.3.0", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 # Shared jobserver token pools for bounding command parallelism (unix only).
