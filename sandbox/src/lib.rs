@@ -112,7 +112,7 @@ pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
 };
 pub use output::{MediaResolution, OutputFormat, OutputStore};
-pub use permission::{PermissionHandler, TerminalMode};
+pub use permission::{PermissionHandler, PermissionRequest, Review, TerminalMode};
 pub use process_tree::{KillTreeError, kill_process_tree};
 pub use shell_session::{
     AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
