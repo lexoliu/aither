@@ -20,6 +20,8 @@ anyhow = "1.0.104"
 askama = "0.16"
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2"
+sync_wrapper = "1"
 serde_json = "1.0"
 serde_yaml = "0.9"
 indexmap = { version = "2", features = ["serde"] }

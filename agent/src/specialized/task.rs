@@ -1591,6 +1591,7 @@ You are a file-defined agent.
         author: &'static str,
         requests: async_channel::Sender<LLMRequest>,
         keep_alive: Option<crate::config::CacheKeepAlive>,
+        cache_lifetime: std::time::Duration,
     ) -> (
         SubagentTool<KeepAliveMockLlm>,
         aither_sandbox::BackgroundTaskSender,
@@ -1615,6 +1616,10 @@ You are a file-defined agent.
                 crate::AgentBuilder::new(llm)
                     .agent_kind(crate::AgentKind::Chatbot)
                     .max_iterations(4)
+                    .prompt_cache(
+                        crate::context::PromptCache::new("keep-alive-test")
+                            .with_lifetime(crate::context::CacheLifetime::Limited(cache_lifetime)),
+                    )
                     .background_channels(receiver.clone(), child_jobs.clone())
             }),
         );
@@ -1659,10 +1664,10 @@ You are a file-defined agent.
             "Anthropic",
             request_tx,
             Some(crate::config::CacheKeepAlive {
-                lifetime: std::time::Duration::from_millis(400),
                 send_before_expiry: std::time::Duration::from_millis(150),
                 frequent_idle_threshold: 2,
             }),
+            std::time::Duration::from_millis(400),
         );
         tokio::spawn(job_service.serve());
         register_running_job(&job_registry, 4242, "sleep 2").await;
@@ -1753,8 +1758,12 @@ You are a file-defined agent.
     async fn subagent_without_keep_alive_config_gets_no_keep_alives() {
         let (dir, prompt_file) = write_prompt_file("keep-alive-other-prompt", "hold a job");
         let (request_tx, request_rx) = async_channel::unbounded();
-        let (tool, sender, job_registry, job_service) =
-            keep_alive_tool("Anthropic", request_tx, None);
+        let (tool, sender, job_registry, job_service) = keep_alive_tool(
+            "Anthropic",
+            request_tx,
+            None,
+            std::time::Duration::from_secs(300),
+        );
         tokio::spawn(job_service.serve());
         register_running_job(&job_registry, 4243, "sleep 2").await;
         sender.task_started();

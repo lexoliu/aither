@@ -10,12 +10,12 @@
 {% endfor %}
 {% endif %}
 
-## Files & Paths
-{% if handoff.files_paths.is_empty() %}
+## Context Files
+{% if handoff.context_files.is_empty() %}
 - None recorded.
 {% else %}
-{% for item in handoff.files_paths %}
-- {{ item }}
+{% for item in handoff.context_files %}
+- `{{ item.path }}`{% if let Some(lines) = item.lines %}:{{ lines.start }}-{{ lines.end }}{% endif %} — {{ item.why }}
 {% endfor %}
 {% endif %}
 
@@ -43,6 +43,15 @@
 {% else %}
 {% for item in handoff.recovery_hints %}
 - {{ item }}
+{% endfor %}
+{% endif %}
+
+## Skills
+{% if handoff.skills.is_empty() %}
+- None recorded.
+{% else %}
+{% for item in handoff.skills %}
+- `{{ item }}`
 {% endfor %}
 {% endif %}
 
