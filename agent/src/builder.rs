@@ -58,6 +58,7 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     hooks: H,
     config: AgentConfig,
     context: Context,
+    prompt_cache: crate::context::PromptCache,
     background_receiver: Option<BackgroundTaskReceiver>,
     permission_receiver: Option<PermissionEventReceiver>,
     job_registry: Option<JobRegistry>,
@@ -90,6 +91,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             hooks: (),
             config: AgentConfig::default(),
             context: Context::default(),
+            prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
@@ -125,6 +127,7 @@ where
             hooks: self.hooks,
             config: self.config,
             context: self.context,
+            prompt_cache: self.prompt_cache,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -152,6 +155,7 @@ where
             hooks: self.hooks,
             config: self.config,
             context: self.context,
+            prompt_cache: self.prompt_cache,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -260,6 +264,7 @@ where
             hooks: HCons::new(hook, self.hooks),
             config: self.config,
             context: self.context,
+            prompt_cache: self.prompt_cache,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -472,6 +477,43 @@ where
         self
     }
 
+    /// Overrides the session's prompt-cache controller.
+    ///
+    /// The default derives a fresh session key per agent and retains Claude
+    /// breakpoints for one hour; a host with its own session identity or a
+    /// provider that retains prompts differently supplies the
+    /// [`PromptCache`](crate::context::PromptCache) it wants here.
+    pub fn prompt_cache(mut self, cache: crate::context::PromptCache) -> Self {
+        self.prompt_cache = cache;
+        self
+    }
+
+    /// Enables prompt-cache keep-alive while the run waits on its own
+    /// background commands.
+    ///
+    /// `SubagentTool` sets this on child agents; ordinary agents leave it
+    /// off. It is a no-op unless the run's model is an Anthropic one.
+    pub const fn cache_keep_alive(mut self, keep_alive: crate::config::CacheKeepAlive) -> Self {
+        self.config.cache_keep_alive = Some(keep_alive);
+        self
+    }
+
+    /// Connects the agent to an external background-task channel pair.
+    ///
+    /// [`terminal`](Self::terminal) and [`dyn_terminal`](Self::dyn_terminal)
+    /// wire these for sandboxed execution; hosts driving an execution
+    /// environment of their own (or simulating one) attach the pair here so
+    /// the run loop waits on it the same way.
+    pub fn background_channels(
+        mut self,
+        receiver: BackgroundTaskReceiver,
+        job_registry: JobRegistry,
+    ) -> Self {
+        self.background_receiver = Some(receiver);
+        self.job_registry = Some(job_registry);
+        self
+    }
+
     /// Returns the definitions of the tools registered on this builder so far.
     ///
     /// These are the definitions the built agent sends to the model, in the
@@ -491,7 +533,7 @@ where
             tools: self.tools,
             hooks: self.hooks,
             budget: crate::context::ContextBudget::default(),
-            prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
+            prompt_cache: self.prompt_cache,
             context_sources: self.context_sources,
             pending_compaction: None,
             completed_compaction: None,
@@ -504,6 +546,8 @@ where
             job_registry: self.job_registry,
             sandbox_dir: self.sandbox_dir,
             last_request_started_at: None,
+            last_request: None,
+            cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,

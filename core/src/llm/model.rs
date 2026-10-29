@@ -135,6 +135,16 @@ pub struct Parameters {
     /// could otherwise fan its tool calls out concurrently.
     pub parallel_tool_calls: Option<bool>,
 
+    /// Whether the provider should answer with a streaming response.
+    ///
+    /// `None` leaves the decision to the provider's own default — providers
+    /// that offer both modes stream by default through
+    /// [`LanguageModel::respond`](crate::LanguageModel::respond). `Some(false)`
+    /// asks for a single buffered response, which callers use for requests
+    /// that exist only to touch the provider (for example a prompt-cache
+    /// keep-alive), never to produce visible output.
+    pub stream: Option<bool>,
+
     /// Preferred reasoning effort when supported.
     pub reasoning_effort: Option<ReasoningEffort>,
 
@@ -207,6 +217,7 @@ impl_with_methods! {
         top_logprobs: u8,
         stop: Vec<String>,
         parallel_tool_calls: bool,
+        stream: bool,
     }
 }
 

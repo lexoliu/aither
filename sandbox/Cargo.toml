@@ -52,6 +52,15 @@ quick-xml = { version = "0.42", features = ["serialize"] }
 shell-words = "1.1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
+# Shared jobserver token pools for bounding command parallelism (unix only).
+# `polling` supplies the readiness watcher, `rustix` the fd/ioctl/inotify
+# syscalls; both are already in the lockfile through async-io.
+polling = { version = "3.11", optional = true }
+rustix = { version = "1.1", optional = true, default-features = false, features = [
+    "std",
+    "fs",
+] }
+
 # Output compression: content detection + code folding.
 # `magika` links ONNX Runtime, so it is opt-in: running bash in a sandbox
 # should not require an ML runtime to be present at link time.
@@ -81,6 +90,8 @@ default = []
 # Detect source code in command output so it can be folded with tree-sitter.
 # Pulls in ONNX Runtime via `magika`.
 code-folding = ["dep:magika", "dep:tree-sitter", "dep:rs-tree-sitter-languages"]
+# Broker a shared GNU make jobserver token pool across commands (unix only).
+jobserver = ["dep:polling", "dep:rustix"]
 
 [dev-dependencies]
 magika = { version = "1", features = ["_test"] }

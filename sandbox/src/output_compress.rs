@@ -7,7 +7,8 @@
 //!    line.
 //! 2. [`collapse`] collapses runs of blank lines to a single blank line.
 //! 3. [`json_tsv`] turns a JSON array of records into TSV.
-//! 4. [`fold`] folds the bodies of blocks in output that is source code.
+//! 4. [`fold`] folds the bodies of blocks in output that is source code, via
+//!    [`folded_code_content`].
 //! 5. [`preview`] reduces stored text to a head+tail preview for the model.
 //!
 //! Stages 1 and 2 are the only ones applied unconditionally: together they
@@ -15,10 +16,12 @@
 //! no copy is kept -- keeps every character the command actually produced,
 //! down to whether it ended with a line terminator.
 //!
-//! Stages 3 and 4 are lossy. They run only when the text they replace can be
-//! written to disk, and the text the model reads names that file, so nothing
-//! is lost. Stage 5 belongs to the stored path in [`crate::output`], which
-//! owns the inline budget.
+//! Stages 3 and 4 are lossy and only run where the text they replace is
+//! written to disk and named in the text the model reads. Stage 3 runs in
+//! [`compress_text`]. Stages 4 and 5 belong to the cut path in
+//! [`crate::output`], which owns the inline budget: output that is not cut is
+//! never folded, and a cut form that is not smaller than the output is
+//! dropped for the output itself.
 
 mod collapse;
 mod fold;
@@ -46,6 +49,25 @@ struct FoldedCodeOutput<'a> {
     folded: &'a str,
     url: &'a str,
     path: &'a str,
+}
+
+/// Renders the folded view of cut source code for the model, or `None` when
+/// `text` is not recognisable source code or folding does not shrink it.
+///
+/// `url` and `path` name the stored unfolded text, whose line numbers the
+/// folded view carries.
+#[must_use]
+pub fn folded_code_content(text: &str, url: &str, path: &str) -> Option<String> {
+    let folded = fold::fold_source_code(text)?;
+    Some(
+        FoldedCodeOutput {
+            folded: folded.trim_end_matches('\n'),
+            url,
+            path,
+        }
+        .render()
+        .expect("folded code output template must render"),
+    )
 }
 
 /// Cleans foreground terminal text for the model.
@@ -80,19 +102,6 @@ pub async fn compress_text(store_dir: &Path, text: &str) -> std::io::Result<Opti
         }
         .render()
         .expect("json tsv output template must render");
-        return Ok(Some(rendered));
-    }
-
-    if let Some(folded) = fold::fold_source_code(&cleaned) {
-        let (url, path) = crate::output::save_raw_to_file(store_dir, cleaned.as_bytes()).await?;
-        let path = path.display().to_string();
-        let rendered = FoldedCodeOutput {
-            folded: folded.trim_end_matches('\n'),
-            url: &url,
-            path: &path,
-        }
-        .render()
-        .expect("folded code output template must render");
         return Ok(Some(rendered));
     }
 

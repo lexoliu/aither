@@ -29,9 +29,9 @@ use crate::{
     checkpoint::AgentCheckpoint,
     config::{AgentConfig, AgentKind},
     context::{
-        AnyContextSource, BackgroundJobs, Block, CompactionFork, CompletedCompaction, Context,
-        ContextBudget, HandoffDocument, PendingCompaction, PromptCache, TasksDocument,
-        restore_context, serialize_xml,
+        AnyContextSource, BackgroundJobs, Block, CacheLifetime, CompactionFork,
+        CompletedCompaction, Context, ContextBudget, HandoffDocument, PendingCompaction,
+        PromptCache, TasksDocument, restore_context, serialize_xml,
     },
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
@@ -245,6 +245,27 @@ pub struct CompactResult {
     pub summary: String,
 }
 
+/// Prompt-cache keep-alive bookkeeping for one run.
+///
+/// The entry's lifetime is the conversation's [`CacheLifetime`], counted
+/// from the start of the last request; each keep-alive send refreshes it.
+/// `sent` counts sends in the current run so the owner can spot a run that
+/// idles frequently.
+///
+/// [`CacheLifetime`]: crate::context::CacheLifetime
+#[derive(Debug, Default)]
+pub struct CacheKeepAliveState {
+    /// When the most recent keep-alive was sent.
+    last_sent_at: Option<Instant>,
+    /// Keep-alives sent so far this run.
+    pub(crate) sent: usize,
+    /// Whether the frequent-idle threshold was already crossed this run.
+    pub(crate) alerted: bool,
+    /// Why the run was waiting when the last keep-alive went out — the
+    /// background command it was parked on.
+    pub(crate) last_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct EmittedCheckpoint {
     phase: ContextWindowPhase,
@@ -450,6 +471,13 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Start time of the most recent LLM request issued by this agent.
     pub(crate) last_request_started_at: Option<Instant>,
 
+    /// The most recent LLM request issued by this agent, retained so a
+    /// prompt-cache keep-alive can re-send it verbatim.
+    pub(crate) last_request: Option<LLMRequest>,
+
+    /// Prompt-cache keep-alive bookkeeping for the current run.
+    pub(crate) cache_keep_alive: CacheKeepAliveState,
+
     /// Rolling KV-cache statistics accumulated from emitted `Usage` events.
     ///
     /// Hosts can read [`Agent::cache_stats`] at any time to observe the
@@ -508,6 +536,8 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             permission_receiver: None,
             job_registry: None,
             sandbox_dir: None,
+            last_request: None,
+            cache_keep_alive: CacheKeepAliveState::default(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -1061,6 +1091,7 @@ where
         let start = Instant::now();
         while start.elapsed() < BACKGROUND_TASK_MAX_WAIT {
             self.push_long_running_alerts();
+            self.maybe_send_cache_keep_alive().await?;
             if let Some(task) = receiver.recv_timeout(BACKGROUND_TASK_POLL_INTERVAL).await {
                 tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
                 self.push_completed_task_event(task, events);
@@ -1079,6 +1110,97 @@ where
         let outcome = self.run_agent_loop(run_id, iteration, events).await?;
         self.push_stop_events(run_id, outcome, events).await?;
         Ok(true)
+    }
+
+    /// Sends one prompt-cache keep-alive when the wait on background tasks
+    /// is about to outlive the conversation's cache entry.
+    ///
+    /// Fires only while the run is parked in
+    /// [`collect_final_background_events`](Self::collect_final_background_events),
+    /// and only when [`AgentConfig::cache_keep_alive`](crate::config::AgentConfig::cache_keep_alive)
+    /// is set; the caller sets it only for providers whose cache expires.
+    /// The keep-alive re-sends the run's last request with `max_tokens: 0`
+    /// and non-streaming, keeping the same thinking and effort settings,
+    /// shortly before the entry's [`CacheLifetime`] — counted from the
+    /// start of the last request, or of the previous keep-alive — expires.
+    /// A [`CacheLifetime::Permanent`] cache never gets one, and there is no
+    /// cap on sends: they repeat for as long as the run waits.
+    ///
+    /// [`CacheLifetime`]: crate::context::CacheLifetime
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error when the keep-alive request fails.
+    async fn maybe_send_cache_keep_alive(&mut self) -> Result<(), AgentError> {
+        let Some(keep_alive) = self.config.cache_keep_alive.clone() else {
+            return Ok(());
+        };
+        let CacheLifetime::Limited(lifetime) = self.prompt_cache.lifetime() else {
+            return Ok(());
+        };
+        let entry_started_at = self
+            .cache_keep_alive
+            .last_sent_at
+            .or(self.last_request_started_at);
+        let Some(entry_started_at) = entry_started_at else {
+            return Ok(());
+        };
+        if entry_started_at.elapsed() + keep_alive.send_before_expiry < lifetime {
+            return Ok(());
+        }
+        let Some(last_request) = self.last_request.clone() else {
+            return Ok(());
+        };
+        let (messages, parameters, tool_definitions) = last_request.into_parts();
+        let request = LLMRequest::new(messages)
+            .with_tool_definitions(tool_definitions)
+            .with_parameters(parameters.max_tokens(0).stream(false));
+        let stream = Self::respond_stream(
+            self.tier,
+            &self.advanced,
+            &self.balanced,
+            &self.fast,
+            request,
+        );
+        futures_lite::pin!(stream);
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(Event::Usage(usage)) => self.cache_stats.record(&usage),
+                Ok(_) => {}
+                Err(error) => return Err(AgentError::Llm(error)),
+            }
+        }
+        self.cache_keep_alive.last_sent_at = Some(Instant::now());
+        self.cache_keep_alive.sent += 1;
+        self.cache_keep_alive.last_reason = self.format_wait_reason().await;
+        if self.cache_keep_alive.sent >= keep_alive.frequent_idle_threshold {
+            self.cache_keep_alive.alerted = true;
+        }
+        Ok(())
+    }
+
+    /// Describes the background commands this run is currently parked on.
+    async fn format_wait_reason(&self) -> Option<String> {
+        let job_registry = self.job_registry.as_ref()?;
+        let running: Vec<String> = job_registry
+            .list()
+            .await
+            .into_iter()
+            .filter(|job| job.status == aither_sandbox::JobStatus::Running)
+            .map(|job| format!("'{}' ({})", job.script, job.task_id))
+            .collect();
+        if running.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "waiting on background command {}",
+            running.join(", ")
+        ))
+    }
+
+    /// Keep-alive bookkeeping for the current run.
+    pub const fn cache_keep_alive_state(&self) -> &CacheKeepAliveState {
+        &self.cache_keep_alive
     }
 
     /// Pushes one durable alert per background job that crossed the
@@ -1798,11 +1920,11 @@ where
         let parameters =
             self.prompt_cache
                 .apply(self.config.request_parameters.clone(), &messages, has_tools);
-        Some(
-            LLMRequest::new(messages)
-                .with_parameters(parameters)
-                .with_tool_definitions(definitions),
-        )
+        let request = LLMRequest::new(messages)
+            .with_parameters(parameters)
+            .with_tool_definitions(definitions);
+        self.last_request = Some(request.clone());
+        Some(request)
     }
 
     /// Rebuilds the window once the provider's cache has gone cold anyway.

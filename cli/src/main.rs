@@ -686,8 +686,8 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
 
 fn print_history<Advanced, Balanced, Fast, H>(agent: &Agent<Advanced, Balanced, Fast, H>)
 where
-    Advanced: LanguageModel,
-    Balanced: LanguageModel,
+    Advanced: LanguageModel + 'static,
+    Balanced: LanguageModel + 'static,
     Fast: LanguageModel + 'static,
     H: Hook,
 {
