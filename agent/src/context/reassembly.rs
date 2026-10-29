@@ -582,6 +582,8 @@ mod tests {
         assert!(block.content().contains("not restored"));
     }
 
+    // Creating a symlink needs privileges on Windows; the fixture is Unix-only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_symlink_escaping_the_root_is_listed_not_read() {
         let root = tempfile::tempdir().expect("tempdir");
