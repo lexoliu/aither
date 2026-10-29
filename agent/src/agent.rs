@@ -46,9 +46,9 @@ use crate::{
 };
 
 use aither_sandbox::{
-    BackgroundTaskEvent, BackgroundTaskReceiver, JobAlert, JobRegistry, PermissionEvent,
-    PermissionEventReceiver, PermissionEventStage, TerminalArgs, TerminalBackgroundArgs,
-    TerminalExecutionMode, TerminalMode,
+    BackgroundTaskEvent, BackgroundTaskReceiver, DirectoryResetReason, JobAlert, JobRegistry,
+    PermissionEvent, PermissionEventReceiver, PermissionEventStage, TerminalArgs,
+    TerminalBackgroundArgs, TerminalExecutionMode, TerminalMode,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -352,6 +352,11 @@ enum JobAlertText<'a> {
     StdinBlocked { task_id: &'a str },
     /// Watching the job's stdin failed.
     StdinProbeFailed { task_id: &'a str, error: &'a str },
+    /// The carried working directory was reset.
+    DirectoryReset {
+        dir: String,
+        reason: DirectoryResetReason,
+    },
 }
 
 fn job_alert_text(alert: &JobAlertText<'_>) -> String {
@@ -1435,6 +1440,14 @@ where
     /// it is a job blocked on stdin, which wakes a parked wait.
     fn push_job_alert(&mut self, alert: JobAlert) -> bool {
         match alert {
+            JobAlert::DirectoryReset(reset) => {
+                tracing::info!(dir = %reset.dir.display(), reason = ?reset.reason, "carried working directory reset");
+                self.push_system_alert(job_alert_text(&JobAlertText::DirectoryReset {
+                    dir: reset.dir.display().to_string(),
+                    reason: reset.reason,
+                }));
+                false
+            }
             JobAlert::LongRunning(job) => {
                 tracing::info!(task_id = %job.task_id, "background job crossed long-running threshold");
                 self.push_system_alert(job_alert_text(&JobAlertText::LongRunning {
@@ -2817,6 +2830,26 @@ mod tests {
             }),
             "Monitoring background job 'amber' for stdin reads failed: no /proc — it cannot report being blocked on stdin."
         );
+        for (reason, expected) in [
+            (DirectoryResetReason::Failed, "the last command failed"),
+            (DirectoryResetReason::Unreported, "exit or a signal"),
+            (
+                DirectoryResetReason::OutsideReadable,
+                "paths the terminal can read",
+            ),
+            (DirectoryResetReason::OutsideWorkspace, "workspace mount"),
+            (DirectoryResetReason::Removed, "no longer exists"),
+        ] {
+            let text = job_alert_text(&JobAlertText::DirectoryReset {
+                dir: "/work/space".to_string(),
+                reason,
+            });
+            assert!(
+                text.starts_with("Commands now run in /work/space: "),
+                "{text}"
+            );
+            assert!(text.contains(expected), "{text}");
+        }
         let long = job_alert_text(&JobAlertText::LongRunning {
             task_id: "amber",
             elapsed: "5m".to_string(),

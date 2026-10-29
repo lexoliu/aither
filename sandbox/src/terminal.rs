@@ -246,16 +246,29 @@ fn build_terminal_launch(
         ));
     }
 
-    if script_requires_shell(script) {
-        return shell_launch_reporting(script, report);
+    match direct_command(script)? {
+        Some((program, args)) => Ok(TerminalLaunch::Direct { program, args }),
+        None => shell_launch_reporting(script, report),
     }
+}
 
+/// The program and arguments of a script that runs without a shell, or
+/// `None` when it needs one.
+fn direct_command(script: &str) -> Result<Option<(String, Vec<String>)>, TerminalError> {
+    if script_requires_shell(script) {
+        return Ok(None);
+    }
     let (program, args) = parse_direct_command(script)?;
     if looks_like_env_assignment(&program) || is_shell_builtin(&program) {
-        return shell_launch_reporting(script, report);
+        return Ok(None);
     }
+    Ok(Some((program, args)))
+}
 
-    Ok(TerminalLaunch::Direct { program, args })
+/// Whether a local launch of `script` runs in a shell, the only way a
+/// command can change directory.
+fn runs_in_shell(script: &str) -> bool {
+    matches!(direct_command(script.trim()), Ok(None))
 }
 
 #[derive(Template)]
@@ -529,10 +542,42 @@ pub struct StdinProbeFailedJob {
     pub error: String,
 }
 
-/// A system alert about a background job, delivered through the terminal's
-/// alert channel.
+/// Why the next foreground command does not start where the last one left
+/// the shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryResetReason {
+    /// The command failed, so the directory it ended in is not carried.
+    Failed,
+    /// The command ended through `exit` or a signal and reported no
+    /// directory.
+    Unreported,
+    /// The directory it ended in lies outside the paths the terminal may
+    /// read.
+    OutsideReadable,
+    /// The directory it ended in lies outside the container's workspace
+    /// mount.
+    OutsideWorkspace,
+    /// The directory no longer exists.
+    Removed,
+}
+
+/// The working directory carried between foreground commands was reset.
+///
+/// Sent once per reset, at the moment it happens.
+#[derive(Debug, Clone)]
+pub struct DirectoryReset {
+    /// The directory the next command runs in, as the command sees it.
+    pub dir: PathBuf,
+    /// Why the shell's directory was not carried.
+    pub reason: DirectoryResetReason,
+}
+
+/// A system alert about a background job, or about the carried working
+/// directory, delivered through the terminal's alert channel.
 #[derive(Debug, Clone)]
 pub enum JobAlert {
+    /// The directory carried between foreground commands was reset.
+    DirectoryReset(DirectoryReset),
     /// The job crossed the long-running threshold.
     LongRunning(LongRunningJob),
     /// The job is waiting for input on its stdin.
@@ -1117,6 +1162,9 @@ struct CwdCarry {
     /// Set for a container command: the workspace mount that maps the host
     /// paths above into the container and back.
     container: Option<ContainerCarry>,
+    /// Whether the command runs in a shell and so writes the report; a
+    /// direct command cannot change directory and writes none.
+    shell: bool,
 }
 
 /// How a container command spells its directory report.
@@ -2147,7 +2195,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
         let prepared = self.prepare_execution(&arguments).await?;
-        let carry = self.cwd_carry(&prepared).await;
+        let carry = self.cwd_carry(&prepared, &arguments.script).await;
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
             task_id: prepared.task_id.clone(),
@@ -2184,7 +2232,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
     /// The directory report of a foreground command on the main agent's
     /// terminal; `None` for a subagent, for an ssh command and for a container
     /// whose workspace mount is not declared.
-    async fn cwd_carry(&self, prepared: &ExecutionPreparation) -> Option<CwdCarry> {
+    async fn cwd_carry(&self, prepared: &ExecutionPreparation, script: &str) -> Option<CwdCarry> {
         let carried = self.carried_dir.as_ref()?;
         let mount = match &prepared.target.backend {
             ExecutionBackend::Local(_) if !cfg!(windows) => None,
@@ -2203,6 +2251,13 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
             }
             Some(_) => {
                 carried.set(None);
+                let dir = if mount.is_some() {
+                    PathBuf::from(CONTAINER_EXEC_WORKING_DIR)
+                } else {
+                    self.own_dir().await
+                };
+                self.send_directory_reset(dir, DirectoryResetReason::Removed)
+                    .await;
                 None
             }
             None => None,
@@ -2228,47 +2283,64 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
                 })
             }
         };
+        let shell = container.is_some() || runs_in_shell(script);
         Some(CwdCarry {
             start,
             report,
             container,
+            shell,
         })
     }
 
     /// Makes the directory a finished foreground command ended in the start
     /// of the next one, when the command succeeded and the directory lies
     /// inside the paths this terminal may read. The report file is consumed
-    /// either way.
+    /// either way. When the next command does not start where the shell
+    /// ended, or the shell reported nothing, the model is alerted once.
     async fn record_carried_dir(&self, carry: &CwdCarry, succeeded: bool) {
         let reported = async_fs::read_to_string(&carry.report).await;
         let _ = async_fs::remove_file(&carry.report).await;
         let Some(carried) = &self.carried_dir else {
             return;
         };
-        if !succeeded {
-            return;
-        }
-        // A direct command, or a shell that ended through `exit` or a
-        // signal, writes none.
-        let Ok(reported) = reported else {
+        // A direct command writes no report; a shell that ended through
+        // `exit` or a signal writes none either.
+        let reported = reported
+            .ok()
+            .map(|reported| reported.trim_end_matches('\n').to_owned())
+            .filter(|reported| !reported.is_empty());
+        let Some(reported) = reported else {
+            if carry.shell {
+                self.alert_directory_reset(carry, DirectoryResetReason::Unreported)
+                    .await;
+            }
             return;
         };
-        let reported = reported.trim_end_matches('\n');
-        if reported.is_empty() {
+        if !succeeded {
+            if !self.left_in_start(carry, &reported).await {
+                self.alert_directory_reset(carry, DirectoryResetReason::Failed)
+                    .await;
+            }
             return;
         }
         if let Some(container) = &carry.container {
             // A container is an unconfined main agent: what bounds its
             // directory is the workspace mount.
-            if let Ok(dir) = ContainerPath::new(reported)
+            match ContainerPath::new(reported.as_str())
                 .map_err(drop)
                 .and_then(|dir| container.mount.host_path(&dir).map_err(drop))
             {
-                carried.set(Some(dir));
+                Ok(dir) => carried.set(Some(dir)),
+                Err(()) => {
+                    self.alert_directory_reset(carry, DirectoryResetReason::OutsideWorkspace)
+                        .await;
+                }
             }
             return;
         }
-        let Ok(dir) = canonical_path(Path::new(reported)).await else {
+        let Ok(dir) = canonical_path(Path::new(&reported)).await else {
+            self.alert_directory_reset(carry, DirectoryResetReason::Removed)
+                .await;
             return;
         };
         for grant in std::iter::once(&self.working_dir)
@@ -2283,6 +2355,50 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
                 return;
             }
         }
+        self.alert_directory_reset(carry, DirectoryResetReason::OutsideReadable)
+            .await;
+    }
+
+    /// Whether the shell ended in the directory the command started in.
+    async fn left_in_start(&self, carry: &CwdCarry, reported: &str) -> bool {
+        if let Some(container) = &carry.container {
+            return reported == container.start.as_str();
+        }
+        let start = carry.start.as_deref().unwrap_or(&self.working_dir);
+        match (
+            canonical_path(Path::new(reported)).await,
+            canonical_path(start).await,
+        ) {
+            (Ok(reported), Ok(start)) => reported == start,
+            _ => false,
+        }
+    }
+
+    /// Alerts the model that the next command starts where `carry` started,
+    /// not where the shell ended.
+    async fn alert_directory_reset(&self, carry: &CwdCarry, reason: DirectoryResetReason) {
+        let dir = match &carry.container {
+            Some(container) => PathBuf::from(container.start.as_str()),
+            None => match &carry.start {
+                Some(start) => start.clone(),
+                None => self.own_dir().await,
+            },
+        };
+        self.send_directory_reset(dir, reason).await;
+    }
+
+    /// The terminal's own directory as a command sees it.
+    async fn own_dir(&self) -> PathBuf {
+        canonical_path(&self.working_dir)
+            .await
+            .unwrap_or_else(|_| self.working_dir.clone())
+    }
+
+    async fn send_directory_reset(&self, dir: PathBuf, reason: DirectoryResetReason) {
+        let _ = self
+            .alert_tx
+            .send(JobAlert::DirectoryReset(DirectoryReset { dir, reason }))
+            .await;
     }
 }
 
@@ -7203,6 +7319,105 @@ mod tests {
         );
     }
 
+    /// Asserts `receiver` holds exactly one alert: a reset of the carried
+    /// directory to `dir` for `reason`.
+    #[cfg(unix)]
+    fn assert_directory_reset(
+        receiver: &BackgroundTaskReceiver,
+        dir: impl AsRef<Path>,
+        reason: DirectoryResetReason,
+    ) {
+        let alerts = receiver.take_job_alerts();
+        match alerts.as_slice() {
+            [JobAlert::DirectoryReset(reset)] => {
+                assert_eq!(reset.dir, dir.as_ref());
+                assert_eq!(reset.reason, reason);
+            }
+            other => panic!("expected one directory reset, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_carried_directory_raises_no_alert() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let receiver = tool.background_receiver();
+
+        assert_eq!(exit_code_of(&tool, "mkdir sub && cd sub").await, 0);
+        assert_eq!(exit_code_of(&tool, "true").await, 0);
+        assert_eq!(exit_code_of(&tool, "pwd").await, 0);
+        // A failure that stayed in its directory, and a direct command.
+        assert_ne!(exit_code_of(&tool, "false").await, 0);
+        assert_ne!(exit_code_of(&tool, "ls /nonexistent-directory").await, 0);
+        assert!(receiver.take_job_alerts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_command_alerts_once_with_the_directory_commands_run_in() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let receiver = tool.background_receiver();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        assert_ne!(exit_code_of(&tool, "mkdir sub && cd sub && false").await, 0);
+        assert_directory_reset(&receiver, &root, DirectoryResetReason::Failed);
+        assert_eq!(pwd_of(&tool).await, root);
+        assert!(receiver.take_job_alerts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exit_without_a_report_alerts_once() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let receiver = tool.background_receiver();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        assert_eq!(exit_code_of(&tool, "mkdir sub && cd sub").await, 0);
+        assert_eq!(exit_code_of(&tool, "cd ..; exit 0").await, 0);
+        assert_directory_reset(
+            &receiver,
+            root.join("sub"),
+            DirectoryResetReason::Unreported,
+        );
+        assert_eq!(pwd_of(&tool).await, root.join("sub"));
+        assert!(receiver.take_job_alerts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_directory_outside_the_readable_paths_alerts_once() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let receiver = tool.background_receiver();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        // Readable to the sandbox, yet in none of the terminal's grants.
+        assert_eq!(exit_code_of(&tool, "cd /usr").await, 0);
+        assert_directory_reset(&receiver, &root, DirectoryResetReason::OutsideReadable);
+        assert_eq!(pwd_of(&tool).await, root);
+        assert!(receiver.take_job_alerts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_removed_carried_directory_alerts_once() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let receiver = tool.background_receiver();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        assert_eq!(exit_code_of(&tool, "mkdir gone && cd gone").await, 0);
+        assert!(receiver.take_job_alerts().is_empty());
+        std::fs::remove_dir(root.join("gone")).unwrap();
+        assert_eq!(pwd_of(&tool).await, root);
+        assert_directory_reset(&receiver, &root, DirectoryResetReason::Removed);
+        assert_eq!(pwd_of(&tool).await, root);
+        assert!(receiver.take_job_alerts().is_empty());
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_container_directory_report_maps_through_the_workspace_mount() {
@@ -7223,7 +7438,9 @@ mod tests {
                     .expect("report is in the mount"),
                 start: ContainerPath::new("/workspace").unwrap(),
             }),
+            shell: true,
         };
+        let receiver = tool.background_receiver();
         assert_eq!(
             carry.container.as_ref().unwrap().report.as_str(),
             format!(
@@ -7239,13 +7456,31 @@ mod tests {
         assert_eq!(carried.get(), Some(dir.path().join("sub/dir")));
         assert!(!report.exists(), "the report is consumed");
 
-        // Outside the mount, after a failure and an empty report: unchanged.
+        assert!(
+            receiver.take_job_alerts().is_empty(),
+            "a carried directory raises no alert"
+        );
+
+        // Outside the mount, after a failure and an empty report: unchanged,
+        // and each raises one alert naming where the next command starts.
         std::fs::write(&report, "/etc\n").unwrap();
         tool.record_carried_dir(&carry, true).await;
         assert_eq!(carried.get(), Some(dir.path().join("sub/dir")));
+        assert_directory_reset(
+            &receiver,
+            "/workspace",
+            DirectoryResetReason::OutsideWorkspace,
+        );
         std::fs::write(&report, "/workspace/other\n").unwrap();
         tool.record_carried_dir(&carry, false).await;
         assert_eq!(carried.get(), Some(dir.path().join("sub/dir")));
+        assert_directory_reset(&receiver, "/workspace", DirectoryResetReason::Failed);
+        tool.record_carried_dir(&carry, true).await;
+        assert_directory_reset(&receiver, "/workspace", DirectoryResetReason::Unreported);
+        // A failure that stayed where it started changes nothing.
+        std::fs::write(&report, "/workspace\n").unwrap();
+        tool.record_carried_dir(&carry, false).await;
+        assert!(receiver.take_job_alerts().is_empty());
 
         // The mapping back to the container for the next start.
         assert_eq!(
