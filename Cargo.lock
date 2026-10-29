@@ -526,6 +526,7 @@ dependencies = [
  "image",
  "libc",
  "magika",
+ "ort",
  "polling",
  "procfs-core",
  "quick-xml",

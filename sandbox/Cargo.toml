@@ -11,6 +11,10 @@ readme = "../README.md"
 keywords = ["sandbox", "agent", "tooling", "terminal"]
 categories = ["api-bindings"]
 
+# `ort` is declared only to choose how ONNX Runtime is obtained.
+[package.metadata.cargo-machete]
+ignored = ["ort"]
+
 [dependencies]
 aither-core.workspace = true
 
@@ -65,6 +69,9 @@ rustix = { version = "1.1", optional = true, default-features = false, features 
 # `magika` links ONNX Runtime, so it is opt-in: running bash in a sandbox
 # should not require an ML runtime to be present at link time.
 magika = { version = "1.1", optional = true }
+# magika leaves obtaining ONNX Runtime to the final binary; the feature
+# provides it as ort's pinned, hash-verified prebuilt runtime.
+ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["download-binaries", "tls-rustls"] }
 # Both are only referenced under `code-folding`, and building them means
 # compiling 22 tree-sitter grammars from C, so they follow the feature too.
 tree-sitter = { version = "0.22.6", optional = true }
@@ -89,7 +96,7 @@ typed-path = "0.12.3"
 default = []
 # Detect source code in command output so it can be folded with tree-sitter.
 # Pulls in ONNX Runtime via `magika`.
-code-folding = ["dep:magika", "dep:tree-sitter", "dep:rs-tree-sitter-languages"]
+code-folding = ["dep:magika", "dep:ort", "dep:tree-sitter", "dep:rs-tree-sitter-languages"]
 # Broker a shared GNU make jobserver token pool across commands (unix only).
 jobserver = ["dep:polling", "dep:rustix"]
 
