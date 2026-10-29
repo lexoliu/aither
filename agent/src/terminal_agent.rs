@@ -830,6 +830,54 @@ where
         self
     }
 
+    /// Overrides the session's prompt-cache controller.
+    ///
+    /// See [`AgentBuilder::prompt_cache`].
+    #[must_use]
+    pub fn prompt_cache(mut self, cache: crate::context::PromptCache) -> Self {
+        self.inner = self.inner.prompt_cache(cache);
+        self
+    }
+
+    /// Sets the conversation's cache lifetime, which idle compaction, idle
+    /// reassembly and keep-alive follow.
+    ///
+    /// See [`AgentBuilder::cache_lifetime`].
+    #[must_use]
+    pub fn cache_lifetime(mut self, lifetime: crate::context::CacheLifetime) -> Self {
+        self.inner = self.inner.cache_lifetime(lifetime);
+        self
+    }
+
+    /// Sets the Claude cache retention of the session's prompt cache.
+    ///
+    /// See [`AgentBuilder::claude_cache_ttl`].
+    #[must_use]
+    pub fn claude_cache_ttl(mut self, ttl: aither_core::llm::model::ClaudePromptCacheTtl) -> Self {
+        self.inner = self.inner.claude_cache_ttl(ttl);
+        self
+    }
+
+    /// Enables prompt-cache keep-alive while the run waits on its own
+    /// background commands.
+    ///
+    /// See [`AgentBuilder::cache_keep_alive`].
+    #[must_use]
+    pub fn cache_keep_alive(mut self, keep_alive: crate::config::CacheKeepAlive) -> Self {
+        self.inner = self.inner.cache_keep_alive(keep_alive);
+        self
+    }
+
+    /// Sets the time source idle compaction, idle reassembly and cache
+    /// keep-alive read; the system clock by default.
+    ///
+    /// See [`AgentBuilder::clock`].
+    #[must_use]
+    pub fn clock(mut self, clock: impl crate::Clock) -> Self {
+        self.inner = self.inner.clock(clock);
+        self
+    }
+
     /// Sets the maximum number of iterations.
     #[must_use]
     pub fn max_iterations(mut self, limit: usize) -> Self {

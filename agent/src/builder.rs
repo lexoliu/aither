@@ -66,6 +66,7 @@ pub struct AgentBuilder<
     config: AgentConfig,
     context: Context,
     prompt_cache: crate::context::PromptCache,
+    clock: crate::AnyClock,
     background_receiver: Option<BackgroundTaskReceiver>,
     permission_receiver: Option<PermissionEventReceiver>,
     job_registry: Option<JobRegistry>,
@@ -118,6 +119,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             config: AgentConfig::default(),
             context: Context::default(),
             prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
+            clock: crate::AnyClock::default(),
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
@@ -159,6 +161,7 @@ where
             config: self.config,
             context: self.context,
             prompt_cache: self.prompt_cache,
+            clock: self.clock,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -191,6 +194,7 @@ where
             config: self.config,
             context: self.context,
             prompt_cache: self.prompt_cache,
+            clock: self.clock,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -227,6 +231,7 @@ where
             config: self.config,
             context: self.context,
             prompt_cache: self.prompt_cache,
+            clock: self.clock,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -392,6 +397,7 @@ where
             config: self.config,
             context: self.context,
             prompt_cache: self.prompt_cache,
+            clock: self.clock,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -629,6 +635,20 @@ where
         self
     }
 
+    /// Sets the conversation's cache lifetime, keeping the rest of its
+    /// prompt cache. Idle compaction, idle reassembly and keep-alive follow it.
+    pub fn cache_lifetime(mut self, lifetime: crate::context::CacheLifetime) -> Self {
+        self.prompt_cache = self.prompt_cache.with_lifetime(lifetime);
+        self
+    }
+
+    /// Sets the time source idle compaction, idle reassembly and cache
+    /// keep-alive read; the system clock by default.
+    pub fn clock(mut self, clock: impl crate::Clock) -> Self {
+        self.clock = crate::AnyClock::new(clock);
+        self
+    }
+
     /// Enables prompt-cache keep-alive while the run waits on its own
     /// background commands.
     ///
@@ -698,6 +718,7 @@ where
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             last_request_started_at: None,
+            clock: self.clock,
             last_request: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
             cache_stats: crate::CacheStats::new(),

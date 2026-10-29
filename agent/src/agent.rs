@@ -545,6 +545,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Start time of the most recent LLM request issued by this agent.
     pub(crate) last_request_started_at: Option<Instant>,
 
+    /// Time source of every idle-timing read.
+    pub(crate) clock: crate::AnyClock,
+
     /// The most recent LLM request issued by this agent, retained so a
     /// prompt-cache keep-alive can re-send it verbatim.
     pub(crate) last_request: Option<LLMRequest>,
@@ -614,6 +617,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             profile: None,
             initialized: false,
             last_request_started_at: None,
+            clock: crate::AnyClock::default(),
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
@@ -1310,7 +1314,7 @@ where
         let Some(entry_started_at) = self.cache_entry_started_at() else {
             return Ok(());
         };
-        if entry_started_at.elapsed() + keep_alive.send_before_expiry < lifetime {
+        if self.clock.since(entry_started_at) + keep_alive.send_before_expiry < lifetime {
             return Ok(());
         }
         let Some(last_request) = self.last_request.clone() else {
@@ -1335,7 +1339,7 @@ where
                 Err(error) => return Err(AgentError::Llm(error)),
             }
         }
-        self.cache_keep_alive.last_sent_at = Some(Instant::now());
+        self.cache_keep_alive.last_sent_at = Some(self.clock.now());
         self.cache_keep_alive.sent += 1;
         self.cache_keep_alive.last_reason = self.format_wait_reason().await;
         if self.cache_keep_alive.sent >= keep_alive.frequent_idle_threshold {
@@ -1782,7 +1786,7 @@ where
         let CacheLifetime::Limited(lifetime) = self.prompt_cache.lifetime() else {
             return None;
         };
-        let idle = self.cache_entry_started_at()?.elapsed();
+        let idle = self.clock.since(self.cache_entry_started_at()?);
         if idle >= lifetime {
             return None;
         }
@@ -2259,7 +2263,7 @@ where
         }
 
         self.commit_tail(&tail).await;
-        self.last_request_started_at = Some(Instant::now());
+        self.last_request_started_at = Some(self.clock.now());
         self.idle_compacted = false;
         self.publish_fork_snapshot(&tail, &definitions);
 
@@ -2334,7 +2338,7 @@ where
         if !self
             .prompt_cache
             .lifetime()
-            .is_cold(entry_started_at.elapsed())
+            .is_cold(self.clock.since(entry_started_at))
         {
             return Ok(());
         }
@@ -2373,7 +2377,7 @@ where
         if !self
             .prompt_cache
             .lifetime()
-            .is_cold(entry_started_at.elapsed())
+            .is_cold(self.clock.since(entry_started_at))
         {
             return unchanged;
         }
@@ -2441,7 +2445,7 @@ where
             || (self.compaction_model.is_some()
                 && self
                     .cache_entry_started_at()
-                    .is_some_and(|at| self.prompt_cache.lifetime().is_cold(at.elapsed())))
+                    .is_some_and(|at| self.prompt_cache.lifetime().is_cold(self.clock.since(at))))
         {
             return ContextWindowPhase::ReassemblyDue;
         }
