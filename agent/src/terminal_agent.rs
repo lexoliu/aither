@@ -214,8 +214,8 @@ where
 {
     /// Creates a new terminal-first agent builder.
     ///
-    /// Creates the agent with native tools (`terminal_kill`, `terminal_input`,
-    /// `terminal_read`, `terminal`) and IPC commands accessible through
+    /// Creates the agent with native tools (`terminal_background`,
+    /// `terminal_kill`, `terminal_input`, `terminal_read`, `terminal`) and IPC commands accessible through
     /// `terminal` (registered via `.tool()`). The native control tools address
     /// the same background jobs as `terminal` and are not advertised as commands.
     pub fn new(llm: LLM, mut terminal_tool: TerminalTool<P, E, Unconfigured>) -> Self {
@@ -496,17 +496,10 @@ where
         self
     }
 
-    /// Sets transcript path for long-memory recovery guidance.
+    /// Registers a source rendered into the tail of every request.
     #[must_use]
-    pub fn transcript_path(mut self, path: impl Into<String>) -> Self {
-        self.inner = self.inner.transcript_path(path.into());
-        self
-    }
-
-    /// Enables writing readable transcript entries to the given file path.
-    #[must_use]
-    pub fn transcript(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.inner = self.inner.transcript(path);
+    pub fn context_source<Source: crate::context::ContextSource>(mut self, source: Source) -> Self {
+        self.inner = self.inner.context_source(source);
         self
     }
 
@@ -722,7 +715,7 @@ where
     /// Sets up the subagents directory and creates a symlink in the sandbox.
     ///
     /// Subagents are markdown files with YAML frontmatter (name, description).
-    /// They can be invoked via: `task --subagent_file <path> --prompt "..."`
+    /// They can be invoked via: `subagent start --subagent <path> --prompt-file "..."`
     ///
     /// A symlink `subagents` is created in the sandbox working directory.
     ///
@@ -810,6 +803,34 @@ where
     /// Useful for dynamically building system prompts.
     pub fn tool_descriptions(&self) -> &[(String, String)] {
         &self.tool_descriptions
+    }
+
+    /// Returns the definitions of the native tools the built agent exposes to
+    /// the model.
+    ///
+    /// The list covers every tool registered on the inner [`AgentBuilder`]
+    /// (`terminal_background`, `terminal_kill`, `terminal_input`, `terminal_read`)
+    /// plus `terminal`,
+    /// which `build()` registers last, in the order the built agent's tool
+    /// registry holds them.
+    ///
+    /// `terminal` only implements [`Tool`] once it holds a command registry,
+    /// but its definition — the name, the `TerminalArgs` schema and the
+    /// description the schema carries — is independent of the registry's
+    /// contents, so an empty registry yields the same definition `build()`
+    /// registers.
+    #[must_use]
+    pub fn native_tool_definitions(&self) -> Vec<ToolDefinition> {
+        let mut definitions = self.inner.tool_definitions();
+        let terminal = self.terminal_tool.clone().with_registry(Arc::new(
+            ToolRegistryBuilder::new().build(self.terminal_tool.outputs_dir()),
+        ));
+        definitions.push(ToolDefinition::new(&terminal));
+        definitions.push(ToolDefinition::new(&terminal.background_tool()));
+        // The registry keys tools by name, so the definition list the built
+        // agent sends is name-ordered.
+        definitions.sort_by(|a, b| a.name().cmp(b.name()));
+        definitions
     }
 
     /// Whether a CLI command with `name` is registered in the terminal registry.
@@ -1211,14 +1232,16 @@ mod tests {
             futures_lite::stream::empty()
         }
 
-        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
-            std::future::ready(ModelProfile::new(
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "mock model",
                 100_000,
-            ))
+            )))
         }
     }
 
@@ -1406,7 +1429,6 @@ mod tests {
                         "description": "Run every baseline command",
                         "script": "apply_patch --version && rg --version && ast-grep --version && jq --version",
                         "mode": "sandboxed",
-                        "timeout": 30,
                         "raw": true
                     }),
                 ))
@@ -1416,14 +1438,16 @@ mod tests {
             futures_lite::stream::once(Ok(event))
         }
 
-        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
-            std::future::ready(ModelProfile::new(
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "mock model",
                 100_000,
-            ))
+            )))
         }
     }
 
@@ -1563,6 +1587,7 @@ mod tests {
             tool_names,
             [
                 "terminal",
+                "terminal_background",
                 "terminal_input",
                 "terminal_kill",
                 "terminal_read"
@@ -1582,6 +1607,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "terminal",
+                "terminal_background",
                 "terminal_input",
                 "terminal_kill",
                 "terminal_read"
@@ -1596,6 +1622,24 @@ mod tests {
         for command in ["apply_patch", "rg -n", "ast-grep run", "jq"] {
             assert!(catalog.contains(command));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_tool_definitions_match_the_built_agents_tool_definitions() {
+        let source = tempdir().unwrap();
+        let binary = compile_baseline_fixture(source.path()).await;
+        let distribution = fixture_distribution(&binary, "1.0.0").await;
+        let cache = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        let (requests, _captured) = async_channel::bounded(4);
+        let builder =
+            TerminalAgentBuilder::new(MockLlm { requests }, noop_terminal(dir.path()).await)
+                .initialize_tools(&distribution, cache.path())
+                .await
+                .unwrap();
+        let expected = builder.native_tool_definitions();
+        let agent = builder.build();
+        assert_eq!(expected, agent.tools.active_definitions());
     }
 
     /// Asks for one native `terminal_kill` call, then stops.
@@ -1628,14 +1672,16 @@ mod tests {
             futures_lite::stream::once(Ok(event))
         }
 
-        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
-            std::future::ready(ModelProfile::new(
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "mock model",
                 100_000,
-            ))
+            )))
         }
     }
 

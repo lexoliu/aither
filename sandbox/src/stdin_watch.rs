@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 /// Notice injected into background promotion previews when stdin blocking is detected.
-pub const TERMINAL_STDIN_BLOCKED_NOTICE: &str = "Auto-promoted to background: process appears blocked on stdin (detected via /proc/<pid>/syscall). Use terminal_input to continue.";
+pub const TERMINAL_STDIN_BLOCKED_NOTICE: &str = "The process appears blocked on stdin (detected via /proc/<pid>/syscall). Rerun it as a background job with terminal_background and feed input with terminal_input.";
 
 /// Poll interval for `/proc/<pid>/syscall` stdin-block detection.
 pub const STDIN_WATCH_INTERVAL: Duration = Duration::from_millis(500);

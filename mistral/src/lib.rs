@@ -312,7 +312,7 @@ impl LanguageModel for Mistral {
         }
     }
 
-    fn profile(&self) -> impl core::future::Future<Output = Profile> + Send {
+    fn profile(&self) -> impl core::future::Future<Output = Result<Profile, Self::Error>> + Send {
         let config = self.config.clone();
         async move {
             let name = config
@@ -321,21 +321,21 @@ impl LanguageModel for Mistral {
                 .unwrap_or_else(|| "mistral-local".to_string());
             let context_length = aither_models::lookup(&name)
                 .and_then(aither_models::ModelEntry::max_input_tokens)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Mistral model '{}' missing context metadata in aither-models",
-                        name
-                    )
-                });
+                .ok_or_else(|| {
+                    MistralError::Api(format!(
+                        "cannot determine context length for model '{name}': \
+                         aither-models has no entry"
+                    ))
+                })?;
 
-            Profile::new(
+            Ok(Profile::new(
                 name.clone(),
                 "mistral",
                 name,
                 "mistral.rs local language model",
                 context_length,
             )
-            .with_abilities([Ability::ToolUse])
+            .with_abilities([Ability::ToolUse]))
         }
     }
 }

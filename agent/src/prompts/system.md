@@ -45,7 +45,8 @@ Commands are registered per agent; the set below is an example. The registered l
 websearch "query"               # Search the web (local runtime only)
 webfetch "url"                  # Fetch URL content (local runtime only)
 cat file | ask "question"       # Query fast LLM about piped content (local runtime only)
-subagent --subagent "<type-or-path>" --prompt "<prompt>"  # Spawn subagent (local runtime only)
+subagent start --subagent "<type-or-path>" --prompt-file "<path>" [--model "<tier>"]  # Spawn subagent (local runtime only)
+subagent resume --id "<id>" --prompt-file "<path>"        # Continue a finished subagent (local runtime only)
 todo add|start|done|list        # Manage todo list (local runtime only)
 terminal({ mode: "<default|unsafe|ssh>", timeout: <sec>, script: "..."[, ssh_server_id: "<id>"] })
 ```
@@ -56,7 +57,7 @@ Run `<command> -h` or `--help` for usage details. Use `--` to end option parsing
 
 Use `subagent` to spawn specialized subagents for complex work.
 
-**Syntax:** `subagent --subagent "<type-or-path>" --prompt "prompt"`
+**Syntax:** `subagent start --subagent "<type-or-path>" --prompt-file "<path>" [--model "<tier>"]`
 
 Where `<subagent>` is either:
 - A builtin type: `research`, `explore`, `plan`
@@ -64,23 +65,27 @@ Where `<subagent>` is either:
   - `subagents/name.md` - global subagents
   - `skills/<skill>/subagents/name.md` - skill-specific subagents
 
+The task prompt is read from a file: write the full prompt to a file first, then pass its path via `--prompt-file`. Inline prompt text is rejected.
+`--model` optionally pins the model tier (`advanced`, `balanced` or `fast`); when omitted, the fast model reads the prompt and routes it to the tier that fits best.
+
 **Examples:**
 
 ```bash
 # Builtin subagents
-subagent --subagent "research" --prompt "Find information about X"
-subagent --subagent "explore" --prompt "Understand codebase structure"
-subagent --subagent "plan" --prompt "Design implementation for feature Y"
+subagent start --subagent "research" --prompt-file "prompts/research.md"
+subagent start --subagent "explore" --prompt-file "prompts/explore.md" --model "fast"
+subagent start --subagent "plan" --prompt-file "prompts/plan.md"
 
 # Skill-specific subagents (inside a skill directory)
-subagent --subagent "skills/slide/subagents/art_direction.md" --prompt "Create design guide..."
-subagent --subagent "skills/slide/subagents/slide_creator.md" --prompt "Create slide 1..."
+subagent start --subagent "skills/slide/subagents/art_direction.md" --prompt-file "prompts/art_direction.md"
+subagent start --subagent "skills/slide/subagents/slide_creator.md" --prompt-file "prompts/slide_1.md"
 
 # Global subagents (shared across skills)
-subagent --subagent "subagents/reviewer.md" --prompt "Review this code..."
+subagent start --subagent "subagents/reviewer.md" --prompt-file "prompts/review.md"
 ```
 
 Subagents run in isolated context - their work doesn't consume your context.
+A finished subagent's result carries an `id`: `subagent resume --id "<id>" --prompt-file "<path>"` continues it in its own context with the follow-up prompt. Ids expire with the provider's prompt cache.
 
 **When to use subagents:**
 - The task can be decomposed into smaller subtasks performed independently

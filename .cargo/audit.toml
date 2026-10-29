@@ -19,4 +19,20 @@ ignore = [
     # no meaningful risk, not that the advisory is wrong. Revisit if LanceDB
     # moves to `pastey`, at which point this line should be deleted.
     "RUSTSEC-2024-0436",
+
+    # `zstd` 0.13.3 / `zstd-safe` 7.3.0 reach us through LanceDB
+    # (zstd <- arrow-ipc 58 / lance-encoding 13 <- lance <- lancedb 0.40).
+    # The fixes are in zstd 0.14.3 / zstd-safe 8.2.0, but every arrow-ipc
+    # 58.x requires `zstd ^0.13` and lancedb 0.40.0, the newest release, still
+    # requires `arrow ^58`, so no upgrade removes them.
+    #
+    # None of the affected entry points is reachable: arrow-ipc calls only
+    # `zstd::bulk`, lance-encoding only `bulk`, `stream::copy_decode` and
+    # `Encoder::new`. 0391 is `raw::{Encoder, Decoder}::with_context`, 0398
+    # needs the `seekable` feature (not enabled), and 0403 is the write-side
+    # `stream::write::Decoder`. Delete these lines once lancedb moves to
+    # arrow 60, which requires `zstd ^0.14`.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
 ]

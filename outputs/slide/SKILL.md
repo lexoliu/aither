@@ -15,16 +15,13 @@ Ask: **"Will you edit this in Keynote/PowerPoint later?"**
 
 ### Phase 1: Research (Optional)
 
-If the topic needs research, use the builtin research subagent:
+If the topic needs research, use the builtin research subagent. Write the prompt to a file first — subagents take a prompt file, not inline text:
 
 ```bash
-task research --prompt "Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights."
-```
-
-Use explicit flags to avoid positional argument ambiguity:
-
-```bash
-task --subagent research --prompt "Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights."
+cat > tmp/research-prompt.md << 'EOF'
+Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights.
+EOF
+subagent start --subagent research --prompt-file tmp/research-prompt.md
 ```
 
 ### Phase 2: Requirements (Main Agent)
@@ -40,7 +37,10 @@ Gather from user:
 Launch art direction subagent to create design guide and outline:
 
 ```bash
-task --subagent .skills/slide/subagents/art_direction.md --prompt "Create design guide for: [TOPIC]. Audience: [AUDIENCE]. Style: [STYLE]. Slide count: [N]."
+cat > tmp/art-direction-prompt.md << 'EOF'
+Create design guide for: [TOPIC]. Audience: [AUDIENCE]. Style: [STYLE]. Slide count: [N].
+EOF
+subagent start --subagent .skills/slide/subagents/art_direction.md --prompt-file tmp/art-direction-prompt.md
 ```
 
 The subagent returns a YAML design guide containing:
@@ -58,13 +58,24 @@ Present the outline to the user:
 
 ### Phase 5: Parallel Slide Creation (Subagents)
 
-Launch one slide_creator subagent per slide **in parallel**:
+Launch one slide_creator subagent per slide **in parallel**. Each call needs its own prompt file:
 
 ```bash
-task --subagent .skills/slide/subagents/slide_creator.md --prompt "Slide 1: [SPEC]. Design: [DESIGN_GUIDE]"
-task --subagent .skills/slide/subagents/slide_creator.md --prompt "Slide 2: [SPEC]. Design: [DESIGN_GUIDE]"
-task --subagent .skills/slide/subagents/slide_creator.md --prompt "Slide 3: [SPEC]. Design: [DESIGN_GUIDE]"
+cat > tmp/slide-1-prompt.md << 'EOF'
+Slide 1: [SPEC]. Design: [DESIGN_GUIDE]
+EOF
+cat > tmp/slide-2-prompt.md << 'EOF'
+Slide 2: [SPEC]. Design: [DESIGN_GUIDE]
+EOF
+cat > tmp/slide-3-prompt.md << 'EOF'
+Slide 3: [SPEC]. Design: [DESIGN_GUIDE]
+EOF
+# ... one file per slide
+subagent start --subagent .skills/slide/subagents/slide_creator.md --prompt-file tmp/slide-1-prompt.md &
+subagent start --subagent .skills/slide/subagents/slide_creator.md --prompt-file tmp/slide-2-prompt.md &
+subagent start --subagent .skills/slide/subagents/slide_creator.md --prompt-file tmp/slide-3-prompt.md &
 # ... one per slide
+wait
 ```
 
 Each subagent:

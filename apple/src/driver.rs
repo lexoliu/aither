@@ -505,9 +505,11 @@ impl Stream for Driver<'_> {
                             }
                         };
                         active.request.tool_result(seq, is_error, &output);
-                        active
-                            .queued
-                            .push_back(Ok(Event::builtin_result(name, output)));
+                        active.queued.push_back(Ok(Event::builtin_result(
+                            seq.to_string(),
+                            name,
+                            output,
+                        )));
                     }
                     Poll::Pending => index += 1,
                 }

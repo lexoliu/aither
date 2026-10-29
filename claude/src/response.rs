@@ -105,6 +105,66 @@ pub enum ContentBlockType {
         #[serde(default)]
         input: Value,
     },
+    /// Server-executed tool use — the API runs it, the caller only observes.
+    #[serde(rename = "server_tool_use")]
+    ServerToolUse {
+        /// Unique ID for this tool use.
+        id: String,
+        /// Tool name (`web_search`, `web_fetch`, `code_execution`, ...).
+        name: String,
+        /// Tool input (builds up via `input_json_delta`).
+        #[serde(default)]
+        input: Value,
+    },
+    /// Result of a server-side web search.
+    #[serde(rename = "web_search_tool_result")]
+    WebSearchToolResult {
+        /// ID of the `server_tool_use` block this answers.
+        tool_use_id: String,
+        /// Search hits or an error object.
+        #[serde(default)]
+        content: Value,
+    },
+    /// Result of a server-side web fetch.
+    #[serde(rename = "web_fetch_tool_result")]
+    WebFetchToolResult {
+        /// ID of the `server_tool_use` block this answers.
+        tool_use_id: String,
+        /// Retrieved document or an error object.
+        #[serde(default)]
+        content: Value,
+    },
+    /// Result of a server-side code execution.
+    #[serde(rename = "code_execution_tool_result")]
+    CodeExecutionToolResult {
+        /// ID of the `server_tool_use` block this answers.
+        tool_use_id: String,
+        /// Execution output or an error object.
+        #[serde(default)]
+        content: Value,
+    },
+    /// Result of a server-side bash code execution.
+    #[serde(rename = "bash_code_execution_tool_result")]
+    BashCodeExecutionToolResult {
+        /// ID of the `server_tool_use` block this answers.
+        tool_use_id: String,
+        /// Execution output or an error object.
+        #[serde(default)]
+        content: Value,
+    },
+    /// Result of a server-side text-editor code execution.
+    #[serde(rename = "text_editor_code_execution_tool_result")]
+    TextEditorCodeExecutionToolResult {
+        /// ID of the `server_tool_use` block this answers.
+        tool_use_id: String,
+        /// Execution output or an error object.
+        #[serde(default)]
+        content: Value,
+    },
+    /// A block type this crate does not model yet — ignored rather than
+    /// fatal, matching the API's forwards-compatibility contract.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Content block delta event data.
@@ -145,6 +205,10 @@ pub enum DeltaType {
         /// Partial JSON to append.
         partial_json: String,
     },
+    /// A delta type this crate does not model yet — ignored rather than
+    /// fatal, matching the API's forwards-compatibility contract.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Message delta event data (final updates).
@@ -227,6 +291,50 @@ pub struct ToolCall {
     pub input: Value,
 }
 
+/// Non-streaming `/v1/messages` response body.
+///
+/// The wire shape mirrors the terminal state an SSE stream ends in: the same
+/// content blocks arrive complete rather than as start/delta/stop triples.
+#[derive(Debug, Deserialize)]
+pub struct MessagesResponse {
+    /// Content blocks produced by the model.
+    pub content: Vec<ContentBlockType>,
+    /// Reason generation stopped.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    /// Token usage for the call.
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+/// Projects a non-streaming [`MessagesResponse`] into the same event stream a
+/// streaming response would have produced.
+///
+/// Each block is replayed through the same start/delta/stop handling the SSE
+/// parser drives, so every block type the stream can carry is projected by
+/// construction rather than re-implemented here.
+#[must_use]
+pub fn response_events(response: MessagesResponse) -> Vec<LLMEvent> {
+    let mut state = StreamState::new();
+    let mut events = Vec::new();
+    for (index, block) in response.content.into_iter().enumerate() {
+        events.extend(state.replay_block(index, block));
+    }
+    if let Some(usage) = response.usage {
+        state.uncached_input_tokens = Some(usage.input_tokens);
+        state.completion_tokens = Some(usage.output_tokens);
+        state.cache_write_tokens = usage.cache_write_tokens();
+        state.cache_read_tokens = usage.cache_read_input_tokens;
+        state.refresh_prompt_tokens();
+    }
+    state.stop_reason = response.stop_reason;
+    events.extend(state.maybe_usage_event());
+    for call in state.tool_calls {
+        events.push(LLMEvent::tool_call(call.id, call.name, call.input));
+    }
+    events
+}
+
 /// State for tracking content blocks during streaming.
 #[derive(Debug, Default)]
 pub struct StreamState {
@@ -266,6 +374,15 @@ pub enum BlockState {
     RedactedThinking(String),
     /// Tool use block with accumulated JSON.
     ToolUse {
+        /// Tool use ID.
+        id: String,
+        /// Tool name.
+        name: String,
+        /// Accumulated input JSON string.
+        input_json: String,
+    },
+    /// Server-executed tool use with accumulated input JSON.
+    ServerToolUse {
         /// Tool use ID.
         id: String,
         /// Tool name.
@@ -404,6 +521,15 @@ impl StreamState {
     fn begin_block(&mut self, ev: ContentBlockStartEvent) -> Vec<LLMEvent> {
         ensure_block_capacity(self, ev.index);
 
+        // Server tool results carry their payload whole at block start.
+        if let Some((tool, tool_use_id, content)) = ev.content_block.server_tool_result() {
+            return vec![LLMEvent::builtin_result(
+                tool_use_id,
+                tool,
+                server_tool_result_text(tool, content),
+            )];
+        }
+
         match ev.content_block {
             ContentBlockType::Text { text } => {
                 self.blocks[ev.index] = BlockState::Text(text.clone());
@@ -448,6 +574,16 @@ impl StreamState {
                 };
                 vec![started]
             }
+            ContentBlockType::ServerToolUse { id, name, .. } => {
+                self.blocks[ev.index] = BlockState::ServerToolUse {
+                    id,
+                    name,
+                    input_json: String::new(),
+                };
+                Vec::new()
+            }
+            // Server tool results were handled above; unknown blocks drop.
+            _ => Vec::new(),
         }
     }
 
@@ -494,6 +630,13 @@ impl StreamState {
                     name: name.clone(),
                     arguments_fragment: partial_json,
                 }]
+            }
+            (
+                BlockState::ServerToolUse { input_json, .. },
+                DeltaType::InputJsonDelta { partial_json },
+            ) => {
+                input_json.push_str(&partial_json);
+                Vec::new()
             }
             _ => Vec::new(),
         }
@@ -551,6 +694,22 @@ impl StreamState {
                     block.to_string(),
                 ))]
             }
+            Some(BlockState::ServerToolUse {
+                id,
+                name,
+                input_json,
+            }) => {
+                let input = serde_json::from_str::<Value>(input_json)
+                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+                // The server runs the call between this block and the result
+                // block, so the call event belongs at close — with the input
+                // complete — not at open.
+                vec![LLMEvent::builtin_call(
+                    id,
+                    name,
+                    server_tool_call_detail(&input),
+                )]
+            }
             Some(BlockState::Text(_)) | None => Vec::new(),
         }
     }
@@ -572,6 +731,36 @@ impl StreamState {
         }
         self.refresh_prompt_tokens();
     }
+
+    /// Replays a complete content block through the block lifecycle —
+    /// non-streaming responses deliver whole blocks, so this synthesizes the
+    /// start/delta/stop sequence a stream would have carried for them.
+    ///
+    /// Tool input travels as `input_json_delta` events on a block that opens
+    /// with an empty `input`, and a missing input means the stream sent none.
+    fn replay_block(&mut self, index: usize, block: ContentBlockType) -> Vec<LLMEvent> {
+        let input_json = match &block {
+            ContentBlockType::ToolUse { input, .. }
+            | ContentBlockType::ServerToolUse { input, .. }
+                if !input.is_null() =>
+            {
+                Some(input.to_string())
+            }
+            _ => None,
+        };
+        let mut events = self.begin_block(ContentBlockStartEvent {
+            index,
+            content_block: block,
+        });
+        if let Some(partial_json) = input_json {
+            events.extend(self.apply_block_delta(ContentBlockDeltaEvent {
+                index,
+                delta: DeltaType::InputJsonDelta { partial_json },
+            }));
+        }
+        events.extend(self.finish_block(index));
+        events
+    }
 }
 
 /// Ensure the blocks vector has capacity for the given index.
@@ -587,9 +776,142 @@ pub fn should_skip_event(event: &Event) -> bool {
     data.is_empty() || event.event() == Some("ping")
 }
 
+impl ContentBlockType {
+    /// `(tool_name, tool_use_id, content)` for server tool result blocks —
+    /// blocks the API executes itself and delivers whole.
+    fn server_tool_result(&self) -> Option<(&'static str, &str, &Value)> {
+        Some(match self {
+            Self::WebSearchToolResult {
+                tool_use_id,
+                content,
+            } => ("web_search", tool_use_id, content),
+            Self::WebFetchToolResult {
+                tool_use_id,
+                content,
+            } => ("web_fetch", tool_use_id, content),
+            Self::CodeExecutionToolResult {
+                tool_use_id,
+                content,
+            } => ("code_execution", tool_use_id, content),
+            Self::BashCodeExecutionToolResult {
+                tool_use_id,
+                content,
+            } => ("bash_code_execution", tool_use_id, content),
+            Self::TextEditorCodeExecutionToolResult {
+                tool_use_id,
+                content,
+            } => ("text_editor_code_execution", tool_use_id, content),
+            _ => return None,
+        })
+    }
+}
+
+/// Invocation detail for a server tool call: the query, URL or command the
+/// block carried, compact JSON otherwise.
+fn server_tool_call_detail(input: &Value) -> String {
+    for key in ["query", "url", "command", "code"] {
+        if let Some(value) = input.get(key).and_then(Value::as_str) {
+            return value.to_string();
+        }
+    }
+    match input {
+        Value::Object(map) if map.is_empty() => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// One-line summary of a server tool result block: the error code on failure,
+/// a result count or output excerpt on success.
+fn server_tool_result_text(tool: &str, content: &Value) -> String {
+    if let Some(code) = content.get("error_code").and_then(Value::as_str) {
+        return format!("error: {code}");
+    }
+    if tool == "web_search" {
+        // `web_search_result_block` wraps a list of hits.
+        if let Some(hits) = content.get("content").and_then(Value::as_array) {
+            return format!("{} results", hits.len());
+        }
+        if content.is_array() {
+            return format!("{} results", content.as_array().map_or(0, Vec::len));
+        }
+    }
+    if tool == "web_fetch"
+        && let Some(url) = content.get("url").and_then(Value::as_str)
+    {
+        return format!("fetched {url}");
+    }
+    if let Some(text) = ["stdout", "stderr"]
+        .iter()
+        .filter_map(|key| content.get(*key).and_then(Value::as_str))
+        .find(|text| !text.is_empty())
+    {
+        return text.chars().take(200).collect();
+    }
+    "completed".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn block_start(data: &str) -> ContentBlockStartEvent {
+        serde_json::from_str(data).expect("content_block_start parses")
+    }
+
+    #[test]
+    fn server_tool_use_emits_builtin_call_at_block_close() {
+        let mut state = StreamState::new();
+        let events = state.begin_block(block_start(
+            r#"{"index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#,
+        ));
+        assert!(events.is_empty());
+
+        let events = state.apply_block_delta(
+            serde_json::from_str(
+                r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"rust\"}"}}"#,
+            )
+            .expect("delta parses"),
+        );
+        assert!(events.is_empty());
+
+        match state.finish_block(0).as_slice() {
+            [LLMEvent::BuiltInToolCall { id, tool, detail }] => {
+                assert_eq!(id, "srvtoolu_1");
+                assert_eq!(tool, "web_search");
+                assert_eq!(detail, "rust");
+            }
+            other => panic!("expected BuiltInToolCall, got {other:?}"),
+        }
+        // Server calls never join the client-side tool queue.
+        assert!(state.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn web_search_tool_result_emits_builtin_result() {
+        let mut state = StreamState::new();
+        match state
+            .begin_block(block_start(
+                r#"{"index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":{"type":"web_search_result_block","content":[{"type":"web_search_result","title":"t","url":"u"}]}}}"#,
+            ))
+            .as_slice()
+        {
+            [LLMEvent::BuiltInToolResult { id, tool, result }] => {
+                assert_eq!(id, "srvtoolu_1");
+                assert_eq!(tool, "web_search");
+                assert_eq!(result, "1 results");
+            }
+            other => panic!("expected BuiltInToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_block_types_are_tolerated() {
+        let mut state = StreamState::new();
+        let events = state.begin_block(block_start(
+            r#"{"index":0,"content_block":{"type":"some_future_block","id":"x"}}"#,
+        ));
+        assert!(events.is_empty());
+    }
 
     #[test]
     fn usage_event_includes_claude_cache_token_stats() {
@@ -641,5 +963,111 @@ mod tests {
         state.cache_write_tokens = Some(10);
         state.refresh_prompt_tokens();
         assert_eq!(state.prompt_tokens, Some(80));
+    }
+
+    #[test]
+    fn response_events_matches_streaming_projection() {
+        let response: MessagesResponse = serde_json::from_str(
+            r#"{
+                "content": [
+                    {"type": "text", "text": "Checking the weather."},
+                    {"type": "thinking", "thinking": "Need a forecast.", "signature": "sig_1"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}},
+                    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "Paris weather"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [{"type": "web_search_result", "title": "t", "url": "u"}]}
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 40, "output_tokens": 30, "cache_read_input_tokens": 10, "cache_creation_input_tokens": 5}
+            }"#,
+        )
+        .expect("response parses");
+
+        // The same response as the API would have streamed it.
+        let streamed = [
+            (
+                "message_start",
+                r#"{"message":{"id":"msg_1","model":"claude-test","usage":{"input_tokens":40,"output_tokens":1,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"text_delta","text":"Checking the weather."}}"#,
+            ),
+            ("content_block_stop", r#"{"index":0}"#),
+            (
+                "content_block_start",
+                r#"{"index":1,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"index":1,"delta":{"type":"thinking_delta","thinking":"Need a forecast."}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"index":1,"delta":{"type":"signature_delta","signature":"sig_1"}}"#,
+            ),
+            ("content_block_stop", r#"{"index":1}"#),
+            (
+                "content_block_start",
+                r#"{"index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"index":2,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"}}"#,
+            ),
+            ("content_block_stop", r#"{"index":2}"#),
+            (
+                "content_block_start",
+                r#"{"index":3,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"index":3,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"Paris weather\"}"}}"#,
+            ),
+            ("content_block_stop", r#"{"index":3}"#),
+            (
+                "content_block_start",
+                r#"{"index":4,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","title":"t","url":"u"}]}}"#,
+            ),
+            ("content_block_stop", r#"{"index":4}"#),
+            (
+                "message_delta",
+                r#"{"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":30}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ];
+
+        let mut state = StreamState::new();
+        let mut expected = Vec::new();
+        for (kind, data) in streamed {
+            expected.extend(
+                parse_event(&Event::from_data(data).with_event(kind), &mut state)
+                    .expect("SSE event parses"),
+            );
+        }
+        // The client drains completed tool calls after the stream ends.
+        expected.extend(
+            std::mem::take(&mut state.tool_calls)
+                .into_iter()
+                .map(|call| LLMEvent::tool_call(call.id, call.name, call.input)),
+        );
+
+        assert!(
+            expected
+                .iter()
+                .any(|event| matches!(event, LLMEvent::BuiltInToolCall { .. }))
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|event| matches!(event, LLMEvent::BuiltInToolResult { .. }))
+        );
+        assert_eq!(
+            format!("{:?}", response_events(response)),
+            format!("{expected:?}")
+        );
     }
 }

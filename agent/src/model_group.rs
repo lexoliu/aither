@@ -259,7 +259,19 @@ impl<M> ModelGroup<M> {
 }
 
 /// Model tier classification for organizing models.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    schemars::JsonSchema,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum ModelTier {
     /// High-capability models (e.g., GPT-4, Claude Opus)
     #[default]
@@ -403,13 +415,21 @@ where
         ModelGroupStream::new(self, request)
     }
 
-    async fn profile(&self) -> Profile {
+    async fn profile(&self) -> Result<Profile, Self::Error> {
         if let Some(model) = self.current() {
-            model.inner().profile().await
+            model
+                .inner()
+                .profile()
+                .await
+                .map_err(ModelGroupError::Model)
         } else if let Some(model) = self.models.first() {
-            model.inner().profile().await
+            model
+                .inner()
+                .profile()
+                .await
+                .map_err(ModelGroupError::Model)
         } else {
-            Profile::new("unknown", "unknown", "unknown", "Empty model group", 0)
+            Err(ModelGroupError::AllModelsExhausted)
         }
     }
 }
@@ -509,8 +529,10 @@ mod tests {
             stream::iter([Ok(Event::Text(self.name.to_string()))])
         }
 
-        fn profile(&self) -> impl std::future::Future<Output = Profile> + Send {
-            std::future::ready(Profile::new("dummy", self.name, "test", "dummy", 0))
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<Profile, Self::Error>> + Send {
+            std::future::ready(Ok(Profile::new("dummy", self.name, "test", "dummy", 0)))
         }
     }
 
