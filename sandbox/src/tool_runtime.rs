@@ -283,8 +283,10 @@ impl HostProgramBinary {
         std::fs::create_dir_all(&directory)?;
         let mut stage = tempfile::NamedTempFile::new_in(&directory)?;
         std::io::Write::write_all(&mut stage, &self.bytes)?;
-        set_executable_readonly(stage.path())?;
-        stage.persist(&path).map_err(|error| error.error)?;
+        drop(stage.persist(&path).map_err(|error| error.error)?);
+        // After the rename: persisting may reset the file's attributes on
+        // Windows, which would clear a read-only bit set on the staged file.
+        set_executable_readonly(&path)?;
         if self.is_prepared(&path)? {
             Ok(HostProgramPath(path))
         } else {
