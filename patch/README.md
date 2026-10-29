@@ -33,12 +33,14 @@ untouched — a validation guarantee, not a crash-atomicity promise.
 
 ## Engine
 
-The parser and backtracking matcher come from
-[`zenpatch`](https://crates.io/crates/zenpatch) (MIT), which implements the
-OpenAI-codex patch format and counts candidate solutions so ambiguous
-context is an error. File-level semantics — unconditional delete, literal
-paths, mode preservation, all-or-nothing validation — live in this crate
-(`src/lib.rs`).
+This crate owns the whole engine. `src/parse.rs` parses the patch into typed
+actions; `src/matcher.rs` places each hunk: its old side (context and `-`
+lines) must match the file contiguously at or after the previous hunk's end
+and after the `@@` anchor line, first with exact whitespace, then
+whitespace-insensitively. Zero matches is a conflict naming the hunk and the
+first line that did not match; several matches is an ambiguity error listing
+the lines. File-level semantics — unconditional delete, literal paths, mode
+preservation, all-or-nothing validation — live in `src/lib.rs`.
 
 ## Artifact build
 

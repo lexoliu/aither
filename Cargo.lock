@@ -472,7 +472,6 @@ version = "0.10.1"
 dependencies = [
  "tempfile",
  "thiserror 2.0.21",
- "zenpatch",
 ]
 
 [[package]]
@@ -9713,15 +9712,6 @@ dependencies = [
  "quote",
  "syn 3.0.9",
  "synstructure",
-]
-
-[[package]]
-name = "zenpatch"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "babe562891b586c616180de552c93c07d158e3520c3d3b455a9ee30cec128ff2"
-dependencies = [
- "serde",
 ]
 
 [[package]]
