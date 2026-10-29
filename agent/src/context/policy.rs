@@ -9,6 +9,9 @@
 
 use std::time::Duration;
 
+/// The share of [`ContextPolicy::compact_at`] a fork may start from.
+const FORK_HEADROOM: f32 = 0.9;
+
 /// Thresholds that govern context compaction and pausing.
 ///
 /// Fractions are of the calibrated context window
@@ -74,6 +77,20 @@ impl ContextPolicy {
         usage >= self.compact_at
     }
 
+    /// The window usage fraction from which a fork is refused: within 10% of
+    /// the compaction point, where the main agent and the fork would each go
+    /// on to compact the same context.
+    #[must_use]
+    pub fn fork_limit(&self) -> f32 {
+        self.compact_at * FORK_HEADROOM
+    }
+
+    /// Whether a fork may start from a context at `usage`.
+    #[must_use]
+    pub fn allows_fork(&self, usage: f32) -> bool {
+        usage < self.fork_limit()
+    }
+
     /// Whether `usage` has reached the pause threshold.
     #[must_use]
     pub fn should_pause(&self, usage: f32) -> bool {
@@ -91,6 +108,14 @@ mod tests {
         assert!(policy.compact_at < policy.pause_at);
         assert!(policy.pause_at < 1.0);
         assert!(policy.restore_budget < policy.compact_at);
+    }
+
+    #[test]
+    fn a_fork_is_refused_within_a_tenth_of_the_compaction_point() {
+        let policy = ContextPolicy::default();
+        assert!(policy.allows_fork(0.53));
+        assert!(!policy.allows_fork(0.54));
+        assert!(!policy.allows_fork(0.7));
     }
 
     #[test]

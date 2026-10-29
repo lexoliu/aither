@@ -47,7 +47,7 @@ use crate::jobserver::{JobBroker, JobPool, job_broker_channel};
 use crate::{
     ContainerPath, MountRoot, PreparedTools, ToolDistribution, ToolRuntimeError,
     builtin::builtin_router,
-    command::ToolRegistry,
+    command::{CommandRole, ToolRegistry},
     job_registry::{JobRegistry, JobStatus, job_registry_channel},
     output::{
         INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, empty_stream,
@@ -67,7 +67,7 @@ use crate::{
     },
 };
 
-fn erase_terminal_tool<T>(tool: T) -> crate::command::DynTerminalToolEntry
+pub fn erase_terminal_tool<T>(tool: T) -> crate::command::DynTerminalToolEntry
 where
     T: Tool + 'static,
 {
@@ -977,6 +977,7 @@ async fn serve_launches<P, E>(
 pub struct TerminalBinding {
     launcher: TerminalToolFactory,
     working_dir: PathBuf,
+    role: CommandRole,
 }
 
 impl TerminalBinding {
@@ -991,6 +992,13 @@ impl TerminalBinding {
     #[must_use]
     pub fn working_dir(&self) -> &Path {
         &self.working_dir
+    }
+
+    /// The role the terminal's command registry serves: the main agent's, or
+    /// a subagent's at any depth.
+    #[must_use]
+    pub const fn role(&self) -> CommandRole {
+        self.role
     }
 }
 
@@ -1430,6 +1438,7 @@ where
         let binding = TerminalBinding {
             launcher: TerminalToolFactory { tx: launcher },
             working_dir: self.working_dir.clone(),
+            role: self.registry.registry.role(),
         };
         let source = self.clone();
         self.executor
@@ -7518,6 +7527,8 @@ mod tests {
         let served = parent.clone().to_dyn();
         assert!(served.has_command("probe_echo"));
         assert_eq!(served.role(), crate::CommandRole::Main);
+        assert_eq!(parent.binding().role(), crate::CommandRole::Main);
+        assert_eq!(child.binding().role(), crate::CommandRole::Subagent);
         let child = child.to_dyn();
         assert!(!child.has_command("probe_echo"));
         assert_eq!(child.role(), crate::CommandRole::Subagent);

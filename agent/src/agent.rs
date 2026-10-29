@@ -552,6 +552,10 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Prompt-cache keep-alive bookkeeping for the current run.
     pub(crate) cache_keep_alive: CacheKeepAliveState,
 
+    /// Where every request this agent sends is published for the `fork`
+    /// subagent kind to start from; `None` when no fork reads this agent.
+    pub(crate) fork_source: Option<crate::fork::ForkSource>,
+
     /// Rolling KV-cache statistics accumulated from emitted `Usage` events.
     ///
     /// Hosts can read [`Agent::cache_stats`] at any time to observe the
@@ -617,6 +621,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             restore_dir: None,
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
+            fork_source: None,
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -2256,6 +2261,7 @@ where
         self.commit_tail(&tail).await;
         self.last_request_started_at = Some(Instant::now());
         self.idle_compacted = false;
+        self.publish_fork_snapshot(&tail, &definitions);
 
         let has_tools = !definitions.is_empty();
         self.prompt_cache
@@ -2268,6 +2274,33 @@ where
             .with_tool_definitions(definitions);
         self.last_request = Some(request.clone());
         Ok(Some(request))
+    }
+
+    /// Publishes the request about to be sent for a fork to start from.
+    fn publish_fork_snapshot(
+        &self,
+        tail: &[Block],
+        definitions: &[aither_core::llm::tool::ToolDefinition],
+    ) {
+        let Some(source) = &self.fork_source else {
+            return;
+        };
+        let mut context = self.context.clone();
+        context.push_tail(tail);
+        source.publish(crate::fork::ForkSnapshot {
+            tier: self.tier,
+            context,
+            prompt_cache: self.prompt_cache.clone(),
+            budget: self.budget,
+            profile: self
+                .profile
+                .clone()
+                .expect("a request is only sent by an initialized agent, which has its profile"),
+            request_parameters: self.config.request_parameters.clone(),
+            context_policy: self.config.context_policy,
+            definitions: definitions.to_vec(),
+            usage: self.budget.usage(),
+        });
     }
 
     /// Rebuilds the prefix once, before a send, when the provider's cache has

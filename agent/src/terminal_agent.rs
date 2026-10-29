@@ -527,6 +527,15 @@ where
         self
     }
 
+    /// Publishes every request the agent sends to `source`, which is where
+    /// the `fork` subagent kind starts from; take it from
+    /// [`SubagentTool::fork_source`](crate::specialized::SubagentTool::fork_source).
+    #[must_use]
+    pub fn fork_source(mut self, source: crate::fork::ForkSource) -> Self {
+        self.inner = self.inner.fork_source(source);
+        self
+    }
+
     /// Inserts or replaces a typed persistent system block.
     #[must_use]
     pub fn system<T: Template>(mut self, value: T) -> Self {
