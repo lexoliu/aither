@@ -149,11 +149,13 @@ pipe_sleeper() {
 
 # Sets $reads and $writes to the link targets — "pipe:[<inode>]" for an
 # anonymous pipe, the path for a FIFO — of the pipes and FIFOs process $1
-# holds open for reading and for writing, each followed by "|". Fails when
+# holds open for reading and for writing, each followed by "|"; $blockreads
+# lists those read through a descriptor without O_NONBLOCK. Fails when
 # the process has exited or denies inspection.
 pipe_fds() {
   reads="|"
   writes="|"
+  blockreads="|"
   # The exe link takes the same ptrace check as the descriptor links, which
   # a mode-bit test on the fd directory does not.
   if ! readlink "/proc/$1/exe" >/dev/null 2>&1; then
@@ -178,6 +180,9 @@ pipe_fds() {
     # bits: 0 read-only, 1 write-only, 2 both.
     mode=$((flags & 3))
     [ "$mode" != 1 ] && reads="$reads$link|"
+    # O_NONBLOCK (04000) is in the same octal word; a read-capable descriptor
+    # without it can sleep in a read of its pipe.
+    [ "$mode" != 1 ] && [ $((flags & 04000)) = 0 ] && blockreads="$blockreads$link|"
     [ "$mode" != 0 ] && writes="$writes$link|"
   done
   return 0
@@ -241,6 +246,15 @@ for pid in $tree; do
     link=${pending%%|*}
     pending=${pending#*|}
     [ "$link" = "$target" ] && continue
+    # A pipe read only through O_NONBLOCK descriptors never sleeps a reader.
+    case $link in
+      pipe:\[*\])
+        case $blockreads in
+          *"|$link|"*) ;;
+          *) continue ;;
+        esac
+        ;;
+    esac
     case $link in
       pipe:\[*\]) ;;
       *) ambiguous=1 ;;

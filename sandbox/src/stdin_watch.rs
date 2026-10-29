@@ -232,6 +232,9 @@ mod platform {
     const ACCESS_MODE_MASK: u32 = 0o3;
     const O_RDONLY: u32 = 0;
     const O_WRONLY: u32 = 0o1;
+    /// `O_NONBLOCK`, which `fdinfo` reports in the same octal `flags` line.
+    #[allow(clippy::cast_sign_loss)]
+    const O_NONBLOCK: u32 = libc::O_NONBLOCK as u32;
 
     #[derive(Debug)]
     pub(super) struct Pipe {
@@ -344,6 +347,10 @@ mod platform {
     /// a pipe whose write end a child also holds, as a jobserver's or a
     /// worker pool's; and a pipe another thread of the reader may feed. A
     /// reader of the job's pipe that also holds such a pipe goes undetected.
+    ///
+    /// An anonymous pipe the process reads only through `O_NONBLOCK`
+    /// descriptors does not count: a read on those returns `EAGAIN` instead
+    /// of sleeping, so the sleeping thread cannot be waiting on that pipe.
     fn reader_of_job_pipe(
         pid: u32,
         tasks: &[PathBuf],
@@ -363,10 +370,9 @@ mod platform {
             return Ok(false);
         }
         let mut self_fed = Vec::new();
-        for fd in fds
-            .iter()
-            .filter(|fd| fd.mode.reads() && fd.inode != Some(inode))
-        {
+        for fd in fds.iter().filter(|fd| {
+            fd.mode.reads() && fd.inode != Some(inode) && !only_read_nonblocking(&fds, fd.inode)
+        }) {
             let Some(other) = fd.inode else {
                 return Ok(false);
             };
@@ -402,6 +408,18 @@ mod platform {
         /// The pipe's inode for an anonymous pipe, `None` for a FIFO.
         inode: Option<u64>,
         mode: AccessMode,
+        /// Whether the open file description has `O_NONBLOCK` set.
+        nonblocking: bool,
+    }
+
+    /// Whether `inode` names an anonymous pipe that every read-capable
+    /// descriptor in `fds` holding it opened with `O_NONBLOCK`.
+    fn only_read_nonblocking(fds: &[PipeFd], inode: Option<u64>) -> bool {
+        inode.is_some()
+            && fds
+                .iter()
+                .filter(|fd| fd.inode == inode && fd.mode.reads())
+                .all(|fd| fd.nonblocking)
     }
 
     /// The pipe and FIFO descriptors of `pid`; `None` when it has exited.
@@ -426,7 +444,7 @@ mod platform {
                 Err(error) if gone(&error) => continue,
                 Err(error) => return Err(error),
             }
-            let Some(mode) = access_mode(pid, &entry.file_name())? else {
+            let Some((mode, nonblocking)) = open_flags(pid, &entry.file_name())? else {
                 continue;
             };
             // The link target names an anonymous pipe as `pipe:[<inode>]` and
@@ -439,6 +457,7 @@ mod platform {
             fds.push(PipeFd {
                 inode: pipe_inode(&target),
                 mode,
+                nonblocking,
             });
         }
         Ok(Some(fds))
@@ -458,9 +477,10 @@ mod platform {
         }
     }
 
-    /// How descriptor `fd` of `pid` is open, from the access mode in its
-    /// `fdinfo`; `None` for a descriptor that closed meanwhile.
-    fn access_mode(pid: u32, fd: &std::ffi::OsStr) -> io::Result<Option<AccessMode>> {
+    /// How descriptor `fd` of `pid` is open, from the access mode and
+    /// `O_NONBLOCK` in its `fdinfo`; `None` for a descriptor that closed
+    /// meanwhile.
+    fn open_flags(pid: u32, fd: &std::ffi::OsStr) -> io::Result<Option<(AccessMode, bool)>> {
         let info = match fs::read_to_string(proc_dir(pid).join("fdinfo").join(fd)) {
             Ok(info) => info,
             Err(error) if gone(&error) => return Ok(None),
@@ -473,7 +493,10 @@ mod platform {
             .ok_or_else(|| {
                 io::Error::other(format!("malformed fdinfo of fd {} of {pid}", fd.display()))
             })?;
-        Ok(Some(AccessMode(flags & ACCESS_MODE_MASK)))
+        Ok(Some((
+            AccessMode(flags & ACCESS_MODE_MASK),
+            flags & O_NONBLOCK != 0,
+        )))
     }
 
     /// Whether some thread of `pid`, whose threads are `tasks`, sleeps in a
@@ -1274,6 +1297,7 @@ mod tests {
             use crate::stdin_watch::{
                 CONTAINER_EXEC_WRAPPER, CONTAINER_JOB_SCRIPT, parse_container_probe,
             };
+            use std::os::fd::AsRawFd;
             use std::path::{Path, PathBuf};
 
             #[test]
@@ -1353,6 +1377,93 @@ mod tests {
                     }
                 }
                 assert!(failures.is_empty(), "{failures:#?}");
+            }
+
+            /// Runs `cat` under the exec wrapper holding, as fd 3, the read end
+            /// of an unrelated pipe whose write end stays with the test, outside
+            /// the job. Returns the job, its pid file and that write end.
+            fn spawn_with_foreign_pipe(dir: &Path, nonblocking: bool) -> (Job, PathBuf, File) {
+                let (reader, writer) = std::io::pipe().expect("pipe");
+                let reader = OwnedFd::from(reader);
+                if nonblocking {
+                    // SAFETY: sets a flag on a descriptor this test owns.
+                    let set = unsafe {
+                        let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
+                        libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                    };
+                    assert_ne!(set, -1, "set O_NONBLOCK");
+                }
+                let pid_file = dir.join("job.pid");
+                let mut command = Command::new("sh");
+                command
+                    .args(["-c", CONTAINER_EXEC_WRAPPER, "sh"])
+                    .arg(&pid_file)
+                    .arg("cat")
+                    .current_dir(dir);
+                let fd = reader.as_raw_fd();
+                // SAFETY: only `dup2`, which is async-signal-safe, runs between
+                // fork and exec; it clears close-on-exec on the copy.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::dup2(fd, 3) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let job = Job::spawn_command(command);
+                (job, pid_file, OwnedFd::from(writer).into())
+            }
+
+            /// A reader of the job's pipe that also inherited an `O_NONBLOCK`
+            /// read end of an unrelated pipe, fed from outside the job, is
+            /// blocked: a read on that end cannot be what it sleeps on.
+            #[test]
+            fn nonblocking_foreign_pipe_does_not_hide_the_reader() {
+                let dir = tempfile::tempdir().expect("temp dir");
+                let (job, pid_file, _foreign_writer) = spawn_with_foreign_pipe(dir.path(), true);
+                let probe = job.probe();
+                let seen = probe_until(&probe, |seen| seen != Probe::Clear);
+                assert_ne!(seen, Probe::Clear, "local probe\n{}", job.dump());
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let container = loop {
+                    let seen = run_container_probe(&pid_file);
+                    if seen != Ok(Probe::Clear) || Instant::now() >= deadline {
+                        break seen;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                };
+                assert!(
+                    matches!(container, Ok(Probe::BlockedAtCpu(_))),
+                    "container probe: {container:?}\n{}",
+                    job.dump()
+                );
+            }
+
+            /// The same reader holding a blocking read end of such a pipe stays
+            /// ambiguous, so it is clear.
+            #[test]
+            fn blocking_foreign_pipe_keeps_the_reader_ambiguous() {
+                let dir = tempfile::tempdir().expect("temp dir");
+                let (job, pid_file, _foreign_writer) = spawn_with_foreign_pipe(dir.path(), false);
+                // Let `cat` reach its steady wait before judging it.
+                std::thread::sleep(Duration::from_secs(1));
+                let probe = job.probe();
+                for _ in 0..8 {
+                    assert_eq!(
+                        probe.probe().expect("probe"),
+                        Probe::Clear,
+                        "local probe\n{}",
+                        job.dump()
+                    );
+                    assert_eq!(
+                        run_container_probe(&pid_file),
+                        Ok(Probe::Clear),
+                        "container probe\n{}",
+                        job.dump()
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
 
             /// `cat` waits in `splice`, a shell in `read`, a grandchild in
