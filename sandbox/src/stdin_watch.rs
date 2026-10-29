@@ -1401,11 +1401,18 @@ mod tests {
                     .arg("cat")
                     .current_dir(dir);
                 let fd = reader.as_raw_fd();
-                // SAFETY: only `dup2`, which is async-signal-safe, runs between
-                // fork and exec; it clears close-on-exec on the copy.
+                // SAFETY: only `dup2` and `fcntl`, which are async-signal-safe,
+                // run between fork and exec. `dup2` clears close-on-exec on the
+                // copy, but is a no-op when the reader already is fd 3, so that
+                // case clears the flag itself.
                 unsafe {
                     command.pre_exec(move || {
-                        if libc::dup2(fd, 3) == -1 {
+                        let status = if fd == 3 {
+                            libc::fcntl(3, libc::F_SETFD, 0)
+                        } else {
+                            libc::dup2(fd, 3)
+                        };
+                        if status == -1 {
                             return Err(std::io::Error::last_os_error());
                         }
                         Ok(())
