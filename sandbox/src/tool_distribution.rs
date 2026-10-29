@@ -9,8 +9,17 @@ use url::Url;
 use zenwave::Client;
 
 use crate::tool_runtime::{
-    ManagedTool, ToolBinary, ToolBundle, ToolRuntimeError, ToolTarget, digest,
+    DistributedTool, HostProgram, HostProgramBinary, ManagedTool, ToolBinary, ToolBundle,
+    ToolRuntimeError, ToolTarget, digest,
 };
+
+/// A kind of program a manifest artifact can provide.
+trait Distributed: Copy + Send + Sync + Into<DistributedTool> {}
+
+impl<P: Copy + Send + Sync + Into<DistributedTool>> Distributed for P {}
+
+/// Largest xz decoder memory a trusted artifact may demand, in KiB.
+const XZ_MEMORY_LIMIT_KIB: u32 = 256 * 1024;
 
 /// Encoding of an artifact, with exactly one executable selected from archives.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +29,11 @@ pub enum ToolArtifactFormat {
     Executable,
     /// Gzip-compressed tar archive.
     TarGzip {
+        /// Regular-file member containing the executable.
+        executable: PathBuf,
+    },
+    /// Xz-compressed tar archive.
+    TarXz {
         /// Regular-file member containing the executable.
         executable: PathBuf,
     },
@@ -41,7 +55,7 @@ pub enum ToolArtifactLocation {
 }
 
 impl ToolArtifactLocation {
-    const fn download_url(&self, tool: ManagedTool) -> Result<&Url, ToolRuntimeError> {
+    const fn download_url(&self, tool: DistributedTool) -> Result<&Url, ToolRuntimeError> {
         match self {
             Self::Download(url) => Ok(url),
             Self::Bundled(_) => Err(ToolRuntimeError::ArtifactSource(tool)),
@@ -50,11 +64,14 @@ impl ToolArtifactLocation {
 }
 
 /// A version-pinned artifact from a trusted distribution manifest.
+///
+/// `P` is the kind of program it provides: a sandbox command
+/// ([`ToolArtifact`]) or a host program ([`HostProgramArtifact`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolArtifact {
-    /// Command provided by this artifact.
-    pub tool: ManagedTool,
-    /// Semantic version of the command.
+pub struct PinnedArtifact<P> {
+    /// Program provided by this artifact.
+    pub tool: P,
+    /// Semantic version of the program.
     pub version: String,
     /// Platform for which the executable was built.
     pub target: ToolTarget,
@@ -66,10 +83,18 @@ pub struct ToolArtifact {
     pub encoding: ToolArtifactFormat,
 }
 
+/// A pinned artifact of a sandbox command.
+pub type ToolArtifact = PinnedArtifact<ManagedTool>;
+
+/// A pinned artifact of a host program.
+pub type HostProgramArtifact = PinnedArtifact<HostProgram>;
+
 /// Pinned artifact catalog used by every execution backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDistribution {
     artifacts: Vec<ToolArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    host_programs: Vec<HostProgramArtifact>,
 }
 
 impl ToolDistribution {
@@ -92,12 +117,10 @@ impl ToolDistribution {
         let root = path.parent().ok_or(ToolRuntimeError::InvalidArchive)?;
         let mut distribution: Self = serde_json::from_slice(&async_fs::read(&path).await?)?;
         for artifact in &mut distribution.artifacts {
-            if let ToolArtifactLocation::Bundled(relative) = &artifact.url {
-                validate_member(relative)?;
-                let url = Url::from_file_path(root.join(relative))
-                    .map_err(|()| ToolRuntimeError::ArtifactSource(artifact.tool))?;
-                artifact.url = ToolArtifactLocation::Download(url);
-            }
+            resolve_bundled(artifact, root)?;
+        }
+        for artifact in &mut distribution.host_programs {
+            resolve_bundled(artifact, root)?;
         }
         distribution.validate()?;
         Ok(distribution)
@@ -105,16 +128,10 @@ impl ToolDistribution {
 
     fn validate(&self) -> Result<(), ToolRuntimeError> {
         for artifact in &self.artifacts {
-            let url = artifact.url.download_url(artifact.tool)?;
-            match url.scheme() {
-                "https" | "file" => {}
-                _ => return Err(ToolRuntimeError::ArtifactSource(artifact.tool)),
-            }
-            if !url.username().is_empty() || url.password().is_some() {
-                return Err(ToolRuntimeError::ArtifactSource(artifact.tool));
-            }
-            hex::decode_to_slice(&artifact.sha256, &mut [0; 32])?;
-            let _ = semver::Version::parse(&artifact.version)?;
+            validate_artifact(artifact)?;
+        }
+        for artifact in &self.host_programs {
+            validate_artifact(artifact)?;
         }
         Ok(())
     }
@@ -126,53 +143,16 @@ impl ToolDistribution {
     pub async fn package_into(&self, directory: &Path) -> Result<PathBuf, ToolRuntimeError> {
         self.validate()?;
         async_fs::create_dir_all(directory.join("artifacts")).await?;
-        let artifacts = stream::iter(self.artifacts.clone())
-            .map(|mut artifact| {
-                let directory = directory.to_path_buf();
-                async move {
-                    let binary = load_artifact(&artifact, &directory.join("artifacts")).await?;
-                    let name = hex::encode(binary.sha256);
-                    let path = directory.join(&name);
-                    let bytes = binary.bytes;
-                    blocking::unblock(move || {
-                        use std::io::Write;
-                        if path.try_exists()? {
-                            if digest(&std::fs::read(&path)?) != digest(&bytes) {
-                                return Err(ToolRuntimeError::Integrity {
-                                    tool: artifact.tool,
-                                });
-                            }
-                        } else {
-                            let mut stage = tempfile::NamedTempFile::new_in(&directory)?;
-                            stage.write_all(&bytes)?;
-                            match stage.persist_noclobber(&path) {
-                                Ok(_) => {}
-                                Err(error)
-                                    if error.error.kind() == std::io::ErrorKind::AlreadyExists =>
-                                {
-                                    if digest(&std::fs::read(&path)?) != digest(&bytes) {
-                                        return Err(ToolRuntimeError::Integrity {
-                                            tool: artifact.tool,
-                                        });
-                                    }
-                                }
-                                Err(error) => return Err(error.error.into()),
-                            }
-                        }
-                        Ok::<(), ToolRuntimeError>(())
-                    })
-                    .await?;
-                    artifact.url = ToolArtifactLocation::Bundled(name.into());
-                    artifact.sha256 = hex::encode(binary.sha256);
-                    artifact.encoding = ToolArtifactFormat::Executable;
-                    Ok::<_, ToolRuntimeError>(artifact)
-                }
-            })
-            .buffer_unordered(ManagedTool::ALL.len())
-            .try_collect::<Vec<_>>()
-            .await?;
+        let (artifacts, host_programs) = futures::future::try_join(
+            package_artifacts(&self.artifacts, directory, ManagedTool::ALL.len()),
+            package_artifacts(&self.host_programs, directory, HostProgram::ALL.len()),
+        )
+        .await?;
         let manifest = directory.join("distribution.json");
-        let content = serde_json::to_vec_pretty(&Self { artifacts })?;
+        let content = serde_json::to_vec_pretty(&Self {
+            artifacts,
+            host_programs,
+        })?;
         let destination = manifest.clone();
         let directory = directory.to_path_buf();
         blocking::unblock(move || {
@@ -217,30 +197,153 @@ impl ToolDistribution {
         let binaries = stream::iter(selected)
             .map(|artifact| {
                 let cache_root = cache_root.to_path_buf();
-                async move { load_artifact(&artifact, &cache_root).await }
+                async move {
+                    let bytes = load_artifact(&artifact, &cache_root).await?;
+                    ToolBinary::verify(artifact.tool, &artifact.version, &digest(&bytes), bytes)
+                }
             })
             .buffer_unordered(ManagedTool::ALL.len())
             .try_collect::<Vec<_>>()
             .await?;
         ToolBundle::new(target.clone(), binaries)
     }
+
+    /// Loads one host program for `target`, with the same pinning, download,
+    /// verification and cache as the sandbox commands.
+    ///
+    /// The result has no way into a [`ToolBundle`], so the program never
+    /// reaches a sandbox `PATH` or the command catalog.
+    ///
+    /// # Errors
+    /// Fails with [`ToolRuntimeError::MissingHostProgram`] naming the program
+    /// and target when the distribution has no artifact for it, and on a
+    /// failed download, digest mismatch or unsafe archive member.
+    pub async fn load_host_program(
+        &self,
+        program: HostProgram,
+        target: &ToolTarget,
+        cache_root: &Path,
+    ) -> Result<HostProgramBinary, ToolRuntimeError> {
+        let mut selected = self
+            .host_programs
+            .iter()
+            .filter(|artifact| artifact.tool == program && &artifact.target == target);
+        let (os, arch) = (target.os().to_owned(), target.arch().to_owned());
+        let artifact = selected
+            .next()
+            .ok_or_else(|| ToolRuntimeError::MissingHostProgram {
+                program,
+                os: os.clone(),
+                arch: arch.clone(),
+            })?;
+        if selected.next().is_some() {
+            return Err(ToolRuntimeError::DuplicateHostProgram { program, os, arch });
+        }
+        async_fs::create_dir_all(cache_root).await?;
+        let bytes = load_artifact(artifact, cache_root).await?;
+        HostProgramBinary::verify(
+            program,
+            target.clone(),
+            &artifact.version,
+            &digest(&bytes),
+            bytes,
+        )
+    }
 }
 
-async fn load_artifact(
-    artifact: &ToolArtifact,
+fn resolve_bundled<P: Distributed>(
+    artifact: &mut PinnedArtifact<P>,
+    root: &Path,
+) -> Result<(), ToolRuntimeError> {
+    if let ToolArtifactLocation::Bundled(relative) = &artifact.url {
+        validate_member(relative)?;
+        let url = Url::from_file_path(root.join(relative))
+            .map_err(|()| ToolRuntimeError::ArtifactSource(artifact.tool.into()))?;
+        artifact.url = ToolArtifactLocation::Download(url);
+    }
+    Ok(())
+}
+
+fn validate_artifact<P: Distributed>(artifact: &PinnedArtifact<P>) -> Result<(), ToolRuntimeError> {
+    let tool = artifact.tool.into();
+    let url = artifact.url.download_url(tool)?;
+    match url.scheme() {
+        "https" | "file" => {}
+        _ => return Err(ToolRuntimeError::ArtifactSource(tool)),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ToolRuntimeError::ArtifactSource(tool));
+    }
+    hex::decode_to_slice(&artifact.sha256, &mut [0; 32])?;
+    let _ = semver::Version::parse(&artifact.version)?;
+    Ok(())
+}
+
+/// Stores every artifact's verified executable beside a relocatable manifest.
+async fn package_artifacts<P: Distributed>(
+    artifacts: &[PinnedArtifact<P>],
+    directory: &Path,
+    concurrency: usize,
+) -> Result<Vec<PinnedArtifact<P>>, ToolRuntimeError> {
+    stream::iter(artifacts.to_vec())
+        .map(|mut artifact| {
+            let directory = directory.to_path_buf();
+            async move {
+                let tool = artifact.tool.into();
+                let bytes = load_artifact(&artifact, &directory.join("artifacts")).await?;
+                let sha256 = digest(&bytes);
+                let name = hex::encode(sha256);
+                let path = directory.join(&name);
+                blocking::unblock(move || {
+                    use std::io::Write;
+                    if path.try_exists()? {
+                        if digest(&std::fs::read(&path)?) != sha256 {
+                            return Err(ToolRuntimeError::Integrity { tool });
+                        }
+                    } else {
+                        let mut stage = tempfile::NamedTempFile::new_in(&directory)?;
+                        stage.write_all(&bytes)?;
+                        match stage.persist_noclobber(&path) {
+                            Ok(_) => {}
+                            Err(error)
+                                if error.error.kind() == std::io::ErrorKind::AlreadyExists =>
+                            {
+                                if digest(&std::fs::read(&path)?) != sha256 {
+                                    return Err(ToolRuntimeError::Integrity { tool });
+                                }
+                            }
+                            Err(error) => return Err(error.error.into()),
+                        }
+                    }
+                    Ok::<(), ToolRuntimeError>(())
+                })
+                .await?;
+                artifact.url = ToolArtifactLocation::Bundled(name.clone().into());
+                artifact.sha256 = name;
+                artifact.encoding = ToolArtifactFormat::Executable;
+                Ok::<_, ToolRuntimeError>(artifact)
+            }
+        })
+        .buffer_unordered(concurrency)
+        .try_collect::<Vec<_>>()
+        .await
+}
+
+/// Fetches an artifact through the cache and returns its extracted executable.
+async fn load_artifact<P: Distributed>(
+    artifact: &PinnedArtifact<P>,
     cache_root: &Path,
-) -> Result<ToolBinary, ToolRuntimeError> {
+) -> Result<Vec<u8>, ToolRuntimeError> {
+    let tool = artifact.tool.into();
     let mut expected = [0; 32];
     hex::decode_to_slice(&artifact.sha256, &mut expected)?;
     let path = cache_root.join(hex::encode(expected));
-    let encoded = match read_artifact_file(&path, artifact.tool).await {
+    let encoded = match read_artifact_file(&path, tool).await {
         Ok(encoded) => encoded,
         Err(ToolRuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            let encoded = download_artifact(artifact).await?;
+            let encoded = download_artifact(tool, &artifact.url).await?;
             if digest(&encoded) != expected {
-                return Err(ToolRuntimeError::Integrity {
-                    tool: artifact.tool,
-                });
+                return Err(ToolRuntimeError::Integrity { tool });
             }
             let destination = path.clone();
             let root = cache_root.to_path_buf();
@@ -255,24 +358,21 @@ async fn load_artifact(
                 }
             })
             .await?;
-            read_artifact_file(&path, artifact.tool).await?
+            read_artifact_file(&path, tool).await?
         }
         Err(error) => return Err(error),
     };
     if digest(&encoded) != expected {
-        return Err(ToolRuntimeError::Integrity {
-            tool: artifact.tool,
-        });
+        return Err(ToolRuntimeError::Integrity { tool });
     }
-    let artifact = artifact.clone();
-    blocking::unblock(move || {
-        let bytes = extract_executable(&artifact.encoding, &encoded)?;
-        ToolBinary::verify(artifact.tool, &artifact.version, &digest(&bytes), bytes)
-    })
-    .await
+    let encoding = artifact.encoding.clone();
+    blocking::unblock(move || extract_executable(&encoding, &encoded)).await
 }
 
-async fn read_artifact_file(path: &Path, tool: ManagedTool) -> Result<Vec<u8>, ToolRuntimeError> {
+async fn read_artifact_file(
+    path: &Path,
+    tool: DistributedTool,
+) -> Result<Vec<u8>, ToolRuntimeError> {
     let file = async_fs::File::open(path).await?;
     let mut bytes = Vec::new();
     file.take(64 * 1024 * 1024 + 1)
@@ -284,14 +384,17 @@ async fn read_artifact_file(path: &Path, tool: ManagedTool) -> Result<Vec<u8>, T
     Ok(bytes)
 }
 
-async fn download_artifact(artifact: &ToolArtifact) -> Result<Vec<u8>, ToolRuntimeError> {
-    let url = artifact.url.download_url(artifact.tool)?;
+async fn download_artifact(
+    tool: DistributedTool,
+    location: &ToolArtifactLocation,
+) -> Result<Vec<u8>, ToolRuntimeError> {
+    let url = location.download_url(tool)?;
     let encoded = match url.scheme() {
         "file" => {
             let path = url
                 .to_file_path()
-                .map_err(|()| ToolRuntimeError::ArtifactSource(artifact.tool))?;
-            read_artifact_file(&path, artifact.tool).await?
+                .map_err(|()| ToolRuntimeError::ArtifactSource(tool))?;
+            read_artifact_file(&path, tool).await?
         }
         "https" => {
             futures_lite::future::or(
@@ -317,10 +420,10 @@ async fn download_artifact(artifact: &ToolArtifact) -> Result<Vec<u8>, ToolRunti
             )
             .await?
         }
-        _ => return Err(ToolRuntimeError::ArtifactSource(artifact.tool)),
+        _ => return Err(ToolRuntimeError::ArtifactSource(tool)),
     };
     if encoded.len() > 64 * 1024 * 1024 {
-        return Err(ToolRuntimeError::ArtifactTooLarge(artifact.tool));
+        return Err(ToolRuntimeError::ArtifactTooLarge(tool));
     }
     Ok(encoded)
 }
@@ -345,6 +448,23 @@ fn validate_member(path: &Path) -> Result<(), ToolRuntimeError> {
     Ok(())
 }
 
+/// Reads the one regular member named `executable` from a decompressed tar stream.
+fn select_tar_member(reader: impl Read, executable: &Path) -> Result<Vec<u8>, ToolRuntimeError> {
+    let mut archive = tar::Archive::new(reader);
+    let mut found = None;
+    for entry in archive.entries()? {
+        let entry = entry?;
+        if entry.path()?.as_ref() != executable {
+            continue;
+        }
+        if found.is_some() || !entry.header().entry_type().is_file() {
+            return Err(ToolRuntimeError::InvalidArchive);
+        }
+        found = Some(read_executable(entry)?);
+    }
+    found.ok_or(ToolRuntimeError::InvalidArchive)
+}
+
 fn extract_executable(
     encoding: &ToolArtifactFormat,
     encoded: &[u8],
@@ -353,19 +473,14 @@ fn extract_executable(
         ToolArtifactFormat::Executable => Ok(encoded.to_vec()),
         ToolArtifactFormat::TarGzip { executable } => {
             validate_member(executable)?;
-            let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(encoded));
-            let mut found = None;
-            for entry in archive.entries()? {
-                let entry = entry?;
-                if entry.path()?.as_ref() != executable {
-                    continue;
-                }
-                if found.is_some() || !entry.header().entry_type().is_file() {
-                    return Err(ToolRuntimeError::InvalidArchive);
-                }
-                found = Some(read_executable(entry)?);
-            }
-            found.ok_or(ToolRuntimeError::InvalidArchive)
+            select_tar_member(flate2::read::GzDecoder::new(encoded), executable)
+        }
+        ToolArtifactFormat::TarXz { executable } => {
+            validate_member(executable)?;
+            select_tar_member(
+                lzma_rust2::XzReader::new_mem_limit(encoded, false, XZ_MEMORY_LIMIT_KIB),
+                executable,
+            )
         }
         ToolArtifactFormat::Zip { executable } => {
             validate_member(executable)?;
@@ -413,6 +528,7 @@ mod tests {
                     encoding: ToolArtifactFormat::Executable,
                 })
                 .collect(),
+            host_programs: Vec::new(),
         };
         let manifest = distribution
             .package_into(installation.path())
@@ -472,6 +588,7 @@ mod tests {
                 sha256: "00".repeat(32),
                 encoding: ToolArtifactFormat::Executable,
             }],
+            host_programs: Vec::new(),
         };
         let path = root.path().join("distribution.json");
         async_fs::write(&path, serde_json::to_vec(&distribution).unwrap())
@@ -496,12 +613,13 @@ mod tests {
                 sha256: "00".repeat(32),
                 encoding: ToolArtifactFormat::Executable,
             }],
+            host_programs: Vec::new(),
         };
         let error =
             ToolDistribution::from_json(&serde_json::to_vec(&manifest).unwrap()).unwrap_err();
         assert!(matches!(
             error,
-            ToolRuntimeError::ArtifactSource(ManagedTool::Ripgrep)
+            ToolRuntimeError::ArtifactSource(DistributedTool::Command(ManagedTool::Ripgrep))
         ));
         assert!(!error.to_string().contains("secret"));
     }
@@ -558,5 +676,256 @@ mod tests {
             extract_executable(&encoding, &encoded),
             Err(ToolRuntimeError::InvalidArchive)
         ));
+    }
+
+    fn tar_xz(member: &str, content: &[u8]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar.append_data(&mut header, member, Cursor::new(content))
+            .unwrap();
+        let contents = tar.into_inner().unwrap();
+        let mut xz =
+            lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1)).unwrap();
+        std::io::Write::write_all(&mut xz, &contents).unwrap();
+        xz.finish().unwrap()
+    }
+
+    #[test]
+    fn extracts_the_executable_from_a_tar_xz_artifact() {
+        let encoded = tar_xz("repo-search-x/search", b"daemon");
+        let encoding = ToolArtifactFormat::TarXz {
+            executable: "repo-search-x/search".into(),
+        };
+        assert_eq!(extract_executable(&encoding, &encoded).unwrap(), b"daemon");
+        let missing = ToolArtifactFormat::TarXz {
+            executable: "other".into(),
+        };
+        assert!(matches!(
+            extract_executable(&missing, &encoded),
+            Err(ToolRuntimeError::InvalidArchive)
+        ));
+        assert!(extract_executable(&encoding, b"not xz").is_err());
+    }
+
+    /// A distribution of fixture sandbox commands plus a tar.xz `search` host program.
+    struct HostFixture {
+        directory: tempfile::TempDir,
+        distribution: ToolDistribution,
+        executable: &'static [u8],
+        archive: PathBuf,
+    }
+
+    impl HostFixture {
+        async fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let target = ToolTarget::native().unwrap();
+            let command = b"baseline command fixture";
+            let command_path = directory.path().join("command");
+            async_fs::write(&command_path, command).await.unwrap();
+            let executable: &'static [u8] = b"host program fixture";
+            let archive = directory.path().join("search.tar.xz");
+            let encoded = tar_xz("repo-search/search", executable);
+            async_fs::write(&archive, &encoded).await.unwrap();
+            let distribution = ToolDistribution {
+                artifacts: ManagedTool::ALL
+                    .into_iter()
+                    .map(|tool| ToolArtifact {
+                        tool,
+                        version: "1.0.0".into(),
+                        target: target.clone(),
+                        url: ToolArtifactLocation::Download(
+                            Url::from_file_path(&command_path).unwrap(),
+                        ),
+                        sha256: hex::encode(digest(command)),
+                        encoding: ToolArtifactFormat::Executable,
+                    })
+                    .collect(),
+                host_programs: vec![HostProgramArtifact {
+                    tool: HostProgram::RepoSearch,
+                    version: "0.0.3".into(),
+                    target,
+                    url: ToolArtifactLocation::Download(Url::from_file_path(&archive).unwrap()),
+                    sha256: hex::encode(digest(&encoded)),
+                    encoding: ToolArtifactFormat::TarXz {
+                        executable: "repo-search/search".into(),
+                    },
+                }],
+            };
+            Self {
+                directory,
+                distribution,
+                executable,
+                archive,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn host_program_is_returned_as_a_host_path_and_never_enters_sandbox_tools() {
+        let fixture = HostFixture::new().await;
+        let target = ToolTarget::native().unwrap();
+        let cache = fixture.directory.path().join("cache");
+        let program = fixture
+            .distribution
+            .load_host_program(HostProgram::RepoSearch, &target, &cache)
+            .await
+            .unwrap();
+        assert_eq!(program.program(), HostProgram::RepoSearch);
+        assert_eq!(program.version().to_string(), "0.0.3");
+        let prepared = program
+            .prepare_local(&fixture.directory.path().join("host"))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(prepared.path()).unwrap(), fixture.executable);
+        assert_eq!(prepared.path().file_name().unwrap(), "search");
+        // Preparing again reuses the verified copy.
+        assert_eq!(
+            program
+                .prepare_local(&fixture.directory.path().join("host"))
+                .await
+                .unwrap(),
+            prepared
+        );
+
+        let bundle = fixture.distribution.load(&target, &cache).await.unwrap();
+        let without_host_programs = ToolDistribution {
+            host_programs: Vec::new(),
+            ..fixture.distribution.clone()
+        };
+        let baseline = without_host_programs
+            .load(&target, &fixture.directory.path().join("baseline-cache"))
+            .await
+            .unwrap();
+        assert_eq!(bundle.catalog(), baseline.catalog());
+        assert_eq!(
+            bundle.catalog().render().unwrap(),
+            baseline.catalog().render().unwrap()
+        );
+        let local = bundle
+            .prepare_local(&fixture.directory.path().join("local"))
+            .await
+            .unwrap();
+        let (mount, container) = bundle
+            .prepare_container_mount(&fixture.directory.path().join("container"))
+            .await
+            .unwrap();
+        for tools in [&local, &container] {
+            let names = std::fs::read_dir(tools.bin_dir())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert!(!names.iter().any(|name| name == "search"));
+            assert!(!prepared.path().starts_with(tools.bin_dir()));
+            assert!(
+                !tools
+                    .prepend_path(None)
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(prepared.path().parent().unwrap().to_str().unwrap())
+            );
+        }
+        assert!(!mount.host_path.join("bin").join("search").exists());
+        assert!(!prepared.path().starts_with(mount.host_path));
+    }
+
+    #[tokio::test]
+    async fn tampered_host_program_artifact_is_rejected() {
+        let fixture = HostFixture::new().await;
+        let target = ToolTarget::native().unwrap();
+        let cache = fixture.directory.path().join("cache");
+        async_fs::write(&fixture.archive, tar_xz("repo-search/search", b"tampered"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .distribution
+                .load_host_program(HostProgram::RepoSearch, &target, &cache)
+                .await,
+            Err(ToolRuntimeError::Integrity {
+                tool: DistributedTool::Host(HostProgram::RepoSearch)
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn host_program_without_an_artifact_for_the_target_names_both() {
+        let fixture = HostFixture::new().await;
+        let error = fixture
+            .distribution
+            .load_host_program(
+                HostProgram::RepoSearch,
+                &ToolTarget::from_probe("Windows_NT", "arm64").unwrap(),
+                &fixture.directory.path().join("cache"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ToolRuntimeError::MissingHostProgram {
+                program: HostProgram::RepoSearch,
+                ..
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "host program `search` has no artifact for windows/aarch64"
+        );
+    }
+
+    #[test]
+    fn third_party_manifest_pins_repo_search_for_its_published_targets() {
+        let distribution =
+            ToolDistribution::from_json(include_bytes!("../../patch/third-party-tools.json"))
+                .unwrap();
+        let mut targets = distribution
+            .host_programs
+            .iter()
+            .map(|artifact| {
+                assert_eq!(artifact.tool, HostProgram::RepoSearch);
+                assert_eq!(artifact.version, "0.0.3");
+                assert!(matches!(
+                    artifact.encoding,
+                    ToolArtifactFormat::TarXz { .. }
+                ));
+                (artifact.target.os(), artifact.target.arch())
+            })
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        assert_eq!(
+            targets,
+            [
+                ("linux", "aarch64"),
+                ("linux", "x86_64"),
+                ("macos", "aarch64")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn packaged_distribution_keeps_host_programs() {
+        let fixture = HostFixture::new().await;
+        let installation = tempfile::tempdir().unwrap();
+        let manifest = fixture
+            .distribution
+            .package_into(installation.path())
+            .await
+            .unwrap();
+        let packaged = ToolDistribution::from_path(&manifest).await.unwrap();
+        let program = packaged
+            .load_host_program(
+                HostProgram::RepoSearch,
+                &ToolTarget::native().unwrap(),
+                &fixture.directory.path().join("cache"),
+            )
+            .await
+            .unwrap();
+        let prepared = program
+            .prepare_local(&fixture.directory.path().join("host"))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(prepared.path()).unwrap(), fixture.executable);
     }
 }

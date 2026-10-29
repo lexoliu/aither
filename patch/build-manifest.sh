@@ -9,7 +9,7 @@
 # emitted by patch/build-artifact.sh; the release tag and repo
 # ("owner/name") fix the asset download base URL. The manifest —
 # patch/third-party-tools.json's pinned entries plus one apply_patch entry
-# per metadata record — is written to stdout.
+# per metadata record, and its pinned host programs — is written to stdout.
 #
 # os/arch are derived from the target triple itself (arch is its first
 # component), not from a lookup table.
@@ -44,4 +44,5 @@ apply_patch_entries="$(jq -cs --arg base "https://github.com/${repo}/releases/do
 
 jq -n --slurpfile third_party "$root/patch/third-party-tools.json" \
       --argjson apply_patch "$apply_patch_entries" \
-      '{artifacts: ($third_party[0].artifacts + $apply_patch)}'
+      '{artifacts: ($third_party[0].artifacts + $apply_patch),
+        host_programs: $third_party[0].host_programs}'
