@@ -1177,6 +1177,9 @@ fn responses_stream_inner(
                                     }
                                 }
                                 ResponsesStreamEvent::OutputItemAdded { item, item_id, output_index } => {
+                                    if let Some(event) = builtin_call_event(&item) {
+                                        yield Ok(event);
+                                    }
                                     // When a function_call item is added, capture id and name
                                     if let ResponsesOutputItem::FunctionCall { id, call_id, name, .. } = item {
                                         let fallback_id = non_empty_response_id(item_id.clone())
@@ -1214,6 +1217,9 @@ fn responses_stream_inner(
                                     acc.arguments = arguments;
                                 }
                                 ResponsesStreamEvent::OutputItemDone { item, item_id, output_index } => {
+                                    if let Some(event) = builtin_result_event(&item) {
+                                        yield Ok(event);
+                                    }
                                     // Emit function call when item is done
                                     if let ResponsesOutputItem::FunctionCall { id, call_id, name, arguments } = item {
                                         let tool_call = mark_and_emit_done_function_call(
@@ -1301,6 +1307,80 @@ fn responses_stream_inner(
             yield Ok(Event::Usage(final_usage));
         }
     }
+}
+
+/// Start event for a provider-executed (hosted) tool item, when the output
+/// item is one we model — the provider runs it, no consumer execution.
+fn builtin_call_event(item: &ResponsesOutputItem) -> Option<Event> {
+    let (id, tool, detail) = match item {
+        ResponsesOutputItem::WebSearchCall { id, action, .. } => (
+            id.as_str(),
+            "web_search",
+            action
+                .as_ref()
+                .and_then(|action| {
+                    action
+                        .get("query")
+                        .or_else(|| action.get("url"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        ResponsesOutputItem::FileSearchCall { id, queries, .. } => {
+            (id.as_str(), "file_search", queries.join(", "))
+        }
+        ResponsesOutputItem::CodeInterpreterCall { id, code, .. } => (
+            id.as_str(),
+            "code_interpreter",
+            code.clone().unwrap_or_default(),
+        ),
+        _ => return None,
+    };
+    Some(Event::builtin_call(id, tool, detail))
+}
+
+/// Completion event for a provider-executed (hosted) tool item.
+fn builtin_result_event(item: &ResponsesOutputItem) -> Option<Event> {
+    let (id, tool, result) = match item {
+        ResponsesOutputItem::WebSearchCall { id, status, action } => {
+            let detail = action.as_ref().and_then(|action| {
+                action
+                    .get("query")
+                    .or_else(|| action.get("url"))
+                    .and_then(serde_json::Value::as_str)
+            });
+            let result = detail.map_or_else(
+                || status.clone().unwrap_or_else(|| "completed".to_string()),
+                |detail| format!("\"{detail}\""),
+            );
+            (id.as_str(), "web_search", result)
+        }
+        ResponsesOutputItem::FileSearchCall {
+            id,
+            queries,
+            results,
+            status,
+        } => {
+            let count = results.as_ref().map_or_else(
+                || status.clone().unwrap_or_else(|| "completed".to_string()),
+                |results| format!("{} results", results.len()),
+            );
+            (
+                id.as_str(),
+                "file_search",
+                format!("{count} for {}", queries.join(", ")),
+            )
+        }
+        ResponsesOutputItem::CodeInterpreterCall { id, status, code } => {
+            let result = code
+                .clone()
+                .unwrap_or_else(|| status.clone().unwrap_or_else(|| "completed".to_string()));
+            (id.as_str(), "code_interpreter", result)
+        }
+        _ => return None,
+    };
+    Some(Event::builtin_result(id, tool, result))
 }
 
 #[cfg(test)]

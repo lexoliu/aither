@@ -584,7 +584,9 @@ async fn build_agent(
 }
 
 fn format_subagent_description(subagent_tool: &SubagentTool<CloudProvider>) -> String {
-    let mut subagent_desc = String::from("Spawn subagent for complex tasks (types: ");
+    let mut subagent_desc = String::from(
+        "Spawn a subagent for complex tasks. The prompt must be a path to a prompt file, not inline text. (types: ",
+    );
     let subagent_names = subagent_tool
         .type_descriptions()
         .iter()

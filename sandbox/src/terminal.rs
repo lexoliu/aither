@@ -44,7 +44,7 @@ use crate::{
     ContainerPath, PreparedTools, ToolDistribution, ToolRuntimeError,
     builtin::builtin_router,
     command::ToolRegistry,
-    job_registry::{JobRegistry, job_registry_channel},
+    job_registry::{JobRegistry, JobStatus, job_registry_channel},
     output::{
         Content, INLINE_OUTPUT_LIMIT, MediaResolution, OutputEntry, OutputFormat, OutputStore,
         save_raw_to_file,
@@ -306,6 +306,9 @@ async fn ensure_mode_allowed<P: PermissionHandler>(
 /// ## Execution Modes
 ///
 /// `terminal` is stateless. Each call selects its own runtime mode.
+/// A call runs in the foreground and is killed — with its whole process
+/// tree — after 10 seconds. Run long-running commands with
+/// `terminal_background`, which takes an explicit job timeout.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TerminalArgs {
     /// Short human-readable explanation of what this command is doing.
@@ -346,16 +349,12 @@ pub struct TerminalArgs {
     #[serde(default)]
     pub resolution: MediaResolution,
 
-    /// Per-command timeout in seconds.
-    /// - 0: run in background immediately
-    /// - >0: run foreground up to timeout, then move to background on timeout
-    pub timeout: u64,
-
     /// Maximum number of output lines to include inline.
-    /// For foreground-complete executions, this is the inline line budget
+    /// For foreground executions, this is the inline line budget
     /// before output offloads to file.
-    /// For timeout-promoted background executions, only the first `max_lines`
-    /// are returned immediately, while full output is redirected to file.
+    /// For background executions started with `terminal_background`, only
+    /// the first `max_lines` are returned immediately, while full output is
+    /// redirected to file.
     /// Clamped to 800 max.
     /// Default: 200.
     #[serde(default = "default_max_lines")]
@@ -366,6 +365,27 @@ pub struct TerminalArgs {
     /// (checksums, binary protocols, diff inputs). Default: false.
     #[serde(default)]
     pub raw: bool,
+}
+
+/// Run a terminal command as a background job.
+///
+/// The command starts detached and this call returns immediately with the
+/// job's task id; `terminal` only runs commands in the foreground and kills
+/// them after 10 seconds. Use `terminal_read` for incremental output,
+/// `terminal_input` for stdin, and `terminal_kill` to stop the job early.
+///
+/// `timeout` is the job's maximum runtime in seconds: the job and its
+/// process tree are killed when it passes, and it may be at most 120
+/// minutes. To wait longer than that, schedule a wake-up (cron) rather than
+/// starting a longer job.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TerminalBackgroundArgs {
+    /// Every argument a foreground `terminal` call takes.
+    #[serde(flatten)]
+    pub terminal: TerminalArgs,
+    /// Maximum runtime of the background job in seconds. The job is killed
+    /// when it passes. At most 7200 (120 minutes).
+    pub timeout: u64,
 }
 
 /// Requested terminal execution backend.
@@ -389,26 +409,47 @@ const fn default_max_lines() -> u32 {
 
 const MAX_LINES_CEILING: u32 = 800;
 
-/// Why a foreground terminal command was promoted to the background.
+/// How long a foreground `terminal` command may run before it is killed
+/// with its process tree.
+pub const DEFAULT_FOREGROUND_LIMIT: Duration = Duration::from_secs(10);
+/// Largest `timeout` a `terminal_background` job accepts.
+pub const DEFAULT_BACKGROUND_TIMEOUT_CAP: Duration = Duration::from_secs(120 * 60);
+/// A background job still running after this long produces one system alert.
+pub const DEFAULT_LONG_JOB_ALERT_AFTER: Duration = Duration::from_secs(40 * 60);
+
+/// Time bounds applied to every execution this terminal spawns.
+#[derive(Debug, Clone, Copy)]
+struct TerminalLimits {
+    /// Foreground kill limit for `terminal` calls.
+    foreground: Duration,
+    /// Maximum accepted `timeout` for `terminal_background` jobs.
+    background_timeout_cap: Duration,
+    /// Runtime after which a background job produces a long-running alert.
+    long_job_alert: Duration,
+}
+
+impl Default for TerminalLimits {
+    fn default() -> Self {
+        Self {
+            foreground: DEFAULT_FOREGROUND_LIMIT,
+            background_timeout_cap: DEFAULT_BACKGROUND_TIMEOUT_CAP,
+            long_job_alert: DEFAULT_LONG_JOB_ALERT_AFTER,
+        }
+    }
+}
+
+/// A background job that crossed the long-running threshold.
 ///
-/// Propagated to the UI so the background shelf can render a meaningful
-/// caption ("Promoted after 2s timeout" vs "Waiting for input" vs explicit).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BackgroundReason {
-    /// Exceeded the per-call foreground timeout budget.
-    Timeout {
-        /// Timeout in seconds as configured by the caller.
-        configured_seconds: u64,
-    },
-    /// stdin-blocked detector fired — process is waiting for input that
-    /// will not arrive via the foreground path.
-    StdinBlocked {
-        /// Human-readable notice from the detector, suitable for display.
-        notice: String,
-    },
-    /// Caller explicitly asked to run in the background (`timeout == 0`).
-    Explicit,
+/// Sent through the terminal's alert channel once per job; the agent turns
+/// it into a durable system alert.
+#[derive(Debug, Clone)]
+pub struct LongRunningJob {
+    /// Task ID of the job (four random words like "amber-forest-thunder-pearl").
+    pub task_id: String,
+    /// The script the job runs.
+    pub script: String,
+    /// How long the job had been running when the alert fired.
+    pub elapsed: Duration,
 }
 
 /// Result of a terminal execution.
@@ -424,24 +465,21 @@ pub struct TerminalResult {
     /// Exit code of the script.
     pub exit_code: i32,
 
-    /// Task ID for background execution.
+    /// Task ID for background execution or a killed foreground command.
     /// Four random words like "amber-forest-thunder-pearl".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
 
-    /// Status for background tasks.
+    /// Status of the execution: `running` for a live background job,
+    /// `killed` when the run was terminated at its bound.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
 
-    /// Why the command was moved to the background (only populated when
-    /// `status == "running"`).
+    /// Model-facing explanation of how the command ended, present only when
+    /// the run did not finish normally (for example when the foreground
+    /// limit killed it).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub background_reason: Option<BackgroundReason>,
-}
-
-enum ForegroundDecision {
-    Completed(Box<Result<TerminalResult, String>>),
-    PromoteToBackground(BackgroundReason),
+    pub notice: Option<String>,
 }
 
 #[derive(Clone)]
@@ -518,6 +556,7 @@ pub struct PermissionEvent {
 #[derive(Clone)]
 pub struct BackgroundTaskReceiver {
     rx: Receiver<CompletedTask>,
+    alert_rx: Receiver<LongRunningJob>,
     running_tasks: Arc<AtomicUsize>,
 }
 
@@ -532,6 +571,19 @@ impl BackgroundTaskReceiver {
             completed.push(task);
         }
         completed
+    }
+
+    /// Takes all pending long-running job alerts without blocking.
+    ///
+    /// Each alert names a background job that crossed the terminal's
+    /// long-running threshold; a job produces at most one.
+    #[must_use]
+    pub fn take_long_running_alerts(&self) -> Vec<LongRunningJob> {
+        let mut alerts = Vec::new();
+        while let Ok(alert) = self.alert_rx.try_recv() {
+            alerts.push(alert);
+        }
+        alerts
     }
 
     /// Checks if there are any completed tasks waiting.
@@ -573,6 +625,7 @@ impl std::fmt::Debug for BackgroundTaskReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BackgroundTaskReceiver")
             .field("pending", &self.rx.len())
+            .field("pending_alerts", &self.alert_rx.len())
             .field("running_tasks", &self.running_tasks.load(Ordering::Acquire))
             .finish()
     }
@@ -735,6 +788,12 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     completed_rx: Receiver<CompletedTask>,
     /// Channel for sending completed background tasks (cloned for each background task).
     completed_tx: Sender<CompletedTask>,
+    /// Channel for receiving long-running job alerts.
+    alert_rx: Receiver<LongRunningJob>,
+    /// Channel for sending long-running job alerts (cloned for each watchdog).
+    alert_tx: Sender<LongRunningJob>,
+    /// Time bounds applied to spawned executions.
+    limits: TerminalLimits,
     /// Number of still-running spawned executions associated with this tool.
     running_tasks: Arc<AtomicUsize>,
     /// Channel for permission lifecycle events.
@@ -765,6 +824,9 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             job_registry: self.job_registry.clone(),
             completed_rx: self.completed_rx.clone(),
             completed_tx: self.completed_tx.clone(),
+            alert_rx: self.alert_rx.clone(),
+            alert_tx: self.alert_tx.clone(),
+            limits: self.limits,
             running_tasks: self.running_tasks.clone(),
             permission_rx: self.permission_rx.clone(),
             permission_tx: self.permission_tx.clone(),
@@ -861,6 +923,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
 
         // Create channel for background task completion (unbounded to not block spawned tasks)
         let (completed_tx, completed_rx) = async_channel::unbounded();
+        let (alert_tx, alert_rx) = async_channel::unbounded();
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (permission_tx, permission_rx) = async_channel::unbounded();
 
@@ -873,6 +936,9 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             job_registry,
             completed_rx,
             completed_tx,
+            alert_rx,
+            alert_tx,
+            limits: TerminalLimits::default(),
             running_tasks,
             permission_rx,
             permission_tx,
@@ -918,6 +984,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
 
         // Create channel for background task completion (unbounded to not block spawned tasks)
         let (completed_tx, completed_rx) = async_channel::unbounded();
+        let (alert_tx, alert_rx) = async_channel::unbounded();
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (permission_tx, permission_rx) = async_channel::unbounded();
 
@@ -930,6 +997,9 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             job_registry,
             completed_rx,
             completed_tx,
+            alert_rx,
+            alert_tx,
+            limits: TerminalLimits::default(),
             running_tasks,
             permission_rx,
             permission_tx,
@@ -957,6 +1027,9 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             job_registry: self.job_registry,
             completed_rx: self.completed_rx,
             completed_tx: self.completed_tx,
+            alert_rx: self.alert_rx,
+            alert_tx: self.alert_tx,
+            limits: self.limits,
             running_tasks: self.running_tasks,
             permission_rx: self.permission_rx,
             permission_tx: self.permission_tx,
@@ -1013,6 +1086,30 @@ where
     #[must_use]
     pub const fn with_process_priority(mut self, priority: ProcessPriority) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Sets how long a foreground `terminal` command may run before it is
+    /// killed with its process tree. Defaults to [`DEFAULT_FOREGROUND_LIMIT`].
+    #[must_use]
+    pub const fn with_foreground_limit(mut self, limit: Duration) -> Self {
+        self.limits.foreground = limit;
+        self
+    }
+
+    /// Sets the largest `timeout` a `terminal_background` job accepts.
+    /// Defaults to [`DEFAULT_BACKGROUND_TIMEOUT_CAP`].
+    #[must_use]
+    pub const fn with_background_timeout_cap(mut self, cap: Duration) -> Self {
+        self.limits.background_timeout_cap = cap;
+        self
+    }
+
+    /// Sets how long a background job may run before it produces one system
+    /// alert naming it. Defaults to [`DEFAULT_LONG_JOB_ALERT_AFTER`].
+    #[must_use]
+    pub const fn with_long_job_alert_after(mut self, after: Duration) -> Self {
+        self.limits.long_job_alert = after;
         self
     }
 
@@ -1124,6 +1221,7 @@ where
     pub fn background_receiver(&self) -> BackgroundTaskReceiver {
         BackgroundTaskReceiver {
             rx: self.completed_rx.clone(),
+            alert_rx: self.alert_rx.clone(),
             running_tasks: self.running_tasks.clone(),
         }
     }
@@ -1168,6 +1266,7 @@ where
     #[must_use]
     pub fn child(&self) -> Self {
         let (completed_tx, completed_rx) = async_channel::unbounded();
+        let (alert_tx, alert_rx) = async_channel::unbounded();
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (permission_tx, permission_rx) = async_channel::unbounded();
         let (job_registry, job_registry_service) = job_registry_channel();
@@ -1182,6 +1281,9 @@ where
             output_store: self.output_store.clone(),
             completed_rx,
             completed_tx,
+            alert_rx,
+            alert_tx,
+            limits: self.limits,
             running_tasks,
             permission_rx,
             permission_tx,
@@ -1234,7 +1336,11 @@ where
             .prepared_catalog()
             .expect("terminal tools must be initialized before exposing child capabilities")
             .clone();
-        let entries = vec![erase_terminal_tool(self)];
+        let background_tool = self.background_tool();
+        let entries = vec![
+            erase_terminal_tool(self),
+            erase_terminal_tool(background_tool),
+        ];
 
         DynTerminalTool {
             entries,
@@ -1249,15 +1355,14 @@ where
 
     fn resolve_execution_target(
         &self,
-        arguments: &TerminalArgs,
+        mode: TerminalExecutionMode,
+        ssh_server_id: Option<&str>,
     ) -> Result<ExecutionTarget, TerminalError> {
-        match arguments.mode {
+        match mode {
             TerminalExecutionMode::Default => self.resolve_default_target(),
             TerminalExecutionMode::Sandboxed => self.resolve_home_target(TerminalMode::Sandboxed),
             TerminalExecutionMode::Unsafe => self.resolve_home_target(TerminalMode::Unsafe),
-            TerminalExecutionMode::Ssh => {
-                self.resolve_ssh_target(arguments.ssh_server_id.as_deref())
-            }
+            TerminalExecutionMode::Ssh => self.resolve_ssh_target(ssh_server_id),
         }
     }
 
@@ -1368,22 +1473,22 @@ where
             resolution,
             max_lines,
             raw,
-            timeout,
+            background,
         } = request;
         let ExecutionTarget { mode, backend } = target;
         let (result_tx, result_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
         let (stdin_blocked_tx, stdin_blocked_rx) = async_channel::bounded(1);
-        let background_mode = Arc::new(AtomicBool::new(timeout == 0));
-        let stdin_blocked_notice = if supports_stdin_blocked_notice(backend.kind()) {
-            Some(stdin_blocked_tx)
-        } else {
+        // Only a foreground call reads the detector's notice: it becomes
+        // guidance inside the kill result. A background job's stdin is
+        // served by `terminal_input`.
+        let stdin_blocked_notice = if background || !supports_stdin_blocked_notice(backend.kind()) {
             None
+        } else {
+            Some(stdin_blocked_tx)
         };
 
         let background_startup = BackgroundStartup::new(startup_tx);
-        let background_mode_for_spawn = background_mode.clone();
-        let background_mode_for_completion = background_mode.clone();
         let running_tasks = self.running_tasks.clone();
         let completed_tx = self.completed_tx.clone();
 
@@ -1399,7 +1504,7 @@ where
                 job_registry: self.job_registry.clone(),
                 task_id,
                 execution_id,
-                background_mode: background_mode_for_spawn,
+                background,
                 script,
                 mode,
                 backend,
@@ -1412,7 +1517,6 @@ where
                 raw,
                 result_tx,
                 completed_tx,
-                background_mode_for_completion,
                 running_tasks,
                 network_audit: self.network_audit.clone(),
                 priority: self.priority,
@@ -1420,10 +1524,9 @@ where
             .detach();
 
         SpawnedTerminal {
-            result_rx,
-            startup_rx,
-            stdin_blocked_rx,
-            background_mode,
+            result: result_rx,
+            startup: startup_rx,
+            stdin_blocked_notice: stdin_blocked_rx,
         }
     }
 }
@@ -1443,19 +1546,54 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         arguments: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
+        let prepared = self.prepare_execution(&arguments).await?;
+        let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
+            target: prepared.target,
+            task_id: prepared.task_id.clone(),
+            execution_id: prepared.execution_id,
+            script: arguments.script,
+            expect: arguments.expect,
+            resolution: arguments.resolution,
+            max_lines: prepared.max_lines,
+            raw: arguments.raw,
+            background: false,
+        });
+        // Registration precedes `report_ready` on every backend, so once
+        // startup returns the job is killable through the registry and the
+        // foreground clock only measures the command's own runtime.
+        wait_for_background_startup(&spawned.startup).await?;
+        match wait_for_foreground_result(&spawned.result, self.limits.foreground).await {
+            Some(Ok(result)) => ToolResult::json(&result),
+            Some(Err(err)) => Err(anyhow::anyhow!(err)),
+            None => {
+                self.finish_killed_foreground(&spawned, &prepared.task_id)
+                    .await
+            }
+        }
+    }
+}
+
+impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool<P, E, Configured> {
+    /// Returns the `terminal_background` native tool that starts background
+    /// jobs on this terminal's sandbox and job registry.
+    #[must_use]
+    pub fn background_tool(&self) -> TerminalBackgroundTool<P, E> {
+        TerminalBackgroundTool {
+            terminal: self.clone(),
+        }
+    }
+
+    /// Shared front half of `terminal` and `terminal_background`: argument
+    /// validation, target resolution, permission and the spawned job's ids.
+    async fn prepare_execution(
+        &self,
+        arguments: &TerminalArgs,
+    ) -> anyhow::Result<ExecutionPreparation> {
         if arguments.description.trim().is_empty() {
             return Err(anyhow::anyhow!("terminal description must not be empty"));
         }
-        let task_id = random_task_id();
-        let script = arguments.script.clone();
-        let execution_id = format!("exec-{task_id}");
-        let expect = arguments.expect;
-        let resolution = arguments.resolution;
-        let max_lines = arguments.max_lines.min(MAX_LINES_CEILING) as usize;
-        let raw = arguments.raw;
-        let timeout = arguments.timeout;
-
-        let target = self.resolve_execution_target(&arguments)?;
+        let target =
+            self.resolve_execution_target(arguments.mode, arguments.ssh_server_id.as_deref())?;
         if let ExecutionBackend::Local(tools) = &target.backend {
             tools
                 .ensure_readonly(
@@ -1463,70 +1601,206 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                 )
                 .await?;
         }
-        self.ensure_permission_allowed(target.mode, &script).await?;
-        let store_dir = self.output_store.dir().to_path_buf();
-        let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
+        self.ensure_permission_allowed(target.mode, &arguments.script)
+            .await?;
+        let task_id = random_task_id();
+        Ok(ExecutionPreparation {
             target,
-            task_id: task_id.clone(),
-            execution_id,
-            script,
-            expect,
-            resolution,
-            max_lines,
-            raw,
-            timeout,
-        });
-
-        if timeout == 0 {
-            let reason = BackgroundReason::Explicit;
-            wait_for_background_startup(&spawned.startup_rx).await?;
-            return background_terminal_result(
-                &self.job_registry,
-                &store_dir,
-                &task_id,
-                max_lines,
-                reason,
-            )
-            .await;
-        }
-
-        let configured_timeout_seconds = timeout;
-        let immediate = wait_for_foreground_decision(
-            &spawned.result_rx,
-            &spawned.stdin_blocked_rx,
-            timeout,
-            configured_timeout_seconds,
-        )
-        .await;
-
-        let (reason, pre_registered) = match immediate {
-            Some(ForegroundDecision::Completed(result)) => match *result {
-                Ok(mut result) => {
-                    result.task_id = None;
-                    result.status = None;
-                    result.background_reason = None;
-                    return ToolResult::json(&result);
-                }
-                Err(err) => return Err(anyhow::anyhow!(err)),
-            },
-            Some(ForegroundDecision::PromoteToBackground(reason)) => (reason, false),
-            None => (BackgroundReason::Explicit, false),
-        };
-
-        tracing::info!(
-            target: "may::background_promotion",
-            reason = ?reason,
-            configured_timeout_seconds,
-            "promoting terminal command to background"
-        );
-
-        spawned.background_mode.store(true, Ordering::Release);
-        if !pre_registered {
-            wait_for_background_startup(&spawned.startup_rx).await?;
-        }
-        background_terminal_result(&self.job_registry, &store_dir, &task_id, max_lines, reason)
-            .await
+            execution_id: format!("exec-{task_id}"),
+            task_id,
+            store_dir: self.output_store.dir().to_path_buf(),
+            max_lines: arguments.max_lines.min(MAX_LINES_CEILING) as usize,
+        })
     }
+
+    /// Starts `arguments` as a background job, arming its kill watchdog and
+    /// the long-running alert.
+    async fn run_background(
+        &self,
+        arguments: TerminalBackgroundArgs,
+    ) -> aither_core::Result<ToolResult> {
+        let cap = self.limits.background_timeout_cap;
+        let timeout = Duration::from_secs(arguments.timeout);
+        if arguments.timeout == 0 || timeout > cap {
+            return Err(anyhow::anyhow!(
+                "terminal_background timeout must be between 1 and {} seconds",
+                cap.as_secs()
+            ));
+        }
+        let prepared = self.prepare_execution(&arguments.terminal).await?;
+        let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
+            target: prepared.target,
+            task_id: prepared.task_id.clone(),
+            execution_id: prepared.execution_id,
+            script: arguments.terminal.script,
+            expect: arguments.terminal.expect,
+            resolution: arguments.terminal.resolution,
+            max_lines: prepared.max_lines,
+            raw: arguments.terminal.raw,
+            background: true,
+        });
+        wait_for_background_startup(&spawned.startup).await?;
+        self.spawn_kill_watchdog(&prepared.task_id, timeout);
+        self.spawn_long_job_alert(&prepared.task_id);
+        background_terminal_result(
+            &self.job_registry,
+            &prepared.store_dir,
+            &prepared.task_id,
+            prepared.max_lines,
+        )
+        .await
+    }
+
+    /// Kills the job through the registry once its timeout passes.
+    fn spawn_kill_watchdog(&self, task_id: &str, timeout: Duration) {
+        let job_registry = self.job_registry.clone();
+        let task_id = task_id.to_string();
+        self.executor
+            .spawn(async move {
+                async_io::Timer::after(timeout).await;
+                if let Some(job) = job_registry.get_by_task_id(&task_id).await
+                    && matches!(job.status, JobStatus::Running)
+                {
+                    job_registry.kill(job.pid).await;
+                }
+            })
+            .detach();
+    }
+
+    /// Emits one [`LongRunningJob`] when the job crosses the configured
+    /// long-running threshold.
+    fn spawn_long_job_alert(&self, task_id: &str) {
+        let job_registry = self.job_registry.clone();
+        let alert_tx = self.alert_tx.clone();
+        let task_id = task_id.to_string();
+        let alert_after = self.limits.long_job_alert;
+        self.executor
+            .spawn(async move {
+                async_io::Timer::after(alert_after).await;
+                if let Some(job) = job_registry.get_by_task_id(&task_id).await
+                    && matches!(job.status, JobStatus::Running)
+                {
+                    let _ = alert_tx
+                        .send(LongRunningJob {
+                            task_id,
+                            script: job.script,
+                            elapsed: job.started_at.elapsed(),
+                        })
+                        .await;
+                }
+            })
+            .detach();
+    }
+
+    /// Kills the registered job behind a foreground call whose limit expired
+    /// and shapes the killed result the model receives.
+    async fn finish_killed_foreground(
+        &self,
+        spawned: &SpawnedTerminal,
+        task_id: &str,
+    ) -> aither_core::Result<ToolResult> {
+        let stdin_notice = spawned.stdin_blocked_notice.try_recv().ok();
+        if !self.job_registry.kill_by_task_id(task_id).await
+            && let Ok(result) = spawned.result.try_recv()
+        {
+            // The command finished between the limit expiring and the kill.
+            return match result {
+                Ok(result) => ToolResult::json(&result),
+                Err(err) => Err(anyhow::anyhow!(err)),
+            };
+        }
+        let mut notice = format!(
+            "Killed after running {}s in the foreground. Use terminal_background to run a command longer than that.",
+            self.limits.foreground.as_secs()
+        );
+        if let Some(stdin_notice) = stdin_notice {
+            notice = format!("{notice}\n{stdin_notice}");
+        }
+        let mut result = spawned
+            .result
+            .recv()
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(TerminalResult {
+                stdout: OutputEntry::Empty,
+                stderr: None,
+                exit_code: -1,
+                task_id: None,
+                status: None,
+                notice: None,
+            });
+        result.task_id = Some(task_id.to_string());
+        result.status = Some("killed".to_string());
+        result.notice = Some(notice);
+        ToolResult::json(&result)
+    }
+}
+
+/// Native tool that runs a command as a background job.
+///
+/// Wraps a configured [`TerminalTool`]: jobs share its sandbox, working
+/// directory and job registry. Created by [`TerminalTool::background_tool`]
+/// and registered next to `terminal`.
+pub struct TerminalBackgroundTool<P, E> {
+    terminal: TerminalTool<P, E, Configured>,
+}
+
+impl<P, E: Clone> Clone for TerminalBackgroundTool<P, E> {
+    fn clone(&self) -> Self {
+        Self {
+            terminal: self.terminal.clone(),
+        }
+    }
+}
+
+impl<P, E> std::fmt::Debug for TerminalBackgroundTool<P, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalBackgroundTool")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
+    for TerminalBackgroundTool<P, E>
+{
+    fn name(&self) -> Cow<'static, str> {
+        "terminal_background".into()
+    }
+
+    fn description(&self) -> Cow<'static, str> {
+        format!(
+            "Run a terminal command as a background job, detached from the \
+             foreground call. Returns immediately with the job's task id; use \
+             terminal_read for incremental output, terminal_input for stdin, \
+             and terminal_kill to stop the job early. The required `timeout` \
+             (seconds) is the job's maximum runtime — it and its process tree \
+             are killed when it passes — and may be at most {} minutes. To \
+             wait longer than that, schedule a wake-up (cron) rather than \
+             starting a longer job.",
+            self.terminal.limits.background_timeout_cap.as_secs() / 60
+        )
+        .into()
+    }
+
+    type Arguments = TerminalBackgroundArgs;
+    type Res = ToolResult;
+
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
+        self.terminal.run_background(arguments).await
+    }
+}
+
+struct ExecutionPreparation {
+    target: ExecutionTarget,
+    task_id: String,
+    execution_id: String,
+    store_dir: PathBuf,
+    max_lines: usize,
 }
 
 async fn wait_for_background_startup(
@@ -1541,47 +1815,18 @@ async fn wait_for_background_startup(
     }
 }
 
-async fn wait_for_foreground_decision(
+/// Races the result channel against the foreground limit.
+///
+/// Returns `None` when the limit expired (or the channel was dropped, which
+/// the caller treats the same way — the job is finished or killed).
+async fn wait_for_foreground_result(
     result_rx: &Receiver<Result<TerminalResult, String>>,
-    stdin_blocked_rx: &Receiver<String>,
-    timeout: u64,
-    configured_timeout_seconds: u64,
-) -> Option<ForegroundDecision> {
-    let timeout = std::time::Duration::from_secs(timeout);
-    futures_lite::future::or(
-        async {
-            result_rx
-                .recv()
-                .await
-                .ok()
-                .map(Box::new)
-                .map(ForegroundDecision::Completed)
-        },
-        async {
-            futures_lite::future::or(
-                async {
-                    match stdin_blocked_rx.recv().await {
-                        Ok(notice) => Some(ForegroundDecision::PromoteToBackground(
-                            BackgroundReason::StdinBlocked { notice },
-                        )),
-                        Err(_) => std::future::pending().await,
-                    }
-                },
-                async {
-                    async_io::Timer::after(timeout).await;
-                    if let Ok(result) = result_rx.try_recv() {
-                        return Some(ForegroundDecision::Completed(Box::new(result)));
-                    }
-                    Some(ForegroundDecision::PromoteToBackground(
-                        BackgroundReason::Timeout {
-                            configured_seconds: configured_timeout_seconds,
-                        },
-                    ))
-                },
-            )
-            .await
-        },
-    )
+    limit: Duration,
+) -> Option<Result<TerminalResult, String>> {
+    futures_lite::future::or(async { result_rx.recv().await.ok() }, async {
+        async_io::Timer::after(limit).await;
+        result_rx.try_recv().ok()
+    })
     .await
 }
 
@@ -1590,23 +1835,16 @@ async fn background_terminal_result(
     store_dir: &Path,
     task_id: &str,
     max_lines: usize,
-    reason: BackgroundReason,
 ) -> aither_core::Result<ToolResult> {
-    let stdout = start_background_output_redirect(
-        job_registry,
-        store_dir,
-        task_id,
-        max_lines,
-        Some(&reason),
-    )
-    .await?;
+    let stdout =
+        start_background_output_redirect(job_registry, store_dir, task_id, max_lines).await?;
     ToolResult::json(&TerminalResult {
         stdout,
         stderr: None,
         exit_code: 0,
         task_id: Some(task_id.to_string()),
         status: Some("running".to_string()),
-        background_reason: Some(reason),
+        notice: None,
     })
 }
 
@@ -1615,7 +1853,6 @@ async fn start_background_output_redirect(
     store_dir: &Path,
     task_id: &str,
     max_lines: usize,
-    promotion_reason: Option<&BackgroundReason>,
 ) -> Result<OutputEntry, anyhow::Error> {
     let (url, output_path) = save_raw_to_file(store_dir, &[]).await?;
     let output_path_string = output_path.display().to_string();
@@ -1624,30 +1861,16 @@ async fn start_background_output_redirect(
         .await
         .map_err(anyhow::Error::msg)?;
     let (preview, truncated) = preview_first_lines(&snapshot, max_lines);
-    let text = match (
-        promotion_reason.map(background_reason_preview),
-        preview.is_empty(),
-    ) {
-        (Some(reason), true) => reason,
-        (Some(reason), false) => format!("{reason}\n{preview}"),
-        (None, true) => "(no output yet)".to_string(),
-        (None, false) => preview,
+    let text = if preview.is_empty() {
+        "(no output yet)".to_string()
+    } else {
+        preview
     };
     Ok(OutputEntry::Stored {
         path: output_path_string,
         url,
         content: Some(Content::Text { text, truncated }),
     })
-}
-
-fn background_reason_preview(reason: &BackgroundReason) -> String {
-    match reason {
-        BackgroundReason::Timeout { configured_seconds } => {
-            format!("Foreground timeout of {configured_seconds}s elapsed — promoted to background.")
-        }
-        BackgroundReason::StdinBlocked { notice } => notice.clone(),
-        BackgroundReason::Explicit => "Started in background (timeout=0 requested).".to_string(),
-    }
 }
 
 struct StandaloneExecution<P, E> {
@@ -1660,7 +1883,7 @@ struct StandaloneExecution<P, E> {
     job_registry: JobRegistry,
     task_id: String,
     execution_id: String,
-    background_mode: Arc<AtomicBool>,
+    background: bool,
     script: String,
     mode: TerminalMode,
     backend: ExecutionBackend,
@@ -1792,14 +2015,13 @@ struct TerminalSpawnRequest {
     resolution: MediaResolution,
     max_lines: usize,
     raw: bool,
-    timeout: u64,
+    background: bool,
 }
 
 struct SpawnedTerminal {
-    result_rx: Receiver<Result<TerminalResult, String>>,
-    startup_rx: Receiver<Result<(), String>>,
-    stdin_blocked_rx: Receiver<String>,
-    background_mode: Arc<AtomicBool>,
+    result: Receiver<Result<TerminalResult, String>>,
+    startup: Receiver<Result<(), String>>,
+    stdin_blocked_notice: Receiver<String>,
 }
 
 struct SpawnedTerminalTask<P, E> {
@@ -1812,7 +2034,7 @@ struct SpawnedTerminalTask<P, E> {
     job_registry: JobRegistry,
     task_id: String,
     execution_id: String,
-    background_mode: Arc<AtomicBool>,
+    background: bool,
     script: String,
     mode: TerminalMode,
     backend: ExecutionBackend,
@@ -1825,7 +2047,6 @@ struct SpawnedTerminalTask<P, E> {
     raw: bool,
     result_tx: Sender<Result<TerminalResult, String>>,
     completed_tx: Sender<CompletedTask>,
-    background_mode_for_completion: Arc<AtomicBool>,
     running_tasks: Arc<AtomicUsize>,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
@@ -1846,7 +2067,7 @@ where
         job_registry,
         task_id,
         execution_id,
-        background_mode,
+        background,
         script,
         mode,
         backend,
@@ -1859,7 +2080,6 @@ where
         raw,
         result_tx,
         completed_tx,
-        background_mode_for_completion,
         running_tasks,
         network_audit,
         priority,
@@ -1874,7 +2094,7 @@ where
         job_registry,
         task_id: task_id.clone(),
         execution_id,
-        background_mode,
+        background,
         script: script.clone(),
         mode,
         backend,
@@ -1895,7 +2115,7 @@ where
         Err(err) => Err(err.to_string()),
     };
     let _ = result_tx.send(quick_result).await;
-    if background_mode_for_completion.load(Ordering::Acquire) {
+    if background {
         let _ = completed_tx
             .send(CompletedTask {
                 task_id,
@@ -1925,7 +2145,7 @@ where
         job_registry,
         task_id,
         execution_id,
-        background_mode,
+        background,
         script,
         mode,
         backend,
@@ -1977,7 +2197,7 @@ where
         job_registry: &job_registry,
         pid,
         output,
-        background_output: background_mode.load(Ordering::Acquire),
+        background_output: background,
         store_dir: &store_dir,
         expect,
         resolution,
@@ -2128,7 +2348,7 @@ async fn save_completed_process_output(
         exit_code,
         task_id: None,
         status: None,
-        background_reason: None,
+        notice: None,
     })
 }
 
@@ -2502,8 +2722,8 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         .job_registry
         .attach_terminal_input(pid, input_tx)
         .await;
-    context.background_startup.report_ready().await;
     context.job_registry.attach_kill_switch(pid, kill_tx).await;
+    context.background_startup.report_ready().await;
 
     let ipc_bridge = if context.ipc_commands.is_empty() {
         None
@@ -3541,7 +3761,6 @@ mod tests {
                     ssh_server_id: None,
                     expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
-                    timeout: 30,
                     max_lines: 50,
                     raw: true,
                 },
@@ -3770,13 +3989,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_args_defaults() {
-        let args: TerminalArgs = serde_json::from_str(
-            r#"{"description":"print a greeting","script":"echo hello","timeout":1}"#,
-        )
-        .unwrap();
+        let args: TerminalArgs =
+            serde_json::from_str(r#"{"description":"print a greeting","script":"echo hello"}"#)
+                .unwrap();
         assert_eq!(args.expect, OutputFormat::Text);
         assert_eq!(args.resolution, MediaResolution::Auto);
-        assert_eq!(args.timeout, 1);
         assert_eq!(args.mode, TerminalExecutionMode::Default);
     }
 
@@ -3797,7 +4014,7 @@ mod tests {
             exit_code: 0,
             task_id: None,
             status: None,
-            background_reason: None,
+            notice: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -3817,7 +4034,7 @@ mod tests {
             exit_code: 0,
             task_id: None,
             status: None,
-            background_reason: None,
+            notice: None,
         };
         let json_inline = serde_json::to_string(&result_inline).unwrap();
         assert!(!json_inline.contains("\"url\""));
@@ -3830,9 +4047,7 @@ mod tests {
             exit_code: 0,
             task_id: Some("amber-forest-thunder-pearl".to_string()),
             status: Some("running".to_string()),
-            background_reason: Some(BackgroundReason::Timeout {
-                configured_seconds: 30,
-            }),
+            notice: None,
         };
         let json_bg = serde_json::to_string(&result_background).unwrap();
         assert!(json_bg.contains("\"task_id\":\"amber-forest-thunder-pearl\""));
@@ -3840,23 +4055,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_terminal_args_timeout() {
-        let args: TerminalArgs = serde_json::from_str(
-            r#"{"description":"print a greeting","script":"echo hello","timeout":0}"#,
+    async fn test_terminal_background_args_parsing() {
+        let args: TerminalBackgroundArgs = serde_json::from_str(
+            r#"{"description":"sleep in background","script":"sleep 5","timeout":30}"#,
         )
         .unwrap();
-        assert_eq!(args.timeout, 0);
+        assert_eq!(args.timeout, 30);
+        assert_eq!(args.terminal.script, "sleep 5");
 
-        let args_default = serde_json::from_str::<TerminalArgs>(
-            r#"{"description":"print a greeting","script":"echo hello"}"#,
+        let missing_timeout = serde_json::from_str::<TerminalBackgroundArgs>(
+            r#"{"description":"sleep in background","script":"sleep 5"}"#,
         )
         .unwrap_err();
-        assert!(args_default.to_string().contains("timeout"));
+        assert!(missing_timeout.to_string().contains("timeout"));
 
         let missing_description =
             serde_json::from_str::<TerminalArgs>(r#"{"script":"echo hello","timeout":1}"#)
                 .unwrap_err();
         assert!(missing_description.to_string().contains("description"));
+    }
+
+    #[test]
+    fn terminal_background_args_schema_inlines_terminal_fields() {
+        let schema = serde_json::to_value(schemars::schema_for!(TerminalBackgroundArgs)).unwrap();
+        let properties = schema["properties"].as_object().expect("object schema");
+        for field in ["description", "script", "timeout", "max_lines"] {
+            assert!(
+                properties.contains_key(field),
+                "{field} missing from schema {schema}"
+            );
+        }
+        let required = schema["required"].as_array().expect("required list");
+        for field in ["description", "script", "timeout"] {
+            assert!(
+                required.iter().any(|name| name == field),
+                "{field} not required in {schema}"
+            );
+        }
     }
 
     /// The tools bin directory a container execution passes to the wrapper.
@@ -3887,7 +4122,7 @@ mod tests {
 
     #[test]
     fn wrap_container_script_preserves_user_script_semantics() {
-        let script = "echo '$5,040' && subagent --subagent .skills/slide/subagents/art_direction.md --prompt 'x'";
+        let script = "echo '$5,040' && subagent --subagent .skills/slide/subagents/art_direction.md --prompt-file tmp/prompt.md";
         let wrapped = wrap_container_script(
             script,
             &[String::from("subagent")],
@@ -4064,7 +4299,7 @@ mod tests {
             .map(|entry| entry.definition.name().to_string())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["terminal"]);
+        assert_eq!(names, vec!["terminal", "terminal_background"]);
     }
 
     async fn query_control(
@@ -4103,17 +4338,20 @@ mod tests {
         let child = parent.child();
 
         let result = child
+            .background_tool()
             .call(
-                TerminalArgs {
-                    description: "echo one stdin line then sleep".to_string(),
-                    script: "read line; printf 'got %s\\n' \"$line\"; sleep 30".to_string(),
-                    mode: TerminalExecutionMode::Sandboxed,
-                    ssh_server_id: None,
-                    expect: OutputFormat::Text,
-                    resolution: MediaResolution::Auto,
-                    timeout: 0,
-                    max_lines: 50,
-                    raw: false,
+                TerminalBackgroundArgs {
+                    terminal: TerminalArgs {
+                        description: "echo one stdin line then sleep".to_string(),
+                        script: "read line; printf 'got %s\\n' \"$line\"; sleep 30".to_string(),
+                        mode: TerminalExecutionMode::Sandboxed,
+                        ssh_server_id: None,
+                        expect: OutputFormat::Text,
+                        resolution: MediaResolution::Auto,
+                        max_lines: 50,
+                        raw: false,
+                    },
+                    timeout: 30,
                 },
                 ToolContext::new(),
             )
@@ -4123,7 +4361,7 @@ mod tests {
         assert_eq!(payload.status.as_deref(), Some("running"));
         let task_id = payload
             .task_id
-            .expect("timeout=0 should return a background task id");
+            .expect("terminal_background should return a task id");
 
         let input = query_control(
             child.registry(),
@@ -4236,7 +4474,7 @@ mod tests {
             job_registry,
             task_id: "task-test".to_string(),
             execution_id: "exec-test".to_string(),
-            background_mode: Arc::new(AtomicBool::new(false)),
+            background: false,
             script: "/bin/pwd".to_string(),
             mode: TerminalMode::Sandboxed,
             backend: ExecutionBackend::Local(tool.shell_sessions.local_tools().unwrap().clone()),
@@ -4293,7 +4531,6 @@ mod tests {
                     ssh_server_id: None,
                     expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
-                    timeout: 30,
                     max_lines: 50,
                     raw: false,
                 },
@@ -4345,18 +4582,21 @@ mod tests {
         let input_tool = InputTerminalTool::new(tool.job_registry());
 
         let result = tool
+            .background_tool()
             .call(
-                TerminalArgs {
-                    description: "wait for terminal input and echo it back".to_string(),
-                    script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\""
-                        .to_string(),
-                    mode: TerminalExecutionMode::Sandboxed,
-                    ssh_server_id: None,
-                    expect: OutputFormat::Text,
-                    resolution: MediaResolution::Auto,
-                    timeout: 0,
-                    max_lines: 50,
-                    raw: false,
+                TerminalBackgroundArgs {
+                    terminal: TerminalArgs {
+                        description: "wait for terminal input and echo it back".to_string(),
+                        script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\""
+                            .to_string(),
+                        mode: TerminalExecutionMode::Sandboxed,
+                        ssh_server_id: None,
+                        expect: OutputFormat::Text,
+                        resolution: MediaResolution::Auto,
+                        max_lines: 50,
+                        raw: false,
+                    },
+                    timeout: 30,
                 },
                 ToolContext::new(),
             )
@@ -4368,7 +4608,7 @@ mod tests {
         let task_id = payload
             .task_id
             .clone()
-            .expect("timeout=0 should return a background task id");
+            .expect("terminal_background should return a task id");
 
         input_tool
             .call(
@@ -4420,17 +4660,20 @@ mod tests {
         let child_pid_path = dir.path().join("child.pid");
 
         let result = tool
+            .background_tool()
             .call(
-                TerminalArgs {
-                    description: "start a descendant process".to_string(),
-                    script: "sleep 30 & echo $! > child.pid; wait".to_string(),
-                    mode: TerminalExecutionMode::Sandboxed,
-                    ssh_server_id: None,
-                    expect: OutputFormat::Text,
-                    resolution: MediaResolution::Auto,
-                    timeout: 0,
-                    max_lines: 50,
-                    raw: false,
+                TerminalBackgroundArgs {
+                    terminal: TerminalArgs {
+                        description: "start a descendant process".to_string(),
+                        script: "sleep 30 & echo $! > child.pid; wait".to_string(),
+                        mode: TerminalExecutionMode::Sandboxed,
+                        ssh_server_id: None,
+                        expect: OutputFormat::Text,
+                        resolution: MediaResolution::Auto,
+                        max_lines: 50,
+                        raw: false,
+                    },
+                    timeout: 30,
                 },
                 ToolContext::new(),
             )
@@ -4471,7 +4714,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn sandboxed_terminal_auto_promotes_stdin_wait_and_accepts_input() {
+    async fn sandboxed_terminal_kills_stdin_blocked_command_and_reports_it() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
         let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
@@ -4489,11 +4732,10 @@ mod tests {
                 local: true,
                 container: false,
                 ssh: false,
-            });
+            })
+            .with_foreground_limit(Duration::from_secs(2));
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
         let tool = tool.with_registry(registry);
-        let background_receiver = tool.background_receiver();
-        let input_tool = InputTerminalTool::new(tool.job_registry());
 
         let result = tool
             .call(
@@ -4505,7 +4747,6 @@ mod tests {
                     ssh_server_id: None,
                     expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
-                    timeout: 30,
                     max_lines: 50,
                     raw: false,
                 },
@@ -4515,38 +4756,13 @@ mod tests {
             .expect("terminal call should succeed");
 
         let payload = parse_terminal_tool_result(&result);
-        assert_eq!(payload.status.as_deref(), Some("running"));
-        let task_id = payload
-            .task_id
-            .clone()
-            .expect("stdin-blocked process should promote to background");
-        let notice = output_text(&payload.stdout).expect("background preview should include text");
+        assert_eq!(payload.status.as_deref(), Some("killed"));
+        let notice = payload
+            .notice
+            .expect("a killed foreground result carries a notice");
         assert!(
-            notice.starts_with(TERMINAL_STDIN_BLOCKED_NOTICE),
-            "unexpected promotion notice: {notice}"
-        );
-
-        input_tool
-            .call(
-                InputTerminalArgs {
-                    task_id: task_id.clone(),
-                    input: "lexo".to_string(),
-                    append_newline: true,
-                },
-                ToolContext::new(),
-            )
-            .await
-            .expect("terminal_input should succeed");
-
-        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
-        let terminal_result = completed
-            .result
-            .expect("background task should complete successfully after stdin input");
-        let stdout =
-            output_text(&terminal_result.stdout).expect("completed task should include stdout");
-        assert!(
-            stdout.contains("hello lexo"),
-            "stdin input should reach the terminal process, got: {stdout}"
+            notice.contains(TERMINAL_STDIN_BLOCKED_NOTICE),
+            "notice should report the stdin wait: {notice}"
         );
     }
 
@@ -4565,6 +4781,209 @@ mod tests {
             CpuPriority::Nice(NiceLevel::new(10).expect("nice level 10 is in range")),
             IoPriority::Normal,
         )
+    }
+
+    /// A configured terminal tool with prepared local tools and the given
+    /// shortened limits. Returns the tool and the cache owning its tools.
+    #[cfg(unix)]
+    async fn configured_test_terminal(
+        dir: &Path,
+        foreground: Duration,
+        background_cap: Duration,
+        alert_after: Duration,
+    ) -> (
+        tempfile::TempDir,
+        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+    ) {
+        let (cache, shell_sessions) = prepared_test_registry().await;
+        let tool = TerminalTool::new_exact(
+            dir,
+            TestPermissionHandler::default(),
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_foreground_limit(foreground)
+        .with_background_timeout_cap(background_cap)
+        .with_long_job_alert_after(alert_after);
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        (cache, tool.with_registry(registry))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreground_command_still_running_at_the_limit_is_killed_with_descendants() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let child_pid_path = dir.path().join("child.pid");
+
+        let result = tool
+            .call(
+                TerminalArgs {
+                    description: "start a descendant process".to_string(),
+                    script: "sleep 30 & echo $! > child.pid; wait".to_string(),
+                    mode: TerminalExecutionMode::Sandboxed,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    max_lines: 50,
+                    raw: false,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal call should succeed");
+        let payload = parse_terminal_tool_result(&result);
+        assert_eq!(payload.status.as_deref(), Some("killed"));
+        let notice = payload
+            .notice
+            .expect("a killed foreground result carries a notice");
+        assert!(
+            notice.contains("terminal_background"),
+            "notice should point to terminal_background: {notice}"
+        );
+
+        let child_pid = async_fs::read_to_string(&child_pid_path)
+            .await
+            .expect("descendant pid file should exist")
+            .trim()
+            .parse::<i32>()
+            .expect("descendant pid should parse");
+        for _ in 0..100 {
+            // SAFETY: signal 0 probes process existence.
+            if unsafe { libc::kill(child_pid, 0) } != 0 {
+                return;
+            }
+            async_io::Timer::after(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("descendant process {child_pid} survived the foreground kill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_background_rejects_timeout_above_cap_and_kills_at_timeout() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        )
+        .await;
+        let background_receiver = tool.background_receiver();
+        let background_tool = tool.background_tool();
+        let args = |timeout: u64| TerminalBackgroundArgs {
+            terminal: TerminalArgs {
+                description: "sleep in the background".to_string(),
+                script: "sleep 30".to_string(),
+                mode: TerminalExecutionMode::Sandboxed,
+                ssh_server_id: None,
+                expect: OutputFormat::Text,
+                resolution: MediaResolution::Auto,
+                max_lines: 50,
+                raw: false,
+            },
+            timeout,
+        };
+
+        assert!(
+            background_tool
+                .call(args(3), ToolContext::new())
+                .await
+                .is_err(),
+            "a timeout above the cap must be rejected"
+        );
+
+        let result = background_tool
+            .call(args(1), ToolContext::new())
+            .await
+            .expect("a timeout within the cap should start the job");
+        let payload = parse_terminal_tool_result(&result);
+        assert_eq!(payload.status.as_deref(), Some("running"));
+        let task_id = payload.task_id.expect("background job needs a task id");
+
+        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the finished job stays in the registry");
+        assert_eq!(
+            info.status,
+            JobStatus::Killed,
+            "the job should have been killed at its timeout: {completed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_job_past_the_alert_threshold_yields_one_alert() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_millis(300),
+        )
+        .await;
+        let background_receiver = tool.background_receiver();
+
+        let result = tool
+            .background_tool()
+            .call(
+                TerminalBackgroundArgs {
+                    terminal: TerminalArgs {
+                        description: "sleep in the background".to_string(),
+                        script: "sleep 30".to_string(),
+                        mode: TerminalExecutionMode::Sandboxed,
+                        ssh_server_id: None,
+                        expect: OutputFormat::Text,
+                        resolution: MediaResolution::Auto,
+                        max_lines: 50,
+                        raw: false,
+                    },
+                    timeout: 30,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal_background should start the job");
+        let task_id = parse_terminal_tool_result(&result)
+            .task_id
+            .expect("background job needs a task id");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let alerts = loop {
+            let alerts = background_receiver.take_long_running_alerts();
+            if !alerts.is_empty() {
+                break alerts;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "long-running alert did not fire"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].task_id, task_id);
+        assert!(
+            background_receiver.take_long_running_alerts().is_empty(),
+            "the same job must not alert twice"
+        );
+
+        assert!(
+            tool.job_registry().kill_by_task_id(&task_id).await,
+            "test cleanup should kill the job"
+        );
     }
 
     /// A terminal tool with prepared local tools and `priority` applied. The
@@ -4600,7 +5019,7 @@ mod tests {
     /// so it reports its own `$$` into `pid` and waits for the host's `go`
     /// marker instead of running `nice`.
     #[cfg(unix)]
-    fn pid_probe_args(timeout: u64) -> TerminalArgs {
+    fn pid_probe_args() -> TerminalArgs {
         TerminalArgs {
             description: "report the process pid and wait".to_string(),
             script: concat!(
@@ -4612,7 +5031,6 @@ mod tests {
             ssh_server_id: None,
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
-            timeout,
             max_lines: 50,
             raw: false,
         }
@@ -4654,7 +5072,7 @@ mod tests {
         let (_tools_cache, tool) =
             prioritized_terminal_tool(dir.path(), test_nice_priority()).await;
 
-        let call = tool.call(pid_probe_args(30), ToolContext::new());
+        let call = tool.call(pid_probe_args(), ToolContext::new());
         let probe = async {
             let pid = probe_pid(dir.path()).await;
             assert_eq!(
@@ -4681,17 +5099,20 @@ mod tests {
         // `exec` keeps `$$` — the pid the probe wrote — on the interactive
         // shell the session then drives.
         let result = tool
+            .background_tool()
             .call(
-                TerminalArgs {
-                    description: "start a persistent shell".to_string(),
-                    script: "printf '%s\\n' $$ > \"$PWD/pid\"; exec sh".to_string(),
-                    mode: TerminalExecutionMode::Sandboxed,
-                    ssh_server_id: None,
-                    expect: OutputFormat::Text,
-                    resolution: MediaResolution::Auto,
-                    timeout: 0,
-                    max_lines: 50,
-                    raw: false,
+                TerminalBackgroundArgs {
+                    terminal: TerminalArgs {
+                        description: "start a persistent shell".to_string(),
+                        script: "printf '%s\\n' $$ > \"$PWD/pid\"; exec sh".to_string(),
+                        mode: TerminalExecutionMode::Sandboxed,
+                        ssh_server_id: None,
+                        expect: OutputFormat::Text,
+                        resolution: MediaResolution::Auto,
+                        max_lines: 50,
+                        raw: false,
+                    },
+                    timeout: 30,
                 },
                 ToolContext::new(),
             )
@@ -4702,7 +5123,7 @@ mod tests {
         let task_id = payload
             .task_id
             .clone()
-            .expect("timeout=0 should return a background task id");
+            .expect("terminal_background should return a task id");
 
         let pid = probe_pid(dir.path()).await;
         assert_eq!(
@@ -4739,7 +5160,14 @@ mod tests {
         let background_receiver = tool.background_receiver();
 
         let result = tool
-            .call(pid_probe_args(0), ToolContext::new())
+            .background_tool()
+            .call(
+                TerminalBackgroundArgs {
+                    terminal: pid_probe_args(),
+                    timeout: 30,
+                },
+                ToolContext::new(),
+            )
             .await
             .expect("terminal call should succeed");
         let payload = parse_terminal_tool_result(&result);
@@ -4747,7 +5175,7 @@ mod tests {
         let task_id = payload
             .task_id
             .clone()
-            .expect("timeout=0 should return a background task id");
+            .expect("terminal_background should return a background task id");
 
         let pid = probe_pid(dir.path()).await;
         assert_eq!(
@@ -5160,7 +5588,6 @@ mod tests {
                     ssh_server_id: None,
                     expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
-                    timeout: 60,
                     max_lines: 50,
                     raw: false,
                 },

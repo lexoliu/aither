@@ -106,11 +106,14 @@ impl SessionUpdateMapper {
                 }))
             }
 
+            AgentEvent::BuiltInToolCall { .. } | AgentEvent::BuiltInToolResult { .. } => {
+                map_builtin(event)
+            }
+
             AgentEvent::RunStart { .. }
             | AgentEvent::Checkpoint { .. }
             | AgentEvent::BackgroundTaskStarted { .. }
             | AgentEvent::BackgroundTaskCompleted { .. }
-            | AgentEvent::TerminalInputNeeded { .. }
             | AgentEvent::RunPaused { .. }
             | AgentEvent::RunResumed { .. }
             | AgentEvent::SkillActivated { .. }
@@ -119,6 +122,40 @@ impl SessionUpdateMapper {
             | AgentEvent::Error(_)
             | AgentEvent::Usage(_) => None,
         }
+    }
+}
+
+/// Map a provider-hosted tool call or result onto the tool-call updates —
+/// the provider executes these, but they render like any other tool call.
+fn map_builtin(event: &AgentEvent) -> Option<SessionUpdate> {
+    match event {
+        AgentEvent::BuiltInToolCall { id, tool, detail } => {
+            Some(SessionUpdate::ToolCall(ToolCall {
+                tool_call_id: id.clone(),
+                title: format_tool_title(tool, detail),
+                kind: Some(infer_tool_kind(tool)),
+                status: Some(ToolCallStatus::Pending),
+                content: vec![],
+                locations: vec![],
+                raw_input: None,
+                raw_output: None,
+                meta: None,
+            }))
+        }
+        AgentEvent::BuiltInToolResult { id, result, .. } => {
+            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                tool_call_id: id.clone(),
+                status: Some(ToolCallStatus::Completed),
+                content: None,
+                title: None,
+                kind: None,
+                locations: None,
+                raw_input: None,
+                raw_output: Some(serde_json::Value::String(result.clone())),
+                meta: None,
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -153,13 +190,13 @@ fn truncate_title(text: &str) -> String {
 
 /// Format a human-readable title for a tool call.
 ///
-/// Covers `terminal` and its control tools (`terminal_kill`, `terminal_input`,
-/// `terminal_read`), the host-mediated `ask_user` and `request_workspace`
+/// Covers `terminal` and its control tools (`terminal_background`,
+/// `terminal_kill`, `terminal_input`, `terminal_read`), the host-mediated `ask_user` and `request_workspace`
 /// tools, and `subagent`. Every other capability is a CLI command executed
 /// through `terminal` and gets the generic title.
 fn format_tool_title(name: &str, arguments: &str) -> String {
     match name {
-        "terminal" => {
+        "terminal" | "terminal_background" => {
             if let Ok(args) = serde_json::from_str::<aither_agent::sandbox::TerminalArgs>(arguments)
                 && !args.description.is_empty()
             {
@@ -230,7 +267,9 @@ fn format_tool_title(name: &str, arguments: &str) -> String {
 /// Infer the tool kind from the tool name.
 fn infer_tool_kind(name: &str) -> ToolKind {
     match name {
-        "terminal" | "terminal_kill" | "terminal_input" => ToolKind::Execute,
+        "terminal" | "terminal_background" | "terminal_kill" | "terminal_input" => {
+            ToolKind::Execute
+        }
         "terminal_read" => ToolKind::Read,
         _ => ToolKind::Other,
     }
@@ -358,7 +397,7 @@ mod tests {
             ),
             (
                 "subagent",
-                r#"{"subagent":"explore","prompt":"find the adapter code"}"#,
+                r#"{"subagent":"explore","prompt_file":"tmp/prompt.md"}"#,
                 "Running explore subagent",
                 ToolKind::Other,
             ),

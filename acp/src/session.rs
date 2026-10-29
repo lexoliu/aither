@@ -30,6 +30,7 @@ pub struct AcpSession<LLM: LanguageModel + 'static> {
 
 impl<LLM: LanguageModel + 'static> AcpSession<LLM> {
     /// Create a new session that drives the given agent.
+    #[must_use]
     pub fn new(cwd: PathBuf, mcp_servers: Vec<McpServer>, agent: Agent<LLM, LLM, LLM>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),

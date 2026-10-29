@@ -90,7 +90,8 @@ struct JobState {
     finished_at: Option<Instant>,
 }
 
-enum JobCommand {
+/// State mutations sent to the registry service; none expect a reply.
+enum StateCommand {
     Register {
         pid: u32,
         task_id: String,
@@ -126,11 +127,19 @@ enum JobCommand {
         error: String,
         output_path: Option<PathBuf>,
     },
+}
+
+/// Registry queries and job-control requests, each answered on `reply`.
+enum JobRequest {
     List {
         reply: Sender<Vec<JobInfo>>,
     },
     Get {
         pid: u32,
+        reply: Sender<Option<JobInfo>>,
+    },
+    GetByTaskId {
+        task_id: String,
         reply: Sender<Option<JobInfo>>,
     },
     Kill {
@@ -177,6 +186,24 @@ enum JobCommand {
     },
 }
 
+/// Message delivered to the registry service.
+enum JobCommand {
+    State(StateCommand),
+    Request(JobRequest),
+}
+
+impl From<StateCommand> for JobCommand {
+    fn from(command: StateCommand) -> Self {
+        Self::State(command)
+    }
+}
+
+impl From<JobRequest> for JobCommand {
+    fn from(request: JobRequest) -> Self {
+        Self::Request(request)
+    }
+}
+
 /// Registry handle for tracking background jobs.
 ///
 /// Cloning keeps a sender to the same registry service.
@@ -199,9 +226,9 @@ pub fn job_registry_channel() -> (JobRegistry, JobRegistryService) {
 }
 
 impl JobRegistry {
-    async fn send_command(&self, command: JobCommand) {
+    async fn send_command(&self, command: impl Into<JobCommand>) {
         self.tx
-            .send(command)
+            .send(command.into())
             .await
             .expect("job registry service unavailable");
     }
@@ -223,7 +250,7 @@ impl JobRegistry {
         mode: TerminalMode,
         output_path: Option<PathBuf>,
     ) {
-        self.send_command(JobCommand::Register {
+        self.send_command(StateCommand::Register {
             pid,
             task_id: task_id.to_string(),
             execution_key: execution_key.to_string(),
@@ -236,19 +263,19 @@ impl JobRegistry {
 
     /// Attaches a stdin input channel to a running job.
     pub async fn attach_terminal_input(&self, pid: u32, input_tx: TerminalInputSender) {
-        self.send_command(JobCommand::AttachTerminalInput { pid, input_tx })
+        self.send_command(StateCommand::AttachTerminalInput { pid, input_tx })
             .await;
     }
 
     /// Attaches a kill switch used by runtimes without host-visible PIDs.
     pub async fn attach_kill_switch(&self, pid: u32, kill_tx: Sender<()>) {
-        self.send_command(JobCommand::AttachKillSwitch { pid, kill_tx })
+        self.send_command(StateCommand::AttachKillSwitch { pid, kill_tx })
             .await;
     }
 
     /// Appends stdout bytes for a running job.
     pub async fn append_stdout(&self, pid: u32, chunk: Vec<u8>) {
-        self.send_command(JobCommand::AppendTerminalOutput {
+        self.send_command(StateCommand::AppendTerminalOutput {
             pid,
             stream: TerminalStream::Stdout,
             chunk,
@@ -258,7 +285,7 @@ impl JobRegistry {
 
     /// Appends stderr bytes for a running job.
     pub async fn append_stderr(&self, pid: u32, chunk: Vec<u8>) {
-        self.send_command(JobCommand::AppendTerminalOutput {
+        self.send_command(StateCommand::AppendTerminalOutput {
             pid,
             stream: TerminalStream::Stderr,
             chunk,
@@ -268,7 +295,7 @@ impl JobRegistry {
 
     /// Marks stdout stream closed.
     pub async fn close_stdout(&self, pid: u32) {
-        self.send_command(JobCommand::CloseTerminalStream {
+        self.send_command(StateCommand::CloseTerminalStream {
             pid,
             stream: TerminalStream::Stdout,
         })
@@ -277,7 +304,7 @@ impl JobRegistry {
 
     /// Marks stderr stream closed.
     pub async fn close_stderr(&self, pid: u32) {
-        self.send_command(JobCommand::CloseTerminalStream {
+        self.send_command(StateCommand::CloseTerminalStream {
             pid,
             stream: TerminalStream::Stderr,
         })
@@ -290,7 +317,7 @@ impl JobRegistry {
     /// Returns an error when the task does not exist or no stdin channel is attached.
     pub async fn terminal_input(&self, task_id: &str, bytes: Vec<u8>) -> Result<(), String> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobCommand::InputTerminal {
+        self.send_command(JobRequest::InputTerminal {
             task_id: task_id.to_string(),
             bytes,
             reply: reply_tx,
@@ -309,7 +336,7 @@ impl JobRegistry {
         output_path: PathBuf,
     ) -> Result<Vec<u8>, String> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobCommand::StartOutputRedirect {
+        self.send_command(JobRequest::StartOutputRedirect {
             task_id: task_id.to_string(),
             output_path,
             reply: reply_tx,
@@ -321,7 +348,7 @@ impl JobRegistry {
     /// Returns true when both stdout/stderr streams are closed for the PID.
     pub async fn terminal_streams_closed(&self, pid: u32) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobCommand::TerminalStreamsClosed {
+        self.send_command(JobRequest::TerminalStreamsClosed {
             pid,
             reply: reply_tx,
         })
@@ -332,7 +359,7 @@ impl JobRegistry {
     /// Returns collected stdout/stderr buffers for a PID.
     pub async fn terminal_output(&self, pid: u32) -> Option<(Vec<u8>, Vec<u8>)> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobCommand::TerminalOutput {
+        self.send_command(JobRequest::TerminalOutput {
             pid,
             reply: reply_tx,
         })
@@ -351,7 +378,7 @@ impl JobRegistry {
         max_bytes: usize,
     ) -> Result<TerminalDelta, String> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobCommand::ReadTerminalDelta {
+        self.send_command(JobRequest::ReadTerminalDelta {
             task_id: task_id.to_string(),
             cursor,
             max_bytes,
@@ -363,7 +390,7 @@ impl JobRegistry {
 
     /// Marks a job as completed.
     pub async fn complete(&self, pid: u32, exit_code: i32, output_path: Option<PathBuf>) {
-        self.send_command(JobCommand::Complete {
+        self.send_command(StateCommand::Complete {
             pid,
             exit_code,
             output_path,
@@ -373,7 +400,7 @@ impl JobRegistry {
 
     /// Marks a job as failed.
     pub async fn fail(&self, pid: u32, error: &str, output_path: Option<PathBuf>) {
-        self.send_command(JobCommand::Fail {
+        self.send_command(StateCommand::Fail {
             pid,
             error: error.to_string(),
             output_path,
@@ -384,7 +411,7 @@ impl JobRegistry {
     /// Lists all jobs.
     pub async fn list(&self) -> Vec<JobInfo> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobCommand::List { reply: reply_tx })
+        self.send_command(JobRequest::List { reply: reply_tx })
             .await;
         Self::recv_reply(reply_rx).await
     }
@@ -392,8 +419,19 @@ impl JobRegistry {
     /// Gets information about a specific job by PID.
     pub async fn get(&self, pid: u32) -> Option<JobInfo> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobCommand::Get {
+        self.send_command(JobRequest::Get {
             pid,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Gets information about a specific job by its task ID.
+    pub async fn get_by_task_id(&self, task_id: &str) -> Option<JobInfo> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::GetByTaskId {
+            task_id: task_id.to_string(),
             reply: reply_tx,
         })
         .await;
@@ -403,7 +441,7 @@ impl JobRegistry {
     /// Kills a running job by its PID.
     pub async fn kill(&self, pid: u32) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobCommand::Kill {
+        self.send_command(JobRequest::Kill {
             pid,
             reply: reply_tx,
         })
@@ -414,7 +452,7 @@ impl JobRegistry {
     /// Kills a running job by its task ID.
     pub async fn kill_by_task_id(&self, task_id: &str) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobCommand::KillByTaskId {
+        self.send_command(JobRequest::KillByTaskId {
             task_id: task_id.to_string(),
             reply: reply_tx,
         })
@@ -441,7 +479,7 @@ impl JobRegistry {
     /// Kills all running jobs owned by an execution key.
     pub async fn kill_by_execution_key(&self, execution_key: &str) -> usize {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobCommand::KillByExecutionKey {
+        self.send_command(JobRequest::KillByExecutionKey {
             execution_key: execution_key.to_string(),
             reply: reply_tx,
         })
@@ -455,10 +493,13 @@ impl JobRegistry {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         if self
             .tx
-            .send_blocking(JobCommand::KillByExecutionKey {
-                execution_key: execution_key.to_string(),
-                reply: reply_tx,
-            })
+            .send_blocking(
+                JobRequest::KillByExecutionKey {
+                    execution_key: execution_key.to_string(),
+                    reply: reply_tx,
+                }
+                .into(),
+            )
             .is_err()
         {
             return 0;
@@ -469,7 +510,7 @@ impl JobRegistry {
     /// Formats only RUNNING jobs for compression preservation.
     pub async fn format_running_jobs(&self) -> String {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobCommand::FormatRunning { reply: reply_tx })
+        self.send_command(JobRequest::FormatRunning { reply: reply_tx })
             .await;
         Self::recv_reply(reply_rx).await
     }
@@ -477,7 +518,7 @@ impl JobRegistry {
     /// Returns true if there are any running jobs.
     pub async fn has_running(&self) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobCommand::HasRunning { reply: reply_tx })
+        self.send_command(JobRequest::HasRunning { reply: reply_tx })
             .await;
         Self::recv_reply(reply_rx).await
     }
@@ -488,15 +529,18 @@ impl JobRegistryService {
     pub async fn serve(self) {
         let mut jobs: HashMap<u32, JobState> = HashMap::new();
 
-        while let Ok(cmd) = self.rx.recv().await {
-            handle_job_command(&mut jobs, cmd).await;
+        while let Ok(command) = self.rx.recv().await {
+            match command {
+                JobCommand::State(command) => handle_state_command(&mut jobs, command).await,
+                JobCommand::Request(request) => handle_job_request(&mut jobs, request).await,
+            }
         }
     }
 }
 
-async fn handle_job_command(jobs: &mut HashMap<u32, JobState>, cmd: JobCommand) {
-    match cmd {
-        JobCommand::Register {
+async fn handle_state_command(jobs: &mut HashMap<u32, JobState>, command: StateCommand) {
+    match command {
+        StateCommand::Register {
             pid,
             task_id,
             execution_key,
@@ -504,54 +548,67 @@ async fn handle_job_command(jobs: &mut HashMap<u32, JobState>, cmd: JobCommand) 
             mode,
             output_path,
         } => register_job(jobs, pid, task_id, execution_key, script, mode, output_path),
-        JobCommand::AttachTerminalInput { pid, input_tx } => {
+        StateCommand::AttachTerminalInput { pid, input_tx } => {
             if let Some(job) = jobs.get_mut(&pid) {
                 job.input_tx = Some(input_tx);
             }
         }
-        JobCommand::AttachKillSwitch { pid, kill_tx } => {
+        StateCommand::AttachKillSwitch { pid, kill_tx } => {
             if let Some(job) = jobs.get_mut(&pid) {
                 job.kill_switch = Some(kill_tx);
             }
         }
-        JobCommand::AppendTerminalOutput { pid, stream, chunk } => {
+        StateCommand::AppendTerminalOutput { pid, stream, chunk } => {
             append_terminal_output(jobs, pid, stream, chunk).await;
         }
-        JobCommand::CloseTerminalStream { pid, stream } => close_terminal_stream(jobs, pid, stream),
-        JobCommand::Complete {
+        StateCommand::CloseTerminalStream { pid, stream } => {
+            close_terminal_stream(jobs, pid, stream);
+        }
+        StateCommand::Complete {
             pid,
             exit_code,
             output_path,
         } => complete_job(jobs, pid, exit_code, output_path).await,
-        JobCommand::Fail {
+        StateCommand::Fail {
             pid,
             error,
             output_path,
         } => fail_job(jobs, pid, error, output_path).await,
-        JobCommand::List { reply } => {
+    }
+}
+
+async fn handle_job_request(jobs: &mut HashMap<u32, JobState>, request: JobRequest) {
+    match request {
+        JobRequest::List { reply } => {
             let items = jobs.values().map(|state| state.info.clone()).collect();
             let _ = reply.send(items).await;
         }
-        JobCommand::Get { pid, reply } => {
+        JobRequest::Get { pid, reply } => {
             let item = jobs.get(&pid).map(|state| state.info.clone());
             let _ = reply.send(item).await;
         }
-        JobCommand::Kill { pid, reply } => {
+        JobRequest::GetByTaskId { task_id, reply } => {
+            let item = find_pid_by_task_id(jobs, &task_id)
+                .and_then(|pid| jobs.get(&pid))
+                .map(|state| state.info.clone());
+            let _ = reply.send(item).await;
+        }
+        JobRequest::Kill { pid, reply } => {
             let result = kill_job(jobs, pid).await;
             let _ = reply.send(result).await;
         }
-        JobCommand::KillByTaskId { task_id, reply } => {
+        JobRequest::KillByTaskId { task_id, reply } => {
             let result = kill_by_task_id(jobs, &task_id).await;
             let _ = reply.send(result).await;
         }
-        JobCommand::KillByExecutionKey {
+        JobRequest::KillByExecutionKey {
             execution_key,
             reply,
         } => {
             let killed = kill_by_execution_key(jobs, &execution_key).await;
             let _ = reply.send(killed).await;
         }
-        JobCommand::InputTerminal {
+        JobRequest::InputTerminal {
             task_id,
             bytes,
             reply,
@@ -559,7 +616,7 @@ async fn handle_job_command(jobs: &mut HashMap<u32, JobState>, cmd: JobCommand) 
             let result = input_terminal(jobs, &task_id, bytes).await;
             let _ = reply.send(result).await;
         }
-        JobCommand::StartOutputRedirect {
+        JobRequest::StartOutputRedirect {
             task_id,
             output_path,
             reply,
@@ -567,10 +624,10 @@ async fn handle_job_command(jobs: &mut HashMap<u32, JobState>, cmd: JobCommand) 
             let result = redirect_task_output(jobs, &task_id, output_path).await;
             let _ = reply.send(result).await;
         }
-        JobCommand::TerminalOutput { pid, reply } => {
+        JobRequest::TerminalOutput { pid, reply } => {
             send_terminal_output(jobs, pid, reply).await;
         }
-        JobCommand::ReadTerminalDelta {
+        JobRequest::ReadTerminalDelta {
             task_id,
             cursor,
             max_bytes,
@@ -579,16 +636,16 @@ async fn handle_job_command(jobs: &mut HashMap<u32, JobState>, cmd: JobCommand) 
             let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes);
             let _ = reply.send(result).await;
         }
-        JobCommand::TerminalStreamsClosed { pid, reply } => {
+        JobRequest::TerminalStreamsClosed { pid, reply } => {
             let closed = jobs
                 .get(&pid)
                 .is_some_and(|job| job.stdout_closed && job.stderr_closed);
             let _ = reply.send(closed).await;
         }
-        JobCommand::FormatRunning { reply } => {
+        JobRequest::FormatRunning { reply } => {
             let _ = reply.send(format_running_jobs(jobs)).await;
         }
-        JobCommand::HasRunning { reply } => {
+        JobRequest::HasRunning { reply } => {
             let _ = reply.send(has_running_job(jobs)).await;
         }
     }
