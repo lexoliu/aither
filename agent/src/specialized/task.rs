@@ -551,7 +551,8 @@ pub struct SubagentTool<LLM> {
     /// handing the tool to a builder to observe or cancel runs.
     runs: SubagentRuns,
     /// Prompt-cache keep-alive settings applied to every child agent; `None`
-    /// disables keep-alive. The caller sets it only for Anthropic providers.
+    /// disables keep-alive. The caller sets it only for the Claude client,
+    /// which also puts the children on the five-minute cache TTL.
     cache_keep_alive: Option<crate::config::CacheKeepAlive>,
     /// Finished subagents the parent can continue; each lives until its
     /// own prompt-cache lifetime passes.
@@ -645,7 +646,10 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
 
     /// Enables prompt-cache keep-alive on child agents with these settings.
     ///
-    /// Call it only when the tool's models are served by Anthropic.
+    /// Call it only when the tool's models are served through the Claude
+    /// client. It also puts those children on the five-minute Claude cache
+    /// TTL, so their cache lifetime is 300 s; without it they keep their
+    /// provider's lifetime.
     #[must_use]
     pub const fn with_cache_keep_alive(
         mut self,
@@ -996,8 +1000,14 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                 .max_iterations(def.max_iterations),
             Source::Registered(subagent_type) => subagent_type.builder(selected),
         };
+        // Keep-alive is configured only for the Claude client, whose
+        // subagents run on the five-minute cache: in-run waits are covered
+        // by the keep-alive and a finished subagent is continuable until
+        // that entry expires.
         let agent_builder = match &self.cache_keep_alive {
-            Some(keep_alive) => agent_builder.cache_keep_alive(keep_alive.clone()),
+            Some(keep_alive) => agent_builder
+                .cache_keep_alive(keep_alive.clone())
+                .claude_cache_ttl(aither_core::llm::model::ClaudePromptCacheTtl::FiveMinutes),
             None => agent_builder,
         };
 
@@ -1854,7 +1864,6 @@ You are a file-defined agent.
         author: &'static str,
         requests: async_channel::Sender<LLMRequest>,
         keep_alive: Option<crate::config::CacheKeepAlive>,
-        cache_lifetime: std::time::Duration,
     ) -> (
         SubagentTool<KeepAliveMockLlm>,
         aither_sandbox::BackgroundTaskSender,
@@ -1879,10 +1888,6 @@ You are a file-defined agent.
                 crate::AgentBuilder::new(llm)
                     .agent_kind(crate::AgentKind::Chatbot)
                     .max_iterations(4)
-                    .prompt_cache(
-                        crate::context::PromptCache::new("keep-alive-test")
-                            .with_lifetime(crate::context::CacheLifetime::Limited(cache_lifetime)),
-                    )
                     .background_channels(receiver.clone(), child_jobs.clone())
             }),
         );
@@ -1927,10 +1932,12 @@ You are a file-defined agent.
             "Anthropic",
             request_tx,
             Some(crate::config::CacheKeepAlive {
-                send_before_expiry: std::time::Duration::from_millis(150),
+                // The Claude-client subagent runs on the real five-minute
+                // lifetime; sending this long before expiry makes the
+                // first keep-alive due 250 ms into the wait.
+                send_before_expiry: std::time::Duration::from_millis(299_750),
                 frequent_idle_threshold: 2,
             }),
-            std::time::Duration::from_millis(400),
         );
         tokio::spawn(job_service.serve());
         register_running_job(&job_registry, 4242, "sleep 2").await;
@@ -2021,12 +2028,8 @@ You are a file-defined agent.
     async fn subagent_without_keep_alive_config_gets_no_keep_alives() {
         let (dir, prompt_file) = write_prompt_file("keep-alive-other-prompt", "hold a job");
         let (request_tx, request_rx) = async_channel::unbounded();
-        let (tool, sender, job_registry, job_service) = keep_alive_tool(
-            "Anthropic",
-            request_tx,
-            None,
-            std::time::Duration::from_secs(300),
-        );
+        let (tool, sender, job_registry, job_service) =
+            keep_alive_tool("Anthropic", request_tx, None);
         tokio::spawn(job_service.serve());
         register_running_job(&job_registry, 4243, "sleep 2").await;
         sender.task_started();
@@ -2188,8 +2191,11 @@ You are a file-defined agent.
         }
     }
 
+    /// `keep_alive` marks the tool as serving the Claude client; `lifetime`
+    /// overrides the cache lifetime the subagent runs with, and `None`
+    /// leaves the one `SubagentTool` itself assigns.
     fn resume_tool(
-        lifetime: CacheLifetime,
+        lifetime: Option<CacheLifetime>,
         keep_alive: Option<crate::config::CacheKeepAlive>,
     ) -> (SubagentTool<EchoLlm>, async_channel::Receiver<LLMRequest>) {
         let (request_tx, request_rx) = async_channel::unbounded();
@@ -2204,12 +2210,15 @@ You are a file-defined agent.
         .with_type(
             "worker",
             SubagentType::new("worker for resume tests", move |llm| {
-                crate::AgentBuilder::new(llm)
+                let builder = crate::AgentBuilder::new(llm)
                     .agent_kind(crate::AgentKind::Chatbot)
-                    .max_iterations(2)
-                    .prompt_cache(
+                    .max_iterations(2);
+                match lifetime {
+                    Some(lifetime) => builder.prompt_cache(
                         crate::context::PromptCache::new("resume-test").with_lifetime(lifetime),
-                    )
+                    ),
+                    None => builder,
+                }
             }),
         );
         (tool, request_rx)
@@ -2243,7 +2252,7 @@ You are a file-defined agent.
     #[tokio::test]
     async fn finished_subagent_continues_with_its_earlier_conversation() {
         let (tool, requests) = resume_tool(
-            CacheLifetime::Limited(std::time::Duration::from_secs(300)),
+            None,
             Some(crate::config::CacheKeepAlive {
                 send_before_expiry: std::time::Duration::ZERO,
                 frequent_idle_threshold: 3,
@@ -2280,10 +2289,7 @@ You are a file-defined agent.
 
     #[tokio::test]
     async fn continuing_an_unknown_id_is_an_error() {
-        let (tool, _requests) = resume_tool(
-            CacheLifetime::Limited(std::time::Duration::from_secs(300)),
-            None,
-        );
+        let (tool, _requests) = resume_tool(None, None);
         let (dir, prompt_file) = write_prompt_file("resume-unknown", "follow-up");
         let error = Tool::call(&tool, resume_args(&prompt_file, 99), ToolContext::new())
             .await
@@ -2295,26 +2301,120 @@ You are a file-defined agent.
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Pretends `age` has passed since the finished subagent's last request,
+    /// so expiry runs against its real cache lifetime without sleeping.
+    fn age_finished_subagent(tool: &SubagentTool<EchoLlm>, id: u64, age: std::time::Duration) {
+        let mut inner = tool
+            .finished
+            .inner
+            .lock()
+            .expect("finished subagents lock poisoned");
+        let Some(FinishedSlot::Idle(finished)) = inner.slots.get_mut(&id) else {
+            panic!("subagent {id} is not idle");
+        };
+        finished.agent.last_request_started_at = Instant::now().checked_sub(age);
+        drop(inner);
+    }
+
     #[tokio::test]
-    async fn continuing_after_the_cache_lifetime_is_an_expiry_error() {
-        let (tool, _requests) = resume_tool(
-            CacheLifetime::Limited(std::time::Duration::from_millis(100)),
-            None,
-        );
+    async fn claude_subagent_expires_after_its_five_minute_lifetime() {
+        let (tool, _requests) = resume_tool(None, Some(crate::config::CacheKeepAlive::default()));
         let (dir, prompt_file) = write_prompt_file("resume-expired", "first");
         let first = first_run(&tool, &prompt_file).await;
         let id = first["id"].as_u64().expect("result names an id");
 
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        age_finished_subagent(&tool, id, std::time::Duration::from_secs(301));
         let error = Tool::call(&tool, resume_args(&prompt_file, id), ToolContext::new())
             .await
             .expect_err("expired subagent must fail");
         let message = error.to_string();
         assert!(message.contains("expired"), "{message}");
         assert!(
-            message.contains("100ms"),
+            message.contains("300s"),
             "the error names the lifetime the id expired after: {message}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn claude_subagent_continues_just_inside_its_five_minute_lifetime() {
+        let (tool, _requests) = resume_tool(None, Some(crate::config::CacheKeepAlive::default()));
+        let (dir, prompt_file) = write_prompt_file("resume-inside", "first");
+        let first = first_run(&tool, &prompt_file).await;
+        let id = first["id"].as_u64().expect("result names an id");
+
+        age_finished_subagent(&tool, id, std::time::Duration::from_secs(290));
+        Tool::call(&tool, resume_args(&prompt_file, id), ToolContext::new())
+            .await
+            .expect("a subagent inside its lifetime continues");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A subagent on another client keeps the lifetime of its provider, not
+    /// the Claude five minutes.
+    #[tokio::test]
+    async fn non_claude_subagent_keeps_the_default_lifetime() {
+        let (tool, _requests) = resume_tool(None, None);
+        let (dir, prompt_file) = write_prompt_file("resume-default-lifetime", "first");
+        let first = first_run(&tool, &prompt_file).await;
+        let id = first["id"].as_u64().expect("result names an id");
+
+        age_finished_subagent(&tool, id, std::time::Duration::from_secs(301));
+        Tool::call(&tool, resume_args(&prompt_file, id), ToolContext::new())
+            .await
+            .expect("past five minutes a non-Claude subagent still continues");
+
+        age_finished_subagent(&tool, id, std::time::Duration::from_secs(3601));
+        let error = Tool::call(&tool, resume_args(&prompt_file, id), ToolContext::new())
+            .await
+            .expect_err("expired subagent must fail");
+        assert!(error.to_string().contains("3600s"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The request a Claude-client subagent sends asks for the five-minute
+    /// cache (which the Claude client serializes without a `ttl` field),
+    /// while the main agent's asks for one hour.
+    #[tokio::test]
+    async fn claude_subagent_requests_five_minute_cache_and_main_agent_one_hour() {
+        use aither_core::llm::model::ClaudePromptCacheTtl;
+
+        let claude_ttl = |request: &LLMRequest| {
+            request
+                .parameters()
+                .cache
+                .claude
+                .as_ref()
+                .expect("request carries Claude cache control")
+                .ttl
+        };
+
+        let (tool, subagent_requests) =
+            resume_tool(None, Some(crate::config::CacheKeepAlive::default()));
+        let (dir, prompt_file) = write_prompt_file("cache-ttl-claude", "first");
+        first_run(&tool, &prompt_file).await;
+        let subagent_request = subagent_requests.try_recv().expect("subagent request");
+        assert_eq!(
+            claude_ttl(&subagent_request),
+            ClaudePromptCacheTtl::FiveMinutes
+        );
+
+        let (other, other_requests) = resume_tool(None, None);
+        first_run(&other, &prompt_file).await;
+        let other_request = other_requests.try_recv().expect("other subagent request");
+        assert_eq!(claude_ttl(&other_request), ClaudePromptCacheTtl::OneHour);
+
+        let (main_tx, main_requests) = async_channel::unbounded();
+        let mut main_agent = crate::AgentBuilder::new(EchoLlm {
+            requests: main_tx,
+            replies: Arc::default(),
+        })
+        .agent_kind(crate::AgentKind::Chatbot)
+        .build();
+        main_agent.query("hello").await.expect("main agent query");
+        let main_request = main_requests.try_recv().expect("main agent request");
+        assert_eq!(claude_ttl(&main_request), ClaudePromptCacheTtl::OneHour);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2342,10 +2442,7 @@ You are a file-defined agent.
     /// prompt-cache lifetime it ran with passes.
     #[tokio::test]
     async fn finished_subagent_without_keep_alive_still_continues() {
-        let (tool, requests) = resume_tool(
-            CacheLifetime::Limited(std::time::Duration::from_secs(300)),
-            None,
-        );
+        let (tool, requests) = resume_tool(None, None);
         let (dir, first_prompt) = write_prompt_file("resume-no-keepalive", "first marker");
         let first = first_run(&tool, &first_prompt).await;
         assert_eq!(first["status"], "completed");
@@ -2372,7 +2469,7 @@ You are a file-defined agent.
     /// A permanent prompt-cache lifetime never expires its continuation id.
     #[tokio::test]
     async fn permanent_cache_lifetime_never_expires() {
-        let (tool, _requests) = resume_tool(CacheLifetime::Permanent, None);
+        let (tool, _requests) = resume_tool(Some(CacheLifetime::Permanent), None);
         let (dir, first_prompt) = write_prompt_file("resume-permanent", "first");
         let first = first_run(&tool, &first_prompt).await;
         let id = first["id"].as_u64().expect("result names an id");

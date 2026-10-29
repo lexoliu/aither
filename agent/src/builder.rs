@@ -488,6 +488,13 @@ where
         self
     }
 
+    /// Sets the Claude cache retention of the session's prompt cache,
+    /// keeping its session key; the cache lifetime follows the retention.
+    pub fn claude_cache_ttl(mut self, ttl: aither_core::llm::model::ClaudePromptCacheTtl) -> Self {
+        self.prompt_cache = self.prompt_cache.with_ttl(ttl);
+        self
+    }
+
     /// Enables prompt-cache keep-alive while the run waits on its own
     /// background commands.
     ///
