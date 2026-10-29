@@ -4,6 +4,19 @@ use crate::context_window::ContextWindowPhase;
 use crate::error::AgentError;
 use crate::hook::CheckpointReason;
 use aither_core::llm::ToolResult;
+use jiff::Timestamp;
+
+/// An [`AgentEvent`] together with the UTC time it was emitted.
+///
+/// The time is taken at the emission point inside the run, not when the
+/// consumer reads the event.
+#[derive(Debug, Clone)]
+pub struct TimedEvent {
+    /// When the agent emitted the event.
+    pub at: Timestamp,
+    /// The event itself.
+    pub event: AgentEvent,
+}
 
 /// Reason why an agent run is paused or resumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
