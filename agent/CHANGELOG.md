@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/lexoliu/aither/compare/agent-v0.10.1...agent-v0.11.0) - 2026-10-29
+
+### Added
+
+- *(sandbox)* [**breaking**] bound foreground terminal runs at 10 s and add terminal_background
+
+### Fixed
+
+- [**breaking**] text returned to the model is natural language, never serialized
+- [**breaking**] fail instead of guessing an unknown model context window
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into fix/208-no-json
+- Merge remote-tracking branch 'origin/dev' into fix/208-no-json
+- Emit events for provider-hosted tool calls ([#203](https://github.com/lexoliu/aither/pull/203))
+- Merge pull request #200 from lexoliu/feat/189-bounded-terminal
+- Merge pull request #185 from lexoliu/fix/181-no-context-fallback
+- *(agent)* initialize before building live request messages in skills test
+
 ## [0.10.1](https://github.com/lexoliu/aither/compare/agent-v0.10.0...agent-v0.10.1) - 2026-10-20
 
 ### Fixed

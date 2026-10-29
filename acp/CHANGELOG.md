@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/lexoliu/aither/compare/acp-v0.10.1...acp-v0.11.0) - 2026-10-29
+
+### Added
+
+- *(sandbox)* [**breaking**] bound foreground terminal runs at 10 s and add terminal_background
+
+### Fixed
+
+- [**breaking**] text returned to the model is natural language, never serialized
+- [**breaking**] fail instead of guessing an unknown model context window
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into fix/208-no-json
+- Emit events for provider-hosted tool calls ([#203](https://github.com/lexoliu/aither/pull/203))
+- Merge pull request #200 from lexoliu/feat/189-bounded-terminal
+
 ## [0.10.1](https://github.com/lexoliu/aither/compare/acp-v0.10.0...acp-v0.10.1) - 2026-10-20
 
 ### Fixed

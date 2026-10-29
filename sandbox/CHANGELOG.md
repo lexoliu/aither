@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/lexoliu/aither/compare/sandbox-v0.10.1...sandbox-v0.11.0) - 2026-10-29
+
+### Added
+
+- *(sandbox)* [**breaking**] bound foreground terminal runs at 10 s and add terminal_background
+
+### Fixed
+
+- [**breaking**] text returned to the model is natural language, never serialized
+- *(sandbox)* keep cut output inline when the cut is not smaller
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into fix/208-no-json
+- Merge remote-tracking branch 'origin/dev' into fix/208-no-json
+- Merge pull request #200 from lexoliu/feat/189-bounded-terminal
+
 ## [0.10.1](https://github.com/lexoliu/aither/compare/sandbox-v0.10.0...sandbox-v0.10.1) - 2026-10-20
 
 ### Fixed

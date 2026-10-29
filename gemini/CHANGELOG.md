@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/lexoliu/aither/compare/gemini-v0.10.1...gemini-v0.11.0) - 2026-10-29
+
+### Fixed
+
+- [**breaking**] fail instead of guessing an unknown model context window
+
+### Other
+
+- Emit events for provider-hosted tool calls ([#203](https://github.com/lexoliu/aither/pull/203))
+
 ## [0.10.0](https://github.com/lexoliu/aither/compare/gemini-v0.9.2...gemini-v0.10.0) - 2026-10-18
 
 ### Other

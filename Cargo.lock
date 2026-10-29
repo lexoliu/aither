@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "aither"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-agent",
  "aither-apple",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "aither-acp"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "aither-agent"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-attachments",
  "aither-command",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "aither-apple"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "async-channel",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "aither-attachments"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "aither-browser"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "aither-claude"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "aither-cli"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-acp",
  "aither-agent",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "aither-cloud"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-claude",
  "aither-codex",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "aither-codex"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "aither-command"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "aither-copilot"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "aither-core"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-derive",
  "anyhow",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "aither-derive"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "aither-fs"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "aither-gemini"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "aither-llama"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "async-channel",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "aither-mcp"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "aither-sandbox",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "aither-mem0"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "aither-gemini",
@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "aither-models"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "async-fs",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "aither-openai"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "aither-ort"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "async-channel",
@@ -472,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "aither-patch"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.21",
@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "aither-rag"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "aither-sandbox"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "aither-search"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "aither-rag",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "aither-skills"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "async-fs",
  "futures-lite",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "aither-webfetch"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "aither-websearch"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aither-core",
  "anyhow",
