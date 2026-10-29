@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/lexoliu/aither/compare/cli-v0.10.1...cli-v0.11.0) - 2026-10-29
+
+### Added
+
+- *(agent)* [**breaking**] take subagent prompts from files and route by the fast model
+
+### Fixed
+
+- [**breaking**] text returned to the model is natural language, never serialized
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into fix/208-no-json
+
 ## [0.10.0](https://github.com/lexoliu/aither/compare/cli-v0.9.2...cli-v0.10.0) - 2026-10-18
 
 ### Other

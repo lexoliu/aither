@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/lexoliu/aither/compare/core-v0.10.1...core-v0.11.0) - 2026-10-29
+
+### Fixed
+
+- [**breaking**] text returned to the model is natural language, never serialized
+- [**breaking**] fail instead of guessing an unknown model context window
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into fix/208-no-json
+- Emit events for provider-hosted tool calls ([#203](https://github.com/lexoliu/aither/pull/203))
+
 ## [0.10.0](https://github.com/lexoliu/aither/compare/core-v0.9.2...core-v0.10.0) - 2026-10-18
 
 ### Other

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/lexoliu/aither/compare/copilot-v0.10.1...copilot-v0.11.0) - 2026-10-29
+
+### Fixed
+
+- [**breaking**] fail instead of guessing an unknown model context window
+
 ## [0.10.0](https://github.com/lexoliu/aither/compare/copilot-v0.9.2...copilot-v0.10.0) - 2026-10-18
 
 ### Other

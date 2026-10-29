@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/lexoliu/aither/compare/claude-v0.10.1...claude-v0.11.0) - 2026-10-29
+
+### Added
+
+- *(agent)* keep idle Anthropic subagents' cache warm while they wait on background commands
+
+### Fixed
+
+- *(claude)* project non-streaming responses through the streaming block lifecycle
+- [**breaking**] fail instead of guessing an unknown model context window
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into feat/192-subagent-keepalive
+
 ## [0.10.0](https://github.com/lexoliu/aither/compare/claude-v0.9.2...claude-v0.10.0) - 2026-10-18
 
 ### Other
