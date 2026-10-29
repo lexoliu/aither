@@ -1,0 +1,7 @@
+{% match outcome %}{% when SubagentReport::Cancelled %}Subagent '{{ subagent }}' was cancelled by the user.{% when SubagentReport::Completed { model, result, id, alert } %}Subagent '{{ subagent }}' completed{% if let Some(model) = model %} (model: {{ model }}){% endif %}.
+
+{{ result }}
+
+Continue this subagent with `subagent resume --id {{ id }}` while its prompt cache is still warm.{% if let Some(alert) = alert %}
+
+{{ alert }}{% endif %}{% endmatch %}{% include "subagent_commits.txt" %}

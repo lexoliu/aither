@@ -90,7 +90,7 @@ pub use context::{
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;
-pub use event::AgentEvent;
+pub use event::{AgentEvent, TimedEvent};
 pub use hook::{
     CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction, StopContext,
     StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,

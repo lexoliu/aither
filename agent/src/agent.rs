@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use aither_core::{
     LanguageModel,
     llm::{
-        Attachment, Event, LLMRequest, Message, ReasoningState, ToolCall,
-        model::Profile as ModelProfile,
+        Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, StoredFile,
+        ToolCall, model::Profile as ModelProfile,
     },
 };
 use askama::Template;
@@ -31,11 +31,11 @@ use crate::{
     context::{
         AnyContextSource, BackgroundJobs, Block, CacheLifetime, CompactionFork,
         CompletedCompaction, Context, ContextBudget, HandoffDocument, PendingCompaction,
-        PromptCache, TasksDocument, restore_context, serialize_xml,
+        PromptCache, TasksDocument, restore_context,
     },
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
-    event::{AgentEvent, RunPauseReason},
+    event::{AgentEvent, RunPauseReason, TimedEvent},
     hook::{
         CheckpointContext, CheckpointReason, Hook, PostToolAction, PreToolAction, StopContext,
         StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
@@ -112,18 +112,21 @@ struct ModelTurn {
 /// after the consumer dropped the stream are discarded.
 #[derive(Clone)]
 struct EventSink {
-    sender: async_channel::Sender<AgentEvent>,
+    sender: async_channel::Sender<TimedEvent>,
 }
 
 impl EventSink {
     fn emit(&self, event: AgentEvent) {
-        let _ = self.sender.try_send(event);
+        let _ = self.sender.try_send(TimedEvent {
+            at: jiff::Timestamp::now(),
+            event,
+        });
     }
 }
 
 /// One step of the merged run/event stream in [`Agent::run`].
 enum RunStep {
-    Event(Option<AgentEvent>),
+    Event(Option<TimedEvent>),
     Finished(Result<(), AgentError>),
 }
 
@@ -227,10 +230,18 @@ fn ensure_non_empty_tool_call_ids(
     if tool_calls.iter().all(|call| !call.id.trim().is_empty()) {
         return Ok(());
     }
-    let tool_calls_json = serde_json::to_string(tool_calls)
-        .unwrap_or_else(|error| format!("failed to serialize tool calls: {error}"));
+    tracing::error!(
+        response_text,
+        ?tool_calls,
+        "provider emitted tool call with empty id"
+    );
+    let tool_calls_text = tool_calls
+        .iter()
+        .map(|call| format!("{} ({})", call.name, call.id))
+        .collect::<Vec<_>>()
+        .join(", ");
     Err(AgentError::Llm(format!(
-        "provider emitted tool call with empty id; response_text={response_text:?}; tool_calls={tool_calls_json}"
+        "provider emitted tool call with empty id; response_text={response_text:?}; tool_calls=[{tool_calls_text}]"
     )))
 }
 
@@ -287,7 +298,7 @@ struct EmittedCheckpoint {
 struct BackgroundStartedReminderTemplate<'a> {
     task_id: &'a str,
     output_preview: &'a str,
-    output_file: &'a str,
+    output_file: &'a StoredFile,
 }
 
 /// `knowledge_and_time` system block. `websearch_command` selects whether the
@@ -299,26 +310,45 @@ pub struct KnowledgeAndTimeTemplate {
     pub websearch_command: bool,
 }
 
-#[derive(serde::Serialize)]
-struct BackgroundTerminalResultXml {
-    #[serde(rename = "@task_id")]
-    task_id: String,
-    script: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exit_code: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stderr: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+#[derive(Template)]
+#[template(path = "background_terminal_result.txt", escape = "none")]
+struct BackgroundTerminalResultTemplate<'a> {
+    task_id: &'a str,
+    script: &'a str,
+    outcome: BackgroundOutcome<'a>,
+    output: Option<&'a str>,
+    stderr: Option<&'a str>,
 }
 
-struct BackgroundTaskStartedEvent {
-    task_id: String,
-    output_preview: String,
-    output_file: String,
-    reminder: String,
+/// The alert text for a background job event.
+#[derive(Template)]
+#[template(path = "job_alert.txt", escape = "none")]
+struct JobAlertTemplate<'a> {
+    alert: &'a JobAlertText<'a>,
+}
+
+/// What a background job alert reports.
+enum JobAlertText<'a> {
+    /// The job crossed the long-running threshold.
+    LongRunning { task_id: &'a str, elapsed: String },
+    /// The job is waiting for input on its stdin.
+    StdinBlocked { task_id: &'a str },
+    /// Watching the job's stdin failed.
+    StdinProbeFailed { task_id: &'a str, error: &'a str },
+}
+
+fn job_alert_text(alert: &JobAlertText<'_>) -> String {
+    JobAlertTemplate { alert }
+        .render()
+        .expect("job alert template must render")
+}
+
+/// How a finished background task ended.
+enum BackgroundOutcome<'a> {
+    /// The script ran to completion.
+    Finished { code: i32 },
+    /// The task could not be run or tracked to completion.
+    Failed { error: &'a str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -993,9 +1023,9 @@ where
             if let Some(reason) = pause_reason_for_tool(call_name.as_str()) {
                 events.emit(AgentEvent::run_resumed(reason, call_id.clone()));
             }
-            let content = tool_result.render_for_model()?;
+            let content = tool_result.render_for_model();
             has_tool_error |= tool_result_is_error(&tool_result, &content);
-            self.push_terminal_followup_events(is_terminal_call, &tool_result, &content, events);
+            self.push_terminal_followup_events(is_terminal_call, &tool_result, events);
             self.context.push(Message::tool(&call_id, content));
         }
         let has_terminal_tool = known_tools.iter().any(|name| name == "terminal");
@@ -1022,18 +1052,27 @@ where
         &mut self,
         is_terminal_call: bool,
         tool_result: &aither_core::llm::ToolResult,
-        content: &str,
         events: &EventSink,
     ) {
         if !is_terminal_call || tool_result.is_error() {
             return;
         }
-        if let Some(started) = Self::format_background_started_event(content) {
-            self.context.push(Message::system(&started.reminder));
+        let Some(receiver) = self.background_receiver.clone() else {
+            return;
+        };
+        for started in receiver.take_started() {
+            let reminder = BackgroundStartedReminderTemplate {
+                task_id: &started.task_id,
+                output_preview: &started.output_preview,
+                output_file: &started.output_file,
+            }
+            .render()
+            .expect("background started reminder template must render");
+            self.context.push(Message::system(&reminder));
             events.emit(AgentEvent::background_task_started(
                 started.task_id,
                 started.output_preview,
-                started.output_file,
+                started.output_file.url,
             ));
         }
     }
@@ -1043,7 +1082,7 @@ where
             self.push_job_alerts();
             for task in receiver.take_completed() {
                 tracing::info!(task_id = %task.task_id, "background task completed");
-                let result_msg = Self::format_background_task_result(&task);
+                let result_msg = format_background_task_result(&task);
                 self.context.push(Message::system(&result_msg));
                 events.emit(AgentEvent::background_task_completed(
                     task.task_id.clone(),
@@ -1293,27 +1332,25 @@ where
         match alert {
             JobAlert::LongRunning(job) => {
                 tracing::info!(task_id = %job.task_id, "background job crossed long-running threshold");
-                self.push_system_alert(format!(
-                    "Background job '{}' has been running for {} — check with terminal_read that it is still progressing normally, and terminal_kill it if it is stuck.",
-                    job.task_id,
-                    format_job_elapsed(job.elapsed)
-                ));
+                self.push_system_alert(job_alert_text(&JobAlertText::LongRunning {
+                    task_id: &job.task_id,
+                    elapsed: format_job_elapsed(job.elapsed),
+                }));
                 false
             }
             JobAlert::StdinBlocked(job) => {
                 tracing::info!(task_id = %job.task_id, "background job is blocked on stdin");
-                self.push_system_alert(format!(
-                    "Background job '{}' is waiting for input on stdin — send it with terminal_input, or terminal_kill it if it needs none.",
-                    job.task_id
-                ));
+                self.push_system_alert(job_alert_text(&JobAlertText::StdinBlocked {
+                    task_id: &job.task_id,
+                }));
                 true
             }
             JobAlert::StdinProbeFailed(job) => {
                 tracing::warn!(task_id = %job.task_id, error = %job.error, "stdin watch failed");
-                self.push_system_alert(format!(
-                    "Monitoring background job '{}' for stdin reads failed: {} — it cannot report being blocked on stdin.",
-                    job.task_id, job.error
-                ));
+                self.push_system_alert(job_alert_text(&JobAlertText::StdinProbeFailed {
+                    task_id: &job.task_id,
+                    error: &job.error,
+                }));
                 false
             }
         }
@@ -1338,7 +1375,7 @@ where
         task: aither_sandbox::CompletedTask,
         events: &EventSink,
     ) {
-        let result_msg = Self::format_background_task_result(&task);
+        let result_msg = format_background_task_result(&task);
         self.context.push(Message::system(&result_msg));
         events.emit(AgentEvent::background_task_completed(
             task.task_id,
@@ -1403,7 +1440,7 @@ where
 
         let mut final_text = String::new();
         while let Some(event) = stream.next().await {
-            match event? {
+            match event?.event {
                 AgentEvent::Text(chunk) => final_text.push_str(&chunk),
                 AgentEvent::Complete {
                     final_text: text, ..
@@ -1440,7 +1477,7 @@ where
         &mut self,
         prompt: &str,
         attachments: impl IntoIterator<Item = Attachment>,
-    ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
+    ) -> impl Stream<Item = Result<TimedEvent, AgentError>> + '_ {
         let prompt = prompt.to_string();
         let attachments: Vec<Attachment> = attachments.into_iter().collect();
 
@@ -2233,84 +2270,40 @@ where
             message_count: self.context.len_recent(),
         })
     }
-
-    /// Formats a reminder and event payload when `terminal` has been auto-promoted to background.
-    fn format_background_started_event(tool_content: &str) -> Option<BackgroundTaskStartedEvent> {
-        let payload: serde_json::Value = serde_json::from_str(tool_content).ok()?;
-        let status = payload.get("status")?.as_str()?;
-        if status != "running" {
-            return None;
-        }
-
-        let task_id = payload.get("task_id")?.as_str()?.trim();
-        if task_id.is_empty() {
-            return None;
-        }
-
-        let output_preview = payload
-            .get("stdout")
-            .and_then(|stdout| stdout.get("content"))
-            .and_then(|content| content.get("text"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .unwrap_or("(no output yet)");
-
-        let output_file = payload
-            .get("stdout")
-            .and_then(|stdout| stdout.get("url"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("(missing output file)");
-
-        let reminder = BackgroundStartedReminderTemplate {
-            task_id,
-            output_preview,
-            output_file,
-        }
-        .render()
-        .ok()?;
-
-        Some(BackgroundTaskStartedEvent {
-            task_id: task_id.to_string(),
-            output_preview: output_preview.to_string(),
-            output_file: output_file.to_string(),
-            reminder,
-        })
-    }
-
-    /// Formats a completed background task result as a system message.
-    fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String {
-        let mut xml = BackgroundTerminalResultXml {
-            task_id: task.task_id.clone(),
-            script: truncate_script(&task.script, 100).to_string(),
-            exit_code: None,
-            output: None,
-            stderr: None,
-            error: None,
-        };
-
-        match &task.result {
-            Ok(result) => {
-                xml.exit_code = Some(result.exit_code);
-                let stdout = result.stdout.to_string();
-                if !stdout.is_empty() {
-                    xml.output = Some(stdout);
-                }
-                if let Some(stderr) = &result.stderr {
-                    let stderr = stderr.to_string();
-                    if !stderr.is_empty() {
-                        xml.stderr = Some(stderr);
-                    }
-                }
-            }
-            Err(error) => {
-                xml.error = Some(error.to_string());
-            }
-        }
-
-        serialize_xml("background-terminal-result", &xml)
-    }
 }
+
+/// Formats a completed background task result as a system message.
+fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String {
+    let error_text;
+    let (outcome, output, stderr) = match &task.result {
+        Ok(command) => (
+            BackgroundOutcome::Finished {
+                code: command.exit_code,
+            },
+            output_block(&command.stdout),
+            command.stderr.as_ref().and_then(output_block),
+        ),
+        Err(error) => {
+            error_text = error.to_string();
+            (BackgroundOutcome::Failed { error: &error_text }, None, None)
+        }
+    };
+    BackgroundTerminalResultTemplate {
+        task_id: &task.task_id,
+        script: truncate_script(&task.script, 100),
+        outcome,
+        output: output.as_deref(),
+        stderr: stderr.as_deref(),
+    }
+    .render()
+    .expect("background terminal result template must render")
+}
+
+/// A command's output as a block of lines, or `None` when it printed nothing.
+fn output_block(stream: &CommandStream) -> Option<String> {
+    Some(stream.render_for_model()).filter(|block| !block.is_empty())
+}
+
 fn format_builtin_tool_result(tool: &str, result: &str) -> String {
     let mut text = String::from("[");
     text.push_str(tool);
@@ -2423,7 +2416,97 @@ fn truncate_script(script: &str, max_chars: usize) -> &str {
 mod tests {
     use super::*;
 
+    use aither_sandbox::{CompletedCommand, CompletedTask, TerminalError};
     use futures_core::Stream;
+
+    fn inline(text: &str) -> CommandStream {
+        CommandStream::Inline(text.to_string())
+    }
+
+    fn completed(result: Result<CompletedCommand, TerminalError>) -> CompletedTask {
+        CompletedTask {
+            task_id: "amber-forest-thunder-pearl".to_string(),
+            script: "make test".to_string(),
+            result,
+        }
+    }
+
+    #[test]
+    fn background_result_exit_zero_with_output() {
+        let task = completed(Ok(CompletedCommand {
+            stdout: inline("all green"),
+            stderr: None,
+            exit_code: 0,
+        }));
+        assert_eq!(
+            format_background_task_result(&task),
+            "Background task 'amber-forest-thunder-pearl' (`make test`) finished with exit code 0.\nall green\n"
+        );
+    }
+
+    #[test]
+    fn background_result_non_zero_exit_with_stderr() {
+        let task = completed(Ok(CompletedCommand {
+            stdout: inline("1 passed"),
+            stderr: Some(inline("boom")),
+            exit_code: 101,
+        }));
+        assert_eq!(
+            format_background_task_result(&task),
+            "Background task 'amber-forest-thunder-pearl' (`make test`) finished with exit code 101.\n1 passed\nstderr:\nboom\n"
+        );
+    }
+
+    #[test]
+    fn job_alerts_render_as_prose() {
+        assert_eq!(
+            job_alert_text(&JobAlertText::StdinBlocked { task_id: "amber" }),
+            "Background job 'amber' is waiting for input on stdin — send it with terminal_input, or terminal_kill it if it needs none."
+        );
+        assert_eq!(
+            job_alert_text(&JobAlertText::StdinProbeFailed {
+                task_id: "amber",
+                error: "no /proc"
+            }),
+            "Monitoring background job 'amber' for stdin reads failed: no /proc — it cannot report being blocked on stdin."
+        );
+        let long = job_alert_text(&JobAlertText::LongRunning {
+            task_id: "amber",
+            elapsed: "5m".to_string(),
+        });
+        assert!(
+            long.starts_with("Background job 'amber' has been running for 5m"),
+            "{long}"
+        );
+    }
+
+    #[test]
+    fn background_result_error() {
+        let task = completed(Err(TerminalError::Execution("spawn failed".to_string())));
+        assert_eq!(
+            format_background_task_result(&task),
+            "Background task 'amber-forest-thunder-pearl' (`make test`) failed: execution failed: spawn failed\n"
+        );
+    }
+
+    #[test]
+    fn background_started_reminder_names_the_output_file() {
+        let file = StoredFile {
+            url: "outputs/calm-river-bold-oak.txt".to_string(),
+            path: "/sandbox/outputs/calm-river-bold-oak.txt".to_string(),
+        };
+        let rendered = BackgroundStartedReminderTemplate {
+            task_id: "amber-forest-thunder-pearl",
+            output_preview: "",
+            output_file: &file,
+        }
+        .render()
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "<system-reminder>\nA terminal command is running in background (task_id=amber-forest-thunder-pearl).\nCurrent output snapshot (first max_lines):\n(no output yet)\nFull redirected output file: outputs/calm-river-bold-oak.txt (absolute path: /sandbox/outputs/calm-river-bold-oak.txt)\nUse terminal_read for incremental reads, read the stored file via terminal commands when needed, use terminal_input for stdin, and terminal_kill to stop it.\n</system-reminder>"
+        );
+    }
 
     use crate::ContextWindowPhase;
     #[cfg(feature = "skills")]
@@ -2472,6 +2555,40 @@ mod tests {
                 self.context_length,
             )))
         }
+    }
+
+    #[tokio::test]
+    async fn events_carry_their_emission_time() {
+        use futures_lite::StreamExt;
+
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 1000,
+            },
+            AgentConfig::default(),
+        );
+        let before = jiff::Timestamp::now();
+        let events: Vec<TimedEvent> = {
+            let stream = agent.run("hello", std::iter::empty());
+            futures_lite::pin!(stream);
+            let mut events = Vec::new();
+            while let Some(item) = stream.next().await {
+                if let Ok(event) = item {
+                    events.push(event);
+                }
+            }
+            events
+        };
+        let after = jiff::Timestamp::now();
+
+        assert!(matches!(
+            events.first().map(|timed| &timed.event),
+            Some(AgentEvent::RunStart { .. })
+        ));
+        for timed in &events {
+            assert!(before <= timed.at && timed.at <= after);
+        }
+        assert!(events.windows(2).all(|pair| pair[0].at <= pair[1].at));
     }
 
     /// aither#143: the provider `respond` stream's multi-KB state machine must

@@ -107,7 +107,7 @@ impl<LLM: LanguageModel + 'static> AcpSession<LLM> {
                 break;
             }
 
-            match event.map_err(|err| err.to_string())? {
+            match event.map_err(|err| err.to_string())?.event {
                 AgentEvent::Text(text) => {
                     on_update(SessionUpdate::AgentMessageChunk(text_chunk(text)));
                 }
@@ -139,9 +139,7 @@ impl<LLM: LanguageModel + 'static> AcpSession<LLM> {
                     } else {
                         ToolCallStatus::Completed
                     };
-                    let text = result
-                        .render_for_model()
-                        .unwrap_or_else(|error| error.to_string());
+                    let text = result.render_for_model();
                     on_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                         tool_call_id: id,
                         status: Some(status),

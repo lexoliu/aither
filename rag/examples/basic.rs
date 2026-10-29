@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
             ToolContext::new(),
         )
         .await?;
-    println!("\nTool response:\n{}", response.render_for_cli()?);
+    println!("\nTool response:\n{}", response.render_for_model());
 
     // Direct search
     println!("\nDirect search results:");

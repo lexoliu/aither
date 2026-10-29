@@ -40,4 +40,4 @@ pub use source::{AnyContextSource, Block, ContextSource};
 #[cfg(feature = "skills")]
 pub use sources::ActiveSkills;
 pub use sources::{BackgroundJobs, TasksDocument};
-pub use window::{Context, ContextCheckpoint, ContextItem, ReassemblyReport, serialize_xml};
+pub use window::{Context, ContextCheckpoint, ContextItem, ReassemblyReport};

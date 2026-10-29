@@ -1,0 +1,3 @@
+{% if killed %}Background task '{{ task_id }}' terminated.
+{% else %}No running background task '{{ task_id }}' (not found or already stopped).
+{% endif %}

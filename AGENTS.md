@@ -22,6 +22,8 @@
 ## Coding Style & Naming Conventions
 Follow `rustfmt` defaults (4 spaces, trailing commas) and keep modules `snake_case`, traits/types `UpperCamelCase`, and feature flags `kebab-case` (`serde`, `derive`). Public APIs need `///` docs because `cargo doc --cfg docsrs` runs in CI. Favor builders such as `Request::new([...])`, keep provider-only structs behind feature flags, and align with `clippy::pedantic` expectations before raising a PR.
 
+Text the model reads — tool results, notices, alerts and reminders — is natural language rendered from a typed template; no serializer output (JSON, XML) reaches the model, except data a command or an external tool itself produced and the schema of output the model must emit.
+
 ## Testing Guidelines
 Co-locate unit tests inside each module using `#[cfg(test)] mod tests` so traits stay covered near their definitions. Async logic should use `#[tokio::test]` (multi-thread flavor when polling streams) and exercise `futures_lite::StreamExt` when verifying streaming traits. Every new capability needs at least one success path, one failure path, and—when user facing—a doc test or example that mirrors realistic prompts.
 

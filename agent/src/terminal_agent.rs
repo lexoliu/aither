@@ -57,12 +57,13 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::hook::Hook;
-use crate::{Agent, AgentBuilder, config::AgentKind, context::serialize_xml};
+use crate::{Agent, AgentBuilder, config::AgentKind};
+use aither_core::llm::ToolResult;
 use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalDeltaTool};
 use aither_sandbox::{
-    CommandPayload, ContainerShellRuntime, PermissionHandler, ShellRuntimeAvailability,
-    ShellSessionRegistry, SshServer, SshSessionAuthorizer, TerminalTool, ToolDistribution,
-    ToolRegistryBuilder, ToolRuntimeError, Unconfigured,
+    ContainerShellRuntime, PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry,
+    SshServer, SshSessionAuthorizer, TerminalTool, ToolDistribution, ToolRegistryBuilder,
+    ToolRuntimeError, Unconfigured,
 };
 
 /// System prompt template for terminal-first agents.
@@ -86,18 +87,12 @@ struct SystemPrompt {
     has_websearch_command: bool,
 }
 
-#[derive(serde::Serialize)]
-struct ShellRuntimeContextXml {
-    available_backends: ShellRuntimeAvailableBackendsXml,
-    runtime: &'static str,
-}
-
-#[derive(serde::Serialize)]
-struct ShellRuntimeAvailableBackendsXml {
-    #[serde(rename = "@local")]
+#[derive(Template)]
+#[template(path = "shell_runtime.txt", escape = "none")]
+struct ShellRuntimeContextTemplate {
     local: bool,
-    #[serde(rename = "@ssh")]
     ssh: bool,
+    runtime: &'static str,
 }
 
 fn join_text(parts: &[&str]) -> String {
@@ -415,8 +410,7 @@ where
     where
         F: Fn(
                 serde_json::Value,
-            )
-                -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
+            ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
             + Send
             + Sync
             + 'static,
@@ -530,7 +524,7 @@ where
 
     /// Inserts or replaces a typed persistent system block.
     #[must_use]
-    pub fn system<T: serde::Serialize>(mut self, value: T) -> Self {
+    pub fn system<T: Template>(mut self, value: T) -> Self {
         self.inner = self.inner.system(value);
         self
     }
@@ -580,17 +574,14 @@ where
             "heel" => "user_local_machine",
             _ => unreachable!("validated host profile"),
         };
-        let shell_context = serialize_xml(
-            "shell_runtime",
-            &ShellRuntimeContextXml {
-                available_backends: ShellRuntimeAvailableBackendsXml {
-                    local: availability.local || availability.container,
-                    ssh: availability.ssh,
-                },
-                runtime: runtime_kind,
-            },
-        );
-        self.inner = self.inner.system_named("shell_runtime", shell_context);
+        let shell_context = ShellRuntimeContextTemplate {
+            local: availability.local || availability.container,
+            ssh: availability.ssh,
+            runtime: runtime_kind,
+        }
+        .render()
+        .expect("shell runtime context template must render");
+        self.inner = self.inner.system_text("shell_runtime", shell_context);
 
         let ssh_context =
             describe_ssh_servers(&self.terminal_tool.shell_sessions().list_ssh_servers());
@@ -1206,6 +1197,21 @@ fn get_os_info() -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_runtime_context_is_prose() {
+        let rendered = ShellRuntimeContextTemplate {
+            local: true,
+            ssh: false,
+            runtime: "user_local_machine",
+        }
+        .render()
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "Shell runtime: user_local_machine. Local backend: available. SSH backend: unavailable."
+        );
+    }
     use std::borrow::Cow;
 
     use crate::test_support::{compile_baseline_fixture, fixture_distribution};
@@ -1696,7 +1702,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            transcript.contains("\"killed\":true"),
+            transcript.contains("' terminated."),
             "native terminal_kill reported the kill: {transcript}"
         );
     }

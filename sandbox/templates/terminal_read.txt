@@ -1,0 +1,3 @@
+{{ delta }}Task '{{ task_id }}' {{ status_text }}; read {{ bytes_read }} new bytes ({{ total_bytes }} buffered in total); next cursor is {{ cursor }}.
+{% if has_more %}More output is buffered: call terminal_read with cursor={{ cursor }}.
+{% endif %}

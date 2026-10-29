@@ -1,5 +1,7 @@
 //! Tool trait implementation for RAG.
 
+use askama::Template;
+
 use aither_core::embedding::EmbeddingModel;
 use aither_core::llm::ToolContext;
 use aither_core::llm::tool::{Tool, ToolResult};
@@ -24,8 +26,14 @@ const fn default_top_k() -> usize {
     5
 }
 
+#[derive(askama::Template)]
+#[template(path = "results.txt", escape = "none")]
+struct RagResultsTemplate<'a> {
+    results: &'a [RagToolResponse],
+}
+
 /// Response from the RAG search tool.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug)]
 pub struct RagToolResponse {
     /// Chunk ID.
     pub id: String,
@@ -68,7 +76,11 @@ where
             })
             .collect();
 
-        ToolResult::json(&response)
+        Ok(ToolResult::text(
+            RagResultsTemplate { results: &response }
+                .render()
+                .expect("rag results template must render"),
+        ))
     }
 }
 
@@ -137,6 +149,11 @@ mod tests {
         };
 
         let result = rag.call(args, ToolContext::new()).await.unwrap();
-        assert!(result.render_for_model().unwrap().contains("Rust"));
+        let rendered = result.render_for_model();
+        assert!(rendered.starts_with("- doc1#"), "{rendered}");
+        assert!(
+            rendered.contains("):\nRust programming language\n"),
+            "{rendered}"
+        );
     }
 }

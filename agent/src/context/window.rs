@@ -33,7 +33,9 @@
 
 use std::hash::{Hash, Hasher};
 
+use askama::Template;
 use indexmap::IndexMap;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use aither_core::llm::{Message, Role};
@@ -41,10 +43,18 @@ use aither_core::llm::{Message, Role};
 use super::compaction::{Handoff, HandoffDocument};
 use super::source::Block;
 
-#[derive(Serialize)]
-struct TextBlock<'a> {
-    #[serde(rename = "$text")]
+/// A block of text wrapped in the one delimiting tag the model sees.
+#[derive(Template)]
+#[template(path = "tagged_block.txt", escape = "none")]
+struct TaggedBlockTemplate<'a> {
+    tag: &'a str,
     content: &'a str,
+}
+
+impl TaggedBlockTemplate<'_> {
+    fn into_text(self) -> String {
+        self.render().expect("tagged block template must render")
+    }
 }
 
 /// Tombstone text left in place of a superseded tool result.
@@ -62,6 +72,9 @@ pub struct ContextItem {
     seq: u64,
     /// The message itself.
     message: Message,
+    /// When the item was committed to the window. Bookkeeping only: it is
+    /// never rendered into a request.
+    committed_at: Timestamp,
 }
 
 impl ContextItem {
@@ -69,6 +82,12 @@ impl ContextItem {
     #[must_use]
     pub const fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// The UTC time the item was committed to the window.
+    #[must_use]
+    pub const fn committed_at(&self) -> Timestamp {
+        self.committed_at
     }
 
     /// The message this item carries.
@@ -127,19 +146,28 @@ impl Context {
 
     /// Inserts or replaces a persistent system block.
     ///
-    /// Identity is derived from the `snake_case` type name of `T`.
-    pub fn insert_system<T: Serialize>(&mut self, value: &T) {
+    /// The block renders through `value`'s typed template; identity is
+    /// derived from the `snake_case` type name of `T`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the template fails to render.
+    pub fn insert_system<T: Template>(&mut self, value: &T) {
         let tag = snake_case_type_name::<T>();
-        let xml = serialize_xml(&tag, value);
-        self.system_blocks.insert(tag, xml);
+        let rendered = value.render().expect("system block template must render");
+        self.system_blocks.insert(tag, rendered);
     }
 
     /// Inserts or replaces a persistent system block with an explicit tag.
     pub fn insert_system_named(&mut self, tag: impl Into<String>, content: impl Into<String>) {
         let tag = tag.into();
         let content = content.into();
-        let xml = serialize_xml(&tag, &TextBlock { content: &content });
-        self.system_blocks.insert(tag, xml);
+        let wrapped = TaggedBlockTemplate {
+            tag: &tag,
+            content: &content,
+        }
+        .into_text();
+        self.system_blocks.insert(tag, wrapped);
     }
 
     /// Inserts or replaces a persistent system block with raw text.
@@ -290,7 +318,11 @@ impl Context {
     pub fn push(&mut self, message: Message) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.items.push(ContextItem { seq, message });
+        self.items.push(ContextItem {
+            seq,
+            message,
+            committed_at: Timestamp::now(),
+        });
         seq
     }
 
@@ -301,16 +333,20 @@ impl Context {
         }
     }
 
-    /// Appends a durable alert, serialized as an XML system message.
+    /// Appends a durable alert, rendered from its typed template as a system
+    /// message.
     ///
     /// The alert enters the conversation and stays there until reassembly or
     /// compaction prunes it — the channel for content that must reach the
     /// *next* request rather than being re-rendered by a
     /// [`ContextSource`](super::ContextSource) every time.
-    pub fn push_alert<T: Serialize>(&mut self, value: &T) -> u64 {
-        let tag = snake_case_type_name::<T>();
-        let xml = serialize_xml(&tag, value);
-        self.push(Message::system(xml))
+    ///
+    /// # Panics
+    ///
+    /// Panics if the template fails to render.
+    pub fn push_alert<T: Template>(&mut self, value: &T) -> u64 {
+        let rendered = value.render().expect("alert template must render");
+        self.push(Message::system(rendered))
     }
 
     /// Appends a durable alert rendered by a context source.
@@ -418,7 +454,7 @@ impl Context {
         }
 
         if let Some(handoff) = &self.handoff {
-            messages.push(Message::system(handoff.to_xml()));
+            messages.push(Message::system(handoff.render()));
         }
 
         messages.extend(self.items.iter().map(|item| item.message.clone()));
@@ -450,7 +486,7 @@ impl Context {
         let handoff = self
             .handoff
             .as_ref()
-            .map_or(0, |handoff| handoff.to_xml().len());
+            .map_or(0, |handoff| handoff.render().len());
         blocks + handoff
     }
 
@@ -742,11 +778,16 @@ impl ContextCheckpoint {
 impl Handoff {
     /// Renders this handoff as the system message body of a request.
     #[must_use]
-    pub fn to_xml(&self) -> String {
-        match self {
-            Self::Text(text) => serialize_xml("handoff", &TextBlock { content: text }),
-            Self::Document(document) => serialize_xml("handoff", document),
+    pub fn render(&self) -> String {
+        let content = match self {
+            Self::Text(text) => text.clone(),
+            Self::Document(document) => document.render_markdown(),
+        };
+        TaggedBlockTemplate {
+            tag: "handoff",
+            content: &content,
         }
+        .into_text()
     }
 }
 
@@ -783,39 +824,16 @@ fn snake_case_type_name<T>() -> String {
     heck::AsSnakeCase(short).to_string()
 }
 
-/// Serializes `value` into an XML element named `tag`.
-///
-/// # Panics
-///
-/// Panics if `value` cannot be represented as XML, which is a bug in the
-/// serialized type rather than a runtime condition.
-pub fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> String {
-    let mut buffer = String::new();
-    let serializer = quick_xml::se::Serializer::with_root(&mut buffer, Some(tag))
-        .unwrap_or_else(|error| panic!("failed to create XML serializer for tag '{tag}': {error}"));
-
-    value
-        .serialize(serializer)
-        .unwrap_or_else(|error| panic!("failed to serialize XML for tag '{tag}': {error}"));
-
-    buffer
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use aither_core::llm::ToolCall;
 
-    #[derive(Serialize)]
-    struct Memory {
-        #[serde(rename = "$text")]
-        content: String,
-    }
-
-    #[derive(Serialize)]
-    struct Workspace {
-        sandbox: String,
-        cwd: String,
+    #[derive(Template)]
+    #[template(path = "tagged_block.txt", escape = "none")]
+    struct Memory<'a> {
+        tag: &'a str,
+        content: &'a str,
     }
 
     fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -833,16 +851,30 @@ mod tests {
     }
 
     #[test]
-    fn serialize_xml_renders_struct_fields() {
-        let xml = serialize_xml(
-            "workspace",
-            &Workspace {
-                sandbox: "/tmp/sandbox".to_string(),
-                cwd: "/home/user".to_string(),
-            },
+    fn typed_system_blocks_render_from_their_template() {
+        let mut context = Context::new();
+        context.insert_system(&Memory {
+            tag: "memory",
+            content: "remember this",
+        });
+        context.insert_system_named("persona", "be brief");
+
+        let messages = context.build_request(&[]);
+        assert_eq!(
+            messages[0].content(),
+            "<memory>remember this</memory>\n<persona>be brief</persona>"
         );
-        assert!(xml.contains("<workspace>"));
-        assert!(xml.contains("/tmp/sandbox"));
+    }
+
+    #[test]
+    fn alerts_render_from_their_template() {
+        let mut context = Context::new();
+        context.push_alert(&Memory {
+            tag: "alert",
+            content: "look here",
+        });
+        let messages = context.build_request(&[]);
+        assert_eq!(messages[0].content(), "<alert>look here</alert>");
     }
 
     #[test]
@@ -905,6 +937,51 @@ mod tests {
     }
 
     #[test]
+    fn items_record_their_commit_time() {
+        let mut context = Context::new();
+        let before = Timestamp::now();
+        context.push(Message::user("one"));
+        let after = Timestamp::now();
+
+        let committed = context.checkpoint().items()[0].committed_at();
+        assert!(before <= committed && committed <= after);
+    }
+
+    #[test]
+    fn checkpoint_round_trip_keeps_every_commit_time_and_the_request() {
+        let mut context = Context::new();
+        context.insert_system_named("base_system", "be useful");
+        context.push(Message::user("first"));
+        context.push(Message::assistant("answer"));
+        context.push(Message::user("second"));
+        let original_times: Vec<Timestamp> = context
+            .checkpoint()
+            .items()
+            .iter()
+            .map(ContextItem::committed_at)
+            .collect();
+
+        let json = serde_json::to_string(&context.checkpoint()).expect("serialize checkpoint");
+        let checkpoint: ContextCheckpoint =
+            serde_json::from_str(&json).expect("deserialize checkpoint");
+
+        let mut restored = Context::new();
+        restored.insert_system_named("base_system", "be useful");
+        restored.restore(checkpoint);
+
+        let restored_times: Vec<Timestamp> = restored
+            .checkpoint()
+            .items()
+            .iter()
+            .map(ContextItem::committed_at)
+            .collect();
+        assert_eq!(original_times, restored_times);
+
+        let tail = [Block::new("tasks", "<tasks>v1</tasks>")];
+        assert_eq!(context.build_request(&tail), restored.build_request(&tail));
+    }
+
+    #[test]
     fn sequence_numbers_are_monotonic_and_identify_the_fork_point() {
         let mut context = Context::new();
         assert_eq!(context.fork_point(), 0);
@@ -932,7 +1009,7 @@ mod tests {
         assert!(
             context
                 .handoff()
-                .is_some_and(|handoff| handoff.to_xml().contains("task"))
+                .is_some_and(|handoff| handoff.render().contains("task"))
         );
     }
 

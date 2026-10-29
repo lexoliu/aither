@@ -2,6 +2,8 @@
 
 use std::borrow::Cow;
 
+use askama::Template;
+
 use aither_core::llm::ToolContext;
 use aither_core::llm::tool::{Tool, ToolResult};
 use schemars::JsonSchema;
@@ -104,6 +106,22 @@ pub enum AnswerValue {
     Skipped,
 }
 
+impl std::fmt::Display for AnswerValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Selected(options) => write!(f, "{}", options.join(", ")),
+            Self::Custom(text) => f.write_str(text),
+            Self::Skipped => f.write_str("(skipped)"),
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "ask_user_result.txt", escape = "none")]
+struct AskUserResultTemplate<'a> {
+    answers: &'a [QuestionAnswer],
+}
+
 /// A request from the agent to ask the user questions.
 pub type AskUserRequest = ToolRequest<AskUserRequestPayload, Vec<QuestionAnswer>>;
 
@@ -166,7 +184,11 @@ impl Tool for AskUserTool {
                 request: args,
             })
             .await?;
-        ToolResult::json(&response)
+        Ok(ToolResult::text(
+            AskUserResultTemplate { answers: &response }
+                .render()
+                .expect("ask_user result template must render"),
+        ))
     }
 }
 

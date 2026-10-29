@@ -7,12 +7,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::error::AgentError;
-use crate::event::AgentEvent;
+use crate::event::TimedEvent;
 use futures_core::Stream;
 
 /// Stream of agent events during execution.
 ///
-/// This stream yields `AgentEvent`s as they happen, including
+/// This stream yields `TimedEvent`s as they happen, including
 /// individual text chunks for real-time display.
 ///
 /// # Example
@@ -22,7 +22,8 @@ use futures_core::Stream;
 ///
 /// let mut stream = agent.run("Do something");
 /// while let Some(event) = stream.next().await {
-///     match event? {
+///     let event = event?;
+///     match event.event {
 ///         AgentEvent::Text(t) => print!("{}", t),
 ///         AgentEvent::Complete { .. } => break,
 ///         _ => {}
@@ -35,7 +36,7 @@ pub struct AgentStream<S> {
 
 impl<S> AgentStream<S>
 where
-    S: Stream<Item = Result<AgentEvent, AgentError>>,
+    S: Stream<Item = Result<TimedEvent, AgentError>>,
 {
     /// Creates a new agent stream wrapping an inner stream.
     pub fn new(inner: S) -> Self {
@@ -47,9 +48,9 @@ where
 
 impl<S> Stream for AgentStream<S>
 where
-    S: Stream<Item = Result<AgentEvent, AgentError>>,
+    S: Stream<Item = Result<TimedEvent, AgentError>>,
 {
-    type Item = Result<AgentEvent, AgentError>;
+    type Item = Result<TimedEvent, AgentError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.inner.as_mut().poll_next(cx)

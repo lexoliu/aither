@@ -2,6 +2,8 @@
 
 use std::borrow::Cow;
 
+use askama::Template;
+
 use aither_core::llm::ToolContext;
 use aither_core::llm::tool::{Tool, ToolResult};
 use schemars::JsonSchema;
@@ -33,15 +35,11 @@ fn default_reason() -> String {
     DEFAULT_REASON.trim().to_string()
 }
 
-/// Result of a workspace access request.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct WorkspaceAccess {
-    /// The requested directory path.
-    pub path: String,
-    /// Reason for the request.
-    pub reason: String,
-    /// Whether access was approved.
-    pub approved: bool,
+#[derive(Template)]
+#[template(path = "workspace_request_result.txt", escape = "none")]
+struct WorkspaceRequestResultTemplate<'a> {
+    path: &'a str,
+    outcome: &'a str,
 }
 
 /// Internal request payload sent from a session-bound tool to the UI/runtime.
@@ -106,11 +104,13 @@ impl Tool for RequestWorkspaceTool {
                 request: args.clone(),
             })
             .await?;
-        let access = WorkspaceAccess {
-            path: args.path,
-            reason: args.reason,
-            approved,
-        };
-        ToolResult::json(&access)
+        Ok(ToolResult::text(
+            WorkspaceRequestResultTemplate {
+                path: &args.path,
+                outcome: if approved { "approved" } else { "denied" },
+            }
+            .render()
+            .expect("workspace request result template must render"),
+        ))
     }
 }

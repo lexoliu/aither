@@ -1,9 +1,9 @@
 //! Output management for terminal tool execution.
 //!
 //! Outputs are classified by size and type:
-//! - **Inline**: Super tiny text (< 5 lines) - always in context, never gets URL
-//! - **Loaded**: Small text/images - in context, URL generated only on offload
-//! - **Stored**: Large text/binary/video - file created immediately
+//! - **Inline**: text within the limits - in the result, never gets a file
+//! - **Stored**: large text, binary, video and every image - file created
+//!   immediately; text keeps a preview in the result
 
 use std::{
     collections::HashMap,
@@ -11,11 +11,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use askama::Template;
+use aither_core::llm::{CommandStream, StoredFile};
 use async_fs as fs;
 use image::{GenericImageView, ImageFormat, ImageReader, imageops::FilterType};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 /// Expected output format for terminal execution.
@@ -63,186 +63,35 @@ impl MediaResolution {
     }
 }
 
-/// Content that can be loaded into agent context.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Content {
-    /// Text content, potentially truncated
-    Text {
-        /// The text content
-        text: String,
-        /// Whether the content was truncated
-        truncated: bool,
-    },
-    /// Image content as base64
-    Image {
-        /// Base64-encoded image data
-        data: String,
-        /// MIME type (e.g., "image/png")
-        media_type: String,
-    },
+/// An output stream holding no output.
+#[must_use]
+pub const fn empty_stream() -> CommandStream {
+    CommandStream::Inline(String::new())
 }
 
-/// Output entry with lazy file creation.
-///
-/// Serializes to a flat JSON object with optional fields.
-#[derive(Debug, Clone)]
-pub enum OutputEntry {
-    /// No output (`ToolResult::Done`) - nothing to store
-    Empty,
-
-    /// Super tiny content - always in context, NEVER gets URL.
-    /// Examples: "done", "3 files deleted", short status messages.
-    Inline {
-        /// The content to display inline.
-        content: Content,
-    },
-
-    /// Content is loaded in context, no file yet.
-    /// URL will be generated when offloaded.
-    Loaded {
-        /// The content to display.
-        content: Content,
-        /// Raw bytes for potential later file creation
-        raw: Vec<u8>,
-        /// Format for extension when creating file
-        format: OutputFormat,
-    },
-
-    /// Content is stored in file, URL available.
-    Stored {
-        /// Relative path: "outputs/purple-ocean-swift-meadow.txt"
-        url: String,
-        /// Absolute filesystem path for the stored payload.
-        path: String,
-        /// Preview content (if large text)
-        content: Option<Content>,
-    },
-}
-
-impl Serialize for OutputEntry {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Self::Empty => {
-                let map = serializer.serialize_map(Some(0))?;
-                map.end()
-            }
-            // Loaded output carries provenance the caller does not need on the
-            // wire, so it serializes exactly like inline output.
-            Self::Inline { content } | Self::Loaded { content, .. } => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("content", content)?;
-                map.end()
-            }
-            Self::Stored { url, path, content } => {
-                let count = if content.is_some() { 3 } else { 2 };
-                let mut map = serializer.serialize_map(Some(count))?;
-                map.serialize_entry("url", url)?;
-                map.serialize_entry("path", path)?;
-                if let Some(c) = content {
-                    map.serialize_entry("content", c)?;
-                }
-                map.end()
-            }
+/// Returns the file a stream was stored in, for streams written to disk.
+#[must_use]
+pub fn stored_path(stream: &CommandStream) -> Option<PathBuf> {
+    match stream {
+        CommandStream::Stored { file, .. } | CommandStream::Image { file, .. } => {
+            Some(PathBuf::from(&file.path))
         }
+        CommandStream::Inline(_) => None,
     }
 }
 
-impl<'de> Deserialize<'de> for OutputEntry {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Helper {
-            url: Option<String>,
-            path: Option<String>,
-            content: Option<Content>,
-        }
-
-        let h = Helper::deserialize(deserializer)?;
-
-        Ok(match (h.url, h.path, h.content) {
-            (Some(url), path, content) => Self::Stored {
-                url,
-                path: path.unwrap_or_default(),
-                content,
-            },
-            (None, _, Some(content)) => Self::Inline { content },
-            (None, _, None) => Self::Empty,
-        })
-    }
-}
-
-impl std::fmt::Display for OutputEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => Ok(()),
-            Self::Inline { content } | Self::Loaded { content, .. } => match content {
-                Content::Text { text, truncated } => {
-                    write!(f, "{text}")?;
-                    if *truncated {
-                        write!(
-                            f,
-                            "\n[truncated: full output is available in the stored file]"
-                        )?;
-                    }
-                    Ok(())
-                }
-                Content::Image { media_type, .. } => {
-                    write!(f, "[Image: {media_type}]")
-                }
-            },
-            Self::Stored { url, path, content } => {
-                if let Some(content) = content {
-                    match content {
-                        Content::Text { text, truncated } => {
-                            write!(f, "{text}")?;
-                            if *truncated {
-                                write!(
-                                    f,
-                                    "\n[full content at {url}; absolute path: {path}; output was truncated in-chat]"
-                                )?;
-                            }
-                        }
-                        Content::Image { media_type, .. } => {
-                            write!(f, "[Image: {media_type}] at {url} ({path})")?;
-                        }
-                    }
-                } else {
-                    write!(f, "[content at {url} ({path})]")?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-impl OutputEntry {
-    /// Returns the stored file path for entries written to disk.
-    #[must_use]
-    pub fn stored_path(&self, base_dir: &Path) -> Option<PathBuf> {
-        match self {
-            Self::Stored { url, path, .. } => {
-                if !path.is_empty() {
-                    return Some(PathBuf::from(path));
-                }
-                let filename = url.strip_prefix("outputs/").unwrap_or(url);
-                Some(base_dir.join(filename))
-            }
-            _ => None,
-        }
+fn stored_file(url: String, path: &Path) -> StoredFile {
+    StoredFile {
+        url,
+        path: path.display().to_string(),
     }
 }
 
 /// Internal reference to a stored output.
 #[derive(Debug, Clone)]
 pub struct OutputRef {
-    /// The output entry state
-    pub entry: OutputEntry,
+    /// How the output was delivered
+    pub stream: CommandStream,
     /// Detected or specified format
     pub format: OutputFormat,
     /// Size in bytes
@@ -256,50 +105,12 @@ pub struct OutputRef {
 /// This is the single source of truth for output size limits.
 pub const INLINE_OUTPUT_LIMIT: usize = 16_000;
 
-#[derive(Template)]
-#[template(path = "stored_output_preview.txt", escape = "none")]
-struct StoredOutputPreviewTemplate<'a> {
-    preview: &'a str,
-    reason: &'a str,
-    line_count: usize,
-    byte_count: usize,
-    url: &'a str,
-}
-
-/// Renders the head+tail form of a cut text output: a preview within the
-/// caller's budget plus the file reference and read guidance.
-///
-/// `text` must be exactly what was written to `url`, because the preview's
-/// omitted-range marker reports line numbers of that file.
-fn stored_text_content(
-    text: &str,
-    reason: &str,
-    line_count: usize,
-    byte_count: usize,
-    url: &str,
-    max_lines: usize,
-    byte_budget: usize,
-) -> String {
-    let preview = crate::output_compress::stored_preview(text, max_lines, byte_budget);
-    StoredOutputPreviewTemplate {
-        preview: preview.trim_end_matches('\n'),
-        reason,
-        line_count,
-        byte_count,
-        url,
-    }
-    .render()
-    .expect("stored output preview template must render")
-}
-
 /// A text output that exceeded a limit, with the limits that cut it.
 struct CutText<'a> {
     /// The original bytes, which are what gets stored.
     data: &'a [u8],
     /// `data` as text.
     text: &'a str,
-    reason: &'a str,
-    line_count: usize,
     max_lines: usize,
     byte_budget: usize,
 }
@@ -308,77 +119,48 @@ struct CutText<'a> {
 ///
 /// The model-facing form is the folded view when the text is source code and
 /// the folded view fits `byte_budget`, otherwise the head+tail preview. That
-/// form, with its markers and stored-output notice, is compared in bytes with
-/// the original: when it is not smaller the original is returned inline and
+/// form, with its stored-output notice, is compared in bytes with the
+/// original: when it is not smaller the original is returned inline and
 /// uncut, and nothing is written to disk.
 async fn cut_text_output(
     dir: &Path,
     format: OutputFormat,
     cut: CutText<'_>,
-) -> std::io::Result<OutputEntry> {
+) -> std::io::Result<CommandStream> {
     let CutText {
         data,
         text,
-        reason,
-        line_count,
         max_lines,
         byte_budget,
     } = cut;
     let (url, path) = allocate_file(dir, data, format);
 
-    let folded =
-        crate::output_compress::folded_code_content(text, &url, &path.display().to_string())
-            .filter(|folded| folded.len() <= byte_budget);
-    let rendered = folded.unwrap_or_else(|| {
-        stored_text_content(
-            text,
-            reason,
-            line_count,
-            data.len(),
-            &url,
-            max_lines,
-            byte_budget,
-        )
+    let folded = crate::output_compress::folded_code_content(text)
+        .filter(|folded| folded.len() <= byte_budget);
+    let preview = folded.unwrap_or_else(|| {
+        crate::output_compress::stored_preview(text, max_lines, byte_budget)
+            .trim_end_matches('\n')
+            .to_owned()
     });
+    let stream = CommandStream::Stored {
+        file: stored_file(url, &path),
+        preview,
+        truncated: true,
+    };
 
-    if rendered.len() >= data.len() {
+    let rendered_len = stream.render_for_model().len();
+    if rendered_len >= data.len() {
         debug!(
             original = data.len(),
-            cut = rendered.len(),
+            cut = rendered_len,
             "cut form is not smaller than the output, returning it inline"
         );
-        return Ok(OutputEntry::Inline {
-            content: Content::Text {
-                text: text.to_owned(),
-                truncated: false,
-            },
-        });
+        return Ok(CommandStream::Inline(text.to_owned()));
     }
 
     fs::write(&path, data).await?;
-    debug!(url = %url, size = data.len(), format = ?format, "saved output");
-    Ok(OutputEntry::Stored {
-        path: path.display().to_string(),
-        url,
-        content: Some(Content::Text {
-            text: rendered,
-            truncated: true,
-        }),
-    })
-}
-
-/// A pending URL allocation that hasn't been written to disk yet.
-///
-/// Used during context compaction to allocate URLs for content before
-/// deciding which ones are actually referenced in the summary.
-#[derive(Debug, Clone)]
-pub struct PendingUrl {
-    /// The allocated URL (e.g., "outputs/amber-oak-swift-river.txt")
-    pub url: String,
-    /// Raw bytes to write if this URL is referenced
-    pub raw: Vec<u8>,
-    /// Format for file extension
-    pub format: OutputFormat,
+    debug!(size = data.len(), format = ?format, "saved output");
+    Ok(stream)
 }
 
 /// Manages output storage for terminal executions.
@@ -414,7 +196,7 @@ impl OutputStore {
         &self.dir
     }
 
-    /// Saves output data and returns an `OutputEntry` with appropriate state.
+    /// Saves output data and returns the stream the result carries.
     ///
     /// # Errors
     ///
@@ -424,8 +206,8 @@ impl OutputStore {
         data: &[u8],
         format: OutputFormat,
         resolution: MediaResolution,
-    ) -> std::io::Result<OutputEntry> {
-        let entry = Self::save_to_dir(&self.dir, data, format, resolution).await?;
+    ) -> std::io::Result<CommandStream> {
+        let stream = Self::save_to_dir(&self.dir, data, format, resolution).await?;
 
         // Track the reference
         let id = format!("output_{}", self.next_id);
@@ -437,21 +219,22 @@ impl OutputStore {
             format
         };
         let output_ref = OutputRef {
-            entry: entry.clone(),
+            stream: stream.clone(),
             format,
             size: data.len(),
         };
         self.entries.insert(id, output_ref);
 
-        Ok(entry)
+        Ok(stream)
     }
 
     /// Saves output data to a directory.
     ///
     /// Uses the system-wide `INLINE_OUTPUT_LIMIT` constant:
-    /// - Empty data → `Empty`
+    /// - Empty data → an empty `Inline` stream
     /// - Below limit → `Inline` (shown directly)
-    /// - Above limit → `Stored` (file created, path returned)
+    /// - Above limit → `Stored` (file created, preview kept for text)
+    /// - Images → `Image` (always a file)
     ///
     /// # Errors
     ///
@@ -461,7 +244,7 @@ impl OutputStore {
         data: &[u8],
         format: OutputFormat,
         resolution: MediaResolution,
-    ) -> std::io::Result<OutputEntry> {
+    ) -> std::io::Result<CommandStream> {
         Self::save_to_dir_with_limit(dir, data, format, resolution, Some(INLINE_OUTPUT_LIMIT)).await
     }
 
@@ -479,9 +262,9 @@ impl OutputStore {
         format: OutputFormat,
         resolution: MediaResolution,
         limit: Option<usize>,
-    ) -> std::io::Result<OutputEntry> {
+    ) -> std::io::Result<CommandStream> {
         if data.is_empty() {
-            return Ok(OutputEntry::Empty);
+            return Ok(empty_stream());
         }
 
         let format = if format == OutputFormat::Auto {
@@ -499,25 +282,11 @@ impl OutputStore {
             OutputFormat::Text | OutputFormat::Auto => save_text_output(dir, data, format).await,
             OutputFormat::Image => {
                 let prepared = prepare_image_for_context(data, resolution)?;
-                let preview_content = Content::Image {
-                    data: base64_encode(&prepared.bytes),
+                let (url, path) = create_file(dir, &prepared.bytes, format).await?;
+                Ok(CommandStream::Image {
                     media_type: prepared.media_type,
-                };
-                let preview_fits_inline = limit.is_none_or(|max| prepared.bytes.len() <= max);
-                let source_fits_inline = limit.is_none_or(|max| data.len() <= max);
-
-                if source_fits_inline && preview_fits_inline {
-                    Ok(OutputEntry::Inline {
-                        content: preview_content,
-                    })
-                } else {
-                    let (url, path) = create_file(dir, data, format).await?;
-                    Ok(OutputEntry::Stored {
-                        path: path.display().to_string(),
-                        url,
-                        content: preview_fits_inline.then_some(preview_content),
-                    })
-                }
+                    file: stored_file(url, &path),
+                })
             }
             OutputFormat::Video | OutputFormat::Binary => {
                 // Binary/video are always Stored
@@ -526,64 +295,10 @@ impl OutputStore {
         }
     }
 
-    /// Offloads a Loaded entry to disk, generating a URL.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if file creation fails.
-    pub async fn offload(&mut self, entry: &OutputEntry) -> std::io::Result<OutputEntry> {
-        match entry {
-            OutputEntry::Loaded {
-                content,
-                raw,
-                format,
-            } => {
-                let (url, path) = create_file(&self.dir, raw, *format).await?;
-                Ok(OutputEntry::Stored {
-                    path: path.display().to_string(),
-                    url,
-                    content: Some(content.clone()),
-                })
-            }
-            // Already stored or inline/empty - return as-is
-            other => Ok(other.clone()),
-        }
-    }
-
     /// Retrieves an output reference by ID.
     #[must_use]
     pub fn get(&self, id: &str) -> Option<&OutputRef> {
         self.entries.get(id)
-    }
-
-    /// Allocates a URL for a Loaded entry without writing to disk.
-    ///
-    /// This is used during context compaction to allocate URLs before
-    /// calling the fast LLM. The file is only written if the URL is
-    /// actually referenced in the compacted summary.
-    ///
-    /// Returns `None` for:
-    /// - `Empty`: No content to store
-    /// - `Inline`: Super tiny content, never gets a URL
-    /// - `Stored`: Already has a URL (no action needed)
-    ///
-    /// Returns `Some(PendingUrl)` for `Loaded` entries.
-    #[must_use]
-    pub fn allocate_url(&self, entry: &OutputEntry) -> Option<PendingUrl> {
-        match entry {
-            OutputEntry::Loaded { raw, format, .. } => {
-                let ext = extension_for_data(raw, *format);
-                let name = generate_word_filename();
-                let url = format!("outputs/{name}.{ext}");
-                Some(PendingUrl {
-                    url,
-                    raw: raw.clone(),
-                    format: *format,
-                })
-            }
-            // Empty, Inline, or Stored - no URL allocation needed
-            _ => None,
-        }
     }
 
     /// Allocates a URL for text content without writing to disk.
@@ -614,22 +329,6 @@ impl OutputStore {
         Ok(filepath)
     }
 
-    /// Writes a pending URL's data to disk.
-    ///
-    /// Call this only for URLs that were actually referenced in the
-    /// compacted summary.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file cannot be written.
-    pub async fn write_pending(&self, pending: &PendingUrl) -> std::io::Result<PathBuf> {
-        let filename = pending.url.strip_prefix("outputs/").unwrap_or(&pending.url);
-        let filepath = self.dir.join(filename);
-        fs::write(&filepath, &pending.raw).await?;
-        debug!(url = %pending.url, size = pending.raw.len(), "wrote pending output");
-        Ok(filepath)
-    }
-
     /// Reads the raw data for a stored output URL.
     ///
     /// # Errors
@@ -648,16 +347,10 @@ impl OutputStore {
     /// Returns an error if files cannot be deleted.
     pub async fn cleanup(&mut self) -> std::io::Result<()> {
         for (_, output_ref) in self.entries.drain() {
-            if let OutputEntry::Stored { url, path, .. } = output_ref.entry {
-                let filename = url.strip_prefix("outputs/").unwrap_or(&url);
-                let filepath = if path.is_empty() {
-                    self.dir.join(filename)
-                } else {
-                    PathBuf::from(path)
-                };
-                if let Err(e) = fs::remove_file(&filepath).await {
-                    tracing::warn!(path = %filepath.display(), error = %e, "failed to remove output file");
-                }
+            if let Some(filepath) = stored_path(&output_ref.stream)
+                && let Err(e) = fs::remove_file(&filepath).await
+            {
+                tracing::warn!(path = %filepath.display(), error = %e, "failed to remove output file");
             }
         }
         Ok(())
@@ -679,6 +372,27 @@ pub async fn save_raw_to_file(dir: &Path, data: &[u8]) -> std::io::Result<(Strin
     Ok((url, path))
 }
 
+/// Saves a binary payload into `dir` under a four-random-words name, with an
+/// image extension when `mime` is an image the bytes confirm.
+///
+/// Returns the relative URL and the absolute path of the file.
+///
+/// # Errors
+///
+/// Returns an error if file creation fails.
+pub async fn save_binary_to_file(
+    dir: &Path,
+    data: &[u8],
+    mime: &str,
+) -> std::io::Result<(String, PathBuf)> {
+    let format = if mime.starts_with("image/") {
+        OutputFormat::Image
+    } else {
+        OutputFormat::Binary
+    };
+    create_file(dir, data, format).await
+}
+
 /// Saves text output with simple size-based classification.
 ///
 /// - Below `INLINE_OUTPUT_LIMIT` → show inline
@@ -687,13 +401,11 @@ async fn save_text_output(
     dir: &Path,
     data: &[u8],
     format: OutputFormat,
-) -> std::io::Result<OutputEntry> {
+) -> std::io::Result<CommandStream> {
     if data.len() <= INLINE_OUTPUT_LIMIT {
-        let content = Content::Text {
-            text: String::from_utf8_lossy(data).into_owned(),
-            truncated: false,
-        };
-        Ok(OutputEntry::Inline { content })
+        Ok(CommandStream::Inline(
+            String::from_utf8_lossy(data).into_owned(),
+        ))
     } else {
         save_large_output(dir, data, format).await
     }
@@ -711,9 +423,9 @@ pub async fn save_text_with_line_limit(
     resolution: MediaResolution,
     max_lines: usize,
     byte_limit: Option<usize>,
-) -> std::io::Result<OutputEntry> {
+) -> std::io::Result<CommandStream> {
     if data.is_empty() {
-        return Ok(OutputEntry::Empty);
+        return Ok(empty_stream());
     }
 
     let format = if format == OutputFormat::Auto {
@@ -736,30 +448,19 @@ pub async fn save_text_with_line_limit(
     let exceeds_lines = line_count > max_lines;
 
     if !exceeds_bytes && !exceeds_lines {
-        let content = Content::Text {
-            text: text.into_owned(),
-            truncated: false,
-        };
-        return Ok(OutputEntry::Inline { content });
+        return Ok(CommandStream::Inline(text.into_owned()));
     }
 
     // Cut: store the full output and hand the model a preview within its
     // requested budget so it never has to re-read blind, unless the preview
     // would not be smaller than the output.
     let byte_budget = byte_limit.unwrap_or(INLINE_OUTPUT_LIMIT);
-    let reason = if exceeds_lines {
-        format!("output exceeded max_lines limit ({line_count} lines > {max_lines} max)")
-    } else {
-        format!("output exceeded the {byte_budget}-byte inline limit")
-    };
     cut_text_output(
         dir,
         format,
         CutText {
             data,
             text: &text,
-            reason: &reason,
-            line_count,
             max_lines,
             byte_budget,
         },
@@ -773,18 +474,15 @@ async fn save_large_output(
     dir: &Path,
     data: &[u8],
     format: OutputFormat,
-) -> std::io::Result<OutputEntry> {
+) -> std::io::Result<CommandStream> {
     if matches!(format, OutputFormat::Text | OutputFormat::Auto) {
         let text = String::from_utf8_lossy(data);
-        let reason = format!("output exceeded the {INLINE_OUTPUT_LIMIT}-byte inline limit");
         return cut_text_output(
             dir,
             format,
             CutText {
                 data,
                 text: &text,
-                reason: &reason,
-                line_count: text.lines().count(),
                 max_lines: usize::MAX,
                 byte_budget: INLINE_OUTPUT_LIMIT,
             },
@@ -794,10 +492,10 @@ async fn save_large_output(
 
     // Binary/video/image just get the file path.
     let (url, path) = create_file(dir, data, format).await?;
-    Ok(OutputEntry::Stored {
-        path: path.display().to_string(),
-        url,
-        content: None,
+    Ok(CommandStream::Stored {
+        file: stored_file(url, &path),
+        preview: String::new(),
+        truncated: false,
     })
 }
 
@@ -971,18 +669,11 @@ fn image_format_from_media_type(media_type: &str) -> Option<ImageFormat> {
     }
 }
 
-/// Base64 encodes data using standard alphabet with padding.
-fn base64_encode(data: &[u8]) -> String {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    STANDARD.encode(data)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{fmt::Write, io::Cursor};
 
-    use base64::Engine;
     use image::{DynamicImage, ImageBuffer, Rgba};
 
     #[test]
@@ -1004,52 +695,17 @@ mod tests {
     }
 
     #[test]
-    fn test_output_entry_inline_serialize() {
-        let entry = OutputEntry::Inline {
-            content: Content::Text {
-                text: "done".to_string(),
-                truncated: false,
-            },
-        };
-        let json = serde_json::to_string(&entry).unwrap();
-        assert!(json.contains("\"content\""));
-        assert!(!json.contains("\"url\""));
-    }
-
-    #[test]
-    fn test_output_entry_stored_serialize() {
-        let entry = OutputEntry::Stored {
-            url: "outputs/test.txt".to_string(),
-            path: "/tmp/test.txt".to_string(),
-            content: Some(Content::Text {
-                text: "preview".to_string(),
-                truncated: true,
-            }),
-        };
-        let json = serde_json::to_string(&entry).unwrap();
-        assert!(json.contains("\"url\""));
-        assert!(json.contains("\"content\""));
-    }
-
-    #[test]
-    fn test_output_entry_empty_serialize() {
-        let entry = OutputEntry::Empty;
-        let json = serde_json::to_string(&entry).unwrap();
-        assert_eq!(json, "{}");
-    }
-
-    #[test]
     fn test_generate_word_filename() {
         let name = generate_word_filename();
         assert_eq!(name.split('-').count(), 4, "Should have 4 words: {name}");
     }
 
     #[tokio::test]
-    async fn save_image_low_resolution_downscales_inline_content() {
+    async fn images_are_always_stored_downscaled_to_the_requested_resolution() {
         let dir = tempfile::tempdir().unwrap();
-        let jpeg = encode_test_image(4000, 3000, ImageFormat::Jpeg);
+        let jpeg = encode_test_image(1200, 900, ImageFormat::Jpeg);
 
-        let entry = OutputStore::save_to_dir_with_limit(
+        let stream = OutputStore::save_to_dir_with_limit(
             dir.path(),
             &jpeg,
             OutputFormat::Image,
@@ -1059,73 +715,47 @@ mod tests {
         .await
         .unwrap();
 
-        let OutputEntry::Inline {
-            content: Content::Image { data, media_type },
-        } = entry
-        else {
-            panic!("expected inline image preview");
+        let CommandStream::Image { media_type, file } = stream else {
+            panic!("expected a stored image");
         };
-
-        assert_eq!(media_type, "image/jpeg");
-
-        let preview_bytes = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .unwrap();
-        let preview = ImageReader::new(Cursor::new(preview_bytes))
-            .with_guessed_format()
-            .unwrap()
-            .decode()
-            .unwrap();
-        assert!(preview.width() <= 512);
-        assert!(preview.height() <= 512);
-    }
-
-    #[tokio::test]
-    async fn save_large_image_keeps_stored_file_and_preview_when_resolution_fits_limit() {
-        const LIMIT: usize = 100_000;
-
-        let dir = tempfile::tempdir().unwrap();
-        let jpeg = encode_test_image(4000, 3000, ImageFormat::Jpeg);
-        assert!(jpeg.len() > LIMIT);
-
-        let entry = OutputStore::save_to_dir_with_limit(
-            dir.path(),
-            &jpeg,
-            OutputFormat::Image,
-            MediaResolution::Low,
-            Some(LIMIT),
-        )
-        .await
-        .unwrap();
-
-        let OutputEntry::Stored {
-            url,
-            path,
-            content: Some(Content::Image { data, media_type }),
-        } = entry
-        else {
-            panic!("expected stored image preview");
-        };
-
         assert_eq!(media_type, "image/jpeg");
         assert!(
-            std::path::Path::new(&path)
+            Path::new(&file.path)
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("jpg")
                     || extension.eq_ignore_ascii_case("jpeg"))
         );
-        assert!(dir.path().join(url.trim_start_matches("outputs/")).exists());
+        assert!(
+            dir.path()
+                .join(file.url.trim_start_matches("outputs/"))
+                .exists()
+        );
 
-        let preview_bytes = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .unwrap();
-        let preview = ImageReader::new(Cursor::new(preview_bytes))
+        let stored = ImageReader::open(&file.path)
+            .unwrap()
             .with_guessed_format()
             .unwrap()
             .decode()
             .unwrap();
-        assert!(preview.width() <= 512);
-        assert!(preview.height() <= 512);
+        assert!(stored.width() <= 512);
+        assert!(stored.height() <= 512);
+    }
+
+    #[tokio::test]
+    async fn small_images_are_stored_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = encode_test_image(8, 8, ImageFormat::Png);
+
+        let stream =
+            OutputStore::save_to_dir(dir.path(), &png, OutputFormat::Auto, MediaResolution::Auto)
+                .await
+                .unwrap();
+
+        let CommandStream::Image { media_type, file } = stream else {
+            panic!("expected a stored image");
+        };
+        assert_eq!(media_type, "image/png");
+        assert_eq!(std::fs::read(&file.path).unwrap(), png);
     }
 
     fn encode_test_image(width: u32, height: u32, format: ImageFormat) -> Vec<u8> {
@@ -1162,10 +792,11 @@ mod tests {
         .await
         .unwrap();
 
-        let OutputEntry::Stored {
-            content: Some(Content::Text { text, truncated }),
-            url,
-            ..
+        let rendered = entry.render_for_model();
+        let CommandStream::Stored {
+            preview: text,
+            truncated,
+            file,
         } = entry
         else {
             panic!("expected stored entry with text content");
@@ -1176,10 +807,10 @@ mod tests {
             "preview must lead with real content: {text}"
         );
         assert!(
-            text.contains(&url),
-            "guidance must reference the saved file"
+            rendered.contains(&file.url) && rendered.contains(&file.path),
+            "guidance must reference the saved file: {rendered}"
         );
-        assert!(text.contains("Use head/tail/grep/sed"));
+        assert!(rendered.contains("Use head/tail/grep/sed"));
     }
 
     #[tokio::test]
@@ -1199,11 +830,7 @@ mod tests {
         .await
         .unwrap();
 
-        let OutputEntry::Stored {
-            content: Some(Content::Text { text, .. }),
-            ..
-        } = entry
-        else {
+        let CommandStream::Stored { preview: text, .. } = entry else {
             panic!("expected stored entry with text content");
         };
         // Eight lines, a budget of three: one for the head, two for the tail.
@@ -1212,7 +839,7 @@ mod tests {
             "preview must stop at max_lines: {text}"
         );
         assert!(
-            text.contains(&format!("gamma{pad}\ndelta{pad}\n[Preview only:")),
+            text.ends_with(&format!("gamma{pad}\ndelta{pad}")),
             "tail must close the preview: {text}"
         );
     }
@@ -1241,14 +868,15 @@ mod tests {
         .await
         .unwrap();
 
-        let OutputEntry::Stored {
-            content: Some(Content::Text { text, .. }),
-            path,
+        let CommandStream::Stored {
+            preview: text,
+            file,
             ..
         } = entry
         else {
             panic!("expected stored entry with text content");
         };
+        let path = file.path;
 
         // The failure is in the preview, at its end.
         assert!(text.contains("error: test failed"), "{text}");
@@ -1308,13 +936,9 @@ mod tests {
         .await
         .unwrap();
 
-        let OutputEntry::Inline {
-            content: Content::Text { text, truncated },
-        } = entry
-        else {
+        let CommandStream::Inline(text) = entry else {
             panic!("expected the original inline");
         };
-        assert!(!truncated);
         assert_eq!(text, data);
         assert_eq!(stored_file_count(dir.path()), 0, "nothing may be stored");
     }
@@ -1335,17 +959,17 @@ mod tests {
         .await
         .unwrap();
 
-        let OutputEntry::Stored {
-            content: Some(Content::Text { text, truncated }),
-            path,
-            ..
+        let CommandStream::Stored {
+            preview: text,
+            truncated,
+            file,
         } = entry
         else {
             panic!("expected stored entry with text content");
         };
         assert!(truncated);
         assert!(text.len() < data.len());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), data);
+        assert_eq!(std::fs::read_to_string(file.path).unwrap(), data);
         assert_eq!(stored_file_count(dir.path()), 1);
     }
 
@@ -1363,11 +987,7 @@ mod tests {
         .await
         .unwrap();
 
-        let OutputEntry::Stored {
-            content: Some(Content::Text { text, .. }),
-            ..
-        } = entry
-        else {
+        let CommandStream::Stored { preview: text, .. } = entry else {
             panic!("expected stored entry with text content");
         };
         assert!(text.len() < data.len());
@@ -1408,14 +1028,15 @@ mod tests {
         .await
         .unwrap();
 
-        let OutputEntry::Stored {
-            content: Some(Content::Text { text, .. }),
-            path,
+        let CommandStream::Stored {
+            preview: text,
+            file,
             ..
         } = entry
         else {
             panic!("expected stored entry with a folded preview");
         };
+        let path = file.path;
         assert!(text.contains("fn compute_0"), "{text}");
         assert!(text.contains("Code folded"), "{text}");
         assert!(!text.contains("step_3 ="), "bodies must be folded: {text}");
@@ -1440,10 +1061,7 @@ mod tests {
         .await
         .unwrap();
 
-        let OutputEntry::Inline {
-            content: Content::Text { text, .. },
-        } = entry
-        else {
+        let CommandStream::Inline(text) = entry else {
             panic!("expected the source inline");
         };
         assert_eq!(text, data);

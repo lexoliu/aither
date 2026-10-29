@@ -38,8 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "raw": true
     }))?;
     let result = terminal.call(arguments, ToolContext::new()).await?;
-    let output: aither_sandbox::TerminalResult = serde_json::from_str(&result.render_for_model()?)?;
-    assert_eq!(output.exit_code, 0, "{output:?}");
-    assert!(output.task_id.is_none(), "{output:?}");
+    let output = result.render_for_model();
+    assert!(output.contains("baseline acceptance passed"), "{output}");
+    assert!(!output.contains("Exit code:"), "{output}");
+    assert!(!output.contains("Started in background"), "{output}");
     Ok(())
 }

@@ -1,0 +1,3 @@
+Background task '{{ task_id }}' (`{{ script }}`) {% match outcome %}{% when BackgroundOutcome::Finished { code } %}finished with exit code {{ code }}.{% when BackgroundOutcome::Failed { error } %}failed: {{ error }}{% endmatch %}
+{% if let Some(output) = output %}{{ output }}{% endif %}{% if let Some(stderr) = stderr %}stderr:
+{{ stderr }}{% endif %}

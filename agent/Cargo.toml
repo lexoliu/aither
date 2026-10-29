@@ -26,7 +26,6 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 indexmap = { version = "2", features = ["serde"] }
 heck = "0.5"
-quick-xml = { version = "0.42", features = ["serialize"] }
 tracing = "0.1"
 async-fs = "2"
 async-channel = "2"
@@ -46,6 +45,7 @@ sha2 = "0.11"
 similar = "3"
 uuid = { version = "1", features = ["v4"] }
 num-traits = "0.2"
+jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
 
 [dev-dependencies]
 hex = "0.4"

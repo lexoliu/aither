@@ -19,7 +19,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use futures::future::try_join_all;
-use serde::{Serialize, Serializer};
 
 /// What a launcher grants a subagent beyond its own space.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -686,7 +685,7 @@ impl SubagentGrant {
 }
 
 /// A commit a subagent made.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentCommit {
     /// The worktree it was made in.
     pub worktree: PathBuf,
@@ -783,28 +782,6 @@ impl CommitLedger {
         ))
         .await?;
         Ok(listed.into_iter().flatten().collect())
-    }
-}
-
-/// The commits listed for one run of a subagent holding a commit grant, or
-/// why they could not be listed. Serializes as the list, or as
-/// `{"error": "..."}`.
-#[derive(Debug)]
-pub struct CommitListing(pub Result<Vec<SubagentCommit>, CommitLedgerError>);
-
-impl Serialize for CommitListing {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Failure {
-            error: String,
-        }
-        match &self.0 {
-            Ok(commits) => commits.serialize(serializer),
-            Err(error) => Failure {
-                error: error.to_string(),
-            }
-            .serialize(serializer),
-        }
     }
 }
 
@@ -1190,26 +1167,6 @@ pub mod tests {
         assert!(
             matches!(error, SubagentGrantError::GitDataExposed { .. }),
             "{error}"
-        );
-    }
-
-    #[test]
-    fn a_failed_listing_serializes_as_an_error() {
-        let failed = CommitListing(Err(CommitLedgerError::Git {
-            repository: PathBuf::from("/repo"),
-            stderr: "boom".to_string(),
-        }));
-        let value = serde_json::to_value(&failed).unwrap();
-        assert!(
-            value["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("boom")),
-            "{value}"
-        );
-        let listed = CommitListing(Ok(Vec::new()));
-        assert_eq!(
-            serde_json::to_value(&listed).unwrap(),
-            serde_json::json!([])
         );
     }
 }

@@ -3,7 +3,8 @@
 use std::borrow::Cow;
 
 use aither_core::llm::ToolContext;
-use aither_core::llm::{Tool, ToolResult};
+use aither_core::llm::{CommandStream, Tool, ToolResult};
+use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -49,16 +50,10 @@ impl Tool for KillTerminalTool {
         }
 
         let killed = self.registry.kill_by_task_id(task_id).await;
-        ToolResult::json(&serde_json::json!({
-            "ok": killed,
-            "task_id": task_id,
-            "killed": killed,
-            "message": if killed {
-                "Background task terminated"
-            } else {
-                "Background task not found or already stopped"
-            }
-        }))
+        let text = TerminalKillTemplate { task_id, killed }
+            .render()
+            .expect("terminal kill template must render");
+        Ok(ToolResult::text(text))
     }
 }
 
@@ -120,10 +115,10 @@ impl Tool for InputTerminalTool {
             .await
             .map_err(anyhow::Error::msg)?;
 
-        ToolResult::json(&serde_json::json!({
-            "ok": true,
-            "task_id": task_id,
-        }))
+        let text = TerminalInputTemplate { task_id }
+            .render()
+            .expect("terminal input template must render");
+        Ok(ToolResult::text(text))
     }
 }
 
@@ -158,17 +153,55 @@ const fn default_max_bytes() -> usize {
     32 * 1024
 }
 
-fn job_status_payload(status: &JobStatus) -> serde_json::Value {
+fn job_status_text(status: &JobStatus) -> String {
     match status {
-        JobStatus::Running => serde_json::json!({ "kind": "running" }),
-        JobStatus::Completed { exit_code } => {
-            serde_json::json!({ "kind": "completed", "exit_code": exit_code })
-        }
-        JobStatus::Failed { error } => {
-            serde_json::json!({ "kind": "failed", "error": error })
-        }
-        JobStatus::Killed => serde_json::json!({ "kind": "killed" }),
+        JobStatus::Running => "is running".to_string(),
+        JobStatus::Completed { exit_code } => format!("completed with exit code {exit_code}"),
+        JobStatus::Failed { error } => format!("failed: {error}"),
+        JobStatus::Killed => "was killed".to_string(),
     }
+}
+
+#[derive(Template)]
+#[template(path = "terminal_kill.txt", escape = "none")]
+struct TerminalKillTemplate<'a> {
+    task_id: &'a str,
+    killed: bool,
+}
+
+#[derive(Template)]
+#[template(path = "terminal_input.txt", escape = "none")]
+struct TerminalInputTemplate<'a> {
+    task_id: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "terminal_read.txt", escape = "none")]
+struct TerminalReadTemplate<'a> {
+    delta: &'a str,
+    has_more: bool,
+    cursor: usize,
+    task_id: &'a str,
+    status_text: &'a str,
+    bytes_read: usize,
+    total_bytes: usize,
+}
+
+fn render_terminal_delta(delta: &crate::job_registry::TerminalDelta) -> String {
+    let delta_text = CommandStream::Inline(String::from_utf8_lossy(&delta.bytes).into_owned())
+        .render_for_model();
+    let status_text = job_status_text(&delta.status);
+    TerminalReadTemplate {
+        delta: &delta_text,
+        has_more: delta.cursor < delta.total_bytes,
+        cursor: delta.cursor,
+        task_id: &delta.task_id,
+        status_text: &status_text,
+        bytes_read: delta.bytes.len(),
+        total_bytes: delta.total_bytes,
+    }
+    .render()
+    .expect("terminal read template must render")
 }
 
 impl Tool for ReadTerminalDeltaTool {
@@ -198,15 +231,44 @@ impl Tool for ReadTerminalDeltaTool {
             .await
             .map_err(anyhow::Error::msg)?;
 
-        ToolResult::json(&serde_json::json!({
-            "ok": true,
-            "task_id": delta.task_id,
-            "cursor": delta.cursor,
-            "total_bytes": delta.total_bytes,
-            "bytes_read": delta.bytes.len(),
-            "has_more": delta.cursor < delta.total_bytes,
-            "delta": String::from_utf8_lossy(&delta.bytes),
-            "status": job_status_payload(&delta.status),
-        }))
+        let text = render_terminal_delta(&delta);
+        Ok(ToolResult::text(text))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job_registry::TerminalDelta;
+
+    fn delta(bytes: &str, cursor: usize, total_bytes: usize, status: JobStatus) -> TerminalDelta {
+        TerminalDelta {
+            task_id: "amber-forest-thunder-pearl".to_string(),
+            bytes: bytes.as_bytes().to_vec(),
+            cursor,
+            total_bytes,
+            status,
+        }
+    }
+
+    #[test]
+    fn terminal_read_without_more_buffered_states_the_next_cursor() {
+        assert_eq!(
+            render_terminal_delta(&delta("hello", 1005, 1005, JobStatus::Running)),
+            "hello\nTask 'amber-forest-thunder-pearl' is running; read 5 new bytes (1005 buffered in total); next cursor is 1005.\n"
+        );
+    }
+
+    #[test]
+    fn terminal_read_with_more_buffered_says_how_to_continue() {
+        assert_eq!(
+            render_terminal_delta(&delta(
+                "hello",
+                5,
+                1005,
+                JobStatus::Completed { exit_code: 0 }
+            )),
+            "hello\nTask 'amber-forest-thunder-pearl' completed with exit code 0; read 5 new bytes (1005 buffered in total); next cursor is 5.\nMore output is buffered: call terminal_read with cursor=5.\n"
+        );
     }
 }

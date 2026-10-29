@@ -1,0 +1,3 @@
+{% if results.is_empty() %}No matching chunks.{% else %}{% for r in results %}- {{ r.id }} (score: {{ r.score }}{% for (key, value) in r.metadata %}, {{ key }}: {{ value }}{% endfor %}):
+{{ r.text }}
+{% endfor %}{% endif %}
