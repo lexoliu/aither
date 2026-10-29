@@ -3451,7 +3451,18 @@ You are a file-defined agent.
             let hook_tools = crate::test_support::prepared_fixture().await;
             let permission = crate::ReviewedPermission::new(
                 permission,
-                crate::external_hook::tests::reviewer_hooks(reviewers, &hook_tools).await,
+                crate::external_hook::ExternalHooks::new(
+                    &crate::external_hook::LiveHooks::start(
+                        crate::external_hook::HooksConfig {
+                            reviewers,
+                            ..crate::external_hook::HooksConfig::default()
+                        },
+                        &hook_tools.tools,
+                        executor_core::AnyExecutor::new(TokioGlobal),
+                    )
+                    .await
+                    .expect("the hooks start"),
+                ),
             );
             let terminal = TerminalTool::new_exact(session.path(), permission, TokioGlobal)
                 .await
