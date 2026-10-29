@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use aither_core::llm::model::Parameters;
 
-use crate::compression::ContextStrategy;
+use crate::context::ContextPolicy;
 
 /// Agent specialization mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -16,26 +16,34 @@ pub enum AgentKind {
     Chatbot,
 }
 
-/// Prompt-level context assembly settings.
+/// Prompt-cache keep-alive settings for an agent that waits on its own
+/// background commands.
+///
+/// Enabled on subagent runs by `SubagentTool`: while the run parks waiting
+/// for background terminal jobs, the conversation's prompt cache entry is
+/// refreshed by re-sending the last request with `max_tokens: 0`. A `None`
+/// value disables keep-alive entirely (the default for ordinary agents,
+/// including the parent agent itself).
+///
+/// How long an entry stays warm is the agent's
+/// [`PromptCache`](crate::context::PromptCache) lifetime — a
+/// [`CacheLifetime::Permanent`](crate::context::CacheLifetime) cache gets no
+/// keep-alives.
 #[derive(Debug, Clone)]
-pub struct ContextAssemblerConfig {
-    /// Fraction of context reserved for static/system blocks.
-    pub static_budget_fraction: f32,
-    /// Usage threshold to request handoff summary.
-    pub handoff_threshold: f32,
-    /// Reassemble ephemeral context when no LLM request has been sent for this long.
-    pub idle_reassemble_after: Duration,
-    /// Instruction injected near context exhaustion.
-    pub handoff_instruction: String,
+pub struct CacheKeepAlive {
+    /// How long before the cache entry's lifetime expires the keep-alive is
+    /// sent.
+    pub send_before_expiry: Duration,
+    /// Number of keep-alives in one run that counts as idling frequently;
+    /// crossing it produces a single parent alert.
+    pub frequent_idle_threshold: usize,
 }
 
-impl Default for ContextAssemblerConfig {
+impl Default for CacheKeepAlive {
     fn default() -> Self {
         Self {
-            static_budget_fraction: 0.2,
-            handoff_threshold: 0.9,
-            idle_reassemble_after: Duration::from_secs(300),
-            handoff_instruction: "Your context window is nearly exhausted. Generate a concise handoff summary now, preserving current goals, constraints, file paths, pending tasks, and immediate next actions.".to_string(),
+            send_before_expiry: Duration::from_secs(30),
+            frequent_idle_threshold: 3,
         }
     }
 }
@@ -46,8 +54,8 @@ pub struct AgentConfig {
     /// Maximum number of agent loop iterations.
     pub max_iterations: usize,
 
-    /// Context management strategy.
-    pub context: ContextStrategy,
+    /// Thresholds governing compaction, pausing and reassembly.
+    pub context_policy: ContextPolicy,
 
     /// Generic system prompt content.
     pub system_prompt: Option<String>,
@@ -58,12 +66,6 @@ pub struct AgentConfig {
     /// Agent specialization (coding vs chatbot).
     pub agent_kind: AgentKind,
 
-    /// Optional transcript path for long-memory recovery.
-    pub transcript_path: Option<String>,
-
-    /// Context assembly behavior.
-    pub context_assembler: ContextAssemblerConfig,
-
     /// Tool turns tolerated before an unmaintained `tasks.md` earns a
     /// staleness alert.
     ///
@@ -73,21 +75,28 @@ pub struct AgentConfig {
     pub tasks_stale_after_turns: usize,
 
     /// Request-level model parameters applied to each LLM call.
+    ///
+    /// This is the only path for request parameters: the agent fills in the
+    /// prompt cache controls it derives from the window layout and sends
+    /// everything else exactly as configured here.
     pub request_parameters: Parameters,
+
+    /// Prompt-cache keep-alive while the run waits on its own background
+    /// commands. `None` disables keep-alive.
+    pub cache_keep_alive: Option<CacheKeepAlive>,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_iterations: 10_000,
-            context: ContextStrategy::default(),
+            context_policy: ContextPolicy::default(),
             system_prompt: None,
             persona_prompt: None,
             agent_kind: AgentKind::default(),
-            transcript_path: None,
-            context_assembler: ContextAssemblerConfig::default(),
             tasks_stale_after_turns: 4,
             request_parameters: Parameters::default(),
+            cache_keep_alive: None,
         }
     }
 }
@@ -106,10 +115,10 @@ impl AgentConfig {
         self
     }
 
-    /// Sets the context strategy.
+    /// Sets the context management policy.
     #[must_use]
-    pub const fn with_context(mut self, strategy: ContextStrategy) -> Self {
-        self.context = strategy;
+    pub const fn with_context_policy(mut self, policy: ContextPolicy) -> Self {
+        self.context_policy = policy;
         self
     }
 
@@ -134,24 +143,18 @@ impl AgentConfig {
         self
     }
 
-    /// Sets a transcript path for memory recovery.
-    #[must_use]
-    pub fn with_transcript_path(mut self, path: impl Into<String>) -> Self {
-        self.transcript_path = Some(path.into());
-        self
-    }
-
-    /// Sets the idle gap after which ephemeral context should be reassembled.
-    #[must_use]
-    pub const fn with_idle_reassemble_after(mut self, idle_reassemble_after: Duration) -> Self {
-        self.context_assembler.idle_reassemble_after = idle_reassemble_after;
-        self
-    }
-
     /// Sets default request-level model parameters for each LLM call.
     #[must_use]
     pub fn with_request_parameters(mut self, parameters: Parameters) -> Self {
         self.request_parameters = parameters;
+        self
+    }
+
+    /// Enables prompt-cache keep-alive while the run waits on its own
+    /// background commands.
+    #[must_use]
+    pub const fn with_cache_keep_alive(mut self, keep_alive: CacheKeepAlive) -> Self {
+        self.cache_keep_alive = Some(keep_alive);
         self
     }
 }

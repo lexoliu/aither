@@ -1,0 +1,3 @@
+That response could not be used as a handoff document: {{ reason }}
+
+Reply with the JSON object only -- no prose, no markdown, no code fences -- using exactly the keys `current_task`, `key_decisions`, `context_files`, `errors_fixes`, `pending_work`, `recovery_hints` and `skills`. `current_task` must be a non-empty string.

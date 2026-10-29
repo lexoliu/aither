@@ -1,0 +1,6 @@
+<tasks_document>
+{% if let Some(tasks) = tasks %}Contents of tasks.md:
+{{ tasks }}
+{% endif %}{% if let Some(changes) = recent_changes %}Changes to tasks.md since it was last shown:
+{{ changes }}
+{% endif %}</tasks_document>

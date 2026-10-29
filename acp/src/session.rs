@@ -20,7 +20,7 @@ use crate::protocol::{
 ///
 /// Each session wraps a conversation context and can process prompts.
 #[derive(Debug)]
-pub struct AcpSession<LLM: LanguageModel> {
+pub struct AcpSession<LLM: LanguageModel + 'static> {
     id: String,
     cwd: PathBuf,
     mcp_servers: Vec<McpServer>,
@@ -28,8 +28,9 @@ pub struct AcpSession<LLM: LanguageModel> {
     agent: Agent<LLM, LLM, LLM>,
 }
 
-impl<LLM: LanguageModel> AcpSession<LLM> {
+impl<LLM: LanguageModel + 'static> AcpSession<LLM> {
     /// Create a new session that drives the given agent.
+    #[must_use]
     pub fn new(cwd: PathBuf, mcp_servers: Vec<McpServer>, agent: Agent<LLM, LLM, LLM>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),

@@ -42,6 +42,8 @@ use serde::{Deserialize, Serialize};
 use shell_words::split as split_shell_words;
 use tracing::{debug, info, warn};
 
+#[cfg(all(unix, feature = "jobserver"))]
+use crate::jobserver::{JobBroker, JobPool, job_broker_channel};
 use crate::{
     ContainerPath, PreparedTools, ToolDistribution, ToolRuntimeError,
     builtin::builtin_router,
@@ -573,6 +575,82 @@ pub struct BackgroundTaskReceiver {
     running_tasks: Arc<AtomicUsize>,
 }
 
+/// Sender half of a [`BackgroundTaskReceiver`] channel.
+///
+/// A `TerminalTool` owns the sender side internally; the exposed pair lets
+/// tests and embedders drive a receiver without a live terminal backend:
+/// `task_started`/`task_finished` move the running counter the receiver's
+/// `has_running` reads, and the `send_*` methods deliver the same payloads
+/// spawned executions produce.
+#[derive(Clone, Debug)]
+pub struct BackgroundTaskSender {
+    completed_tx: Sender<CompletedTask>,
+    alert_tx: Sender<LongRunningJob>,
+    started_tx: Sender<StartedBackgroundTask>,
+    running_tasks: Arc<AtomicUsize>,
+}
+
+impl BackgroundTaskSender {
+    /// Records a task start: `has_running` on the paired receiver turns true.
+    pub fn task_started(&self) {
+        self.running_tasks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records a task end: decrements the running counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics when more tasks are finished than were started — the counter
+    /// can never go negative, so a mismatched pair is a bug in the driver.
+    pub fn task_finished(&self) {
+        let previous = self.running_tasks.fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            previous > 0,
+            "task_finished without a matching task_started"
+        );
+    }
+
+    /// Delivers a completed-task event to the receiver.
+    pub async fn send_completed(&self, task: CompletedTask) {
+        let _ = self.completed_tx.send(task).await;
+    }
+
+    /// Delivers a long-running-job alert to the receiver.
+    pub async fn send_long_running(&self, alert: LongRunningJob) {
+        let _ = self.alert_tx.send(alert).await;
+    }
+
+    /// Delivers a background-task-started event to the receiver.
+    pub async fn send_started(&self, task: StartedBackgroundTask) {
+        let _ = self.started_tx.send(task).await;
+    }
+}
+
+/// Creates a standalone [`BackgroundTaskSender`]/[`BackgroundTaskReceiver`]
+/// pair disconnected from any `TerminalTool`, mirroring
+/// [`job_registry_channel`](crate::job_registry_channel).
+#[must_use]
+pub fn background_task_channel() -> (BackgroundTaskSender, BackgroundTaskReceiver) {
+    let (completed_tx, rx) = async_channel::unbounded();
+    let (alert_tx, alert_rx) = async_channel::unbounded();
+    let (started_tx, started_rx) = async_channel::unbounded();
+    let running_tasks = Arc::new(AtomicUsize::new(0));
+    (
+        BackgroundTaskSender {
+            completed_tx,
+            alert_tx,
+            started_tx,
+            running_tasks: running_tasks.clone(),
+        },
+        BackgroundTaskReceiver {
+            rx,
+            alert_rx,
+            started_rx,
+            running_tasks,
+        },
+    )
+}
+
 impl BackgroundTaskReceiver {
     /// Takes all completed background tasks without blocking.
     ///
@@ -839,6 +917,9 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     network_audit: Option<NetworkAuditLog>,
     /// Scheduling priority applied to every sandboxed execution.
     priority: ProcessPriority,
+    /// Shared jobserver token broker, when configured.
+    #[cfg(all(unix, feature = "jobserver"))]
+    jobserver: Option<JobBroker>,
     /// Tool registry state.
     registry: State,
 }
@@ -867,6 +948,8 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             readable_paths: self.readable_paths.clone(),
             network_audit: self.network_audit.clone(),
             priority: self.priority,
+            #[cfg(all(unix, feature = "jobserver"))]
+            jobserver: self.jobserver.clone(),
             registry: self.registry.clone(),
         }
     }
@@ -982,6 +1065,8 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             readable_paths: Vec::new(),
             network_audit: None,
             priority: ProcessPriority::default(),
+            #[cfg(all(unix, feature = "jobserver"))]
+            jobserver: None,
             registry: Unconfigured,
         })
     }
@@ -1046,6 +1131,8 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             readable_paths: Vec::new(),
             network_audit: None,
             priority: ProcessPriority::default(),
+            #[cfg(all(unix, feature = "jobserver"))]
+            jobserver: None,
             registry: Unconfigured,
         })
     }
@@ -1078,6 +1165,8 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             readable_paths: self.readable_paths,
             network_audit: self.network_audit,
             priority: self.priority,
+            #[cfg(all(unix, feature = "jobserver"))]
+            jobserver: self.jobserver,
             registry: Configured { registry },
         }
     }
@@ -1128,6 +1217,40 @@ where
     pub const fn with_process_priority(mut self, priority: ProcessPriority) -> Self {
         self.priority = priority;
         self
+    }
+
+    /// Shares a jobserver token pool across every command this tool runs.
+    ///
+    /// `pool` is the host-provided shared pool (a `fifo:` jobserver). Each
+    /// command — foreground or background — gets its own fifo beneath
+    /// `fifo_dir` (created if missing, broker-owned, kept out of command
+    /// working directories), exported through
+    /// `MAKEFLAGS=--jobserver-auth=fifo:PATH`. The broker moves tokens
+    /// between the pool and each fifo on demand and returns every token
+    /// once the command's whole process tree is gone: the fifo's read end
+    /// reports EOF only when its last writer — including surviving
+    /// grandchildren — has exited. Commands never see the shared pool
+    /// directly, so killed commands cannot leak tokens.
+    ///
+    /// Only local executions can open a host fifo; container and SSH
+    /// commands fail while a pool is configured rather than running
+    /// unbounded.
+    ///
+    /// # Errors
+    /// Returns an error when the fifo directory cannot be created or the
+    /// broker's readiness poller cannot be set up.
+    #[cfg(all(unix, feature = "jobserver"))]
+    pub fn with_jobserver_pool(
+        mut self,
+        pool: JobPool,
+        fifo_dir: impl AsRef<Path>,
+    ) -> Result<Self, TerminalError> {
+        let (broker, service) = job_broker_channel(pool, fifo_dir)?;
+        self.executor
+            .spawn(async move { service.serve().await })
+            .detach();
+        self.jobserver = Some(broker);
+        Ok(self)
     }
 
     /// Sets how long a foreground `terminal` command may run before it is
@@ -1336,6 +1459,8 @@ where
             readable_paths: self.readable_paths.clone(),
             network_audit: self.network_audit.clone(),
             priority: self.priority,
+            #[cfg(all(unix, feature = "jobserver"))]
+            jobserver: self.jobserver.clone(),
             registry: self
                 .registry
                 .for_jobs(job_registry.clone(), self.outputs_dir()),
@@ -1565,6 +1690,8 @@ where
                 running_tasks,
                 network_audit: self.network_audit.clone(),
                 priority: self.priority,
+                #[cfg(all(unix, feature = "jobserver"))]
+                jobserver: self.jobserver.clone(),
             }))
             .detach();
 
@@ -1967,6 +2094,8 @@ struct StandaloneExecution<P, E> {
     background_startup: BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
+    #[cfg(all(unix, feature = "jobserver"))]
+    jobserver: Option<JobBroker>,
     expect: OutputFormat,
     resolution: MediaResolution,
     store_dir: PathBuf,
@@ -1991,6 +2120,8 @@ struct StandaloneStart<'a, P, E> {
     background_startup: &'a BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
+    #[cfg(all(unix, feature = "jobserver"))]
+    jobserver: &'a Option<JobBroker>,
 }
 
 struct LocalBackgroundExecution<'a, E> {
@@ -2008,6 +2139,8 @@ struct LocalBackgroundExecution<'a, E> {
     stdin_blocked_notice: Option<Sender<String>>,
     background_startup: &'a BackgroundStartup,
     priority: ProcessPriority,
+    #[cfg(all(unix, feature = "jobserver"))]
+    job_fifo: Option<crate::jobserver::CommandFifo>,
 }
 
 struct ContainerBackgroundExecution<'a, E> {
@@ -2126,6 +2259,8 @@ struct SpawnedTerminalTask<P, E> {
     running_tasks: Arc<AtomicUsize>,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
+    #[cfg(all(unix, feature = "jobserver"))]
+    jobserver: Option<JobBroker>,
 }
 
 async fn execute_terminal_task<P, E>(task: SpawnedTerminalTask<P, E>)
@@ -2159,6 +2294,8 @@ where
         running_tasks,
         network_audit,
         priority,
+        #[cfg(all(unix, feature = "jobserver"))]
+        jobserver,
     } = task;
     let result = execute_script_standalone(StandaloneExecution {
         working_dir,
@@ -2178,6 +2315,8 @@ where
         background_startup,
         network_audit,
         priority,
+        #[cfg(all(unix, feature = "jobserver"))]
+        jobserver,
         expect,
         resolution,
         store_dir,
@@ -2229,6 +2368,8 @@ where
         background_startup,
         network_audit,
         priority,
+        #[cfg(all(unix, feature = "jobserver"))]
+        jobserver,
         expect,
         resolution,
         store_dir,
@@ -2259,6 +2400,8 @@ where
         background_startup: &background_startup,
         network_audit,
         priority,
+        #[cfg(all(unix, feature = "jobserver"))]
+        jobserver: &jobserver,
     })
     .await;
     let (pid, output) = match start_result {
@@ -2291,6 +2434,25 @@ where
     Ok(result)
 }
 
+/// Creates the private jobserver fifo for one command under the broker.
+///
+/// Only local commands can open a host fifo. Container and SSH executions
+/// fail rather than running unbounded while a pool is configured.
+#[cfg(all(unix, feature = "jobserver"))]
+async fn open_command_fifo(
+    broker: &JobBroker,
+    backend: &ExecutionBackend,
+) -> Result<crate::jobserver::CommandFifo, TerminalError> {
+    match backend {
+        ExecutionBackend::Local(_) => Ok(broker.open_fifo().await?),
+        ExecutionBackend::Container { .. } | ExecutionBackend::Ssh { .. } => {
+            Err(TerminalError::Execution(
+                "jobserver token pools are supported for local executions only".into(),
+            ))
+        }
+    }
+}
+
 async fn start_standalone_execution<P, E>(
     request: StandaloneStart<'_, P, E>,
 ) -> Result<(u32, std::process::Output), TerminalError>
@@ -2298,6 +2460,11 @@ where
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
+    #[cfg(all(unix, feature = "jobserver"))]
+    let job_fifo = match request.jobserver {
+        Some(broker) => Some(open_command_fifo(broker, request.backend).await?),
+        None => None,
+    };
     let prepared_tools = match request.backend {
         ExecutionBackend::Local(tools) => tools,
         ExecutionBackend::Container { runtime, tools } => {
@@ -2353,6 +2520,8 @@ where
         stdin_blocked_notice: request.stdin_blocked_notice,
         background_startup: request.background_startup,
         priority: request.priority,
+        #[cfg(all(unix, feature = "jobserver"))]
+        job_fifo,
     };
     match request.mode {
         TerminalMode::Sandboxed => {
@@ -2521,12 +2690,26 @@ fn local_path_grants<'a>(
     writable: &'a [PathBuf],
     readable: &'a [PathBuf],
     tools: &'a PreparedTools<PathBuf>,
+    job_fifo: Option<&'a Path>,
 ) -> impl Iterator<Item = Grant> + 'a {
     writable
         .iter()
         .map(|path| Grant::new(path, Access::WRITE))
         .chain(readable.iter().map(|path| Grant::new(path, Access::READ)))
         .chain(std::iter::once(Grant::new(tools.bin_dir(), Access::EXEC)))
+        .chain(job_fifo.map(|path| Grant::new(path, Access::WRITE)))
+}
+
+/// Adds a command's private jobserver variables to its process environment.
+#[cfg(all(unix, feature = "jobserver"))]
+fn with_jobserver_environment(
+    mut environment: Vec<(String, String)>,
+    fifo: Option<&crate::jobserver::CommandFifo>,
+) -> Vec<(String, String)> {
+    if let Some(fifo) = fifo {
+        environment.extend(fifo.environment());
+    }
+    environment
 }
 
 async fn execute_sandboxed_background<E, N>(
@@ -2539,6 +2722,16 @@ where
 {
     let runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    #[cfg(all(unix, feature = "jobserver"))]
+    let runtime_environment =
+        with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
+    #[cfg(all(unix, feature = "jobserver"))]
+    let job_fifo_path = context
+        .job_fifo
+        .as_ref()
+        .map(crate::jobserver::CommandFifo::path);
+    #[cfg(not(all(unix, feature = "jobserver")))]
+    let job_fifo_path: Option<&Path> = None;
     let config_builder = SandboxConfig::builder()
         .network(policy)
         .working_dir(context.working_dir)
@@ -2546,6 +2739,7 @@ where
             context.writable_paths,
             context.readable_paths,
             context.prepared_tools,
+            job_fifo_path,
         ))
         .security(SecurityConfig::interactive())
         .priority(context.priority);
@@ -2610,6 +2804,16 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
 ) -> Result<(u32, std::process::Output), TerminalError> {
     let runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    #[cfg(all(unix, feature = "jobserver"))]
+    let runtime_environment =
+        with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
+    #[cfg(all(unix, feature = "jobserver"))]
+    let job_fifo_path = context
+        .job_fifo
+        .as_ref()
+        .map(crate::jobserver::CommandFifo::path);
+    #[cfg(not(all(unix, feature = "jobserver")))]
+    let job_fifo_path: Option<&Path> = None;
     let config_builder = SandboxConfig::builder()
         .network(AllowAll)
         .working_dir(context.working_dir)
@@ -2617,6 +2821,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
             context.writable_paths,
             context.readable_paths,
             context.prepared_tools,
+            job_fifo_path,
         ))
         .security(SecurityConfig::interactive())
         .priority(context.priority);
@@ -3622,6 +3827,11 @@ pub enum TerminalError {
     /// IO error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Jobserver pool or broker error.
+    #[cfg(all(unix, feature = "jobserver"))]
+    #[error(transparent)]
+    Jobserver(#[from] crate::jobserver::JobserverError),
 }
 
 impl<P, E, State> std::fmt::Debug for TerminalTool<P, E, State> {
@@ -4193,7 +4403,7 @@ mod tests {
 
     #[test]
     fn wrap_container_script_preserves_user_script_semantics() {
-        let script = "echo '$5,040' && subagent --subagent .skills/slide/subagents/art_direction.md --prompt-file tmp/prompt.md";
+        let script = "echo '$5,040' && subagent start --subagent .skills/slide/subagents/art_direction.md --prompt-file tmp/prompt.md";
         let wrapped = wrap_container_script(
             script,
             &[String::from("subagent")],
@@ -4556,6 +4766,8 @@ mod tests {
             background_startup: BackgroundStartup::new(startup_tx),
             network_audit: None,
             priority: ProcessPriority::default(),
+            #[cfg(all(unix, feature = "jobserver"))]
+            jobserver: None,
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             store_dir: tool.outputs_dir(),

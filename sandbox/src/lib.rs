@@ -72,6 +72,10 @@ pub mod builtin;
 /// Background job registry for tracking tasks.
 pub mod job_registry;
 
+/// Jobserver token pool brokering across commands.
+#[cfg(all(unix, feature = "jobserver"))]
+pub mod jobserver;
+
 /// Declarative host-based network policy.
 pub mod network_policy;
 
@@ -96,6 +100,10 @@ pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use job_registry::{
     JobInfo, JobRegistry, JobRegistryService, JobStatus, TerminalDelta, job_registry_channel,
 };
+#[cfg(all(unix, feature = "jobserver"))]
+pub use jobserver::{
+    CommandFifo, JobBroker, JobBrokerService, JobPool, JobserverError, job_broker_channel,
+};
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
 };
@@ -112,13 +120,13 @@ pub use stdin_watch::{
     is_waiting_on_stdin,
 };
 pub use terminal::{
-    BackgroundTaskReceiver, CompletedCommand, CompletedTask, Configured,
+    BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand, CompletedTask, Configured,
     DEFAULT_BACKGROUND_TIMEOUT_CAP, DEFAULT_FOREGROUND_LIMIT, DEFAULT_LONG_JOB_ALERT_AFTER,
     LongRunningJob, PermissionEvent, PermissionEventReceiver, PermissionEventStage,
     StartedBackgroundTask, TerminalArgs, TerminalBackgroundArgs, TerminalBackgroundTool,
     TerminalError, TerminalExecutionMode, TerminalTool, TerminalToolFactory,
-    TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured, open_network_audit_log,
-    terminal_tool_factory_channel,
+    TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured, background_task_channel,
+    open_network_audit_log, terminal_tool_factory_channel,
 };
 pub use tool_distribution::{
     ToolArtifact, ToolArtifactFormat, ToolArtifactLocation, ToolDistribution,

@@ -104,6 +104,14 @@ name = "aither-ort"
 git_tag_name = "ort-v{{ version }}"
 
 [[package]]
+name = "aither-patch"
+git_tag_name = "patch-v{{ version }}"
+# Not on crates.io (`publish = false` in its manifest): released from git
+# tags only, so the apply_patch assets attach to its patch-v release.
+publish = false
+git_only = true
+
+[[package]]
 name = "aither-rag"
 git_tag_name = "rag-v{{ version }}"
 

@@ -1,1 +1,0 @@
-<tasks_diff_reminder><diff>{{ diff }}</diff></tasks_diff_reminder>

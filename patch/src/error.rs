@@ -17,9 +17,38 @@ pub enum PatchError {
     #[error("patch input is not valid UTF-8")]
     InputNotUtf8,
 
-    /// The patch could not be parsed, or one of its hunks did not apply.
-    #[error("{0}")]
-    Patch(#[from] zenpatch::ZenpatchError),
+    /// The patch text is not in the compact patch format.
+    #[error("Invalid patch format: {0}")]
+    InvalidFormat(String),
+
+    /// A hunk's context and deleted lines match nowhere it may apply.
+    #[error("Patch conflict: in {path}: hunk {hunk}: {reason}")]
+    Conflict {
+        /// The patch-relative path of the file being updated.
+        path: String,
+        /// The 1-based number of the failing hunk within that file's update.
+        hunk: usize,
+        /// Which line failed to match and where.
+        reason: String,
+    },
+
+    /// A hunk's context and deleted lines match in more than one place.
+    #[error(
+        "Ambiguous patch: in {path}: hunk {hunk} matches at file lines {}; add surrounding context or an `@@ anchor` line to select one",
+        join_lines(starts)
+    )]
+    Ambiguous {
+        /// The patch-relative path of the file being updated.
+        path: String,
+        /// The 1-based number of the ambiguous hunk within that file's update.
+        hunk: usize,
+        /// The 1-based file lines where the hunk's old side starts.
+        starts: Vec<usize>,
+    },
+
+    /// A `Delete File` directive's content lines differ from the file.
+    #[error("Patch conflict: in {0}: content to delete does not match the file's content")]
+    DeleteMismatch(String),
 
     /// An Update or Delete directive named a path that does not exist.
     #[error("{0}: file not found")]
@@ -46,4 +75,12 @@ pub enum PatchError {
         /// The underlying OS error.
         source: io::Error,
     },
+}
+
+fn join_lines(lines: &[usize]) -> String {
+    lines
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }

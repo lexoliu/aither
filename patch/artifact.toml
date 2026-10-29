@@ -4,21 +4,20 @@
 # pinned artifact URLs and hashes. This file documents the build contract;
 # it is not a runtime distribution manifest.
 #
-# Distribution prerequisite (NOT solved here): the initializer needs a
-# location from which to fetch or rebuild artifacts. There is currently no
-# published release or download URL — artifacts are produced by
-# `patch/build-artifact.sh` in this repo and their `.tar.gz` + `.sha256`
-# output is what must be staged. Stable release assets are tracked in #113.
+# Distribution: when release-plz cuts a patch-v<version> release,
+# .github/workflows/release.yml builds each target with
+# `patch/build-artifact.sh` and uploads the `.tar.gz` + `.sha256` output
+# plus a tool-distribution-<version>.json manifest as assets on that
+# release (#113).
 
 [artifact]
 # Executable filename as installed into the managed tools directory.
 name = "apply_patch"
-# Version is the workspace package version of `aither-patch`; it is the
-# exact string printed by `apply_patch --version` after the executable name.
-version = "0.7.0"
-# No published download URL exists. Distribution is a #113
-# prerequisite to satisfy with a staged tarball or a rebuild from source.
-distribution = "build-artifact.sh output; no published URL"
+# The version is always the workspace package version of `aither-patch`,
+# printed by `apply_patch --version` after the executable name.
+# Published download URL pattern on the patch-v<version> GitHub release;
+# the authoritative URLs + hashes live in its tool-distribution manifest.
+distribution = "https://github.com/lexoliu/aither/releases/download/patch-v{version}/apply_patch-{version}-{target}.tar.gz"
 # Cargo package whose [[bin]] produces the executable.
 package = "aither-patch"
 crate_dir = "patch"
@@ -53,7 +52,7 @@ outputs = ["apply_patch-{version}-{target}.tar.gz", ".sha256", ".json"]
 [validation]
 # The initializer MUST run these checks before marking the tool ready.
 version_command = "apply_patch --version"
-version_stdout = "apply_patch 0.7.0"
+version_stdout = "apply_patch <aither-patch version>"
 help_command = "apply_patch --help"        # exits 0, prints usage + format
 sha256 = "verify downloaded/staged tarball against its .sha256 sidecar"
 
