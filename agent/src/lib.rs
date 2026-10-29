@@ -36,6 +36,7 @@ mod browser_backend;
 mod builder;
 mod cache_stats;
 mod checkpoint;
+mod clock;
 mod config;
 pub mod context;
 mod context_window;
@@ -44,6 +45,8 @@ mod event;
 mod fork;
 mod fs_util;
 mod hook;
+#[cfg(test)]
+mod idle_compaction_tests;
 mod model_group;
 mod output_urls;
 mod stream;
@@ -81,6 +84,7 @@ pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser}
 pub use builder::AgentBuilder;
 pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
+pub use clock::{AnyClock, Clock, ManualClock, SystemClock};
 pub use config::{AgentConfig, AgentKind};
 #[cfg(feature = "skills")]
 pub use context::ActiveSkills;
