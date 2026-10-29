@@ -617,6 +617,7 @@ where
             reassembled: false,
             pending_compaction: None,
             completed_compaction: None,
+            tool_results: std::collections::VecDeque::new(),
             config: self.config,
             context: self.context,
             profile: None,
