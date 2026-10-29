@@ -3737,7 +3737,7 @@ You are a file-defined agent.
                 let contents: Vec<&str> = request
                     .messages()
                     .iter()
-                    .map(|message| message.content())
+                    .map(aither_core::llm::Message::content)
                     .collect();
                 panic!("no terminal result reported a task id; messages: {contents:#?}")
             })
