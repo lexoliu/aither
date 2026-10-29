@@ -21,7 +21,7 @@ If the topic needs research, use the builtin research subagent. Write the prompt
 cat > tmp/research-prompt.md << 'EOF'
 Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights.
 EOF
-subagent --subagent research --prompt-file tmp/research-prompt.md
+subagent start --subagent research --prompt-file tmp/research-prompt.md
 ```
 
 ### Phase 2: Requirements (Main Agent)
@@ -40,7 +40,7 @@ Launch art direction subagent to create design guide and outline:
 cat > tmp/art-direction-prompt.md << 'EOF'
 Create design guide for: [TOPIC]. Audience: [AUDIENCE]. Style: [STYLE]. Slide count: [N].
 EOF
-subagent --subagent .skills/slide/subagents/art_direction.md --prompt-file tmp/art-direction-prompt.md
+subagent start --subagent .skills/slide/subagents/art_direction.md --prompt-file tmp/art-direction-prompt.md
 ```
 
 The subagent returns a YAML design guide containing:
@@ -71,9 +71,9 @@ cat > tmp/slide-3-prompt.md << 'EOF'
 Slide 3: [SPEC]. Design: [DESIGN_GUIDE]
 EOF
 # ... one file per slide
-subagent --subagent .skills/slide/subagents/slide_creator.md --prompt-file tmp/slide-1-prompt.md &
-subagent --subagent .skills/slide/subagents/slide_creator.md --prompt-file tmp/slide-2-prompt.md &
-subagent --subagent .skills/slide/subagents/slide_creator.md --prompt-file tmp/slide-3-prompt.md &
+subagent start --subagent .skills/slide/subagents/slide_creator.md --prompt-file tmp/slide-1-prompt.md &
+subagent start --subagent .skills/slide/subagents/slide_creator.md --prompt-file tmp/slide-2-prompt.md &
+subagent start --subagent .skills/slide/subagents/slide_creator.md --prompt-file tmp/slide-3-prompt.md &
 # ... one per slide
 wait
 ```

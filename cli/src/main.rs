@@ -353,7 +353,7 @@ struct Args {
     #[arg(long)]
     skills: Option<PathBuf>,
 
-    /// Path to subagents directory. Subagents are markdown files invoked via `task <path> <prompt>`.
+    /// Path to subagents directory. Subagents are markdown files invoked via `subagent start --subagent <path> --prompt-file <file>`.
     #[arg(long)]
     subagents: Option<PathBuf>,
 
@@ -585,7 +585,7 @@ async fn build_agent(
 
 fn format_subagent_description(subagent_tool: &SubagentTool<CloudProvider>) -> String {
     let mut subagent_desc = String::from(
-        "Spawn a subagent for complex tasks. The prompt must be a path to a prompt file, not inline text. (types: ",
+        "Spawn or continue a subagent for complex tasks. The prompt must be a path to a prompt file, not inline text. (types: ",
     );
     let subagent_names = subagent_tool
         .type_descriptions()

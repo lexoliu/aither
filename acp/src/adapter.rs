@@ -253,10 +253,14 @@ fn format_tool_title(name: &str, arguments: &str) -> String {
             "Requesting workspace access".to_string()
         }
         "subagent" => {
-            if let Ok(args) =
-                serde_json::from_str::<aither_agent::specialized::SubagentArgs>(arguments)
-            {
-                return format!("Running {} subagent", truncate_title(&args.subagent));
+            use aither_agent::specialized::SubagentArgs;
+            if let Ok(args) = serde_json::from_str::<SubagentArgs>(arguments) {
+                return match args {
+                    SubagentArgs::Start { subagent, .. } => {
+                        format!("Running {} subagent", truncate_title(&subagent))
+                    }
+                    SubagentArgs::Resume { .. } => "Continuing subagent".to_string(),
+                };
             }
             "Running subagent".to_string()
         }
@@ -397,8 +401,14 @@ mod tests {
             ),
             (
                 "subagent",
-                r#"{"subagent":"explore","prompt_file":"tmp/prompt.md"}"#,
+                r#"{"command":"start","subagent":"explore","prompt_file":"tmp/prompt.md"}"#,
                 "Running explore subagent",
+                ToolKind::Other,
+            ),
+            (
+                "subagent",
+                r#"{"command":"resume","id":3,"prompt_file":"tmp/follow-up.md"}"#,
+                "Continuing subagent",
                 ToolKind::Other,
             ),
         ];
