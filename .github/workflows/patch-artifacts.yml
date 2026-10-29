@@ -8,6 +8,14 @@ on:
       - Cargo.lock
       - .github/workflows/patch-artifacts.yml
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      # JSON array of APPLY_PATCH_ABORT variants to build, e.g. '["immediate"]'.
+      # PRs and manual runs leave it unset and get both variants.
+      abort_variants:
+        type: string
+        required: false
+        default: '["immediate", "panic"]'
 
 permissions:
   contents: read
@@ -24,7 +32,9 @@ jobs:
       fail-fast: false
       matrix:
         platform: [linux-x86_64, linux-aarch64, macos-aarch64, macos-x86_64, windows-x86_64, windows-aarch64]
-        abort: [immediate, panic]
+        # inputs is empty on pull_request/workflow_dispatch, where the
+        # fallback keeps both abort variants.
+        abort: ${{ fromJSON(inputs.abort_variants || '["immediate", "panic"]') }}
         include:
           - platform: linux-x86_64
             runner: ubuntu-24.04

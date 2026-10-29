@@ -18,6 +18,10 @@ jobs:
     # both release-plz commands take it, so it is a job-level variable.
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      patch-tag: ${{ steps.patch-release.outputs.tag }}
+      patch-version: ${{ steps.patch-release.outputs.version }}
+      patch-released: ${{ steps.patch-release.outputs.released }}
     steps:
       # Check out the branch rather than the pushed commit: release-plz runs
       # `git rev-parse @{upstream}`, which needs a branch with an upstream.
@@ -119,3 +123,85 @@ jobs:
           --forge github
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+      # release-plz tags the commit it released — this job's checkout — so a
+      # patch-v<version> tag resolving to GITHUB_SHA means this run cut the
+      # aither-patch release; an earlier release's tag points at the commit
+      # that cut it and does not retrigger asset publishing. The GitHub
+      # release is checked rather than assumed (release-plz creates it with
+      # the tag).
+      - name: Detect the aither-patch release
+        id: patch-release
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "aither-patch") | .version')"
+          tag="patch-v${version}"
+          released=false
+          if [ "$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq .sha 2>/dev/null || true)" = "${GITHUB_SHA}" ] \
+              && gh release view "${tag}" --json tagName >/dev/null 2>&1; then
+            released=true
+          fi
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "released=${released}"
+          } >> "${GITHUB_OUTPUT}"
+
+  # Rebuilt-std `apply_patch` binaries ship as assets on the patch-v<version>
+  # GitHub release, next to the tool-distribution manifest may's initializer
+  # consumes (aither #104/#113). The PR-time build+verify matrix is reused
+  # through workflow_call, restricted to the `immediate` abort variant that
+  # is the published executable.
+  apply-patch-artifacts:
+    needs: release-plz
+    if: needs.release-plz.outputs.patch-released == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/patch-artifacts.yml
+    with:
+      abort_variants: '["immediate"]'
+
+  publish-patch-assets:
+    name: Publish apply_patch assets
+    needs: [release-plz, apply-patch-artifacts]
+    if: needs.release-plz.outputs.patch-released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.release-plz.outputs.patch-tag }}
+      VERSION: ${{ needs.release-plz.outputs.patch-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: apply-patch-*-immediate
+          path: artifacts
+          merge-multiple: true
+      - name: Build the tool-distribution manifest
+        run: >-
+          patch/build-manifest.sh artifacts "${TAG}" "${GITHUB_REPOSITORY}"
+          > "tool-distribution-${VERSION}.json"
+      # Every sha256 is 64 lowercase hex, and apply_patch coverage must span
+      # the same (os, arch) set the pinned third-party entries do — the
+      # expected targets come from that data file, not a duplicated list.
+      - name: Validate the manifest and staged assets
+        run: |
+          set -euo pipefail
+          manifest="tool-distribution-${VERSION}.json"
+          jq -e --slurpfile third_party patch/third-party-tools.json '
+            ([.artifacts[].sha256] | all(test("^[0-9a-f]{64}$"))) and
+            ([.artifacts[] | select(.tool == "apply_patch") | .target] | sort
+              == ($third_party[0].artifacts | map(.target) | unique | sort))
+          ' "${manifest}" > /dev/null
+          for meta in artifacts/apply_patch-*.json; do
+            file="$(jq -r .file "${meta}")"
+            [ -f "artifacts/${file}" ] && [ -f "artifacts/${file}.sha256" ] \
+              || { echo "missing staged asset for ${file}" >&2; exit 1; }
+          done
+      - name: Upload release assets
+        run: >-
+          gh release upload "${TAG}" --clobber
+          artifacts/*.tar.gz artifacts/*.sha256
+          "tool-distribution-${VERSION}.json"

@@ -1,0 +1,250 @@
+{
+  "artifacts": [
+    {
+      "tool": "ripgrep",
+      "version": "15.2.0",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-apple-darwin.tar.gz",
+      "sha256": "3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "ripgrep-15.2.0-aarch64-apple-darwin/rg"
+      }
+    },
+    {
+      "tool": "ast_grep",
+      "version": "0.45.3",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-aarch64-apple-darwin.zip",
+      "sha256": "6d2279dea5bea2ad79c66ea93f5fe54ba926e398a8a26de76c56db68fe59eac6",
+      "encoding": {
+        "format": "zip",
+        "executable": "ast-grep"
+      }
+    },
+    {
+      "tool": "jq",
+      "version": "1.8.2",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-macos-arm64",
+      "sha256": "2d75340ba57a4b4b4c8708a21c2dc8e958a48aaa8bba13b27f77f6e4c0eca07e",
+      "encoding": {
+        "format": "executable"
+      }
+    },
+    {
+      "tool": "ripgrep",
+      "version": "15.2.0",
+      "target": {
+        "os": "macos",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-apple-darwin.tar.gz",
+      "sha256": "af7825fcc69a2afc7a7aea55fc9af90e26421d8f20fe59df32e233c0b8a231c1",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "ripgrep-15.2.0-x86_64-apple-darwin/rg"
+      }
+    },
+    {
+      "tool": "ast_grep",
+      "version": "0.45.3",
+      "target": {
+        "os": "macos",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-apple-darwin.zip",
+      "sha256": "b2ffd26f42810340326a9e8a084bdc3647a8795c1a3f21fc06bd7bef3c7c5b2c",
+      "encoding": {
+        "format": "zip",
+        "executable": "ast-grep"
+      }
+    },
+    {
+      "tool": "jq",
+      "version": "1.8.2",
+      "target": {
+        "os": "macos",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-macos-amd64",
+      "sha256": "e94b266e3c26690550006abe63152b782280f4e14374accdf04cbde844f00bc0",
+      "encoding": {
+        "format": "executable"
+      }
+    },
+    {
+      "tool": "ripgrep",
+      "version": "15.2.0",
+      "target": {
+        "os": "linux",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "ripgrep-15.2.0-aarch64-unknown-linux-musl/rg"
+      }
+    },
+    {
+      "tool": "ast_grep",
+      "version": "0.45.3",
+      "target": {
+        "os": "linux",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-aarch64-unknown-linux-gnu.zip",
+      "sha256": "b39cfbc58da4b869a88b8a4bc57bd5deb0d24541e704cf7c257da7b53ec81c8f",
+      "encoding": {
+        "format": "zip",
+        "executable": "ast-grep"
+      }
+    },
+    {
+      "tool": "jq",
+      "version": "1.8.2",
+      "target": {
+        "os": "linux",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-arm64",
+      "sha256": "8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309",
+      "encoding": {
+        "format": "executable"
+      }
+    },
+    {
+      "tool": "ripgrep",
+      "version": "15.2.0",
+      "target": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "ripgrep-15.2.0-x86_64-unknown-linux-musl/rg"
+      }
+    },
+    {
+      "tool": "ast_grep",
+      "version": "0.45.3",
+      "target": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-unknown-linux-gnu.zip",
+      "sha256": "f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8",
+      "encoding": {
+        "format": "zip",
+        "executable": "ast-grep"
+      }
+    },
+    {
+      "tool": "jq",
+      "version": "1.8.2",
+      "target": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64",
+      "sha256": "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f",
+      "encoding": {
+        "format": "executable"
+      }
+    },
+    {
+      "tool": "ripgrep",
+      "version": "15.2.0",
+      "target": {
+        "os": "windows",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-pc-windows-msvc.zip",
+      "sha256": "e4abca10c3a64ebea742667dd7009449d49403db5460dd6873e389fa2945360f",
+      "encoding": {
+        "format": "zip",
+        "executable": "ripgrep-15.2.0-aarch64-pc-windows-msvc/rg.exe"
+      }
+    },
+    {
+      "tool": "ast_grep",
+      "version": "0.45.3",
+      "target": {
+        "os": "windows",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-aarch64-pc-windows-msvc.zip",
+      "sha256": "5da748848c4cad2a1e7f41e27b58871714dd2c0908632f9874cc2833b92a21ca",
+      "encoding": {
+        "format": "zip",
+        "executable": "ast-grep.exe"
+      }
+    },
+    {
+      "tool": "jq",
+      "version": "1.8.2",
+      "target": {
+        "os": "windows",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-arm64.exe",
+      "sha256": "083b5377392bc57cf27052b6d20a2d927770683bca844632901ff38b4b7b0ac7",
+      "encoding": {
+        "format": "executable"
+      }
+    },
+    {
+      "tool": "ripgrep",
+      "version": "15.2.0",
+      "target": {
+        "os": "windows",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip",
+      "sha256": "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5",
+      "encoding": {
+        "format": "zip",
+        "executable": "ripgrep-15.2.0-x86_64-pc-windows-msvc/rg.exe"
+      }
+    },
+    {
+      "tool": "ast_grep",
+      "version": "0.45.3",
+      "target": {
+        "os": "windows",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-pc-windows-msvc.zip",
+      "sha256": "3751b7d6be7fd39a80df1180ffe7e053903dcf92d3190e5a8336ff1746af9059",
+      "encoding": {
+        "format": "zip",
+        "executable": "ast-grep.exe"
+      }
+    },
+    {
+      "tool": "jq",
+      "version": "1.8.2",
+      "target": {
+        "os": "windows",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-amd64.exe",
+      "sha256": "a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627",
+      "encoding": {
+        "format": "executable"
+      }
+    }
+  ]
+}

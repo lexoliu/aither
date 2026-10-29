@@ -104,6 +104,10 @@ name = "aither-ort"
 git_tag_name = "ort-v{{ version }}"
 
 [[package]]
+name = "aither-patch"
+git_tag_name = "patch-v{{ version }}"
+
+[[package]]
 name = "aither-rag"
 git_tag_name = "rag-v{{ version }}"
 
