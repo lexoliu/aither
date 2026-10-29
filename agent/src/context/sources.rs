@@ -35,6 +35,10 @@ struct TasksStaleTemplate {
 }
 
 #[derive(Template)]
+#[template(path = "tasks_continue.txt", escape = "none")]
+struct TasksContinueTemplate;
+
+#[derive(Template)]
 #[template(path = "system_reminder.txt", escape = "none")]
 struct SystemReminderTemplate {
     content: String,
@@ -171,7 +175,9 @@ impl ContextSource for TasksDocument {
         Some(block(
             "system_reminder",
             &SystemReminderTemplate {
-                content: "tasks.md still has unchecked items. Continue working through the checklist. If user input is required, call ask_user and then proceed.".to_string(),
+                content: TasksContinueTemplate
+                    .render()
+                    .expect("tasks continue template must render"),
             },
         ))
     }
@@ -432,5 +438,17 @@ mod tests {
 
         write_tasks(root.path(), "- [x] work\n").await;
         assert!(source.on_final_turn().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_continue_alert_holds_work_an_open_question_blocks() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(root.path(), "- [ ] work\n").await;
+        let mut source = TasksDocument::new(root.path(), 4);
+        let alert = source.on_final_turn().await.expect("alert fires");
+        assert_eq!(
+            alert.content(),
+            "<system_reminder>tasks.md still has unchecked items. Continue with the items no open ask_user question blocks. Work that an open question blocks waits for its answer.</system_reminder>"
+        );
     }
 }
