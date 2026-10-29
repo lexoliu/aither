@@ -7171,7 +7171,8 @@ mod tests {
             .output()
             .expect("sh should run");
         assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "it's\n");
+        // bash ends the unterminated body with a newline, dash does not.
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), "it's");
         let written = std::fs::read_to_string(&report).expect("the trailer writes the report");
         assert_eq!(
             PathBuf::from(written.trim_end()),
