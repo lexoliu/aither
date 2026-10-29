@@ -3775,7 +3775,7 @@ You are a file-defined agent.
             "terminal_background",
             serde_json::json!({
                 "description": "start a job",
-                "script": "cat",
+                "script": "sleep 30",
                 "timeout": 60,
             }),
         ))]]);
