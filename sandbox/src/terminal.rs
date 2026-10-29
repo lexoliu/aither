@@ -56,7 +56,9 @@ use crate::{
         BridgeAddress, ContainerExecOutcome, ContainerShellRuntime, ShellBackend,
         ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile,
     },
-    stdin_watch::{EpisodeDetector, FeedCounter, LocalStdinProbe, STDIN_WATCH_INTERVAL},
+    stdin_watch::{
+        EpisodeDetector, FeedCounter, LocalStdinProbe, STDIN_WATCH_INTERVAL, StdinWatchSignal,
+    },
 };
 
 fn erase_terminal_tool<T>(tool: T) -> crate::command::DynTerminalToolEntry
@@ -459,6 +461,20 @@ pub struct StdinBlockedJob {
     pub script: String,
 }
 
+/// A background job whose stdin watch failed; carries the probe's error.
+///
+/// Sent once: after a failure the job can no longer report being blocked on
+/// stdin.
+#[derive(Debug, Clone)]
+pub struct StdinProbeFailedJob {
+    /// Task ID of the job.
+    pub task_id: String,
+    /// The script the job runs.
+    pub script: String,
+    /// Why the watch failed.
+    pub error: String,
+}
+
 /// A system alert about a background job, delivered through the terminal's
 /// alert channel.
 #[derive(Debug, Clone)]
@@ -467,6 +483,8 @@ pub enum JobAlert {
     LongRunning(LongRunningJob),
     /// The job is waiting for input on its stdin.
     StdinBlocked(StdinBlockedJob),
+    /// Watching the job's stdin failed; no blocked-on-stdin alert can follow.
+    StdinProbeFailed(StdinProbeFailedJob),
 }
 
 /// Result of a terminal execution.
@@ -703,6 +721,49 @@ impl BackgroundTaskReceiver {
         })
         .await
     }
+
+    /// Waits for the next completed task or job alert, bounded by `duration`.
+    ///
+    /// Returns `None` when nothing arrives in time; a closed channel never
+    /// ends the wait early.
+    pub async fn recv_event_timeout(
+        &self,
+        duration: std::time::Duration,
+    ) -> Option<BackgroundTaskEvent> {
+        futures_lite::future::or(
+            async {
+                match self.rx.recv().await {
+                    Ok(task) => Some(BackgroundTaskEvent::Completed(Box::new(task))),
+                    // A closed channel never yields again; only the timer
+                    // may end the wait, or callers would spin.
+                    Err(_) => std::future::pending().await,
+                }
+            },
+            futures_lite::future::or(
+                async {
+                    match self.alert_rx.recv().await {
+                        Ok(alert) => Some(BackgroundTaskEvent::Alert(alert)),
+                        Err(_) => std::future::pending().await,
+                    }
+                },
+                async {
+                    futures_lite::future::yield_now().await;
+                    async_io::Timer::after(duration).await;
+                    None
+                },
+            ),
+        )
+        .await
+    }
+}
+
+/// What ended a [`BackgroundTaskReceiver::recv_event_timeout`] wait.
+#[derive(Debug)]
+pub enum BackgroundTaskEvent {
+    /// A background task completed; boxed to keep the enum small.
+    Completed(Box<CompletedTask>),
+    /// A job alert arrived.
+    Alert(JobAlert),
 }
 
 impl std::fmt::Debug for BackgroundTaskReceiver {
@@ -2817,6 +2878,20 @@ impl StdinAlerts {
             }))
             .await;
     }
+
+    /// Tells the agent this job's stdin watch died: no blocked-on-stdin
+    /// alert can come for it anymore.
+    async fn raise_failure(&self, error: String) {
+        warn!(task_id = %self.task_id, error = %error, "stdin watch failed");
+        let _ = self
+            .tx
+            .send(JobAlert::StdinProbeFailed(StdinProbeFailedJob {
+                task_id: self.task_id.clone(),
+                script: self.script.clone(),
+                error,
+            }))
+            .await;
+    }
 }
 
 const fn local_stdin_config(alerts: Option<&StdinAlerts>) -> StdioConfig {
@@ -2842,7 +2917,7 @@ impl LocalStdinWatch {
         loop {
             async_io::Timer::after(STDIN_WATCH_INTERVAL).await;
             let Self {
-                mut probe,
+                probe,
                 feed,
                 mut detector,
                 alerts,
@@ -2860,7 +2935,11 @@ impl LocalStdinWatch {
                     }
                 }
                 Err(error) => {
-                    tracing::debug!(error = %error, task_id = %alerts.task_id, "stdin probe failed");
+                    // Detection cannot run: surface it once, then park — the
+                    // job's exit still ends the race in
+                    // `wait_for_local_process_exit`.
+                    alerts.raise_failure(error.to_string()).await;
+                    std::future::pending::<()>().await;
                 }
             }
             self = Self {
@@ -2979,25 +3058,30 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         .await;
     // A foreground command gets no input channel: the dropped sender is the
     // EOF its stdin reads.
-    let stdin_blocked = match context.stdin_alerts {
-        Some(alerts) => {
-            context
-                .job_registry
-                .attach_terminal_input(pid, input_tx)
-                .await;
-            let (blocked_tx, blocked_rx) = async_channel::unbounded::<()>();
-            context
-                .executor
-                .clone()
-                .spawn(async move {
-                    while blocked_rx.recv().await.is_ok() {
-                        alerts.raise().await;
+    let stdin_blocked = if let Some(alerts) = context.stdin_alerts {
+        context
+            .job_registry
+            .attach_terminal_input(pid, input_tx)
+            .await;
+        let (signal_tx, signal_rx) = async_channel::unbounded::<StdinWatchSignal>();
+        context
+            .executor
+            .clone()
+            .spawn(async move {
+                while let Ok(signal) = signal_rx.recv().await {
+                    match signal {
+                        StdinWatchSignal::Blocked => alerts.raise().await,
+                        StdinWatchSignal::Failed(error) => {
+                            alerts.raise_failure(error).await;
+                        }
                     }
-                })
-                .detach();
-            Some(blocked_tx)
-        }
-        None => None,
+                }
+            })
+            .detach();
+        Some(signal_tx)
+    } else {
+        drop(input_tx);
+        None
     };
     context.job_registry.attach_kill_switch(pid, kill_tx).await;
     context.background_startup.report_ready().await;
@@ -3856,8 +3940,11 @@ mod tests {
 
     use super::*;
     use crate::ToolRegistryBuilder;
+    #[cfg(unix)]
     use crate::builtin::{InputTerminalArgs, InputTerminalTool};
-    use heel::{DenyAll, NiceLevel};
+    #[cfg(unix)]
+    use heel::DenyAll;
+    use heel::NiceLevel;
 
     async fn prepared_test_registry() -> (tempfile::TempDir, ShellSessionRegistry) {
         let cache = tempfile::tempdir().unwrap();
@@ -3913,7 +4000,7 @@ mod tests {
             _working_dir: &str,
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
-            _stdin_blocked: Option<Sender<()>>,
+            _stdin_blocked: Option<Sender<StdinWatchSignal>>,
         ) -> impl std::future::Future<Output = Result<crate::ContainerExecOutcome, String>> + Send
         {
             std::future::ready(Err("adoption never executes in the container".to_string()))
@@ -5081,6 +5168,77 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         alerts
+    }
+
+    /// A foreground container command must see stdin EOF at once: the input
+    /// sender is dropped before the exec runs. Catches the regression where
+    /// the sender lived until the call returned and `cat` waited out the
+    /// limit.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn container_foreground_command_reading_stdin_gets_eof_at_once() {
+        /// A container executor that asserts its stdin is already at EOF.
+        struct ForegroundStdinEofExec;
+
+        impl crate::ContainerExec for ForegroundStdinEofExec {
+            async fn exec(
+                &self,
+                _container_id: &str,
+                _script: &str,
+                _working_dir: &str,
+                _kill_rx: Receiver<()>,
+                stdin_rx: Receiver<Vec<u8>>,
+                _stdin_blocked: Option<Sender<StdinWatchSignal>>,
+            ) -> Result<ContainerExecOutcome, String> {
+                let eof = futures_lite::future::or(async { Some(stdin_rx.recv().await) }, async {
+                    async_io::Timer::after(Duration::from_secs(5)).await;
+                    None
+                })
+                .await
+                .expect("a foreground exec's stdin must be EOF at once, not left open");
+                assert!(eof.is_err(), "a foreground exec's stdin must carry no data");
+                Ok(ContainerExecOutcome::Completed(std::process::Output {
+                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(dir.path()));
+        let (job_registry, job_registry_service) = job_registry_channel();
+        tokio::spawn(async move { job_registry_service.serve().await });
+        let container_tools =
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle());
+        let runtime = ContainerShellRuntime::new(
+            "aither-test-foreground-eof",
+            crate::ContainerIpcRoute::new(
+                "host.docker.internal",
+                crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
+                    .expect("loopback binds the bridge"),
+            ),
+            crate::AnyContainerExec::new(Arc::new(ForegroundStdinEofExec)),
+        );
+        let (startup_tx, _startup_rx) = async_channel::bounded(1);
+        let (_pid, output) = execute_container_background(ContainerBackgroundExecution {
+            executor: executor_core::tokio::TokioGlobal,
+            registry: &registry,
+            task_id: "task-test",
+            execution_id: "exec-test",
+            script: "cat",
+            mode: TerminalMode::Sandboxed,
+            container_runtime: &runtime,
+            prepared_tools: &container_tools,
+            ipc_commands: &[],
+            job_registry: &job_registry,
+            stdin_alerts: None,
+            background_startup: &BackgroundStartup::new(startup_tx),
+            priority: ProcessPriority::default(),
+        })
+        .await
+        .expect("a foreground container exec should complete at EOF");
+        assert_eq!(output.status.code(), Some(0));
     }
 
     /// A job whose `reader` script blocks on stdin yields exactly one alert

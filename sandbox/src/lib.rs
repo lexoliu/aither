@@ -114,14 +114,15 @@ pub use shell_session::{
     ShellRuntimeAvailability, ShellSessionRegistry, SshAuthorizationError, SshRuntimeProfile,
     SshServer, SshSessionAuthorizer, bootstrap_ssh_runtime,
 };
+pub use stdin_watch::StdinWatchSignal;
 pub use terminal::{
-    BackgroundTaskReceiver, BackgroundTaskSender, CompletedTask, Configured,
+    BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedTask, Configured,
     DEFAULT_BACKGROUND_TIMEOUT_CAP, DEFAULT_FOREGROUND_LIMIT, DEFAULT_LONG_JOB_ALERT_AFTER,
     JobAlert, LongRunningJob, PermissionEvent, PermissionEventReceiver, PermissionEventStage,
-    StdinBlockedJob, TerminalArgs, TerminalBackgroundArgs, TerminalBackgroundTool, TerminalError,
-    TerminalExecutionMode, TerminalResult, TerminalTool, TerminalToolFactory,
-    TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured, background_task_channel,
-    open_network_audit_log, terminal_tool_factory_channel,
+    StdinBlockedJob, StdinProbeFailedJob, TerminalArgs, TerminalBackgroundArgs,
+    TerminalBackgroundTool, TerminalError, TerminalExecutionMode, TerminalResult, TerminalTool,
+    TerminalToolFactory, TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured,
+    background_task_channel, open_network_audit_log, terminal_tool_factory_channel,
 };
 pub use tool_distribution::{
     ToolArtifact, ToolArtifactFormat, ToolArtifactLocation, ToolDistribution,

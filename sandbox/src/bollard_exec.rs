@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use crate::shell_session::{ContainerExec, ContainerExecOutcome};
 use crate::stdin_watch::{
-    CONTAINER_STDIN_PROBE, CONTAINER_STDIN_WATCH_INTERVAL, EpisodeDetector, Probe,
-    parse_container_probe,
+    CONTAINER_EXEC_WRAPPER, CONTAINER_JOB_SCRIPT, CONTAINER_STDIN_WATCH_INTERVAL, EpisodeDetector,
+    Probe, StdinWatchSignal, parse_container_probe,
 };
 
 /// Executes commands in a running container via Docker exec.
@@ -30,103 +30,152 @@ impl BollardContainerExec {
     }
 }
 
-/// Runs the stdin probe script inside the container for the exec whose root
-/// process is `pid`.
-async fn probe_stdin_inside_container(
+/// Exit code of [`CONTAINER_JOB_SCRIPT`]'s `kill` when no pid is recorded.
+const KILL_NO_PID: i64 = 3;
+
+/// What a helper script run inside the container printed and returned.
+struct ScriptRun {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i64>,
+}
+
+impl ScriptRun {
+    /// The output when the script exited 0.
+    fn success(self, what: &str) -> Result<String, String> {
+        if self.exit_code == Some(0) {
+            return Ok(self.stdout);
+        }
+        Err(format!(
+            "{what} exited with {:?}: {}{}",
+            self.exit_code,
+            self.stdout.trim(),
+            self.stderr.trim()
+        ))
+    }
+}
+
+/// Runs `sh -c script sh args…` in the container and collects its output and
+/// exit code.
+async fn run_script_in_container(
     client: &Docker,
     container_id: &str,
-    pid: i64,
-) -> Result<Probe, String> {
-    let pid = pid.to_string();
-    let probe = client
+    script: &str,
+    args: &[&str],
+    what: &str,
+) -> Result<ScriptRun, String> {
+    let mut cmd = vec!["sh", "-c", script, "sh"];
+    cmd.extend_from_slice(args);
+    let exec = client
         .create_exec(
             container_id,
             CreateExecOptions {
-                cmd: Some(vec!["sh", "-c", CONTAINER_STDIN_PROBE, "sh", pid.as_str()]),
+                cmd: Some(cmd),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 ..Default::default()
             },
         )
         .await
-        .map_err(|e| format!("failed to create stdin probe exec: {e}"))?;
+        .map_err(|e| format!("failed to create {what} exec: {e}"))?;
 
     let started = client
-        .start_exec(&probe.id, None)
+        .start_exec(&exec.id, None)
         .await
-        .map_err(|e| format!("failed to start stdin probe exec: {e}"))?;
+        .map_err(|e| format!("failed to start {what} exec: {e}"))?;
 
-    let mut stdout = String::new();
+    let mut run = ScriptRun {
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: None,
+    };
     match started {
         bollard::exec::StartExecResults::Attached { mut output, .. } => {
             while let Some(chunk) = output.next().await {
                 match chunk {
                     Ok(LogOutput::StdOut { message } | LogOutput::Console { message }) => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
+                        run.stdout.push_str(&String::from_utf8_lossy(&message));
                     }
-                    Ok(LogOutput::StdErr { .. } | LogOutput::StdIn { .. }) => {}
-                    Err(e) => return Err(format!("stdin probe stream error: {e}")),
+                    Ok(LogOutput::StdErr { message }) => {
+                        run.stderr.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    Ok(LogOutput::StdIn { .. }) => {}
+                    Err(e) => return Err(format!("{what} stream error: {e}")),
                 }
             }
         }
         bollard::exec::StartExecResults::Detached => {
-            return Err("stdin probe exec detached unexpectedly".to_string());
+            return Err(format!("{what} exec detached unexpectedly"));
         }
     }
-
-    parse_container_probe(&stdout)
+    run.exit_code = client
+        .inspect_exec(&exec.id)
+        .await
+        .map_err(|e| format!("failed to inspect {what} exec: {e}"))?
+        .exit_code;
+    Ok(run)
 }
 
-async fn kill_exec_pid_inside_container(
+/// Runs the stdin probe script inside the container for the exec whose root
+/// recorded its own in-container pid in `pid_file`.
+async fn probe_stdin_inside_container(
+    client: &Docker,
+    container_id: &str,
+    pid_file: &str,
+) -> Result<Probe, String> {
+    let output = run_script_in_container(
+        client,
+        container_id,
+        CONTAINER_JOB_SCRIPT,
+        &["probe", pid_file],
+        "stdin probe",
+    )
+    .await?
+    .success("stdin probe")?;
+    parse_container_probe(&output)
+}
+
+/// Whether the exec is still running.
+async fn exec_running(client: &Docker, exec_id: &str) -> Result<bool, String> {
+    Ok(client
+        .inspect_exec(exec_id)
+        .await
+        .map_err(|e| format!("failed to inspect exec for kill: {e}"))?
+        .running
+        .unwrap_or(false))
+}
+
+/// Kills the exec's whole process tree inside the container. Docker reports
+/// exec pids in the host's namespace, so the kill goes through `pid_file`,
+/// where the exec root recorded its own in-container pid. Succeeds only when
+/// the exec is gone: a running exec that recorded no pid is an error.
+async fn kill_exec_inside_container(
     client: &Docker,
     container_id: &str,
     exec_id: &str,
+    pid_file: &str,
 ) -> Result<(), String> {
-    let inspect = client
-        .inspect_exec(exec_id)
-        .await
-        .map_err(|e| format!("failed to inspect exec for kill: {e}"))?;
-    if !inspect.running.unwrap_or(false) {
+    if !exec_running(client, exec_id).await? {
         return Ok(());
     }
-    let Some(pid) = inspect.pid else {
-        return Ok(());
-    };
-    if pid <= 0 {
-        return Ok(());
+    let run = run_script_in_container(
+        client,
+        container_id,
+        CONTAINER_JOB_SCRIPT,
+        &["kill", pid_file],
+        "in-container kill",
+    )
+    .await?;
+    if run.exit_code == Some(KILL_NO_PID) {
+        // The root removes its pid file when it exits, so a missing file is
+        // an exec that ended meanwhile — or one that never recorded a pid.
+        return if exec_running(client, exec_id).await? {
+            Err("the exec is running but recorded no in-container pid".to_string())
+        } else {
+            Ok(())
+        };
     }
-
-    let kill_script = format!("kill -KILL {pid} >/dev/null 2>&1 || true");
-    let kill_exec = client
-        .create_exec(
-            container_id,
-            CreateExecOptions {
-                cmd: Some(vec!["sh", "-c", kill_script.as_str()]),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| format!("failed to create in-container kill exec: {e}"))?;
-    match client
-        .start_exec(&kill_exec.id, None)
-        .await
-        .map_err(|e| format!("failed to start in-container kill exec: {e}"))?
-    {
-        bollard::exec::StartExecResults::Attached { mut output, .. } => {
-            while let Some(chunk) = output.next().await {
-                if let Err(error) = chunk {
-                    return Err(format!("in-container kill stream error: {error}"));
-                }
-            }
-        }
-        bollard::exec::StartExecResults::Detached => {
-            return Err("in-container kill exec detached unexpectedly".to_string());
-        }
-    }
-
-    Ok(())
+    run.success("in-container kill").map(drop)
 }
 
 enum StreamEvent {
@@ -178,61 +227,68 @@ where
 
 /// Alerts for the stdin of one container exec.
 struct StdinWatch {
-    blocked: Sender<()>,
+    signal: Sender<StdinWatchSignal>,
     detector: EpisodeDetector,
     /// Writes fed to the exec's stdin so far.
     fed: u64,
+}
+
+impl StdinWatch {
+    /// Reports a probe outcome through the alert channel.
+    fn send(&self, signal: StdinWatchSignal) {
+        let _ = self.signal.try_send(signal);
+    }
 }
 
 struct WatchTick<'a, W> {
     client: &'a Docker,
     container_id: &'a str,
     exec_id: &'a str,
+    pid_file: &'a str,
     input: &'a mut W,
     stdin_open: &'a mut bool,
     watch: &'a mut Option<StdinWatch>,
 }
 
-async fn handle_container_watch_tick<W>(tick: WatchTick<'_, W>) -> Result<(), String>
+/// One watch tick. A probe-side failure — a Docker API error or the script
+/// reporting it cannot read the job — is surfaced to the job's alerts and
+/// ends detection for this exec; it must never fail the exec itself.
+async fn handle_container_watch_tick<W>(tick: WatchTick<'_, W>)
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let inspect = tick
-        .client
-        .inspect_exec(tick.exec_id)
-        .await
-        .map_err(|e| format!("failed to inspect running exec for stdin watch: {e}"))?;
-
-    if !inspect.running.unwrap_or(false) {
-        if *tick.stdin_open {
-            let _ = shutdown_container_stdin(tick.input).await;
-            *tick.stdin_open = false;
-        }
-        *tick.watch = None;
-        return Ok(());
-    }
-
-    let Some(pid) = inspect.pid else {
-        return Ok(());
-    };
-    if pid <= 0 {
-        return Ok(());
-    }
     let Some(watch) = tick.watch.as_mut() else {
-        return Ok(());
+        return;
     };
-
-    match probe_stdin_inside_container(tick.client, tick.container_id, pid).await {
-        Ok(probe) => {
-            if watch.detector.observe(watch.fed, probe) {
-                let _ = watch.blocked.try_send(());
+    match tick.client.inspect_exec(tick.exec_id).await {
+        Err(error) => {
+            watch.send(StdinWatchSignal::Failed(format!(
+                "failed to inspect running exec for stdin watch: {error}"
+            )));
+            *tick.watch = None;
+        }
+        Ok(inspect) if !inspect.running.unwrap_or(false) => {
+            if *tick.stdin_open {
+                let _ = shutdown_container_stdin(tick.input).await;
+                *tick.stdin_open = false;
+            }
+            *tick.watch = None;
+        }
+        Ok(_) => {
+            match probe_stdin_inside_container(tick.client, tick.container_id, tick.pid_file).await
+            {
+                Ok(probe) => {
+                    if watch.detector.observe(watch.fed, probe) {
+                        watch.send(StdinWatchSignal::Blocked);
+                    }
+                }
+                Err(error) => {
+                    watch.send(StdinWatchSignal::Failed(error));
+                    *tick.watch = None;
+                }
             }
         }
-        Err(error) => {
-            tracing::debug!(error = %error, pid, "stdin probe failed");
-        }
     }
-    Ok(())
 }
 
 async fn inspect_exec_exit_status(client: &Docker, exec_id: &str) -> Result<ExitStatus, String> {
@@ -251,16 +307,26 @@ type ExecOutput = Pin<Box<dyn Stream<Item = Result<LogOutput, bollard::errors::E
 /// The writable stdin of an attached container exec.
 type ExecInput = Pin<Box<dyn tokio::io::AsyncWrite + Send>>;
 
-/// Creates the exec running `script` in `working_dir` and starts it with its
-/// output stream and stdin attached.
+/// Creates the exec running `script` in `working_dir` under
+/// [`CONTAINER_EXEC_WRAPPER`],
+/// which records its pid in `pid_file`, and starts it with its output stream
+/// and stdin attached.
 async fn start_attached_exec(
     client: &Docker,
     container_id: &str,
     script: &str,
+    pid_file: &str,
     working_dir: &str,
 ) -> Result<(String, ExecOutput, ExecInput), String> {
     let config = CreateExecOptions {
-        cmd: Some(vec!["sh", "-c", script]),
+        cmd: Some(vec![
+            "sh",
+            "-c",
+            CONTAINER_EXEC_WRAPPER,
+            "sh",
+            pid_file,
+            script,
+        ]),
         attach_stdin: Some(true),
         attach_stdout: Some(true),
         attach_stderr: Some(true),
@@ -294,7 +360,7 @@ impl ContainerExec for BollardContainerExec {
         working_dir: &str,
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
-        stdin_blocked: Option<Sender<()>>,
+        stdin_blocked: Option<Sender<StdinWatchSignal>>,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
         let container_id = container_id.to_string();
         let script = script.to_string();
@@ -302,13 +368,21 @@ impl ContainerExec for BollardContainerExec {
         let client = self.client.clone();
 
         async move {
+            // Docker reports the exec's pid in the host's namespace, which a
+            // probe inside the container cannot use: the exec root records
+            // its own in-container pid for the stdin probe and the kill path.
+            let pid_file = format!(
+                "/tmp/aither-exec-stdin-{}.pid",
+                uuid::Uuid::new_v4().simple()
+            );
             let (exec_id, mut output, mut input) =
-                start_attached_exec(&client, &container_id, &script, &working_dir).await?;
+                start_attached_exec(&client, &container_id, &script, &pid_file, &working_dir)
+                    .await?;
 
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            let mut watch = stdin_blocked.map(|blocked| StdinWatch {
-                blocked,
+            let mut watch = stdin_blocked.map(|signal| StdinWatch {
+                signal,
                 detector: EpisodeDetector::default(),
                 fed: 0,
             });
@@ -349,15 +423,11 @@ impl ContainerExec for BollardContainerExec {
                         if stdin_open {
                             let _ = shutdown_container_stdin(&mut input).await;
                         }
-                        if let Err(error) =
-                            kill_exec_pid_inside_container(&client, &container_id, &exec_id).await
-                        {
-                            tracing::warn!(
-                                error = %error,
-                                exec_id = %exec_id,
-                                "failed to kill container exec after cancellation request"
-                            );
-                        }
+                        // A job the kill could not stop is still running, so
+                        // it must not be reported killed.
+                        kill_exec_inside_container(&client, &container_id, &exec_id, &pid_file)
+                            .await
+                            .map_err(|error| format!("failed to kill container exec: {error}"))?;
                         return Ok(ContainerExecOutcome::Killed);
                     }
                     StreamEvent::WatchTick => {
@@ -365,11 +435,12 @@ impl ContainerExec for BollardContainerExec {
                             client: &client,
                             container_id: &container_id,
                             exec_id: &exec_id,
+                            pid_file: &pid_file,
                             input: &mut input,
                             stdin_open: &mut stdin_open,
                             watch: &mut watch,
                         })
-                        .await?;
+                        .await;
                     }
                 }
             }
@@ -403,5 +474,96 @@ impl ExitStatusExt {
     fn from_raw(code: i32) -> ExitStatus {
         use std::os::windows::process::ExitStatusExt as _;
         ExitStatus::from_raw(code as u32)
+    }
+}
+
+/// The wrapper scripts run on the host here; the kill and the stdin probe
+/// read `/proc` and are tested on Linux in `stdin_watch`.
+#[cfg(all(test, unix))]
+mod tests {
+    use std::process::Command;
+
+    use super::CONTAINER_EXEC_WRAPPER;
+
+    fn run_wrapper(
+        pid_file: &std::path::Path,
+        script: &str,
+        dir: &std::path::Path,
+    ) -> std::process::Output {
+        Command::new("sh")
+            .args(["-c", CONTAINER_EXEC_WRAPPER, "sh"])
+            .arg(pid_file)
+            .arg(script)
+            .current_dir(dir)
+            .env("PID_FILE", pid_file)
+            .output()
+            .expect("run the exec wrapper")
+    }
+
+    /// The wrapper records its own pid — the parent of the shell running
+    /// the script — keeps the script's exit status, and removes the file
+    /// when it exits, also after a script that `exec`s.
+    #[test]
+    fn wrapper_records_its_pid_and_removes_the_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("exec.pid");
+        let run = run_wrapper(
+            &pid_file,
+            "echo \"$PPID $(cat \"$PID_FILE\")\"; exit 3",
+            dir.path(),
+        );
+        assert_eq!(run.status.code(), Some(3), "the script's status survives");
+        let printed = String::from_utf8_lossy(&run.stdout);
+        let mut pids = printed.split_whitespace();
+        let parent = pids.next().expect("the script's parent pid");
+        assert_eq!(
+            pids.next(),
+            Some(parent),
+            "the file holds the wrapper's pid"
+        );
+        assert!(!pid_file.exists(), "the pid file is removed on exit");
+
+        let run = run_wrapper(&pid_file, "exec true", dir.path());
+        assert!(run.status.success());
+        assert!(
+            !pid_file.exists(),
+            "a script that execs still gets cleaned up"
+        );
+    }
+
+    /// The script sees none of the wrapper's arguments or variables, and a
+    /// variable it sets cannot redirect the wrapper's cleanup.
+    #[test]
+    fn wrapper_hides_its_arguments_from_the_script() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("exec.pid");
+        let run = run_wrapper(
+            &pid_file,
+            "echo \"$#[${1-}][${pid_file-}][${script-}]\"; pid_file=user.pid; : > \"$pid_file\"; trap - EXIT",
+            dir.path(),
+        );
+        assert!(run.status.success());
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "0[][][]\n");
+        assert!(
+            dir.path().join("user.pid").exists(),
+            "the script's own file stays"
+        );
+        assert!(!pid_file.exists(), "the wrapper removes its own file");
+    }
+
+    /// A wrapper that cannot record its pid fails before running the
+    /// script, so the exec can never run without a pid to kill it by.
+    #[test]
+    fn wrapper_fails_fast_without_a_pid_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("missing").join("exec.pid");
+        let run = run_wrapper(&pid_file, "echo ran", dir.path());
+        assert_eq!(run.status.code(), Some(125));
+        assert!(run.stdout.is_empty(), "the script must not run");
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("cannot record the exec's pid"),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
     }
 }
