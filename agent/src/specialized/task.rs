@@ -3421,6 +3421,7 @@ You are a file-defined agent.
 
     /// A main agent's terminal whose permission requests are recorded.
     struct ForkFixture {
+        _hook_tools: crate::test_support::PreparedFixture,
         _dirs: [tempfile::TempDir; 3],
         terminal: aither_sandbox::TerminalTool<
             crate::ReviewedPermission<RecordingPermission>,
@@ -3447,7 +3448,12 @@ You are a file-defined agent.
             let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
             let permission = RecordingPermission::default();
             let asked = permission.asked.clone();
-            let permission = crate::ReviewedPermission::new(permission, chain);
+            let hook_tools = crate::test_support::prepared_fixture().await;
+            let permission = crate::ReviewedPermission::new(
+                permission,
+                chain,
+                crate::external_hook::HookRunner::new(&hook_tools.tools),
+            );
             let terminal = TerminalTool::new_exact(session.path(), permission, TokioGlobal)
                 .await
                 .expect("terminal tool should initialize")
@@ -3457,6 +3463,7 @@ You are a file-defined agent.
             let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
             Self {
                 _dirs: [session, source, cache],
+                _hook_tools: hook_tools,
                 terminal: terminal.with_registry(registry),
                 asked,
             }

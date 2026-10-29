@@ -704,10 +704,15 @@ printf '%s' "$2"
         }
     }
 
-    fn handler(chain: Vec<ReviewerConfig>) -> (ReviewedPermission<Route>, Route) {
+    async fn handler(chain: Vec<ReviewerConfig>) -> (ReviewedPermission<Route>, Route) {
+        let tools = crate::test_support::prepared_fixture().await;
         let route = Route::default();
         (
-            ReviewedPermission::new(route.clone(), ReviewerChain::new(chain)),
+            ReviewedPermission::new(
+                route.clone(),
+                ReviewerChain::new(chain),
+                HookRunner::new(&tools.tools),
+            ),
             route,
         )
     }
@@ -724,7 +729,8 @@ printf '%s' "$2"
                 &second,
                 r#"{"decision":"deny","reason":"no"}"#,
             ),
-        ]);
+        ])
+        .await;
         assert_eq!(bounded(handler.review(&COMMAND)).await, Review::Approved);
         assert!(route.asked.lock().unwrap().is_empty());
         assert_eq!(logged(&first).len(), 1);
@@ -747,7 +753,8 @@ printf '%s' "$2"
                 &log,
                 r#"{"decision":"deny","reason":"touches /etc"}"#,
             ),
-        ]);
+        ])
+        .await;
         let Review::Denied(reason) = bounded(handler.review(&COMMAND)).await else {
             panic!("the guard denies");
         };
@@ -767,12 +774,14 @@ printf '%s' "$2"
             allow: true,
             ..Route::default()
         };
+        let tools = crate::test_support::prepared_fixture().await;
         let handler = ReviewedPermission::new(
             route.clone(),
             ReviewerChain::new(vec![
                 reviewer(dir.path(), "a", &log, r#"{"decision":"pass"}"#),
                 reviewer(dir.path(), "b", &log, ""),
             ]),
+            HookRunner::new(&tools.tools),
         );
         assert_eq!(bounded(handler.review(&COMMAND)).await, Review::Passed);
         assert!(
@@ -796,7 +805,8 @@ printf '%s' "$2"
             "a",
             &log,
             r#"{"decision":"pass"}"#,
-        )]);
+        )])
+        .await;
         let subagent = handler
             .for_subagent()
             .expect("a reviewed handler labels subagents");
@@ -837,7 +847,8 @@ printf '%s' "$2"
                     deadline_ms: 500,
                 },
             },
-        ]);
+        ])
+        .await;
         let started = Instant::now();
         assert_eq!(
             bounded(handler.review(&COMMAND)).await,
@@ -861,7 +872,8 @@ printf '%s' "$2"
             "net",
             &log,
             r#"{"decision":"approve"}"#,
-        )]);
+        )])
+        .await;
         assert!(bounded(handler.authorize_domain("registry.example", 443)).await);
         assert!(
             route.domains_asked.lock().unwrap().is_empty(),
@@ -890,7 +902,8 @@ printf '%s' "$2"
             "net",
             &log,
             r#"{"decision":"deny","reason":"unknown host"}"#,
-        )]);
+        )])
+        .await;
         let Review::Denied(reason) = bounded(handler.review(&DOMAIN)).await else {
             panic!("the reviewer denies");
         };
@@ -910,6 +923,7 @@ printf '%s' "$2"
             allowed_domains: Arc::new(Mutex::new(vec!["allowed.example".into()])),
             ..Route::default()
         };
+        let tools = crate::test_support::prepared_fixture().await;
         let handler = ReviewedPermission::new(
             route.clone(),
             ReviewerChain::new(vec![reviewer(
@@ -918,6 +932,7 @@ printf '%s' "$2"
                 &log,
                 r#"{"decision":"pass"}"#,
             )]),
+            HookRunner::new(&tools.tools),
         );
         // Allowed without asking anyone: no reviewer, and the route decides.
         assert!(bounded(handler.authorize_domain("allowed.example", 443)).await);
