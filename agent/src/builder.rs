@@ -17,13 +17,11 @@ use askama::Template;
 
 use crate::{
     agent::Agent,
-    compression::ContextStrategy,
     config::{AgentConfig, AgentKind},
-    context::Context,
+    context::{AnyContextSource, Context, ContextPolicy, ContextSource},
     hook::{HCons, Hook},
     model_group::ModelTier,
     tools::AgentTools,
-    transcript::Transcript,
 };
 
 #[cfg(feature = "mcp")]
@@ -60,10 +58,11 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     hooks: H,
     config: AgentConfig,
     context: Context,
+    prompt_cache: crate::context::PromptCache,
     background_receiver: Option<BackgroundTaskReceiver>,
     permission_receiver: Option<PermissionEventReceiver>,
     job_registry: Option<JobRegistry>,
-    transcript: Option<Transcript>,
+    context_sources: Vec<AnyContextSource>,
     sandbox_dir: Option<std::path::PathBuf>,
     #[cfg(feature = "skills")]
     skill_registry: Option<Arc<SkillRegistry>>,
@@ -92,10 +91,11 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             hooks: (),
             config: AgentConfig::default(),
             context: Context::default(),
+            prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
-            transcript: None,
+            context_sources: Vec::new(),
             sandbox_dir: None,
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -127,10 +127,11 @@ where
             hooks: self.hooks,
             config: self.config,
             context: self.context,
+            prompt_cache: self.prompt_cache,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
-            transcript: self.transcript,
+            context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
@@ -154,10 +155,11 @@ where
             hooks: self.hooks,
             config: self.config,
             context: self.context,
+            prompt_cache: self.prompt_cache,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
-            transcript: self.transcript,
+            context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
@@ -262,10 +264,11 @@ where
             hooks: HCons::new(hook, self.hooks),
             config: self.config,
             context: self.context,
+            prompt_cache: self.prompt_cache,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
-            transcript: self.transcript,
+            context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
@@ -289,9 +292,18 @@ where
         self
     }
 
-    /// Sets the context compression strategy.
-    pub const fn context_strategy(mut self, strategy: ContextStrategy) -> Self {
-        self.config.context = strategy;
+    /// Sets the context management policy.
+    pub const fn context_policy(mut self, policy: ContextPolicy) -> Self {
+        self.config.context_policy = policy;
+        self
+    }
+
+    /// Registers a source rendered into the tail of every request.
+    ///
+    /// Sources are rendered in registration order, after the built-in ones,
+    /// and each is told when the request it contributed to was sent.
+    pub fn context_source<S: ContextSource>(mut self, source: S) -> Self {
+        self.context_sources.push(AnyContextSource::new(source));
         self
     }
 
@@ -304,18 +316,6 @@ where
     /// Sets agent kind (coding or chatbot).
     pub const fn agent_kind(mut self, kind: AgentKind) -> Self {
         self.config.agent_kind = kind;
-        self
-    }
-
-    /// Sets transcript path for long-memory recovery guidance.
-    pub fn transcript_path(mut self, path: impl Into<String>) -> Self {
-        self.config.transcript_path = Some(path.into());
-        self
-    }
-
-    /// Enables writing a readable transcript to the given path.
-    pub fn transcript(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.transcript = Some(Transcript::new(path));
         self
     }
 
@@ -477,6 +477,17 @@ where
         self
     }
 
+    /// Overrides the session's prompt-cache controller.
+    ///
+    /// The default derives a fresh session key per agent and retains Claude
+    /// breakpoints for one hour; a host with its own session identity or a
+    /// provider that retains prompts differently supplies the
+    /// [`PromptCache`](crate::context::PromptCache) it wants here.
+    pub fn prompt_cache(mut self, cache: crate::context::PromptCache) -> Self {
+        self.prompt_cache = cache;
+        self
+    }
+
     /// Enables prompt-cache keep-alive while the run waits on its own
     /// background commands.
     ///
@@ -515,24 +526,25 @@ where
     /// Builds the agent.
     pub fn build(self) -> Agent<Advanced, Balanced, Fast, H> {
         Agent {
-            advanced: self.advanced,
-            balanced: self.balanced,
-            fast: self.fast,
+            advanced: std::sync::Arc::new(self.advanced),
+            balanced: std::sync::Arc::new(self.balanced),
+            fast: std::sync::Arc::new(self.fast),
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,
+            budget: crate::context::ContextBudget::default(),
+            prompt_cache: self.prompt_cache,
+            context_sources: self.context_sources,
+            pending_compaction: None,
+            completed_compaction: None,
             config: self.config,
             context: self.context,
             profile: None,
-            fast_profile: None,
             initialized: false,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
-            transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
-            last_working_docs: None,
-            tasks_staleness: crate::agent::TasksDocStaleness::default(),
             last_request_started_at: None,
             last_request: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
@@ -540,7 +552,7 @@ where
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
             #[cfg(feature = "skills")]
-            active_skills: Vec::new(),
+            active_skills: crate::context::ActiveSkills::new(),
             #[cfg(feature = "skills")]
             active_allowed_tools: None,
         }

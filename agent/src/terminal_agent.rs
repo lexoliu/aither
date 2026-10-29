@@ -496,17 +496,10 @@ where
         self
     }
 
-    /// Sets transcript path for long-memory recovery guidance.
+    /// Registers a source rendered into the tail of every request.
     #[must_use]
-    pub fn transcript_path(mut self, path: impl Into<String>) -> Self {
-        self.inner = self.inner.transcript_path(path.into());
-        self
-    }
-
-    /// Enables writing readable transcript entries to the given file path.
-    #[must_use]
-    pub fn transcript(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.inner = self.inner.transcript(path);
+    pub fn context_source<Source: crate::context::ContextSource>(mut self, source: Source) -> Self {
+        self.inner = self.inner.context_source(source);
         self
     }
 
@@ -722,7 +715,7 @@ where
     /// Sets up the subagents directory and creates a symlink in the sandbox.
     ///
     /// Subagents are markdown files with YAML frontmatter (name, description).
-    /// They can be invoked via: `subagent --subagent <path> --prompt-file "..."`
+    /// They can be invoked via: `subagent start --subagent <path> --prompt-file "..."`
     ///
     /// A symlink `subagents` is created in the sandbox working directory.
     ///

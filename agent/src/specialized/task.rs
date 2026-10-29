@@ -12,7 +12,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use aither_core::llm::ToolContext;
 use aither_core::{
@@ -25,6 +25,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::AgentBuilder;
+use crate::context::CacheLifetime;
 use crate::fs_util::path_exists;
 use crate::model_group::ModelTier;
 use crate::subagent_file::SubagentDefinition;
@@ -98,7 +99,7 @@ impl<LLM: Clone> SubagentType<LLM> {
     }
 
     /// Declare the model tier this subagent runs on unless the caller
-    /// overrides it in `SubagentArgs::model`.
+    /// overrides it with the `model` argument of a `start` call.
     #[must_use]
     pub const fn with_model(mut self, model: ModelTier) -> Self {
         self.model = Some(model);
@@ -124,32 +125,49 @@ impl<LLM: Clone> SubagentType<LLM> {
 /// Each subagent type has focused tools and prompts optimized for its purpose.
 /// Choose the subagent type that best matches the task requirements.
 ///
-/// You can also load custom subagents from `.md` files by specifying a path
-/// (e.g., `./custom-agent.md` or `subagents/researcher.md`).
-///
-/// The task prompt is read from a file: write the full prompt to a file
-/// first, then pass its path in `prompt_file`. Inline prompt text is not a
-/// file path and is rejected.
+/// The task prompt is always read from a file: write the full prompt to a
+/// file first, then pass its path in `prompt_file`. Inline prompt text is
+/// not a file path and is rejected.
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
-pub struct SubagentArgs {
-    /// Subagent type name (e.g., "explore", "plan") or path to a subagent file.
-    /// If the value contains '/' or ends with '.md', it's treated as a file path.
-    /// Required to start a subagent; omit it when continuing one with `resume`.
-    pub subagent: Option<String>,
-    /// Path to a file containing the detailed task prompt for the subagent.
-    /// The file must exist and be non-empty. When continuing a subagent it
-    /// holds the follow-up prompt.
-    pub prompt_file: String,
-    /// Model tier to run the subagent on. When omitted and the subagent
-    /// definition declares none, the fast model reads the prompt and routes
-    /// it to one of the configured tiers. Not accepted with `resume`: a
-    /// continued subagent keeps its model.
-    pub model: Option<ModelTier>,
-    /// Id from a finished subagent's result. The subagent continues in its
-    /// own context with `prompt_file` as the next prompt and returns a new
-    /// result under the same id. Ids expire with the provider's prompt cache;
-    /// continuing an expired or unknown id is an error.
-    pub resume: Option<u64>,
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SubagentArgs {
+    /// Start a new subagent.
+    Start {
+        /// Subagent type name (e.g., "explore", "plan") or path to a
+        /// subagent file. If the value contains '/' or ends with '.md',
+        /// it's treated as a file path, so custom subagents can be loaded
+        /// from files like `./custom-agent.md` or `subagents/researcher.md`.
+        subagent: String,
+        /// Path to a file containing the detailed task prompt for the
+        /// subagent. The file must exist and be non-empty.
+        prompt_file: String,
+        /// Model tier to run the subagent on. When omitted and the subagent
+        /// definition declares none, the fast model reads the prompt and
+        /// routes it to one of the configured tiers.
+        model: Option<ModelTier>,
+    },
+    /// Continue a finished subagent in its own context.
+    ///
+    /// Its earlier conversation stays its context and `prompt_file` is the
+    /// follow-up prompt; the result comes back under the same id. Ids
+    /// expire with the provider's prompt cache: continuing an expired or
+    /// unknown id is an error.
+    Resume {
+        /// Id from a finished subagent's result.
+        id: u64,
+        /// Path to a file containing the follow-up prompt. The file must
+        /// exist and be non-empty.
+        prompt_file: String,
+    },
+}
+
+impl SubagentArgs {
+    /// The prompt file either call shape carries.
+    fn prompt_file(&self) -> &str {
+        match self {
+            Self::Start { prompt_file, .. } | Self::Resume { prompt_file, .. } => prompt_file,
+        }
+    }
 }
 
 /// How the model that ran a subagent was selected.
@@ -176,8 +194,9 @@ struct SubagentResult {
     subagent: String,
     status: &'static str,
     result: String,
-    /// Id to pass as `resume` to continue this subagent while its prompt
-    /// cache is warm; absent when the subagent cannot be continued.
+    /// Id to continue this subagent with (`subagent resume --id`) while
+    /// its prompt cache is warm; absent only when the run cannot be
+    /// continued at all, like a cancelled one.
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -374,16 +393,19 @@ struct FinishedSubagent<LLM> {
     subagent: String,
     model: Option<SubagentRunModel>,
     child_job_registry: Option<aither_sandbox::JobRegistry>,
-    /// Provider cache lifetime, from the keep-alive configuration the
-    /// subagent ran with.
-    lifetime: Duration,
+    /// How long the provider keeps this subagent's prompt cache warm — the
+    /// [`PromptCache`](crate::context::PromptCache) lifetime the subagent
+    /// ran with. The continuation id expires with the cache entry.
+    lifetime: CacheLifetime,
 }
 
-impl<LLM: LanguageModel> FinishedSubagent<LLM> {
+impl<LLM: LanguageModel + 'static> FinishedSubagent<LLM> {
+    /// Whether the cache entry's lifetime passed since it was last
+    /// refreshed (the later of the last request and the last keep-alive).
     fn expired(&self) -> bool {
         self.agent
             .cache_entry_started_at()
-            .is_none_or(|started| started.elapsed() >= self.lifetime)
+            .is_none_or(|started| self.lifetime.is_cold(started.elapsed()))
     }
 }
 
@@ -392,8 +414,9 @@ enum FinishedSlot<LLM> {
     Idle(Box<FinishedSubagent<LLM>>),
     /// Checked out by a continuation in flight.
     Running,
-    /// Its cache lifetime passed; the context was dropped.
-    Expired,
+    /// Its cache lifetime passed; the context was dropped. The lifetime
+    /// stays so continuing the id names how long it lived.
+    Expired(CacheLifetime),
 }
 
 struct FinishedInner<LLM> {
@@ -417,12 +440,14 @@ impl<LLM> FinishedSubagents<LLM> {
     }
 }
 
-impl<LLM: LanguageModel> FinishedSubagents<LLM> {
+impl<LLM: LanguageModel + 'static> FinishedSubagents<LLM> {
     /// Drops the context of every subagent whose cache lifetime passed.
     fn expire(inner: &mut FinishedInner<LLM>) {
         for slot in inner.slots.values_mut() {
-            if matches!(slot, FinishedSlot::Idle(finished) if finished.expired()) {
-                *slot = FinishedSlot::Expired;
+            if let FinishedSlot::Idle(finished) = slot
+                && finished.expired()
+            {
+                *slot = FinishedSlot::Expired(finished.lifetime);
             }
         }
     }
@@ -433,9 +458,14 @@ impl<LLM: LanguageModel> FinishedSubagents<LLM> {
         Self::expire(&mut inner);
         match inner.slots.get_mut(&id) {
             None => anyhow::bail!("unknown subagent id {id}"),
-            Some(FinishedSlot::Expired) => anyhow::bail!(
-                "subagent {id} expired: its prompt cache lifetime passed and its context was released"
-            ),
+            Some(FinishedSlot::Expired(lifetime)) => {
+                let CacheLifetime::Limited(lifetime) = lifetime else {
+                    unreachable!("a permanent cache lifetime never expires");
+                };
+                anyhow::bail!(
+                    "subagent {id} expired: its prompt-cache entry lived {lifetime:?} and its context was released"
+                );
+            }
             Some(FinishedSlot::Running) => {
                 anyhow::bail!("subagent {id} is still running a continuation")
             }
@@ -523,8 +553,8 @@ pub struct SubagentTool<LLM> {
     /// Prompt-cache keep-alive settings applied to every child agent; `None`
     /// disables keep-alive. The caller sets it only for Anthropic providers.
     cache_keep_alive: Option<crate::config::CacheKeepAlive>,
-    /// Finished subagents the parent can continue; kept only while a
-    /// keep-alive configuration supplies the provider cache lifetime.
+    /// Finished subagents the parent can continue; each lives until its
+    /// own prompt-cache lifetime passes.
     finished: FinishedSubagents<LLM>,
 }
 
@@ -872,7 +902,8 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         Ok(prompt.to_string())
     }
 
-    /// Resolves `args.subagent` into the source a call builds its agent from.
+    /// Resolves a `start` call's `subagent` into the source it builds its
+    /// agent from.
     ///
     /// Returns the subagent id, the model the definition declares (if any),
     /// and the source. Values containing '/' or ending in '.md' load a
@@ -921,7 +952,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
     }
 }
 
-impl<LLM: LanguageModel + Clone + Sync> SubagentTool<LLM> {
+impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
     /// Register a subagent from a definition (builder pattern).
     ///
     /// Creates a subagent type from a `SubagentDefinition` loaded from a file.
@@ -993,49 +1024,44 @@ impl<LLM: LanguageModel + Clone + Sync> SubagentTool<LLM> {
         ))
     }
 
-    /// Returns the subagent a call runs: the finished one `args.resume`
-    /// names, or a fresh one for `args.subagent`; the second value is the
-    /// continued id.
+    /// Returns the subagent a call runs: a fresh agent for
+    /// [`SubagentArgs::Start`], or the finished one
+    /// [`SubagentArgs::Resume`] names; the second value is the continued
+    /// id.
     async fn acquire(
         &self,
         args: SubagentArgs,
         prompt: &str,
     ) -> anyhow::Result<(FinishedSubagent<LLM>, Option<u64>)> {
-        let Some(id) = args.resume else {
-            let subagent = args
-                .subagent
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("`subagent` is required unless `resume` is set"))?;
-            let (agent, subagent, model, child_job_registry) =
-                self.start_agent(subagent, args.model, prompt).await?;
-            let lifetime = self
-                .cache_keep_alive
-                .as_ref()
-                .map(|keep_alive| keep_alive.lifetime);
-            return Ok((
-                FinishedSubagent {
-                    agent,
-                    subagent,
-                    model: Some(model),
-                    child_job_registry,
-                    lifetime: lifetime.unwrap_or_default(),
-                },
-                None,
-            ));
-        };
-        if args.subagent.is_some() || args.model.is_some() {
-            anyhow::bail!(
-                "`resume` continues an existing subagent; `subagent` and `model` must be omitted"
-            );
+        match args {
+            SubagentArgs::Start {
+                subagent, model, ..
+            } => {
+                let (agent, subagent, model, child_job_registry) =
+                    self.start_agent(&subagent, model, prompt).await?;
+                let lifetime = agent.cache_lifetime();
+                Ok((
+                    FinishedSubagent {
+                        agent,
+                        subagent,
+                        model: Some(model),
+                        child_job_registry,
+                        lifetime,
+                    },
+                    None,
+                ))
+            }
+            SubagentArgs::Resume { id, .. } => {
+                let finished = self.finished.checkout(id)?;
+                tracing::info!(subagent = %finished.subagent, id, "Continuing subagent");
+                Ok((*finished, Some(id)))
+            }
         }
-        let finished = self.finished.checkout(id)?;
-        tracing::info!(subagent = %finished.subagent, id, "Continuing subagent");
-        Ok((*finished, Some(id)))
     }
 
     /// Picks the model a subagent call runs on.
     ///
-    /// A `chosen` tier — from `SubagentArgs::model` or the definition —
+    /// A `chosen` tier — from a `start` call's `model` or the definition —
     /// is used as given. Without one, [`route_model`](Self::route_model)
     /// asks the fast model which configured tier fits the prompt.
     async fn select_model(
@@ -1161,7 +1187,7 @@ where
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
         // The task prompt comes from a file; inline prompt text is rejected.
-        let prompt = self.read_prompt(&args.prompt_file).await?;
+        let prompt = self.read_prompt(args.prompt_file()).await?;
 
         let (
             FinishedSubagent {
@@ -1232,21 +1258,18 @@ where
             )
         });
 
-        // Without a configured cache lifetime there is no window to continue in.
-        let id = if self.cache_keep_alive.is_some() {
-            Some(self.finished.store(
-                resumed,
-                FinishedSubagent {
-                    agent,
-                    subagent: subagent_id.clone(),
-                    model: model.clone(),
-                    child_job_registry,
-                    lifetime,
-                },
-            ))
-        } else {
-            None
-        };
+        // A finished subagent stays continuable on every provider until
+        // its prompt-cache lifetime passes.
+        let id = Some(self.finished.store(
+            resumed,
+            FinishedSubagent {
+                agent,
+                subagent: subagent_id.clone(),
+                model: model.clone(),
+                child_job_registry,
+                lifetime,
+            },
+        ));
 
         ToolResult::json(&SubagentResult {
             subagent: subagent_id,
@@ -1272,21 +1295,42 @@ mod tests {
     fn subagent_args_schema() {
         let schema = schemars::schema_for!(SubagentArgs);
         let value = schema.to_value();
-        let props = value.get("properties").expect("should have properties");
-        assert!(props.get("subagent").is_some());
-        assert!(props.get("prompt_file").is_some());
-        assert!(props.get("model").is_some());
+        let variants = value
+            .get("oneOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("start and resume are tagged-enum variants");
+        assert_eq!(variants.len(), 2);
 
-        // `model` stays optional; the caller may leave routing to the tool.
-        let required = value
-            .get("required")
-            .expect("should have required")
-            .as_array()
-            .expect("required should be an array");
-        assert!(!required.contains(&serde_json::json!("subagent")));
-        assert!(!required.contains(&serde_json::json!("resume")));
-        assert!(required.contains(&serde_json::json!("prompt_file")));
-        assert!(!required.contains(&serde_json::json!("model")));
+        let requires = |variant: &serde_json::Value, field: &str| {
+            variant
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .expect("a variant lists its required fields")
+                .contains(&serde_json::json!(field))
+        };
+        let start = variants
+            .iter()
+            .find(|variant| requires(variant, "subagent"))
+            .expect("one variant starts a subagent");
+        let resume = variants
+            .iter()
+            .find(|variant| requires(variant, "id"))
+            .expect("one variant continues a subagent");
+
+        assert!(requires(start, "prompt_file"));
+        assert!(
+            !requires(start, "model"),
+            "`model` stays optional; the caller may leave routing to the tool"
+        );
+        assert!(requires(resume, "prompt_file"));
+        let resume_props = resume
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("resume has properties");
+        assert!(
+            !resume_props.contains_key("model") && !resume_props.contains_key("subagent"),
+            "a continuation keeps its model and its subagent type"
+        );
     }
 
     #[test]
@@ -1549,11 +1593,10 @@ mod tests {
         let call = tokio::spawn(async move {
             Tool::call(
                 &tool,
-                SubagentArgs {
-                    subagent: Some("explore".to_string()),
+                SubagentArgs::Start {
+                    subagent: "explore".to_string(),
                     prompt_file: prompt_path,
                     model: Some(ModelTier::Fast),
-                    resume: None,
                 },
                 ToolContext::new(),
             )
@@ -1594,11 +1637,10 @@ mod tests {
 
         let error = Tool::call(
             &tool,
-            SubagentArgs {
-                subagent: Some("worker".to_string()),
+            SubagentArgs::Start {
+                subagent: "worker".to_string(),
                 prompt_file: "summarize the repository layout".to_string(),
                 model: Some(ModelTier::Fast),
-                resume: None,
             },
             ToolContext::new(),
         )
@@ -1617,11 +1659,10 @@ mod tests {
 
         let error = Tool::call(
             &tool,
-            SubagentArgs {
-                subagent: Some("worker".to_string()),
+            SubagentArgs::Start {
+                subagent: "worker".to_string(),
                 prompt_file: prompt_file.to_string_lossy().into_owned(),
                 model: Some(ModelTier::Fast),
-                resume: None,
             },
             ToolContext::new(),
         )
@@ -1646,11 +1687,10 @@ mod tests {
 
         let result = Tool::call(
             &tool,
-            SubagentArgs {
-                subagent: Some("worker".to_string()),
+            SubagentArgs::Start {
+                subagent: "worker".to_string(),
                 prompt_file: prompt_file.to_string_lossy().into_owned(),
                 model: Some(ModelTier::Fast),
-                resume: None,
             },
             ToolContext::new(),
         )
@@ -1678,11 +1718,10 @@ mod tests {
 
         let result = Tool::call(
             &tool,
-            SubagentArgs {
-                subagent: Some("worker".to_string()),
+            SubagentArgs::Start {
+                subagent: "worker".to_string(),
                 prompt_file: prompt_file.to_string_lossy().into_owned(),
                 model: None,
-                resume: None,
             },
             ToolContext::new(),
         )
@@ -1724,11 +1763,10 @@ You are a file-defined agent.
 
         let result = Tool::call(
             &tool,
-            SubagentArgs {
-                subagent: Some(def_path.to_string_lossy().into_owned()),
+            SubagentArgs::Start {
+                subagent: def_path.to_string_lossy().into_owned(),
                 prompt_file: prompt_file.to_string_lossy().into_owned(),
                 model: None,
-                resume: None,
             },
             ToolContext::new(),
         )
@@ -1816,6 +1854,7 @@ You are a file-defined agent.
         author: &'static str,
         requests: async_channel::Sender<LLMRequest>,
         keep_alive: Option<crate::config::CacheKeepAlive>,
+        cache_lifetime: std::time::Duration,
     ) -> (
         SubagentTool<KeepAliveMockLlm>,
         aither_sandbox::BackgroundTaskSender,
@@ -1840,6 +1879,10 @@ You are a file-defined agent.
                 crate::AgentBuilder::new(llm)
                     .agent_kind(crate::AgentKind::Chatbot)
                     .max_iterations(4)
+                    .prompt_cache(
+                        crate::context::PromptCache::new("keep-alive-test")
+                            .with_lifetime(crate::context::CacheLifetime::Limited(cache_lifetime)),
+                    )
                     .background_channels(receiver.clone(), child_jobs.clone())
             }),
         );
@@ -1884,10 +1927,10 @@ You are a file-defined agent.
             "Anthropic",
             request_tx,
             Some(crate::config::CacheKeepAlive {
-                lifetime: std::time::Duration::from_millis(400),
                 send_before_expiry: std::time::Duration::from_millis(150),
                 frequent_idle_threshold: 2,
             }),
+            std::time::Duration::from_millis(400),
         );
         tokio::spawn(job_service.serve());
         register_running_job(&job_registry, 4242, "sleep 2").await;
@@ -1896,11 +1939,10 @@ You are a file-defined agent.
         let call = tokio::spawn(async move {
             Tool::call(
                 &tool,
-                SubagentArgs {
-                    subagent: Some("worker".to_string()),
+                SubagentArgs::Start {
+                    subagent: "worker".to_string(),
                     prompt_file: prompt_file.to_string_lossy().into_owned(),
                     model: Some(ModelTier::Fast),
-                    resume: None,
                 },
                 ToolContext::new(),
             )
@@ -1979,8 +2021,12 @@ You are a file-defined agent.
     async fn subagent_without_keep_alive_config_gets_no_keep_alives() {
         let (dir, prompt_file) = write_prompt_file("keep-alive-other-prompt", "hold a job");
         let (request_tx, request_rx) = async_channel::unbounded();
-        let (tool, sender, job_registry, job_service) =
-            keep_alive_tool("Anthropic", request_tx, None);
+        let (tool, sender, job_registry, job_service) = keep_alive_tool(
+            "Anthropic",
+            request_tx,
+            None,
+            std::time::Duration::from_secs(300),
+        );
         tokio::spawn(job_service.serve());
         register_running_job(&job_registry, 4243, "sleep 2").await;
         sender.task_started();
@@ -1988,11 +2034,10 @@ You are a file-defined agent.
         let call = tokio::spawn(async move {
             Tool::call(
                 &tool,
-                SubagentArgs {
-                    subagent: Some("worker".to_string()),
+                SubagentArgs::Start {
+                    subagent: "worker".to_string(),
                     prompt_file: prompt_file.to_string_lossy().into_owned(),
                     model: Some(ModelTier::Fast),
-                    resume: None,
                 },
                 ToolContext::new(),
             )
@@ -2053,11 +2098,10 @@ You are a file-defined agent.
 
         let result = Tool::call(
             &tool,
-            SubagentArgs {
-                subagent: Some("worker".to_string()),
+            SubagentArgs::Start {
+                subagent: "worker".to_string(),
                 prompt_file: prompt_file.to_string_lossy().into_owned(),
                 model: Some(ModelTier::Fast),
-                resume: None,
             },
             ToolContext::new(),
         )
@@ -2145,40 +2189,46 @@ You are a file-defined agent.
     }
 
     fn resume_tool(
-        lifetime: std::time::Duration,
+        lifetime: CacheLifetime,
+        keep_alive: Option<crate::config::CacheKeepAlive>,
     ) -> (SubagentTool<EchoLlm>, async_channel::Receiver<LLMRequest>) {
         let (request_tx, request_rx) = async_channel::unbounded();
-        let tool = worker_tool(
-            SubagentTool::new(EchoLlm {
-                requests: request_tx,
-                replies: Arc::default(),
-            })
-            .with_cache_keep_alive(crate::config::CacheKeepAlive {
-                lifetime,
-                send_before_expiry: std::time::Duration::ZERO,
-                frequent_idle_threshold: 3,
+        let tool = SubagentTool::new(EchoLlm {
+            requests: request_tx,
+            replies: Arc::default(),
+        });
+        let tool = match keep_alive {
+            Some(keep_alive) => tool.with_cache_keep_alive(keep_alive),
+            None => tool,
+        }
+        .with_type(
+            "worker",
+            SubagentType::new("worker for resume tests", move |llm| {
+                crate::AgentBuilder::new(llm)
+                    .agent_kind(crate::AgentKind::Chatbot)
+                    .max_iterations(2)
+                    .prompt_cache(
+                        crate::context::PromptCache::new("resume-test").with_lifetime(lifetime),
+                    )
             }),
         );
         (tool, request_rx)
     }
 
     fn resume_args(prompt_file: &Path, resume: u64) -> SubagentArgs {
-        SubagentArgs {
-            subagent: None,
+        SubagentArgs::Resume {
+            id: resume,
             prompt_file: prompt_file.to_string_lossy().into_owned(),
-            model: None,
-            resume: Some(resume),
         }
     }
 
     async fn first_run(tool: &SubagentTool<EchoLlm>, prompt_file: &Path) -> serde_json::Value {
         let result = Tool::call(
             tool,
-            SubagentArgs {
-                subagent: Some("worker".to_string()),
+            SubagentArgs::Start {
+                subagent: "worker".to_string(),
                 prompt_file: prompt_file.to_string_lossy().into_owned(),
                 model: Some(ModelTier::Fast),
-                resume: None,
             },
             ToolContext::new(),
         )
@@ -2192,7 +2242,13 @@ You are a file-defined agent.
 
     #[tokio::test]
     async fn finished_subagent_continues_with_its_earlier_conversation() {
-        let (tool, requests) = resume_tool(std::time::Duration::from_secs(300));
+        let (tool, requests) = resume_tool(
+            CacheLifetime::Limited(std::time::Duration::from_secs(300)),
+            Some(crate::config::CacheKeepAlive {
+                send_before_expiry: std::time::Duration::ZERO,
+                frequent_idle_threshold: 3,
+            }),
+        );
         let (dir, first_prompt) = write_prompt_file("resume-first", "first question marker");
         let first = first_run(&tool, &first_prompt).await;
         assert_eq!(first["status"], "completed");
@@ -2224,7 +2280,10 @@ You are a file-defined agent.
 
     #[tokio::test]
     async fn continuing_an_unknown_id_is_an_error() {
-        let (tool, _requests) = resume_tool(std::time::Duration::from_secs(300));
+        let (tool, _requests) = resume_tool(
+            CacheLifetime::Limited(std::time::Duration::from_secs(300)),
+            None,
+        );
         let (dir, prompt_file) = write_prompt_file("resume-unknown", "follow-up");
         let error = Tool::call(&tool, resume_args(&prompt_file, 99), ToolContext::new())
             .await
@@ -2238,7 +2297,10 @@ You are a file-defined agent.
 
     #[tokio::test]
     async fn continuing_after_the_cache_lifetime_is_an_expiry_error() {
-        let (tool, _requests) = resume_tool(std::time::Duration::from_millis(100));
+        let (tool, _requests) = resume_tool(
+            CacheLifetime::Limited(std::time::Duration::from_millis(100)),
+            None,
+        );
         let (dir, prompt_file) = write_prompt_file("resume-expired", "first");
         let first = first_run(&tool, &prompt_file).await;
         let id = first["id"].as_u64().expect("result names an id");
@@ -2247,22 +2309,88 @@ You are a file-defined agent.
         let error = Tool::call(&tool, resume_args(&prompt_file, id), ToolContext::new())
             .await
             .expect_err("expired subagent must fail");
-        assert!(error.to_string().contains("expired"), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("expired"), "{message}");
+        assert!(
+            message.contains("100ms"),
+            "the error names the lifetime the id expired after: {message}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The `resume` shape carries no model or subagent selector at all, so
+    /// an argument object that names one fails to deserialize.
+    #[test]
+    fn resume_args_carry_no_model_or_subagent() {
+        for extra in ["model", "subagent"] {
+            let error = serde_json::from_value::<SubagentArgs>(serde_json::json!({
+                "command": "resume",
+                "id": 7,
+                "prompt_file": "prompt.txt",
+                extra: "fast",
+            }))
+            .expect_err("a resume call cannot name a model or subagent");
+            assert!(
+                error.to_string().contains("unknown field"),
+                "{extra} must be rejected as unknown: {error}"
+            );
+        }
+    }
+
+    /// Continuation does not depend on a keep-alive configuration: every
+    /// finished subagent gets an id, and it stays continuable until the
+    /// prompt-cache lifetime it ran with passes.
     #[tokio::test]
-    async fn resume_rejects_subagent_and_model_arguments() {
-        let (tool, _requests) = resume_tool(std::time::Duration::from_secs(300));
-        let (dir, prompt_file) = write_prompt_file("resume-conflict", "first");
-        let first = first_run(&tool, &prompt_file).await;
-        let id = first["id"].as_u64().expect("result names an id");
-        let mut args = resume_args(&prompt_file, id);
-        args.model = Some(ModelTier::Fast);
-        let error = Tool::call(&tool, args, ToolContext::new())
+    async fn finished_subagent_without_keep_alive_still_continues() {
+        let (tool, requests) = resume_tool(
+            CacheLifetime::Limited(std::time::Duration::from_secs(300)),
+            None,
+        );
+        let (dir, first_prompt) = write_prompt_file("resume-no-keepalive", "first marker");
+        let first = first_run(&tool, &first_prompt).await;
+        assert_eq!(first["status"], "completed");
+        let id = first["id"]
+            .as_u64()
+            .expect("a provider without keep-alive still gets an id");
+        while requests.try_recv().is_ok() {}
+
+        let follow_up = dir.join("follow-up.txt");
+        std::fs::write(&follow_up, "second marker").expect("write follow-up");
+        let result = Tool::call(&tool, resume_args(&follow_up, id), ToolContext::new())
             .await
-            .expect_err("model with resume must fail");
-        assert!(error.to_string().contains("must be omitted"), "{error}");
+            .expect("continuing failed");
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result, got {result:?}");
+        };
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["result"], "reply-1");
+        assert_eq!(value["id"], id);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A permanent prompt-cache lifetime never expires its continuation id.
+    #[tokio::test]
+    async fn permanent_cache_lifetime_never_expires() {
+        let (tool, _requests) = resume_tool(CacheLifetime::Permanent, None);
+        let (dir, first_prompt) = write_prompt_file("resume-permanent", "first");
+        let first = first_run(&tool, &first_prompt).await;
+        let id = first["id"].as_u64().expect("result names an id");
+
+        // Well past the lifetime the expiry test uses; a permanent cache
+        // never goes cold.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let follow_up = dir.join("follow-up.txt");
+        std::fs::write(&follow_up, "second").expect("write follow-up");
+        let result = Tool::call(&tool, resume_args(&follow_up, id), ToolContext::new())
+            .await
+            .expect("a permanent lifetime never expires");
+        let ToolResult::Json { value } = result else {
+            panic!("expected json result, got {result:?}");
+        };
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["id"], id);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

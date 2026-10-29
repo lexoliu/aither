@@ -41,7 +41,7 @@ use crate::session::AcpSession;
 ///     Ok(agent)
 /// }).await?;
 /// ```
-pub struct AcpServer<T: BidirectionalTransport, LLM: LanguageModel> {
+pub struct AcpServer<T: BidirectionalTransport, LLM: LanguageModel + 'static> {
     transport: T,
     info: Implementation,
     sessions: HashMap<String, AcpSession<LLM>>,
@@ -65,7 +65,9 @@ pub type AgentFactory<LLM> = Box<
     dyn Fn(PathBuf) -> Pin<Box<dyn Future<Output = Result<Agent<LLM, LLM, LLM>>> + Send>> + Send,
 >;
 
-impl<T: BidirectionalTransport, LLM: LanguageModel> std::fmt::Debug for AcpServer<T, LLM> {
+impl<T: BidirectionalTransport, LLM: LanguageModel + 'static> std::fmt::Debug
+    for AcpServer<T, LLM>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcpServer")
             .field("info", &self.info)
@@ -75,7 +77,7 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> std::fmt::Debug for AcpServe
     }
 }
 
-impl<LLM: LanguageModel> AcpServer<StdioTransport, LLM> {
+impl<LLM: LanguageModel + 'static> AcpServer<StdioTransport, LLM> {
     /// Create an ACP server using stdio transport.
     ///
     /// This is the standard way to create an ACP server that communicates
@@ -117,7 +119,7 @@ enum Progress<E> {
     Update(SessionUpdate),
 }
 
-impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
+impl<T: BidirectionalTransport, LLM: LanguageModel + 'static> AcpServer<T, LLM> {
     /// Run the server main loop.
     ///
     /// This processes incoming requests until the connection is closed.

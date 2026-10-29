@@ -26,7 +26,7 @@
 //! - **Ergonomic API**: Simple `query()` for one-shot tasks, `run()` for streaming
 //! - **Internal Loop**: Tool execution handled automatically
 //! - **Trait-based Hooks**: Intercept operations at compile time
-//! - **Smart Compression**: Intelligent context management preserving critical info
+//! - **Context Management**: One policy, a cache-aware window, async compaction
 //! - **Generic over LLM**: Works with any `LanguageModel` implementation
 
 // Core modules
@@ -36,22 +36,20 @@ mod browser_backend;
 mod builder;
 mod cache_stats;
 mod checkpoint;
-mod compression;
 mod config;
-mod context;
+pub mod context;
 mod context_window;
 mod error;
 mod event;
 mod fs_util;
-mod handoff;
 mod hook;
 mod model_group;
+mod output_urls;
 mod stream;
 mod subagent_file;
 mod terminal_agent;
 pub mod tool_request;
 mod tools;
-pub mod transcript;
 pub mod working_docs;
 pub mod workspace_request;
 
@@ -80,19 +78,22 @@ pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser}
 pub use builder::AgentBuilder;
 pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
-pub use compression::{
-    CompressionLevel, ContextStrategy, PreserveConfig, PreservedContent, SmartCompressionConfig,
+pub use config::{AgentConfig, AgentKind};
+#[cfg(feature = "skills")]
+pub use context::ActiveSkills;
+pub use context::{
+    AnyContextSource, BackgroundJobs, Block, CompactionError, CompletedCompaction, Context,
+    ContextBudget, ContextCheckpoint, ContextItem, ContextPolicy, ContextSource, HandoffDocument,
+    PromptCache, ReassemblyReport, TasksDocument,
 };
-pub use config::{AgentConfig, AgentKind, ContextAssemblerConfig};
-pub use context::{Context, ContextCheckpoint, ReassemblyReport};
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;
 pub use event::AgentEvent;
-pub use handoff::HandoffDocument;
 pub use hook::{
     CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction, StopContext,
     StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
 };
+pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
 pub use stream::AgentStream;
 pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};
 pub use tools::AgentTools;
