@@ -780,7 +780,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(prepared.path()).unwrap(), fixture.executable);
-        assert_eq!(prepared.path().file_name().unwrap(), "search");
+        assert_eq!(
+            prepared.path().file_name().unwrap(),
+            HostProgram::RepoSearch.executable_name(&target).as_str()
+        );
         // Preparing again reuses the verified copy.
         assert_eq!(
             program
