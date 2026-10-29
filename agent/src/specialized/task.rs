@@ -1994,9 +1994,19 @@ You are a file-defined agent.
             .await
         });
 
-        // Let the run park on the job long enough for two keep-alives,
-        // then complete the task so the wait unwinds.
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // Hold the job open until two keep-alives have gone out, then
+        // complete the task so the wait unwinds.
+        let mut keep_alives = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while keep_alives.len() < 2 {
+                let request = request_rx.recv().await.expect("request channel closed");
+                if request.parameters().max_tokens == Some(0) {
+                    keep_alives.push(request);
+                }
+            }
+        })
+        .await
+        .expect("two keep-alives while the job ran");
         sender.task_finished();
         sender
             .send_completed(aither_sandbox::CompletedTask {
@@ -2017,12 +2027,7 @@ You are a file-defined agent.
         let text = result.render_for_model();
         assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
 
-        let keep_alives = keep_alive_requests(&request_rx);
-        assert!(
-            keep_alives.len() >= 2,
-            "expected repeated keep-alives while the job ran, got {}",
-            keep_alives.len()
-        );
+        keep_alives.extend(keep_alive_requests(&request_rx));
         for request in &keep_alives {
             let params = request.parameters();
             assert_eq!(params.max_tokens, Some(0));
