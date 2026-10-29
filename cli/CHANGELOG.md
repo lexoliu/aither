@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/lexoliu/aither/compare/cli-v0.11.0...cli-v0.12.0) - 2026-10-29
+
+### Added
+
+- *(agent,sandbox)* keep subagents inside the main agent's authority
+
+### Other
+
+- Merge pull request #260 from lexoliu/feat/238-fork-subagent
+- Merge remote-tracking branch 'origin/main' into chore/merge-main-into-dev-0.11
+- Merge origin/dev into feat/227-subagent-authority
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/cli-v0.10.1...cli-v0.11.0) - 2026-10-29
 
 ### Added

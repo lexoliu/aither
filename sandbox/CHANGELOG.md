@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/lexoliu/aither/compare/sandbox-v0.11.0...sandbox-v0.12.0) - 2026-10-29
+
+### Added
+
+- *(sandbox)* distribute host programs, starting with the repo-search daemon
+- *(sandbox)* carry the main agent's working directory across commands
+- *(sandbox)* refuse name- and pattern-based kills
+- *(agent,sandbox)* keep subagents inside the main agent's authority
+
+### Fixed
+
+- *(sandbox)* mark a host program read-only after it is renamed into place
+- *(sandbox)* spell unparsable consistently and let typos skip option strings
+- *(agent,sandbox)* resolve canonical paths without the Windows verbatim prefix
+
+### Other
+
+- Merge pull request #266 from lexoliu/feat/264-host-programs
+- *(sandbox)* expect the target's executable name for the prepared host program
+- Merge remote-tracking branch 'origin/main' into chore/merge-main-into-dev-0.11
+- Merge pull request #251 from lexoliu/feat/227-subagent-authority
+- *(sandbox)* gate the recording container exec to unix like its only user
+- Merge origin/dev into feat/227-subagent-authority
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/sandbox-v0.10.1...sandbox-v0.11.0) - 2026-10-29
 
 ### Added
