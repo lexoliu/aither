@@ -67,9 +67,7 @@ impl Transcript {
     /// Append a tool result block.
     pub async fn write_tool_result(&self, name: &str, result: &ToolResult) {
         let mut block = String::new();
-        let rendered = result
-            .render_for_cli()
-            .unwrap_or_else(|error| format!("failed to render tool result: {error}"));
+        let rendered = result.render_for_model();
         let truncated = truncate_lines(&rendered, 200);
         if result.is_error() {
             let _ = writeln!(block, "-> {name} (error): {truncated}\n");

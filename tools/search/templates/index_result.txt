@@ -1,0 +1,2 @@
+Indexed {{ files_indexed }} files ({{ chunks_indexed }} chunks) under {{ indexed_root }} at {{ indexed_at }}.{% if semantic_indexed %} Semantic index rebuilt.{% endif %}
+Indexed roots: {{ roots }}.

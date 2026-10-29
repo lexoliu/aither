@@ -1,0 +1,7 @@
+<skill_instruction>
+Skill: {{ name }} - {{ description }}
+{% if let Some(tools) = allowed_tools %}Allowed tools: {{ tools|join(", ") }}.
+{% endif %}{% if let Some(paths) = resource_paths %}Resource paths: {{ paths|join(", ") }}.
+{% endif %}
+{{ instructions }}
+</skill_instruction>

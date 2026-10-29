@@ -1,2 +1,2 @@
 {{ folded }}
-[Code folded; line numbers are those of the unfolded text, saved to {{ url }} ({{ path }}).]
+[Code folded; line numbers are those of the unfolded text.]

@@ -9,9 +9,10 @@ use std::{
 };
 
 use aither_core::llm::ToolContext;
-use aither_core::llm::{Tool, ToolResult, tool::json};
+use aither_core::llm::{Tool, ToolResult};
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwap;
+use askama::Template;
 use async_fs::{
     OpenOptions, create_dir_all, read_dir, read_to_string, remove_dir, remove_file, write,
 };
@@ -108,6 +109,20 @@ pub enum FsOperation {
 pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
+}
+
+/// A directory listing as the model reads it, rendered by `templates/listing.txt`.
+#[derive(Template)]
+#[template(path = "listing.txt", escape = "none")]
+struct ListingTemplate<'a> {
+    entries: &'a [DirEntry],
+}
+
+/// Glob matches as the model reads them, rendered by `templates/matches.txt`.
+#[derive(Template)]
+#[template(path = "matches.txt", escape = "none")]
+struct MatchesTemplate<'a> {
+    matches: &'a [String],
 }
 
 #[derive(Clone)]
@@ -223,11 +238,15 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .list_dir(path.as_deref().map_or(Path::new(""), Path::new))
                     .await
                     .map_err(anyhow::Error::new)?;
-                Ok(ToolResult::text(json(&listing)?))
+                Ok(ToolResult::text(
+                    ListingTemplate { entries: &listing }.render()?,
+                ))
             }
             FsOperation::Glob { pattern } => {
                 let matches = self.filesystem.glob(&pattern)?;
-                Ok(ToolResult::text(json(&matches)?))
+                Ok(ToolResult::text(
+                    MatchesTemplate { matches: &matches }.render()?,
+                ))
             }
         }
     }
@@ -924,5 +943,45 @@ where
             path: dir.to_path_buf(),
         });
         self.inner.remove_dir(dir)
+    }
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    #[test]
+    fn listing_marks_directories() {
+        let entries = [
+            DirEntry {
+                name: "src".into(),
+                is_dir: true,
+            },
+            DirEntry {
+                name: "Cargo.toml".into(),
+                is_dir: false,
+            },
+        ];
+        assert_eq!(
+            ListingTemplate { entries: &entries }.render().unwrap(),
+            "src/\nCargo.toml\n"
+        );
+        assert_eq!(
+            ListingTemplate { entries: &[] }.render().unwrap(),
+            "The directory is empty."
+        );
+    }
+
+    #[test]
+    fn matches_are_one_per_line() {
+        let matches = ["a.rs".to_string(), "b/c.rs".to_string()];
+        assert_eq!(
+            MatchesTemplate { matches: &matches }.render().unwrap(),
+            "a.rs\nb/c.rs\n"
+        );
+        assert_eq!(
+            MatchesTemplate { matches: &[] }.render().unwrap(),
+            "No files match."
+        );
     }
 }

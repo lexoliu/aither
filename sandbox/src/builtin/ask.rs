@@ -11,6 +11,8 @@
 
 use std::borrow::Cow;
 
+use askama::Template;
+
 use aither_core::LanguageModel;
 use aither_core::llm::ToolContext;
 use aither_core::llm::{Event, LLMRequest, Message, Tool, ToolResult};
@@ -54,26 +56,11 @@ pub enum AskModelTier {
     Fast,
 }
 
-#[derive(Serialize)]
-struct AskContext<'a> {
-    #[serde(rename = "$text")]
-    content: &'a str,
-}
-
-fn join_text(parts: &[&str]) -> String {
-    let capacity = parts.iter().map(|part| part.len()).sum();
-    let mut output = String::with_capacity(capacity);
-    for part in parts {
-        output.push_str(part);
-    }
-    output
-}
-
-fn serialize_context_xml(content: &str) -> Result<String, quick_xml::SeError> {
-    let mut buffer = String::new();
-    let serializer = quick_xml::se::Serializer::with_root(&mut buffer, Some("context"))?;
-    AskContext { content }.serialize(serializer)?;
-    Ok(buffer)
+#[derive(Template)]
+#[template(path = "ask_message.txt", escape = "none")]
+struct AskMessageTemplate<'a> {
+    input: &'a str,
+    prompt: &'a str,
 }
 
 /// The ask command tool.
@@ -130,9 +117,12 @@ impl<LLM: LanguageModel> Tool for AskCommand<LLM> {
             return Ok(ToolResult::text("No input provided. Pipe content to ask."));
         }
 
-        let context_xml = serialize_context_xml(&args.input)
-            .map_err(|error| anyhow::anyhow!("failed to serialize ask context XML: {error}"))?;
-        let user_content = join_text(&[context_xml.as_str(), "\n\n", args.prompt.as_str()]);
+        let user_content = AskMessageTemplate {
+            input: &args.input,
+            prompt: &args.prompt,
+        }
+        .render()
+        .expect("ask message template must render");
 
         let request = LLMRequest::new(vec![Message::user(user_content)]);
         let llm = match args.model {

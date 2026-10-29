@@ -43,14 +43,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aither_agent::sandbox::{
-    CommandPayload, ToolRegistryBuilder, cli_to_json,
+    ToolRegistryBuilder, cli_to_json,
     permission::{PermissionError, PermissionHandler, TerminalMode},
     schema_to_help,
 };
 use aither_agent::specialized::SubagentTool;
 use aither_agent::{Agent, Hook, TerminalAgentBuilder};
 use aither_core::LanguageModel;
-use aither_core::llm::Role;
+use aither_core::llm::{Role, ToolResult};
 use aither_mcp::{McpConnection, McpServersConfig};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -296,7 +296,7 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
-                        Ok(Some(CommandPayload::Text { content }))
+                        Ok(ToolResult::text(content))
                     }
                     Err(error) => Err(error.to_string()),
                 }

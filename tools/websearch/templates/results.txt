@@ -1,0 +1,4 @@
+{% if results.is_empty() %}No results.{% else %}{% for result in results %}{{ loop.index }}. {{ result.title }}
+   {{ result.url }}
+   {{ result.snippet }}
+{% endfor %}{% endif %}

@@ -94,6 +94,17 @@ pub enum Role {
     Tool,
 }
 
+impl core::fmt::Display for Role {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::User => "User",
+            Self::Assistant => "Assistant",
+            Self::System => "System",
+            Self::Tool => "Tool",
+        })
+    }
+}
+
 /// A message in a conversation.
 ///
 /// Different message types have different fields:

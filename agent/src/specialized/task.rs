@@ -22,7 +22,7 @@ use aither_core::{
 use aither_sandbox::TerminalToolFactory;
 use askama::Template;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::AgentBuilder;
 use crate::fs_util::path_exists;
@@ -144,43 +144,37 @@ pub struct SubagentArgs {
     pub model: Option<ModelTier>,
 }
 
-/// How the model that ran a subagent was selected.
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum ModelSource {
-    /// The call's `model` argument or the subagent definition chose it.
-    Chosen,
-    /// The fast model routed the prompt to it.
-    Routed,
+#[derive(Template)]
+#[template(path = "subagent_result.txt", escape = "none")]
+struct SubagentResultTemplate<'a> {
+    subagent: &'a str,
+    outcome: SubagentReport<'a>,
 }
 
-/// The model that ran a subagent, reported back to the caller.
-#[derive(Debug, Clone, Serialize)]
-struct SubagentRunModel {
-    /// Profile name of the model that ran.
-    name: String,
-    /// Whether the model was chosen or routed.
-    source: ModelSource,
+/// What the result text reports about a subagent run.
+enum SubagentReport<'a> {
+    /// The user cancelled the run.
+    Cancelled,
+    /// The run produced a result.
+    Completed {
+        model: Option<&'a str>,
+        result: &'a str,
+    },
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct SubagentResult {
-    subagent: String,
-    status: &'static str,
-    result: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<SubagentRunModel>,
+struct HistoryEntry {
+    role: aither_core::llm::Role,
+    content: String,
+    /// Names of the tools the message called.
+    tool_names: Vec<String>,
 }
 
-impl SubagentResult {
-    fn cancelled(subagent: String) -> Self {
-        Self {
-            subagent,
-            status: "cancelled",
-            result: "Cancelled by user".to_string(),
-            model: None,
-        }
-    }
+#[derive(Template)]
+#[template(path = "subagent_error.txt", escape = "none")]
+struct SubagentErrorTemplate<'a> {
+    subagent: &'a str,
+    error: &'a str,
+    history: &'a [HistoryEntry],
 }
 
 /// Structured response the fast model returns when routing a prompt.
@@ -789,7 +783,7 @@ impl<LLM: LanguageModel + Clone + Sync> SubagentTool<LLM> {
         &self,
         prompt: &str,
         chosen: Option<ModelTier>,
-    ) -> anyhow::Result<(ModelTier, SubagentRunModel)> {
+    ) -> anyhow::Result<(ModelTier, String)> {
         if let Some(tier) = chosen {
             let profile = self.model_for(tier).profile().await.map_err(|error| {
                 anyhow::anyhow!(
@@ -797,23 +791,10 @@ impl<LLM: LanguageModel + Clone + Sync> SubagentTool<LLM> {
                     tier_label(tier)
                 )
             })?;
-            return Ok((
-                tier,
-                SubagentRunModel {
-                    name: profile.name,
-                    source: ModelSource::Chosen,
-                },
-            ));
+            return Ok((tier, profile.name));
         }
 
-        let (tier, name) = self.route_model(prompt).await?;
-        Ok((
-            tier,
-            SubagentRunModel {
-                name,
-                source: ModelSource::Routed,
-            },
-        ))
+        self.route_model(prompt).await
     }
 
     /// Asks the fast model which configured tier fits `prompt`.
@@ -927,7 +908,7 @@ where
             Source::Registered(subagent_type) => subagent_type.builder(selected),
         };
 
-        tracing::info!(subagent = %subagent_id, model = %model.name.as_str(), "Starting subagent");
+        tracing::info!(subagent = %subagent_id, model = %model, "Starting subagent");
 
         // Add child terminal tool if factory is configured
         let (agent_builder, child_job_registry) = if let Some(factory) = &self.terminal_tool_factory
@@ -960,7 +941,14 @@ where
         let result = match outcome {
             SubagentOutcome::Cancelled => {
                 tracing::info!(subagent = %subagent_id, "Subagent cancelled");
-                return ToolResult::json(&SubagentResult::cancelled(subagent_id));
+                return Ok(ToolResult::text(
+                    SubagentResultTemplate {
+                        subagent: &subagent_id,
+                        outcome: SubagentReport::Cancelled,
+                    }
+                    .render()
+                    .expect("subagent result template must render"),
+                ));
             }
             SubagentOutcome::Finished(Ok(result)) => result,
             SubagentOutcome::Finished(Err(error)) => {
@@ -973,22 +961,42 @@ where
                     .into_iter()
                     .rev()
                     .collect::<Vec<_>>();
-                let recent_json = serde_json::to_string(&recent)
-                    .unwrap_or_else(|serialize_error| serialize_error.to_string());
-                return Err(anyhow::anyhow!(
-                    "Subagent '{subagent_id}' error: {error}\nRecent subagent history: {recent_json}"
-                ));
+                let history = recent
+                    .iter()
+                    .map(|message| HistoryEntry {
+                        role: message.role(),
+                        content: message.content().to_string(),
+                        tool_names: message
+                            .tool_calls()
+                            .iter()
+                            .map(|call| call.name.clone())
+                            .collect(),
+                    })
+                    .collect::<Vec<_>>();
+                let error_text = SubagentErrorTemplate {
+                    subagent: &subagent_id,
+                    error: &error.to_string(),
+                    history: &history,
+                }
+                .render()
+                .expect("subagent error template must render");
+                return Err(anyhow::anyhow!(error_text));
             }
         };
 
         tracing::info!(subagent = %subagent_id, "Subagent completed");
 
-        ToolResult::json(&SubagentResult {
-            subagent: subagent_id,
-            status: "completed",
-            result,
-            model: Some(model),
-        })
+        Ok(ToolResult::text(
+            SubagentResultTemplate {
+                subagent: &subagent_id,
+                outcome: SubagentReport::Completed {
+                    model: Some(&model),
+                    result: &result,
+                },
+            }
+            .render()
+            .expect("subagent result template must render"),
+        ))
     }
 }
 
@@ -1022,40 +1030,66 @@ mod tests {
     }
 
     #[test]
-    fn subagent_result_serializes_as_structured_json() {
-        let value = serde_json::to_value(SubagentResult {
-            subagent: "research".to_string(),
-            status: "completed",
-            result: "done".to_string(),
-            model: Some(SubagentRunModel {
-                name: "test-model".to_string(),
-                source: ModelSource::Routed,
-            }),
-        })
-        .expect("subagent result should serialize");
+    fn subagent_error_history_names_tool_calls() {
+        let history = [
+            HistoryEntry {
+                role: aither_core::llm::Role::User,
+                content: "go".to_string(),
+                tool_names: Vec::new(),
+            },
+            HistoryEntry {
+                role: aither_core::llm::Role::Assistant,
+                content: String::new(),
+                tool_names: vec!["terminal".to_string(), "terminal_read".to_string()],
+            },
+        ];
+        let rendered = SubagentErrorTemplate {
+            subagent: "research",
+            error: "boom",
+            history: &history,
+        }
+        .render()
+        .expect("subagent error should render");
         assert_eq!(
-            value,
-            serde_json::json!({
-                "subagent": "research",
-                "status": "completed",
-                "result": "done",
-                "model": {
-                    "name": "test-model",
-                    "source": "routed",
-                },
-            })
+            rendered,
+            "Subagent 'research' error: boom\n\nRecent subagent history:\n- User: go\n- Assistant: [called terminal, terminal_read]\n"
+        );
+    }
+
+    #[test]
+    fn subagent_result_renders_as_prose() {
+        let completed = SubagentResultTemplate {
+            subagent: "research",
+            outcome: SubagentReport::Completed {
+                model: Some("test-model"),
+                result: "done",
+            },
+        }
+        .render()
+        .expect("subagent result should render");
+        assert_eq!(
+            completed,
+            "Subagent 'research' completed (model: test-model).\n\ndone"
         );
 
-        let cancelled = serde_json::to_value(SubagentResult::cancelled("explore".to_string()))
-            .expect("cancelled result should serialize");
-        assert_eq!(
-            cancelled,
-            serde_json::json!({
-                "subagent": "explore",
-                "status": "cancelled",
-                "result": "Cancelled by user",
-            })
-        );
+        let without_model = SubagentResultTemplate {
+            subagent: "research",
+            outcome: SubagentReport::Completed {
+                model: None,
+                result: "done",
+            },
+        }
+        .render()
+        .expect("subagent result should render");
+        assert_eq!(without_model, "Subagent 'research' completed.\n\ndone");
+
+        let cancelled = SubagentResultTemplate {
+            subagent: "explore",
+            outcome: SubagentReport::Cancelled,
+        }
+        .render()
+        .expect("cancelled result should render");
+        assert_eq!(cancelled, "Subagent 'explore' was cancelled by the user.");
     }
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
@@ -1305,11 +1339,10 @@ mod tests {
             .await
             .expect("call task panicked")
             .expect("subagent call failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
+        let ToolResult::Text { text } = result else {
+            panic!("expected text result, got {result:?}");
         };
-        assert_eq!(value["status"], "cancelled");
-        assert_eq!(value["subagent"], "explore");
+        assert_eq!(text, "Subagent 'explore' was cancelled by the user.");
         assert!(runs.list().is_empty(), "finished run must unregister");
         assert!(!runs.cancel(run.id), "finished run cannot be cancelled");
 
@@ -1381,13 +1414,13 @@ mod tests {
         )
         .await
         .expect("subagent call failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
+        let ToolResult::Text { text } = result else {
+            panic!("expected text result, got {result:?}");
         };
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["result"], "fast-model");
-        assert_eq!(value["model"]["name"], "fast-model");
-        assert_eq!(value["model"]["source"], "chosen");
+        assert_eq!(
+            text,
+            "Subagent 'worker' completed (model: fast-model).\n\nfast-model"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1412,13 +1445,13 @@ mod tests {
         )
         .await
         .expect("subagent call failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
+        let ToolResult::Text { text } = result else {
+            panic!("expected text result, got {result:?}");
         };
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["result"], "balanced-model");
-        assert_eq!(value["model"]["name"], "balanced-model");
-        assert_eq!(value["model"]["source"], "routed");
+        assert_eq!(
+            text,
+            "Subagent 'worker' completed (model: balanced-model).\n\nbalanced-model"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1457,13 +1490,13 @@ You are a file-defined agent.
         )
         .await
         .expect("subagent call failed");
-        let ToolResult::Json { value } = result else {
-            panic!("expected json result, got {result:?}");
+        let ToolResult::Text { text } = result else {
+            panic!("expected text result, got {result:?}");
         };
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["result"], "fast-model");
-        assert_eq!(value["model"]["name"], "fast-model");
-        assert_eq!(value["model"]["source"], "chosen");
+        assert_eq!(
+            text,
+            "Subagent 'file-agent' completed (model: fast-model).\n\nfast-model"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(root);

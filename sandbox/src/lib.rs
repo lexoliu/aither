@@ -83,6 +83,7 @@ pub use command::{
     CommandEnvelope, CommandPayload, DynTerminalTool, DynToolHandler, IpcToolCommand,
     ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
     register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
+    tool_output_to_payload,
 };
 pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
@@ -98,7 +99,7 @@ pub use job_registry::{
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
 };
-pub use output::{Content, MediaResolution, OutputEntry, OutputFormat, OutputStore, PendingUrl};
+pub use output::{MediaResolution, OutputFormat, OutputStore};
 pub use permission::{PermissionHandler, TerminalMode};
 pub use shell_session::{
     AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
@@ -111,12 +112,13 @@ pub use stdin_watch::{
     is_waiting_on_stdin,
 };
 pub use terminal::{
-    BackgroundTaskReceiver, CompletedTask, Configured, DEFAULT_BACKGROUND_TIMEOUT_CAP,
-    DEFAULT_FOREGROUND_LIMIT, DEFAULT_LONG_JOB_ALERT_AFTER, LongRunningJob, PermissionEvent,
-    PermissionEventReceiver, PermissionEventStage, TerminalArgs, TerminalBackgroundArgs,
-    TerminalBackgroundTool, TerminalError, TerminalExecutionMode, TerminalResult, TerminalTool,
-    TerminalToolFactory, TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured,
-    open_network_audit_log, terminal_tool_factory_channel,
+    BackgroundTaskReceiver, CompletedCommand, CompletedTask, Configured,
+    DEFAULT_BACKGROUND_TIMEOUT_CAP, DEFAULT_FOREGROUND_LIMIT, DEFAULT_LONG_JOB_ALERT_AFTER,
+    LongRunningJob, PermissionEvent, PermissionEventReceiver, PermissionEventStage,
+    StartedBackgroundTask, TerminalArgs, TerminalBackgroundArgs, TerminalBackgroundTool,
+    TerminalError, TerminalExecutionMode, TerminalTool, TerminalToolFactory,
+    TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured, open_network_audit_log,
+    terminal_tool_factory_channel,
 };
 pub use tool_distribution::{
     ToolArtifact, ToolArtifactFormat, ToolArtifactLocation, ToolDistribution,

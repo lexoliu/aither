@@ -1,0 +1,3 @@
+{% match outcome %}{% when SubagentReport::Cancelled %}Subagent '{{ subagent }}' was cancelled by the user.{% when SubagentReport::Completed { model, result } %}Subagent '{{ subagent }}' completed{% if let Some(model) = model %} (model: {{ model }}){% endif %}.
+
+{{ result }}{% endmatch %}

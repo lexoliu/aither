@@ -1,0 +1,7 @@
+{% if stdout.is_empty() && stderr.is_none() %}{% match outcome %}{% when CommandOutcome::Running { .. } %}{% else %}(no output)
+{% endmatch %}{% endif %}{{ stdout }}{% if let Some(stderr) = stderr %}stderr:
+{{ stderr }}{% endif %}{% match outcome %}{% when CommandOutcome::Exited { code: 0 } %}{% when CommandOutcome::Exited { code } %}Exit code: {{ code }}.
+{% when CommandOutcome::Running { task_id, output } %}Started in background as task '{{ task_id }}'; output is being written to {{ output.url }} (absolute path: {{ output.path }}).
+{% when CommandOutcome::Killed { task_id, notice } %}{{ notice }}
+Task ID: '{{ task_id }}'.
+{% endmatch %}

@@ -138,9 +138,7 @@ impl<LLM: LanguageModel> AcpSession<LLM> {
                     } else {
                         ToolCallStatus::Completed
                     };
-                    let text = result
-                        .render_for_model()
-                        .unwrap_or_else(|error| error.to_string());
+                    let text = result.render_for_model();
                     on_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                         tool_call_id: id,
                         status: Some(status),

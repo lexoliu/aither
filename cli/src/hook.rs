@@ -5,7 +5,7 @@
 use aither_agent::{
     Hook, PostToolAction, PreToolAction, StopContext, ToolResultContext, ToolUseContext,
 };
-use aither_core::llm::ToolResult;
+use aither_core::llm::{CommandOutcome, ToolResult};
 
 /// A debug hook that logs tool calls with human-friendly terminal output.
 #[derive(Debug, Clone, Copy, Default)]
@@ -58,16 +58,7 @@ impl Hook for DebugHook {
             if let Some(err) = ctx.result.error_message() {
                 println!("\x1b[31m✗ Error:\x1b[0m {err} \x1b[90m({duration_ms}ms)\x1b[0m");
             } else {
-                let result = render_tool_result(ctx.result);
-                if let Some(output) = parse_terminal_result(&result) {
-                    print_terminal_output(&output, duration_ms);
-                } else {
-                    println!("\x1b[90m({duration_ms}ms)\x1b[0m");
-                    let truncated = truncate_output(&result, 500);
-                    for line in truncated.lines().take(10) {
-                        println!("  {line}");
-                    }
-                }
+                print_terminal_result(ctx.result, duration_ms);
             }
         } else {
             // Non-terminal tools
@@ -78,7 +69,7 @@ impl Hook for DebugHook {
                 );
                 println!("  \x1b[31m{err}\x1b[0m");
             } else {
-                let result = render_tool_result(ctx.result);
+                let result = ctx.result.render_for_model();
                 let truncated = truncate_output(&result, 500);
                 println!(
                     "\x1b[32m[ok]\x1b[0m {} \x1b[90m({duration_ms}ms)\x1b[0m",
@@ -111,15 +102,6 @@ impl Hook for DebugHook {
     }
 }
 
-fn render_tool_result(result: &ToolResult) -> String {
-    match result.render_for_cli() {
-        Ok(output) => output,
-        Err(error) => {
-            panic!("failed to render ToolResult for CLI output: {error}");
-        }
-    }
-}
-
 /// Parsed terminal arguments.
 fn parse_terminal_args(arguments: &str) -> Option<(String, Option<String>)> {
     let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
@@ -131,103 +113,36 @@ fn parse_terminal_args(arguments: &str) -> Option<(String, Option<String>)> {
     Some((script, mode))
 }
 
-/// Parsed terminal output.
-struct TerminalOutput {
-    stdout: Option<String>,
-    stderr: Option<String>,
-    exit_code: i64,
-    task_id: Option<String>,
-    status: Option<String>,
-}
-
-/// Parse terminal result JSON into human-readable format.
-fn parse_terminal_result(result: &str) -> Option<TerminalOutput> {
-    let parsed: serde_json::Value = serde_json::from_str(result).ok()?;
-
-    // Handle stdout - can be string or object with "text" field
-    let stdout = match parsed.get("stdout") {
-        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        Some(serde_json::Value::Object(obj)) => {
-            obj.get("text").and_then(|t| t.as_str()).map(String::from)
+/// Print a terminal tool result in human-friendly format, driven by its
+/// typed command outcome.
+fn print_terminal_result(result: &ToolResult, duration_ms: u128) {
+    match result.command().map(|command| &command.outcome) {
+        Some(CommandOutcome::Running { task_id, .. }) => {
+            println!("\x1b[33m⏳ Background task started:\x1b[0m {task_id}");
+            return;
         }
-        _ => None,
-    };
-
-    // Handle stderr similarly
-    let stderr = match parsed.get("stderr") {
-        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        Some(serde_json::Value::Object(obj)) => {
-            obj.get("text").and_then(|t| t.as_str()).map(String::from)
+        Some(CommandOutcome::Exited { code }) if *code != 0 => {
+            print!("\x1b[31m✗ Exit code {code}:\x1b[0m ");
         }
-        _ => None,
-    };
-
-    let exit_code = parsed
-        .get("exit_code")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
-    let task_id = parsed
-        .get("task_id")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let status = parsed
-        .get("status")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    Some(TerminalOutput {
-        stdout,
-        stderr,
-        exit_code,
-        task_id,
-        status,
-    })
-}
-
-/// Print terminal output in human-friendly format.
-fn print_terminal_output(output: &TerminalOutput, duration_ms: u128) {
-    // Background task
-    if let Some(ref task_id) = output.task_id
-        && output.status.as_deref() == Some("running")
-    {
-        println!("\x1b[33m⏳ Background task started:\x1b[0m {task_id}");
-        return;
+        Some(CommandOutcome::Killed { task_id, .. }) => {
+            print!("\x1b[31m✗ Killed task {task_id}:\x1b[0m ");
+        }
+        _ => print!("\x1b[90m"),
     }
-
-    // Success indicator
-    if output.exit_code == 0 {
-        print!("\x1b[90m");
-    } else {
-        print!("\x1b[31m✗ Exit code {}:\x1b[0m ", output.exit_code);
-    }
-
-    // Duration
     println!("({duration_ms}ms)\x1b[0m");
 
-    // Show stdout
-    if let Some(ref stdout) = output.stdout {
-        let truncated = truncate_output(stdout, 2000);
-        let lines: Vec<&str> = truncated.lines().collect();
-        let max_lines = 20;
-
-        for line in lines.iter().take(max_lines) {
-            println!("  {line}");
-        }
-        if lines.len() > max_lines {
-            println!(
-                "  \x1b[90m... ({} more lines)\x1b[0m",
-                lines.len() - max_lines
-            );
-        }
+    let text = result.render_for_model();
+    let truncated = truncate_output(&text, 2000);
+    let lines: Vec<&str> = truncated.lines().collect();
+    let max_lines = 20;
+    for line in lines.iter().take(max_lines) {
+        println!("  {line}");
     }
-
-    // Show stderr if present
-    if let Some(ref stderr) = output.stderr {
-        println!("\x1b[31m  stderr:\x1b[0m");
-        let truncated = truncate_output(stderr, 500);
-        for line in truncated.lines().take(5) {
-            println!("  \x1b[31m{line}\x1b[0m");
-        }
+    if lines.len() > max_lines {
+        println!(
+            "  \x1b[90m... ({} more lines)\x1b[0m",
+            lines.len() - max_lines
+        );
     }
 }
 
