@@ -480,9 +480,12 @@ struct WorktreeGit {
     common_dir: PathBuf,
 }
 
+/// `path` resolved to its canonical form, without the Windows verbatim
+/// (`\\?\`) prefix, which git and other tools given these paths cannot read.
 pub async fn canonical(path: &Path) -> Result<PathBuf, SubagentGrantError> {
     async_fs::canonicalize(path)
         .await
+        .map(|canonical| dunce::simplified(&canonical).to_path_buf())
         .map_err(|source| SubagentGrantError::Inspect {
             path: path.to_path_buf(),
             source,
@@ -892,7 +895,7 @@ pub mod tests {
         grant: &SubagentGrant,
         history: &mut LaunchHistory,
     ) -> Result<ResolvedGrant, SubagentGrantError> {
-        let writable = [std::fs::canonicalize(root).unwrap()];
+        let writable = [dunce::canonicalize(root).unwrap()];
         let spaces_root = writable[0].join("subagent-spaces");
         grant
             .resolve(
@@ -917,7 +920,7 @@ pub mod tests {
         )
         .await
         .expect("a worktree on a namespaced branch can be granted commit");
-        let common = std::fs::canonicalize(dir.path().join("repository/.git")).unwrap();
+        let common = dunce::canonicalize(dir.path().join("repository/.git")).unwrap();
         let writable = &resolved.writable;
         assert!(writable.contains(&common.join("refs/heads/subagent/alpha")));
         assert!(writable.contains(&common.join("objects/ab")));
@@ -1049,7 +1052,7 @@ pub mod tests {
             ],
         );
         git_in(&decoy, &["update-ref", "HEAD", signed.as_str()]);
-        let decoy_git = std::fs::canonicalize(decoy.join(".git")).unwrap();
+        let decoy_git = dunce::canonicalize(decoy.join(".git")).unwrap();
         let worktree_git = &resolved.committing[0].git_dir;
         std::fs::write(
             worktree.join(".git"),

@@ -12,6 +12,7 @@ keywords = ["ai", "agent", "llm", "planning"]
 categories = ["api-bindings"]
 
 [dependencies]
+dunce = { version = "1.0.5", default-features = false }
 aither-core.workspace = true
 aither-attachments.workspace = true
 aither-sandbox.workspace = true

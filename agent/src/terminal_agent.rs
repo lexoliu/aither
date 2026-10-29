@@ -285,10 +285,15 @@ where
             crate::AgentError::Config(path_error_text(prefix.as_str(), path, &error))
         })?;
 
-        fs::canonicalize(path).await.map_err(|error| {
-            let prefix = join_text(&["failed to canonicalize ", kind, " directory '"]);
-            crate::AgentError::Config(path_error_text(prefix.as_str(), path, &error))
-        })
+        fs::canonicalize(path)
+            .await
+            // Without the Windows verbatim prefix, so these roots compare with
+            // the canonical paths subagent grants resolve.
+            .map(|canonical| dunce::simplified(&canonical).to_path_buf())
+            .map_err(|error| {
+                let prefix = join_text(&["failed to canonicalize ", kind, " directory '"]);
+                crate::AgentError::Config(path_error_text(prefix.as_str(), path, &error))
+            })
     }
 
     async fn register_readable_dir(

@@ -6549,7 +6549,7 @@ mod tests {
             .expect("an empty grant is always given");
         // The acceptance container does not really mount the host workspace,
         // so the subagent's space is created inside it too.
-        let root = std::fs::canonicalize(dir.path()).expect("workspace root should resolve");
+        let root = dunce::canonicalize(dir.path()).expect("workspace root should resolve");
         let space = child
             .working_dir()
             .strip_prefix(&root)
@@ -6736,7 +6736,7 @@ mod tests {
         assert!(
             child
                 .working_dir()
-                .starts_with(std::fs::canonicalize(dir.path()).unwrap())
+                .starts_with(dunce::canonicalize(dir.path()).unwrap())
         );
         assert_ne!(child.working_dir(), parent.working_dir());
         assert_eq!(
@@ -6822,10 +6822,7 @@ mod tests {
         let commits = ledger.since(&mark).await.expect("commits can be listed");
         assert_eq!(commits.len(), 1, "{commits:?}");
         assert_eq!(commits[0].subject, "authorized");
-        assert_eq!(
-            commits[0].worktree,
-            std::fs::canonicalize(&worktree).unwrap()
-        );
+        assert_eq!(commits[0].worktree, dunce::canonicalize(&worktree).unwrap());
     }
 
     #[cfg(unix)]
@@ -7185,7 +7182,7 @@ mod tests {
         );
         assert!(sub.contains("\"$MAY_IPC_BIN\" run --working-dir"), "{sub}");
         assert!(!sub.contains("--isolation permissive"), "{sub}");
-        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
         let space = child
             .working_dir()
             .strip_prefix(&root)
