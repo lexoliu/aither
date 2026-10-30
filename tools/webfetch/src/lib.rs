@@ -165,6 +165,10 @@ pub struct FetchContext {
     budget: Duration,
     /// Per-stage traces in execution order.
     pub trace: Vec<StageTrace>,
+    /// When set, `elapsed` reports this instead of the wall clock, so a test
+    /// decides exactly when the budget runs out.
+    #[cfg(test)]
+    frozen_elapsed: Option<Duration>,
 }
 
 impl FetchContext {
@@ -174,11 +178,17 @@ impl FetchContext {
             started_at: Instant::now(),
             budget,
             trace: Vec::new(),
+            #[cfg(test)]
+            frozen_elapsed: None,
         }
     }
 
     #[must_use]
     pub fn elapsed(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(frozen) = self.frozen_elapsed {
+            return frozen;
+        }
         self.started_at.elapsed()
     }
 
@@ -1582,12 +1592,18 @@ description: Example
         }
     }
 
+    fn frozen_ctx(budget: Duration) -> FetchContext {
+        let mut ctx = FetchContext::new(budget);
+        ctx.frozen_elapsed = Some(Duration::ZERO);
+        ctx
+    }
+
     #[tokio::test]
     async fn fallback2_falls_back_only_on_http_failure() {
         let first_calls = Arc::new(AtomicUsize::new(0));
         let second_calls = Arc::new(AtomicUsize::new(0));
         let request = FetchRequest::new("https://example.com");
-        let mut ctx = FetchContext::new(Duration::from_secs(1));
+        let mut ctx = frozen_ctx(Duration::from_secs(1));
 
         let first = MockFetcher {
             name: "first",
@@ -1620,7 +1636,7 @@ description: Example
         let first_calls = Arc::new(AtomicUsize::new(0));
         let second_calls = Arc::new(AtomicUsize::new(0));
         let request = FetchRequest::new("https://example.com");
-        let mut ctx = FetchContext::new(Duration::from_secs(1));
+        let mut ctx = frozen_ctx(Duration::from_secs(1));
 
         let first = MockFetcher {
             name: "first",
@@ -1646,6 +1662,45 @@ description: Example
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 0);
         assert_eq!(ctx.trace.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_stops_when_pipeline_deadline_is_exhausted() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let request = FetchRequest::new("https://example.com");
+        let mut ctx = FetchContext::new(Duration::from_secs(1));
+        ctx.frozen_elapsed = Some(Duration::from_secs(2));
+
+        let first = MockFetcher {
+            name: "first",
+            calls: Arc::clone(&first_calls),
+            result: Err(ProviderErrorKind::HttpFailure),
+        };
+        let second = MockFetcher {
+            name: "second",
+            calls: Arc::clone(&second_calls),
+            result: Ok(markdown_to_result(
+                "https://example.com",
+                "# second".to_string(),
+                Some("text/markdown".to_string()),
+                None,
+                None,
+            )),
+        };
+
+        let chain = Fallback2::new(first, second);
+        let err = chain.fetch(&request, &mut ctx).await.unwrap_err();
+
+        assert!(err.is_http_failure());
+        assert_eq!(first_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ctx.trace.len(), 2);
+        assert!(
+            ctx.trace
+                .iter()
+                .all(|t| t.message.as_deref() == Some("pipeline deadline exhausted"))
+        );
     }
 
     #[test]
