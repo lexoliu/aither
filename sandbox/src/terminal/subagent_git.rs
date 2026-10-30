@@ -114,28 +114,39 @@ fn borrowed_object_stores(repository: &Path) -> Vec<PathBuf> {
 }
 
 impl<E: Executor + Clone + 'static> LocalGit<E> {
+    /// The worktree the repository answers to: the committing grant knows
+    /// which worktree holds the `.git` file that names it. `git` enters the
+    /// worktree — the subagent's authorized space — and discovers the
+    /// repository through that file, opening only paths the grants cover.
+    fn enter<'a>(&'a self, repository: &'a Path) -> &'a Path {
+        self.committing
+            .iter()
+            .find(|granted| canonical(repository).parent() == Some(&*canonical(granted.git_dir())))
+            .map_or(repository, CommittingWorktree::worktree)
+    }
+
     /// The sandbox the export's git runs in, and the program it launches:
     /// the host's resolved `git`, falling back to a bare `git` when the host
     /// itself cannot find one — the error then is the launch's to report.
-    /// The working directory is the git binary's own, which is granted and
-    /// canonically spelled — a directory the subagent spells may resolve to a
-    /// differently-spelled object, and git refuses to start where it cannot
-    /// read the current directory. The repository is granted read beside the
-    /// subagent's grants: it lives inside the main worktree's git directory,
-    /// outside them. So are the pieces of the main repository the export's
-    /// reads resolve to — the object store its alternates name and the
-    /// configuration its own includes — spelled exactly, because a directory
-    /// grant would open everything beneath it. The working directory is the
-    /// subagent's own space: a sandbox makes it writable but denies exec
-    /// beneath it, so it is never the git binary's directory — and writable
-    /// alone does not make it readable on Windows, where git's check that it
-    /// can read its own directory needs the read granted beside it.
-    async fn sandbox(&self, repository: &Path) -> Result<(Sandbox, String), ExportError> {
+    /// The working directory is the worktree the run enters: it lives inside
+    /// the subagent's authorized space, and a sandbox denies exec beneath a
+    /// working directory, so the git binary's own directory could never be
+    /// chosen. The repository is granted read beside the subagent's grants:
+    /// it lives inside the main worktree's git directory, outside them. So
+    /// are the pieces of the main repository the export's reads resolve to —
+    /// the object store its alternates name and the configuration its own
+    /// includes — spelled exactly, because a directory grant would open
+    /// everything beneath it.
+    async fn sandbox(
+        &self,
+        repository: &Path,
+        enter: &Path,
+    ) -> Result<(Sandbox, String), ExportError> {
         let git = host_git_binary();
         let config =
             SandboxConfig::builder()
                 .network(DenyAll)
-                .working_dir(canonical(&self.working_dir))
+                .working_dir(canonical(enter))
                 .grants(
                     self.writable
                         .iter()
@@ -200,31 +211,16 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
     }
 
     async fn run_in_sandbox(&self, run: SandboxedRun<'_>) -> Result<SandboxedExit, ExportError> {
-        let (sandbox, program) = self.sandbox(run.repository).await?;
+        let enter = self.enter(run.repository);
+        let (sandbox, program) = self.sandbox(run.repository, enter).await?;
         let child = sandbox
             .command(program)
-            // `-C` lets git discover the repository through the worktree's
-            // `.git` file: entering the repository itself would have git
-            // re-resolve its own path, checking access on every component —
-            // more than the traverse the sandbox grants ancestors — where
-            // discovery opens only paths inside the grants. The worktree is
-            // the committing grant's: its ancestors are granted for real.
-            .arg("-C")
-            .arg(
-                &*canonical(
-                    self.committing
-                        .iter()
-                        .find(|granted| {
-                            canonical(run.repository).parent()
-                                == Some(&*canonical(granted.git_dir()))
-                        })
-                        .map_or(run.repository, CommittingWorktree::worktree),
-                )
-                .to_string_lossy(),
-            )
             .args(run.args)
             .env("HOME", self.working_dir.to_string_lossy())
-            .env("GIT_TRACE", "1")
+            // Git reports its working directory through `PWD` when it matches
+            // `.`: resolving it by syscall would walk every ancestor for the
+            // read a sandbox grants only to the leaves it names.
+            .env("PWD", canonical(enter).to_string_lossy())
             .stdin(StdioConfig::Piped)
             .stdout(StdioConfig::Piped)
             .stderr(StdioConfig::Piped)
