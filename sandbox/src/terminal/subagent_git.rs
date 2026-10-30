@@ -16,7 +16,9 @@ use heel::{
 use super::{ContainerConfinement, prioritized_container_script};
 use crate::MountRoot;
 use crate::shell_session::{ContainerExecOutcome, ShellSessionRegistry};
-use crate::subagent::{ExportError, SandboxedExit, SandboxedGitImpl, SandboxedRun};
+use crate::subagent::{
+    CommittingWorktree, ExportError, SandboxedExit, SandboxedGitImpl, SandboxedRun,
+};
 
 /// How much of what a command printed on stderr is kept for a message.
 const STDERR_KEPT: usize = 8 * 1024;
@@ -52,6 +54,9 @@ pub(super) struct LocalGit<E> {
     pub working_dir: PathBuf,
     pub writable: Vec<PathBuf>,
     pub readable: Vec<PathBuf>,
+    /// The worktrees the subagent may commit in, to find the worktree a
+    /// repository answers to.
+    pub committing: Vec<CommittingWorktree>,
     pub priority: ProcessPriority,
 }
 
@@ -96,18 +101,6 @@ fn canonical(path: &std::path::Path) -> PathBuf {
         .to_str()
         .and_then(|spelled| spelled.strip_prefix(r"\\?\"))
         .map_or_else(|| resolved.clone(), PathBuf::from)
-}
-
-/// The worktree the repository answers to, spelled for git: the sibling
-/// `gitdir` file records `<worktree>/.git`, whose parent is the worktree
-/// root. Git enters it — its ancestors are granted for real, where the
-/// repository's are only traversable — and discovers the repository through
-/// the worktree's `.git` file, opening only paths the grants cover.
-fn worktree(repository: &Path) -> Option<PathBuf> {
-    repository
-        .parent()
-        .and_then(|dir| std::fs::read_to_string(dir.join("gitdir")).ok())
-        .and_then(|link| PathBuf::from(link.trim()).parent().map(Path::to_path_buf))
 }
 
 /// The object stores the repository borrows through its
@@ -202,13 +195,15 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
             // `.git` file: entering the repository itself would have git
             // re-resolve its own path, checking access on every component —
             // more than the traverse the sandbox grants ancestors — where
-            // discovery opens only paths inside the grants.
+            // discovery opens only paths inside the grants. The worktree is
+            // the committing grant's: its ancestors are granted for real.
             .arg("-C")
             .arg(
                 &*canonical(
-                    worktree(run.repository)
-                        .as_deref()
-                        .unwrap_or(run.repository),
+                    self.committing
+                        .iter()
+                        .find(|granted| run.repository.parent() == Some(granted.git_dir()))
+                        .map_or(run.repository, CommittingWorktree::worktree),
                 )
                 .to_string_lossy(),
             )

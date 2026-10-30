@@ -1936,6 +1936,7 @@ where
                 working_dir: space.clone(),
                 writable: granted.writable.clone(),
                 readable: readable_paths.clone(),
+                committing: granted.committing.clone(),
                 priority: self.priority,
             })),
         };
