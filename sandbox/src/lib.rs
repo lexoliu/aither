@@ -132,9 +132,8 @@ pub use terminal::{
     DEFAULT_SUBAGENT_IMPORT_LIMIT, DEFAULT_TIMEOUT_CAP, DirectoryReset, DirectoryResetReason,
     JobAlert, LongRunningJob, PermissionEvent, PermissionEventReceiver, PermissionEventStage,
     StartedBackgroundTask, StdinBlockedJob, StdinProbeFailedJob, TerminalArgs, TerminalBinding,
-    TerminalError,
-    TerminalExecutionMode, TerminalTool, TerminalToolFactory, TerminalToolFactoryError,
-    Unconfigured, background_task_channel, open_network_audit_log,
+    TerminalError, TerminalExecutionMode, TerminalTool, TerminalToolFactory,
+    TerminalToolFactoryError, Unconfigured, background_task_channel, open_network_audit_log,
 };
 pub use tool_distribution::{
     HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,
