@@ -190,13 +190,13 @@ fn truncate_title(text: &str) -> String {
 
 /// Format a human-readable title for a tool call.
 ///
-/// Covers `terminal` and its control tools (`terminal_background`,
-/// `terminal_kill`, `terminal_input`, `terminal_read`), the host-mediated `ask_user` and `request_workspace`
+/// Covers `terminal` and its control tools (`terminal_kill`,
+/// `terminal_input`, `terminal_read`), the host-mediated `ask_user` and `request_workspace`
 /// tools, and `subagent`. Every other capability is a CLI command executed
 /// through `terminal` and gets the generic title.
 fn format_tool_title(name: &str, arguments: &str) -> String {
     match name {
-        "terminal" | "terminal_background" => {
+        "terminal" => {
             if let Ok(args) = serde_json::from_str::<aither_agent::sandbox::TerminalArgs>(arguments)
                 && !args.description.is_empty()
             {
@@ -271,9 +271,7 @@ fn format_tool_title(name: &str, arguments: &str) -> String {
 /// Infer the tool kind from the tool name.
 fn infer_tool_kind(name: &str) -> ToolKind {
     match name {
-        "terminal" | "terminal_background" | "terminal_kill" | "terminal_input" => {
-            ToolKind::Execute
-        }
+        "terminal" | "terminal_kill" | "terminal_input" => ToolKind::Execute,
         "terminal_read" => ToolKind::Read,
         _ => ToolKind::Other,
     }

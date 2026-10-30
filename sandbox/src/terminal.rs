@@ -57,8 +57,8 @@ use crate::{
     },
     job_registry::{JobRegistry, JobStatus, job_registry_channel},
     output::{
-        INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, empty_stream,
-        save_raw_to_file, stored_path,
+        INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, save_raw_to_file,
+        stored_path,
     },
     permission::{PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode},
     process_tree::{JobMarker, JobProcess, JobTree},
@@ -377,10 +377,16 @@ async fn ensure_mode_allowed<P: PermissionHandler>(
 /// ## Execution Modes
 ///
 /// Each call selects its own runtime mode and starts a fresh shell; only a
-/// successful `cd` carries over to the next call.
-/// A call runs in the foreground and is killed — with its whole process
-/// tree — after 10 seconds. Run long-running commands with
-/// `terminal_background`, which takes an explicit job timeout.
+/// successful `cd` carries over to the next call. `timeout` is required:
+/// it is the job's maximum runtime in seconds — the job and its process
+/// tree are killed when it passes — and it may be at most 120 minutes.
+///
+/// By default the call waits in the foreground for up to 10 seconds. A
+/// command still running then **promotes to a background task**: the call
+/// returns the task id and the output captured so far, and the job keeps
+/// running under its `timeout` bound. Manage it with `terminal_read`
+/// (incremental output), `terminal_input` (stdin) and `terminal_kill`.
+/// Set `background: true` to detach immediately instead of waiting.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TerminalArgs {
     /// Short human-readable explanation of what this command is doing.
@@ -424,9 +430,9 @@ pub struct TerminalArgs {
     /// Maximum number of output lines to include inline.
     /// For foreground executions, this is the inline line budget
     /// before output offloads to file.
-    /// For background executions started with `terminal_background`, only
-    /// the first `max_lines` are returned immediately, while full output is
-    /// redirected to file.
+    /// For executions detached with `background: true` or promoted past
+    /// the foreground window, only the first `max_lines` are returned
+    /// immediately, while full output is redirected to file.
     /// Clamped to 800 max.
     /// Default: 200.
     #[serde(default = "default_max_lines")]
@@ -437,27 +443,18 @@ pub struct TerminalArgs {
     /// (checksums, binary protocols, diff inputs). Default: false.
     #[serde(default)]
     pub raw: bool,
-}
 
-/// Run a terminal command as a background job.
-///
-/// The command starts detached and this call returns immediately with the
-/// job's task id; `terminal` only runs commands in the foreground and kills
-/// them after 10 seconds. Use `terminal_read` for incremental output,
-/// `terminal_input` for stdin, and `terminal_kill` to stop the job early.
-///
-/// `timeout` is the job's maximum runtime in seconds: the job and its
-/// process tree are killed when it passes, and it may be at most 120
-/// minutes. To wait longer than that, schedule a wake-up (cron) rather than
-/// starting a longer job.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct TerminalBackgroundArgs {
-    /// Every argument a foreground `terminal` call takes.
-    #[serde(flatten)]
-    pub terminal: TerminalArgs,
-    /// Maximum runtime of the background job in seconds. The job is killed
-    /// when it passes. At most 7200 (120 minutes).
+    /// Maximum runtime of the command in seconds. Required. The command and
+    /// its process tree are killed when it passes; the value may be at most
+    /// 7200 (120 minutes).
     pub timeout: u64,
+
+    /// Start the command detached and return immediately with its task id
+    /// instead of waiting in the foreground. Default: false — the call
+    /// waits up to the foreground window and promotes a still-running
+    /// command to a background task.
+    #[serde(default)]
+    pub background: bool,
 }
 
 /// Requested terminal execution backend.
@@ -481,21 +478,22 @@ const fn default_max_lines() -> u32 {
 
 const MAX_LINES_CEILING: u32 = 800;
 
-/// How long a foreground `terminal` command may run before it is killed
-/// with its process tree.
-pub const DEFAULT_FOREGROUND_LIMIT: Duration = Duration::from_secs(10);
-/// Largest `timeout` a `terminal_background` job accepts.
-pub const DEFAULT_BACKGROUND_TIMEOUT_CAP: Duration = Duration::from_secs(120 * 60);
+/// How long a `terminal` call waits in the foreground before a still-running
+/// command promotes to a background task.
+pub const DEFAULT_FOREGROUND_WAIT: Duration = Duration::from_secs(10);
+/// Largest `timeout` a command accepts.
+pub const DEFAULT_TIMEOUT_CAP: Duration = Duration::from_secs(120 * 60);
 /// A background job still running after this long produces one system alert.
 pub const DEFAULT_LONG_JOB_ALERT_AFTER: Duration = Duration::from_secs(40 * 60);
 
 /// Time bounds applied to every execution this terminal spawns.
 #[derive(Debug, Clone, Copy)]
 struct TerminalLimits {
-    /// Foreground kill limit for `terminal` calls.
-    foreground: Duration,
-    /// Maximum accepted `timeout` for `terminal_background` jobs.
-    background_timeout_cap: Duration,
+    /// Foreground wait before a `terminal` call promotes to a background
+    /// task.
+    foreground_wait: Duration,
+    /// Maximum accepted `timeout` for a command.
+    timeout_cap: Duration,
     /// Runtime after which a background job produces a long-running alert.
     long_job_alert: Duration,
 }
@@ -503,8 +501,8 @@ struct TerminalLimits {
 impl Default for TerminalLimits {
     fn default() -> Self {
         Self {
-            foreground: DEFAULT_FOREGROUND_LIMIT,
-            background_timeout_cap: DEFAULT_BACKGROUND_TIMEOUT_CAP,
+            foreground_wait: DEFAULT_FOREGROUND_WAIT,
+            timeout_cap: DEFAULT_TIMEOUT_CAP,
             long_job_alert: DEFAULT_LONG_JOB_ALERT_AFTER,
         }
     }
@@ -648,7 +646,8 @@ impl From<CompletedCommand> for CommandResult {
     }
 }
 
-/// A background job that has just been started by `terminal_background`.
+/// A job `terminal` has just detached as a background task — started with
+/// `background: true` or promoted past the foreground window.
 ///
 /// Sent through the terminal's started-task channel once per launched job;
 /// the agent turns it into a durable reminder and a `background_task_started`
@@ -846,8 +845,8 @@ impl BackgroundTaskReceiver {
 
     /// Takes all freshly started background tasks without blocking.
     ///
-    /// Each entry names a job `terminal_background` has just launched; a job
-    /// produces exactly one.
+    /// Each entry names a job `terminal` has just detached; a job produces
+    /// exactly one.
     #[must_use]
     pub fn take_started(&self) -> Vec<StartedBackgroundTask> {
         let mut started = Vec::new();
@@ -1668,19 +1667,20 @@ where
         Ok(self)
     }
 
-    /// Sets how long a foreground `terminal` command may run before it is
-    /// killed with its process tree. Defaults to [`DEFAULT_FOREGROUND_LIMIT`].
+    /// Sets how long a `terminal` call waits in the foreground before a
+    /// still-running command promotes to a background task. Defaults to
+    /// [`DEFAULT_FOREGROUND_WAIT`].
     #[must_use]
-    pub const fn with_foreground_limit(mut self, limit: Duration) -> Self {
-        self.limits.foreground = limit;
+    pub const fn with_foreground_wait(mut self, wait: Duration) -> Self {
+        self.limits.foreground_wait = wait;
         self
     }
 
-    /// Sets the largest `timeout` a `terminal_background` job accepts.
-    /// Defaults to [`DEFAULT_BACKGROUND_TIMEOUT_CAP`].
+    /// Sets the largest `timeout` a command accepts.
+    /// Defaults to [`DEFAULT_TIMEOUT_CAP`].
     #[must_use]
-    pub const fn with_background_timeout_cap(mut self, cap: Duration) -> Self {
-        self.limits.background_timeout_cap = cap;
+    pub const fn with_timeout_cap(mut self, cap: Duration) -> Self {
+        self.limits.timeout_cap = cap;
         self
     }
 
@@ -2040,11 +2040,7 @@ where
             .prepared_catalog()
             .expect("terminal tools must be initialized before exposing child capabilities")
             .clone();
-        let background_tool = self.background_tool();
-        let entries = vec![
-            erase_terminal_tool(self),
-            erase_terminal_tool(background_tool),
-        ];
+        let entries = vec![erase_terminal_tool(self)];
 
         DynTerminalTool {
             entries,
@@ -2199,18 +2195,22 @@ where
             max_lines,
             raw,
             background,
+            timeout,
             carry,
         } = request;
         let ExecutionTarget { mode, backend } = target;
         let (result_tx, result_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
-        // A foreground command reads EOF from a null stdin; only a background
-        // job gets a stdin pipe, fed through `terminal_input` and watched.
-        let stdin_alerts = background.then(|| StdinAlerts {
+        // Every job gets a real stdin pipe: a foreground command that blocks
+        // on it promotes to a background task the model can feed through
+        // `terminal_input`, and a blocked episode raises an alert.
+        let stdin_alerts = Some(StdinAlerts {
             tx: self.alert_tx.clone(),
             task_id: task_id.clone(),
             script: script.clone(),
         });
+        self.spawn_kill_watchdog(&task_id, timeout);
+        self.spawn_long_job_alert(&task_id);
 
         let lifetime = if background {
             JobLifetime::Background
@@ -2280,8 +2280,22 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         arguments: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
+        let cap = self.limits.timeout_cap;
+        let timeout = Duration::from_secs(arguments.timeout);
+        if arguments.timeout == 0 || timeout > cap {
+            return Err(anyhow::anyhow!(
+                "terminal timeout must be between 1 and {} seconds",
+                cap.as_secs()
+            ));
+        }
         let prepared = self.prepare_execution(&arguments).await?;
-        let carry = self.cwd_carry(&prepared, &arguments.script).await;
+        // A detached job cannot report a directory carry: its final
+        // directory is unknowable when the call returns.
+        let carry = if arguments.background {
+            None
+        } else {
+            self.cwd_carry(&prepared, &arguments.script).await
+        };
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
             task_id: prepared.task_id.clone(),
@@ -2291,14 +2305,26 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             resolution: arguments.resolution,
             max_lines: prepared.max_lines,
             raw: arguments.raw,
-            background: false,
+            background: arguments.background,
+            timeout,
             carry: carry.clone(),
         });
         // Registration precedes `report_ready` on every backend, so once
         // startup returns the job is killable through the registry and the
         // foreground clock only measures the command's own runtime.
         wait_for_background_startup(&spawned.startup).await?;
-        let outcome = wait_for_foreground_result(&spawned.result, self.limits.foreground).await;
+        if arguments.background {
+            return background_terminal_result(
+                &self.job_registry,
+                &prepared.store_dir,
+                &prepared.task_id,
+                prepared.max_lines,
+                &self.started_tx,
+            )
+            .await;
+        }
+        let outcome =
+            wait_for_foreground_result(&spawned.result, self.limits.foreground_wait).await;
         if let Some(carry) = &carry {
             let succeeded = matches!(&outcome, Some(Ok(result)) if result.exit_code == 0);
             self.record_carried_dir(carry, succeeded).await;
@@ -2307,8 +2333,23 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             Some(Ok(result)) => CommandResult::from(result).into_tool_result(),
             Some(Err(err)) => Err(anyhow::anyhow!(err)),
             None => {
-                self.finish_killed_foreground(&spawned, &prepared.task_id)
-                    .await
+                // The command outlived its foreground window: promote it to a
+                // background task. A result that raced in at the window's
+                // edge is returned directly.
+                match spawned.result.try_recv() {
+                    Ok(Ok(result)) => CommandResult::from(result).into_tool_result(),
+                    Ok(Err(err)) => Err(anyhow::anyhow!(err)),
+                    Err(_) => {
+                        background_terminal_result(
+                            &self.job_registry,
+                            &prepared.store_dir,
+                            &prepared.task_id,
+                            prepared.max_lines,
+                            &self.started_tx,
+                        )
+                        .await
+                    }
+                }
             }
         }
     }
@@ -2489,16 +2530,27 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
 }
 
 impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool<P, E, Configured> {
-    /// Returns the `terminal_background` native tool that starts background
-    /// jobs on this terminal's sandbox and job registry.
-    #[must_use]
-    pub fn background_tool(&self) -> TerminalBackgroundTool<P, E> {
-        TerminalBackgroundTool {
-            terminal: self.clone(),
-        }
+    /// Runs `script` as a detached background job bounded by `timeout`, for
+    /// embedders that drive the terminal directly rather than through the
+    /// `terminal` tool schema. Shares [`Self::call`]'s `background: true`
+    /// path.
+    ///
+    /// # Errors
+    ///
+    /// Fails the way a `terminal` call does: an invalid `timeout`, a
+    /// refused permission, a blocked command or a spawn failure.
+    pub async fn run_background(&self, arguments: TerminalArgs) -> aither_core::Result<ToolResult> {
+        self.call(
+            TerminalArgs {
+                background: true,
+                ..arguments
+            },
+            ToolContext::new(),
+        )
+        .await
     }
 
-    /// Shared front half of `terminal` and `terminal_background`: argument
+    /// Shared front half of every `terminal` execution: argument
     /// validation, target resolution, permission and the spawned job's ids.
     async fn prepare_execution(
         &self,
@@ -2536,46 +2588,6 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
             store_dir: self.output_store.dir().to_path_buf(),
             max_lines: arguments.max_lines.min(MAX_LINES_CEILING) as usize,
         })
-    }
-
-    /// Starts `arguments` as a background job, arming its kill watchdog and
-    /// the long-running alert.
-    async fn run_background(
-        &self,
-        arguments: TerminalBackgroundArgs,
-    ) -> aither_core::Result<ToolResult> {
-        let cap = self.limits.background_timeout_cap;
-        let timeout = Duration::from_secs(arguments.timeout);
-        if arguments.timeout == 0 || timeout > cap {
-            return Err(anyhow::anyhow!(
-                "terminal_background timeout must be between 1 and {} seconds",
-                cap.as_secs()
-            ));
-        }
-        let prepared = self.prepare_execution(&arguments.terminal).await?;
-        let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
-            target: prepared.target,
-            task_id: prepared.task_id.clone(),
-            execution_id: prepared.execution_id,
-            script: arguments.terminal.script,
-            expect: arguments.terminal.expect,
-            resolution: arguments.terminal.resolution,
-            max_lines: prepared.max_lines,
-            raw: arguments.terminal.raw,
-            background: true,
-            carry: None,
-        });
-        wait_for_background_startup(&spawned.startup).await?;
-        self.spawn_kill_watchdog(&prepared.task_id, timeout);
-        self.spawn_long_job_alert(&prepared.task_id);
-        background_terminal_result(
-            &self.job_registry,
-            &prepared.store_dir,
-            &prepared.task_id,
-            prepared.max_lines,
-            &self.started_tx,
-        )
-        .await
     }
 
     /// Kills the job through the registry once its timeout passes.
@@ -2617,99 +2629,6 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
                 }
             })
             .detach();
-    }
-
-    /// Kills the registered job behind a foreground call whose limit expired
-    /// and shapes the killed result the model receives.
-    async fn finish_killed_foreground(
-        &self,
-        spawned: &SpawnedTerminal,
-        task_id: &str,
-    ) -> aither_core::Result<ToolResult> {
-        if !self.job_registry.kill_by_task_id(task_id).await
-            && let Ok(result) = spawned.result.try_recv()
-        {
-            // The command finished between the limit expiring and the kill.
-            return match result {
-                Ok(result) => CommandResult::from(result).into_tool_result(),
-                Err(err) => Err(anyhow::anyhow!(err)),
-            };
-        }
-        let notice = format!(
-            "Killed after running {}s in the foreground. Use terminal_background to run a command longer than that.",
-            self.limits.foreground.as_secs()
-        );
-        let partial = spawned.result.recv().await.ok().and_then(Result::ok);
-        let (stdout, stderr) = partial.map_or((empty_stream(), None), |partial| {
-            (partial.stdout, partial.stderr)
-        });
-        CommandResult {
-            stdout,
-            stderr,
-            outcome: CommandOutcome::Killed {
-                task_id: task_id.to_string(),
-                notice,
-            },
-        }
-        .into_tool_result()
-    }
-}
-
-/// Native tool that runs a command as a background job.
-///
-/// Wraps a configured [`TerminalTool`]: jobs share its sandbox, working
-/// directory and job registry. Created by [`TerminalTool::background_tool`]
-/// and registered next to `terminal`.
-pub struct TerminalBackgroundTool<P, E> {
-    terminal: TerminalTool<P, E, Configured>,
-}
-
-impl<P, E: Clone> Clone for TerminalBackgroundTool<P, E> {
-    fn clone(&self) -> Self {
-        Self {
-            terminal: self.terminal.clone(),
-        }
-    }
-}
-
-impl<P, E> std::fmt::Debug for TerminalBackgroundTool<P, E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TerminalBackgroundTool")
-            .finish_non_exhaustive()
-    }
-}
-
-impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
-    for TerminalBackgroundTool<P, E>
-{
-    fn name(&self) -> Cow<'static, str> {
-        "terminal_background".into()
-    }
-
-    fn description(&self) -> Cow<'static, str> {
-        format!(
-            "Run a terminal command as a background job, detached from the \
-             foreground call. Returns immediately with the job's task id; use \
-             terminal_read for incremental output, terminal_input for stdin, \
-             and terminal_kill to stop the job early. The required `timeout` \
-             (seconds) is the job's maximum runtime — it and its process tree \
-             are killed when it passes — and may be at most {} minutes. To \
-             wait longer than that, schedule a wake-up (cron) rather than \
-             starting a longer job.",
-            self.terminal.limits.background_timeout_cap.as_secs() / 60
-        )
-        .into()
-    }
-
-    type Arguments = TerminalBackgroundArgs;
-    type Res = ToolResult;
-
-    async fn call(
-        &self,
-        arguments: Self::Arguments,
-        _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
-        self.terminal.run_background(arguments).await
     }
 }
 
@@ -2979,6 +2898,7 @@ struct TerminalSpawnRequest {
     max_lines: usize,
     raw: bool,
     background: bool,
+    timeout: Duration,
     carry: Option<CwdCarry>,
 }
 
@@ -3090,15 +3010,16 @@ where
         Err(err) => Err(err.to_string()),
     };
     let _ = result_tx.send(quick_result).await;
-    if background {
-        let _ = completed_tx
-            .send(CompletedTask {
-                task_id,
-                script,
-                result,
-            })
-            .await;
-    }
+    // Every job reports completion; the agent reinjects the result only for
+    // tasks it saw promoted or detached (`take_started`), so a plain
+    // foreground result is not delivered twice.
+    let _ = completed_tx
+        .send(CompletedTask {
+            task_id,
+            script,
+            result,
+        })
+        .await;
     running_tasks.fetch_sub(1, Ordering::AcqRel);
 }
 
@@ -5127,6 +5048,7 @@ mod tests {
     use crate::ToolRegistryBuilder;
     #[cfg(unix)]
     use crate::builtin::{InputTerminalArgs, InputTerminalTool};
+    use crate::output::empty_stream;
     #[cfg(unix)]
     use heel::DenyAll;
     use heel::NiceLevel;
@@ -5325,6 +5247,8 @@ mod tests {
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
                     raw: true,
+                    timeout: 30,
+                    background: false,
                 },
                 ToolContext::new(),
             )
@@ -5589,12 +5513,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_args_defaults() {
-        let args: TerminalArgs =
-            serde_json::from_str(r#"{"description":"print a greeting","script":"echo hello"}"#)
-                .unwrap();
+        let args: TerminalArgs = serde_json::from_str(
+            r#"{"description":"print a greeting","script":"echo hello","timeout":30}"#,
+        )
+        .unwrap();
         assert_eq!(args.expect, OutputFormat::Text);
         assert_eq!(args.resolution, MediaResolution::Auto);
         assert_eq!(args.mode, TerminalExecutionMode::Default);
+        assert!(!args.background);
     }
 
     #[test]
@@ -5663,15 +5589,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_terminal_background_args_parsing() {
-        let args: TerminalBackgroundArgs = serde_json::from_str(
-            r#"{"description":"sleep in background","script":"sleep 5","timeout":30}"#,
+    async fn test_terminal_args_parsing() {
+        let args: TerminalArgs = serde_json::from_str(
+            r#"{"description":"sleep in background","script":"sleep 5","timeout":30,"background":true}"#,
         )
         .unwrap();
         assert_eq!(args.timeout, 30);
-        assert_eq!(args.terminal.script, "sleep 5");
+        assert_eq!(args.script, "sleep 5");
+        assert!(args.background);
 
-        let missing_timeout = serde_json::from_str::<TerminalBackgroundArgs>(
+        let missing_timeout = serde_json::from_str::<TerminalArgs>(
             r#"{"description":"sleep in background","script":"sleep 5"}"#,
         )
         .unwrap_err();
@@ -5684,10 +5611,16 @@ mod tests {
     }
 
     #[test]
-    fn terminal_background_args_schema_inlines_terminal_fields() {
-        let schema = serde_json::to_value(schemars::schema_for!(TerminalBackgroundArgs)).unwrap();
+    fn terminal_args_schema_lists_required_fields() {
+        let schema = serde_json::to_value(schemars::schema_for!(TerminalArgs)).unwrap();
         let properties = schema["properties"].as_object().expect("object schema");
-        for field in ["description", "script", "timeout", "max_lines"] {
+        for field in [
+            "description",
+            "script",
+            "timeout",
+            "max_lines",
+            "background",
+        ] {
             assert!(
                 properties.contains_key(field),
                 "{field} missing from schema {schema}"
@@ -5700,6 +5633,10 @@ mod tests {
                 "{field} not required in {schema}"
             );
         }
+        assert!(
+            !required.iter().any(|name| name == "background"),
+            "background must not be required in {schema}"
+        );
     }
 
     /// The tools bin directory a container execution passes to the wrapper.
@@ -6083,7 +6020,7 @@ mod tests {
             .map(|entry| entry.definition.name().to_string())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["terminal", "terminal_background"]);
+        assert_eq!(names, vec!["terminal"]);
     }
 
     async fn query_control(
@@ -6125,23 +6062,18 @@ mod tests {
             .expect("an empty grant is always given");
 
         let result = child
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: TerminalArgs {
-                        description: "echo one stdin line then sleep".to_string(),
-                        script: "read line; printf 'got %s\\n' \"$line\"; sleep 30".to_string(),
-                        mode: TerminalExecutionMode::Sandboxed,
-                        ssh_server_id: None,
-                        expect: OutputFormat::Text,
-                        resolution: MediaResolution::Auto,
-                        max_lines: 50,
-                        raw: false,
-                    },
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                description: "echo one stdin line then sleep".to_string(),
+                script: "read line; printf 'got %s\\n' \"$line\"; sleep 30".to_string(),
+                mode: TerminalExecutionMode::Sandboxed,
+                ssh_server_id: None,
+                expect: OutputFormat::Text,
+                resolution: MediaResolution::Auto,
+                max_lines: 50,
+                raw: false,
+                timeout: 30,
+                background: true,
+            })
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
@@ -6329,6 +6261,8 @@ mod tests {
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
                     raw: false,
+                    timeout: 30,
+                    background: false,
                 },
                 ToolContext::new(),
             )
@@ -6376,24 +6310,18 @@ mod tests {
         let input_tool = InputTerminalTool::new(tool.job_registry());
 
         let result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: TerminalArgs {
-                        description: "wait for terminal input and echo it back".to_string(),
-                        script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\""
-                            .to_string(),
-                        mode: TerminalExecutionMode::Sandboxed,
-                        ssh_server_id: None,
-                        expect: OutputFormat::Text,
-                        resolution: MediaResolution::Auto,
-                        max_lines: 50,
-                        raw: false,
-                    },
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                description: "wait for terminal input and echo it back".to_string(),
+                script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"".to_string(),
+                mode: TerminalExecutionMode::Sandboxed,
+                ssh_server_id: None,
+                expect: OutputFormat::Text,
+                resolution: MediaResolution::Auto,
+                max_lines: 50,
+                raw: false,
+                timeout: 30,
+                background: true,
+            })
             .await
             .expect("terminal call should succeed");
 
@@ -6454,23 +6382,18 @@ mod tests {
         let child_pid_path = dir.path().join("child.pid");
 
         let result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: TerminalArgs {
-                        description: "start a descendant process".to_string(),
-                        script: "sleep 30 & echo $! > child.pid; wait".to_string(),
-                        mode: TerminalExecutionMode::Sandboxed,
-                        ssh_server_id: None,
-                        expect: OutputFormat::Text,
-                        resolution: MediaResolution::Auto,
-                        max_lines: 50,
-                        raw: false,
-                    },
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                description: "start a descendant process".to_string(),
+                script: "sleep 30 & echo $! > child.pid; wait".to_string(),
+                mode: TerminalExecutionMode::Sandboxed,
+                ssh_server_id: None,
+                expect: OutputFormat::Text,
+                resolution: MediaResolution::Auto,
+                max_lines: 50,
+                raw: false,
+                timeout: 30,
+                background: true,
+            })
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
@@ -6509,19 +6432,22 @@ mod tests {
         panic!("descendant process {child_pid} survived terminal cancellation");
     }
 
+    /// A foreground command blocked on stdin sees no EOF: every job owns a
+    /// live stdin pipe, so at the foreground window the call promotes it to
+    /// a background task the model feeds through `terminal_input`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn foreground_command_reading_stdin_gets_eof_at_once() {
+    async fn foreground_command_blocked_on_stdin_promotes_at_the_window() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, tool) = configured_test_terminal(
             dir.path(),
-            Duration::from_secs(30),
+            Duration::from_secs(1),
             Duration::from_secs(60),
             Duration::from_secs(60),
         )
         .await;
+        let background_receiver = tool.background_receiver();
 
-        let started = std::time::Instant::now();
         let result = tool
             .call(
                 terminal_args("read all of stdin", "cat"),
@@ -6531,14 +6457,17 @@ mod tests {
             .expect("terminal call should succeed");
 
         let command = result.command().expect("terminal returns a command result");
+        let CommandOutcome::Running { task_id, .. } = &command.outcome else {
+            panic!(
+                "cat blocked on stdin must promote to a task, got {:?}",
+                command.outcome
+            );
+        };
+        assert_eq!(started_task_id(&background_receiver), *task_id);
+
         assert!(
-            matches!(command.outcome, CommandOutcome::Exited { code: 0 }),
-            "the call must exit 0, not be killed: {:?}",
-            command.outcome
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "cat must see EOF instead of waiting out the limit"
+            tool.job_registry().kill_by_task_id(task_id).await,
+            "the promoted task must still be running"
         );
     }
 
@@ -6553,6 +6482,8 @@ mod tests {
             resolution: MediaResolution::Auto,
             max_lines: 50,
             raw: false,
+            timeout: 30,
+            background: false,
         }
     }
 
@@ -6563,16 +6494,12 @@ mod tests {
         script: &str,
     ) -> String {
         let result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: terminal_args("background job", script),
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                background: true,
+                ..terminal_args("background job", script)
+            })
             .await
-            .expect("terminal_background should start the job");
+            .expect("terminal should start the job");
         match result.command().map(|command| &command.outcome) {
             Some(CommandOutcome::Running { task_id, .. }) => task_id.clone(),
             other => panic!("background job needs a task id, got {other:?}"),
@@ -6591,17 +6518,17 @@ mod tests {
         alerts
     }
 
-    /// A foreground container command must see stdin EOF at once: the input
-    /// sender is dropped before the exec runs. Catches the regression where
-    /// the sender lived until the call returned and `cat` waited out the
-    /// limit.
+    /// A foreground container command gets a live stdin pipe like every
+    /// other job: no EOF shortcut. The exec's stdin channel stays open and
+    /// its blocked watch channel is wired, so a reader can be fed through
+    /// `terminal_input` once the call promotes.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn container_foreground_command_reading_stdin_gets_eof_at_once() {
-        /// A container executor that asserts its stdin is already at EOF.
-        struct ForegroundStdinEofExec;
+    async fn container_foreground_command_gets_a_live_stdin_pipe() {
+        /// A container executor that asserts stdin is a watched live pipe.
+        struct ForegroundStdinPipeExec;
 
-        impl crate::ContainerExec for ForegroundStdinEofExec {
+        impl crate::ContainerExec for ForegroundStdinPipeExec {
             async fn exec(
                 &self,
                 _container_id: &str,
@@ -6636,15 +6563,16 @@ mod tests {
         let container_tools =
             crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle());
         let runtime = ContainerShellRuntime::new(
-            "aither-test-foreground-eof",
+            "aither-test-foreground-stdin",
             crate::ContainerIpcRoute::new(
                 "host.docker.internal",
                 crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
                     .expect("loopback binds the bridge"),
             ),
-            crate::AnyContainerExec::new(Arc::new(ForegroundStdinEofExec)),
+            crate::AnyContainerExec::new(Arc::new(ForegroundStdinPipeExec)),
         );
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
+        let (alert_tx, _alert_rx) = async_channel::unbounded();
         let (_pid, output) = execute_container_background(ContainerBackgroundExecution {
             executor: executor_core::tokio::TokioGlobal,
             registry: &registry,
@@ -6656,17 +6584,19 @@ mod tests {
             prepared_tools: &container_tools,
             ipc_commands: &[],
             job_registry: &job_registry,
-            stdin_alerts: None,
-            lifetime: JobLifetime::Foreground {
-                alerts: async_channel::unbounded().0,
-            },
+            stdin_alerts: Some(StdinAlerts {
+                tx: alert_tx.clone(),
+                task_id: "task-test".to_string(),
+                script: "cat".to_string(),
+            }),
+            lifetime: JobLifetime::Foreground { alerts: alert_tx },
             background_startup: &BackgroundStartup::new(startup_tx),
             priority: ProcessPriority::default(),
             confinement: None,
             carry: None,
         })
         .await
-        .expect("a foreground container exec should complete at EOF");
+        .expect("a foreground container exec should complete");
         assert_eq!(output.status.code(), Some(0));
     }
 
@@ -6773,8 +6703,8 @@ mod tests {
     #[cfg(unix)]
     async fn configured_test_terminal(
         dir: &Path,
-        foreground: Duration,
-        background_cap: Duration,
+        foreground_wait: Duration,
+        timeout_cap: Duration,
         alert_after: Duration,
     ) -> (
         tempfile::TempDir,
@@ -6791,16 +6721,20 @@ mod tests {
         .adopt_prepared_tools(shell_sessions)
         .await
         .expect("prepared tools should be adopted")
-        .with_foreground_limit(foreground)
-        .with_background_timeout_cap(background_cap)
+        .with_foreground_wait(foreground_wait)
+        .with_timeout_cap(timeout_cap)
         .with_long_job_alert_after(alert_after);
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
         (cache, tool.with_registry(registry))
     }
 
+    /// A foreground command still running at the window promotes to a
+    /// background task instead of dying; its `timeout` then kills it with
+    /// its descendants.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn foreground_command_still_running_at_the_limit_is_killed_with_descendants() {
+    async fn foreground_command_still_running_at_the_window_promotes_and_times_out_with_descendants()
+     {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, tool) = configured_test_terminal(
             dir.path(),
@@ -6809,6 +6743,7 @@ mod tests {
             Duration::from_secs(60),
         )
         .await;
+        let background_receiver = tool.background_receiver();
         let child_pid_path = dir.path().join("child.pid");
 
         let result = tool
@@ -6822,17 +6757,19 @@ mod tests {
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
                     raw: false,
+                    timeout: 3,
+                    background: false,
                 },
                 ToolContext::new(),
             )
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
-        assert!(rendered.contains("Task ID: '"), "{rendered}");
         assert!(
-            rendered.contains("terminal_background"),
-            "rendered result should point to terminal_background: {rendered}"
+            rendered.contains("Started in background as task '"),
+            "the still-running command must promote: {rendered}"
         );
+        let task_id = started_task_id(&background_receiver);
 
         let child_pid = async_fs::read_to_string(&child_pid_path)
             .await
@@ -6840,14 +6777,29 @@ mod tests {
             .trim()
             .parse::<i32>()
             .expect("descendant pid should parse");
-        for _ in 0..100 {
+        for _ in 0..500 {
             // SAFETY: signal 0 probes process existence.
             if unsafe { libc::kill(child_pid, 0) } != 0 {
-                return;
+                break;
             }
             async_io::Timer::after(std::time::Duration::from_millis(20)).await;
         }
-        panic!("descendant process {child_pid} survived the foreground kill");
+        assert!(
+            unsafe { libc::kill(child_pid, 0) } != 0,
+            "descendant process {child_pid} survived the timeout kill"
+        );
+
+        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the finished job stays in the registry");
+        assert_eq!(
+            info.status,
+            JobStatus::Killed,
+            "the promoted job should be killed at its timeout: {completed:?}"
+        );
     }
 
     /// What a test leaves running after its shell exits.
@@ -7091,16 +7043,13 @@ mod tests {
         timeout: u64,
     ) -> (String, i32) {
         let result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: terminal_args("background job", script),
-                    timeout,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                background: true,
+                timeout,
+                ..terminal_args("background job", script)
+            })
             .await
-            .expect("terminal_background should start the job");
+            .expect("terminal should start the background job");
         let task_id = match result.command().map(|command| &command.outcome) {
             Some(CommandOutcome::Running { task_id, .. }) => task_id.clone(),
             other => panic!("background job needs a task id, got {other:?}"),
@@ -7274,7 +7223,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn terminal_background_rejects_timeout_above_cap_and_kills_at_timeout() {
+    async fn terminal_rejects_timeout_above_cap_and_kills_at_timeout() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, tool) = configured_test_terminal(
             dir.path(),
@@ -7284,30 +7233,25 @@ mod tests {
         )
         .await;
         let background_receiver = tool.background_receiver();
-        let background_tool = tool.background_tool();
-        let args = |timeout: u64| TerminalBackgroundArgs {
-            terminal: TerminalArgs {
-                description: "sleep in the background".to_string(),
-                script: "sleep 30".to_string(),
-                mode: TerminalExecutionMode::Sandboxed,
-                ssh_server_id: None,
-                expect: OutputFormat::Text,
-                resolution: MediaResolution::Auto,
-                max_lines: 50,
-                raw: false,
-            },
+        let args = |timeout: u64| TerminalArgs {
+            description: "sleep in the background".to_string(),
+            script: "sleep 30".to_string(),
+            mode: TerminalExecutionMode::Sandboxed,
+            ssh_server_id: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            max_lines: 50,
+            raw: false,
             timeout,
+            background: true,
         };
 
         assert!(
-            background_tool
-                .call(args(3), ToolContext::new())
-                .await
-                .is_err(),
+            tool.call(args(3), ToolContext::new()).await.is_err(),
             "a timeout above the cap must be rejected"
         );
 
-        let result = background_tool
+        let result = tool
             .call(args(1), ToolContext::new())
             .await
             .expect("a timeout within the cap should start the job");
@@ -7345,25 +7289,20 @@ mod tests {
         let background_receiver = tool.background_receiver();
 
         let _result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: TerminalArgs {
-                        description: "sleep in the background".to_string(),
-                        script: "sleep 30".to_string(),
-                        mode: TerminalExecutionMode::Sandboxed,
-                        ssh_server_id: None,
-                        expect: OutputFormat::Text,
-                        resolution: MediaResolution::Auto,
-                        max_lines: 50,
-                        raw: false,
-                    },
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                description: "sleep in the background".to_string(),
+                script: "sleep 30".to_string(),
+                mode: TerminalExecutionMode::Sandboxed,
+                ssh_server_id: None,
+                expect: OutputFormat::Text,
+                resolution: MediaResolution::Auto,
+                max_lines: 50,
+                raw: false,
+                timeout: 30,
+                background: true,
+            })
             .await
-            .expect("terminal_background should start the job");
+            .expect("terminal should start the job");
         let task_id = started_task_id(&background_receiver);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -7441,6 +7380,8 @@ mod tests {
             resolution: MediaResolution::Auto,
             max_lines: 50,
             raw: false,
+            timeout: 30,
+            background: false,
         }
     }
 
@@ -7507,23 +7448,18 @@ mod tests {
         // `exec` keeps `$$` — the pid the probe wrote — on the interactive
         // shell the session then drives.
         let result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: TerminalArgs {
-                        description: "start a persistent shell".to_string(),
-                        script: "printf '%s\\n' $$ > \"$PWD/pid\"; exec sh".to_string(),
-                        mode: TerminalExecutionMode::Sandboxed,
-                        ssh_server_id: None,
-                        expect: OutputFormat::Text,
-                        resolution: MediaResolution::Auto,
-                        max_lines: 50,
-                        raw: false,
-                    },
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                description: "start a persistent shell".to_string(),
+                script: "printf '%s\\n' $$ > \"$PWD/pid\"; exec sh".to_string(),
+                mode: TerminalExecutionMode::Sandboxed,
+                ssh_server_id: None,
+                expect: OutputFormat::Text,
+                resolution: MediaResolution::Auto,
+                max_lines: 50,
+                raw: false,
+                timeout: 30,
+                background: true,
+            })
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
@@ -7568,14 +7504,10 @@ mod tests {
         let background_receiver = tool.background_receiver();
 
         let result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: pid_probe_args(),
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                background: true,
+                ..pid_probe_args()
+            })
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
@@ -8095,6 +8027,8 @@ mod tests {
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
                     raw: false,
+                    timeout: 30,
+                    background: false,
                 },
                 ToolContext::new(),
             )
@@ -9116,14 +9050,7 @@ mod tests {
                 "`{killer}` refusal must tell the agent to kill by PID: {error}"
             );
             let error = tool
-                .background_tool()
-                .call(
-                    TerminalBackgroundArgs {
-                        terminal: terminal_args("name-based kill", &script),
-                        timeout: 30,
-                    },
-                    ToolContext::new(),
-                )
+                .run_background(terminal_args("name-based kill", &script))
                 .await
                 .expect_err("a background name-based kill must be refused");
             assert!(

@@ -9,20 +9,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aither_core::{
-    LanguageModel,
-    llm::{
-        Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, StoredFile,
-        ToolCall, model::Profile as ModelProfile,
-    },
-};
-use askama::Template;
-use futures_core::Stream;
-use futures_lite::StreamExt;
-use sha2::{Digest, Sha256};
-#[cfg(feature = "skills")]
-use std::collections::HashSet;
-
 #[cfg(feature = "skills")]
 use crate::context::{ActiveSkills, ContextSource as _, SkillCatalogEntry};
 use crate::{
@@ -44,13 +30,24 @@ use crate::{
     model_group::ModelTier,
     tools::AgentTools,
 };
+use aither_core::{
+    LanguageModel,
+    llm::{
+        Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, StoredFile,
+        ToolCall, model::Profile as ModelProfile,
+    },
+};
+use askama::Template;
+use futures_core::Stream;
+use futures_lite::StreamExt;
+use sha2::{Digest, Sha256};
 
 use aither_sandbox::{
     BackgroundTaskEvent, BackgroundTaskReceiver, DirectoryResetReason, JobAlert, JobProcess,
     JobRegistry, PermissionEvent, PermissionEventReceiver, PermissionEventStage, TerminalArgs,
-    TerminalBackgroundArgs, TerminalExecutionMode, TerminalMode,
+    TerminalExecutionMode, TerminalMode,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const BACKGROUND_TASK_MAX_WAIT: Duration = Duration::from_secs(300);
 const BACKGROUND_TASK_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -559,6 +556,16 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Registry for running background terminal tasks.
     pub(crate) job_registry: Option<JobRegistry>,
 
+    /// Task ids of jobs the model knows as background tasks.
+    ///
+    /// Every spawned job reports a `CompletedTask` when it ends, foreground
+    /// ones included, but only a job that detached — started `background:
+    /// true` or promoted past the foreground window — is announced to the
+    /// model. An id enters the set when `take_started` reports it; a
+    /// completion whose id is absent already returned through the tool call
+    /// and is dropped.
+    pub(crate) detached_task_ids: HashSet<String>,
+
     /// Optional sandbox directory for working-doc supervision (`tasks.md`).
     pub(crate) sandbox_dir: Option<PathBuf>,
 
@@ -645,6 +652,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
+            detached_task_ids: HashSet::new(),
             sandbox_dir: None,
             restore_dir: None,
             last_request: None,
@@ -1126,7 +1134,7 @@ where
             .collect();
         while let Some(result) = self.tool_results.pop_front() {
             let (call_id, call_name, tool_result) = result?;
-            let is_terminal_call = matches!(call_name.as_str(), "terminal" | "terminal_background");
+            let is_terminal_call = call_name == "terminal";
             if !known_tools.contains(&call_name) && !unknown_tools.contains(&call_name) {
                 unknown_tools.push(call_name.clone());
             }
@@ -1151,12 +1159,12 @@ where
             // the model retry the same wrong call.
             for name in &unknown_tools {
                 self.push_system_alert(format!(
-                    "There is no native tool named '{name}'. This runtime is terminal-first: the only native tools are terminal, terminal_background, terminal_kill, terminal_input, and terminal_read; every other capability is a CLI command executed through the `terminal` tool. If '{name}' is a capability, run it as a command (check with `{name} --help`)."
+                    "There is no native tool named '{name}'. This runtime is terminal-first: the only native tools are terminal, terminal_kill, terminal_input, and terminal_read; every other capability is a CLI command executed through the `terminal` tool. If '{name}' is a capability, run it as a command (check with `{name} --help`)."
                 ));
             }
         } else if has_tool_error {
             self.push_system_alert(
-                "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain terminal, terminal_background, terminal_kill, terminal_input, and terminal_read.",
+                "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain terminal, terminal_kill, terminal_input, and terminal_read.",
             );
         }
         self.push_completed_background_events(events);
@@ -1176,6 +1184,7 @@ where
             return;
         };
         for started in receiver.take_started() {
+            self.detached_task_ids.insert(started.task_id.clone());
             let reminder = BackgroundStartedReminderTemplate {
                 task_id: &started.task_id,
                 output_preview: &started.output_preview,
@@ -1197,12 +1206,7 @@ where
             self.push_job_alerts();
             for task in receiver.take_completed() {
                 tracing::info!(task_id = %task.task_id, "background task completed");
-                let result_msg = format_background_task_result(&task);
-                self.context.push(Message::system(&result_msg));
-                events.emit(AgentEvent::background_task_completed(
-                    task.task_id.clone(),
-                    result_msg,
-                ));
+                self.push_completed_task_event(task, events);
             }
         }
     }
@@ -1509,6 +1513,13 @@ where
         task: aither_sandbox::CompletedTask,
         events: &EventSink,
     ) {
+        // Every spawned job reports its completion, foreground ones
+        // included; only a job the model knows as a background task is
+        // announced, since a foreground result already returned through the
+        // tool call.
+        if !self.detached_task_ids.contains(&task.task_id) {
+            return;
+        }
         let result_msg = format_background_task_result(&task);
         self.context.push(Message::system(&result_msg));
         events.emit(AgentEvent::background_task_completed(
@@ -2695,10 +2706,6 @@ fn permission_event_key_for_call(
             let args: TerminalArgs = serde_json::from_value(arguments.clone()).ok()?;
             (args.mode, args.script)
         }
-        "terminal_background" => {
-            let args: TerminalBackgroundArgs = serde_json::from_value(arguments.clone()).ok()?;
-            (args.terminal.mode, args.terminal.script)
-        }
         _ => return None,
     };
     let mode = match mode {
@@ -3143,6 +3150,8 @@ mod tests {
             resolution: aither_sandbox::MediaResolution::Auto,
             max_lines: 200,
             raw: false,
+            timeout: 60,
+            background: false,
         })
         .expect("default args should serialize");
         let unsafe_args = serde_json::to_value(TerminalArgs {
@@ -3154,6 +3163,8 @@ mod tests {
             resolution: aither_sandbox::MediaResolution::Auto,
             max_lines: 200,
             raw: false,
+            timeout: 60,
+            background: false,
         })
         .expect("unsafe args should serialize");
         let sandboxed_args = serde_json::to_value(TerminalArgs {
@@ -3165,6 +3176,8 @@ mod tests {
             resolution: aither_sandbox::MediaResolution::Auto,
             max_lines: 200,
             raw: false,
+            timeout: 60,
+            background: false,
         })
         .expect("sandboxed args should serialize");
 
@@ -3193,6 +3206,8 @@ mod tests {
                 resolution: aither_sandbox::MediaResolution::Auto,
                 max_lines: 200,
                 raw: false,
+                timeout: 60,
+                background: false,
             })
             .expect("tool args should serialize"),
         )];
@@ -3527,6 +3542,9 @@ mod tests {
         let mut agent = Agent::new(FinishesJobLlm { job: job_rx });
         agent.background_receiver = Some(receiver);
         agent.ensure_initialized().await.expect("agent initializes");
+        // The model already knows this job: `terminal` detached it earlier
+        // and its started entry was drained into `detached_task_ids`.
+        agent.detached_task_ids.insert("task-test".to_string());
         sender.task_started();
         sender
             .send_alert(JobAlert::StdinBlocked(aither_sandbox::StdinBlockedJob {
