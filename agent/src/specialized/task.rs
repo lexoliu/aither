@@ -2678,11 +2678,12 @@ You are a file-defined agent.
             let event = match turn {
                 0 => Event::ToolCall(aither_core::llm::ToolCall::new(
                     "bg-1",
-                    "terminal_background",
+                    "terminal",
                     serde_json::json!({
                         "description": "hold the cache window",
                         "script": "sleep 2",
-                        "timeout": 60
+                        "timeout": 60,
+                        "background": true
                     }),
                 )),
                 _ => Event::Text("done".to_string()),
@@ -3576,6 +3577,7 @@ You are a file-defined agent.
                 "description": "probe the permission path",
                 "script": "echo forked",
                 "mode": "unsafe",
+                "timeout": 30,
             }),
         ))
     }
@@ -3966,11 +3968,12 @@ You are a file-defined agent.
 
         main.then([vec![Event::ToolCall(aither_core::llm::ToolCall::new(
             "bg-1",
-            "terminal_background",
+            "terminal",
             serde_json::json!({
                 "description": "start a job",
                 "script": "sleep 30",
                 "timeout": 60,
+                "background": true,
             }),
         ))]]);
         main.then_with(|request| {

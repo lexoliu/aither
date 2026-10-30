@@ -212,8 +212,8 @@ where
 {
     /// Creates a new terminal-first agent builder.
     ///
-    /// Creates the agent with native tools (`terminal_background`,
-    /// `terminal_kill`, `terminal_input`, `terminal_read`, `terminal`) and IPC commands accessible through
+    /// Creates the agent with native tools (`terminal`, `terminal_kill`,
+    /// `terminal_input`, `terminal_read`) and IPC commands accessible through
     /// `terminal` (registered via `.tool()`). The native control tools address
     /// the same background jobs as `terminal` and are not advertised as commands.
     pub fn new(llm: LLM, mut terminal_tool: TerminalTool<P, E, Unconfigured>) -> Self {
@@ -896,8 +896,7 @@ where
     /// the model.
     ///
     /// The list covers every tool registered on the inner [`AgentBuilder`]
-    /// (`terminal_background`, `terminal_kill`, `terminal_input`, `terminal_read`)
-    /// plus `terminal`,
+    /// (`terminal_kill`, `terminal_input`, `terminal_read`) plus `terminal`,
     /// which `build()` registers last, in the order the built agent's tool
     /// registry holds them.
     ///
@@ -913,7 +912,6 @@ where
             ToolRegistryBuilder::new().build(self.terminal_tool.outputs_dir()),
         ));
         definitions.push(ToolDefinition::new(&terminal));
-        definitions.push(ToolDefinition::new(&terminal.background_tool()));
         // The registry keys tools by name, so the definition list the built
         // agent sends is name-ordered.
         definitions.sort_by(|a, b| a.name().cmp(b.name()));
@@ -1488,7 +1486,8 @@ mod tests {
                         "description": "Run every baseline command",
                         "script": "apply_patch --version && rg --version && ast-grep --version && jq --version",
                         "mode": "sandboxed",
-                        "raw": true
+                        "raw": true,
+                        "timeout": 30
                     }),
                 ))
             } else {
@@ -1646,7 +1645,6 @@ mod tests {
             tool_names,
             [
                 "terminal",
-                "terminal_background",
                 "terminal_input",
                 "terminal_kill",
                 "terminal_read"
@@ -1666,7 +1664,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "terminal",
-                "terminal_background",
                 "terminal_input",
                 "terminal_kill",
                 "terminal_read"

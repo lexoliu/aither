@@ -390,9 +390,9 @@ impl std::error::Error for CommandBlocked {}
 
 /// Decides whether a shell command may run, before it does.
 ///
-/// Every command of the `terminal` and `terminal_background` tools, the
-/// main agent's and every subagent's, is put to the gate of its terminal's
-/// registry in full, ahead of the permission path.
+/// Every command of the `terminal` tool, the main agent's and every
+/// subagent's, is put to the gate of its terminal's registry in full, ahead
+/// of the permission path.
 pub trait CommandGate: Send + Sync + 'static {
     /// Decides on `command`, the full script text.
     fn check(&self, command: &str) -> impl Future<Output = GateDecision> + Send;
