@@ -679,7 +679,7 @@ impl StreamState {
                     "thinking": text,
                     "signature": signature,
                 });
-                vec![LLMEvent::ReasoningState(ReasoningState::new(
+                vec![LLMEvent::ReasoningState(ReasoningState::bound(
                     PROVIDER_NAME,
                     block.to_string(),
                 ))]
@@ -689,7 +689,7 @@ impl StreamState {
                     "type": "redacted_thinking",
                     "data": data,
                 });
-                vec![LLMEvent::ReasoningState(ReasoningState::new(
+                vec![LLMEvent::ReasoningState(ReasoningState::bound(
                     PROVIDER_NAME,
                     block.to_string(),
                 ))]

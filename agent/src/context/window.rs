@@ -354,13 +354,33 @@ impl Context {
         self.push(Message::system(block.content()))
     }
 
-    /// Returns the sequence number the next item will receive.
+    /// Returns the sequence number a compaction may split the window at.
     ///
     /// This is the fork point handed to a background compaction: every item
     /// numbered at or above it arrived after the fork and must survive the
     /// handoff that replaces the rest.
+    ///
+    /// A tool round is never split: when the tail is an assistant turn whose
+    /// tool calls still lack results, the point moves back to that turn's
+    /// sequence number, so the kept side never starts with an orphaned
+    /// result and the compacted side never ends inside an open round.
     #[must_use]
-    pub const fn fork_point(&self) -> u64 {
+    pub fn fork_point(&self) -> u64 {
+        let mut results = std::collections::HashSet::new();
+        for item in self.items.iter().rev() {
+            if let Some(id) = item.message.tool_call_id() {
+                results.insert(id);
+                continue;
+            }
+            let calls = item.message.tool_calls();
+            if calls.is_empty() {
+                break;
+            }
+            if calls.iter().any(|call| !results.contains(call.id.as_str())) {
+                return item.seq;
+            }
+            break;
+        }
         self.next_seq
     }
 
@@ -564,8 +584,18 @@ impl Context {
     /// `handoff` becomes the new anchor and only the items numbered at or
     /// above `fork_point` are kept: they arrived while the handoff was being
     /// written and are not described by it.
+    ///
+    /// Kept items lose reasoning bound to the old prefix: a provider whose
+    /// thinking verifies the conversation around it rejects a block replayed
+    /// under a rewritten prefix, so the strip happens here, where the rewrite
+    /// happens. Text and tool calls stay; prefix-independent reasoning
+    /// (`OpenAI`'s encrypted items, Gemini's signatures) stays valid and is
+    /// kept.
     pub fn apply_handoff(&mut self, handoff: &HandoffDocument, fork_point: u64) {
         self.items.retain(|item| item.seq >= fork_point);
+        for item in &mut self.items {
+            item.message.strip_bound_reasoning();
+        }
         self.set_handoff_document(handoff);
     }
 
@@ -1020,6 +1050,60 @@ mod tests {
                 .handoff()
                 .is_some_and(|handoff| handoff.render().contains("task"))
         );
+    }
+
+    #[test]
+    fn applying_a_handoff_strips_prefix_bound_reasoning_from_kept_items() {
+        let mut context = Context::new();
+        context.push(Message::user("old work"));
+        let fork = context.fork_point();
+        context.push(Message::assistant_with_reasoning(
+            "kept turn",
+            vec![tool_call("c1", "terminal", serde_json::json!({}))],
+            vec![
+                aither_core::llm::ReasoningState::bound("claude", "sig-bound"),
+                aither_core::llm::ReasoningState::new("openai", "enc-item"),
+            ],
+        ));
+        context.push(Message::tool("c1", "done"));
+
+        let handoff = HandoffDocument {
+            current_task: "task".into(),
+            ..HandoffDocument::default()
+        };
+        context.apply_handoff(&handoff, fork);
+
+        let kept: Vec<&Message> = context.recent();
+        assert_eq!(kept.len(), 2);
+        let reasoning = kept[0].reasoning();
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(reasoning[0].provider(), "openai");
+        assert_eq!(reasoning[0].payload(), "enc-item");
+        assert_eq!(kept[0].content(), "kept turn");
+        assert_eq!(kept[0].tool_calls().len(), 1);
+        assert_eq!(kept[1].content(), "done");
+    }
+
+    #[test]
+    fn fork_point_never_splits_an_open_tool_round() {
+        let mut context = Context::new();
+        context.push(Message::user("closed round"));
+        context.push(Message::assistant_with_tool_calls(
+            "",
+            vec![
+                tool_call("a", "read", serde_json::json!({})),
+                tool_call("b", "read", serde_json::json!({})),
+            ],
+        ));
+        let round_start = context.fork_point();
+        context.push(Message::tool("a", "one result"));
+
+        // One result is still missing: the round is open, so the fork point
+        // backs up to the assistant turn that opened it.
+        assert_eq!(context.fork_point(), round_start);
+
+        context.push(Message::tool("b", "two result"));
+        assert_eq!(context.fork_point(), context.len_recent() as u64);
     }
 
     #[test]
