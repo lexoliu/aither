@@ -2,7 +2,7 @@
 //! denial as the subagent's commands, as the subagent, with stdout streamed.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use async_channel::Sender;
@@ -76,11 +76,14 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
     /// The sandbox the export's git runs in, and the program it launches:
     /// the host's resolved `git`, falling back to a bare `git` when the host
     /// itself cannot find one — the error then is the launch's to report.
-    async fn sandbox(&self) -> Result<(Sandbox, String), ExportError> {
+    /// The working directory is the repository, which the subagent's grants
+    /// always cover — its own working directory need not be one of them, and
+    /// git refuses to start in a directory it cannot read.
+    async fn sandbox(&self, repository: &Path) -> Result<(Sandbox, String), ExportError> {
         let git = host_git_binary();
         let config = SandboxConfig::builder()
             .network(DenyAll)
-            .working_dir(&self.working_dir)
+            .working_dir(repository)
             .grants(
                 self.writable
                     .iter()
@@ -109,7 +112,7 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
     }
 
     async fn run_in_sandbox(&self, run: SandboxedRun<'_>) -> Result<SandboxedExit, ExportError> {
-        let (sandbox, program) = self.sandbox().await?;
+        let (sandbox, program) = self.sandbox(run.repository).await?;
         let child = sandbox
             .command(program)
             .arg("--git-dir")
