@@ -224,6 +224,7 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
             )
             .args(run.args)
             .env("HOME", self.working_dir.to_string_lossy())
+            .env("GIT_TRACE", "1")
             .stdin(StdioConfig::Piped)
             .stdout(StdioConfig::Piped)
             .stderr(StdioConfig::Piped)
