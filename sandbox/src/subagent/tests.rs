@@ -443,6 +443,9 @@ async fn a_commit_grant_writes_the_workstrees_own_repository_and_nothing_in_the_
     );
 }
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_sha256_repository_works_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
@@ -513,6 +516,9 @@ async fn a_commit_lands_only_in_the_subagents_repository_and_the_main_one_stays_
 /// The control for the test above: a ref of the main repository that names an
 /// object only another repository has is what made the main agent's fetch,
 /// repack, gc and fsck fail when a subagent's refs lived there.
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_ref_naming_an_object_the_main_store_lacks_breaks_the_main_repository() {
     let fixture = Fixture::new("gamma").await;
@@ -568,6 +574,9 @@ async fn git_elsewhere_is_untouched_by_the_redirected_worktree() {
 
 // ---- 4. since imports -------------------------------------------------------
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn since_imports_the_commits_and_a_second_since_runs_no_pack_export() {
     let fixture = Fixture::new("epsilon").await;
@@ -626,6 +635,9 @@ async fn since_imports_the_commits_and_a_second_since_runs_no_pack_export() {
     );
 }
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn merging_the_subagents_work_keeps_its_objects_after_its_repository_is_removed() {
     let fixture = Fixture::new("zeta").await;
@@ -670,6 +682,9 @@ fn forge_object(fixture: &Fixture) {
     git_in(&fixture.worktree, &["commit", "-m", "forged"]);
 }
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_forged_object_under_a_predicted_id_is_rejected_and_leaves_nothing_behind() {
     let fixture = Fixture::new("eta").await;
@@ -710,6 +725,9 @@ fn unrelated_pack(directory: &Path) -> Vec<u8> {
     child.wait_with_output().unwrap().stdout
 }
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_pack_that_omits_a_reported_tip_is_incomplete_and_moves_no_ref() {
     let scratch = tempfile::tempdir().unwrap();
@@ -828,6 +846,9 @@ async fn a_pack_over_the_byte_budget_is_rejected_and_nothing_is_left_behind() {
 
 // ---- 9. a detached HEAD ------------------------------------------------------
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn detached_work_is_listed_mirrored_into_the_entry_and_kept_by_gc() {
     let fixture = Fixture::new("lambda").await;
@@ -900,6 +921,9 @@ fn graph_hiding_the_parent(commit: &str, tree: &str) -> Vec<u8> {
     data
 }
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_forged_commit_graph_and_a_nested_alternate_change_nothing_the_main_repository_reads() {
     let fixture = Fixture::new("mu").await;
@@ -951,6 +975,9 @@ async fn a_forged_commit_graph_and_a_nested_alternate_change_nothing_the_main_re
 
 // ---- 11. compare and swap ---------------------------------------------------
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_ref_that_moved_in_the_main_repository_during_the_import_is_reported_and_left_alone() {
     let common = Arc::new(Mutex::new(None::<(PathBuf, String)>));
@@ -978,6 +1005,9 @@ async fn a_ref_that_moved_in_the_main_repository_during_the_import_is_reported_a
 
 // ---- 12. cancellation and several repositories -----------------------------
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn dropping_since_mid_index_leaves_no_quarantine() {
     let stub = TestGit::new().replying("pack-objects", Reply::Hang);
@@ -998,6 +1028,9 @@ async fn dropping_since_mid_index_leaves_no_quarantine() {
     assert!(fixture.stray_object_directories().is_empty());
 }
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn one_rejected_repository_does_not_stop_the_others_and_is_named() {
     let dir = tempfile::tempdir().unwrap();
@@ -1394,6 +1427,9 @@ async fn the_ledger_reads_only_the_main_repository_and_runs_no_program_the_subag
 /// Commits made on another branch of the namespace, or left behind by
 /// resetting the worktree's branch and detaching `HEAD`, are still listed;
 /// a branch moved back to where it was lists nothing.
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn the_ledger_lists_commits_whatever_head_does() {
     let fixture = Fixture::new("delta2").await;
@@ -1588,6 +1624,9 @@ async fn every_question_to_the_subagents_repository_is_bounded_in_time_and_its_p
     }
 }
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn the_tidying_after_an_import_is_bounded_in_time() {
     let stub = TestGit::new().replying("prune-packed", Reply::Hang);
@@ -1825,6 +1864,9 @@ async fn a_locked_head_stops_a_symbolic_mirror_but_not_the_refs() {
 /// moves in a follow-up transaction — updating its referent already
 /// counts as updating it. A lock on it still freezes the whole import:
 /// the referent update itself needs HEAD's lock. Removing it recovers.
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_locked_head_blocks_an_import_moving_its_referent_too() {
     let fixture = Fixture::new("referent").await;
@@ -1906,6 +1948,9 @@ async fn one_worktree_that_cannot_be_prepared_does_not_hold_back_the_others() {
     );
 }
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn an_import_never_removes_a_directory_it_did_not_create() {
     let fixture = Fixture::new("sweep").await;
