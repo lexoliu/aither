@@ -814,6 +814,9 @@ async fn a_report_naming_a_ref_outside_the_namespace_is_refused_before_anything_
     }
 }
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_pack_over_the_byte_budget_is_rejected_and_nothing_is_left_behind() {
     let tight = ImportLimits {
@@ -2060,6 +2063,9 @@ fn commit_noise(fixture: &Fixture) {
     git_in(&fixture.worktree, &["commit", "-m", "heavy"]);
 }
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_byte_budget_of_zero_bounds_nothing() {
     let limits = ImportLimits {
@@ -2077,6 +2083,9 @@ async fn a_byte_budget_of_zero_bounds_nothing() {
     assert_eq!(listed.len(), 1);
 }
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn the_byte_budget_is_read_at_each_import() {
     let budget = ImportBudget::new(2048);
