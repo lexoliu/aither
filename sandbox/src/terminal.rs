@@ -3525,6 +3525,37 @@ async fn write_git_shim(_tools: &PreparedTools<PathBuf>) -> Result<(), TerminalE
     Ok(())
 }
 
+/// The script a container's command runs ahead of its own: the `git`
+/// shim written into a writable directory it puts first on `PATH`, and
+/// the worktree map as exports. Empty without a map — subagent
+/// containers never see it.
+#[cfg(unix)]
+fn container_git_preamble(registry: &ToolRegistry) -> String {
+    use std::fmt::Write as _;
+    let mut environment = Vec::new();
+    committed_git_environment(registry, &mut environment);
+    if environment.is_empty() {
+        return String::new();
+    }
+    let mut preamble =
+        "aither_shim=${TMPDIR:-/tmp}/aither-shim-$$\nmkdir -p \"$aither_shim\"\n".to_string();
+    preamble.push_str("cat > \"$aither_shim/git\" <<'AITHER_GIT_SHIM'\n");
+    preamble.push_str(GIT_SHIM);
+    preamble.push_str(
+        "AITHER_GIT_SHIM\nchmod +x \"$aither_shim/git\"\nPATH=\"$aither_shim:$PATH\"\nexport PATH\n",
+    );
+    for (name, value) in &environment {
+        writeln!(preamble, "export {name}={}", shell_words::quote(value))
+            .expect("a string cannot fail a write");
+    }
+    preamble
+}
+
+#[cfg(not(unix))]
+fn container_git_preamble(_registry: &ToolRegistry) -> String {
+    String::new()
+}
+
 /// Hands the git shim of a main terminal's commands the worktree map.
 ///
 /// A command's `git` in a committing worktree resolves the worktree's
@@ -4006,7 +4037,18 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             container_runtime.ipc_route().bind(),
         )?)
     };
-    let script = context.prepared_tools.wrap_script(context.script)?;
+    // A main terminal's git shim and worktree map travel inside the
+    // script: the container's tools mount is read-only, so the command
+    // writes the shim where its own PATH can put it first.
+    let preamble = container_git_preamble(context.registry);
+    let script_owned;
+    let script = if preamble.is_empty() {
+        context.script
+    } else {
+        script_owned = format!("{preamble}{}", context.script);
+        &script_owned
+    };
+    let script = context.prepared_tools.wrap_script(script)?;
     let script = match context.carry {
         Some(carry) => carry_cwd_script(&script, carry.report.as_str())?,
         None => script,

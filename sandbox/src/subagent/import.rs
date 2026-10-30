@@ -639,27 +639,39 @@ impl CommittingWorktree {
             }
         }
         if let Some(target) = symbolic_after {
-            let now = HostGit::in_repository(&self.git_dir, &["symbolic-ref", "-q", "HEAD"])
-                .output(input(Vec::new()))
-                .await?;
-            if let Head::Symbolic(old) = entry_head {
-                let current = String::from_utf8_lossy(&now.stdout);
-                if !now.status.success() || current.trim() != *old {
-                    return Err(CommitLedgerError::Moved {
-                        repository: self.git_dir.clone(),
-                        reference: "HEAD".to_string(),
-                    });
-                }
-            }
-            let moved = HostGit::in_repository(&self.git_dir, &["symbolic-ref", "HEAD", target])
-                .output(input(Vec::new()))
-                .await?;
-            if !moved.status.success() {
-                return Err(CommitLedgerError::Git {
+            self.mirror_symbolic_head(target, entry_head).await?;
+        }
+        Ok(())
+    }
+
+    /// Points the entry's `HEAD` at `target` with `symbolic-ref`, the one
+    /// write that reaches a worktree entry's HEAD file, refusing while it
+    /// no longer names the branch the report found.
+    async fn mirror_symbolic_head(
+        &self,
+        target: &str,
+        entry_head: &Head,
+    ) -> Result<(), CommitLedgerError> {
+        let now = HostGit::in_repository(&self.git_dir, &["symbolic-ref", "-q", "HEAD"])
+            .output(input(Vec::new()))
+            .await?;
+        if let Head::Symbolic(old) = entry_head {
+            let current = String::from_utf8_lossy(&now.stdout);
+            if !now.status.success() || current.trim() != *old {
+                return Err(CommitLedgerError::Moved {
                     repository: self.git_dir.clone(),
-                    stderr: String::from_utf8_lossy(&moved.stderr).trim().to_string(),
+                    reference: "HEAD".to_string(),
                 });
             }
+        }
+        let moved = HostGit::in_repository(&self.git_dir, &["symbolic-ref", "HEAD", target])
+            .output(input(Vec::new()))
+            .await?;
+        if !moved.status.success() {
+            return Err(CommitLedgerError::Git {
+                repository: self.git_dir.clone(),
+                stderr: String::from_utf8_lossy(&moved.stderr).trim().to_string(),
+            });
         }
         Ok(())
     }
