@@ -2,7 +2,7 @@
 //! denial as the subagent's commands, as the subagent, with stdout streamed.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use async_channel::Sender;
@@ -91,8 +91,10 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
     /// The working directory is the git binary's own, which is granted and
     /// canonically spelled — a directory the subagent spells may resolve to a
     /// differently-spelled object, and git refuses to start where it cannot
-    /// read the current directory.
-    async fn sandbox(&self) -> Result<(Sandbox, String), ExportError> {
+    /// read the current directory. The repository is granted read beside the
+    /// subagent's grants: it lives inside the main worktree's git directory,
+    /// outside them.
+    async fn sandbox(&self, repository: &Path) -> Result<(Sandbox, String), ExportError> {
         let git = host_git_binary();
         let config =
             SandboxConfig::builder()
@@ -112,7 +114,11 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
                         )
                         .chain(git.as_ref().map(|(_, dir)| {
                             Grant::new(canonical(dir), Access::READ | Access::EXEC)
-                        })),
+                        }))
+                        .chain(std::iter::once(Grant::new(
+                            canonical(repository),
+                            Access::READ,
+                        ))),
                 )
                 .security(SecurityConfig::interactive())
                 .priority(self.priority)
@@ -128,7 +134,7 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
     }
 
     async fn run_in_sandbox(&self, run: SandboxedRun<'_>) -> Result<SandboxedExit, ExportError> {
-        let (sandbox, program) = self.sandbox().await?;
+        let (sandbox, program) = self.sandbox(run.repository).await?;
         let child = sandbox
             .command(program)
             .arg("--git-dir")
