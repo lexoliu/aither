@@ -89,11 +89,10 @@ struct RefTransaction<'a> {
     updates: Vec<RefUpdate<'a>>,
     creates: Vec<RefCreate<'a>>,
     deletes: Vec<RefDelete<'a>>,
-    /// The commit the worktree's entry is to be detached at.
-    detached: Option<&'a str>,
-    /// The branch the worktree's entry's HEAD is to point at, moving in the
-    /// same transaction as the namespace refs so a failure leaves neither.
-    symbolic: Option<&'a str>,
+    /// The commit the worktree's entry is to be detached at, and the ref or
+    /// object id it must still resolve to - a HEAD that moved between the
+    /// report and the import is not overwritten.
+    detached: Option<(&'a str, &'a str)>,
 }
 
 impl RefTransaction<'_> {
@@ -102,7 +101,6 @@ impl RefTransaction<'_> {
             && self.creates.is_empty()
             && self.deletes.is_empty()
             && self.detached.is_none()
-            && self.symbolic.is_none()
     }
 
     /// Whether the transaction moves `name`.
@@ -562,7 +560,6 @@ impl CommittingWorktree {
             creates: Vec::new(),
             deletes: Vec::new(),
             detached: None,
-            symbolic: None,
         };
         for (name, new) in &report.refs {
             match old_of(name) {
@@ -576,17 +573,32 @@ impl CommittingWorktree {
                 transaction.deletes.push(RefDelete { name, old });
             }
         }
+        // A symbolic HEAD cannot move inside the transaction: symref-update
+        // on a worktree entry lands on a per-worktree ref rather than its
+        // HEAD file, so a symbolic move follows the committed refs through
+        // symbolic-ref, retargeted only while HEAD still says what the
+        // report read.
+        let mut symbolic_after = None;
         if report.head != *entry_head {
             match &report.head {
-                Head::Detached(id) => transaction.detached = Some(id),
-                Head::Symbolic(branch) => transaction.symbolic = Some(branch),
+                // The value the entry's HEAD held at the report goes into
+                // the update as its expected old value.
+                Head::Detached(id) => {
+                    transaction.detached = Some((
+                        id,
+                        match entry_head {
+                            Head::Detached(oid) | Head::Symbolic(oid) => oid,
+                        },
+                    ));
+                }
+                Head::Symbolic(branch) => symbolic_after = Some(branch),
             }
         }
         // Updating the ref the entry's HEAD points at counts as a second
-        // update of HEAD, which update-ref refuses; HEAD then moves in a
-        // follow-up transaction of its own. One that fails leaves the
-        // entry's HEAD behind — recoverable, since the next import reads
-        // the difference and tries again.
+        // update of HEAD, which update-ref refuses; a detached HEAD then
+        // moves in a follow-up transaction of its own. One that fails
+        // leaves the entry's HEAD behind — recoverable, since the next
+        // import reads the difference and tries again.
         let head_after = if let Head::Symbolic(referent) = entry_head
             && transaction.touches(referent)
         {
@@ -595,7 +607,6 @@ impl CommittingWorktree {
                 creates: Vec::new(),
                 deletes: Vec::new(),
                 detached: transaction.detached.take(),
-                symbolic: transaction.symbolic.take(),
             })
         } else {
             None
@@ -627,6 +638,29 @@ impl CommittingWorktree {
                 });
             }
         }
+        if let Some(target) = symbolic_after {
+            let now = HostGit::in_repository(&self.git_dir, &["symbolic-ref", "-q", "HEAD"])
+                .output(input(Vec::new()))
+                .await?;
+            if let Head::Symbolic(old) = entry_head {
+                let current = String::from_utf8_lossy(&now.stdout);
+                if !now.status.success() || current.trim() != *old {
+                    return Err(CommitLedgerError::Moved {
+                        repository: self.git_dir.clone(),
+                        reference: "HEAD".to_string(),
+                    });
+                }
+            }
+            let moved = HostGit::in_repository(&self.git_dir, &["symbolic-ref", "HEAD", target])
+                .output(input(Vec::new()))
+                .await?;
+            if !moved.status.success() {
+                return Err(CommitLedgerError::Git {
+                    repository: self.git_dir.clone(),
+                    stderr: String::from_utf8_lossy(&moved.stderr).trim().to_string(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -644,4 +678,24 @@ fn render(template: &impl Template) -> String {
     template
         .render()
         .expect("the import templates render any input")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_detached_head_move_carries_its_expected_value() {
+        let transaction = RefTransaction {
+            updates: Vec::new(),
+            creates: Vec::new(),
+            deletes: Vec::new(),
+            detached: Some(("new-oid", "refs/heads/old")),
+        };
+        let rendered = render(&transaction);
+        assert!(
+            rendered.contains("option no-deref\nupdate HEAD new-oid refs/heads/old"),
+            "{rendered}"
+        );
+    }
 }

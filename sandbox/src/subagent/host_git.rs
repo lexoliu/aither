@@ -22,9 +22,9 @@ use super::{CommitLedgerError, NULL_DEVICE, SubagentGrantError};
 
 /// The oldest git the subagent commit grant works with: its snapshot refresh
 /// needs negative refspecs, which arrived in git 2.29, and the
-/// import moves symbolic HEADs with `symref-update`, which arrived in
-/// git 2.46.
-const MINIMUM_VERSION: (u32, u32) = (2, 46);
+/// import detaches worktree HEADs with `option no-deref`, which
+/// arrived in git 2.40.
+const MINIMUM_VERSION: (u32, u32) = (2, 40);
 
 /// The object directories a host git reads and writes while a pack is
 /// quarantined.
@@ -205,7 +205,7 @@ pub(super) async fn require_supported_version() -> Result<(), SubagentGrantError
     check_version(String::from_utf8_lossy(&output.stdout).trim())
 }
 
-/// Accepts the output of `git --version` when it names git 2.46 or later.
+/// Accepts the output of `git --version` when it names git 2.40 or later.
 pub(super) fn check_version(printed: &str) -> Result<(), SubagentGrantError> {
     let version = printed
         .strip_prefix("git version ")
@@ -229,13 +229,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn git_before_2_46_is_refused_naming_the_version_found() {
+    fn git_before_2_40_is_refused_naming_the_version_found() {
         for old in [
-            "git version 2.45.9",
+            "git version 2.39.4",
             "git version 1.9.5",
             "git version 2.7.4",
         ] {
-            let error = check_version(old).expect_err("symref-update needs git 2.46");
+            let error = check_version(old).expect_err("option no-deref needs git 2.40");
             assert!(
                 matches!(&error, SubagentGrantError::GitTooOld { found } if found == old),
                 "{error}"
@@ -243,7 +243,7 @@ mod tests {
             assert!(error.to_string().contains(old), "{error}");
         }
         for fine in [
-            "git version 2.46.0",
+            "git version 2.40.0",
             "git version 2.54.0 (Apple Git-157)",
             "git version 3.0.1",
         ] {

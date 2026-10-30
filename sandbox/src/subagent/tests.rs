@@ -1773,39 +1773,52 @@ async fn a_repository_whose_commits_cannot_be_imported_does_not_lock_the_worktre
     assert!(fixture.main_has(&commit));
 }
 
-/// The worktree's HEAD moves inside the same transaction as the namespace
-/// refs: a lock on it refuses the whole import — no ref moved — and its
-/// removal lets the next one commit both.
+/// A symbolic HEAD move cannot ride the refs transaction — symref-update
+/// cannot rewrite a worktree entry's HEAD — so it follows the committed
+/// refs through symbolic-ref, which takes HEAD's lock like any ref write:
+/// the refs are already committed when the lock refuses the mirror, and
+/// the next import heals it.
 #[tokio::test]
-async fn a_locked_head_blocks_the_whole_import_and_its_removal_recovers() {
+async fn a_locked_head_stops_a_symbolic_mirror_but_not_the_refs() {
     let fixture = Fixture::new("locked").await;
     let mark = fixture.ledger.mark().await.unwrap();
     // A branch inside the granted namespace moves the report's HEAD while
-    // leaving the entry's referent untouched, so HEAD rides the same
-    // transaction as the refs.
+    // leaving the entry's referent untouched.
     git_in(
         &fixture.worktree,
         &["checkout", "-b", "subagent/locked/other"],
     );
-    let commit = fixture.commit("blocked");
-    let refs = fixture.main(&["for-each-ref"]);
+    let commit = fixture.commit("moved");
     let lock = fixture.entry.join("HEAD.lock");
     std::fs::write(&lock, "").unwrap();
     fixture
         .ledger
         .since(&mark)
         .await
-        .expect_err("a locked HEAD refuses the import");
+        .expect_err("the locked HEAD refuses the mirror");
     assert_eq!(
-        fixture.main(&["for-each-ref"]),
-        refs,
-        "no namespace ref moved while HEAD was unmovable"
+        fixture.main(&["rev-parse", "refs/heads/subagent/locked/other"]),
+        commit,
+        "the namespace refs committed, the HEAD mirror alone is behind"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.entry.join("HEAD"))
+            .unwrap()
+            .trim(),
+        "ref: refs/heads/subagent/locked/work",
+        "the entry's HEAD stayed where it was"
     );
 
     std::fs::remove_file(&lock).unwrap();
     let listed = fixture.ledger.since(&mark).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].commit, commit);
+    assert_eq!(
+        std::fs::read_to_string(fixture.entry.join("HEAD"))
+            .unwrap()
+            .trim(),
+        "ref: refs/heads/subagent/locked/other"
+    );
 }
 
 /// When an import also moves the ref the entry's HEAD points at, HEAD
