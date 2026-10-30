@@ -3455,7 +3455,13 @@ where
     .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(policy)
-        .working_dir(context.working_dir)
+        .working_dir(
+            // A symlink in the working directory's spelling fails the
+            // sandbox's own resolution — it does not follow a link a
+            // sandboxed process could have planted.
+            std::fs::canonicalize(context.working_dir)
+                .unwrap_or_else(|_| context.working_dir.to_path_buf()),
+        )
         .grants(grants)
         .security(SecurityConfig::interactive())
         .priority(context.priority);
@@ -3556,7 +3562,10 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(AllowAll)
-        .working_dir(context.working_dir)
+        .working_dir(
+            std::fs::canonicalize(context.working_dir)
+                .unwrap_or_else(|_| context.working_dir.to_path_buf()),
+        )
         .grants(grants)
         .security(SecurityConfig::interactive())
         .priority(context.priority);
