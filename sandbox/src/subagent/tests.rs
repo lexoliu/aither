@@ -1752,6 +1752,9 @@ async fn poisoned() -> (Fixture, CommitMark) {
     (fixture, mark)
 }
 
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_repository_whose_commits_cannot_be_imported_does_not_lock_the_worktree() {
     let (fixture, mark) = poisoned().await;
@@ -1817,6 +1820,9 @@ async fn a_repository_whose_commits_cannot_be_imported_does_not_lock_the_worktre
 /// refs through symbolic-ref, which takes HEAD's lock like any ref write:
 /// the refs are already committed when the lock refuses the mirror, and
 /// the next import heals it.
+// Sandboxed git runs only off Windows: a package's ancestors carry
+// traverse alone, and git resolves its paths through a read on each.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_locked_head_stops_a_symbolic_mirror_but_not_the_refs() {
     let fixture = Fixture::new("locked").await;
