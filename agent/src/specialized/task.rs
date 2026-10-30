@@ -279,6 +279,21 @@ struct CommitListing {
     setbacks: Vec<String>,
 }
 
+/// Lists the commits a run made on its granted repositories; `None` when the
+/// run held no commit grant.
+async fn list_commits(
+    ledger: Option<&CommitLedger>,
+    mark: Option<&CommitMark>,
+) -> Option<CommitListing> {
+    match (ledger, mark) {
+        (Some(ledger), Some(mark)) => Some(CommitListing {
+            listed: ledger.since(mark).await,
+            setbacks: mark.setbacks().iter().map(ToString::to_string).collect(),
+        }),
+        _ => None,
+    }
+}
+
 /// What the result text reports about a subagent run.
 enum SubagentReport<'a> {
     /// The user cancelled the run.
@@ -1573,13 +1588,7 @@ where
         // Whatever way the run ended, the commits it made are reported; a
         // failure to list them is reported in their place and changes nothing
         // else about the run.
-        let commits = match (&commit_ledger, &commit_mark) {
-            (Some(ledger), Some(mark)) => Some(CommitListing {
-                listed: ledger.since(mark).await,
-                setbacks: mark.setbacks().iter().map(ToString::to_string).collect(),
-            }),
-            _ => None,
-        };
+        let commits = list_commits(commit_ledger.as_ref(), commit_mark.as_ref()).await;
         let result = match outcome {
             SubagentOutcome::Cancelled => {
                 // The cancelled query left the agent mid-turn; it cannot be continued.
