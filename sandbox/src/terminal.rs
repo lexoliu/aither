@@ -3386,22 +3386,28 @@ fn local_path_grants(
     tools: &PreparedTools<PathBuf>,
     job_fifo: Option<&Path>,
 ) -> heel::Result<Vec<Grant>> {
+    /// The object a spelled path names, in the spelling a resolved grant
+    /// checks: canonicalized, without the verbatim prefix Windows adds — an
+    /// 8.3 alias or a symlinked component does not name the same object.
+    fn resolved(path: &Path) -> heel::Result<ResolvedPath> {
+        ResolvedPath::new(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+    }
     writable
         .iter()
-        .map(|path| Ok(Grant::new(ResolvedPath::new(path)?, Access::WRITE)))
+        .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE)))
         .chain(
             readable
                 .iter()
-                .map(|path| Ok(Grant::new(ResolvedPath::new(path)?, Access::READ))),
+                .map(|path| Ok(Grant::new(resolved(path)?, Access::READ))),
         )
         .chain(std::iter::once(Ok(Grant::new(
-            ResolvedPath::new(tools.bin_dir())?,
+            resolved(tools.bin_dir())?,
             Access::EXEC,
         ))))
         .chain(
             job_fifo
                 .iter()
-                .map(|path| Ok(Grant::new(ResolvedPath::new(path)?, Access::WRITE))),
+                .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE))),
         )
         .collect()
 }
