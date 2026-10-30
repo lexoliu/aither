@@ -2332,16 +2332,14 @@ mod tests {
     /// that also leaves its session can no longer be found through its
     /// group either: only its ancestry — or, on Linux, the job's supervisor —
     /// still attributes it to the job. The kill must reach it anyway.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[tokio::test(flavor = "multi_thread")]
     async fn an_env_cleaned_setsid_descendant_is_still_killed() {
         let marker = JobMarker::new();
         #[cfg(target_os = "macos")]
         let script = "/usr/bin/env -i /usr/bin/perl -e \
             'use POSIX; POSIX::setsid(); exec \"sleep\", \"300\"' & exit 0";
-        #[cfg(target_os = "linux")]
-        let script = "/usr/bin/env -i setsid sleep 300 & exit 0";
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(target_os = "macos"))]
         let script = "/usr/bin/env -i sleep 300 & exit 0";
         let mut root = spawn_group_leader(script, &marker);
         let tree = JobTree::spawn(&TokioGlobal, ProcessScanner::default(), root.id(), &marker);
@@ -2354,6 +2352,37 @@ mod tests {
         );
         tree.finish().await;
         root.wait().expect("root is reaped");
+    }
+
+    /// On Linux the same escape runs under the job's supervisor, which owns
+    /// the descendants itself: neither marker nor ancestry is needed to
+    /// name the leftover it killed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_env_cleaned_setsid_descendant_is_still_killed() {
+        let config = heel::SandboxConfig::builder()
+            .network(heel::DenyAll)
+            .security(heel::SecurityConfig::interactive())
+            .supervised_spawn(true)
+            .build();
+        let sandbox = heel::Sandbox::with_config_and_executor(config, TokioGlobal)
+            .await
+            .expect("the sandbox builds");
+        let mut child = sandbox
+            .command("sh")
+            .args(["-c", "/usr/bin/env -i setsid sleep 300 & exit 0"])
+            .spawn_supervised(heel::supervisor::Foreground {
+                reap_timeout: Duration::from_secs(5),
+            })
+            .await
+            .expect("the supervised command spawns");
+        let exit = child.wait().await.expect("the supervisor tears down");
+        assert_eq!(exit.report.killed.len(), 1, "{:?}", exit.report.killed);
+        assert_eq!(exit.report.killed[0].name, "sleep");
+        assert!(
+            gone_within(exit.report.killed[0].pid, Duration::from_secs(2)).await,
+            "the env-cleaned setsid child survived its job's teardown"
+        );
     }
 
     /// A kill of a plain tree freezes and kills the group's members and the
