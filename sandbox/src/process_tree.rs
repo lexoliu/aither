@@ -421,7 +421,7 @@ impl JobTree {
     /// report rather than scanning the process table.
     #[cfg(target_os = "linux")]
     #[must_use]
-    pub fn supervised(control: heel::supervisor::TreeControl) -> Self {
+    pub const fn supervised(control: heel::supervisor::TreeControl) -> Self {
         Self {
             tracked: TrackedJob::Supervised(control),
         }
@@ -460,14 +460,13 @@ impl JobTree {
                 self.ask_at(commands, |reply| unix::Command::Kill { group: true, reply })
                     .await?
                     .ok_or(KillTreeError::Ended)??;
-                Ok(())
             }
             #[cfg(target_os = "linux")]
             TrackedJob::Supervised(control) => {
                 control.kill().await.map_err(KillTreeError::Supervised)?;
-                Ok(())
             }
         }
+        Ok(())
     }
 
     /// Kills every descendant of the job that is alive and returns what it
