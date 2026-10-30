@@ -36,6 +36,7 @@ use crate::{
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
     event::{AgentEvent, RunPauseReason, TimedEvent},
+    external_hook,
     hook::{
         CheckpointContext, CheckpointReason, Hook, PostToolAction, PreToolAction, StopContext,
         StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
@@ -45,9 +46,9 @@ use crate::{
 };
 
 use aither_sandbox::{
-    BackgroundTaskEvent, BackgroundTaskReceiver, JobAlert, JobRegistry, PermissionEvent,
-    PermissionEventReceiver, PermissionEventStage, TerminalArgs, TerminalBackgroundArgs,
-    TerminalExecutionMode, TerminalMode,
+    BackgroundTaskEvent, BackgroundTaskReceiver, DirectoryResetReason, JobAlert, JobRegistry,
+    PermissionEvent, PermissionEventReceiver, PermissionEventStage, TerminalArgs,
+    TerminalBackgroundArgs, TerminalExecutionMode, TerminalMode,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -327,6 +328,15 @@ struct BackgroundTerminalResultTemplate<'a> {
     stderr: Option<&'a str>,
 }
 
+/// Whether the session's first run has begun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPhase {
+    /// No run has begun.
+    NotStarted,
+    /// A run has begun.
+    Started,
+}
+
 /// The alert text for a background job event.
 #[derive(Template)]
 #[template(path = "job_alert.txt", escape = "none")]
@@ -342,6 +352,11 @@ enum JobAlertText<'a> {
     StdinBlocked { task_id: &'a str },
     /// Watching the job's stdin failed.
     StdinProbeFailed { task_id: &'a str, error: &'a str },
+    /// The carried working directory was reset.
+    DirectoryReset {
+        dir: String,
+        reason: DirectoryResetReason,
+    },
 }
 
 fn job_alert_text(alert: &JobAlertText<'_>) -> String {
@@ -529,6 +544,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Whether tools have been bootstrapped.
     pub(crate) initialized: bool,
 
+    /// Whether the session-start lifecycle event has fired.
+    pub(crate) session: SessionPhase,
+
     /// Receiver for completed background terminal tasks.
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
     /// Receiver for permission wait/resume events emitted by terminal execution.
@@ -616,6 +634,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             tool_results: VecDeque::new(),
             profile: None,
             initialized: false,
+            session: SessionPhase::NotStarted,
             last_request_started_at: None,
             clock: crate::AnyClock::default(),
             background_receiver: None,
@@ -743,6 +762,17 @@ where
             self.config.max_iterations,
         ));
         self.ensure_initialized().await?;
+        if std::mem::replace(&mut self.session, SessionPhase::Started) == SessionPhase::NotStarted {
+            self.hooks
+                .on_lifecycle(&external_hook::SessionStart {})
+                .await;
+        }
+        self.hooks
+            .on_lifecycle(&external_hook::UserMessage {
+                message: prompt.clone(),
+                attachments: attachments.len(),
+            })
+            .await;
         #[cfg(feature = "skills")]
         for event in self.activate_skills_for_prompt(&prompt) {
             events.emit(event);
@@ -1410,6 +1440,14 @@ where
     /// it is a job blocked on stdin, which wakes a parked wait.
     fn push_job_alert(&mut self, alert: JobAlert) -> bool {
         match alert {
+            JobAlert::DirectoryReset(reset) => {
+                tracing::info!(dir = %reset.dir.display(), reason = ?reset.reason, "carried working directory reset");
+                self.push_system_alert(job_alert_text(&JobAlertText::DirectoryReset {
+                    dir: reset.dir.display().to_string(),
+                    reason: reset.reason,
+                }));
+                false
+            }
             JobAlert::LongRunning(job) => {
                 tracing::info!(task_id = %job.task_id, "background job crossed long-running threshold");
                 self.push_system_alert(job_alert_text(&JobAlertText::LongRunning {
@@ -1488,6 +1526,13 @@ where
             turns: outcome.iteration,
             reason: outcome.stop_reason,
         };
+        self.hooks
+            .on_lifecycle(&external_hook::Stop {
+                final_text: outcome.final_text.clone(),
+                turns: outcome.iteration,
+                reason: outcome.stop_reason,
+            })
+            .await;
         if let Some(reason) = self.hooks.on_stop(&stop_ctx).await {
             return Err(AgentError::HookRejected {
                 hook: "on_stop",
@@ -1681,6 +1726,12 @@ where
         }
 
         let messages_compacted = messages.len();
+        self.hooks
+            .on_lifecycle(&external_hook::BeforeCompaction {
+                messages: messages_compacted,
+                focus: focus.map(str::to_string),
+            })
+            .await;
         let tail = self.render_tail().await;
         let definitions = self.tools.active_definitions();
         let messages = self.context.build_request(&tail);
@@ -1898,6 +1949,11 @@ where
             kept = self.context.len_recent(),
             "applied handoff from forked compaction"
         );
+        self.hooks
+            .on_lifecycle(&external_hook::AfterCompaction {
+                messages_remaining: self.context.len_recent(),
+            })
+            .await;
 
         if let Some(restore_dir) = self.restore_dir.clone() {
             let tokens = self
@@ -1990,11 +2046,21 @@ where
         self.context.push_block_alert(&block);
     }
 
+    /// Delivers the context lifecycle hooks injected since the last call, one
+    /// system alert per piece. A piece leaves the hooks' inbox as it is
+    /// delivered, so it reaches the model once.
+    fn push_injected_context(&mut self) {
+        for injected in self.hooks.take_injected_context() {
+            self.push_system_alert(injected.alert_text());
+        }
+    }
+
     /// Collects the durable alerts sources raise as a request begins.
     ///
     /// Tells the sources whether the window was reassembled since the last
     /// time, which is when their earlier alerts stopped being in it.
     async fn push_request_alerts(&mut self) {
+        self.push_injected_context();
         let reassembled = std::mem::take(&mut self.reassembled);
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_request(reassembled).await {
@@ -2006,6 +2072,7 @@ where
 
     /// Collects the durable alerts sources raise after a tool turn.
     async fn push_tool_turn_alerts(&mut self) {
+        self.push_injected_context();
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_tool_turn_end().await {
                 self.budget.append(block.len());
@@ -2242,6 +2309,12 @@ where
                     !definitions.is_empty(),
                 ))
                 .with_tool_definitions(definitions.clone());
+            self.hooks
+                .on_lifecycle(&external_hook::BeforeCompaction {
+                    messages: self.context.len_recent(),
+                    focus: None,
+                })
+                .await;
             self.start_compaction(&fork_request, None);
         }
 
@@ -2757,6 +2830,26 @@ mod tests {
             }),
             "Monitoring background job 'amber' for stdin reads failed: no /proc — it cannot report being blocked on stdin."
         );
+        for (reason, expected) in [
+            (DirectoryResetReason::Failed, "the last command failed"),
+            (DirectoryResetReason::Unreported, "exit or a signal"),
+            (
+                DirectoryResetReason::OutsideReadable,
+                "paths the terminal can read",
+            ),
+            (DirectoryResetReason::OutsideWorkspace, "workspace mount"),
+            (DirectoryResetReason::Removed, "no longer exists"),
+        ] {
+            let text = job_alert_text(&JobAlertText::DirectoryReset {
+                dir: "/work/space".to_string(),
+                reason,
+            });
+            assert!(
+                text.starts_with("Commands now run in /work/space: "),
+                "{text}"
+            );
+            assert!(text.contains(expected), "{text}");
+        }
         let long = job_alert_text(&JobAlertText::LongRunning {
             task_id: "amber",
             elapsed: "5m".to_string(),

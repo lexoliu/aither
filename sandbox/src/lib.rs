@@ -59,6 +59,7 @@ mod kill_guard;
 mod naming;
 mod output;
 mod output_compress;
+mod process_tree;
 mod shell_session;
 mod stdin_watch;
 mod subagent;
@@ -86,7 +87,8 @@ pub mod permission;
 
 pub use bollard_exec::BollardContainerExec;
 pub use command::{
-    CommandEnvelope, CommandPayload, CommandRole, DynTerminalTool, DynToolHandler, IpcToolCommand,
+    AnyCommandGate, AnyCommandObserver, CommandCall, CommandEnvelope, CommandGate, CommandObserver,
+    CommandPayload, CommandRole, DynTerminalTool, DynToolHandler, GateDecision, IpcToolCommand,
     ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
     register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
     tool_output_to_payload,
@@ -111,7 +113,8 @@ pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
 };
 pub use output::{MediaResolution, OutputFormat, OutputStore};
-pub use permission::{PermissionHandler, TerminalMode};
+pub use permission::{PermissionHandler, PermissionRequest, Review, TerminalMode};
+pub use process_tree::{KillTreeError, kill_process_tree};
 pub use shell_session::{
     AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
     ContainerExecOutcome, ContainerIpcRoute, ContainerShellRuntime, ShellBackend,
@@ -126,7 +129,8 @@ pub use subagent::{
 pub use terminal::{
     BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand,
     CompletedTask, Configured, DEFAULT_BACKGROUND_TIMEOUT_CAP, DEFAULT_FOREGROUND_LIMIT,
-    DEFAULT_LONG_JOB_ALERT_AFTER, DEFAULT_SUBAGENT_IMPORT_LIMIT, JobAlert, LongRunningJob,
+    DEFAULT_LONG_JOB_ALERT_AFTER, DEFAULT_SUBAGENT_IMPORT_LIMIT, DirectoryReset,
+    DirectoryResetReason, JobAlert, LongRunningJob,
     PermissionEvent, PermissionEventReceiver, PermissionEventStage, StartedBackgroundTask,
     StdinBlockedJob, StdinProbeFailedJob, TerminalArgs, TerminalBackgroundArgs,
     TerminalBackgroundTool, TerminalBinding, TerminalError, TerminalExecutionMode, TerminalTool,

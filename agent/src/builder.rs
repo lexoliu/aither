@@ -692,6 +692,7 @@ where
             fast: std::sync::Arc::new(self.fast),
             compaction_model: self.compaction_model.map(std::sync::Arc::new),
             idle_compacted: false,
+            session: crate::agent::SessionPhase::NotStarted,
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,
@@ -938,7 +939,7 @@ mod tests {
         let subagent = terminal
             .binding()
             .launcher()
-            .create(SubagentGrant::new())
+            .create(SubagentGrant::new(), None, None)
             .await
             .unwrap();
         let space = subagent.working_dir().clone();
