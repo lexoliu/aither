@@ -91,7 +91,9 @@ struct RefTransaction<'a> {
     deletes: Vec<RefDelete<'a>>,
     /// The commit the worktree's entry is to be detached at.
     detached: Option<&'a str>,
-    entry: &'a str,
+    /// The branch the worktree's entry's HEAD is to point at, moving in the
+    /// same transaction as the namespace refs so a failure leaves neither.
+    symbolic: Option<&'a str>,
 }
 
 impl RefTransaction<'_> {
@@ -100,6 +102,7 @@ impl RefTransaction<'_> {
             && self.creates.is_empty()
             && self.deletes.is_empty()
             && self.detached.is_none()
+            && self.symbolic.is_none()
     }
 }
 
@@ -552,14 +555,7 @@ impl CommittingWorktree {
             creates: Vec::new(),
             deletes: Vec::new(),
             detached: None,
-            entry: self
-                .git_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| CommitLedgerError::Output {
-                    repository: self.git_dir.clone(),
-                    line: self.git_dir.display().to_string(),
-                })?,
+            symbolic: None,
         };
         for (name, new) in &report.refs {
             match old_of(name) {
@@ -573,15 +569,16 @@ impl CommittingWorktree {
                 transaction.deletes.push(RefDelete { name, old });
             }
         }
-        if let Head::Detached(id) = &report.head
-            && report.head != *entry_head
-        {
-            transaction.detached = Some(id);
+        if report.head != *entry_head {
+            match &report.head {
+                Head::Detached(id) => transaction.detached = Some(id),
+                Head::Symbolic(branch) => transaction.symbolic = Some(branch),
+            }
         }
         if !transaction.is_empty() {
             // Once it is under way it is left to finish: killed, it would
             // leave the lock files of the refs it was moving behind.
-            let applied = HostGit::in_repository(&self.common_dir, &["update-ref", "--stdin"])
+            let applied = HostGit::in_repository(&self.git_dir, &["update-ref", "--stdin"])
                 .finish_when_dropped()
                 .output(input(render(&transaction).into_bytes()))
                 .await?;
@@ -598,14 +595,6 @@ impl CommittingWorktree {
                     },
                 });
             }
-        }
-        if let Head::Symbolic(branch) = &report.head
-            && report.head != *entry_head
-        {
-            HostGit::in_repository(&self.git_dir, &["symbolic-ref", "HEAD", branch])
-                .finish_when_dropped()
-                .succeed(Vec::new())
-                .await?;
         }
         Ok(())
     }

@@ -2,5 +2,6 @@
 {% endfor %}{% for create in creates %}create {{ create.name }} {{ create.new }}
 {% endfor %}{% for delete in deletes %}delete {{ delete.name }} {{ delete.old }}
 {% endfor %}{% if let Some(id) = detached %}option no-deref
-update worktrees/{{ entry }}/HEAD {{ id }}
+update HEAD {{ id }}
+{% endif %}{% if let Some(target) = symbolic %}symref-update HEAD {{ target }}
 {% endif %}
