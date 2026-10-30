@@ -2351,6 +2351,9 @@ mod tests {
             .collect()
     }
 
+    // Sandboxed git runs only off Windows: a package's ancestors carry
+    // traverse alone, and git resolves its paths through a read on each.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_completed_run_lists_the_commits_made_in_its_granted_worktree() {
         let fixture = CommitFixture::new().await;
@@ -2368,6 +2371,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_run_lists_the_commits_made_in_its_granted_worktree() {
         let fixture = CommitFixture::new().await;
@@ -2419,6 +2423,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn cancelled_run_lists_the_commits_made_in_its_granted_worktree() {
         let fixture = CommitFixture::new().await;
