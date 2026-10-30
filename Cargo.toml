@@ -87,7 +87,7 @@ aither-command = { path = "./tools/command", version = "0.11.0" }
 aither-mcp = { path = "./mcp", version = "0.11.0" }
 aither-acp = { path = "./acp", version = "0.11.0" }
 aither-sandbox = { path = "./sandbox", version = "0.11.0" }
-aither-agent = { path = "./agent", version = "0.11.0" }
+aither-agent = { path = "./agent", version = "0.11.0", default-features = false }
 aither-openai = { path = "./openai", version = "0.11.0" }
 aither-claude = { path = "./claude", version = "0.11.0" }
 aither-cloud = { path = "./cloud", version = "0.11.0" }
@@ -117,7 +117,7 @@ aither-llama = { workspace = true, optional = true }
 aither-ort = { workspace = true, optional = true }
 
 # High-level features
-aither-agent = { workspace = true, optional = true }
+aither-agent = { workspace = true, optional = true, default-features = true }
 aither-rag = { workspace = true, optional = true }
 aither-mem0 = { workspace = true, optional = true }
 aither-skills = { workspace = true, optional = true }
