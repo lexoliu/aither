@@ -1497,6 +1497,7 @@ fn quick(millis: u64) -> ImportLimits {
     }
 }
 
+#[cfg(unix)]
 fn make_fifo(path: &Path) {
     let status = std::process::Command::new("mkfifo")
         .arg(path)
@@ -1605,6 +1606,7 @@ async fn the_tidying_after_an_import_is_bounded_in_time() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn a_fifo_planted_in_the_subagents_repository_cannot_hang_the_main_agent() {
     // One planted as a ref file, one behind a config include: every git in
     // the repository reads both.
@@ -1656,6 +1658,7 @@ fn deep_layout(root: &Path) -> (PathBuf, PathBuf) {
     (repository, worktree)
 }
 
+#[cfg(unix)]
 fn planted_hook(directory: &Path, marker: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::create_dir_all(directory).unwrap();
@@ -1665,6 +1668,7 @@ fn planted_hook(directory: &Path, marker: &Path) {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn host_git_runs_no_hook_a_subagent_could_have_placed() {
     let dir = tempfile::tempdir().unwrap();
     let (repository, worktree) = deep_layout(dir.path());
@@ -1837,6 +1841,7 @@ async fn an_import_never_removes_a_directory_it_did_not_create() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn killing_the_update_of_the_refs_would_leave_locks_but_letting_it_finish_does_not() {
     let dir = tempfile::tempdir().unwrap();
     let repository = dir.path().join("repository");
@@ -1958,6 +1963,7 @@ async fn the_byte_budget_is_read_at_each_import() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn a_gitfile_the_subagent_replaced_is_never_followed_or_waited_on() {
     let fixture = Fixture::new("gitfile").await;
     let dot_git = fixture.worktree.join(".git");
