@@ -235,7 +235,7 @@ mod tests {
             "git version 1.9.5",
             "git version 2.7.4",
         ] {
-            let error = check_version(old).expect_err("negative refspecs need git 2.29");
+            let error = check_version(old).expect_err("symref-update needs git 2.46");
             assert!(
                 matches!(&error, SubagentGrantError::GitTooOld { found } if found == old),
                 "{error}"
@@ -243,7 +243,7 @@ mod tests {
             assert!(error.to_string().contains(old), "{error}");
         }
         for fine in [
-            "git version 2.29.0",
+            "git version 2.46.0",
             "git version 2.54.0 (Apple Git-157)",
             "git version 3.0.1",
         ] {
