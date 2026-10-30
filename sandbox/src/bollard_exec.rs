@@ -185,14 +185,33 @@ enum StreamEvent {
     Cancel,
 }
 
-fn append_log_output(output: LogOutput, stdout: &mut Vec<u8>, stderr: &mut Vec<u8>) {
+/// How much of a streamed exec's stderr is kept for a message. The rest is
+/// read and dropped, so the process is never held back and memory never grows
+/// with what it prints.
+const STREAMED_STDERR_KEPT: usize = 8 * 1024;
+
+/// Appends `chunk` to `kept` up to `cap` bytes in all.
+fn append_capped(kept: &mut Vec<u8>, chunk: &[u8], cap: usize) {
+    let room = cap.saturating_sub(kept.len());
+    kept.extend_from_slice(&chunk[..chunk.len().min(room)]);
+}
+
+/// Collects one chunk of output. The stderr kept is bounded when `streamed`,
+/// for an exec whose stdout is streamed away and so never accumulates.
+fn append_log_output(
+    output: LogOutput,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    streamed: bool,
+) {
     match output {
         LogOutput::StdOut { message } | LogOutput::Console { message } => {
             stdout.extend_from_slice(&message);
         }
-        LogOutput::StdErr { message } => {
-            stderr.extend_from_slice(&message);
+        LogOutput::StdErr { message } if streamed => {
+            append_capped(stderr, &message, STREAMED_STDERR_KEPT);
         }
+        LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
         LogOutput::StdIn { .. } => {}
     }
 }
@@ -352,6 +371,150 @@ async fn start_attached_exec(
     }
 }
 
+/// What became of one output chunk handed to a streaming consumer.
+enum Forwarded {
+    /// The consumer took the chunk.
+    Sent,
+    /// The consumer is gone, so the exec has no reason to run on.
+    ConsumerGone,
+    /// The exec was told to stop while the consumer was not keeping up.
+    Killed,
+}
+
+/// Hands `bytes` to `sink`, giving way to a kill while the sink is full.
+async fn forward_stdout(
+    sink: &Sender<Vec<u8>>,
+    bytes: Vec<u8>,
+    kill_rx: &Receiver<()>,
+) -> Forwarded {
+    tokio::select! {
+        sent = sink.send(bytes) => if sent.is_ok() { Forwarded::Sent } else { Forwarded::ConsumerGone },
+        () = async {
+            let _ = kill_rx.recv().await;
+        } => Forwarded::Killed,
+    }
+}
+
+/// Everything one exec needs besides its client.
+struct ExecRequest {
+    container_id: String,
+    script: String,
+    working_dir: String,
+    kill_rx: Receiver<()>,
+    stdin_rx: Receiver<Vec<u8>>,
+    stdin_blocked: Option<Sender<StdinWatchSignal>>,
+    /// Where stdout goes chunk by chunk instead of into the outcome.
+    stdout_sink: Option<Sender<Vec<u8>>>,
+}
+
+/// Runs one exec to completion, or until it is killed.
+async fn run_exec(client: &Docker, request: ExecRequest) -> Result<ContainerExecOutcome, String> {
+    let ExecRequest {
+        container_id,
+        script,
+        working_dir,
+        kill_rx,
+        stdin_rx,
+        stdin_blocked,
+        stdout_sink,
+    } = request;
+    // Docker reports the exec's pid in the host's namespace, which a
+    // probe inside the container cannot use: the exec root records
+    // its own in-container pid for the stdin probe and the kill path.
+    let pid_file = format!(
+        "/tmp/aither-exec-stdin-{}.pid",
+        uuid::Uuid::new_v4().simple()
+    );
+    let (exec_id, mut output, mut input) =
+        start_attached_exec(client, &container_id, &script, &pid_file, &working_dir).await?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut watch = stdin_blocked.map(|signal| StdinWatch {
+        signal,
+        detector: EpisodeDetector::default(),
+        fed: 0,
+    });
+    let mut ticker = async_io::Timer::interval(CONTAINER_STDIN_WATCH_INTERVAL);
+    let mut stdin_open = true;
+
+    loop {
+        let event = tokio::select! {
+            output = async { output.next().await } => StreamEvent::Output(output),
+            () = async {
+                let _ = kill_rx.recv().await;
+            } => StreamEvent::Cancel,
+            bytes = async { stdin_rx.recv().await }, if stdin_open => StreamEvent::Stdin(bytes),
+            _ = async { ticker.next().await }, if watch.is_some() => StreamEvent::WatchTick,
+        };
+
+        let cancel = match event {
+            StreamEvent::Output(Some(Ok(output))) => match (&stdout_sink, output) {
+                (Some(sink), LogOutput::StdOut { message } | LogOutput::Console { message }) => {
+                    !matches!(
+                        forward_stdout(sink, message.to_vec(), &kill_rx).await,
+                        Forwarded::Sent
+                    )
+                }
+                (_, output) => {
+                    append_log_output(output, &mut stdout, &mut stderr, stdout_sink.is_some());
+                    false
+                }
+            },
+            StreamEvent::Output(Some(Err(e))) => {
+                return Err(format!("exec stream error: {e}"));
+            }
+            StreamEvent::Output(None) => {
+                break;
+            }
+            StreamEvent::Stdin(Ok(bytes)) => {
+                if let Some(watch) = watch.as_mut() {
+                    watch.fed += 1;
+                }
+                write_container_stdin(&mut input, &bytes).await?;
+                false
+            }
+            StreamEvent::Stdin(Err(_)) => {
+                shutdown_container_stdin(&mut input).await?;
+                stdin_open = false;
+                false
+            }
+            StreamEvent::Cancel => true,
+            StreamEvent::WatchTick => {
+                handle_container_watch_tick(WatchTick {
+                    client,
+                    container_id: &container_id,
+                    exec_id: &exec_id,
+                    pid_file: &pid_file,
+                    input: &mut input,
+                    stdin_open: &mut stdin_open,
+                    watch: &mut watch,
+                })
+                .await;
+                false
+            }
+        };
+        if cancel {
+            if stdin_open {
+                let _ = shutdown_container_stdin(&mut input).await;
+            }
+            // A job the kill could not stop is still running, so
+            // it must not be reported killed.
+            kill_exec_inside_container(client, &container_id, &exec_id, &pid_file)
+                .await
+                .map_err(|error| format!("failed to kill container exec: {error}"))?;
+            return Ok(ContainerExecOutcome::Killed);
+        }
+    }
+
+    let status = inspect_exec_exit_status(client, &exec_id).await?;
+    Ok(ContainerExecOutcome::Completed(Output {
+        status,
+        stdout,
+        stderr,
+    }))
+}
+
 impl ContainerExec for BollardContainerExec {
     fn exec(
         &self,
@@ -362,96 +525,39 @@ impl ContainerExec for BollardContainerExec {
         stdin_rx: Receiver<Vec<u8>>,
         stdin_blocked: Option<Sender<StdinWatchSignal>>,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
-        let container_id = container_id.to_string();
-        let script = script.to_string();
-        let working_dir = working_dir.to_string();
+        let request = ExecRequest {
+            container_id: container_id.to_string(),
+            script: script.to_string(),
+            working_dir: working_dir.to_string(),
+            kill_rx,
+            stdin_rx,
+            stdin_blocked,
+            stdout_sink: None,
+        };
         let client = self.client.clone();
+        async move { run_exec(&client, request).await }
+    }
 
-        async move {
-            // Docker reports the exec's pid in the host's namespace, which a
-            // probe inside the container cannot use: the exec root records
-            // its own in-container pid for the stdin probe and the kill path.
-            let pid_file = format!(
-                "/tmp/aither-exec-stdin-{}.pid",
-                uuid::Uuid::new_v4().simple()
-            );
-            let (exec_id, mut output, mut input) =
-                start_attached_exec(&client, &container_id, &script, &pid_file, &working_dir)
-                    .await?;
-
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            let mut watch = stdin_blocked.map(|signal| StdinWatch {
-                signal,
-                detector: EpisodeDetector::default(),
-                fed: 0,
-            });
-            let mut ticker = async_io::Timer::interval(CONTAINER_STDIN_WATCH_INTERVAL);
-            let mut stdin_open = true;
-
-            loop {
-                let event = tokio::select! {
-                    output = async { output.next().await } => StreamEvent::Output(output),
-                    () = async {
-                        let _ = kill_rx.recv().await;
-                    } => StreamEvent::Cancel,
-                    bytes = async { stdin_rx.recv().await }, if stdin_open => StreamEvent::Stdin(bytes),
-                    _ = async { ticker.next().await }, if watch.is_some() => StreamEvent::WatchTick,
-                };
-
-                match event {
-                    StreamEvent::Output(Some(Ok(output))) => {
-                        append_log_output(output, &mut stdout, &mut stderr);
-                    }
-                    StreamEvent::Output(Some(Err(e))) => {
-                        return Err(format!("exec stream error: {e}"));
-                    }
-                    StreamEvent::Output(None) => {
-                        break;
-                    }
-                    StreamEvent::Stdin(Ok(bytes)) => {
-                        if let Some(watch) = watch.as_mut() {
-                            watch.fed += 1;
-                        }
-                        write_container_stdin(&mut input, &bytes).await?;
-                    }
-                    StreamEvent::Stdin(Err(_)) => {
-                        shutdown_container_stdin(&mut input).await?;
-                        stdin_open = false;
-                    }
-                    StreamEvent::Cancel => {
-                        if stdin_open {
-                            let _ = shutdown_container_stdin(&mut input).await;
-                        }
-                        // A job the kill could not stop is still running, so
-                        // it must not be reported killed.
-                        kill_exec_inside_container(&client, &container_id, &exec_id, &pid_file)
-                            .await
-                            .map_err(|error| format!("failed to kill container exec: {error}"))?;
-                        return Ok(ContainerExecOutcome::Killed);
-                    }
-                    StreamEvent::WatchTick => {
-                        handle_container_watch_tick(WatchTick {
-                            client: &client,
-                            container_id: &container_id,
-                            exec_id: &exec_id,
-                            pid_file: &pid_file,
-                            input: &mut input,
-                            stdin_open: &mut stdin_open,
-                            watch: &mut watch,
-                        })
-                        .await;
-                    }
-                }
-            }
-
-            let status = inspect_exec_exit_status(&client, &exec_id).await?;
-            Ok(ContainerExecOutcome::Completed(Output {
-                status,
-                stdout,
-                stderr,
-            }))
-        }
+    fn exec_streamed(
+        &self,
+        container_id: &str,
+        script: &str,
+        working_dir: &str,
+        kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
+        stdout: Sender<Vec<u8>>,
+    ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
+        let request = ExecRequest {
+            container_id: container_id.to_string(),
+            script: script.to_string(),
+            working_dir: working_dir.to_string(),
+            kill_rx,
+            stdin_rx,
+            stdin_blocked: None,
+            stdout_sink: Some(stdout),
+        };
+        let client = self.client.clone();
+        async move { run_exec(&client, request).await }
     }
 }
 
@@ -483,7 +589,26 @@ impl ExitStatusExt {
 mod tests {
     use std::process::Command;
 
-    use super::CONTAINER_EXEC_WRAPPER;
+    use super::{CONTAINER_EXEC_WRAPPER, STREAMED_STDERR_KEPT, append_capped};
+
+    /// A streamed exec's stderr never grows past its cap, whatever the
+    /// process keeps printing.
+    #[test]
+    fn streamed_stderr_is_kept_only_up_to_its_cap() {
+        let mut kept = Vec::new();
+        let chunk = vec![b'e'; 1000];
+        for _ in 0..1_000_000 {
+            append_capped(&mut kept, &chunk, STREAMED_STDERR_KEPT);
+            if kept.len() == STREAMED_STDERR_KEPT {
+                // The rest of the stream is ignored; stop feeding the test.
+                append_capped(&mut kept, &chunk, STREAMED_STDERR_KEPT);
+                break;
+            }
+        }
+        assert_eq!(kept.len(), STREAMED_STDERR_KEPT);
+        append_capped(&mut kept, b"more", STREAMED_STDERR_KEPT);
+        assert_eq!(kept.len(), STREAMED_STDERR_KEPT);
+    }
 
     fn run_wrapper(
         pid_file: &std::path::Path,

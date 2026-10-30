@@ -265,8 +265,14 @@ struct SubagentResultTemplate<'a> {
 }
 
 /// The commits listed for one run of a subagent holding a commit grant, or
-/// why they could not be listed.
-type CommitListing = Result<Vec<SubagentCommit>, CommitLedgerError>;
+/// why they could not be listed, and what could not be done to its
+/// repositories before the run.
+struct CommitListing {
+    listed: Result<Vec<SubagentCommit>, CommitLedgerError>,
+    /// Why a repository could not be refreshed or imported when the run
+    /// started: its commits stay in it, out of the main repository.
+    setbacks: Vec<String>,
+}
 
 /// What the result text reports about a subagent run.
 enum SubagentReport<'a> {
@@ -1505,7 +1511,10 @@ where
         // failure to list them is reported in their place and changes nothing
         // else about the run.
         let commits = match (&commit_ledger, &commit_mark) {
-            (Some(ledger), Some(mark)) => Some(ledger.since(mark).await),
+            (Some(ledger), Some(mark)) => Some(CommitListing {
+                listed: ledger.since(mark).await,
+                setbacks: mark.setbacks().iter().map(ToString::to_string).collect(),
+            }),
             _ => None,
         };
         let result = match outcome {
@@ -1745,11 +1754,14 @@ mod tests {
 
     #[test]
     fn commit_listings_render_as_prose() {
-        let listed: CommitListing = Ok(vec![SubagentCommit {
-            worktree: PathBuf::from("/work/tree"),
-            commit: "abc123".to_string(),
-            subject: "fix the parser".to_string(),
-        }]);
+        let listed = CommitListing {
+            listed: Ok(vec![SubagentCommit {
+                worktree: PathBuf::from("/work/tree"),
+                commit: "abc123".to_string(),
+                subject: "fix the parser".to_string(),
+            }]),
+            setbacks: Vec::new(),
+        };
         let completed = SubagentResultTemplate {
             subagent: "worker",
             outcome: SubagentReport::Completed {
@@ -1767,7 +1779,10 @@ mod tests {
             "Subagent 'worker' completed.\n\ndone\n\nContinue this subagent with `subagent resume --id 3` while its prompt cache is still warm.\n\nIt idled too often.\n\nCommits made in the granted worktrees:\n- abc123 fix the parser (in /work/tree)"
         );
 
-        let none: CommitListing = Ok(Vec::new());
+        let none = CommitListing {
+            listed: Ok(Vec::new()),
+            setbacks: Vec::new(),
+        };
         let cancelled = SubagentResultTemplate {
             subagent: "worker",
             outcome: SubagentReport::Cancelled,
@@ -1780,10 +1795,13 @@ mod tests {
             "Subagent 'worker' was cancelled by the user.\n\nNo commits were made in the granted worktrees."
         );
 
-        let failed: CommitListing = Err(CommitLedgerError::Git {
-            repository: PathBuf::from("/repo"),
-            stderr: "boom".to_string(),
-        });
+        let failed = CommitListing {
+            listed: Err(CommitLedgerError::Git {
+                repository: PathBuf::from("/repo"),
+                stderr: "boom".to_string(),
+            }),
+            setbacks: vec!["the repository at /repo is stuck".to_string()],
+        };
         let rendered = SubagentErrorTemplate {
             subagent: "worker",
             error: "model failed",
@@ -1794,7 +1812,7 @@ mod tests {
         .expect("subagent error should render");
         assert_eq!(
             rendered,
-            "Subagent 'worker' error: model failed\n\nThe commits made in the granted worktrees could not be listed: git failed on /repo: boom\n\nRecent subagent history:\n"
+            "Subagent 'worker' error: model failed\n\nThe commits made in the granted worktrees could not be listed: git failed on /repo: boom\n\nBefore the run started: the repository at /repo is stuck\n\nRecent subagent history:\n"
         );
     }
 

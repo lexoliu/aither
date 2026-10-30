@@ -38,6 +38,23 @@ pub trait ContainerExec: Send + Sync {
         stdin_rx: Receiver<Vec<u8>>,
         stdin_blocked: Option<Sender<StdinWatchSignal>>,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
+
+    /// Executes a command like [`Self::exec`], handing its stdout on chunk by
+    /// chunk through `stdout` as it arrives instead of collecting it.
+    ///
+    /// The returned outcome carries the exit status and stderr; its stdout is
+    /// empty. `stdout` is bounded, so a consumer that stops reading holds the
+    /// command back. The command is killed, as when `kill_rx` fires, once
+    /// `kill_rx` fires or closes, or once `stdout` has no receiver left.
+    fn exec_streamed(
+        &self,
+        container_id: &str,
+        script: &str,
+        working_dir: &str,
+        kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
+        stdout: Sender<Vec<u8>>,
+    ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
 }
 
 /// Object-safe twin of [`ContainerExec`], used only through
@@ -52,6 +69,18 @@ pub trait ContainerExecImpl: Send + Sync {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdin_blocked: Option<Sender<StdinWatchSignal>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
+
+    /// Execute a command inside a container, streaming its stdout, through a
+    /// boxed future.
+    fn exec_streamed_boxed<'a>(
+        &'a self,
+        container_id: &'a str,
+        script: &'a str,
+        working_dir: &'a str,
+        kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
+        stdout: Sender<Vec<u8>>,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
 }
 
@@ -106,6 +135,34 @@ impl ContainerExec for AnyContainerExec {
                     kill_rx,
                     stdin_rx,
                     stdin_blocked,
+                )
+                .await
+        }
+    }
+
+    fn exec_streamed(
+        &self,
+        container_id: &str,
+        script: &str,
+        working_dir: &str,
+        kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
+        stdout: Sender<Vec<u8>>,
+    ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let container_id = container_id.to_string();
+        let script = script.to_string();
+        let working_dir = working_dir.to_string();
+
+        async move {
+            inner
+                .exec_streamed_boxed(
+                    &container_id,
+                    &script,
+                    &working_dir,
+                    kill_rx,
+                    stdin_rx,
+                    stdout,
                 )
                 .await
         }
@@ -298,6 +355,18 @@ impl<T: ContainerExec> ContainerExecImpl for T {
             stdin_rx,
             stdin_blocked,
         ))
+    }
+
+    fn exec_streamed_boxed<'a>(
+        &'a self,
+        container_id: &'a str,
+        script: &'a str,
+        working_dir: &'a str,
+        kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
+        stdout: Sender<Vec<u8>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>> {
+        Box::pin(self.exec_streamed(container_id, script, working_dir, kill_rx, stdin_rx, stdout))
     }
 }
 

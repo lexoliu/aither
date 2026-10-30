@@ -120,16 +120,18 @@ pub use shell_session::{
 };
 pub use stdin_watch::StdinWatchSignal;
 pub use subagent::{
-    CommitLedger, CommitLedgerError, CommitMark, SubagentCommit, SubagentGrant, SubagentGrantError,
+    CommitLedger, CommitLedgerError, CommitMark, ImportBudget, SubagentCommit, SubagentGrant,
+    SubagentGrantError,
 };
 pub use terminal::{
     BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand,
     CompletedTask, Configured, DEFAULT_BACKGROUND_TIMEOUT_CAP, DEFAULT_FOREGROUND_LIMIT,
-    DEFAULT_LONG_JOB_ALERT_AFTER, JobAlert, LongRunningJob, PermissionEvent,
-    PermissionEventReceiver, PermissionEventStage, StartedBackgroundTask, StdinBlockedJob,
-    StdinProbeFailedJob, TerminalArgs, TerminalBackgroundArgs, TerminalBackgroundTool,
-    TerminalBinding, TerminalError, TerminalExecutionMode, TerminalTool, TerminalToolFactory,
-    TerminalToolFactoryError, Unconfigured, background_task_channel, open_network_audit_log,
+    DEFAULT_LONG_JOB_ALERT_AFTER, DEFAULT_SUBAGENT_IMPORT_LIMIT, JobAlert, LongRunningJob,
+    PermissionEvent, PermissionEventReceiver, PermissionEventStage, StartedBackgroundTask,
+    StdinBlockedJob, StdinProbeFailedJob, TerminalArgs, TerminalBackgroundArgs,
+    TerminalBackgroundTool, TerminalBinding, TerminalError, TerminalExecutionMode, TerminalTool,
+    TerminalToolFactory, TerminalToolFactoryError, Unconfigured, background_task_channel,
+    open_network_audit_log,
 };
 pub use tool_distribution::{
     HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,
