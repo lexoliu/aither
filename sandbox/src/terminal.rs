@@ -6166,7 +6166,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let config = SandboxConfig::builder()
             .network(DenyAll)
-            .working_dir(dir.path())
+            .working_dir(
+                std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf()),
+            )
             .security(SecurityConfig::interactive())
             .build();
         let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)

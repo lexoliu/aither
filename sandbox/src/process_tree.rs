@@ -2392,7 +2392,13 @@ mod tests {
             .expect("the supervised command spawns");
         let exit = child.wait().await.expect("the supervisor tears down");
         assert_eq!(exit.report.killed.len(), 1, "{:?}", exit.report.killed);
-        assert_eq!(exit.report.killed[0].name, "sleep");
+        // The name is read at kill time: caught between `setsid`'s fork and
+        // exec it is still "setsid", after it "sleep".
+        assert!(
+            matches!(exit.report.killed[0].name.as_str(), "setsid" | "sleep"),
+            "{:?}",
+            exit.report.killed[0]
+        );
         assert!(
             gone_within(exit.report.killed[0].pid, Duration::from_secs(2)).await,
             "the env-cleaned setsid child survived its job's teardown"
