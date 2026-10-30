@@ -143,6 +143,12 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
                             Grant::new(canonical(dir), Access::READ | Access::EXEC)
                         }))
                         .chain(
+                            // The repository `git -C` enters: it lives inside
+                            // the main worktree's git directory, outside the
+                            // subagent's grants.
+                            [Grant::new(canonical(repository), Access::READ)],
+                        )
+                        .chain(
                             // The alternates the repository's object store
                             // names: the main object store, as a subtree.
                             borrowed_object_stores(repository)
