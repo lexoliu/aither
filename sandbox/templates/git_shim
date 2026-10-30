@@ -1,0 +1,73 @@
+#!/bin/sh
+# A `git` wrapper for the commands of a terminal that granted commit to
+# subagents. A git whose working tree is one of those worktrees runs
+# against the worktree's host-owned repository entry instead, so nothing
+# the subagent wrote - a `.git` file, the repository's configuration,
+# hooks, fsmonitor, filters - decides what program runs.
+#
+# The terminal hands the map as AITHER_GIT_WORKTREES_COUNT and, for each
+# index, AITHER_GIT_WORKTREE_PATH_<i> and AITHER_GIT_WORKTREE_GITDIR_<i>.
+# Without it the wrapper is a pass-through.
+
+real=
+for candidate in /opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git /bin/git; do
+    if [ -x "$candidate" ]; then
+        real=$candidate
+        break
+    fi
+done
+if [ -z "$real" ]; then
+    echo "git: no git executable found" >&2
+    exit 127
+fi
+if [ "${AITHER_GIT_WORKTREES_COUNT:-0}" = 0 ]; then
+    exec "$real" "$@"
+fi
+
+# Explicit repository plumbing takes precedence over this wrapper.
+for argument in "$@"; do
+    case $argument in
+        --git-dir|--work-tree|--git-dir=*|--work-tree=*|--bare)
+            exec "$real" "$@" ;;
+    esac
+done
+
+# The directory git resolves the repository from: this shell's working
+# directory with every -C applied in order, as git applies them.
+directory=$(pwd -P)
+pending=
+for argument in "$@"; do
+    if [ -n "$pending" ]; then
+        if [ "$pending" = dir ]; then
+            resolved=$(cd -P -- "$directory" 2>/dev/null && cd -P -- "$argument" 2>/dev/null && pwd -P)
+            if [ -n "$resolved" ]; then
+                directory=$resolved
+            fi
+        fi
+        pending=
+        continue
+    fi
+    case $argument in
+        -C) pending=dir ;;
+        -c|--config-env|--exec-path|--namespace) pending=skip ;;
+        --) break ;;
+    esac
+done
+
+i=0
+git_dir=
+work_tree=
+while [ "$i" -lt "$AITHER_GIT_WORKTREES_COUNT" ]; do
+    eval "worktree=\$AITHER_GIT_WORKTREE_PATH_$i"
+    case $directory in
+        "$worktree"|"$worktree"/*)
+            eval "git_dir=\$AITHER_GIT_WORKTREE_GITDIR_$i"
+            work_tree=$worktree
+            break ;;
+    esac
+    i=$((i + 1))
+done
+if [ -n "$git_dir" ]; then
+    GIT_DIR=$git_dir GIT_WORK_TREE=$work_tree exec "$real" "$@"
+fi
+exec "$real" "$@"

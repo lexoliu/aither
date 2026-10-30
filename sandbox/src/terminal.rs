@@ -1890,6 +1890,9 @@ where
                 history,
             )
             .await?;
+        self.registry
+            .registry()
+            .record_committed(&granted.committing);
 
         let space = spaces_root.join(crate::naming::random_word_slug(4));
         let container = mount
@@ -3476,6 +3479,84 @@ async fn save_completed_stderr(
     }
 }
 
+/// The `git` shim every sandboxed command's PATH resolves first: a git
+/// run in a committing worktree reads the worktree's host-owned entry
+/// instead of whatever `.git` its subagent wrote.
+#[cfg(unix)]
+const GIT_SHIM: &str = include_str!("../templates/git_shim");
+
+/// Writes the `git` shim into the prepared tools directory once: the
+/// commands' PATH sees it ahead of the system's `git`.
+#[cfg(unix)]
+async fn write_git_shim(tools: &PreparedTools<PathBuf>) -> Result<(), TerminalError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let shim = tools.bin_dir().join("git");
+    match async_fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&shim)
+        .await
+    {
+        Ok(mut file) => {
+            file.write_all(GIT_SHIM.as_bytes()).await.map_err(|error| {
+                TerminalError::Execution(format!("writing {}: {error}", shim.display()))
+            })?;
+            file.flush().await.map_err(|error| {
+                TerminalError::Execution(format!("writing {}: {error}", shim.display()))
+            })?;
+            async_fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .await
+                .map_err(|error| {
+                    TerminalError::Execution(format!("writing {}: {error}", shim.display()))
+                })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(TerminalError::Execution(format!(
+            "writing {}: {error}",
+            shim.display()
+        ))),
+    }
+}
+
+/// Windows commands run no `sh`: no shim, and the worktrees' git map is
+/// never handed out either.
+#[cfg(not(unix))]
+async fn write_git_shim(_tools: &PreparedTools<PathBuf>) -> Result<(), TerminalError> {
+    Ok(())
+}
+
+/// Hands the git shim of a main terminal's commands the worktree map.
+///
+/// A command's `git` in a committing worktree resolves the worktree's
+/// host-owned repository entry through `GIT_DIR`, so nothing a subagent
+/// wrote — a `.git` file, the repository's configuration, hooks,
+/// fsmonitor or filter programs — decides what program git runs. The
+/// map only describes paths the host resolved when the grant was made.
+/// Subagent terminals keep their own repositories' view.
+fn committed_git_environment(registry: &ToolRegistry, environment: &mut Vec<(String, String)>) {
+    if registry.role() != crate::command::CommandRole::Main {
+        return;
+    }
+    let committed = registry.committed_worktrees();
+    if committed.is_empty() {
+        return;
+    }
+    environment.push((
+        "AITHER_GIT_WORKTREES_COUNT".to_string(),
+        committed.len().to_string(),
+    ));
+    for (index, worktree) in committed.iter().enumerate() {
+        environment.push((
+            format!("AITHER_GIT_WORKTREE_PATH_{index}"),
+            worktree.worktree().display().to_string(),
+        ));
+        environment.push((
+            format!("AITHER_GIT_WORKTREE_GITDIR_{index}"),
+            worktree.git_dir().display().to_string(),
+        ));
+    }
+}
+
 fn local_path_grants<'a>(
     writable: &'a [PathBuf],
     readable: &'a [PathBuf],
@@ -3510,8 +3591,10 @@ where
     E: Executor + Clone + 'static,
     N: NetworkPolicy + 'static,
 {
-    let runtime_environment =
+    write_git_shim(context.prepared_tools).await?;
+    let mut runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    committed_git_environment(context.registry, &mut runtime_environment);
     #[cfg(all(unix, feature = "jobserver"))]
     let runtime_environment =
         with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
@@ -3598,8 +3681,10 @@ where
 async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let runtime_environment =
+    write_git_shim(context.prepared_tools).await?;
+    let mut runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    committed_git_environment(context.registry, &mut runtime_environment);
     #[cfg(all(unix, feature = "jobserver"))]
     let runtime_environment =
         with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
@@ -8024,6 +8109,101 @@ mod tests {
             commits[0].commit
         );
         setup.main(&["fsck", "--strict", "--no-dangling"]);
+    }
+
+    /// The main agent's `git` in a committing worktree resolves the
+    /// worktree's host-owned repository entry through the terminal's shim:
+    /// no program the subagent's repository config names — fsmonitor,
+    /// hooks, filters — and no `.git` file it replaced decides what runs.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_main_agents_git_in_a_committing_worktree_runs_nothing_the_subagent_chose() {
+        use std::fmt::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let setup = CommitSetup::new("guarded").await;
+        let _child = setup.committing_child(&setup.parent).await;
+
+        // A program only subagent-chosen configuration can reach.
+        let marker = setup.dir.path().join("subagent-ran");
+        let program = setup.dir.path().join("ran-by-git.sh");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\nprintf ran >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hooks = setup.dir.path().join("evil-hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let pre_commit = hooks.join("pre-commit");
+        std::fs::write(
+            &pre_commit,
+            format!("#!/bin/sh\nprintf hook >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&pre_commit, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Its repository's configuration names the program everywhere a
+        // program can be named; the worktree's attributes bind the filter.
+        let mut config = std::fs::read_to_string(setup.subagent.join("config")).unwrap();
+        write!(
+            config,
+            "\n[core]\n\tfsmonitor = {}\n\thooksPath = {}\n[filter \"pwn\"]\n\tclean = {}\n\trequired = true\n",
+            program.display(),
+            hooks.display(),
+            program.display()
+        )
+        .unwrap();
+        std::fs::write(setup.subagent.join("config"), config).unwrap();
+        std::fs::write(setup.worktree.join(".gitattributes"), "* filter=pwn\n").unwrap();
+
+        let worktree = setup.worktree.display().to_string();
+        for script in [
+            format!("git -C '{worktree}' status"),
+            format!("cd '{worktree}' && git status"),
+            format!(
+                "git -C '{worktree}' add -A && \
+                 git -C '{worktree}' -c user.name=a -c user.email=a@a -c commit.gpgSign=false \
+                 commit --allow-empty -m x"
+            ),
+        ] {
+            assert_eq!(
+                exit_code_of(&setup.parent, &script).await,
+                0,
+                "the ordinary git command should keep working: {script}"
+            );
+        }
+        assert!(
+            !marker.exists(),
+            "no program of the subagent's choosing ran through the worktree's repository"
+        );
+
+        // A replaced `.git` file resolves nothing either: the shim acts on
+        // the worktree's path, not on what its `.git` says.
+        std::fs::write(
+            setup.worktree.join(".git"),
+            format!("gitdir: {}\n", setup.subagent.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            exit_code_of(&setup.parent, &format!("git -C '{worktree}' status")).await,
+            0
+        );
+        assert!(
+            !marker.exists(),
+            "a replaced .git file chose no program either"
+        );
+
+        // Git anywhere else is untouched.
+        let repository = dunce::canonicalize(setup.dir.path().join("repository")).unwrap();
+        assert_eq!(
+            exit_code_of(
+                &setup.parent,
+                &format!("git -C '{}' log --oneline -1", repository.display())
+            )
+            .await,
+            0,
+            "git in unrelated repositories still reaches them"
+        );
     }
 
     /// Nothing of the main repository's git directory is writable to a

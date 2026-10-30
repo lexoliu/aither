@@ -353,6 +353,17 @@ fn inside_any(path: &Path, roots: &[PathBuf]) -> bool {
 }
 
 impl CommittingWorktree {
+    /// The worktree.
+    pub(crate) fn worktree(&self) -> &Path {
+        &self.worktree
+    }
+
+    /// Its entry in the repository's `worktrees`: the host-owned git
+    /// directory a main agent's `git` in the worktree resolves to.
+    pub(crate) fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
     /// `refs/heads/subagent/<id>/`, as git spells the namespace.
     fn ref_prefix(&self) -> String {
         format!("refs/heads/subagent/{}/", self.namespace)
