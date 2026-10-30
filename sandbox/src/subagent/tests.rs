@@ -1773,6 +1773,81 @@ async fn a_repository_whose_commits_cannot_be_imported_does_not_lock_the_worktre
     assert!(fixture.main_has(&commit));
 }
 
+/// The worktree's HEAD moves inside the same transaction as the namespace
+/// refs: a lock on it refuses the whole import — no ref moved — and its
+/// removal lets the next one commit both.
+#[tokio::test]
+async fn a_locked_head_blocks_the_whole_import_and_its_removal_recovers() {
+    let fixture = Fixture::new("locked").await;
+    let mark = fixture.ledger.mark().await.unwrap();
+    // A branch inside the granted namespace moves the report's HEAD while
+    // leaving the entry's referent untouched, so HEAD rides the same
+    // transaction as the refs.
+    git_in(
+        &fixture.worktree,
+        &["checkout", "-b", "subagent/locked/other"],
+    );
+    let commit = fixture.commit("blocked");
+    let refs = fixture.main(&["for-each-ref"]);
+    let lock = fixture.entry.join("HEAD.lock");
+    std::fs::write(&lock, "").unwrap();
+    fixture
+        .ledger
+        .since(&mark)
+        .await
+        .expect_err("a locked HEAD refuses the import");
+    assert_eq!(
+        fixture.main(&["for-each-ref"]),
+        refs,
+        "no namespace ref moved while HEAD was unmovable"
+    );
+
+    std::fs::remove_file(&lock).unwrap();
+    let listed = fixture.ledger.since(&mark).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].commit, commit);
+}
+
+/// When an import also moves the ref the entry's HEAD points at, HEAD
+/// moves in a follow-up transaction — updating its referent already
+/// counts as updating it. A lock on it still freezes the whole import:
+/// the referent update itself needs HEAD's lock. Removing it recovers.
+#[tokio::test]
+async fn a_locked_head_blocks_an_import_moving_its_referent_too() {
+    let fixture = Fixture::new("referent").await;
+    let mark = fixture.ledger.mark().await.unwrap();
+    let commit = fixture.commit("moved");
+    // Detaching changes the entry's HEAD while the import also updates
+    // its referent: HEAD cannot ride this transaction, but its lock still
+    // covers the referent update.
+    git_in(&fixture.worktree, &["checkout", "--detach"]);
+    let refs = fixture.main(&["for-each-ref"]);
+    let lock = fixture.entry.join("HEAD.lock");
+    std::fs::write(&lock, "").unwrap();
+    fixture
+        .ledger
+        .since(&mark)
+        .await
+        .expect_err("the locked HEAD refuses the import");
+    assert_eq!(
+        fixture.main(&["for-each-ref"]),
+        refs,
+        "the namespace refs did not move either"
+    );
+
+    std::fs::remove_file(&lock).unwrap();
+    let listed = fixture.ledger.since(&mark).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].commit, commit);
+    assert_eq!(
+        std::fs::read_to_string(fixture.entry.join("HEAD"))
+            .unwrap()
+            .trim(),
+        commit,
+        "the entry's HEAD was detached at the commit once the lock went"
+    );
+}
+
 #[tokio::test]
 async fn one_worktree_that_cannot_be_prepared_does_not_hold_back_the_others() {
     let dir = tempfile::tempdir().unwrap();

@@ -104,6 +104,13 @@ impl RefTransaction<'_> {
             && self.detached.is_none()
             && self.symbolic.is_none()
     }
+
+    /// Whether the transaction moves `name`.
+    fn touches(&self, name: &str) -> bool {
+        self.updates.iter().any(|update| update.name == name)
+            || self.creates.iter().any(|create| create.name == name)
+            || self.deletes.iter().any(|delete| delete.name == name)
+    }
 }
 
 /// A directory only the host writes, in which a pack is indexed before the
@@ -575,12 +582,36 @@ impl CommittingWorktree {
                 Head::Symbolic(branch) => transaction.symbolic = Some(branch),
             }
         }
-        if !transaction.is_empty() {
+        // Updating the ref the entry's HEAD points at counts as a second
+        // update of HEAD, which update-ref refuses; HEAD then moves in a
+        // follow-up transaction of its own. One that fails leaves the
+        // entry's HEAD behind — recoverable, since the next import reads
+        // the difference and tries again.
+        let head_after = if let Head::Symbolic(referent) = entry_head
+            && transaction.touches(referent)
+        {
+            Some(RefTransaction {
+                updates: Vec::new(),
+                creates: Vec::new(),
+                deletes: Vec::new(),
+                detached: transaction.detached.take(),
+                symbolic: transaction.symbolic.take(),
+            })
+        } else {
+            None
+        };
+        for next in [Some(&transaction), head_after.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if next.is_empty() {
+                continue;
+            }
             // Once it is under way it is left to finish: killed, it would
             // leave the lock files of the refs it was moving behind.
             let applied = HostGit::in_repository(&self.git_dir, &["update-ref", "--stdin"])
                 .finish_when_dropped()
-                .output(input(render(&transaction).into_bytes()))
+                .output(input(render(next).into_bytes()))
                 .await?;
             if !applied.status.success() {
                 let now = self.namespace_refs().await?;
