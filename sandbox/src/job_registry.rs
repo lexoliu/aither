@@ -247,6 +247,9 @@ impl From<JobRequest> for JobCommand {
 #[derive(Clone, Debug)]
 pub struct JobRegistry {
     tx: Sender<JobCommand>,
+    /// The tree scanner — kept for the other unixes and the tests; on Linux
+    /// the supervisor owns each tree.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     scanner: ProcessScanner,
 }
 
@@ -341,6 +344,7 @@ impl JobRegistry {
     /// the tree follows the root from its first moments, while its children's
     /// lineage can still be read. The caller keeps `pid` unreaped until it
     /// calls [`JobTree::finish`].
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) fn start_process_tree<E: executor_core::Executor>(
         &self,
         executor: &E,

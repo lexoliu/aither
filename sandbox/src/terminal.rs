@@ -3860,6 +3860,7 @@ const SUPERVISED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// supervisor is the command's parent and owns its whole tree.
 enum LocalChild {
     /// Everywhere but Linux: the sandboxed process itself.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Plain(heel::Child),
     /// Linux, foreground lifetime: `wait` yields the command's status and
     /// the teardown's report of what it killed.
@@ -4095,33 +4096,36 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         )
         .await;
     // A foreground command gets no input channel: the dropped sender is the
-    // EOF its stdin reads.
-    let exec_lifetime = if let Some(alerts) = context.stdin_alerts {
+    // EOF its stdin reads. StdinAlerts may ride along either way; they are
+    // the background job's blocked-reader wiring.
+    let exec_lifetime = if let JobLifetime::Foreground { .. } = context.lifetime {
+        drop(input_tx);
+        ExecLifetime::Foreground
+    } else {
         context
             .job_registry
             .attach_terminal_input(pid, input_tx)
             .await;
         let (signal_tx, signal_rx) = async_channel::unbounded::<StdinWatchSignal>();
-        context
-            .executor
-            .clone()
-            .spawn(async move {
-                while let Ok(signal) = signal_rx.recv().await {
-                    match signal {
-                        StdinWatchSignal::Blocked => alerts.raise().await,
-                        StdinWatchSignal::Failed(error) => {
-                            alerts.raise_failure(error).await;
+        if let Some(alerts) = context.stdin_alerts {
+            context
+                .executor
+                .clone()
+                .spawn(async move {
+                    while let Ok(signal) = signal_rx.recv().await {
+                        match signal {
+                            StdinWatchSignal::Blocked => alerts.raise().await,
+                            StdinWatchSignal::Failed(error) => {
+                                alerts.raise_failure(error).await;
+                            }
                         }
                     }
-                }
-            })
-            .detach();
+                })
+                .detach();
+        }
         ExecLifetime::Background {
             stdin_blocked: signal_tx,
         }
-    } else {
-        drop(input_tx);
-        ExecLifetime::Foreground
     };
     context.job_registry.attach_kill_switch(pid, kill_tx).await;
     context.background_startup.report_ready().await;
