@@ -86,7 +86,7 @@ job_tree() {
   while [ "$grown" = 1 ]; do
     grown=0
     for tree_stat in /proc/[0-9]*/stat; do
-      read -r tree_line < "$tree_stat" 2>/dev/null || continue
+      read -r tree_line 2>/dev/null < "$tree_stat" || continue
       tree_pid=${tree_stat#/proc/}
       tree_pid=${tree_pid%/stat}
       # The command name may contain spaces and parentheses; the fields that
@@ -123,7 +123,7 @@ kill_tree() {
       # A zombie is already dead: nothing to stop, kill or report.
       alive "$pid" || continue
       kill -STOP "$pid" 2>/dev/null
-      read -r comm < "/proc/$pid/comm" 2>/dev/null || comm=unknown
+      read -r comm 2>/dev/null < "/proc/$pid/comm" || comm=unknown
       report="$report$pid $comm
 "
       new=1
@@ -192,7 +192,7 @@ denied=0
 pipe_sleeper() {
   sleeper=$1
   for task in /proc/$sleeper/task/*; do
-    read -r task_line < "$task/stat" 2>/dev/null || continue
+    read -r task_line 2>/dev/null < "$task/stat" || continue
     set -- ${task_line##*) }
     [ "$1" = S ] || continue
     # The kernel writes wchan without a trailing newline, so `read` would
@@ -288,7 +288,7 @@ blocked=0
 total=0
 for pid in $tree; do
   stat=/proc/$pid/stat
-  if ! read -r line < "$stat" 2>/dev/null; then
+  if ! read -r line 2>/dev/null < "$stat"; then
     [ -e "$stat" ] && denied=1
     continue
   fi

@@ -293,6 +293,10 @@ fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
 /// them. A read never holds the cache's lock.
 ///
 /// One scanner belongs to one registry, and clones share it.
+///
+/// On Linux the supervisor owns the trees it watches, so it is kept for its
+/// tests and the other Unixes.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub struct ProcessScanner {
     #[cfg(target_os = "linux")]
@@ -375,6 +379,10 @@ pub struct JobTree {
 enum TrackedJob {
     /// A handle to the job's own task, which owns the set of processes found
     /// so far. Cloning keeps a handle to the same task.
+    ///
+    /// Only the other Unixes and the tests use it: on Linux the supervisor
+    /// owns the tree.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Watched(async_channel::Sender<unix::Command>),
     /// A handle to the job's `heel supervise` supervisor: the tree is ended
     /// through it, not by signalling the process group.
@@ -383,6 +391,7 @@ enum TrackedJob {
 }
 
 #[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 impl JobTree {
     /// Starts the task of the job whose root shell is `root`, a process group
     /// leader the caller keeps unreaped until [`JobTree::finish`], and whose
@@ -571,7 +580,10 @@ impl JobTree {
     pub async fn finish(&self) {}
 }
 
+/// The watched-tree machinery a Linux build keeps for the tests and the
+/// other Unixes only: the supervisor owns the trees there.
 #[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod unix {
     use std::{collections::HashSet, io, time::Duration};
 
@@ -1188,7 +1200,10 @@ mod unix {
     }
 }
 
+/// Parts of the process-table reads are reached only through the watched
+/// tree, which the supervisor replaces on Linux.
 #[cfg(target_os = "linux")]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod platform {
     use std::{
         fs, io,
