@@ -115,10 +115,16 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
                         .chain(git.as_ref().map(|(_, dir)| {
                             Grant::new(canonical(dir), Access::READ | Access::EXEC)
                         }))
-                        .chain(std::iter::once(Grant::new(
-                            canonical(repository),
-                            Access::READ,
-                        ))),
+                        .chain(
+                            // Git checks access on every component of
+                            // `--git-dir`; ancestors of the repository that a
+                            // subtree grant does not cover get their own read
+                            // grant — the sandbox denies their listing
+                            // otherwise.
+                            repository
+                                .ancestors()
+                                .map(|path| Grant::new(canonical(path), Access::READ)),
+                        ),
                 )
                 .security(SecurityConfig::interactive())
                 .priority(self.priority)
