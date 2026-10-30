@@ -1369,7 +1369,7 @@ pub mod tests {
             .grants([heel::Grant::new(
                 heel::ResolvedPath::new(
                     std::fs::canonicalize(ready.bin_dir())
-                        .unwrap_or_else(|_| ready.bin_dir().to_path_buf()),
+                        .unwrap_or_else(|_| ready.bin_dir().clone()),
                 )
                 .unwrap(),
                 heel::Access::EXEC,
