@@ -32,6 +32,19 @@ use alloc::string::String;
 pub struct ReasoningState {
     provider: String,
     payload: String,
+    /// Whether the state is bound to the exact prefix that produced it.
+    ///
+    /// Anthropic's preserved thinking is: a request replaying a thinking block
+    /// under a changed prefix — a client-side compaction summary, say — is
+    /// rejected with a 400, so the state must be dropped when the prefix
+    /// changes rather than replayed. `OpenAI`'s encrypted items and Gemini's
+    /// thought signatures verify themselves, not the surrounding
+    /// conversation, and stay valid.
+    ///
+    /// Defaults to `false` so states serialized before the flag existed keep
+    /// replaying as they did.
+    #[cfg_attr(feature = "serde", serde(default))]
+    bound: bool,
 }
 
 impl ReasoningState {
@@ -40,12 +53,36 @@ impl ReasoningState {
     /// `provider` should be the stable short name the provider crate uses for
     /// itself (`"claude"`, `"openai"`, `"gemini"`), and `payload` its own
     /// encoding of the block, which it alone will decode.
+    ///
+    /// The state is taken as prefix-independent; a provider whose reasoning
+    /// verifies the conversation around it uses [`bound`](Self::bound).
     #[must_use]
     pub fn new(provider: impl Into<String>, payload: impl Into<String>) -> Self {
         Self {
             provider: provider.into(),
             payload: payload.into(),
+            bound: false,
         }
+    }
+
+    /// Creates reasoning state bound to the prefix that produced it.
+    ///
+    /// Same as [`new`](Self::new), but the state is marked so a rewrite of the
+    /// conversation prefix — a generic compaction — drops it instead of
+    /// replaying it into a request the provider would reject.
+    #[must_use]
+    pub fn bound(provider: impl Into<String>, payload: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            payload: payload.into(),
+            bound: true,
+        }
+    }
+
+    /// Whether this state is valid only under the prefix that produced it.
+    #[must_use]
+    pub const fn is_bound(&self) -> bool {
+        self.bound
     }
 
     /// The provider that produced this state.

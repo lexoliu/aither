@@ -268,6 +268,21 @@ impl Message {
         }
     }
 
+    /// Drops every reasoning state bound to the conversation's old prefix.
+    ///
+    /// Prefix-bound reasoning (Anthropic thinking blocks) verifies the context
+    /// it was produced under, so replaying it after a rewrite — a compaction
+    /// handoff — fails. Stripping is all-or-nothing per provider, which
+    /// matches the rule Anthropic states: it rejects a turn whose thinking was
+    /// partially dropped, and the states of one provider's turn are bound
+    /// together or not at all. Prefix-independent reasoning (`OpenAI`'s
+    /// encrypted items, Gemini's signatures) is kept.
+    pub fn strip_bound_reasoning(&mut self) {
+        if let Self::Assistant { reasoning, .. } = self {
+            reasoning.retain(|state| !state.is_bound());
+        }
+    }
+
     /// Creates a new system message.
     pub fn system(content: impl Into<String>) -> Self {
         Self::System {
