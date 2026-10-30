@@ -127,13 +127,12 @@ pub use subagent::{
 };
 pub use terminal::{
     BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand,
-    CompletedTask, Configured, DEFAULT_BACKGROUND_TIMEOUT_CAP, DEFAULT_FOREGROUND_LIMIT,
-    DEFAULT_LONG_JOB_ALERT_AFTER, DirectoryReset, DirectoryResetReason, JobAlert, LongRunningJob,
+    CompletedTask, Configured, DEFAULT_FOREGROUND_WAIT, DEFAULT_LONG_JOB_ALERT_AFTER,
+    DEFAULT_TIMEOUT_CAP, DirectoryReset, DirectoryResetReason, JobAlert, LongRunningJob,
     PermissionEvent, PermissionEventReceiver, PermissionEventStage, StartedBackgroundTask,
-    StdinBlockedJob, StdinProbeFailedJob, TerminalArgs, TerminalBackgroundArgs,
-    TerminalBackgroundTool, TerminalBinding, TerminalError, TerminalExecutionMode, TerminalTool,
-    TerminalToolFactory, TerminalToolFactoryError, Unconfigured, background_task_channel,
-    open_network_audit_log,
+    StdinBlockedJob, StdinProbeFailedJob, TerminalArgs, TerminalBinding, TerminalError,
+    TerminalExecutionMode, TerminalTool, TerminalToolFactory, TerminalToolFactoryError,
+    Unconfigured, background_task_channel, open_network_audit_log,
 };
 pub use tool_distribution::{
     HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,

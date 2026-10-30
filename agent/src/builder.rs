@@ -600,9 +600,6 @@ where
         self.sandbox_dir = Some(terminal_tool.working_dir().clone());
         self.restore_dir = Some(terminal_tool.working_dir().clone());
         self.tools
-            .register(terminal_tool.background_tool())
-            .expect("tool registration must succeed: duplicate name or missing description");
-        self.tools
             .register(terminal_tool)
             .expect("tool registration must succeed: duplicate name or missing description");
         self.background_receiver = Some(background_receiver);
@@ -715,6 +712,7 @@ where
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
+            detached_task_ids: std::collections::HashSet::new(),
             sandbox_dir: self.sandbox_dir,
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,

@@ -151,6 +151,7 @@ fn args(script: &str, mode: &str) -> serde_json::Value {
         "script": script,
         "mode": mode,
         "raw": true,
+        "timeout": 60,
     })
 }
 
@@ -260,15 +261,10 @@ async fn a_background_command_is_gated_too() {
     let mut background = args("echo $(rm -rf /nowhere)", "sandboxed");
     background["timeout"] = 30.into();
     let arguments = serde_json::from_value(background).unwrap();
-    let refusal = tokio::time::timeout(
-        BOUND,
-        terminal
-            .background_tool()
-            .call(arguments, ToolContext::new()),
-    )
-    .await
-    .expect("the call finishes within its bound")
-    .expect_err("the background command is blocked");
+    let refusal = tokio::time::timeout(BOUND, terminal.run_background(arguments))
+        .await
+        .expect("the call finishes within its bound")
+        .expect_err("the background command is blocked");
     assert!(
         refusal.to_string().contains("rm -rf is not allowed here"),
         "{refusal}"
