@@ -55,8 +55,29 @@ pub(super) struct LocalGit<E> {
     pub priority: ProcessPriority,
 }
 
+/// The host's own `git` as an absolute path, so a sandboxed git does not
+/// depend on the sandbox's `PATH` — which holds only system directories on
+/// Windows, where `git` never lives. The directory that holds it is granted
+/// beside it: the binary's sibling libraries live there.
+fn host_git_binary() -> Option<(PathBuf, PathBuf)> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for name in ["git", "git.exe"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some((candidate, dir));
+            }
+        }
+    }
+    None
+}
+
 impl<E: Executor + Clone + 'static> LocalGit<E> {
-    async fn run_in_sandbox(&self, run: SandboxedRun<'_>) -> Result<SandboxedExit, ExportError> {
+    /// The sandbox the export's git runs in, and the program it launches:
+    /// the host's resolved `git`, falling back to a bare `git` when the host
+    /// itself cannot find one — the error then is the launch's to report.
+    async fn sandbox(&self) -> Result<(Sandbox, String), ExportError> {
+        let git = host_git_binary();
         let config = SandboxConfig::builder()
             .network(DenyAll)
             .working_dir(&self.working_dir)
@@ -68,6 +89,10 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
                         self.readable
                             .iter()
                             .map(|path| Grant::new(path, Access::READ)),
+                    )
+                    .chain(
+                        git.as_ref()
+                            .map(|(_, dir)| Grant::new(dir, Access::READ | Access::EXEC)),
                     ),
             )
             .security(SecurityConfig::interactive())
@@ -76,8 +101,17 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
         let sandbox = Sandbox::with_config_and_executor(config, self.executor.clone())
             .await
             .map_err(|error| ExportError::Launch(error.to_string()))?;
+        let program = git.map_or_else(
+            || "git".to_string(),
+            |(path, _)| path.to_string_lossy().into_owned(),
+        );
+        Ok((sandbox, program))
+    }
+
+    async fn run_in_sandbox(&self, run: SandboxedRun<'_>) -> Result<SandboxedExit, ExportError> {
+        let (sandbox, program) = self.sandbox().await?;
         let child = sandbox
-            .command("git")
+            .command(program)
             .arg("--git-dir")
             .arg(run.repository.to_string_lossy())
             .args(run.args)
