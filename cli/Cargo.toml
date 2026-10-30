@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 aither-acp.workspace = true
-aither-agent = { workspace = true, features = ["full"] }
+aither-agent = { workspace = true, default-features = true, features = ["full"] }
 aither-cloud.workspace = true
 aither-core.workspace = true
 aither-mcp.workspace = true
