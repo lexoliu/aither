@@ -60,6 +60,20 @@ pub(super) struct LocalGit<E> {
 /// Windows, where `git` never lives. The directory that holds it is granted
 /// beside it: the binary's sibling libraries live there.
 fn host_git_binary() -> Option<(PathBuf, PathBuf)> {
+    // `/usr/bin/git` on macOS is the xcode-select stub: it execs the real
+    // toolchain git, which a grant on `/usr/bin` does not cover. `xcrun`
+    // names the resolved binary.
+    #[cfg(target_os = "macos")]
+    if let Ok(resolved) = std::process::Command::new("xcrun")
+        .args(["-f", "git"])
+        .output()
+        && resolved.status.success()
+    {
+        let path = PathBuf::from(String::from_utf8_lossy(&resolved.stdout).trim());
+        if let (true, Some(dir)) = (path.is_file(), path.parent().map(Path::to_path_buf)) {
+            return Some((path, dir));
+        }
+    }
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         for name in ["git", "git.exe"] {
@@ -84,6 +98,16 @@ fn canonical(path: &std::path::Path) -> PathBuf {
         .map_or_else(|| resolved.clone(), PathBuf::from)
 }
 
+/// The object stores the repository borrows through its
+/// `objects/info/alternates`, as absolute paths. Each line there is relative
+/// to the repository's object directory.
+fn borrowed_object_stores(repository: &Path) -> Vec<PathBuf> {
+    let objects = repository.join("objects");
+    std::fs::read_to_string(objects.join("info/alternates"))
+        .map(|alternates| alternates.lines().map(|line| objects.join(line)).collect())
+        .unwrap_or_default()
+}
+
 impl<E: Executor + Clone + 'static> LocalGit<E> {
     /// The sandbox the export's git runs in, and the program it launches:
     /// the host's resolved `git`, falling back to a bare `git` when the host
@@ -93,16 +117,19 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
     /// differently-spelled object, and git refuses to start where it cannot
     /// read the current directory. The repository is granted read beside the
     /// subagent's grants: it lives inside the main worktree's git directory,
-    /// outside them.
+    /// outside them. So are the pieces of the main repository the export's
+    /// reads resolve to — the object store its alternates name and the
+    /// configuration its own includes — spelled exactly, because a directory
+    /// grant would open everything beneath it. The working directory is the
+    /// subagent's own space, already granted: a sandbox denies exec beneath
+    /// its working directory, so the git binary's directory would be denied
+    /// exec the moment it was chosen.
     async fn sandbox(&self, repository: &Path) -> Result<(Sandbox, String), ExportError> {
         let git = host_git_binary();
         let config =
             SandboxConfig::builder()
                 .network(DenyAll)
-                .working_dir(
-                    git.as_ref()
-                        .map_or_else(|| canonical(&self.working_dir), |(_, dir)| canonical(dir)),
-                )
+                .working_dir(canonical(&self.working_dir))
                 .grants(
                     self.writable
                         .iter()
@@ -116,14 +143,21 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
                             Grant::new(canonical(dir), Access::READ | Access::EXEC)
                         }))
                         .chain(
-                            // Git checks access on every component of
-                            // `--git-dir`; ancestors of the repository that a
-                            // subtree grant does not cover get their own read
-                            // grant — the sandbox denies their listing
-                            // otherwise.
-                            repository
-                                .ancestors()
-                                .map(|path| Grant::new(canonical(path), Access::READ)),
+                            // The alternates the repository's object store
+                            // names: the main object store, as a subtree.
+                            borrowed_object_stores(repository)
+                                .into_iter()
+                                .map(|store| Grant::new(canonical(&store), Access::READ)),
+                        )
+                        .chain(
+                            // The configuration `include.path` reaches: one
+                            // file, never its directory.
+                            borrowed_object_stores(repository)
+                                .into_iter()
+                                .filter_map(|store| store.parent().map(Path::to_path_buf))
+                                .map(|common| common.join("config"))
+                                .filter(|config| config.is_file())
+                                .map(|config| Grant::new(canonical(&config), Access::READ)),
                         ),
                 )
                 .security(SecurityConfig::interactive())
@@ -134,7 +168,10 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
             .map_err(|error| ExportError::Launch(error.to_string()))?;
         let program = git.map_or_else(
             || "git".to_string(),
-            |(path, _)| path.to_string_lossy().into_owned(),
+            // The binary is spelled canonically the same way its directory's
+            // grant is: a firmlinked `/Applications` or an 8.3 alias resolves
+            // to the object the grant names, where the spelled path does not.
+            |(path, _)| canonical(&path).to_string_lossy().into_owned(),
         );
         Ok((sandbox, program))
     }
@@ -143,7 +180,12 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
         let (sandbox, program) = self.sandbox(run.repository).await?;
         let child = sandbox
             .command(program)
-            .arg("--git-dir")
+            // `-C` lets git discover the repository as the bare gitdir it
+            // is: `--git-dir` would normalize the path instead, checking
+            // access on every component — more than the traverse the
+            // sandbox grants ancestors — where discovery opens only paths
+            // inside the grants.
+            .arg("-C")
             .arg(&*canonical(run.repository).to_string_lossy())
             .args(run.args)
             .env("HOME", self.working_dir.to_string_lossy())
