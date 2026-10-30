@@ -72,6 +72,18 @@ fn host_git_binary() -> Option<(PathBuf, PathBuf)> {
     None
 }
 
+/// A path spelled the way the sandbox resolves grants: canonicalized, minus
+/// the `\\?\` prefix canonicalization puts on Windows paths. A grant and a
+/// spelled path must name the object the same way — an 8.3 alias and its
+/// long name do not match.
+fn canonical(path: &std::path::Path) -> PathBuf {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    resolved
+        .to_str()
+        .and_then(|spelled| spelled.strip_prefix(r"\\?\"))
+        .map_or_else(|| resolved.clone(), PathBuf::from)
+}
+
 impl<E: Executor + Clone + 'static> LocalGit<E> {
     /// The sandbox the export's git runs in, and the program it launches:
     /// the host's resolved `git`, falling back to a bare `git` when the host
@@ -82,26 +94,29 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
     /// read the current directory.
     async fn sandbox(&self) -> Result<(Sandbox, String), ExportError> {
         let git = host_git_binary();
-        let config = SandboxConfig::builder()
-            .network(DenyAll)
-            .working_dir(git.as_ref().map_or(&self.working_dir, |(_, dir)| dir))
-            .grants(
-                self.writable
-                    .iter()
-                    .map(|path| Grant::new(path, Access::WRITE))
-                    .chain(
-                        self.readable
-                            .iter()
-                            .map(|path| Grant::new(path, Access::READ)),
-                    )
-                    .chain(
-                        git.as_ref()
-                            .map(|(_, dir)| Grant::new(dir, Access::READ | Access::EXEC)),
-                    ),
-            )
-            .security(SecurityConfig::interactive())
-            .priority(self.priority)
-            .build();
+        let config =
+            SandboxConfig::builder()
+                .network(DenyAll)
+                .working_dir(
+                    git.as_ref()
+                        .map_or_else(|| canonical(&self.working_dir), |(_, dir)| canonical(dir)),
+                )
+                .grants(
+                    self.writable
+                        .iter()
+                        .map(|path| Grant::new(canonical(path), Access::WRITE))
+                        .chain(
+                            self.readable
+                                .iter()
+                                .map(|path| Grant::new(canonical(path), Access::READ)),
+                        )
+                        .chain(git.as_ref().map(|(_, dir)| {
+                            Grant::new(canonical(dir), Access::READ | Access::EXEC)
+                        })),
+                )
+                .security(SecurityConfig::interactive())
+                .priority(self.priority)
+                .build();
         let sandbox = Sandbox::with_config_and_executor(config, self.executor.clone())
             .await
             .map_err(|error| ExportError::Launch(error.to_string()))?;
@@ -117,7 +132,7 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
         let child = sandbox
             .command(program)
             .arg("--git-dir")
-            .arg(run.repository.to_string_lossy())
+            .arg(&*canonical(run.repository).to_string_lossy())
             .args(run.args)
             .env("HOME", self.working_dir.to_string_lossy())
             .stdin(StdioConfig::Piped)
