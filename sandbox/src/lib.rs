@@ -114,10 +114,12 @@ pub use network_policy::{
 };
 pub use output::{MediaResolution, OutputFormat, OutputStore};
 pub use permission::{PermissionHandler, PermissionRequest, Review, TerminalMode};
-pub use process_tree::{KillTreeError, kill_process_tree};
+pub use process_tree::{
+    JOB_MARKER_VAR, JobProcess, KillTreeError, ProcessTableError, kill_process_tree,
+};
 pub use shell_session::{
     AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
-    ContainerExecOutcome, ContainerIpcRoute, ContainerShellRuntime, ShellBackend,
+    ContainerExecOutcome, ContainerIpcRoute, ContainerShellRuntime, ExecLifetime, ShellBackend,
     ShellRuntimeAvailability, ShellSessionRegistry, SshAuthorizationError, SshRuntimeProfile,
     SshServer, SshSessionAuthorizer, bootstrap_ssh_runtime,
 };
@@ -128,12 +130,12 @@ pub use subagent::{
 pub use terminal::{
     BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand,
     CompletedTask, Configured, DEFAULT_BACKGROUND_TIMEOUT_CAP, DEFAULT_FOREGROUND_LIMIT,
-    DEFAULT_LONG_JOB_ALERT_AFTER, DirectoryReset, DirectoryResetReason, JobAlert, LongRunningJob,
-    PermissionEvent, PermissionEventReceiver, PermissionEventStage, StartedBackgroundTask,
-    StdinBlockedJob, StdinProbeFailedJob, TerminalArgs, TerminalBackgroundArgs,
-    TerminalBackgroundTool, TerminalBinding, TerminalError, TerminalExecutionMode, TerminalTool,
-    TerminalToolFactory, TerminalToolFactoryError, Unconfigured, background_task_channel,
-    open_network_audit_log,
+    DEFAULT_LONG_JOB_ALERT_AFTER, DescendantsKilled, DirectoryReset, DirectoryResetReason,
+    JobAlert, LongRunningJob, PermissionEvent, PermissionEventReceiver, PermissionEventStage,
+    StartedBackgroundTask, StdinBlockedJob, StdinProbeFailedJob, TerminalArgs,
+    TerminalBackgroundArgs, TerminalBackgroundTool, TerminalBinding, TerminalError,
+    TerminalExecutionMode, TerminalTool, TerminalToolFactory, TerminalToolFactoryError,
+    Unconfigured, background_task_channel, open_network_audit_log,
 };
 pub use tool_distribution::{
     HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,

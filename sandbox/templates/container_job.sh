@@ -1,15 +1,26 @@
 # Inspects or kills the job of one container exec. $1 is the action, $2 the
 # file where the exec's wrapper recorded its own in-container pid (Docker
 # reports exec pids in the host's namespace); the wrapper removes the file
-# when it exits.
+# when it exits. The file's path is also the job's marker: the wrapper starts
+# the job's script with it in AITHER_JOB, so the job's processes are found
+# wherever they went — a process that outlives its shell is reparented to the
+# container's init, and one that calls setsid leaves the shell's process group.
+# A process that cleared the variable from its environment, or whose
+# environment this script cannot read, is not found.
 #
 #   probe  prints "blocked <ticks>" when a process of the job tree is blocked
 #          reading the job's stdin pipe, <ticks> being the tree's total CPU
 #          time in USER_HZ ticks for the caller's CPU-idle confirmation;
 #          prints nothing when it is not, or when the job has ended; prints
 #          an error and exits 1 when it cannot probe.
-#   kill   stops and then kills every process of the job tree and removes
-#          the file; exits 3 when no pid is recorded, 1 when it cannot kill.
+#   kill   stops and then kills every process of the job tree, the wrapper
+#          included, and removes the file; exits 3 when no pid is recorded,
+#          1 when it cannot kill.
+#   alive  prints the pid of every live process the wrapper's shell left
+#          behind, one per line; prints nothing when there is none.
+#   reap   stops and then kills every process the wrapper's shell left
+#          behind and prints "<pid> <name>" for each; exits 1 when it cannot
+#          kill one. The wrapper itself is not touched.
 #
 # The probe reads wchan, which needs only ptrace read access, unlike
 # task/*/syscall, which needs attach — a sibling exec gets the former even
@@ -22,25 +33,19 @@
 action=$1
 pid_file=$2
 case $action in
-  probe|kill) ;;
+  probe|kill|alive|reap) ;;
   *) echo "unknown action $action"; exit 1 ;;
 esac
+
+# The job's processes are found by their environment, which only tr can make
+# readable to the shell; without it nothing would be found, silently.
+command -v tr >/dev/null 2>&1 || { echo "the job script needs tr"; exit 1; }
 
 # The exec ended and its wrapper removed the file.
 ended() {
   [ "$action" = kill ] && exit 3
   exit 0
 }
-
-[ -e "$pid_file" ] || ended
-root=$(cat "$pid_file" 2>/dev/null)
-case $root in
-  ''|*[!0-9]*)
-    [ -e "$pid_file" ] || ended
-    echo "cannot read the job's pid file $pid_file"
-    exit 1
-    ;;
-esac
 
 # Succeeds while process $1 exists and is not a zombie.
 alive() {
@@ -49,10 +54,30 @@ alive() {
   [ "$1" != Z ]
 }
 
-# Sets $tree to " <root> <descendant> ... ": every process whose parent is in
-# the tree joins it, until a pass adds none.
+# Succeeds when process $1 carries the job's marker in its environment. tr
+# turns the NUL separators into spaces, which a shell can match and a
+# command substitution can hold.
+marked() {
+  marked_env=$(tr '\0' ' ' < "/proc/$1/environ" 2>/dev/null) || return 1
+  case " $marked_env " in
+    *" AITHER_JOB=$pid_file "*) return 0 ;;
+  esac
+  return 1
+}
+
+# Sets $tree to " <root> <descendant> ... ": the root $1 (none when empty) and
+# every live process carrying the job's marker, then every process whose
+# parent is in the tree, until a pass adds none.
 job_tree() {
   tree=" $1 "
+  for seed_stat in /proc/[0-9]*/stat; do
+    seed_pid=${seed_stat#/proc/}
+    seed_pid=${seed_pid%/stat}
+    case $tree in
+      *" $seed_pid "*) continue ;;
+    esac
+    alive "$seed_pid" && marked "$seed_pid" && tree="$tree$seed_pid "
+  done
   grown=1
   while [ "$grown" = 1 ]; do
     grown=0
@@ -75,21 +100,28 @@ job_tree() {
   done
 }
 
-if [ "$action" = kill ]; then
-  alive "$root" || { rm -f "$pid_file"; exit 0; }
-  # A stopped process cannot fork, so the tree is stopped until a pass finds
-  # no process it has not stopped yet; then all of it is killed.
+# Stops and then kills the tree grown from the root $1 (none when empty),
+# setting $report to "<pid> <name>" lines for what it killed. A stopped process
+# cannot fork, so the tree is stopped until a pass finds no process it has not
+# stopped yet; then all of it is killed. Fails when a process survives.
+kill_tree() {
   stopped=" "
+  report=
   new=1
   while [ "$new" = 1 ]; do
     new=0
-    job_tree "$root"
+    job_tree "$1"
     for pid in $tree; do
       case $stopped in
         *" $pid "*) continue ;;
       esac
-      kill -STOP "$pid" 2>/dev/null
       stopped="$stopped$pid "
+      # A zombie is already dead: nothing to stop, kill or report.
+      alive "$pid" || continue
+      kill -STOP "$pid" 2>/dev/null
+      read -r comm < "/proc/$pid/comm" 2>/dev/null || comm=unknown
+      report="$report$pid $comm
+"
       new=1
     done
   done
@@ -100,7 +132,36 @@ if [ "$action" = kill ]; then
       failed=1
     fi
   done
-  [ "$failed" = 0 ] || exit 1
+  [ "$failed" = 0 ]
+}
+
+# What the wrapper's shell left behind: no root, only the marked processes.
+if [ "$action" = alive ]; then
+  job_tree ""
+  for pid in $tree; do
+    echo "$pid"
+  done
+  exit 0
+fi
+if [ "$action" = reap ]; then
+  kill_tree "" || exit 1
+  printf '%s' "$report"
+  exit 0
+fi
+
+[ -e "$pid_file" ] || ended
+root=$(cat "$pid_file" 2>/dev/null)
+case $root in
+  ''|*[!0-9]*)
+    [ -e "$pid_file" ] || ended
+    echo "cannot read the job's pid file $pid_file"
+    exit 1
+    ;;
+esac
+
+if [ "$action" = kill ]; then
+  alive "$root" || { rm -f "$pid_file"; exit 0; }
+  kill_tree "$root" || exit 1
   rm -f "$pid_file"
   exit 0
 fi

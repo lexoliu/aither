@@ -11,6 +11,7 @@ use async_channel::{Receiver, Sender};
 use futures_lite::io::AsyncWriteExt;
 
 use crate::permission::TerminalMode;
+use crate::process_tree::{JobMarker, JobTree, KillTreeError, ProcessScanner};
 
 /// Information about a running or completed background job.
 #[derive(Debug, Clone)]
@@ -86,6 +87,11 @@ struct JobState {
     stderr_closed: bool,
     input_tx: Option<TerminalInputSender>,
     kill_switch: Option<Sender<()>>,
+    process_tree: Option<JobTree>,
+    /// How many kills of the job run outside the registry; an ending the
+    /// job's own flow reports meanwhile waits in `deferred_end`.
+    kills_in_flight: usize,
+    deferred_end: Option<Ending>,
     output_redirect: Option<async_fs::File>,
     finished_at: Option<Instant>,
 }
@@ -99,6 +105,7 @@ enum StateCommand {
         script: String,
         mode: TerminalMode,
         output_path: Option<PathBuf>,
+        process_tree: Option<JobTree>,
     },
     AttachTerminalInput {
         pid: u32,
@@ -142,17 +149,22 @@ enum JobRequest {
         task_id: String,
         reply: Sender<Option<JobInfo>>,
     },
-    Kill {
+    BeginKill {
         pid: u32,
-        reply: Sender<bool>,
+        reply: Sender<KillPlan>,
     },
-    KillByTaskId {
+    BeginKillByTaskId {
         task_id: String,
-        reply: Sender<bool>,
+        reply: Sender<Option<(u32, KillPlan)>>,
     },
-    KillByExecutionKey {
+    BeginKillByExecutionKey {
         execution_key: String,
-        reply: Sender<usize>,
+        reply: Sender<Vec<(u32, KillPlan)>>,
+    },
+    EndKill {
+        pid: u32,
+        killed: bool,
+        reply: Sender<bool>,
     },
     InputTerminal {
         task_id: String,
@@ -186,6 +198,31 @@ enum JobRequest {
     },
 }
 
+/// How the registry's caller kills a job: the kill itself runs outside the
+/// registry's state actor, which would otherwise stall every other job's
+/// output, listing and kills meanwhile.
+enum KillPlan {
+    /// The registry decided at once.
+    Done(bool),
+    /// Kill the job's whole process tree.
+    Tree(JobTree),
+    /// Kill the process group led by this pid.
+    Group(u32),
+}
+
+/// How a job's own flow ended it while a kill of it was running.
+#[derive(Debug)]
+enum Ending {
+    Complete {
+        exit_code: i32,
+        output_path: Option<PathBuf>,
+    },
+    Fail {
+        error: String,
+        output_path: Option<PathBuf>,
+    },
+}
+
 /// Message delivered to the registry service.
 enum JobCommand {
     State(StateCommand),
@@ -210,6 +247,7 @@ impl From<JobRequest> for JobCommand {
 #[derive(Clone, Debug)]
 pub struct JobRegistry {
     tx: Sender<JobCommand>,
+    scanner: ProcessScanner,
 }
 
 /// Background service that owns the job registry state.
@@ -222,7 +260,13 @@ pub struct JobRegistryService {
 #[must_use]
 pub fn job_registry_channel() -> (JobRegistry, JobRegistryService) {
     let (tx, rx) = async_channel::unbounded();
-    (JobRegistry { tx }, JobRegistryService { rx })
+    (
+        JobRegistry {
+            tx,
+            scanner: ProcessScanner::default(),
+        },
+        JobRegistryService { rx },
+    )
 }
 
 impl JobRegistry {
@@ -250,6 +294,24 @@ impl JobRegistry {
         mode: TerminalMode,
         output_path: Option<PathBuf>,
     ) {
+        self.register_with_tree(pid, task_id, execution_key, script, mode, output_path, None)
+            .await;
+    }
+
+    /// Registers a new running job whose process tree was started with
+    /// [`Self::start_process_tree`]: the tree is part of the job from its
+    /// first moment, so a kill never finds a job without it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn register_with_tree(
+        &self,
+        pid: u32,
+        task_id: &str,
+        execution_key: &str,
+        script: &str,
+        mode: TerminalMode,
+        output_path: Option<PathBuf>,
+        process_tree: Option<JobTree>,
+    ) {
         self.send_command(StateCommand::Register {
             pid,
             task_id: task_id.to_string(),
@@ -257,6 +319,7 @@ impl JobRegistry {
             script: script.to_string(),
             mode,
             output_path,
+            process_tree,
         })
         .await;
     }
@@ -271,6 +334,20 @@ impl JobRegistry {
     pub async fn attach_kill_switch(&self, pid: u32, kill_tx: Sender<()>) {
         self.send_command(StateCommand::AttachKillSwitch { pid, kill_tx })
             .await;
+    }
+
+    /// Starts watching the process tree of a local job whose root shell is
+    /// `pid`. Called right after the spawn and before [`Self::register`]:
+    /// the tree follows the root from its first moments, while its children's
+    /// lineage can still be read. The caller keeps `pid` unreaped until it
+    /// calls [`JobTree::finish`].
+    pub(crate) fn start_process_tree<E: executor_core::Executor>(
+        &self,
+        executor: &E,
+        pid: u32,
+        marker: &JobMarker,
+    ) -> JobTree {
+        JobTree::spawn(executor, self.scanner.clone(), pid, marker)
     }
 
     /// Appends stdout bytes for a running job.
@@ -441,70 +518,94 @@ impl JobRegistry {
     /// Kills a running job by its PID.
     pub async fn kill(&self, pid: u32) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::Kill {
+        self.send_command(JobRequest::BeginKill {
             pid,
             reply: reply_tx,
         })
         .await;
-        Self::recv_reply(reply_rx).await
+        let plan = Self::recv_reply(reply_rx).await;
+        self.finish_kill(pid, plan).await
     }
 
     /// Kills a running job by its task ID.
     pub async fn kill_by_task_id(&self, task_id: &str) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::KillByTaskId {
+        self.send_command(JobRequest::BeginKillByTaskId {
             task_id: task_id.to_string(),
             reply: reply_tx,
         })
         .await;
-        Self::recv_reply(reply_rx).await
+        match Self::recv_reply(reply_rx).await {
+            Some((pid, plan)) => self.finish_kill(pid, plan).await,
+            None => false,
+        }
     }
 
     /// Kills every job that is still running in this registry.
     pub async fn kill_running(&self) -> usize {
-        let running_pids = self
-            .list()
-            .await
-            .into_iter()
-            .filter(|job| job.status == JobStatus::Running)
-            .map(|job| job.pid)
-            .collect::<Vec<_>>();
-        let mut killed = 0;
-        for pid in running_pids {
-            killed += usize::from(self.kill(pid).await);
-        }
-        killed
+        let jobs = self.list().await;
+        futures::future::join_all(
+            jobs.into_iter()
+                .filter(|job| job.status == JobStatus::Running)
+                .map(|job| self.kill(job.pid)),
+        )
+        .await
+        .into_iter()
+        .filter(|killed| *killed)
+        .count()
     }
 
     /// Kills all running jobs owned by an execution key.
     pub async fn kill_by_execution_key(&self, execution_key: &str) -> usize {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::KillByExecutionKey {
+        self.send_command(JobRequest::BeginKillByExecutionKey {
             execution_key: execution_key.to_string(),
             reply: reply_tx,
         })
         .await;
-        Self::recv_reply(reply_rx).await
+        let plans = Self::recv_reply(reply_rx).await;
+        futures::future::join_all(
+            plans
+                .into_iter()
+                .map(|(pid, plan)| self.finish_kill(pid, plan)),
+        )
+        .await
+        .into_iter()
+        .filter(|killed| *killed)
+        .count()
     }
 
-    /// Blocking variant of `kill_by_execution_key`, intended for drop-time cleanup.
-    #[must_use]
-    pub fn kill_by_execution_key_blocking(&self, execution_key: &str) -> usize {
-        let (reply_tx, reply_rx) = async_channel::bounded(1);
-        if self
-            .tx
-            .send_blocking(
-                JobRequest::KillByExecutionKey {
-                    execution_key: execution_key.to_string(),
-                    reply: reply_tx,
+    /// Runs the kill a [`KillPlan`] describes and records its outcome.
+    async fn finish_kill(&self, pid: u32, plan: KillPlan) -> bool {
+        let killed = match plan {
+            KillPlan::Done(killed) => return killed,
+            KillPlan::Tree(tree) => match tree.kill().await {
+                Ok(()) => true,
+                Err(KillTreeError::Ended) => {
+                    tracing::debug!(pid = %pid, "the job ended before the kill reached it");
+                    false
                 }
-                .into(),
-            )
-            .is_err()
-        {
-            return 0;
-        }
-        reply_rx.recv_blocking().unwrap_or(0)
+                Err(error) => {
+                    tracing::warn!(pid = %pid, error = %error, "failed to kill job");
+                    false
+                }
+            },
+            KillPlan::Group(group) => match crate::process_tree::kill_process_tree(group).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(pid = %pid, error = %error, "failed to kill job");
+                    false
+                }
+            },
+        };
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::EndKill {
+            pid,
+            killed,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
     }
 
     /// Formats only RUNNING jobs for compression preservation.
@@ -547,7 +648,13 @@ async fn handle_state_command(jobs: &mut HashMap<u32, JobState>, command: StateC
             script,
             mode,
             output_path,
-        } => register_job(jobs, pid, task_id, execution_key, script, mode, output_path),
+            process_tree,
+        } => {
+            register_job(jobs, pid, task_id, execution_key, script, mode, output_path);
+            if let Some(job) = jobs.get_mut(&pid) {
+                job.process_tree = process_tree;
+            }
+        }
         StateCommand::AttachTerminalInput { pid, input_tx } => {
             if let Some(job) = jobs.get_mut(&pid) {
                 job.input_tx = Some(input_tx);
@@ -593,20 +700,27 @@ async fn handle_job_request(jobs: &mut HashMap<u32, JobState>, request: JobReque
                 .map(|state| state.info.clone());
             let _ = reply.send(item).await;
         }
-        JobRequest::Kill { pid, reply } => {
-            let result = kill_job(jobs, pid).await;
-            let _ = reply.send(result).await;
+        JobRequest::BeginKill { pid, reply } => {
+            let plan = begin_kill(jobs, pid).await;
+            let _ = reply.send(plan).await;
         }
-        JobRequest::KillByTaskId { task_id, reply } => {
-            let result = kill_by_task_id(jobs, &task_id).await;
-            let _ = reply.send(result).await;
+        JobRequest::BeginKillByTaskId { task_id, reply } => {
+            let plan = match find_pid_by_task_id(jobs, &task_id) {
+                Some(pid) => Some((pid, begin_kill(jobs, pid).await)),
+                None => None,
+            };
+            let _ = reply.send(plan).await;
         }
-        JobRequest::KillByExecutionKey {
+        JobRequest::BeginKillByExecutionKey {
             execution_key,
             reply,
         } => {
-            let killed = kill_by_execution_key(jobs, &execution_key).await;
-            let _ = reply.send(killed).await;
+            let plans = begin_kill_by_execution_key(jobs, &execution_key).await;
+            let _ = reply.send(plans).await;
+        }
+        JobRequest::EndKill { pid, killed, reply } => {
+            let result = end_kill(jobs, pid, killed).await;
+            let _ = reply.send(result).await;
         }
         JobRequest::InputTerminal {
             task_id,
@@ -701,6 +815,9 @@ impl JobState {
             stderr_closed: false,
             input_tx: None,
             kill_switch: None,
+            process_tree: None,
+            kills_in_flight: 0,
+            deferred_end: None,
             output_redirect: None,
             finished_at: None,
         }
@@ -765,6 +882,13 @@ async fn complete_job(
             );
             return;
         }
+        if job.kills_in_flight > 0 {
+            job.deferred_end = Some(Ending::Complete {
+                exit_code,
+                output_path,
+            });
+            return;
+        }
         if let Err(error) = finalize_output_redirect(job).await {
             tracing::error!(
                 pid = %pid,
@@ -799,6 +923,10 @@ async fn fail_job(
             );
             return;
         }
+        if job.kills_in_flight > 0 {
+            job.deferred_end = Some(Ending::Fail { error, output_path });
+            return;
+        }
         let status_error = if let Err(finalize_error) = finalize_output_redirect(job).await {
             format!("{error}; additionally failed to flush redirected output: {finalize_error}")
         } else {
@@ -813,15 +941,10 @@ async fn fail_job(
     }
 }
 
-async fn kill_by_task_id(jobs: &mut HashMap<u32, JobState>, task_id: &str) -> bool {
-    if let Some(pid) = find_pid_by_task_id(jobs, task_id) {
-        kill_job(jobs, pid).await
-    } else {
-        false
-    }
-}
-
-async fn kill_by_execution_key(jobs: &mut HashMap<u32, JobState>, execution_key: &str) -> usize {
+async fn begin_kill_by_execution_key(
+    jobs: &mut HashMap<u32, JobState>,
+    execution_key: &str,
+) -> Vec<(u32, KillPlan)> {
     let pids: Vec<u32> = jobs
         .iter()
         .filter_map(|(pid, state)| {
@@ -831,13 +954,11 @@ async fn kill_by_execution_key(jobs: &mut HashMap<u32, JobState>, execution_key:
         })
         .collect();
 
-    let mut killed = 0usize;
+    let mut plans = Vec::with_capacity(pids.len());
     for pid in pids {
-        if kill_job(jobs, pid).await {
-            killed += 1;
-        }
+        plans.push((pid, begin_kill(jobs, pid).await));
     }
-    killed
+    plans
 }
 
 async fn input_terminal(
@@ -974,57 +1095,97 @@ fn find_pid_by_task_id(jobs: &HashMap<u32, JobState>, task_id: &str) -> Option<u
     })
 }
 
-async fn kill_job(jobs: &mut HashMap<u32, JobState>, pid: u32) -> bool {
-    if let Some(job) = jobs.get_mut(&pid) {
-        if !matches!(job.info.status, JobStatus::Running) {
-            tracing::warn!(pid = %pid, "cannot kill non-running job");
-            return false;
-        }
+/// Starts killing a job: decides at once what needs no process signal, and
+/// otherwise hands back what the caller must kill outside the registry.
+async fn begin_kill(jobs: &mut HashMap<u32, JobState>, pid: u32) -> KillPlan {
+    let Some(job) = jobs.get_mut(&pid) else {
+        return KillPlan::Done(false);
+    };
+    if !matches!(job.info.status, JobStatus::Running) {
+        tracing::warn!(pid = %pid, "cannot kill non-running job");
+        return KillPlan::Done(false);
+    }
 
-        if let Some(kill_switch) = job.kill_switch.take() {
-            if kill_switch.send(()).await.is_err() {
-                tracing::warn!(pid = %pid, "failed to signal runtime kill switch");
-                return false;
-            }
+    if let Some(kill_switch) = job.kill_switch.take() {
+        if kill_switch.send(()).await.is_err() {
+            tracing::warn!(pid = %pid, "failed to signal runtime kill switch");
+            return KillPlan::Done(false);
+        }
+        if let Err(error) = finalize_output_redirect(job).await {
+            tracing::warn!(
+                pid = %pid,
+                error = %error,
+                "failed to flush redirected output after kill switch signal"
+            );
+        }
+        job.info.status = JobStatus::Killed;
+        job.finished_at = Some(Instant::now());
+        job.stdout_closed = true;
+        job.stderr_closed = true;
+        tracing::info!(pid = %pid, "killed job via runtime kill switch");
+        return KillPlan::Done(true);
+    }
+
+    job.kills_in_flight += 1;
+    job.process_tree
+        .as_ref()
+        .map_or(KillPlan::Group(pid), |tree| KillPlan::Tree(tree.clone()))
+}
+
+/// Records the outcome of a kill that ran outside the registry. A job whose
+/// own flow ended it meanwhile takes that ending only when the kill failed.
+async fn end_kill(jobs: &mut HashMap<u32, JobState>, pid: u32, killed: bool) -> bool {
+    let Some(job) = jobs.get_mut(&pid) else {
+        return false;
+    };
+    job.kills_in_flight = job.kills_in_flight.saturating_sub(1);
+    if killed {
+        job.deferred_end = None;
+        if matches!(job.info.status, JobStatus::Running) {
             if let Err(error) = finalize_output_redirect(job).await {
                 tracing::warn!(
                     pid = %pid,
                     error = %error,
-                    "failed to flush redirected output after kill switch signal"
+                    "failed to flush redirected output after kill"
                 );
             }
             job.info.status = JobStatus::Killed;
             job.finished_at = Some(Instant::now());
             job.stdout_closed = true;
             job.stderr_closed = true;
-            tracing::info!(pid = %pid, "killed job via runtime kill switch");
-            return true;
+            tracing::info!(pid = %pid, "killed job");
         }
-
-        match crate::process_tree::kill_process_tree(pid).await {
-            Ok(()) => {
-                if let Err(error) = finalize_output_redirect(job).await {
-                    tracing::warn!(
-                        pid = %pid,
-                        error = %error,
-                        "failed to flush redirected output after kill"
-                    );
-                }
-                job.info.status = JobStatus::Killed;
-                job.finished_at = Some(Instant::now());
-                job.stdout_closed = true;
-                job.stderr_closed = true;
-                tracing::info!(pid = %pid, "killed job");
-                return true;
-            }
-            Err(error) => {
-                tracing::warn!(pid = %pid, error = %error, "failed to kill job");
-                return false;
-            }
-        }
+        return true;
     }
-
+    // While another kill of the job still runs, `complete_job` and `fail_job`
+    // defer the ending again.
+    match job.deferred_end.take() {
+        Some(Ending::Complete {
+            exit_code,
+            output_path,
+        }) => complete_job(jobs, pid, exit_code, output_path).await,
+        Some(Ending::Fail { error, output_path }) => {
+            fail_job(jobs, pid, error, output_path).await;
+        }
+        None => {}
+    }
     false
+}
+
+/// The bytes of a script a running-jobs line shows.
+const SCRIPT_PREVIEW_BYTES: usize = 50;
+
+/// The start of `script`, cut at a character boundary at or below
+/// [`SCRIPT_PREVIEW_BYTES`] bytes.
+fn script_preview(script: &str) -> String {
+    if script.len() <= SCRIPT_PREVIEW_BYTES {
+        return script.to_string();
+    }
+    let end = (0..=SCRIPT_PREVIEW_BYTES)
+        .rev()
+        .find(|index| script.is_char_boundary(*index))
+        .unwrap_or(0);
+    format!("{}...", &script[..end])
 }
 
 fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
@@ -1039,11 +1200,7 @@ fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
 
     let mut output = String::new();
     for job in running {
-        let script_preview = if job.info.script.len() > 50 {
-            format!("{}...", &job.info.script[..50])
-        } else {
-            job.info.script.clone()
-        };
+        let script_preview = script_preview(&job.info.script);
 
         let output_path = job
             .info
@@ -1301,5 +1458,89 @@ mod tests {
         registry.complete(556, 0, None).await;
         let job = registry.get(556).await.expect("job should exist");
         assert!(matches!(job.status, JobStatus::Killed));
+    }
+
+    /// A script longer than the preview, with a multibyte character across
+    /// the cut, is listed instead of panicking inside the registry.
+    #[tokio::test]
+    async fn test_format_running_jobs_cuts_a_multibyte_script_at_a_boundary() {
+        let (registry, service) = job_registry_channel();
+        TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
+
+        // Three bytes per character: byte 50 lies inside the 17th.
+        let script = "日".repeat(30);
+        assert!(!script.is_char_boundary(SCRIPT_PREVIEW_BYTES));
+        registry
+            .register(
+                1,
+                "task-cjk",
+                "exec-cjk",
+                &script,
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+
+        let running = registry.format_running_jobs().await;
+        assert!(
+            running.contains(&format!("`{}...`", "日".repeat(16))),
+            "{running}"
+        );
+        assert_eq!(script_preview("short"), "short");
+        assert_eq!(script_preview(&"x".repeat(50)), "x".repeat(50));
+        assert_eq!(
+            script_preview(&"x".repeat(51)),
+            format!("{}...", "x".repeat(50))
+        );
+    }
+
+    fn running_job(pid: u32) -> HashMap<u32, JobState> {
+        let mut jobs = HashMap::new();
+        register_job(
+            &mut jobs,
+            pid,
+            "task".to_string(),
+            "exec".to_string(),
+            "true".to_string(),
+            TerminalMode::Sandboxed,
+            None,
+        );
+        jobs
+    }
+
+    /// Two kills of one job overlap: the first to end must not release an
+    /// ending the job's own flow reported while the second still runs.
+    #[tokio::test]
+    async fn overlapping_kills_hold_the_deferred_ending_until_the_last_ends() {
+        let mut jobs = running_job(7);
+        assert!(matches!(begin_kill(&mut jobs, 7).await, KillPlan::Group(7)));
+        assert!(matches!(begin_kill(&mut jobs, 7).await, KillPlan::Group(7)));
+        complete_job(&mut jobs, 7, 0, None).await;
+        assert_eq!(jobs[&7].info.status, JobStatus::Running, "the ending waits");
+
+        assert!(!end_kill(&mut jobs, 7, false).await);
+        assert_eq!(
+            jobs[&7].info.status,
+            JobStatus::Running,
+            "the other kill still runs"
+        );
+        assert!(!end_kill(&mut jobs, 7, false).await);
+        assert_eq!(
+            jobs[&7].info.status,
+            JobStatus::Completed { exit_code: 0 },
+            "the last kill to fail releases the ending"
+        );
+    }
+
+    /// A kill that succeeds wins over an ending reported while it ran.
+    #[tokio::test]
+    async fn a_successful_kill_wins_over_a_deferred_ending() {
+        let mut jobs = running_job(8);
+        assert!(matches!(begin_kill(&mut jobs, 8).await, KillPlan::Group(8)));
+        complete_job(&mut jobs, 8, 0, None).await;
+        assert!(end_kill(&mut jobs, 8, true).await);
+        assert_eq!(jobs[&8].info.status, JobStatus::Killed);
     }
 }

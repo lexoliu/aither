@@ -10,7 +10,8 @@ use std::pin::Pin;
 use std::process::{ExitStatus, Output};
 use std::sync::Arc;
 
-use crate::shell_session::{ContainerExec, ContainerExecOutcome};
+use crate::process_tree::JobProcess;
+use crate::shell_session::{ContainerExec, ContainerExecOutcome, ExecLifetime};
 use crate::stdin_watch::{
     CONTAINER_EXEC_WRAPPER, CONTAINER_JOB_SCRIPT, CONTAINER_STDIN_WATCH_INTERVAL, EpisodeDetector,
     Probe, StdinWatchSignal, parse_container_probe,
@@ -307,6 +308,49 @@ type ExecOutput = Pin<Box<dyn Stream<Item = Result<LogOutput, bollard::errors::E
 /// The writable stdin of an attached container exec.
 type ExecInput = Pin<Box<dyn tokio::io::AsyncWrite + Send>>;
 
+/// The wrapper's argument naming what becomes of the processes the script
+/// leaves running.
+const fn lifetime_argument(lifetime: &ExecLifetime) -> &'static str {
+    match lifetime {
+        ExecLifetime::Foreground => "foreground",
+        ExecLifetime::Background { .. } => "background",
+    }
+}
+
+/// Takes the lines the exec wrapper wrote about the processes it killed out of
+/// the exec's stderr. Each starts with `pid_file`, a path nothing else knows:
+/// `<pid_file> killed <pid> <name>` names one process, `<pid_file> error
+/// <message>` reports a kill that failed.
+fn split_killed(stderr: &[u8], pid_file: &str) -> Result<(Vec<u8>, Vec<JobProcess>), String> {
+    let killed_prefix = format!("{pid_file} killed ");
+    let error_prefix = format!("{pid_file} error ");
+    let mut kept = Vec::with_capacity(stderr.len());
+    let mut killed = Vec::new();
+    for line in stderr.split_inclusive(|byte| *byte == b'\n') {
+        let text = String::from_utf8_lossy(line);
+        let text = text.trim_end_matches('\n');
+        if let Some(process) = text.strip_prefix(&killed_prefix) {
+            let (pid, name) = process
+                .split_once(' ')
+                .ok_or_else(|| format!("malformed process report from the exec wrapper: {text}"))?;
+            let pid = pid
+                .parse()
+                .map_err(|_| format!("malformed process report from the exec wrapper: {text}"))?;
+            killed.push(JobProcess {
+                pid,
+                name: name.to_string(),
+            });
+        } else if let Some(message) = text.strip_prefix(&error_prefix) {
+            return Err(format!(
+                "could not end the processes the command left running: {message}"
+            ));
+        } else {
+            kept.extend_from_slice(line);
+        }
+    }
+    Ok((kept, killed))
+}
+
 /// Creates the exec running `script` in `working_dir` under
 /// [`CONTAINER_EXEC_WRAPPER`],
 /// which records its pid in `pid_file`, and starts it with its output stream
@@ -317,6 +361,7 @@ async fn start_attached_exec(
     script: &str,
     pid_file: &str,
     working_dir: &str,
+    lifetime: &ExecLifetime,
 ) -> Result<(String, ExecOutput, ExecInput), String> {
     let config = CreateExecOptions {
         cmd: Some(vec![
@@ -326,6 +371,8 @@ async fn start_attached_exec(
             "sh",
             pid_file,
             script,
+            lifetime_argument(lifetime),
+            CONTAINER_JOB_SCRIPT,
         ]),
         attach_stdin: Some(true),
         attach_stdout: Some(true),
@@ -360,7 +407,7 @@ impl ContainerExec for BollardContainerExec {
         working_dir: &str,
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
-        stdin_blocked: Option<Sender<StdinWatchSignal>>,
+        lifetime: ExecLifetime,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
         let container_id = container_id.to_string();
         let script = script.to_string();
@@ -375,12 +422,22 @@ impl ContainerExec for BollardContainerExec {
                 "/tmp/aither-exec-stdin-{}.pid",
                 uuid::Uuid::new_v4().simple()
             );
-            let (exec_id, mut output, mut input) =
-                start_attached_exec(&client, &container_id, &script, &pid_file, &working_dir)
-                    .await?;
+            let (exec_id, mut output, mut input) = start_attached_exec(
+                &client,
+                &container_id,
+                &script,
+                &pid_file,
+                &working_dir,
+                &lifetime,
+            )
+            .await?;
 
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
+            let stdin_blocked = match lifetime {
+                ExecLifetime::Foreground => None,
+                ExecLifetime::Background { stdin_blocked } => Some(stdin_blocked),
+            };
             let mut watch = stdin_blocked.map(|signal| StdinWatch {
                 signal,
                 detector: EpisodeDetector::default(),
@@ -446,11 +503,15 @@ impl ContainerExec for BollardContainerExec {
             }
 
             let status = inspect_exec_exit_status(&client, &exec_id).await?;
-            Ok(ContainerExecOutcome::Completed(Output {
-                status,
-                stdout,
-                stderr,
-            }))
+            let (stderr, killed) = split_killed(&stderr, &pid_file)?;
+            Ok(ContainerExecOutcome::Completed {
+                output: Output {
+                    status,
+                    stdout,
+                    stderr,
+                },
+                killed,
+            })
         }
     }
 }
@@ -483,17 +544,39 @@ impl ExitStatusExt {
 mod tests {
     use std::process::Command;
 
-    use super::CONTAINER_EXEC_WRAPPER;
+    use super::{CONTAINER_EXEC_WRAPPER, CONTAINER_JOB_SCRIPT};
 
     fn run_wrapper(
         pid_file: &std::path::Path,
         script: &str,
         dir: &std::path::Path,
     ) -> std::process::Output {
+        run_wrapper_as(pid_file, script, "foreground", dir)
+    }
+
+    fn run_wrapper_as(
+        pid_file: &std::path::Path,
+        script: &str,
+        lifetime: &str,
+        dir: &std::path::Path,
+    ) -> std::process::Output {
+        run_wrapper_with_helper(pid_file, script, lifetime, CONTAINER_JOB_SCRIPT, dir)
+    }
+
+    /// Runs the wrapper with `helper` standing in for the job script.
+    fn run_wrapper_with_helper(
+        pid_file: &std::path::Path,
+        script: &str,
+        lifetime: &str,
+        helper: &str,
+        dir: &std::path::Path,
+    ) -> std::process::Output {
         Command::new("sh")
             .args(["-c", CONTAINER_EXEC_WRAPPER, "sh"])
             .arg(pid_file)
             .arg(script)
+            .arg(lifetime)
+            .arg(helper)
             .current_dir(dir)
             .env("PID_FILE", pid_file)
             .output()
@@ -549,6 +632,153 @@ mod tests {
             "the script's own file stays"
         );
         assert!(!pid_file.exists(), "the wrapper removes its own file");
+    }
+
+    /// The wrapper's report of killed processes is taken out of stderr, which
+    /// keeps everything else, in order.
+    #[test]
+    fn killed_processes_are_split_from_stderr() {
+        let pid_file = "/tmp/aither-exec-stdin-abc.pid";
+        let stderr = format!(
+            "warning\n{pid_file} killed 41 sleep\n{pid_file} killed 42 my daemon\nlast words"
+        );
+        let (kept, killed) = super::split_killed(stderr.as_bytes(), pid_file).unwrap();
+        assert_eq!(kept, b"warning\nlast words");
+        assert_eq!(
+            killed,
+            [
+                super::JobProcess {
+                    pid: 41,
+                    name: "sleep".to_string()
+                },
+                super::JobProcess {
+                    pid: 42,
+                    name: "my daemon".to_string()
+                },
+            ]
+        );
+        // Another exec's report, or the script's own line, is just output.
+        let other = b"/tmp/other.pid killed 1 x\n".to_vec();
+        let (kept, killed) = super::split_killed(&other, pid_file).unwrap();
+        assert_eq!(kept, other);
+        assert_eq!(killed, []);
+    }
+
+    /// A kill the wrapper could not complete fails the exec instead of passing
+    /// as a clean one.
+    #[test]
+    fn a_failed_kill_report_is_an_error() {
+        let pid_file = "/tmp/aither-exec-stdin-abc.pid";
+        let stderr = format!("{pid_file} error cannot kill process 9 of the job\n");
+        let error = super::split_killed(stderr.as_bytes(), pid_file).unwrap_err();
+        assert!(error.contains("cannot kill process 9"), "{error}");
+    }
+
+    /// Whether `/proc/<pid>` is gone or the process is a zombie, within
+    /// `wait`: the wrapper's SIGKILL is delivered and the process reaped
+    /// asynchronously, so the kill is not visible the moment the wrapper exits.
+    #[cfg(target_os = "linux")]
+    fn dead_within(pid: &str, wait: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let dead = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X')),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => panic!("cannot read /proc/{pid}/stat: {error}"),
+            };
+            if dead {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// A foreground wrapper kills what its script left running, including a
+    /// process that left the process group, and reports each on stderr. Needs
+    /// `/proc`, so it runs on Linux only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreground_wrapper_kills_and_reports_leftover_processes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("exec.pid");
+        for script in [
+            "sleep 300 > /dev/null 2>&1 &",
+            "setsid sleep 300 > /dev/null 2>&1 &",
+        ] {
+            let run = run_wrapper_as(&pid_file, script, "foreground", dir.path());
+            assert!(run.status.success());
+            let report = format!("{} killed ", pid_file.display());
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            let line = stderr
+                .lines()
+                .find_map(|line| line.strip_prefix(&report))
+                .unwrap_or_else(|| panic!("{script}: no kill report in {stderr}"));
+            let (pid, name) = line.split_once(' ').expect("pid and name");
+            assert_eq!(name, "sleep", "{script}");
+            assert!(
+                dead_within(pid, std::time::Duration::from_secs(5)),
+                "{script}: process {pid} survived"
+            );
+        }
+        let run = run_wrapper_as(&pid_file, "exit 4", "foreground", dir.path());
+        assert_eq!(run.status.code(), Some(4));
+        assert!(run.stderr.is_empty(), "nothing left, nothing reported");
+    }
+
+    /// A background wrapper stays until what its script left running exits,
+    /// and kills nothing. Needs `/proc`, so it runs on Linux only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_wrapper_stays_until_leftover_processes_exit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("exec.pid");
+        let started = std::time::Instant::now();
+        let run = run_wrapper_as(
+            &pid_file,
+            "setsid sleep 2 > /dev/null 2>&1 &",
+            "background",
+            dir.path(),
+        );
+        assert!(run.status.success());
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(2),
+            "the wrapper must outlive the leftover process"
+        );
+        assert!(
+            run.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    /// A helper that fails ends the wait with an error line the exec turns
+    /// into a failure, in the background wait and in the foreground kill: it
+    /// is not read as "still alive". Runs anywhere `sh` does.
+    #[test]
+    fn a_failing_helper_ends_the_wait_with_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("exec.pid");
+        let broken = "echo the job script needs tr; echo and more; exit 1";
+        for lifetime in ["background", "foreground"] {
+            let started = std::time::Instant::now();
+            let run = run_wrapper_with_helper(&pid_file, "exit 0", lifetime, broken, dir.path());
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{lifetime}: the wrapper must not wait on a broken helper"
+            );
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            let error = super::split_killed(&run.stderr, &pid_file.display().to_string())
+                .expect_err(&format!("{lifetime}: no error reported in {stderr}"));
+            assert!(
+                error.contains("the job script needs tr and more"),
+                "{error}"
+            );
+        }
     }
 
     /// A wrapper that cannot record its pid fails before running the

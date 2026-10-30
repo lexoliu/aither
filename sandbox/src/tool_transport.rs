@@ -76,7 +76,7 @@ impl ToolTransport for ContainerToolTransport {
             "/",
             kill_rx,
             input_rx,
-            None,
+            crate::ExecLifetime::Foreground,
         );
         let result = futures_lite::future::or(
             async { execution.await.map_err(ToolRuntimeError::Container) },
@@ -88,7 +88,7 @@ impl ToolTransport for ContainerToolTransport {
         )
         .await?;
         match result {
-            crate::ContainerExecOutcome::Completed(output) => Ok(output),
+            crate::ContainerExecOutcome::Completed { output, .. } => Ok(output),
             crate::ContainerExecOutcome::Killed => Err(ToolRuntimeError::InitializationInterrupted),
         }
     }
