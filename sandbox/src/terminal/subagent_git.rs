@@ -98,6 +98,18 @@ fn canonical(path: &std::path::Path) -> PathBuf {
         .map_or_else(|| resolved.clone(), PathBuf::from)
 }
 
+/// The worktree the repository answers to, spelled for git: the sibling
+/// `gitdir` file records `<worktree>/.git`, whose parent is the worktree
+/// root. Git enters it — its ancestors are granted for real, where the
+/// repository's are only traversable — and discovers the repository through
+/// the worktree's `.git` file, opening only paths the grants cover.
+fn worktree(repository: &Path) -> Option<PathBuf> {
+    repository
+        .parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("gitdir")).ok())
+        .and_then(|link| PathBuf::from(link.trim()).parent().map(Path::to_path_buf))
+}
+
 /// The object stores the repository borrows through its
 /// `objects/info/alternates`, as absolute paths. Each line there is relative
 /// to the repository's object directory.
@@ -186,13 +198,20 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
         let (sandbox, program) = self.sandbox(run.repository).await?;
         let child = sandbox
             .command(program)
-            // `-C` lets git discover the repository as the bare gitdir it
-            // is: `--git-dir` would normalize the path instead, checking
-            // access on every component — more than the traverse the
-            // sandbox grants ancestors — where discovery opens only paths
-            // inside the grants.
+            // `-C` lets git discover the repository through the worktree's
+            // `.git` file: entering the repository itself would have git
+            // re-resolve its own path, checking access on every component —
+            // more than the traverse the sandbox grants ancestors — where
+            // discovery opens only paths inside the grants.
             .arg("-C")
-            .arg(&*canonical(run.repository).to_string_lossy())
+            .arg(
+                &*canonical(
+                    worktree(run.repository)
+                        .as_deref()
+                        .unwrap_or(run.repository),
+                )
+                .to_string_lossy(),
+            )
             .args(run.args)
             .env("HOME", self.working_dir.to_string_lossy())
             .stdin(StdioConfig::Piped)
