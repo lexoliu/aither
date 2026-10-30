@@ -62,7 +62,7 @@ impl<'a> Spelling<'a> {
 
     fn text(self, path: &Path) -> Result<String, SubagentGrantError> {
         self.mount.map_or_else(
-            || text(path).map(str::to_string),
+            || text(path),
             |mount| {
                 mount
                     .container_path(path)
@@ -130,14 +130,14 @@ struct Head<'a> {
 
 #[derive(Template)]
 #[template(path = "subagent_gitfile", escape = "none")]
-struct GitFile<'a> {
-    repository: &'a str,
+struct GitFile {
+    repository: String,
 }
 
 #[derive(Template)]
 #[template(path = "subagent_alternates", escape = "none")]
-struct Alternates<'a> {
-    objects: &'a str,
+struct Alternates {
+    objects: String,
 }
 
 /// The refspec that keeps a fetch from the main repository away from the
@@ -146,9 +146,15 @@ fn negative_refspec(namespace: &str) -> String {
     format!("^refs/heads/subagent/{namespace}/*")
 }
 
-fn text(path: &Path) -> Result<&str, SubagentGrantError> {
+/// A path spelled the way git's own files take one: `/` between components
+/// on every platform — a gitdir, alternates or include line asks git for it
+/// back, and git reads `/` as a separator everywhere. On Unix the separator
+/// already is `/` — and where it is not, a `\` is an ordinary file name
+/// character nothing should rewrite.
+fn text(path: &Path) -> Result<String, SubagentGrantError> {
     path.to_str()
         .filter(|text| !text.contains(['\n', '\0']))
+        .map(|text| text.replace(std::path::MAIN_SEPARATOR, "/"))
         .ok_or_else(|| SubagentGrantError::UnrepresentablePath(path.to_path_buf()))
 }
 
@@ -325,7 +331,7 @@ async fn populate(
             "--quiet",
             "--no-write-fetch-head",
             "--no-recurse-submodules",
-            common,
+            &common,
             "+refs/*:refs/*",
             &negative,
         ],
@@ -394,9 +400,9 @@ async fn config(layout: Layout<'_>, spelling: Spelling<'_>) -> Result<String, Su
     let include = relative(layout.repository, &layout.common.join("config"));
     Ok(RepositoryConfig {
         format_version,
-        hooks_path: ConfigValue::new(text(&hooks)?)?,
+        hooks_path: ConfigValue::new(&text(&hooks)?)?,
         extensions,
-        include_path: ConfigValue::new(text(&include)?)?,
+        include_path: ConfigValue::new(&text(&include)?)?,
         url: ConfigValue::new(&spelling.text(layout.common)?)?,
         positive_refspec: ConfigValue::new("+refs/*:refs/*")?,
         negative_refspec: ConfigValue::new(&negative_refspec(layout.namespace))?,
