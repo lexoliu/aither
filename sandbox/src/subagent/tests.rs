@@ -1862,6 +1862,7 @@ async fn a_locked_head_blocks_an_import_moving_its_referent_too() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn one_worktree_that_cannot_be_prepared_does_not_hold_back_the_others() {
     let dir = tempfile::tempdir().unwrap();
     let repository = dir.path().join("repository");
