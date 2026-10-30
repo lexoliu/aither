@@ -143,10 +143,21 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
         enter: &Path,
     ) -> Result<(Sandbox, String), ExportError> {
         let git = host_git_binary();
+        // On Windows the working directory is the git binary's own: git's
+        // resolution of the directory it runs in asks more of ancestors than
+        // the traverse the sandbox grants them — reading a directory's entry
+        // needs its parent's list — where the binary's system ancestors are
+        // legible to every package.
+        #[cfg(windows)]
+        let working_dir = git
+            .as_ref()
+            .map_or_else(|| enter.to_path_buf(), |(_, dir)| dir.clone());
+        #[cfg(not(windows))]
+        let working_dir = enter.to_path_buf();
         let config =
             SandboxConfig::builder()
                 .network(DenyAll)
-                .working_dir(canonical(enter))
+                .working_dir(canonical(&working_dir))
                 .grants(
                     self.writable
                         .iter()
@@ -217,10 +228,10 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
             .command(program)
             .args(run.args)
             .env("HOME", self.working_dir.to_string_lossy())
-            // Git reports its working directory through `PWD` when it matches
-            // `.`: resolving it by syscall would walk every ancestor for the
-            // read a sandbox grants only to the leaves it names.
-            .env("PWD", canonical(enter).to_string_lossy())
+            // An absolute `GIT_DIR` is used as it stands — `git` discovers a
+            // relative one by resolving it, a read on every ancestor that a
+            // traverse grant does not carry.
+            .env("GIT_DIR", canonical(run.repository).to_string_lossy())
             .stdin(StdioConfig::Piped)
             .stdout(StdioConfig::Piped)
             .stderr(StdioConfig::Piped)
