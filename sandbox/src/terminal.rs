@@ -3956,7 +3956,8 @@ impl LocalChild {
         match self {
             Self::Plain(child) => child.id(),
             #[cfg(target_os = "linux")]
-            Self::Foreground(child) | Self::Background(child) => child.id(),
+            Self::Foreground(child) => child.id(),
+            Self::Background(child) => child.id(),
         }
     }
 
@@ -3964,7 +3965,8 @@ impl LocalChild {
         match self {
             Self::Plain(child) => child.take_stdin(),
             #[cfg(target_os = "linux")]
-            Self::Foreground(child) | Self::Background(child) => child.take_stdin(),
+            Self::Foreground(child) => child.take_stdin(),
+            Self::Background(child) => child.take_stdin(),
         }
     }
 
@@ -3972,7 +3974,8 @@ impl LocalChild {
         match self {
             Self::Plain(child) => child.take_stdout(),
             #[cfg(target_os = "linux")]
-            Self::Foreground(child) | Self::Background(child) => child.take_stdout(),
+            Self::Foreground(child) => child.take_stdout(),
+            Self::Background(child) => child.take_stdout(),
         }
     }
 
@@ -3980,7 +3983,8 @@ impl LocalChild {
         match self {
             Self::Plain(child) => child.take_stderr(),
             #[cfg(target_os = "linux")]
-            Self::Foreground(child) | Self::Background(child) => child.take_stderr(),
+            Self::Foreground(child) => child.take_stderr(),
+            Self::Background(child) => child.take_stderr(),
         }
     }
 
@@ -3988,7 +3992,8 @@ impl LocalChild {
     #[cfg(target_os = "linux")]
     fn tree_control(&self) -> TreeControl {
         match self {
-            Self::Foreground(child) | Self::Background(child) => child.tree_control(),
+            Self::Foreground(child) => child.tree_control(),
+            Self::Background(child) => child.tree_control(),
             Self::Plain(_) => unreachable!("a supervised spawn returns no plain child"),
         }
     }
