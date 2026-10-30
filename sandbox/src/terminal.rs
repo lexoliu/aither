@@ -855,6 +855,29 @@ impl BackgroundTaskReceiver {
         .await
     }
 
+    /// Waits for the next completed task or job alert.
+    ///
+    /// Cancel-safe: an event is taken only when this future completes, so a
+    /// caller racing it against other work loses nothing. A closed channel
+    /// never ends the wait.
+    pub async fn recv_event(&self) -> BackgroundTaskEvent {
+        futures_lite::future::or(
+            async {
+                match self.rx.recv().await {
+                    Ok(task) => BackgroundTaskEvent::Completed(Box::new(task)),
+                    Err(_) => std::future::pending().await,
+                }
+            },
+            async {
+                match self.alert_rx.recv().await {
+                    Ok(alert) => BackgroundTaskEvent::Alert(alert),
+                    Err(_) => std::future::pending().await,
+                }
+            },
+        )
+        .await
+    }
+
     /// Waits for the next completed task or job alert, bounded by `duration`.
     ///
     /// Returns `None` when nothing arrives in time; a closed channel never
