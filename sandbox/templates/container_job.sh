@@ -49,7 +49,7 @@ ended() {
 
 # Succeeds while process $1 exists and is not a zombie.
 alive() {
-  read -r alive_line < "/proc/$1/stat" 2>/dev/null || return 1
+  read -r alive_line 2>/dev/null < "/proc/$1/stat" || return 1
   set -- ${alive_line##*) }
   [ "$1" != Z ]
 }
@@ -58,7 +58,7 @@ alive() {
 # turns the NUL separators into spaces, which a shell can match and a
 # command substitution can hold.
 marked() {
-  marked_env=$(tr '\0' ' ' < "/proc/$1/environ" 2>/dev/null) || return 1
+  marked_env=$(tr '\0' ' ' 2>/dev/null < "/proc/$1/environ") || return 1
   case " $marked_env " in
     *" AITHER_JOB=$pid_file "*) return 0 ;;
   esac

@@ -113,6 +113,11 @@ pub enum KillTreeError {
         /// What `taskkill` wrote to its standard error.
         stderr: String,
     },
+    /// The job's supervisor could not end its tree; its report names any
+    /// process that survived.
+    #[cfg(target_os = "linux")]
+    #[error("the job's supervisor could not end its tree: {0}")]
+    Supervised(#[source] heel::supervisor::TreeKillError),
 }
 
 /// Why a job's descendants could not be found or killed.
@@ -351,14 +356,30 @@ impl ProcessScanner {
 /// The process tree of one local job: its root shell and everything that
 /// descends from it, wherever the descendants have gone.
 ///
-/// A handle to the job's own task, which owns the set of processes found so
-/// far. Cloning keeps a handle to the same task.
+/// On Linux the tree is owned by the job's supervisor
+/// ([`TrackedJob::Supervised`]), which is a child subreaper inside the
+/// sandbox, so a descendant that empties its environment, double-forks or
+/// leaves its session is still attributed and still dies with the job.
+/// Everywhere else it is the job's own task watching the process table.
 #[derive(Debug, Clone)]
 pub struct JobTree {
     #[cfg(windows)]
     root: u32,
     #[cfg(unix)]
-    commands: async_channel::Sender<unix::Command>,
+    tracked: TrackedJob,
+}
+
+/// How a Unix job's tree is owned.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+enum TrackedJob {
+    /// A handle to the job's own task, which owns the set of processes found
+    /// so far. Cloning keeps a handle to the same task.
+    Watched(async_channel::Sender<unix::Command>),
+    /// A handle to the job's `heel supervise` supervisor: the tree is ended
+    /// through it, not by signalling the process group.
+    #[cfg(target_os = "linux")]
+    Supervised(heel::supervisor::TreeControl),
 }
 
 #[cfg(unix)]
@@ -379,17 +400,33 @@ impl JobTree {
         let (commands, inbox) = async_channel::unbounded();
         let task = unix::Task::new(root, marker.value.clone(), scanner);
         executor_core::Task::detach(executor.spawn(task.run(inbox)));
-        Self { commands }
+        Self {
+            tracked: TrackedJob::Watched(commands),
+        }
+    }
+
+    /// The tree of a job whose command runs under `heel supervise`.
+    ///
+    /// The supervisor already owns membership — every orphan of the job
+    /// reparents to it — so the job asks it to end the tree and trusts its
+    /// report rather than scanning the process table.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn supervised(control: heel::supervisor::TreeControl) -> Self {
+        Self {
+            tracked: TrackedJob::Supervised(control),
+        }
     }
 
     /// Sends `command` to the job's task and returns its answer; `None` when
     /// the task has ended, which it does only once the job did.
-    async fn ask<T>(
+    async fn ask_at<T>(
         &self,
+        commands: &async_channel::Sender<unix::Command>,
         command: impl FnOnce(async_channel::Sender<T>) -> unix::Command,
     ) -> Result<Option<T>, ProcessTableError> {
         let (reply, answer) = async_channel::bounded(1);
-        if self.commands.send(command(reply)).await.is_err() {
+        if commands.send(command(reply)).await.is_err() {
             return Ok(None);
         }
         answer
@@ -409,10 +446,19 @@ impl JobTree {
     /// alive after repeated kills, or when the tree had already ended
     /// ([`KillTreeError::Ended`]): nothing was killed then.
     pub async fn kill(&self) -> Result<(), KillTreeError> {
-        self.ask(|reply| unix::Command::Kill { group: true, reply })
-            .await?
-            .ok_or(KillTreeError::Ended)??;
-        Ok(())
+        match &self.tracked {
+            TrackedJob::Watched(commands) => {
+                self.ask_at(commands, |reply| unix::Command::Kill { group: true, reply })
+                    .await?
+                    .ok_or(KillTreeError::Ended)??;
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            TrackedJob::Supervised(control) => {
+                control.kill().await.map_err(KillTreeError::Supervised)?;
+                Ok(())
+            }
+        }
     }
 
     /// Kills every descendant of the job that is alive and returns what it
@@ -424,14 +470,21 @@ impl JobTree {
     /// process cannot be signalled, or a tracked descendant survives repeated
     /// `SIGKILL`.
     pub async fn kill_descendants(&self) -> Result<Vec<JobProcess>, ProcessTableError> {
-        Ok(self
-            .ask(|reply| unix::Command::Kill {
-                group: false,
-                reply,
-            })
-            .await?
-            .transpose()?
-            .unwrap_or_default())
+        match &self.tracked {
+            TrackedJob::Watched(commands) => Ok(self
+                .ask_at(commands, |reply| unix::Command::Kill {
+                    group: false,
+                    reply,
+                })
+                .await?
+                .transpose()?
+                .unwrap_or_default()),
+            // A supervised job's supervisor has already torn its tree down
+            // by the time descendants are asked for; what it killed arrives
+            // in the wait's report.
+            #[cfg(target_os = "linux")]
+            TrackedJob::Supervised(_) => Ok(Vec::new()),
+        }
     }
 
     /// Returns once no descendant of the job is alive.
@@ -443,14 +496,32 @@ impl JobTree {
     ///
     /// Returns [`ProcessTableError`] when the process table cannot be read.
     pub async fn wait_descendants_exit(&self) -> Result<(), ProcessTableError> {
-        self.ask(unix::Command::Wait).await?.transpose()?;
+        match &self.tracked {
+            TrackedJob::Watched(commands) => {
+                self.ask_at(commands, unix::Command::Wait)
+                    .await?
+                    .transpose()?;
+            }
+            // A supervised background job's supervisor exits only once the
+            // last descendant has, which the caller's own wait on the child
+            // already covers; a supervised foreground job's teardown is
+            // reported by that same wait.
+            #[cfg(target_os = "linux")]
+            TrackedJob::Supervised(_) => {}
+        }
         Ok(())
     }
 
     /// Ends the job's task. Called before the root is reaped: afterwards the
     /// root's pid may belong to any process, so every later kill does nothing.
     pub async fn finish(&self) {
-        let _ = self.ask(unix::Command::Finish).await;
+        match &self.tracked {
+            TrackedJob::Watched(commands) => {
+                let _ = self.ask_at(commands, unix::Command::Finish).await;
+            }
+            #[cfg(target_os = "linux")]
+            TrackedJob::Supervised(_) => {}
+        }
     }
 }
 
@@ -2257,6 +2328,34 @@ mod tests {
         root.wait().expect("root is reaped");
     }
 
+    /// A descendant that empties its environment loses the marker, and one
+    /// that also leaves its session can no longer be found through its
+    /// group either: only its ancestry — or, on Linux, the job's supervisor —
+    /// still attributes it to the job. The kill must reach it anyway.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_env_cleaned_setsid_descendant_is_still_killed() {
+        let marker = JobMarker::new();
+        #[cfg(target_os = "macos")]
+        let script = "/usr/bin/env -i /usr/bin/perl -e \
+            'use POSIX; POSIX::setsid(); exec \"sleep\", \"300\"' & exit 0";
+        #[cfg(target_os = "linux")]
+        let script = "/usr/bin/env -i setsid sleep 300 & exit 0";
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let script = "/usr/bin/env -i sleep 300 & exit 0";
+        let mut root = spawn_group_leader(script, &marker);
+        let tree = JobTree::spawn(&TokioGlobal, ProcessScanner::default(), root.id(), &marker);
+        wait_for_exit(root.id()).await.expect("root exit observed");
+        let killed = tree.kill_descendants().await.expect("kill succeeds");
+        assert_eq!(killed.len(), 1, "{killed:?}");
+        assert!(
+            gone_within(killed[0].pid, Duration::from_secs(2)).await,
+            "the env-cleaned setsid child survived its job's kill"
+        );
+        tree.finish().await;
+        root.wait().expect("root is reaped");
+    }
+
     /// A kill of a plain tree freezes and kills the group's members and the
     /// descendants that left it, and names them.
     #[tokio::test(flavor = "multi_thread")]
@@ -2345,7 +2444,9 @@ mod tests {
             &TokioGlobal,
             task.run(inbox),
         ));
-        let tree = JobTree { commands };
+        let tree = JobTree {
+            tracked: super::TrackedJob::Watched(commands),
+        };
         wait_for_exit(root.id()).await.expect("root exit observed");
         let result = tree.kill_descendants().await;
         let survivors = match result {

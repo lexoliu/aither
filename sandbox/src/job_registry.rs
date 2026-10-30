@@ -581,6 +581,7 @@ impl JobRegistry {
             KillPlan::Done(killed) => return killed,
             KillPlan::Tree(tree) => match tree.kill().await {
                 Ok(()) => true,
+                #[cfg(unix)]
                 Err(KillTreeError::Ended) => {
                     tracing::debug!(pid = %pid, "the job ended before the kill reached it");
                     false

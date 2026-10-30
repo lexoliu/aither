@@ -32,11 +32,16 @@ use async_channel::{Receiver, Sender};
 use async_io::Async;
 use executor_core::{Executor, Task};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(target_os = "linux")]
+use heel::supervisor::{TreeControl, TreeReport};
 use heel::{
     Access, AllowAll, Audited, CpuPriority, DomainRequest, Grant, IoPriority, IpcRouter,
-    NetworkAuditLog, NetworkPolicy, ProcessPriority, Sandbox, SandboxConfig, SecurityConfig,
-    StdioConfig, WorkingDir,
+    NetworkAuditLog, NetworkPolicy, ProcessPriority, ResolvedPath, Sandbox, SandboxConfig,
+    SecurityConfig, StdioConfig, WorkingDir,
 };
+/// On platforms without `heel supervise` a wait produces no report.
+#[cfg(not(target_os = "linux"))]
+struct TreeReport;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use shell_words::split as split_shell_words;
@@ -3454,18 +3459,30 @@ async fn save_completed_stderr(
     }
 }
 
-fn local_path_grants<'a>(
-    writable: &'a [PathBuf],
-    readable: &'a [PathBuf],
-    tools: &'a PreparedTools<PathBuf>,
-    job_fifo: Option<&'a Path>,
-) -> impl Iterator<Item = Grant> + 'a {
+fn local_path_grants(
+    writable: &[PathBuf],
+    readable: &[PathBuf],
+    tools: &PreparedTools<PathBuf>,
+    job_fifo: Option<&Path>,
+) -> heel::Result<Vec<Grant>> {
     writable
         .iter()
-        .map(|path| Grant::new(path, Access::WRITE))
-        .chain(readable.iter().map(|path| Grant::new(path, Access::READ)))
-        .chain(std::iter::once(Grant::new(tools.bin_dir(), Access::EXEC)))
-        .chain(job_fifo.map(|path| Grant::new(path, Access::WRITE)))
+        .map(|path| Ok(Grant::new(ResolvedPath::new(path)?, Access::WRITE)))
+        .chain(
+            readable
+                .iter()
+                .map(|path| Ok(Grant::new(ResolvedPath::new(path)?, Access::READ))),
+        )
+        .chain(std::iter::once(Ok(Grant::new(
+            ResolvedPath::new(tools.bin_dir())?,
+            Access::EXEC,
+        ))))
+        .chain(
+            job_fifo
+                .iter()
+                .map(|path| Ok(Grant::new(ResolvedPath::new(path)?, Access::WRITE))),
+        )
+        .collect()
 }
 
 /// Adds a command's private jobserver variables to its process environment.
@@ -3502,17 +3519,21 @@ where
         .map(crate::jobserver::CommandFifo::path);
     #[cfg(not(all(unix, feature = "jobserver")))]
     let job_fifo_path: Option<&Path> = None;
+    let grants = local_path_grants(
+        context.writable_paths,
+        context.readable_paths,
+        context.prepared_tools,
+        job_fifo_path,
+    )
+    .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(policy)
         .working_dir(context.working_dir)
-        .grants(local_path_grants(
-            context.writable_paths,
-            context.readable_paths,
-            context.prepared_tools,
-            job_fifo_path,
-        ))
+        .grants(grants)
         .security(SecurityConfig::interactive())
         .priority(context.priority);
+    #[cfg(target_os = "linux")]
+    let config_builder = config_builder.supervised_spawn(true);
     // `ipc` changes the builder's type, so both arms build where they are.
     let config = match create_ipc_router(context.registry) {
         Some(router) => config_builder.ipc(router).build(),
@@ -3537,20 +3558,19 @@ where
     if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
         command = command.current_dir(start);
     }
-    let child = command
-        .args(args)
-        .envs(runtime_environment)
-        .stdin(local_stdin_config(context.stdin_alerts.as_ref()))
-        .stdout(StdioConfig::Piped)
-        .stderr(StdioConfig::Piped)
-        .spawn()
-        .await
-        .map_err(|e| TerminalError::Execution(e.to_string()))?;
+    let (child, tree) = spawn_local_command(
+        command,
+        args,
+        runtime_environment,
+        context.stdin_alerts.as_ref(),
+        &context.lifetime,
+        context.job_registry,
+        &context.executor,
+        &marker,
+    )
+    .await?;
 
     let pid = child.id();
-    let tree = context
-        .job_registry
-        .start_process_tree(&context.executor, pid, &marker);
     context
         .job_registry
         .register_with_tree(
@@ -3600,17 +3620,21 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         .map(crate::jobserver::CommandFifo::path);
     #[cfg(not(all(unix, feature = "jobserver")))]
     let job_fifo_path: Option<&Path> = None;
+    let grants = local_path_grants(
+        context.writable_paths,
+        context.readable_paths,
+        context.prepared_tools,
+        job_fifo_path,
+    )
+    .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(AllowAll)
         .working_dir(context.working_dir)
-        .grants(local_path_grants(
-            context.writable_paths,
-            context.readable_paths,
-            context.prepared_tools,
-            job_fifo_path,
-        ))
+        .grants(grants)
         .security(SecurityConfig::interactive())
         .priority(context.priority);
+    #[cfg(target_os = "linux")]
+    let config_builder = config_builder.supervised_spawn(true);
     // `ipc` changes the builder's type, so both arms build where they are.
     let config = match create_ipc_gateway_router(context.registry) {
         Some(router) => config_builder.ipc(router).build(),
@@ -3635,20 +3659,19 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
         command = command.current_dir(start);
     }
-    let child = command
-        .args(args)
-        .envs(runtime_environment)
-        .stdin(local_stdin_config(context.stdin_alerts.as_ref()))
-        .stdout(StdioConfig::Piped)
-        .stderr(StdioConfig::Piped)
-        .spawn()
-        .await
-        .map_err(|e| TerminalError::Execution(e.to_string()))?;
+    let (child, tree) = spawn_local_command(
+        command,
+        args,
+        runtime_environment,
+        context.stdin_alerts.as_ref(),
+        &context.lifetime,
+        context.job_registry,
+        &context.executor,
+        &marker,
+    )
+    .await?;
 
     let pid = child.id();
-    let tree = context
-        .job_registry
-        .start_process_tree(&context.executor, pid, &marker);
     context
         .job_registry
         .register_with_tree(
@@ -3786,7 +3809,7 @@ impl LocalStdinWatch {
 }
 
 async fn collect_local_process_output<E: Executor + Clone + 'static>(
-    mut child: heel::Child,
+    mut child: LocalChild,
     executor: E,
     job_registry: &JobRegistry,
     pid: u32,
@@ -3845,13 +3868,36 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
     let descendants = end_descendants(&tree, &lifetime).await;
     // The task ends first: afterwards the root's pid may belong to anyone.
     tree.finish().await;
-    let status = match exited {
-        Some(status) => Ok(status),
-        None => child
-            .wait()
-            .await
-            .map_err(|error| TerminalError::Execution(error.to_string())),
+    let (status, report) = match exited {
+        Some(status) => (Ok(status), None),
+        None => match child.wait_reported().await {
+            Ok((status, report)) => (Ok(status), report),
+            Err(error) => (Err(TerminalError::Execution(error.to_string())), None),
+        },
     };
+    let _ = &report;
+    #[cfg(target_os = "linux")]
+    if let Some(report) = report {
+        let killed: Vec<JobProcess> = report
+            .killed
+            .into_iter()
+            .map(|process| JobProcess {
+                pid: process.pid,
+                name: process.name,
+            })
+            .collect();
+        if !killed.is_empty() {
+            info!(
+                killed = killed.len(),
+                "the supervisor killed the finished command's descendants"
+            );
+            if let JobLifetime::Foreground { alerts } = &lifetime {
+                let _ = alerts
+                    .send(JobAlert::DescendantsKilled(DescendantsKilled::new(killed)))
+                    .await;
+            }
+        }
+    }
     let status = match (descendants, status) {
         (Ok(()), Ok(status)) => status,
         (Err(error), _) | (Ok(()), Err(error)) => {
@@ -3879,6 +3925,154 @@ struct LocalJob {
     tree: JobTree,
     lifetime: JobLifetime,
     stdin_alerts: Option<StdinAlerts>,
+}
+
+/// The teardown budget a job's supervisor gives its kills: the time to
+/// freeze the tree, deliver `SIGKILL` and see every killed process exit.
+/// Generous relative to the few milliseconds a `SIGKILL` exit takes, since a
+/// too-short budget reports survivors that are merely still exiting.
+#[cfg(target_os = "linux")]
+const SUPERVISED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A spawned local job: the plain `heel` child on platforms without a
+/// supervisor, or a `heel supervise`-supervised one on Linux, where the
+/// supervisor is the command's parent and owns its whole tree.
+enum LocalChild {
+    /// Everywhere but Linux: the sandboxed process itself.
+    Plain(heel::Child),
+    /// Linux, foreground lifetime: `wait` yields the command's status and
+    /// the teardown's report of what it killed.
+    #[cfg(target_os = "linux")]
+    Foreground(heel::supervisor::SupervisedChild<heel::supervisor::Foreground>),
+    /// Linux, background lifetime: `wait` ends only once the last descendant
+    /// of the command has exited.
+    #[cfg(target_os = "linux")]
+    Background(heel::supervisor::SupervisedChild<heel::supervisor::Background>),
+}
+
+impl LocalChild {
+    /// The spawned process's id: the supervisor's on Linux.
+    fn id(&self) -> u32 {
+        match self {
+            Self::Plain(child) => child.id(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) | Self::Background(child) => child.id(),
+        }
+    }
+
+    fn take_stdin(&mut self) -> Option<std::fs::File> {
+        match self {
+            Self::Plain(child) => child.take_stdin(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) | Self::Background(child) => child.take_stdin(),
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<std::fs::File> {
+        match self {
+            Self::Plain(child) => child.take_stdout(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) | Self::Background(child) => child.take_stdout(),
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<std::fs::File> {
+        match self {
+            Self::Plain(child) => child.take_stderr(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) | Self::Background(child) => child.take_stderr(),
+        }
+    }
+
+    /// A handle to the supervisor owning the job's tree.
+    #[cfg(target_os = "linux")]
+    fn tree_control(&self) -> TreeControl {
+        match self {
+            Self::Foreground(child) | Self::Background(child) => child.tree_control(),
+            Self::Plain(_) => unreachable!("a supervised spawn returns no plain child"),
+        }
+    }
+
+    /// Waits the job out, yielding the command's status and, for a
+    /// supervised foreground job, the supervisor's teardown report: what it
+    /// found still running under the command and killed.
+    async fn wait_reported(
+        &mut self,
+    ) -> Result<(std::process::ExitStatus, Option<TreeReport>), heel::Error> {
+        match self {
+            Self::Plain(child) => Ok((child.wait().await?, None)),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) => {
+                let exit = child.wait().await?;
+                Ok((exit.status, Some(exit.report)))
+            }
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => Ok((child.wait().await?, None)),
+        }
+    }
+}
+
+/// Spawns a local job's command and hands its tree to whoever owns it.
+///
+/// On Linux the sandbox was built with `supervised_spawn(true)`, so the
+/// command runs under `heel supervise`: a child subreaper inside the sandbox
+/// that owns the whole tree however its members change session, group or
+/// environment. Everywhere else the root's process group is watched through
+/// the process table, keyed by the job's marker.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_local_command<E: Executor + Clone + 'static>(
+    command: heel::Command<'_>,
+    args: &[String],
+    environment: Vec<(String, String)>,
+    stdin_alerts: Option<&StdinAlerts>,
+    lifetime: &JobLifetime,
+    job_registry: &JobRegistry,
+    executor: &E,
+    marker: &JobMarker,
+) -> Result<(LocalChild, JobTree), TerminalError> {
+    let command = command
+        .args(args)
+        .envs(environment)
+        .stdin(local_stdin_config(stdin_alerts))
+        .stdout(StdioConfig::Piped)
+        .stderr(StdioConfig::Piped);
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (job_registry, executor, marker);
+        let child = match lifetime {
+            JobLifetime::Foreground { .. } => LocalChild::Foreground(
+                command
+                    .spawn_supervised(heel::supervisor::Foreground {
+                        reap_timeout: SUPERVISED_REAP_TIMEOUT,
+                    })
+                    .await
+                    .map_err(|error| TerminalError::Execution(error.to_string()))?,
+            ),
+            JobLifetime::Background => LocalChild::Background(
+                command
+                    .spawn_supervised(heel::supervisor::Background {
+                        reap_timeout: SUPERVISED_REAP_TIMEOUT,
+                    })
+                    .await
+                    .map_err(|error| TerminalError::Execution(error.to_string()))?,
+            ),
+        };
+        let tree = JobTree::supervised(child.tree_control());
+        Ok((child, tree))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = lifetime;
+        let child = command
+            .spawn()
+            .await
+            .map_err(|error| TerminalError::Execution(error.to_string()))?;
+        let pid = child.id();
+        let tree = job_registry.start_process_tree(executor, pid, marker);
+        Ok((LocalChild::Plain(child), tree))
+    }
 }
 
 /// Applies the rule that a job's descendants live exactly as long as the job,
@@ -3920,7 +4114,7 @@ async fn end_descendants(tree: &JobTree, lifetime: &JobLifetime) -> Result<(), T
 /// has no such state and answers the exit status.
 #[cfg_attr(unix, allow(clippy::needless_pass_by_ref_mut))]
 async fn wait_for_local_process_exit(
-    child: &mut heel::Child,
+    child: &mut LocalChild,
     stdin_watch: Option<LocalStdinWatch>,
 ) -> Result<Option<std::process::ExitStatus>, TerminalError> {
     #[cfg(unix)]
@@ -3933,9 +4127,9 @@ async fn wait_for_local_process_exit(
     #[cfg(not(unix))]
     let exit = async {
         child
-            .wait()
+            .wait_reported()
             .await
-            .map(Some)
+            .map(|(status, _)| Some(status))
             .map_err(|error| TerminalError::Execution(error.to_string()))
     };
     let Some(stdin_watch) = stdin_watch else {

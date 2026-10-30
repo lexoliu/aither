@@ -654,7 +654,11 @@ impl PreparedTools<PathBuf> {
         let scratch = blocking::unblock(tempfile::tempdir).await?;
         let config = heel::SandboxConfig::builder()
             .working_dir(scratch.path())
-            .grant(&self.bin_dir, heel::Access::READ | heel::Access::EXEC)
+            .grant(
+                heel::ResolvedPath::new(&self.bin_dir)
+                    .map_err(|error| ToolRuntimeError::SshBootstrap(error.to_string()))?,
+                heel::Access::READ | heel::Access::EXEC,
+            )
             .build();
         let sandbox = std::sync::Arc::new(
             heel::Sandbox::with_config_and_executor(config, executor)
@@ -1356,7 +1360,10 @@ pub mod tests {
         let config = heel::SandboxConfig::builder()
             .network(heel::DenyAll)
             .working_dir(workspace.path())
-            .grants([heel::Grant::new(ready.bin_dir(), heel::Access::EXEC)])
+            .grants([heel::Grant::new(
+                heel::ResolvedPath::new(ready.bin_dir()).unwrap(),
+                heel::Access::EXEC,
+            )])
             .ipc(heel::IpcRouter::new().register(RuntimeProbe))
             .security(heel::SecurityConfig::interactive())
             .build();
