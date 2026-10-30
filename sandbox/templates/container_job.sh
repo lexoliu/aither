@@ -6,7 +6,11 @@
 # wherever they went — a process that outlives its shell is reparented to the
 # container's init, and one that calls setsid leaves the shell's process group.
 # A process that cleared the variable from its environment, or whose
-# environment this script cannot read, is not found.
+# environment this script cannot read, is not found; nor is one the scan
+# could not reach through parentage before its chain back to the wrapper
+# broke — there is no kernel-tracked owner of the job inside the container
+# the way the local supervisor is one, so a descendant that both drops the
+# marker and leaves the ancestry before the next scan escapes the job.
 #
 #   probe  prints "blocked <ticks>" when a process of the job tree is blocked
 #          reading the job's stdin pipe, <ticks> being the tree's total CPU
