@@ -126,9 +126,10 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
     /// reads resolve to — the object store its alternates name and the
     /// configuration its own includes — spelled exactly, because a directory
     /// grant would open everything beneath it. The working directory is the
-    /// subagent's own space, already granted: a sandbox denies exec beneath
-    /// its working directory, so the git binary's directory would be denied
-    /// exec the moment it was chosen.
+    /// subagent's own space: a sandbox makes it writable but denies exec
+    /// beneath it, so it is never the git binary's directory — and writable
+    /// alone does not make it readable on Windows, where git's check that it
+    /// can read its own directory needs the read granted beside it.
     async fn sandbox(&self, repository: &Path) -> Result<(Sandbox, String), ExportError> {
         let git = host_git_binary();
         let config =
@@ -139,6 +140,7 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
                     self.writable
                         .iter()
                         .map(|path| Grant::new(canonical(path), Access::WRITE))
+                        .chain([Grant::new(canonical(&self.working_dir), Access::READ)])
                         .chain(
                             self.readable
                                 .iter()
