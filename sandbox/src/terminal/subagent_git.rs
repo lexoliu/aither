@@ -150,20 +150,20 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
                             Grant::new(canonical(dir), Access::READ | Access::EXEC)
                         }))
                         .chain(
-                            // The repository and the worktree `git -C`
-                            // enters: the worktree's `.git` file names the
-                            // repository, which lives inside the main
-                            // worktree's git directory, and neither lies in
-                            // the subagent's grants.
-                            self.committing
-                                .iter()
-                                .filter(|granted| repository.parent() == Some(granted.git_dir()))
-                                .flat_map(|granted| {
-                                    [
-                                        Grant::new(canonical(granted.worktree()), Access::READ),
-                                        Grant::new(canonical(repository), Access::READ),
-                                    ]
-                                }),
+                            // The repository `git -C` enters: it lives inside
+                            // the main worktree's git directory, outside the
+                            // subagent's grants.
+                            [Grant::new(canonical(repository), Access::READ)],
+                        )
+                        .chain(
+                            // The worktrees `git -C` may enter: the
+                            // repository lives inside the main worktree's
+                            // git directory, and the worktree is outside the
+                            // subagent's grants — its `.git` file names the
+                            // repository.
+                            self.committing.iter().map(|granted| {
+                                Grant::new(canonical(granted.worktree()), Access::READ)
+                            }),
                         )
                         .chain(
                             // The alternates the repository's object store
@@ -214,7 +214,10 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
                 &*canonical(
                     self.committing
                         .iter()
-                        .find(|granted| run.repository.parent() == Some(granted.git_dir()))
+                        .find(|granted| {
+                            canonical(run.repository).parent()
+                                == Some(&*canonical(granted.git_dir()))
+                        })
                         .map_or(run.repository, CommittingWorktree::worktree),
                 )
                 .to_string_lossy(),
