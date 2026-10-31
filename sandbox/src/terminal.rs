@@ -3452,12 +3452,37 @@ async fn write_git_shim(_tools: &PreparedTools<PathBuf>) -> Result<(), TerminalE
 /// the worktree map as exports. Empty without a map — subagent
 /// containers never see it.
 #[cfg(unix)]
-fn container_git_preamble(registry: &ToolRegistry) -> String {
+fn container_git_preamble(
+    registry: &ToolRegistry,
+    mount: Option<&MountRoot>,
+) -> Result<String, TerminalError> {
     use std::fmt::Write as _;
     let mut environment = Vec::new();
-    committed_git_environment(registry, &mut environment);
+    // The shim inside the container compares its working directory against
+    // the map: every path it holds must be spelled the way the container's
+    // workspace mount resolves it, or the worktree goes unprotected.
+    let spell = |path: &Path| -> Result<String, TerminalError> {
+        let mount = mount.ok_or_else(|| {
+            TerminalError::SandboxSetup(format!(
+                "a committing worktree {} has no workspace mount to map through",
+                path.display()
+            ))
+        })?;
+        let host_root =
+            std::fs::canonicalize(&mount.host_root).unwrap_or_else(|_| mount.host_root.clone());
+        MountRoot::new(host_root, mount.container_root.clone())
+            .container_path(path)
+            .map(|path| path.to_string())
+            .map_err(|source| {
+                TerminalError::SandboxSetup(format!(
+                    "{} is outside the container workspace mount: {source}",
+                    path.display()
+                ))
+            })
+    };
+    committed_git_environment(registry, &mut environment, spell)?;
     if environment.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
     let mut preamble =
         "aither_shim=${TMPDIR:-/tmp}/aither-shim-$$\nmkdir -p \"$aither_shim\"\n".to_string();
@@ -3470,15 +3495,20 @@ fn container_git_preamble(registry: &ToolRegistry) -> String {
         writeln!(preamble, "export {name}={}", shell_words::quote(value))
             .expect("a string cannot fail a write");
     }
-    preamble
+    Ok(preamble)
 }
 
 #[cfg(not(unix))]
-fn container_git_preamble(_registry: &ToolRegistry) -> String {
-    String::new()
+fn container_git_preamble(
+    _registry: &ToolRegistry,
+    _mount: Option<&MountRoot>,
+) -> Result<String, TerminalError> {
+    Ok(String::new())
 }
 
-/// Hands the git shim of a main terminal's commands the worktree map.
+/// Hands the git shim of a main terminal's commands the worktree map,
+/// each path spelled the way `spell` resolves it for the command's
+/// context — a host path locally, a container path inside a container.
 ///
 /// A command's `git` in a committing worktree resolves the worktree's
 /// host-owned repository entry through `GIT_DIR`, so nothing a subagent
@@ -3486,13 +3516,17 @@ fn container_git_preamble(_registry: &ToolRegistry) -> String {
 /// fsmonitor or filter programs — decides what program git runs. The
 /// map only describes paths the host resolved when the grant was made.
 /// Subagent terminals keep their own repositories' view.
-fn committed_git_environment(registry: &ToolRegistry, environment: &mut Vec<(String, String)>) {
+fn committed_git_environment(
+    registry: &ToolRegistry,
+    environment: &mut Vec<(String, String)>,
+    spell: impl Fn(&Path) -> Result<String, TerminalError>,
+) -> Result<(), TerminalError> {
     if registry.role() != crate::command::CommandRole::Main {
-        return;
+        return Ok(());
     }
     let committed = registry.committed_worktrees();
     if committed.is_empty() {
-        return;
+        return Ok(());
     }
     environment.push((
         "AITHER_GIT_WORKTREES_COUNT".to_string(),
@@ -3501,13 +3535,14 @@ fn committed_git_environment(registry: &ToolRegistry, environment: &mut Vec<(Str
     for (index, worktree) in committed.iter().enumerate() {
         environment.push((
             format!("AITHER_GIT_WORKTREE_PATH_{index}"),
-            worktree.worktree().display().to_string(),
+            spell(worktree.worktree())?,
         ));
         environment.push((
             format!("AITHER_GIT_WORKTREE_GITDIR_{index}"),
-            worktree.git_dir().display().to_string(),
+            spell(worktree.git_dir())?,
         ));
     }
+    Ok(())
 }
 
 fn local_path_grants<'a>(
@@ -3547,7 +3582,9 @@ where
     write_git_shim(context.prepared_tools).await?;
     let mut runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
-    committed_git_environment(context.registry, &mut runtime_environment);
+    committed_git_environment(context.registry, &mut runtime_environment, |path| {
+        Ok(path.display().to_string())
+    })?;
     #[cfg(all(unix, feature = "jobserver"))]
     let runtime_environment =
         with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
@@ -3637,7 +3674,9 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     write_git_shim(context.prepared_tools).await?;
     let mut runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
-    committed_git_environment(context.registry, &mut runtime_environment);
+    committed_git_environment(context.registry, &mut runtime_environment, |path| {
+        Ok(path.display().to_string())
+    })?;
     #[cfg(all(unix, feature = "jobserver"))]
     let runtime_environment =
         with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
@@ -3895,6 +3934,30 @@ async fn wait_for_local_process_exit(
     futures_lite::future::or(exit, async { match stdin_watch.run().await {} }).await
 }
 
+/// A container command's full script. A main terminal's git shim and
+/// worktree map travel inside it: the container's tools mount is
+/// read-only, so the command writes the shim where its own `PATH` can
+/// put it first.
+fn container_exec_script(
+    registry: &ToolRegistry,
+    container_runtime: &ContainerShellRuntime,
+    prepared_tools: &PreparedTools<ContainerPath>,
+    carry: Option<&ContainerCarry>,
+    script: &str,
+) -> Result<String, TerminalError> {
+    let preamble = container_git_preamble(registry, container_runtime.workspace_mount())?;
+    let script = if preamble.is_empty() {
+        script.to_string()
+    } else {
+        format!("{preamble}{script}")
+    };
+    let script = prepared_tools.wrap_script(&script)?;
+    match carry {
+        Some(carry) => carry_cwd_script(&script, carry.report.as_str()),
+        None => Ok(script),
+    }
+}
+
 async fn execute_container_background<E: Executor + Clone + 'static>(
     context: ContainerBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
@@ -3920,6 +3983,13 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             None,
         )
         .await;
+    let script = container_exec_script(
+        context.registry,
+        context.container_runtime,
+        context.prepared_tools,
+        context.carry,
+        context.script,
+    )?;
     // Every spawned job carries a stdin channel: a job without a stdin
     // watch (a caller that passed no `stdin_alerts`) gets the channel's EOF
     // instead, which is what `stdin_alerts: None` means here.
@@ -3959,22 +4029,6 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             Arc::clone(context.registry),
             container_runtime.ipc_route().bind(),
         )?)
-    };
-    // A main terminal's git shim and worktree map travel inside the
-    // script: the container's tools mount is read-only, so the command
-    // writes the shim where its own PATH can put it first.
-    let preamble = container_git_preamble(context.registry);
-    let script_owned;
-    let script = if preamble.is_empty() {
-        context.script
-    } else {
-        script_owned = format!("{preamble}{}", context.script);
-        &script_owned
-    };
-    let script = context.prepared_tools.wrap_script(script)?;
-    let script = match context.carry {
-        Some(carry) => carry_cwd_script(&script, carry.report.as_str())?,
-        None => script,
     };
     let working_dir = context
         .carry
@@ -9056,6 +9110,53 @@ mod tests {
         assert!(
             sub.contains(&format!("--grant '/workspace/{granted_name}=rw'")),
             "{sub}"
+        );
+    }
+
+    /// The shim inside a container compares its working directory against
+    /// the worktree map: the map must spell the paths the mount resolves —
+    /// host spellings would leave the worktree unprotected, the `git` shim
+    /// unable to hit it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_containers_git_map_spells_the_worktree_and_gitdir_the_container_way() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let worktree =
+            crate::subagent::tests::repository_with_linked_worktree(dir.path(), "mapped");
+        let (scripts, parent) = recording_container_terminal(dir.path(), Some(dir.path())).await;
+        let _child = launch(
+            &parent,
+            SubagentGrant::new().with_committing_worktree(&worktree),
+        )
+        .await
+        .expect("the worktree can be granted with commit");
+
+        assert_eq!(exit_code_of(&parent, "echo mapped-worktree").await, 0);
+
+        let script = scripts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|script| script.contains("mapped-worktree"))
+            .expect("the main agent's command ran")
+            .clone();
+        assert!(
+            script.contains("export AITHER_GIT_WORKTREE_PATH_0=/workspace/mapped"),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "export AITHER_GIT_WORKTREE_GITDIR_0=/workspace/repository/.git/worktrees/mapped"
+            ),
+            "{script}"
+        );
+        let host = dunce::canonicalize(&worktree)
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(
+            !script.contains(&host),
+            "the shim sees no host spelling: {script}"
         );
     }
 

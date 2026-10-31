@@ -229,6 +229,10 @@ pub enum SubagentGrantError {
         /// What `git --version` printed.
         found: String,
     },
+    /// A commit grant was asked for somewhere the terminal can run no git
+    /// shim, so the isolation the grant promises could not be kept.
+    #[error("a commit grant needs a POSIX shell for its git shim; this platform has none")]
+    CommitGrantUnsupported,
 }
 
 /// What a launching terminal may hand on.
@@ -851,6 +855,12 @@ impl SubagentGrant {
         launcher: Launcher<'_>,
         history: &mut LaunchHistory,
     ) -> Result<ResolvedGrant, SubagentGrantError> {
+        // Off Unix the terminal runs no `sh`, so nothing guards a committing
+        // worktree's git data — a grant must not pretend otherwise.
+        #[cfg(not(unix))]
+        if self.worktrees.iter().any(|grant| grant.commit) {
+            return Err(SubagentGrantError::CommitGrantUnsupported);
+        }
         let mut paths = Vec::with_capacity(self.worktrees.len());
         for grant in &self.worktrees {
             let path = canonical(&grant.path).await?;
