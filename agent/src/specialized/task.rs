@@ -2397,6 +2397,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // A commit grant is refused where no shell can carry its shim.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_listing_failure_keeps_the_runs_outcome() {
         let fixture = CommitFixture::new().await;
