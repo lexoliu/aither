@@ -70,10 +70,12 @@ use crate::{
         EpisodeDetector, FeedCounter, LocalStdinProbe, STDIN_WATCH_INTERVAL, StdinWatchSignal,
     },
     subagent::{
-        CommitLedger, CommittingWorktree, LaunchHistory, Launcher, SubagentGrant,
-        SubagentGrantError, canonical as canonical_path,
+        CommitLedger, CommittingWorktree, ImportBudget, ImportLimits, LaunchHistory, Launcher,
+        Spelling, SubagentGit, SubagentGrant, SubagentGrantError, canonical as canonical_path,
     },
 };
+
+mod subagent_git;
 
 pub fn erase_terminal_tool<T>(tool: T) -> crate::command::DynTerminalToolEntry
 where
@@ -481,13 +483,16 @@ const MAX_LINES_CEILING: u32 = 800;
 /// How long a `terminal` call waits in the foreground before a still-running
 /// command promotes to a background task.
 pub const DEFAULT_FOREGROUND_WAIT: Duration = Duration::from_secs(10);
+/// The default of the most bytes a subagent's sandbox may send the host while
+/// its commits are imported into the main repository.
+pub const DEFAULT_SUBAGENT_IMPORT_LIMIT: u64 = 1024 * 1024 * 1024;
 /// Largest `timeout` a command accepts.
 pub const DEFAULT_TIMEOUT_CAP: Duration = Duration::from_secs(120 * 60);
 /// A background job still running after this long produces one system alert.
 pub const DEFAULT_LONG_JOB_ALERT_AFTER: Duration = Duration::from_secs(40 * 60);
 
 /// Time bounds applied to every execution this terminal spawns.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TerminalLimits {
     /// Foreground wait before a `terminal` call promotes to a background
     /// task.
@@ -496,6 +501,10 @@ struct TerminalLimits {
     timeout_cap: Duration,
     /// Runtime after which a background job produces a long-running alert.
     long_job_alert: Duration,
+    /// Most bytes a subagent's sandbox may send while its commits are
+    /// imported; shared with every terminal derived from this one, and
+    /// adjustable at runtime.
+    subagent_import: ImportBudget,
 }
 
 impl Default for TerminalLimits {
@@ -504,6 +513,7 @@ impl Default for TerminalLimits {
             foreground_wait: DEFAULT_FOREGROUND_WAIT,
             timeout_cap: DEFAULT_TIMEOUT_CAP,
             long_job_alert: DEFAULT_LONG_JOB_ALERT_AFTER,
+            subagent_import: ImportBudget::new(DEFAULT_SUBAGENT_IMPORT_LIMIT),
         }
     }
 }
@@ -1193,6 +1203,8 @@ struct SubagentAuthority {
     /// The worktrees it may commit in, with their git data; it hands on no
     /// other commit grant.
     committing: Vec<CommittingWorktree>,
+    /// Runs git in its sandbox, as it, for the host's view of its commits.
+    git: SubagentGit,
     /// Where its commands run when its home backend is a container: its
     /// space and granted paths, mapped through the container's workspace
     /// mount when it was launched.
@@ -1308,7 +1320,7 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             alert_tx: self.alert_tx.clone(),
             started_rx: self.started_rx.clone(),
             started_tx: self.started_tx.clone(),
-            limits: self.limits,
+            limits: self.limits.clone(),
             running_tasks: self.running_tasks.clone(),
             permission_rx: self.permission_rx.clone(),
             permission_tx: self.permission_tx.clone(),
@@ -1707,6 +1719,28 @@ where
         self
     }
 
+    /// Sets the most bytes a subagent's sandbox may send the host while the
+    /// commits it made are imported into the main repository; a pack or answer
+    /// that exceeds it fails the import. `0` leaves the bytes unbounded.
+    /// Defaults to [`DEFAULT_SUBAGENT_IMPORT_LIMIT`]. Each piece of an import's
+    /// sandboxed work is bounded in time by the foreground limit.
+    ///
+    /// The setting can be changed while the terminal and the subagents it
+    /// launches run, through [`Self::subagent_import_budget`].
+    #[must_use]
+    pub fn with_subagent_import_limit(self, bytes: u64) -> Self {
+        self.limits.subagent_import.set(bytes);
+        self
+    }
+
+    /// A handle on the setting [`Self::with_subagent_import_limit`] sets,
+    /// shared with every subagent this terminal launches: a change through it
+    /// applies to the next import of each of them.
+    #[must_use]
+    pub fn subagent_import_budget(&self) -> ImportBudget {
+        self.limits.subagent_import.clone()
+    }
+
     /// Sets how long a background job may run before it produces one system
     /// alert naming it. Defaults to [`DEFAULT_LONG_JOB_ALERT_AFTER`].
     #[must_use]
@@ -1881,6 +1915,7 @@ where
     /// or a commit it cannot grant, when the grant cannot be resolved, when a
     /// container session cannot express the subagent's paths, or when the
     /// subagent's space cannot be created.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn subagent(
         &self,
         history: &mut LaunchHistory,
@@ -1896,6 +1931,7 @@ where
             authority.push(canonical_path(path).await?);
         }
         let spaces_root = working_dir.join(SUBAGENT_SPACES_DIR);
+        let mount = self.container_mount().await?;
         let granted = grant
             .resolve(
                 Launcher {
@@ -1905,15 +1941,22 @@ where
                         .as_ref()
                         .map(|subagent| subagent.committing.as_slice()),
                     spaces_root: &spaces_root,
+                    spelling: mount
+                        .as_ref()
+                        .map_or_else(Spelling::host, Spelling::through),
                 },
                 history,
             )
             .await?;
+        self.registry
+            .registry()
+            .record_committed(&granted.committing);
 
         let space = spaces_root.join(crate::naming::random_word_slug(4));
-        let container = self
-            .container_confinement_for(&space, &granted.writable)
-            .await?;
+        let container = mount
+            .as_ref()
+            .map(|mount| container_confinement_for(mount, &space, &granted.writable))
+            .transpose()?;
         async_fs::create_dir_all(&space)
             .await
             .map_err(|source| SubagentGrantError::Space {
@@ -1930,12 +1973,31 @@ where
         self.executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
-        let readable_paths = self
+        let readable_paths: Vec<PathBuf> = self
             .readable_paths
             .iter()
             .cloned()
             .chain(authority)
             .collect();
+        let git = match (&container, mount) {
+            (Some(confinement), Some(mount)) => {
+                SubagentGit::new(Arc::new(subagent_git::ContainerGit {
+                    executor: self.executor.clone(),
+                    shell_sessions: self.shell_sessions.clone(),
+                    confinement: confinement.clone(),
+                    mount,
+                    priority: self.priority,
+                }))
+            }
+            _ => SubagentGit::new(Arc::new(subagent_git::LocalGit {
+                executor: self.executor.clone(),
+                working_dir: space.clone(),
+                writable: granted.writable.clone(),
+                readable: readable_paths.clone(),
+                committing: granted.committing.clone(),
+                priority: self.priority,
+            })),
+        };
         let registry = Arc::new(
             self.registry
                 .registry()
@@ -1958,7 +2020,7 @@ where
             alert_tx,
             started_rx,
             started_tx,
-            limits: self.limits,
+            limits: self.limits.clone(),
             running_tasks,
             permission_rx,
             permission_tx,
@@ -1966,6 +2028,7 @@ where
             readable_paths,
             subagent: Some(SubagentAuthority {
                 committing: granted.committing,
+                git,
                 container,
             }),
             carried_dir: None,
@@ -1978,14 +2041,10 @@ where
         Ok(launching.into_served())
     }
 
-    /// The sandbox a subagent's commands run in when this terminal's home
-    /// backend is a container: its space and granted paths, spelled through
-    /// the container's workspace mount. `None` outside a container.
-    async fn container_confinement_for(
-        &self,
-        space: &Path,
-        writable: &[PathBuf],
-    ) -> Result<Option<ContainerConfinement>, SubagentGrantError> {
+    /// The workspace mount of this terminal's home container, with its host
+    /// side canonical, spelling every path of a subagent's view inside the
+    /// container. `None` outside a container.
+    async fn container_mount(&self) -> Result<Option<MountRoot>, SubagentGrantError> {
         if self.shell_sessions.resolve_local_backend() != Ok(ShellBackend::Container) {
             return Ok(None);
         }
@@ -1995,26 +2054,35 @@ where
             .and_then(ContainerShellRuntime::workspace_mount)
             .ok_or(SubagentGrantError::NoContainerMount)?;
         // The mount is compared by real path, like everything it maps.
-        let mount = MountRoot::new(
+        Ok(Some(MountRoot::new(
             canonical_path(&mount.host_root).await?,
             mount.container_root.clone(),
-        );
-        let map = |path: &Path| {
-            mount
-                .container_path(path)
-                .map_err(|source| SubagentGrantError::OutsideContainerMount {
-                    path: path.to_path_buf(),
-                    source,
-                })
-        };
-        Ok(Some(ContainerConfinement {
-            working_dir: map(space)?,
-            writable: writable
-                .iter()
-                .map(|path| map(path))
-                .collect::<Result<_, _>>()?,
-        }))
+        )))
     }
+}
+
+/// The sandbox a subagent's commands run in inside a container: its space and
+/// granted paths, spelled through the container's workspace mount.
+fn container_confinement_for(
+    mount: &MountRoot,
+    space: &Path,
+    writable: &[PathBuf],
+) -> Result<ContainerConfinement, SubagentGrantError> {
+    let map = |path: &Path| {
+        mount
+            .container_path(path)
+            .map_err(|source| SubagentGrantError::OutsideContainerMount {
+                path: path.to_path_buf(),
+                source,
+            })
+    };
+    Ok(ContainerConfinement {
+        working_dir: map(space)?,
+        writable: writable
+            .iter()
+            .map(|path| map(path))
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 impl<P, E> TerminalTool<P, E, Configured>
@@ -2036,9 +2104,16 @@ where
     /// Lists the commits of the subagent this terminal serves, when it holds a
     /// commit grant.
     fn commit_ledger(&self) -> Option<CommitLedger> {
-        self.subagent
-            .as_ref()
-            .and_then(|subagent| CommitLedger::new(&subagent.committing))
+        self.subagent.as_ref().and_then(|subagent| {
+            CommitLedger::new(
+                &subagent.committing,
+                subagent.git.clone(),
+                ImportLimits {
+                    bytes: self.limits.subagent_import.clone(),
+                    time: self.limits.foreground_wait,
+                },
+            )
+        })
     }
 
     /// Converts this `TerminalTool` into a type-erased `DynTerminalTool`.
@@ -3403,6 +3478,150 @@ async fn save_completed_stderr(
     }
 }
 
+/// The `git` shim every sandboxed command's PATH resolves first: a git
+/// run in a committing worktree reads the worktree's host-owned entry
+/// instead of whatever `.git` its subagent wrote.
+#[cfg(unix)]
+const GIT_SHIM: &str = include_str!("../templates/git_shim");
+
+/// Writes the `git` shim into the prepared tools directory once: the
+/// commands' PATH sees it ahead of the system's `git`.
+#[cfg(unix)]
+async fn write_git_shim(tools: &PreparedTools<PathBuf>) -> Result<(), TerminalError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let shim = tools.bin_dir().join("git");
+    match async_fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&shim)
+        .await
+    {
+        Ok(mut file) => {
+            file.write_all(GIT_SHIM.as_bytes()).await.map_err(|error| {
+                TerminalError::Execution(format!("writing {}: {error}", shim.display()))
+            })?;
+            file.flush().await.map_err(|error| {
+                TerminalError::Execution(format!("writing {}: {error}", shim.display()))
+            })?;
+            async_fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .await
+                .map_err(|error| {
+                    TerminalError::Execution(format!("writing {}: {error}", shim.display()))
+                })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(TerminalError::Execution(format!(
+            "writing {}: {error}",
+            shim.display()
+        ))),
+    }
+}
+
+/// Windows commands run no `sh`: no shim, and the worktrees' git map is
+/// never handed out either.
+#[cfg(not(unix))]
+async fn write_git_shim(_tools: &PreparedTools<PathBuf>) -> Result<(), TerminalError> {
+    Ok(())
+}
+
+/// The script a container's command runs ahead of its own: the `git`
+/// shim written into a writable directory it puts first on `PATH`, and
+/// the worktree map as exports. Empty without a map — subagent
+/// containers never see it.
+#[cfg(unix)]
+fn container_git_preamble(
+    registry: &ToolRegistry,
+    mount: Option<&MountRoot>,
+) -> Result<String, TerminalError> {
+    use std::fmt::Write as _;
+    let mut environment = Vec::new();
+    // The shim inside the container compares its working directory against
+    // the map: every path it holds must be spelled the way the container's
+    // workspace mount resolves it, or the worktree goes unprotected.
+    let spell = |path: &Path| -> Result<String, TerminalError> {
+        let mount = mount.ok_or_else(|| {
+            TerminalError::SandboxSetup(format!(
+                "a committing worktree {} has no workspace mount to map through",
+                path.display()
+            ))
+        })?;
+        let host_root =
+            std::fs::canonicalize(&mount.host_root).unwrap_or_else(|_| mount.host_root.clone());
+        MountRoot::new(host_root, mount.container_root.clone())
+            .container_path(path)
+            .map(|path| path.to_string())
+            .map_err(|source| {
+                TerminalError::SandboxSetup(format!(
+                    "{} is outside the container workspace mount: {source}",
+                    path.display()
+                ))
+            })
+    };
+    committed_git_environment(registry, &mut environment, spell)?;
+    if environment.is_empty() {
+        return Ok(String::new());
+    }
+    let mut preamble =
+        "aither_shim=${TMPDIR:-/tmp}/aither-shim-$$\nmkdir -p \"$aither_shim\"\n".to_string();
+    preamble.push_str("cat > \"$aither_shim/git\" <<'AITHER_GIT_SHIM'\n");
+    preamble.push_str(GIT_SHIM);
+    preamble.push_str(
+        "AITHER_GIT_SHIM\nchmod +x \"$aither_shim/git\"\nPATH=\"$aither_shim:$PATH\"\nexport PATH\n",
+    );
+    for (name, value) in &environment {
+        writeln!(preamble, "export {name}={}", shell_words::quote(value))
+            .expect("a string cannot fail a write");
+    }
+    Ok(preamble)
+}
+
+#[cfg(not(unix))]
+fn container_git_preamble(
+    _registry: &ToolRegistry,
+    _mount: Option<&MountRoot>,
+) -> Result<String, TerminalError> {
+    Ok(String::new())
+}
+
+/// Hands the git shim of a main terminal's commands the worktree map,
+/// each path spelled the way `spell` resolves it for the command's
+/// context — a host path locally, a container path inside a container.
+///
+/// A command's `git` in a committing worktree resolves the worktree's
+/// host-owned repository entry through `GIT_DIR`, so nothing a subagent
+/// wrote — a `.git` file, the repository's configuration, hooks,
+/// fsmonitor or filter programs — decides what program git runs. The
+/// map only describes paths the host resolved when the grant was made.
+/// Subagent terminals keep their own repositories' view.
+fn committed_git_environment(
+    registry: &ToolRegistry,
+    environment: &mut Vec<(String, String)>,
+    spell: impl Fn(&Path) -> Result<String, TerminalError>,
+) -> Result<(), TerminalError> {
+    if registry.role() != crate::command::CommandRole::Main {
+        return Ok(());
+    }
+    let committed = registry.committed_worktrees();
+    if committed.is_empty() {
+        return Ok(());
+    }
+    environment.push((
+        "AITHER_GIT_WORKTREES_COUNT".to_string(),
+        committed.len().to_string(),
+    ));
+    for (index, worktree) in committed.iter().enumerate() {
+        environment.push((
+            format!("AITHER_GIT_WORKTREE_PATH_{index}"),
+            spell(worktree.worktree())?,
+        ));
+        environment.push((
+            format!("AITHER_GIT_WORKTREE_GITDIR_{index}"),
+            spell(worktree.git_dir())?,
+        ));
+    }
+    Ok(())
+}
+
 fn local_path_grants(
     writable: &[PathBuf],
     readable: &[PathBuf],
@@ -3455,8 +3674,12 @@ where
     E: Executor + Clone + 'static,
     N: NetworkPolicy + 'static,
 {
+    write_git_shim(context.prepared_tools).await?;
     let mut runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    committed_git_environment(context.registry, &mut runtime_environment, |path| {
+        Ok(path.display().to_string())
+    })?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
     #[cfg(all(unix, feature = "jobserver"))]
@@ -3562,8 +3785,12 @@ where
 async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
+    write_git_shim(context.prepared_tools).await?;
     let mut runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    committed_git_environment(context.registry, &mut runtime_environment, |path| {
+        Ok(path.display().to_string())
+    })?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
     #[cfg(all(unix, feature = "jobserver"))]
@@ -4108,6 +4335,30 @@ async fn wait_for_local_process_exit(
     futures_lite::future::or(exit, async { match stdin_watch.run().await {} }).await
 }
 
+/// A container command's full script. A main terminal's git shim and
+/// worktree map travel inside it: the container's tools mount is
+/// read-only, so the command writes the shim where its own `PATH` can
+/// put it first.
+fn container_exec_script(
+    registry: &ToolRegistry,
+    container_runtime: &ContainerShellRuntime,
+    prepared_tools: &PreparedTools<ContainerPath>,
+    carry: Option<&ContainerCarry>,
+    script: &str,
+) -> Result<String, TerminalError> {
+    let preamble = container_git_preamble(registry, container_runtime.workspace_mount())?;
+    let script = if preamble.is_empty() {
+        script.to_string()
+    } else {
+        format!("{preamble}{script}")
+    };
+    let script = prepared_tools.wrap_script(&script)?;
+    match carry {
+        Some(carry) => carry_cwd_script(&script, carry.report.as_str()),
+        None => Ok(script),
+    }
+}
+
 async fn execute_container_background<E: Executor + Clone + 'static>(
     context: ContainerBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
@@ -4133,6 +4384,13 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             None,
         )
         .await;
+    let script = container_exec_script(
+        context.registry,
+        context.container_runtime,
+        context.prepared_tools,
+        context.carry,
+        context.script,
+    )?;
     // A foreground command gets no input channel: the dropped sender is the
     // EOF its stdin reads. StdinAlerts may ride along either way; they are
     // the background job's blocked-reader wiring.
@@ -4176,11 +4434,6 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             Arc::clone(context.registry),
             container_runtime.ipc_route().bind(),
         )?)
-    };
-    let script = context.prepared_tools.wrap_script(context.script)?;
-    let script = match context.carry {
-        Some(carry) => carry_cwd_script(&script, carry.report.as_str())?,
-        None => script,
     };
     let working_dir = context
         .carry
@@ -5150,6 +5403,19 @@ mod tests {
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
             _lifetime: ExecLifetime,
+        ) -> impl std::future::Future<Output = Result<crate::ContainerExecOutcome, String>> + Send
+        {
+            std::future::ready(Err("adoption never executes in the container".to_string()))
+        }
+
+        fn exec_streamed(
+            &self,
+            _container_id: &str,
+            _script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _stdout: Sender<Vec<u8>>,
         ) -> impl std::future::Future<Output = Result<crate::ContainerExecOutcome, String>> + Send
         {
             std::future::ready(Err("adoption never executes in the container".to_string()))
@@ -6598,6 +6864,19 @@ mod tests {
                     killed: Vec::new(),
                 })
             }
+
+            fn exec_streamed(
+                &self,
+                _container_id: &str,
+                _script: &str,
+                _working_dir: &str,
+                _kill_rx: Receiver<()>,
+                _stdin_rx: Receiver<Vec<u8>>,
+                _stdout: Sender<Vec<u8>>,
+            ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
+            {
+                std::future::ready(Err("a foreground command does not stream".to_string()))
+            }
         }
 
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -7968,6 +8247,64 @@ mod tests {
         .with_test_container_tools(container_tools, container.0.clone())
     }
 
+    /// The streamed exec of the real docker backend delivers a command's
+    /// stdout in order and whole across chunks, reports its exit status, and
+    /// kills the command when its kill switch is dropped.
+    #[cfg(all(unix, aither_container_acceptance))]
+    #[tokio::test]
+    async fn container_streamed_exec_streams_stdout_reports_status_and_kills_on_drop() {
+        use crate::ContainerExec as _;
+        let (container, _bundle, _tools_cache) = start_acceptance_container().await;
+        let client = Arc::new(
+            bollard::Docker::connect_with_local_defaults().expect("docker client should connect"),
+        );
+        let exec = crate::BollardContainerExec::new(client);
+
+        let (_kill_tx, kill_rx) = async_channel::bounded::<()>(1);
+        let (stdin_tx, stdin_rx) = async_channel::bounded::<Vec<u8>>(1);
+        drop(stdin_tx);
+        let (out_tx, out_rx) = async_channel::bounded::<Vec<u8>>(8);
+        let streaming = exec.exec_streamed(
+            &container.0,
+            "head -c 300000 /dev/zero | tr '\\0' 'x'; exit 3",
+            "/",
+            kill_rx,
+            stdin_rx,
+            out_tx,
+        );
+        let collect = async {
+            let mut total = 0;
+            while let Ok(chunk) = out_rx.recv().await {
+                assert!(chunk.iter().all(|byte| *byte == b'x'));
+                total += chunk.len();
+            }
+            total
+        };
+        let (outcome, total) = futures::join!(streaming, collect);
+        assert_eq!(total, 300_000, "every byte arrives");
+        match outcome.expect("the exec runs") {
+            ContainerExecOutcome::Completed { output, .. } => {
+                assert_eq!(output.status.code(), Some(3));
+            }
+            ContainerExecOutcome::Killed => panic!("nothing killed it"),
+        }
+
+        // A reader that goes away ends the command.
+        let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
+        let (stdin_tx, stdin_rx) = async_channel::bounded::<Vec<u8>>(1);
+        drop(stdin_tx);
+        let (out_tx, out_rx) = async_channel::bounded::<Vec<u8>>(1);
+        drop(out_rx);
+        let outcome = exec
+            .exec_streamed(&container.0, "yes", "/", kill_rx, stdin_rx, out_tx)
+            .await;
+        drop(kill_tx);
+        assert!(
+            matches!(outcome, Ok(ContainerExecOutcome::Killed) | Err(_)),
+            "a gone reader stops the command: {outcome:?}"
+        );
+    }
+
     /// In a real container the main agent's command runs unconfined, while a
     /// subagent's runs under its per-command sandbox: it writes its own space
     /// and nothing else of the workspace.
@@ -8566,60 +8903,657 @@ mod tests {
         )
     }
 
+    /// A repository with a worktree one can commit in, and the paths the
+    /// commit grant is about, all canonical.
+    #[cfg(unix)]
+    struct CommitSetup {
+        dir: tempfile::TempDir,
+        worktree: PathBuf,
+        /// The main repository's git directory.
+        common: PathBuf,
+        /// The worktree's entry in it.
+        entry: PathBuf,
+        /// The subagent's repository.
+        subagent: PathBuf,
+        parent: ConfiguredTestTool,
+        _cache: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl CommitSetup {
+        async fn new(namespace: &str) -> Self {
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let worktree =
+                crate::subagent::tests::repository_with_linked_worktree(dir.path(), namespace);
+            let (cache, parent) = authority_terminal(dir.path()).await;
+            let common = dunce::canonicalize(dir.path().join("repository/.git")).unwrap();
+            let entry = common.join("worktrees").join(namespace);
+            Self {
+                worktree: dunce::canonicalize(worktree).unwrap(),
+                subagent: entry.join("subagent"),
+                common,
+                entry,
+                parent,
+                dir,
+                _cache: cache,
+            }
+        }
+
+        async fn committing_child(&self, launcher: &ConfiguredTestTool) -> ConfiguredTestTool {
+            launch(
+                launcher,
+                SubagentGrant::new().with_committing_worktree(&self.worktree),
+            )
+            .await
+            .expect("the worktree can be granted with commit")
+        }
+
+        fn main_has(&self, id: &str) -> bool {
+            std::process::Command::new("git")
+                .args(["cat-file", "-e", id])
+                .current_dir(&self.common)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        }
+
+        fn main(&self, args: &[&str]) -> String {
+            crate::subagent::tests::git_in(&self.common, args)
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn commit_in_a_linked_worktree_needs_the_commit_grant() {
-        let dir = tempfile::tempdir().expect("temp dir should be created");
-        let worktree = crate::subagent::tests::repository_with_linked_worktree(dir.path(), "one");
-        let (_cache, parent) = authority_terminal(dir.path()).await;
+    async fn a_sandboxed_commit_lands_in_the_subagents_repository_and_the_main_one_is_read_only() {
+        let setup = CommitSetup::new("one").await;
+        let child = setup.committing_child(&setup.parent).await;
+        let ledger = child.commit_ledger().expect("a commit grant has a ledger");
+        let mark = ledger.mark().await.expect("the namespace can be read");
+        let before = setup.main(&["rev-parse", "refs/heads/subagent/one/work"]);
 
-        let without = launch(&parent, SubagentGrant::new().with_worktree(&worktree))
-            .await
-            .expect("the worktree can be granted");
+        assert_eq!(
+            exit_code_of(&child, &commit_script(&setup.worktree, "authorized")).await,
+            0,
+            "a commit grant lets the subagent commit"
+        );
+        assert_eq!(
+            setup.main(&["rev-parse", "refs/heads/subagent/one/work"]),
+            before,
+            "the commit is not in the main repository yet"
+        );
+
+        let commits = ledger.since(&mark).await.expect("commits can be listed");
+        assert_eq!(commits.len(), 1, "{commits:?}");
+        assert_eq!(commits[0].subject, "authorized");
+        assert_eq!(commits[0].worktree, setup.worktree);
+        assert!(setup.main_has(&commits[0].commit));
+        assert_eq!(
+            setup.main(&["rev-parse", "refs/heads/subagent/one/work"]),
+            commits[0].commit
+        );
+        setup.main(&["fsck", "--strict", "--no-dangling"]);
+    }
+
+    /// The main agent's `git` in a committing worktree resolves the
+    /// worktree's host-owned repository entry through the terminal's shim:
+    /// no program the subagent's repository config names — fsmonitor,
+    /// hooks, filters — and no `.git` file it replaced decides what runs.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_main_agents_git_in_a_committing_worktree_runs_nothing_the_subagent_chose() {
+        use std::fmt::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let setup = CommitSetup::new("guarded").await;
+        let _child = setup.committing_child(&setup.parent).await;
+
+        // A program only subagent-chosen configuration can reach.
+        let marker = setup.dir.path().join("subagent-ran");
+        let program = setup.dir.path().join("ran-by-git.sh");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\nprintf ran >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hooks = setup.dir.path().join("evil-hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let pre_commit = hooks.join("pre-commit");
+        std::fs::write(
+            &pre_commit,
+            format!("#!/bin/sh\nprintf hook >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&pre_commit, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Its repository's configuration names the program everywhere a
+        // program can be named; the worktree's attributes bind the filter.
+        let mut config = std::fs::read_to_string(setup.subagent.join("config")).unwrap();
+        write!(
+            config,
+            "\n[core]\n\tfsmonitor = {}\n\thooksPath = {}\n[filter \"pwn\"]\n\tclean = {}\n\trequired = true\n",
+            program.display(),
+            hooks.display(),
+            program.display()
+        )
+        .unwrap();
+        std::fs::write(setup.subagent.join("config"), config).unwrap();
+        std::fs::write(setup.worktree.join(".gitattributes"), "* filter=pwn\n").unwrap();
+
+        let worktree = setup.worktree.display().to_string();
+        for script in [
+            format!("git -C '{worktree}' status"),
+            format!("cd '{worktree}' && git status"),
+            format!(
+                "git -C '{worktree}' add -A && \
+                 git -C '{worktree}' -c user.name=a -c user.email=a@a -c commit.gpgSign=false \
+                 commit --allow-empty -m x"
+            ),
+        ] {
+            assert_eq!(
+                exit_code_of(&setup.parent, &script).await,
+                0,
+                "the ordinary git command should keep working: {script}"
+            );
+        }
+        assert!(
+            !marker.exists(),
+            "no program of the subagent's choosing ran through the worktree's repository"
+        );
+
+        // A replaced `.git` file resolves nothing either: the shim acts on
+        // the worktree's path, not on what its `.git` says.
+        std::fs::write(
+            setup.worktree.join(".git"),
+            format!("gitdir: {}\n", setup.subagent.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            exit_code_of(&setup.parent, &format!("git -C '{worktree}' status")).await,
+            0
+        );
+        assert!(
+            !marker.exists(),
+            "a replaced .git file chose no program either"
+        );
+
+        // Git anywhere else is untouched.
+        let repository = dunce::canonicalize(setup.dir.path().join("repository")).unwrap();
         assert_eq!(
             exit_code_of(
-                &without,
-                &format!("touch '{}'", worktree.join("f.txt").display())
+                &setup.parent,
+                &format!("git -C '{}' log --oneline -1", repository.display())
             )
             .await,
             0,
-            "the worktree itself is writable"
+            "git in unrelated repositories still reaches them"
         );
-        assert_ne!(
-            exit_code_of(&without, &commit_script(&worktree, "denied")).await,
-            0,
-            "its git data lives outside the subagent's space"
+    }
+
+    /// Nothing of the main repository's git directory is writable to a
+    /// committing subagent: each attempt on the main repository fails, and the
+    /// same command shape on the subagent's own repository, its positive
+    /// control, succeeds.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn a_committing_subagent_can_change_nothing_the_main_repository_reads() {
+        let setup = CommitSetup::new("two").await;
+        let child = setup.committing_child(&setup.parent).await;
+
+        // A fan-out directory known to be absent, and a loose object known to
+        // exist, in the main object store.
+        let absent = setup.common.join("objects/ff");
+        let _ = std::fs::remove_dir(&absent);
+        assert!(!absent.exists());
+        let loose_dir = std::fs::read_dir(setup.common.join("objects"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.len() == 2 && name != "ff")
+            })
+            .expect("the initial commit left loose objects");
+        let loose = std::fs::read_dir(&loose_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let loose_name = loose.file_name().unwrap().to_str().unwrap().to_string();
+        let loose_dir_name = loose_dir.file_name().unwrap().to_str().unwrap().to_string();
+        let loose_bytes = std::fs::read(&loose).unwrap();
+
+        // The subagent's own repository, for the controls.
+        let own = &setup.subagent;
+        std::fs::create_dir_all(own.join("objects").join(&loose_dir_name)).unwrap();
+        std::fs::write(
+            own.join("objects").join(&loose_dir_name).join(&loose_name),
+            b"own",
+        )
+        .unwrap();
+
+        let main_objects = setup.common.join("objects");
+        let own_objects = own.join("objects");
+        let attempts: Vec<(&str, String, String)> = vec![
+            (
+                "create a fan-out directory",
+                format!("mkdir '{}'", main_objects.join("ff").display()),
+                format!("mkdir '{}'", own_objects.join("ff").display()),
+            ),
+            (
+                "create an object in an existing fan-out directory",
+                format!(
+                    "touch '{}'",
+                    main_objects.join(&loose_dir_name).join("new").display()
+                ),
+                format!(
+                    "touch '{}'",
+                    own_objects.join(&loose_dir_name).join("new").display()
+                ),
+            ),
+            (
+                "overwrite an existing loose object",
+                format!("echo evil > '{}'", loose.display()),
+                format!(
+                    "echo evil > '{}'",
+                    own_objects
+                        .join(&loose_dir_name)
+                        .join(&loose_name)
+                        .display()
+                ),
+            ),
+            (
+                "replace an existing loose object by renaming over it",
+                format!(
+                    "echo evil > '{}/stage' && mv -f '{}/stage' '{}'",
+                    own_objects.display(),
+                    own_objects.display(),
+                    loose.display()
+                ),
+                format!(
+                    "echo evil > '{}/stage' && mv -f '{}/stage' '{}'",
+                    own_objects.display(),
+                    own_objects.display(),
+                    own_objects
+                        .join(&loose_dir_name)
+                        .join(&loose_name)
+                        .display()
+                ),
+            ),
+            (
+                "remove an existing loose object",
+                format!("rm -f '{}'", loose.display()),
+                format!(
+                    "rm -f '{}'",
+                    own_objects
+                        .join(&loose_dir_name)
+                        .join(&loose_name)
+                        .display()
+                ),
+            ),
+            (
+                "create a pack",
+                format!(
+                    "touch '{}'",
+                    main_objects.join("pack/pack-x.pack").display()
+                ),
+                format!("touch '{}'", own_objects.join("pack/pack-x.pack").display()),
+            ),
+            (
+                "write an alternates file",
+                format!(
+                    "echo /tmp > '{}'",
+                    main_objects.join("info/alternates").display()
+                ),
+                format!(
+                    "echo /tmp > '{}'",
+                    own_objects.join("info/scratch").display()
+                ),
+            ),
+            (
+                "move the worktree's branch",
+                format!(
+                    "echo {} > '{}'",
+                    "a".repeat(40),
+                    setup.common.join("refs/heads/subagent/two/work").display()
+                ),
+                format!(
+                    "echo {} > '{}'",
+                    "a".repeat(40),
+                    own.join("refs/heads/subagent/two/scratch").display()
+                ),
+            ),
+            (
+                "rewrite the entry's HEAD",
+                format!("echo evil >> '{}'", setup.entry.join("HEAD").display()),
+                format!("echo evil >> '{}'", own.join("scratch-head").display()),
+            ),
+            (
+                "rewrite the entry's index",
+                format!("echo evil >> '{}'", setup.entry.join("index").display()),
+                format!("echo evil >> '{}'", own.join("scratch-index").display()),
+            ),
+            (
+                "rewrite the repository's configuration",
+                format!("echo evil >> '{}'", setup.common.join("config").display()),
+                format!("echo evil >> '{}'", own.join("scratch-config").display()),
+            ),
+        ];
+        for (what, denied, control) in attempts {
+            assert_ne!(
+                exit_code_of(&child, &denied).await,
+                0,
+                "must not {what} in the main repository"
+            );
+            assert_eq!(
+                exit_code_of(&child, &control).await,
+                0,
+                "the same command succeeds in the subagent's own repository: {what}"
+            );
+        }
+        assert!(!absent.exists(), "no fan-out directory appeared");
+        assert_eq!(
+            std::fs::read(&loose).unwrap(),
+            loose_bytes,
+            "the object is as it was"
+        );
+        assert!(
+            !std::fs::read_to_string(setup.common.join("config"))
+                .unwrap()
+                .contains("evil")
+        );
+        setup.main(&["fsck", "--strict", "--no-dangling"]);
+    }
+
+    /// Git in a repository the sandbox can read keeps working next to the
+    /// redirected worktree: nothing is set process-wide.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn git_in_another_repository_works_inside_a_committing_subagents_sandbox() {
+        let setup = CommitSetup::new("three").await;
+        let other = setup.dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        crate::subagent::tests::git_in(&other, &["init", "--initial-branch=main"]);
+        crate::subagent::tests::git_in(&other, &["commit", "--allow-empty", "-m", "elsewhere"]);
+        let child = setup.committing_child(&setup.parent).await;
+
+        assert!(
+            stdout_of(
+                &child,
+                &format!("git -C '{}' log --oneline", other.display())
+            )
+            .await
+            .contains("elsewhere")
+        );
+        let clone = child.working_dir().join("clone");
+        assert_eq!(
+            exit_code_of(
+                &child,
+                &format!("git clone '{}' '{}'", other.display(), clone.display())
+            )
+            .await,
+            0
+        );
+        assert!(clone.join(".git").exists());
+    }
+
+    /// A subagent a committing subagent launches with the commit grant it
+    /// holds works in the same repository: it sees its parent's commits and
+    /// the parent's ledger reports both.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_committing_child_shares_its_parents_repository() {
+        let setup = CommitSetup::new("four").await;
+        let parent_subagent = setup.committing_child(&setup.parent).await;
+        let parent_ledger = parent_subagent.commit_ledger().unwrap();
+        let parent_mark = parent_ledger.mark().await.unwrap();
+        assert_eq!(
+            exit_code_of(
+                &parent_subagent,
+                &commit_script(&setup.worktree, "parent work")
+            )
+            .await,
+            0
         );
 
-        let with = launch(
+        let child = setup.committing_child(&parent_subagent).await;
+        let child_ledger = child.commit_ledger().unwrap();
+        let child_mark = child_ledger.mark().await.unwrap();
+        assert!(
+            stdout_of(
+                &child,
+                &format!("git -C '{}' log --oneline", setup.worktree.display())
+            )
+            .await
+            .contains("parent work"),
+            "the child sees its parent's commit"
+        );
+        assert_eq!(
+            exit_code_of(&child, &commit_script(&setup.worktree, "child work")).await,
+            0
+        );
+
+        let child_commits = child_ledger.since(&child_mark).await.unwrap();
+        assert_eq!(
+            child_commits
+                .iter()
+                .map(|commit| commit.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["child work"]
+        );
+        let parent_commits = parent_ledger.since(&parent_mark).await.unwrap();
+        assert_eq!(
+            parent_commits
+                .iter()
+                .map(|commit| commit.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["parent work", "child work"]
+        );
+        for commit in &parent_commits {
+            assert!(setup.main_has(&commit.commit));
+        }
+        setup.main(&["fsck", "--strict", "--no-dangling"]);
+    }
+
+    /// The import asks a sandbox that cannot read another repository for that
+    /// repository's objects: they cannot reach the main one.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objects_the_subagent_cannot_read_never_reach_the_main_repository() {
+        let setup = CommitSetup::new("five").await;
+        let child = setup.committing_child(&setup.parent).await;
+        let outside = tempfile::tempdir().expect("temp dir should be created");
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        crate::subagent::tests::git_in(outside.path(), &["init", "--initial-branch=main"]);
+        crate::subagent::tests::git_in(outside.path(), &["add", "secret.txt"]);
+        crate::subagent::tests::git_in(outside.path(), &["commit", "-m", "secret commit"]);
+        let secret = crate::subagent::tests::git_in(outside.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(
+            exit_code_of(
+                &child,
+                &format!("cat '{}'", outside.path().join("secret.txt").display())
+            )
+            .await,
+            0,
+            "the control: the sandbox cannot read the other repository"
+        );
+
+        let ledger = child.commit_ledger().unwrap();
+        let mark = ledger.mark().await.unwrap();
+        // The subagent's repository names a commit only the other one has,
+        // and reaches its objects through symlinks, as its own: a process
+        // that could read the other repository would pack them (the pack
+        // leaves out only objects borrowed from an alternate).
+        for entry in std::fs::read_dir(outside.path().join(".git/objects")).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.len() == 2 {
+                std::os::unix::fs::symlink(entry.path(), setup.subagent.join("objects").join(name))
+                    .unwrap();
+            }
+        }
+        std::fs::write(
+            setup.subagent.join("refs/heads/subagent/five/stolen"),
+            format!("{secret}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::subagent::tests::git_in(
+                &setup.subagent,
+                &["--git-dir", ".", "cat-file", "-t", &secret]
+            ),
+            "commit",
+            "the control: a git that could read the other repository packs its commit"
+        );
+        let error = ledger
+            .since(&mark)
+            .await
+            .expect_err("the sandbox cannot read the objects it is asked to pack");
+        assert!(
+            matches!(error, crate::CommitLedgerError::Export { .. }),
+            "the sandboxed git is what refuses: {error}"
+        );
+        assert!(!setup.main_has(&secret), "the secret commit never arrives");
+        assert!(
+            !setup
+                .common
+                .join("refs/heads/subagent/five/stolen")
+                .exists(),
+            "and no ref names it"
+        );
+    }
+
+    /// The import budget is the terminal's operator setting: 1 GiB unless set,
+    /// and a change through its handle reaches the subagents already running.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_import_budget_is_a_setting_adjustable_while_subagents_run() {
+        let setup = CommitSetup::new("budget").await;
+        let budget = setup.parent.subagent_import_budget();
+        assert_eq!(budget.get(), DEFAULT_SUBAGENT_IMPORT_LIMIT);
+        let child = setup.committing_child(&setup.parent).await;
+        let ledger = child.commit_ledger().unwrap();
+        let mark = ledger.mark().await.unwrap();
+        assert_eq!(
+            exit_code_of(
+                &child,
+                &commit_script(&setup.worktree, "heavier than 1 byte")
+            )
+            .await,
+            0
+        );
+
+        budget.set(1);
+        let error = ledger
+            .since(&mark)
+            .await
+            .expect_err("the setting changed after the subagent launched applies to it");
+        assert!(
+            matches!(
+                error,
+                crate::CommitLedgerError::Export { .. } | crate::CommitLedgerError::Rejected { .. }
+            ),
+            "{error}"
+        );
+        budget.set(0);
+        let listed = ledger.since(&mark).await.expect("zero bounds nothing");
+        assert_eq!(listed.len(), 1);
+    }
+
+    /// A commit the main agent makes between runs is visible to the next run,
+    /// and what the subagent had not yet shared survives the refresh.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_run_start_refresh_shows_new_main_commits_and_keeps_unimported_work() {
+        let setup = CommitSetup::new("six").await;
+        let child = setup.committing_child(&setup.parent).await;
+        let ledger = child.commit_ledger().unwrap();
+        ledger.mark().await.unwrap();
+        assert_eq!(
+            exit_code_of(&child, &commit_script(&setup.worktree, "unimported")).await,
+            0
+        );
+
+        crate::subagent::tests::git_in(
+            &dunce::canonicalize(setup.dir.path().join("repository")).unwrap(),
+            &["commit", "--allow-empty", "-m", "main moved on"],
+        );
+        let log = |branch: &str| {
+            format!(
+                "git -C '{}' log --format=%s {branch}",
+                setup.worktree.display()
+            )
+        };
+        assert!(
+            !stdout_of(&child, &log("main"))
+                .await
+                .contains("main moved on"),
+            "the snapshot is the one from before"
+        );
+
+        ledger.mark().await.unwrap();
+        assert!(
+            stdout_of(&child, &log("main"))
+                .await
+                .contains("main moved on"),
+            "the next run starts with the main agent's new commit"
+        );
+        assert!(
+            stdout_of(&child, &log("subagent/six/work"))
+                .await
+                .contains("unimported"),
+            "the subagent's own work survives the refresh"
+        );
+    }
+
+    /// A container backend spells the repository's remote and runs the
+    /// refresh, as the subagent, through the confined streamed exec.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_container_commit_grant_refreshes_through_the_confined_streamed_exec() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let worktree = crate::subagent::tests::repository_with_linked_worktree(dir.path(), "seven");
+        let (scripts, parent) = recording_container_terminal(dir.path(), Some(dir.path())).await;
+        let child = launch(
             &parent,
             SubagentGrant::new().with_committing_worktree(&worktree),
         )
         .await
-        .expect("the worktree can be granted with commit");
-        let ledger = with.commit_ledger().expect("a commit grant has a ledger");
-        let mark = ledger.mark().await.expect("the namespace can be read");
-        assert_eq!(
-            exit_code_of(&with, &commit_script(&worktree, "authorized")).await,
-            0,
-            "a commit grant lets the subagent commit"
+        .expect("a worktree inside the workspace can be granted commit");
+
+        let subagent = dunce::canonicalize(dir.path())
+            .unwrap()
+            .join("repository/.git/worktrees/seven/subagent");
+        let config = std::fs::read_to_string(subagent.join("config")).unwrap();
+        assert!(
+            config.contains("url = \"/workspace/repository/.git\""),
+            "the remote is spelled as the container sees it: {config}"
         );
-        assert_ne!(
-            exit_code_of(
-                &with,
-                &format!(
-                    "git -C '{}' update-ref refs/heads/main HEAD",
-                    worktree.display()
-                )
-            )
-            .await,
-            0,
-            "a branch outside the subagent's namespace stays read-only"
+        assert!(
+            config.contains("hooksPath = \"../repository/.git/hooks\""),
+            "{config}"
         );
-        let commits = ledger.since(&mark).await.expect("commits can be listed");
-        assert_eq!(commits.len(), 1, "{commits:?}");
-        assert_eq!(commits[0].subject, "authorized");
-        assert_eq!(commits[0].worktree, dunce::canonicalize(&worktree).unwrap());
+
+        // The recording exec prints nothing, so the import that follows the
+        // refresh finds no report; only the refresh is of interest here.
+        let _ = child.commit_ledger().unwrap().mark().await;
+        let scripts = scripts.lock().unwrap().clone();
+        let refresh = scripts
+            .iter()
+            .find(|script| script.contains("fetch"))
+            .expect("the refresh ran in the container");
+        assert!(refresh.contains("run --working-dir"), "{refresh}");
+        assert!(
+            refresh.contains("--grant '/workspace/repository/.git/worktrees/seven/subagent=rw'"),
+            "{refresh}"
+        );
+        assert!(
+            refresh.contains("git --git-dir /workspace/repository/.git/worktrees/seven/subagent"),
+            "{refresh}"
+        );
+        assert!(refresh.contains("main-repository"), "{refresh}");
     }
 
     #[cfg(unix)]
@@ -8904,6 +9838,27 @@ mod tests {
                 killed: Vec::new(),
             }))
         }
+
+        fn exec_streamed(
+            &self,
+            _container_id: &str,
+            script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _stdout: Sender<Vec<u8>>,
+        ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
+        {
+            self.scripts.lock().unwrap().push(script.to_string());
+            std::future::ready(Ok(ContainerExecOutcome::Completed {
+                output: std::process::Output {
+                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                killed: Vec::new(),
+            }))
+        }
     }
 
     /// A terminal whose home backend is a recording container, which mounts
@@ -8999,6 +9954,53 @@ mod tests {
         assert!(
             sub.contains(&format!("--grant '/workspace/{granted_name}=rw'")),
             "{sub}"
+        );
+    }
+
+    /// The shim inside a container compares its working directory against
+    /// the worktree map: the map must spell the paths the mount resolves —
+    /// host spellings would leave the worktree unprotected, the `git` shim
+    /// unable to hit it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_containers_git_map_spells_the_worktree_and_gitdir_the_container_way() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let worktree =
+            crate::subagent::tests::repository_with_linked_worktree(dir.path(), "mapped");
+        let (scripts, parent) = recording_container_terminal(dir.path(), Some(dir.path())).await;
+        let _child = launch(
+            &parent,
+            SubagentGrant::new().with_committing_worktree(&worktree),
+        )
+        .await
+        .expect("the worktree can be granted with commit");
+
+        assert_eq!(exit_code_of(&parent, "echo mapped-worktree").await, 0);
+
+        let script = scripts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|script| script.contains("mapped-worktree"))
+            .expect("the main agent's command ran")
+            .clone();
+        assert!(
+            script.contains("export AITHER_GIT_WORKTREE_PATH_0=/workspace/mapped"),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "export AITHER_GIT_WORKTREE_GITDIR_0=/workspace/repository/.git/worktrees/mapped"
+            ),
+            "{script}"
+        );
+        let host = dunce::canonicalize(&worktree)
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(
+            !script.contains(&host),
+            "the shim sees no host spelling: {script}"
         );
     }
 

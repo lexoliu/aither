@@ -990,6 +990,7 @@ impl ToolRegistryBuilder {
             role: CommandRole::Main,
             observer: self.observer,
             gate: self.gate,
+            committed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -1123,6 +1124,10 @@ pub struct ToolRegistry {
     role: CommandRole,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
+    /// The worktrees this registry's terminals have granted commit to so
+    /// far, in grant order: the git map the terminal's `git` shim reads.
+    /// Shared across every bind and role of the session's registries.
+    committed: std::sync::Arc<std::sync::Mutex<Vec<crate::subagent::CommittingWorktree>>>,
 }
 
 /// Detects the stdin argument from a JSON schema.
@@ -1180,6 +1185,22 @@ impl ToolRegistry {
         self
     }
 
+    /// The worktrees this registry's terminals granted commit to, in grant
+    /// order.
+    pub(crate) fn committed_worktrees(&self) -> Vec<crate::subagent::CommittingWorktree> {
+        self.committed.lock().expect("committed worktrees").clone()
+    }
+
+    /// Records worktrees a grant just made committing, once each.
+    pub(crate) fn record_committed(&self, worktrees: &[crate::subagent::CommittingWorktree]) {
+        let mut committed = self.committed.lock().expect("committed worktrees");
+        for worktree in worktrees {
+            if !committed.contains(worktree) {
+                committed.push(worktree.clone());
+            }
+        }
+    }
+
     /// The role this registry serves.
     #[must_use]
     pub const fn role(&self) -> CommandRole {
@@ -1209,6 +1230,7 @@ impl ToolRegistry {
             role: CommandRole::Subagent,
             observer,
             gate,
+            committed: self.committed.clone(),
         }
     }
 

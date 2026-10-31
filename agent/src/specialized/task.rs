@@ -270,8 +270,29 @@ struct SubagentResultTemplate<'a> {
 }
 
 /// The commits listed for one run of a subagent holding a commit grant, or
-/// why they could not be listed.
-type CommitListing = Result<Vec<SubagentCommit>, CommitLedgerError>;
+/// why they could not be listed, and what could not be done to its
+/// repositories before the run.
+struct CommitListing {
+    listed: Result<Vec<SubagentCommit>, CommitLedgerError>,
+    /// Why a repository could not be refreshed or imported when the run
+    /// started: its commits stay in it, out of the main repository.
+    setbacks: Vec<String>,
+}
+
+/// Lists the commits a run made on its granted repositories; `None` when the
+/// run held no commit grant.
+async fn list_commits(
+    ledger: Option<&CommitLedger>,
+    mark: Option<&CommitMark>,
+) -> Option<CommitListing> {
+    match (ledger, mark) {
+        (Some(ledger), Some(mark)) => Some(CommitListing {
+            listed: ledger.since(mark).await,
+            setbacks: mark.setbacks().iter().map(ToString::to_string).collect(),
+        }),
+        _ => None,
+    }
+}
 
 /// What the result text reports about a subagent run.
 enum SubagentReport<'a> {
@@ -1567,10 +1588,7 @@ where
         // Whatever way the run ended, the commits it made are reported; a
         // failure to list them is reported in their place and changes nothing
         // else about the run.
-        let commits = match (&commit_ledger, &commit_mark) {
-            (Some(ledger), Some(mark)) => Some(ledger.since(mark).await),
-            _ => None,
-        };
+        let commits = list_commits(commit_ledger.as_ref(), commit_mark.as_ref()).await;
         let result = match outcome {
             SubagentOutcome::Cancelled => {
                 // The cancelled query left the agent mid-turn; it cannot be continued.
@@ -1808,11 +1826,14 @@ mod tests {
 
     #[test]
     fn commit_listings_render_as_prose() {
-        let listed: CommitListing = Ok(vec![SubagentCommit {
-            worktree: PathBuf::from("/work/tree"),
-            commit: "abc123".to_string(),
-            subject: "fix the parser".to_string(),
-        }]);
+        let listed = CommitListing {
+            listed: Ok(vec![SubagentCommit {
+                worktree: PathBuf::from("/work/tree"),
+                commit: "abc123".to_string(),
+                subject: "fix the parser".to_string(),
+            }]),
+            setbacks: Vec::new(),
+        };
         let completed = SubagentResultTemplate {
             subagent: "worker",
             outcome: SubagentReport::Completed {
@@ -1830,7 +1851,10 @@ mod tests {
             "Subagent 'worker' completed.\n\ndone\n\nContinue this subagent with `subagent resume --id 3` while its prompt cache is still warm.\n\nIt idled too often.\n\nCommits made in the granted worktrees:\n- abc123 fix the parser (in /work/tree)"
         );
 
-        let none: CommitListing = Ok(Vec::new());
+        let none = CommitListing {
+            listed: Ok(Vec::new()),
+            setbacks: Vec::new(),
+        };
         let cancelled = SubagentResultTemplate {
             subagent: "worker",
             outcome: SubagentReport::Cancelled,
@@ -1843,10 +1867,13 @@ mod tests {
             "Subagent 'worker' was cancelled by the user.\n\nNo commits were made in the granted worktrees."
         );
 
-        let failed: CommitListing = Err(CommitLedgerError::Git {
-            repository: PathBuf::from("/repo"),
-            stderr: "boom".to_string(),
-        });
+        let failed = CommitListing {
+            listed: Err(CommitLedgerError::Git {
+                repository: PathBuf::from("/repo"),
+                stderr: "boom".to_string(),
+            }),
+            setbacks: vec!["the repository at /repo is stuck".to_string()],
+        };
         let rendered = SubagentErrorTemplate {
             subagent: "worker",
             error: "model failed",
@@ -1857,7 +1884,7 @@ mod tests {
         .expect("subagent error should render");
         assert_eq!(
             rendered,
-            "Subagent 'worker' error: model failed\n\nThe commits made in the granted worktrees could not be listed: git failed on /repo: boom\n\nRecent subagent history:\n"
+            "Subagent 'worker' error: model failed\n\nThe commits made in the granted worktrees could not be listed: git failed on /repo: boom\n\nBefore the run started: the repository at /repo is stuck\n\nRecent subagent history:\n"
         );
     }
 
@@ -2324,6 +2351,9 @@ mod tests {
             .collect()
     }
 
+    // Sandboxed git runs only off Windows: a package's ancestors carry
+    // traverse alone, and git resolves its paths through a read on each.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_completed_run_lists_the_commits_made_in_its_granted_worktree() {
         let fixture = CommitFixture::new().await;
@@ -2341,6 +2371,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_run_lists_the_commits_made_in_its_granted_worktree() {
         let fixture = CommitFixture::new().await;
@@ -2366,6 +2397,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // A commit grant is refused where no shell can carry its shim.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_listing_failure_keeps_the_runs_outcome() {
         let fixture = CommitFixture::new().await;
@@ -2392,6 +2425,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn cancelled_run_lists_the_commits_made_in_its_granted_worktree() {
         let fixture = CommitFixture::new().await;

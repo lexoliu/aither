@@ -1,0 +1,4 @@
+{% for id in want %}{{ id }}
+{% endfor %}--not
+{% for id in have %}{{ id }}
+{% endfor %}

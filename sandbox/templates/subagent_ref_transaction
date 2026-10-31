@@ -1,0 +1,6 @@
+{% for update in updates %}update {{ update.name }} {{ update.new }} {{ update.old }}
+{% endfor %}{% for create in creates %}create {{ create.name }} {{ create.new }}
+{% endfor %}{% for delete in deletes %}delete {{ delete.name }} {{ delete.old }}
+{% endfor %}{% if let Some((id, old)) = detached %}option no-deref
+update HEAD {{ id }} {{ old }}
+{% endif %}
