@@ -10,7 +10,8 @@ use blocking::Unblock;
 use executor_core::{Executor, Task};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use heel::{
-    Access, DenyAll, Grant, ProcessPriority, Sandbox, SandboxConfig, SecurityConfig, StdioConfig,
+    Access, DenyAll, Grant, ProcessPriority, ResolvedPath, Sandbox, SandboxConfig, SecurityConfig,
+    StdioConfig,
 };
 
 use super::{ContainerConfinement, prioritized_container_script};
@@ -103,6 +104,12 @@ fn canonical(path: &std::path::Path) -> PathBuf {
         .map_or_else(|| resolved.clone(), PathBuf::from)
 }
 
+/// The object a spelled path names, in the spelling a resolved grant
+/// checks.
+fn resolved(path: &std::path::Path) -> heel::Result<ResolvedPath> {
+    ResolvedPath::new(canonical(path))
+}
+
 /// The object stores the repository borrows through its
 /// `objects/info/alternates`, as absolute paths. Each line there is relative
 /// to the repository's object directory.
@@ -154,60 +161,59 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
             .map_or_else(|| enter.to_path_buf(), |(_, dir)| dir.clone());
         #[cfg(not(windows))]
         let working_dir = enter.to_path_buf();
-        let config =
-            SandboxConfig::builder()
-                .network(DenyAll)
-                .working_dir(canonical(&working_dir))
-                .grants(
-                    self.writable
+        let grants: Vec<Grant> =
+            self.writable
+                .iter()
+                .map(|path| resolved(path).map(|p| Grant::new(p, Access::WRITE)))
+                .chain([resolved(&self.working_dir).map(|p| Grant::new(p, Access::READ))])
+                .chain(
+                    self.readable
                         .iter()
-                        .map(|path| Grant::new(canonical(path), Access::WRITE))
-                        .chain([Grant::new(canonical(&self.working_dir), Access::READ)])
-                        .chain(
-                            self.readable
-                                .iter()
-                                .map(|path| Grant::new(canonical(path), Access::READ)),
-                        )
-                        .chain(git.as_ref().map(|(_, dir)| {
-                            Grant::new(canonical(dir), Access::READ | Access::EXEC)
-                        }))
-                        .chain(
-                            // The repository `git -C` enters: it lives inside
-                            // the main worktree's git directory, outside the
-                            // subagent's grants.
-                            [Grant::new(canonical(repository), Access::READ)],
-                        )
-                        .chain(
-                            // The worktrees `git -C` may enter: the
-                            // repository lives inside the main worktree's
-                            // git directory, and the worktree is outside the
-                            // subagent's grants — its `.git` file names the
-                            // repository.
-                            self.committing.iter().map(|granted| {
-                                Grant::new(canonical(granted.worktree()), Access::READ)
-                            }),
-                        )
-                        .chain(
-                            // The alternates the repository's object store
-                            // names: the main object store, as a subtree.
-                            borrowed_object_stores(repository)
-                                .into_iter()
-                                .map(|store| Grant::new(canonical(&store), Access::READ)),
-                        )
-                        .chain(
-                            // The configuration `include.path` reaches: one
-                            // file, never its directory.
-                            borrowed_object_stores(repository)
-                                .into_iter()
-                                .filter_map(|store| store.parent().map(Path::to_path_buf))
-                                .map(|common| common.join("config"))
-                                .filter(|config| config.is_file())
-                                .map(|config| Grant::new(canonical(&config), Access::READ)),
-                        ),
+                        .map(|path| resolved(path).map(|p| Grant::new(p, Access::READ))),
                 )
-                .security(SecurityConfig::interactive())
-                .priority(self.priority)
-                .build();
+                .chain(git.as_ref().map(|(_, dir)| {
+                    resolved(dir).map(|p| Grant::new(p, Access::READ | Access::EXEC))
+                }))
+                .chain(
+                    // The repository `git -C` enters: it lives inside the main
+                    // worktree's git directory, outside the subagent's grants.
+                    [resolved(repository).map(|p| Grant::new(p, Access::READ))],
+                )
+                .chain(
+                    // The worktrees `git -C` may enter: the repository lives
+                    // inside the main worktree's git directory, and the worktree
+                    // is outside the subagent's grants — its `.git` file names
+                    // the repository.
+                    self.committing.iter().map(|granted| {
+                        resolved(granted.worktree()).map(|p| Grant::new(p, Access::READ))
+                    }),
+                )
+                .chain(
+                    // The alternates the repository's object store names: the
+                    // main object store, as a subtree.
+                    borrowed_object_stores(repository)
+                        .into_iter()
+                        .map(|store| resolved(&store).map(|p| Grant::new(p, Access::READ))),
+                )
+                .chain(
+                    // The configuration `include.path` reaches: one file, never
+                    // its directory.
+                    borrowed_object_stores(repository)
+                        .into_iter()
+                        .filter_map(|store| store.parent().map(Path::to_path_buf))
+                        .map(|common| common.join("config"))
+                        .filter(|config| config.is_file())
+                        .map(|config| resolved(&config).map(|p| Grant::new(p, Access::READ))),
+                )
+                .collect::<heel::Result<_>>()
+                .map_err(|error| ExportError::Launch(error.to_string()))?;
+        let config = SandboxConfig::builder()
+            .network(DenyAll)
+            .working_dir(canonical(&working_dir))
+            .grants(grants)
+            .security(SecurityConfig::interactive())
+            .priority(self.priority)
+            .build();
         let sandbox = Sandbox::with_config_and_executor(config, self.executor.clone())
             .await
             .map_err(|error| ExportError::Launch(error.to_string()))?;
@@ -399,7 +405,7 @@ impl<E: Executor + Clone + 'static> ContainerGit<E> {
             .map_err(|_| ExportError::Launch("the container exec ended without a result".into()))?;
         drop(kill_tx);
         match outcome {
-            Ok(ContainerExecOutcome::Completed(output)) => Ok(SandboxedExit {
+            Ok(ContainerExecOutcome::Completed { output, .. }) => Ok(SandboxedExit {
                 code: output.status.code(),
                 stderr: stderr_text(&output.stderr),
             }),

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crate::context::{ActiveSkills, ContextSource as _, SkillCatalogEntry};
 use crate::{
     checkpoint::AgentCheckpoint,
-    config::{AgentConfig, AgentKind},
+    config::{AgentConfig, AgentKind, BackgroundJobPolicy},
     context::{
         AnyContextSource, BackgroundJobs, Block, CacheLifetime, CompactionFork,
         CompletedCompaction, Context, ContextBudget, HandoffDocument, PendingCompaction,
@@ -43,13 +43,12 @@ use futures_lite::StreamExt;
 use sha2::{Digest, Sha256};
 
 use aither_sandbox::{
-    BackgroundTaskEvent, BackgroundTaskReceiver, DirectoryResetReason, JobAlert, JobRegistry,
-    PermissionEvent, PermissionEventReceiver, PermissionEventStage, TerminalArgs,
+    BackgroundTaskEvent, BackgroundTaskReceiver, DirectoryResetReason, JobAlert, JobProcess,
+    JobRegistry, PermissionEvent, PermissionEventReceiver, PermissionEventStage, TerminalArgs,
     TerminalExecutionMode, TerminalMode,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
-const BACKGROUND_TASK_MAX_WAIT: Duration = Duration::from_secs(300);
 const BACKGROUND_TASK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Which of the two futures raced during a turn finished first.
@@ -126,6 +125,54 @@ impl EventSink {
 enum RunStep {
     Event(Option<TimedEvent>),
     Finished(Result<(), AgentError>),
+}
+
+/// What [`Agent::wait_background`] took from the background channel.
+#[derive(Debug)]
+pub struct BackgroundWake {
+    /// Events the background work produced, such as a completed command's
+    /// result, for the host to show.
+    pub events: Vec<TimedEvent>,
+    /// Whether the model has something to act on: a command it started in
+    /// the background completed, or one is blocked on stdin. The host then
+    /// calls [`Agent::resume`].
+    pub needs_model: bool,
+}
+
+/// Streams the events of one run, then its error if it failed.
+fn drive_run<'a, F, Fut>(run: F) -> impl Stream<Item = Result<TimedEvent, AgentError>> + 'a
+where
+    F: FnOnce(EventSink) -> Fut + 'a,
+    Fut: std::future::Future<Output = Result<(), AgentError>> + 'a,
+{
+    async_stream::stream! {
+        let (sender, receiver) = async_channel::unbounded();
+        // The run owns the sink and drops it as it finishes.
+        let run = run(EventSink { sender });
+        futures_lite::pin!(run);
+
+        let mut outcome = None;
+        while outcome.is_none() {
+            let step = futures_lite::future::or(
+                async { RunStep::Event(receiver.recv().await.ok()) },
+                async { RunStep::Finished((&mut run).await) },
+            )
+            .await;
+            match step {
+                RunStep::Event(Some(event)) => yield Ok(event),
+                // Sink dropped: the run is wrapping up — await its outcome.
+                RunStep::Event(None) => outcome = Some((&mut run).await),
+                RunStep::Finished(result) => outcome = Some(result),
+            }
+        }
+        // Deliver events that raced with run completion.
+        while let Ok(event) = receiver.try_recv() {
+            yield Ok(event);
+        }
+        if let Some(Err(error)) = outcome {
+            yield Err(error);
+        }
+    }
 }
 
 struct RunLoopOutcome {
@@ -343,6 +390,11 @@ struct JobAlertTemplate<'a> {
 
 /// What a background job alert reports.
 enum JobAlertText<'a> {
+    /// A foreground command left processes running; they were killed.
+    DescendantsKilled {
+        processes: &'a [JobProcess],
+        omitted: usize,
+    },
     /// The job crossed the long-running threshold.
     LongRunning { task_id: &'a str, elapsed: String },
     /// The job is waiting for input on its stdin.
@@ -790,16 +842,40 @@ where
             .push(Message::user(&prompt).with_attachments(attachments));
 
         let outcome = self.run_agent_loop(run_id.as_str(), 0, events).await?;
+        self.finish_run(run_id.as_str(), outcome, events).await
+    }
+
+    /// A run without a new user message: the model acts on what
+    /// [`wait_background`](Self::wait_background) recorded.
+    async fn resume_streaming(&mut self, events: &EventSink) -> Result<(), AgentError> {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        self.cache_keep_alive.begin_run();
+        events.emit(AgentEvent::run_start(
+            run_id.clone(),
+            self.config.max_iterations,
+        ));
+        self.ensure_initialized().await?;
+        self.settle_interrupted_tool_calls();
+        let outcome = self.run_agent_loop(run_id.as_str(), 0, events).await?;
+        self.finish_run(run_id.as_str(), outcome, events).await
+    }
+
+    /// Ends a run whose loop stopped: collects its background events as the
+    /// [`BackgroundJobPolicy`] says, then emits the stop events.
+    async fn finish_run(
+        &mut self,
+        run_id: &str,
+        outcome: RunLoopOutcome,
+        events: &EventSink,
+    ) -> Result<(), AgentError> {
         if outcome.stop_reason != StopReason::EndTurn
             && self
-                .collect_final_background_events(run_id.as_str(), outcome.iteration, events)
+                .collect_final_background_events(run_id, outcome.iteration, events)
                 .await?
         {
             return Ok(());
         }
-        self.push_stop_events(run_id.as_str(), outcome, events)
-            .await?;
-        Ok(())
+        self.push_stop_events(run_id, outcome, events).await
     }
 
     async fn run_agent_loop(
@@ -1248,27 +1324,22 @@ where
         let Some(receiver) = self.background_receiver.clone() else {
             return Ok(false);
         };
-        let start = Instant::now();
         let mut iteration = iteration;
         // The outcome of the last loop this wait resumed; the run ends with
         // its stop events once the wait is over.
         let mut resumed: Option<RunLoopOutcome> = None;
         loop {
-            if !self
-                .wait_for_background_events(&receiver, start, events)
-                .await?
-            {
+            if !self.wait_for_background_events(&receiver, events).await? {
                 break;
             }
             let outcome = self.run_agent_loop(run_id, iteration, events).await?;
             iteration = outcome.iteration;
             let hook_ended = outcome.stop_reason == StopReason::EndTurn;
             resumed = Some(outcome);
-            // A model turn that answered an alert goes back to waiting, within
-            // the same budget: a job may still run, or may have finished while
-            // the model replied and left its completion queued, which the
-            // wait collects first even once the budget is spent. A turn a hook
-            // ended stays ended.
+            // A model turn that answered an alert goes back to waiting: a job
+            // may still run, or may have finished while the model replied and
+            // left its completion queued, which the wait collects first. A
+            // turn a hook ended stays ended.
             if hook_ended {
                 break;
             }
@@ -1280,22 +1351,28 @@ where
         Ok(true)
     }
 
-    /// Parks until the background jobs are done, the wait budget runs out, or
-    /// a job alert that needs the model arrives; returns whether the model has
+    /// Collects the run's background events; returns whether the model has
     /// something new to see.
+    ///
+    /// Under [`BackgroundJobPolicy::Await`] it parks until the background jobs
+    /// are done or a job alert that needs the model arrives; each job's own
+    /// timeout bounds the wait. Under [`BackgroundJobPolicy::Detach`] it only
+    /// takes what is already queued.
     async fn wait_for_background_events(
         &mut self,
         receiver: &BackgroundTaskReceiver,
-        start: Instant,
         events: &EventSink,
     ) -> Result<bool, AgentError> {
         let mut needs_model = self.drain_background_receiver(receiver, events);
-        while start.elapsed() < BACKGROUND_TASK_MAX_WAIT {
+        loop {
             // A job blocked on stdin can never complete, so parking on it
             // would hide its alert from the model for the whole wait. Other
             // alerts become durable context without ending the wait.
             if self.push_job_alerts() {
                 return Ok(true);
+            }
+            if self.config.background_jobs == BackgroundJobPolicy::Detach {
+                break;
             }
             self.maybe_send_cache_keep_alive().await?;
             match receiver
@@ -1304,8 +1381,7 @@ where
             {
                 Some(BackgroundTaskEvent::Completed(task)) => {
                     tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
-                    self.push_completed_task_event(*task, events);
-                    needs_model = true;
+                    needs_model |= self.push_completed_task_event(*task, events);
                 }
                 Some(BackgroundTaskEvent::Alert(alert)) => {
                     if self.push_job_alert(alert) {
@@ -1444,6 +1520,17 @@ where
     /// it is a job blocked on stdin, which wakes a parked wait.
     fn push_job_alert(&mut self, alert: JobAlert) -> bool {
         match alert {
+            JobAlert::DescendantsKilled(killed) => {
+                tracing::info!(
+                    killed = killed.processes.len() + killed.omitted,
+                    "foreground command left processes running; killed"
+                );
+                self.push_system_alert(job_alert_text(&JobAlertText::DescendantsKilled {
+                    processes: &killed.processes,
+                    omitted: killed.omitted,
+                }));
+                false
+            }
             JobAlert::DirectoryReset(reset) => {
                 tracing::info!(dir = %reset.dir.display(), reason = ?reset.reason, "carried working directory reset");
                 self.push_system_alert(job_alert_text(&JobAlertText::DirectoryReset {
@@ -1483,26 +1570,27 @@ where
         receiver: &BackgroundTaskReceiver,
         events: &EventSink,
     ) -> bool {
-        let completed_tasks = receiver.take_completed();
-        let had_completed = !completed_tasks.is_empty();
-        for task in completed_tasks {
+        let mut announced = false;
+        for task in receiver.take_completed() {
             tracing::info!(task_id = %task.task_id, "background task completed (final check)");
-            self.push_completed_task_event(task, events);
+            announced |= self.push_completed_task_event(task, events);
         }
-        had_completed
+        announced
     }
 
+    /// Records a completed job in the context; returns whether it was
+    /// announced, which a job the model knows as a background task is.
     fn push_completed_task_event(
         &mut self,
         task: aither_sandbox::CompletedTask,
         events: &EventSink,
-    ) {
+    ) -> bool {
         // Every spawned job reports its completion, foreground ones
         // included; only a job the model knows as a background task is
         // announced, since a foreground result already returned through the
         // tool call.
         if !self.detached_task_ids.contains(&task.task_id) {
-            return;
+            return false;
         }
         let result_msg = format_background_task_result(&task);
         self.context.push(Message::system(&result_msg));
@@ -1510,6 +1598,7 @@ where
             task.task_id,
             result_msg,
         ));
+        true
     }
 
     async fn push_stop_events(
@@ -1616,38 +1705,49 @@ where
     ) -> impl Stream<Item = Result<TimedEvent, AgentError>> + '_ {
         let prompt = prompt.to_string();
         let attachments: Vec<Attachment> = attachments.into_iter().collect();
+        drive_run(move |sink| async move { self.run_streaming(prompt, attachments, &sink).await })
+    }
 
-        async_stream::stream! {
-            let (sender, receiver) = async_channel::unbounded();
-            let sink = EventSink { sender };
-            let run = async {
-                let result = self.run_streaming(prompt, attachments, &sink).await;
-                drop(sink);
-                result
-            };
-            futures_lite::pin!(run);
+    /// Continues the conversation without a new user message, so the model
+    /// acts on the background events [`wait_background`](Self::wait_background)
+    /// recorded. Streams like [`run`](Self::run).
+    pub fn resume(&mut self) -> impl Stream<Item = Result<TimedEvent, AgentError>> + '_ {
+        drive_run(move |sink| async move { self.resume_streaming(&sink).await })
+    }
 
-            let mut outcome = None;
-            while outcome.is_none() {
-                let step = futures_lite::future::or(
-                    async { RunStep::Event(receiver.recv().await.ok()) },
-                    async { RunStep::Finished((&mut run).await) },
-                )
-                .await;
-                match step {
-                    RunStep::Event(Some(event)) => yield Ok(event),
-                    // Sink dropped: the run is wrapping up — await its outcome.
-                    RunStep::Event(None) => outcome = Some((&mut run).await),
-                    RunStep::Finished(result) => outcome = Some(result),
-                }
+    /// Waits, between runs, for a background command of an earlier run to
+    /// complete or raise an alert, and records it in the context.
+    ///
+    /// For an agent built with [`BackgroundJobPolicy::Detach`]: its runs end
+    /// with the model's turn, and the host races this against its own work
+    /// while the agent is idle. When the returned
+    /// [`BackgroundWake::needs_model`] is set, the host continues with
+    /// [`resume`](Self::resume). The wait is cancel-safe: nothing is taken
+    /// until it completes. Without a terminal it never completes.
+    pub async fn wait_background(&mut self) -> BackgroundWake {
+        let Some(receiver) = self.background_receiver.clone() else {
+            return std::future::pending().await;
+        };
+        let event = receiver.recv_event().await;
+        let (sender, emitted) = async_channel::unbounded();
+        let sink = EventSink { sender };
+        let mut needs_model = match event {
+            BackgroundTaskEvent::Completed(task) => {
+                tracing::info!(task_id = %task.task_id, "background task completed (idle)");
+                self.push_completed_task_event(*task, &sink)
             }
-            // Deliver events that raced with run completion.
-            while let Ok(event) = receiver.try_recv() {
-                yield Ok(event);
-            }
-            if let Some(Err(error)) = outcome {
-                yield Err(error);
-            }
+            BackgroundTaskEvent::Alert(alert) => self.push_job_alert(alert),
+        };
+        needs_model |= self.drain_background_receiver(&receiver, &sink);
+        needs_model |= self.push_job_alerts();
+        drop(sink);
+        let mut events = Vec::new();
+        while let Ok(event) = emitted.try_recv() {
+            events.push(event);
+        }
+        BackgroundWake {
+            events,
+            needs_model,
         }
     }
 
@@ -2857,6 +2957,31 @@ mod tests {
             );
             assert!(text.contains(expected), "{text}");
         }
+        let killed = job_alert_text(&JobAlertText::DescendantsKilled {
+            processes: &[
+                JobProcess {
+                    pid: 41,
+                    name: "sleep".to_string(),
+                },
+                JobProcess {
+                    pid: 42,
+                    name: "node".to_string(),
+                },
+            ],
+            omitted: 3,
+        });
+        assert_eq!(
+            killed,
+            "The command ended while sleep (pid 41), node (pid 42) and 3 more kept running, so they were killed with it. A process meant to keep running belongs in terminal_background."
+        );
+        let one = job_alert_text(&JobAlertText::DescendantsKilled {
+            processes: &[JobProcess {
+                pid: 7,
+                name: "sleep".to_string(),
+            }],
+            omitted: 0,
+        });
+        assert!(one.contains("sleep (pid 7) kept running"), "{one}");
         let long = job_alert_text(&JobAlertText::LongRunning {
             task_id: "amber",
             elapsed: "5m".to_string(),
@@ -3392,7 +3517,7 @@ mod tests {
 
     /// A job blocked on stdin can never complete, so its alert must end the
     /// post-turn wait and resume the loop — otherwise the model never sees
-    /// it until the 300 s cap runs out.
+    /// it until the job's own timeout kills it.
     #[tokio::test]
     async fn stdin_blocked_alert_wakes_the_parked_background_wait() {
         let (sender, receiver) = aither_sandbox::background_task_channel();
@@ -3425,7 +3550,7 @@ mod tests {
             agent.collect_final_background_events("run-test", 1, &sink),
         )
         .await
-        .expect("the wait must end with the job, not the 300 s cap")
+        .expect("the wait must end with the job")
         .expect("collecting final events should succeed");
         assert!(woke, "a stdin-blocked alert must resume the run loop");
         assert!(
@@ -4772,5 +4897,165 @@ mod tests {
             .find(|message| message.tool_call_id() == Some("call_slow"))
             .expect("the cancelled call has a result");
         assert!(slow.content().contains("cancelled"), "{}", slow.content());
+    }
+
+    async fn drain_run(
+        stream: impl Stream<Item = Result<TimedEvent, AgentError>>,
+    ) -> Vec<AgentEvent> {
+        futures_lite::pin!(stream);
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("the run should succeed").event);
+        }
+        events
+    }
+
+    fn detached_agent(
+        responses: impl IntoIterator<Item = String>,
+    ) -> (
+        Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, ()>,
+        aither_sandbox::BackgroundTaskSender,
+        ScriptedLlm,
+    ) {
+        let llm = ScriptedLlm::new(100_000, responses);
+        let (sender, receiver) = aither_sandbox::background_task_channel();
+        let mut agent = Agent::with_config(
+            llm.clone(),
+            AgentConfig {
+                background_jobs: BackgroundJobPolicy::Detach,
+                ..AgentConfig::default()
+            },
+        );
+        agent.background_receiver = Some(receiver);
+        (agent, sender, llm)
+    }
+
+    fn finished(task_id: &str, output: &str) -> aither_sandbox::CompletedTask {
+        aither_sandbox::CompletedTask {
+            task_id: task_id.to_string(),
+            script: "make".to_string(),
+            result: Err(aither_sandbox::TerminalError::Execution(output.to_string())),
+        }
+    }
+
+    /// Under `Detach` the run ends with the model's turn even while a
+    /// background command it started still runs.
+    #[tokio::test]
+    async fn a_detached_run_ends_without_waiting_for_its_jobs() {
+        let (mut agent, sender, _llm) = detached_agent(["started the build".to_string()]);
+        sender.task_started();
+        let events = tokio::time::timeout(
+            Duration::from_secs(5),
+            drain_run(agent.run("build it", std::iter::empty())),
+        )
+        .await
+        .expect("the run must not park on the running job");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Complete { .. })),
+            "the run should complete: {events:?}"
+        );
+    }
+
+    /// Between runs, a finished background command lands in the context and
+    /// asks for the model; `resume` then runs it without a user message.
+    #[tokio::test]
+    async fn a_command_finishing_between_runs_wakes_the_model() {
+        use aither_core::llm::Role;
+
+        let (mut agent, sender, llm) = detached_agent([
+            "started the build".to_string(),
+            "the build failed".to_string(),
+        ]);
+        drain_run(agent.run("build it", std::iter::empty())).await;
+        agent.detached_task_ids.insert("task-build".to_string());
+
+        let waiting = tokio::spawn(async move {
+            let wake = agent.wait_background().await;
+            (agent, wake)
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sender
+            .send_completed(finished("task-build", "linker error"))
+            .await;
+        let (mut agent, wake) = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the completion must end the wait")
+            .expect("the wait task should not panic");
+
+        assert!(
+            wake.needs_model,
+            "a background command's result needs the model"
+        );
+        assert!(
+            wake.events
+                .iter()
+                .any(|timed| matches!(timed.event, AgentEvent::BackgroundTaskCompleted { .. })),
+            "the host should see the completion: {:?}",
+            wake.events
+        );
+
+        let events = drain_run(agent.resume()).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Complete { .. })),
+            "the resumed run should complete: {events:?}"
+        );
+        let requests = llm.recorded();
+        let resumed = requests.last().expect("the resumed run asked the model");
+        assert!(
+            resumed
+                .messages()
+                .iter()
+                .any(|message| message.content().contains("linker error")),
+            "the resumed request must carry the command's result"
+        );
+        assert!(
+            !resumed
+                .messages()
+                .iter()
+                .rev()
+                .take_while(|message| message.role() != Role::Assistant)
+                .any(|message| message.role() == Role::User),
+            "resume must not add a user message"
+        );
+    }
+
+    /// A foreground command's completion is not news to the model: its
+    /// result already returned through the tool call.
+    #[tokio::test]
+    async fn a_foreground_completion_does_not_wake_the_model() {
+        let (mut agent, sender, _llm) = detached_agent(Vec::new());
+        sender
+            .send_completed(finished("task-foreground", "ok"))
+            .await;
+        let wake = tokio::time::timeout(Duration::from_secs(5), agent.wait_background())
+            .await
+            .expect("the queued completion ends the wait");
+        assert!(!wake.needs_model);
+        assert!(wake.events.is_empty(), "{:?}", wake.events);
+    }
+
+    /// The idle wait gives the event up when it is dropped before anything
+    /// arrived, so a host can race it against its own work.
+    #[tokio::test]
+    async fn an_abandoned_idle_wait_takes_nothing() {
+        let (mut agent, sender, _llm) = detached_agent(Vec::new());
+        agent.detached_task_ids.insert("task-late".to_string());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), agent.wait_background())
+                .await
+                .is_err(),
+            "nothing is queued yet"
+        );
+        sender
+            .send_completed(finished("task-late", "done late"))
+            .await;
+        let wake = tokio::time::timeout(Duration::from_secs(5), agent.wait_background())
+            .await
+            .expect("the completion is still there for the next wait");
+        assert!(wake.needs_model);
     }
 }

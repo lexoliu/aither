@@ -868,6 +868,16 @@ where
         self
     }
 
+    /// Sets what a run does with background commands still running when the
+    /// model ends its turn.
+    ///
+    /// See [`AgentBuilder::background_jobs`].
+    #[must_use]
+    pub fn background_jobs(mut self, policy: crate::BackgroundJobPolicy) -> Self {
+        self.inner = self.inner.background_jobs(policy);
+        self
+    }
+
     /// Sets the time source idle compaction, idle reassembly and cache
     /// keep-alive read; the system clock by default.
     ///

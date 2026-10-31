@@ -19,7 +19,7 @@ ignored = ["ort"]
 aither-core.workspace = true
 
 # Sandboxing
-heel = "0.5"
+heel = "0.7"
 rmp-serde = "1"
 
 # Executor for tokio integration

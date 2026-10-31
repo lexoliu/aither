@@ -6,11 +6,37 @@ use crate::stdin_watch::StdinWatchSignal;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// How long the processes a container command leaves running when its
+/// top-level shell exits may live.
+#[derive(Debug, Clone)]
+pub enum ExecLifetime {
+    /// None: they are killed with the shell and reported in
+    /// [`ContainerExecOutcome::Completed`]'s `killed`. Its stdin is not
+    /// watched.
+    Foreground,
+    /// All of them: the execution ends with its last process. Its stdin is
+    /// watched: implementations send one [`StdinWatchSignal::Blocked`] each
+    /// time a process of the command's tree starts waiting to read the stdin
+    /// pipe with nothing buffered — and send again only after the command was
+    /// fed and blocks anew — or a single [`StdinWatchSignal::Failed`] when the
+    /// watch cannot run at all.
+    Background {
+        /// Where the stdin watch reports.
+        stdin_blocked: Sender<StdinWatchSignal>,
+    },
+}
+
 /// Outcome of a container execution request.
 #[derive(Debug)]
 pub enum ContainerExecOutcome {
-    /// The command ran to completion; carries its exit status and output.
-    Completed(std::process::Output),
+    /// The command ran to completion.
+    Completed {
+        /// Its exit status and output.
+        output: std::process::Output,
+        /// The processes it left running that an [`ExecLifetime::Foreground`]
+        /// execution killed; empty for any other.
+        killed: Vec<crate::JobProcess>,
+    },
     /// The command was terminated before it finished.
     Killed,
 }
@@ -36,7 +62,7 @@ pub trait ContainerExec: Send + Sync {
         working_dir: &str,
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
-        stdin_blocked: Option<Sender<StdinWatchSignal>>,
+        lifetime: ExecLifetime,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
 
     /// Executes a command like [`Self::exec`], handing its stdout on chunk by
@@ -68,7 +94,7 @@ pub trait ContainerExecImpl: Send + Sync {
         working_dir: &'a str,
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
-        stdin_blocked: Option<Sender<StdinWatchSignal>>,
+        lifetime: ExecLifetime,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
 
     /// Execute a command inside a container, streaming its stdout, through a
@@ -119,7 +145,7 @@ impl ContainerExec for AnyContainerExec {
         working_dir: &str,
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
-        stdin_blocked: Option<Sender<StdinWatchSignal>>,
+        lifetime: ExecLifetime,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
         let inner = Arc::clone(&self.inner);
         let container_id = container_id.to_string();
@@ -134,7 +160,7 @@ impl ContainerExec for AnyContainerExec {
                     &working_dir,
                     kill_rx,
                     stdin_rx,
-                    stdin_blocked,
+                    lifetime,
                 )
                 .await
         }
@@ -345,7 +371,7 @@ impl<T: ContainerExec> ContainerExecImpl for T {
         working_dir: &'a str,
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
-        stdin_blocked: Option<Sender<StdinWatchSignal>>,
+        lifetime: ExecLifetime,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>> {
         Box::pin(self.exec(
             container_id,
@@ -353,7 +379,7 @@ impl<T: ContainerExec> ContainerExecImpl for T {
             working_dir,
             kill_rx,
             stdin_rx,
-            stdin_blocked,
+            lifetime,
         ))
     }
 

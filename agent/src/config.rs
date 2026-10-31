@@ -84,6 +84,10 @@ pub struct AgentConfig {
     /// Prompt-cache keep-alive while the run waits on its own background
     /// commands. `None` disables keep-alive.
     pub cache_keep_alive: Option<CacheKeepAlive>,
+
+    /// What a run does with background commands still running when the
+    /// model ends its turn.
+    pub background_jobs: BackgroundJobPolicy,
 }
 
 impl Default for AgentConfig {
@@ -97,8 +101,29 @@ impl Default for AgentConfig {
             tasks_stale_after_turns: 4,
             request_parameters: Parameters::default(),
             cache_keep_alive: None,
+            background_jobs: BackgroundJobPolicy::default(),
         }
     }
+}
+
+/// What a run does with background commands still running when the model
+/// ends its turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackgroundJobPolicy {
+    /// The run waits until they finish, waking the model for each completion
+    /// and for a command blocked on stdin. Each command's own `timeout`
+    /// bounds the wait. For an agent nothing resumes once its run ends, such
+    /// as a subagent.
+    #[default]
+    Await,
+    /// The run ends with the model's turn. Completions and alerts that
+    /// arrive afterwards are taken by [`Agent::wait_background`], which
+    /// tells the host whether the model has something to act on; the host
+    /// then continues the conversation with [`Agent::resume`].
+    ///
+    /// [`Agent::wait_background`]: crate::Agent::wait_background
+    /// [`Agent::resume`]: crate::Agent::resume
+    Detach,
 }
 
 impl AgentConfig {

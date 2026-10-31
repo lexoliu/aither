@@ -80,13 +80,13 @@ pub use aither_websearch as websearch;
 pub use aither_sandbox as sandbox;
 
 // Public API
-pub use agent::{Agent, CompactResult};
+pub use agent::{Agent, BackgroundWake, CompactResult};
 pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser};
 pub use builder::AgentBuilder;
 pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
 pub use clock::{AnyClock, Clock, ManualClock, SystemClock};
-pub use config::{AgentConfig, AgentKind};
+pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy};
 #[cfg(feature = "skills")]
 pub use context::ActiveSkills;
 pub use context::{
