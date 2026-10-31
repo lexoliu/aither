@@ -392,6 +392,8 @@ fn contents(root: &Path, except: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 
 // ---- 1. the grant's layout ------------------------------------------------
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_commit_grant_writes_the_workstrees_own_repository_and_nothing_in_the_main_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -477,6 +479,8 @@ async fn a_sha256_repository_works_end_to_end() {
 
 // ---- 2. a commit lands only in the subagent's repository -------------------
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_commit_lands_only_in_the_subagents_repository_and_the_main_one_stays_sound() {
     let fixture = Fixture::new("beta").await;
@@ -535,6 +539,8 @@ async fn a_ref_naming_an_object_the_main_store_lacks_breaks_the_main_repository(
 
 // ---- 3. git elsewhere is untouched -----------------------------------------
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn git_elsewhere_is_untouched_by_the_redirected_worktree() {
     let fixture = Fixture::new("delta").await;
@@ -758,6 +764,8 @@ async fn a_pack_that_omits_a_reported_tip_is_incomplete_and_moves_no_ref() {
     assert!(fixture.stray_object_directories().is_empty());
 }
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_report_naming_a_ref_outside_the_namespace_is_refused_before_anything_runs() {
     let id = "a".repeat(40);
@@ -1111,6 +1119,8 @@ async fn one_rejected_repository_does_not_stop_the_others_and_is_named() {
 
 // ---- 13. relocation ---------------------------------------------------------
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn moving_the_whole_tree_keeps_the_worktree_working() {
     let fixture = Fixture::new("omicron").await;
@@ -1131,6 +1141,8 @@ async fn moving_the_whole_tree_keeps_the_worktree_working() {
 
 // ---- 14. re-grants ----------------------------------------------------------
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_converted_worktree_is_granted_again_with_a_fresh_history_and_reuses_its_repository() {
     let fixture = Fixture::new("pi").await;
@@ -1150,6 +1162,8 @@ async fn a_converted_worktree_is_granted_again_with_a_fresh_history_and_reuses_i
     );
 }
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_converted_worktree_that_names_another_worktrees_repository_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -1181,6 +1195,8 @@ async fn a_converted_worktree_that_names_another_worktrees_repository_is_refused
     );
 }
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_commit_grant_under_a_plain_granted_ancestor_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -1240,6 +1256,8 @@ async fn a_commit_grant_under_a_plain_granted_ancestor_is_refused() {
 
 // ---- 15. the exporter's time bound ------------------------------------------
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn an_exporter_that_never_finishes_is_killed_at_the_time_bound() {
     let stub = TestGit::new().replying("pack-objects", Reply::Hang);
@@ -1320,6 +1338,8 @@ async fn a_branch_outside_a_subagent_namespace_cannot_be_granted_commit() {
     );
 }
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_namespace_holding_another_branch_is_not_the_worktrees_own() {
     let dir = tempfile::tempdir().unwrap();
@@ -1464,6 +1484,8 @@ async fn the_ledger_lists_commits_whatever_head_does() {
     assert_eq!(subjects, ["detached later", "on a side branch"]);
 }
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_plain_grant_cannot_reach_git_data_commits_are_listed_from() {
     let dir = tempfile::tempdir().unwrap();
@@ -1491,6 +1513,8 @@ async fn a_plain_grant_cannot_reach_git_data_commits_are_listed_from() {
     );
 }
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn git_data_a_subagent_could_write_is_not_trusted_for_a_commit_grant() {
     let dir = tempfile::tempdir().unwrap();
@@ -1562,6 +1586,8 @@ async fn process_is_gone(pid: u32) -> bool {
     false
 }
 
+// A commit grant is refused where no shell can carry its shim.
+#[cfg(unix)]
 #[tokio::test]
 async fn every_question_to_the_subagents_repository_is_bounded_in_time_and_its_process_killed() {
     // Each sandboxed command of an import, in the order the import meets them.
