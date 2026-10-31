@@ -855,12 +855,6 @@ impl SubagentGrant {
         launcher: Launcher<'_>,
         history: &mut LaunchHistory,
     ) -> Result<ResolvedGrant, SubagentGrantError> {
-        // Off Unix the terminal runs no `sh`, so nothing guards a committing
-        // worktree's git data — a grant must not pretend otherwise.
-        #[cfg(not(unix))]
-        if self.worktrees.iter().any(|grant| grant.commit) {
-            return Err(SubagentGrantError::CommitGrantUnsupported);
-        }
         let mut paths = Vec::with_capacity(self.worktrees.len());
         for grant in &self.worktrees {
             let path = canonical(&grant.path).await?;
@@ -963,11 +957,18 @@ impl SubagentGrant {
                     other: shared.worktree.display().to_string(),
                 });
             }
-            if launcher.committing.is_none() {
-                worktree.prepare(launcher.spelling).await?;
+            // Off Unix the terminal runs no `sh`, so nothing guards a
+            // committing worktree's git data — refused only once every real
+            // refusal had its say.
+            if cfg!(unix) {
+                if launcher.committing.is_none() {
+                    worktree.prepare(launcher.spelling).await?;
+                }
+                writable.push(path.clone());
+                committing.push(worktree);
+            } else {
+                return Err(SubagentGrantError::CommitGrantUnsupported);
             }
-            writable.push(path.clone());
-            committing.push(worktree);
         }
 
         if launcher.committing.is_none() {
