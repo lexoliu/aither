@@ -656,6 +656,15 @@ where
         self
     }
 
+    /// Sets what a run does with background commands still running when the
+    /// model ends its turn; [`BackgroundJobPolicy::Await`] by default.
+    ///
+    /// [`BackgroundJobPolicy::Await`]: crate::BackgroundJobPolicy::Await
+    pub const fn background_jobs(mut self, policy: crate::BackgroundJobPolicy) -> Self {
+        self.config.background_jobs = policy;
+        self
+    }
+
     /// Connects the agent to an external background-task channel pair.
     ///
     /// [`terminal`](Self::terminal) and [`dyn_terminal`](Self::dyn_terminal)
