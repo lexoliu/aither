@@ -8283,7 +8283,9 @@ mod tests {
         let (outcome, total) = futures::join!(streaming, collect);
         assert_eq!(total, 300_000, "every byte arrives");
         match outcome.expect("the exec runs") {
-            ContainerExecOutcome::Completed(output) => assert_eq!(output.status.code(), Some(3)),
+            ContainerExecOutcome::Completed { output, .. } => {
+                assert_eq!(output.status.code(), Some(3));
+            }
             ContainerExecOutcome::Killed => panic!("nothing killed it"),
         }
 
