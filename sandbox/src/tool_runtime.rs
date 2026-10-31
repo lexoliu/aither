@@ -653,8 +653,15 @@ impl PreparedTools<PathBuf> {
         use futures::{StreamExt, TryStreamExt};
         let scratch = blocking::unblock(tempfile::tempdir).await?;
         let config = heel::SandboxConfig::builder()
-            .working_dir(scratch.path())
-            .grant(&self.bin_dir, heel::Access::READ | heel::Access::EXEC)
+            .working_dir(
+                std::fs::canonicalize(scratch.path())
+                    .unwrap_or_else(|_| scratch.path().to_path_buf()),
+            )
+            .grant(
+                heel::ResolvedPath::new(std::fs::canonicalize(&self.bin_dir)?)
+                    .map_err(|error| ToolRuntimeError::SshBootstrap(error.to_string()))?,
+                heel::Access::READ | heel::Access::EXEC,
+            )
             .build();
         let sandbox = std::sync::Arc::new(
             heel::Sandbox::with_config_and_executor(config, executor)
@@ -1355,8 +1362,18 @@ pub mod tests {
         let path = ready.prepend_path(Some(OsStr::new(&sandbox_path))).unwrap();
         let config = heel::SandboxConfig::builder()
             .network(heel::DenyAll)
-            .working_dir(workspace.path())
-            .grants([heel::Grant::new(ready.bin_dir(), heel::Access::EXEC)])
+            .working_dir(
+                std::fs::canonicalize(workspace.path())
+                    .unwrap_or_else(|_| workspace.path().to_path_buf()),
+            )
+            .grants([heel::Grant::new(
+                heel::ResolvedPath::new(
+                    std::fs::canonicalize(ready.bin_dir())
+                        .unwrap_or_else(|_| ready.bin_dir().clone()),
+                )
+                .unwrap(),
+                heel::Access::EXEC,
+            )])
             .ipc(heel::IpcRouter::new().register(RuntimeProbe))
             .security(heel::SecurityConfig::interactive())
             .build();

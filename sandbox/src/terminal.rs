@@ -32,11 +32,16 @@ use async_channel::{Receiver, Sender};
 use async_io::Async;
 use executor_core::{Executor, Task};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(target_os = "linux")]
+use heel::supervisor::{TreeControl, TreeReport};
 use heel::{
     Access, AllowAll, Audited, CpuPriority, DomainRequest, Grant, IoPriority, IpcRouter,
-    NetworkAuditLog, NetworkPolicy, ProcessPriority, Sandbox, SandboxConfig, SecurityConfig,
-    StdioConfig, WorkingDir,
+    NetworkAuditLog, NetworkPolicy, ProcessPriority, ResolvedPath, Sandbox, SandboxConfig,
+    SecurityConfig, StdioConfig, WorkingDir,
 };
+/// On platforms without `heel supervise` a wait produces no report.
+#[cfg(not(target_os = "linux"))]
+struct TreeReport;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use shell_words::split as split_shell_words;
@@ -56,8 +61,9 @@ use crate::{
         stored_path,
     },
     permission::{PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode},
+    process_tree::{JobMarker, JobProcess, JobTree},
     shell_session::{
-        BridgeAddress, ContainerExecOutcome, ContainerShellRuntime, ShellBackend,
+        BridgeAddress, ContainerExecOutcome, ContainerShellRuntime, ExecLifetime, ShellBackend,
         ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile,
     },
     stdin_watch::{
@@ -572,10 +578,39 @@ pub struct DirectoryReset {
     pub reason: DirectoryResetReason,
 }
 
+/// The most processes a [`DescendantsKilled`] alert names.
+const KILLED_PROCESSES_NAMED: usize = 8;
+
+/// Processes a foreground command left running when its shell exited, killed
+/// with it.
+///
+/// Sent once per command, at the moment they were killed.
+#[derive(Debug, Clone)]
+pub struct DescendantsKilled {
+    /// The first processes killed, at most eight.
+    pub processes: Vec<JobProcess>,
+    /// How many more were killed beyond those named.
+    pub omitted: usize,
+}
+
+impl DescendantsKilled {
+    fn new(mut killed: Vec<JobProcess>) -> Self {
+        let omitted = killed.len().saturating_sub(KILLED_PROCESSES_NAMED);
+        killed.truncate(KILLED_PROCESSES_NAMED);
+        Self {
+            processes: killed,
+            omitted,
+        }
+    }
+}
+
 /// A system alert about a background job, or about the carried working
 /// directory, delivered through the terminal's alert channel.
 #[derive(Debug, Clone)]
 pub enum JobAlert {
+    /// A foreground command's shell exited while descendants were still
+    /// running, and they were killed.
+    DescendantsKilled(DescendantsKilled),
     /// The directory carried between foreground commands was reset.
     DirectoryReset(DirectoryReset),
     /// The job crossed the long-running threshold.
@@ -2200,6 +2235,13 @@ where
         self.spawn_kill_watchdog(&task_id, timeout);
         self.spawn_long_job_alert(&task_id);
 
+        let lifetime = if background {
+            JobLifetime::Background
+        } else {
+            JobLifetime::Foreground {
+                alerts: self.alert_tx.clone(),
+            }
+        };
         let background_startup = BackgroundStartup::new(startup_tx);
         let running_tasks = self.running_tasks.clone();
         let completed_tx = self.completed_tx.clone();
@@ -2222,6 +2264,7 @@ where
                 mode,
                 backend,
                 stdin_alerts,
+                lifetime,
                 background_startup,
                 expect,
                 resolution,
@@ -2743,6 +2786,7 @@ struct StandaloneExecution<P, E> {
     mode: TerminalMode,
     backend: ExecutionBackend,
     stdin_alerts: Option<StdinAlerts>,
+    lifetime: JobLifetime,
     background_startup: BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
@@ -2770,6 +2814,7 @@ struct StandaloneStart<'a, P, E> {
     mode: TerminalMode,
     backend: &'a ExecutionBackend,
     stdin_alerts: Option<StdinAlerts>,
+    lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
@@ -2791,6 +2836,7 @@ struct LocalBackgroundExecution<'a, E> {
     mode: TerminalMode,
     job_registry: &'a JobRegistry,
     stdin_alerts: Option<StdinAlerts>,
+    lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
@@ -2811,6 +2857,7 @@ struct ContainerBackgroundExecution<'a, E> {
     ipc_commands: &'a [String],
     job_registry: &'a JobRegistry,
     stdin_alerts: Option<StdinAlerts>,
+    lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
     priority: ProcessPriority,
 }
@@ -2899,6 +2946,7 @@ struct SpawnedTerminalTask<P, E> {
     mode: TerminalMode,
     backend: ExecutionBackend,
     stdin_alerts: Option<StdinAlerts>,
+    lifetime: JobLifetime,
     background_startup: BackgroundStartup,
     expect: OutputFormat,
     resolution: MediaResolution,
@@ -2935,6 +2983,7 @@ where
         mode,
         backend,
         stdin_alerts,
+        lifetime,
         background_startup,
         expect,
         resolution,
@@ -2965,6 +3014,7 @@ where
         mode,
         backend,
         stdin_alerts,
+        lifetime,
         background_startup,
         network_audit,
         priority,
@@ -3020,6 +3070,7 @@ where
         mode,
         backend,
         stdin_alerts,
+        lifetime,
         background_startup,
         network_audit,
         priority,
@@ -3053,6 +3104,7 @@ where
         mode,
         backend: &backend,
         stdin_alerts,
+        lifetime,
         background_startup: &background_startup,
         network_audit,
         priority,
@@ -3143,6 +3195,7 @@ where
                 ipc_commands: &ipc_commands,
                 job_registry: request.job_registry,
                 stdin_alerts: request.stdin_alerts,
+                lifetime: request.lifetime,
                 background_startup: request.background_startup,
                 priority: request.priority,
             })
@@ -3181,6 +3234,7 @@ where
         mode: request.mode,
         job_registry: request.job_registry,
         stdin_alerts: request.stdin_alerts,
+        lifetime: request.lifetime,
         background_startup: request.background_startup,
         priority: request.priority,
         #[cfg(all(unix, feature = "jobserver"))]
@@ -3349,18 +3403,36 @@ async fn save_completed_stderr(
     }
 }
 
-fn local_path_grants<'a>(
-    writable: &'a [PathBuf],
-    readable: &'a [PathBuf],
-    tools: &'a PreparedTools<PathBuf>,
-    job_fifo: Option<&'a Path>,
-) -> impl Iterator<Item = Grant> + 'a {
+fn local_path_grants(
+    writable: &[PathBuf],
+    readable: &[PathBuf],
+    tools: &PreparedTools<PathBuf>,
+    job_fifo: Option<&Path>,
+) -> heel::Result<Vec<Grant>> {
+    /// The object a spelled path names, in the spelling a resolved grant
+    /// checks: canonicalized, without the verbatim prefix Windows adds — an
+    /// 8.3 alias or a symlinked component does not name the same object.
+    fn resolved(path: &Path) -> heel::Result<ResolvedPath> {
+        ResolvedPath::new(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+    }
     writable
         .iter()
-        .map(|path| Grant::new(path, Access::WRITE))
-        .chain(readable.iter().map(|path| Grant::new(path, Access::READ)))
-        .chain(std::iter::once(Grant::new(tools.bin_dir(), Access::EXEC)))
-        .chain(job_fifo.map(|path| Grant::new(path, Access::WRITE)))
+        .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE)))
+        .chain(
+            readable
+                .iter()
+                .map(|path| Ok(Grant::new(resolved(path)?, Access::READ))),
+        )
+        .chain(std::iter::once(Ok(Grant::new(
+            resolved(tools.bin_dir())?,
+            Access::EXEC,
+        ))))
+        .chain(
+            job_fifo
+                .iter()
+                .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE))),
+        )
+        .collect()
 }
 
 /// Adds a command's private jobserver variables to its process environment.
@@ -3383,8 +3455,10 @@ where
     E: Executor + Clone + 'static,
     N: NetworkPolicy + 'static,
 {
-    let runtime_environment =
+    let mut runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    let marker = JobMarker::new();
+    runtime_environment.push(marker.entry());
     #[cfg(all(unix, feature = "jobserver"))]
     let runtime_environment =
         with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
@@ -3395,17 +3469,27 @@ where
         .map(crate::jobserver::CommandFifo::path);
     #[cfg(not(all(unix, feature = "jobserver")))]
     let job_fifo_path: Option<&Path> = None;
+    let grants = local_path_grants(
+        context.writable_paths,
+        context.readable_paths,
+        context.prepared_tools,
+        job_fifo_path,
+    )
+    .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(policy)
-        .working_dir(context.working_dir)
-        .grants(local_path_grants(
-            context.writable_paths,
-            context.readable_paths,
-            context.prepared_tools,
-            job_fifo_path,
-        ))
+        .working_dir(
+            // A symlink in the working directory's spelling fails the
+            // sandbox's own resolution — it does not follow a link a
+            // sandboxed process could have planted.
+            std::fs::canonicalize(context.working_dir)
+                .unwrap_or_else(|_| context.working_dir.to_path_buf()),
+        )
+        .grants(grants)
         .security(SecurityConfig::interactive())
         .priority(context.priority);
+    #[cfg(target_os = "linux")]
+    let config_builder = config_builder.supervised_spawn(true);
     // `ipc` changes the builder's type, so both arms build where they are.
     let config = match create_ipc_router(context.registry) {
         Some(router) => config_builder.ipc(router).build(),
@@ -3430,26 +3514,29 @@ where
     if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
         command = command.current_dir(start);
     }
-    let child = command
-        .args(args)
-        .envs(runtime_environment)
-        .stdin(local_stdin_config(context.stdin_alerts.as_ref()))
-        .stdout(StdioConfig::Piped)
-        .stderr(StdioConfig::Piped)
-        .spawn()
-        .await
-        .map_err(|e| TerminalError::Execution(e.to_string()))?;
+    let (child, tree) = spawn_local_command(
+        command,
+        args,
+        runtime_environment,
+        context.stdin_alerts.as_ref(),
+        &context.lifetime,
+        context.job_registry,
+        &context.executor,
+        &marker,
+    )
+    .await?;
 
     let pid = child.id();
     context
         .job_registry
-        .register(
+        .register_with_tree(
             pid,
             context.task_id,
             context.execution_id,
             context.script,
             context.mode,
             None,
+            Some(tree.clone()),
         )
         .await;
     context.background_startup.report_ready().await;
@@ -3459,7 +3546,11 @@ where
         context.executor,
         context.job_registry,
         pid,
-        context.stdin_alerts,
+        LocalJob {
+            tree,
+            lifetime: context.lifetime,
+            stdin_alerts: context.stdin_alerts,
+        },
         "missing stdout pipe for sandbox process",
         "missing stderr pipe for sandbox process",
     )
@@ -3471,8 +3562,10 @@ where
 async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let runtime_environment =
+    let mut runtime_environment =
         prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    let marker = JobMarker::new();
+    runtime_environment.push(marker.entry());
     #[cfg(all(unix, feature = "jobserver"))]
     let runtime_environment =
         with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
@@ -3483,17 +3576,24 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         .map(crate::jobserver::CommandFifo::path);
     #[cfg(not(all(unix, feature = "jobserver")))]
     let job_fifo_path: Option<&Path> = None;
+    let grants = local_path_grants(
+        context.writable_paths,
+        context.readable_paths,
+        context.prepared_tools,
+        job_fifo_path,
+    )
+    .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(AllowAll)
-        .working_dir(context.working_dir)
-        .grants(local_path_grants(
-            context.writable_paths,
-            context.readable_paths,
-            context.prepared_tools,
-            job_fifo_path,
-        ))
+        .working_dir(
+            std::fs::canonicalize(context.working_dir)
+                .unwrap_or_else(|_| context.working_dir.to_path_buf()),
+        )
+        .grants(grants)
         .security(SecurityConfig::interactive())
         .priority(context.priority);
+    #[cfg(target_os = "linux")]
+    let config_builder = config_builder.supervised_spawn(true);
     // `ipc` changes the builder's type, so both arms build where they are.
     let config = match create_ipc_gateway_router(context.registry) {
         Some(router) => config_builder.ipc(router).build(),
@@ -3518,26 +3618,29 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
         command = command.current_dir(start);
     }
-    let child = command
-        .args(args)
-        .envs(runtime_environment)
-        .stdin(local_stdin_config(context.stdin_alerts.as_ref()))
-        .stdout(StdioConfig::Piped)
-        .stderr(StdioConfig::Piped)
-        .spawn()
-        .await
-        .map_err(|e| TerminalError::Execution(e.to_string()))?;
+    let (child, tree) = spawn_local_command(
+        command,
+        args,
+        runtime_environment,
+        context.stdin_alerts.as_ref(),
+        &context.lifetime,
+        context.job_registry,
+        &context.executor,
+        &marker,
+    )
+    .await?;
 
     let pid = child.id();
     context
         .job_registry
-        .register(
+        .register_with_tree(
             pid,
             context.task_id,
             context.execution_id,
             context.script,
             context.mode,
             None,
+            Some(tree.clone()),
         )
         .await;
     context.background_startup.report_ready().await;
@@ -3547,13 +3650,26 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         context.executor,
         context.job_registry,
         pid,
-        context.stdin_alerts,
+        LocalJob {
+            tree,
+            lifetime: context.lifetime,
+            stdin_alerts: context.stdin_alerts,
+        },
         "missing stdout pipe for unsafe process",
         "missing stderr pipe for unsafe process",
     )
     .await?;
 
     Ok((pid, output))
+}
+
+/// How long a command's descendants may outlive its top-level shell.
+#[derive(Clone)]
+enum JobLifetime {
+    /// None: the survivors are killed and reported on `alerts`.
+    Foreground { alerts: Sender<JobAlert> },
+    /// All of them: the job runs until its whole tree has exited.
+    Background,
 }
 
 /// Where a background job's stdin alerts go.
@@ -3652,14 +3768,19 @@ impl LocalStdinWatch {
 }
 
 async fn collect_local_process_output<E: Executor + Clone + 'static>(
-    mut child: heel::Child,
+    mut child: LocalChild,
     executor: E,
     job_registry: &JobRegistry,
     pid: u32,
-    stdin_alerts: Option<StdinAlerts>,
+    job: LocalJob,
     missing_stdout_message: &'static str,
     missing_stderr_message: &'static str,
 ) -> Result<std::process::Output, TerminalError> {
+    let LocalJob {
+        tree,
+        lifetime,
+        stdin_alerts,
+    } = job;
     let mut stdin_watch = None;
     if let Some(stdin) = child.take_stdin() {
         let feed = FeedCounter::default();
@@ -3692,11 +3813,56 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
         .spawn(drain_terminal_chunks(job_registry.clone(), pid, chunk_rx))
         .detach();
 
-    let status = match wait_for_local_process_exit(&mut child, stdin_watch).await {
-        Ok(status) => status,
+    // The root stays unreaped until its tree is gone, so its pid and process
+    // group stay reserved while the job's descendants are tracked by them.
+    let exited = match wait_for_local_process_exit(&mut child, stdin_watch).await {
+        Ok(exited) => exited,
         Err(error) => {
+            tree.finish().await;
             job_registry.close_stdout(pid).await;
             job_registry.close_stderr(pid).await;
+            return Err(error);
+        }
+    };
+    let descendants = end_descendants(&tree, &lifetime).await;
+    // The task ends first: afterwards the root's pid may belong to anyone.
+    tree.finish().await;
+    let (status, report) = match exited {
+        Some(status) => (Ok(status), None),
+        None => match child.wait_reported().await {
+            Ok((status, report)) => (Ok(status), report),
+            Err(error) => (Err(TerminalError::Execution(error.to_string())), None),
+        },
+    };
+    let _ = &report;
+    #[cfg(target_os = "linux")]
+    if let Some(report) = report {
+        let killed: Vec<JobProcess> = report
+            .killed
+            .into_iter()
+            .map(|process| JobProcess {
+                pid: process.pid,
+                name: process.name,
+            })
+            .collect();
+        if !killed.is_empty() {
+            info!(
+                killed = killed.len(),
+                "the supervisor killed the finished command's descendants"
+            );
+            if let JobLifetime::Foreground { alerts } = &lifetime {
+                let _ = alerts
+                    .send(JobAlert::DescendantsKilled(DescendantsKilled::new(killed)))
+                    .await;
+            }
+        }
+    }
+    let status = match (descendants, status) {
+        (Ok(()), Ok(status)) => status,
+        (Err(error), _) | (Ok(()), Err(error)) => {
+            job_registry.close_stdout(pid).await;
+            job_registry.close_stderr(pid).await;
+            job_registry.fail(pid, &error.to_string(), None).await;
             return Err(error);
         }
     };
@@ -3713,15 +3879,227 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
     Ok(output)
 }
 
+/// A local job's process tree and how long its descendants may live.
+struct LocalJob {
+    tree: JobTree,
+    lifetime: JobLifetime,
+    stdin_alerts: Option<StdinAlerts>,
+}
+
+/// The teardown budget a job's supervisor gives its kills: the time to
+/// freeze the tree, deliver `SIGKILL` and see every killed process exit.
+/// Generous relative to the few milliseconds a `SIGKILL` exit takes, since a
+/// too-short budget reports survivors that are merely still exiting.
+#[cfg(target_os = "linux")]
+const SUPERVISED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A spawned local job: the plain `heel` child on platforms without a
+/// supervisor, or a `heel supervise`-supervised one on Linux, where the
+/// supervisor is the command's parent and owns its whole tree.
+enum LocalChild {
+    /// Everywhere but Linux: the sandboxed process itself.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    Plain(heel::Child),
+    /// Linux, foreground lifetime: `wait` yields the command's status and
+    /// the teardown's report of what it killed.
+    #[cfg(target_os = "linux")]
+    Foreground(heel::supervisor::SupervisedChild<heel::supervisor::Foreground>),
+    /// Linux, background lifetime: `wait` ends only once the last descendant
+    /// of the command has exited.
+    #[cfg(target_os = "linux")]
+    Background(heel::supervisor::SupervisedChild<heel::supervisor::Background>),
+}
+
+impl LocalChild {
+    /// The spawned process's id: the supervisor's on Linux.
+    fn id(&self) -> u32 {
+        match self {
+            Self::Plain(child) => child.id(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) => child.id(),
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => child.id(),
+        }
+    }
+
+    fn take_stdin(&mut self) -> Option<std::fs::File> {
+        match self {
+            Self::Plain(child) => child.take_stdin(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) => child.take_stdin(),
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => child.take_stdin(),
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<std::fs::File> {
+        match self {
+            Self::Plain(child) => child.take_stdout(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) => child.take_stdout(),
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => child.take_stdout(),
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<std::fs::File> {
+        match self {
+            Self::Plain(child) => child.take_stderr(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) => child.take_stderr(),
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => child.take_stderr(),
+        }
+    }
+
+    /// A handle to the supervisor owning the job's tree.
+    #[cfg(target_os = "linux")]
+    fn tree_control(&self) -> TreeControl {
+        match self {
+            Self::Foreground(child) => child.tree_control(),
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => child.tree_control(),
+            Self::Plain(_) => unreachable!("a supervised spawn returns no plain child"),
+        }
+    }
+
+    /// Waits the job out, yielding the command's status and, for a
+    /// supervised foreground job, the supervisor's teardown report: what it
+    /// found still running under the command and killed.
+    async fn wait_reported(
+        &mut self,
+    ) -> Result<(std::process::ExitStatus, Option<TreeReport>), heel::Error> {
+        match self {
+            Self::Plain(child) => Ok((child.wait().await?, None)),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) => {
+                let exit = child.wait().await?;
+                Ok((exit.status, Some(exit.report)))
+            }
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => Ok((child.wait().await?, None)),
+        }
+    }
+}
+
+/// Spawns a local job's command and hands its tree to whoever owns it.
+///
+/// On Linux the sandbox was built with `supervised_spawn(true)`, so the
+/// command runs under `heel supervise`: a child subreaper inside the sandbox
+/// that owns the whole tree however its members change session, group or
+/// environment. Everywhere else the root's process group is watched through
+/// the process table, keyed by the job's marker.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_local_command<E: Executor + Clone + 'static>(
+    command: heel::Command<'_>,
+    args: &[String],
+    environment: Vec<(String, String)>,
+    stdin_alerts: Option<&StdinAlerts>,
+    lifetime: &JobLifetime,
+    job_registry: &JobRegistry,
+    executor: &E,
+    marker: &JobMarker,
+) -> Result<(LocalChild, JobTree), TerminalError> {
+    let command = command
+        .args(args)
+        .envs(environment)
+        .stdin(local_stdin_config(stdin_alerts))
+        .stdout(StdioConfig::Piped)
+        .stderr(StdioConfig::Piped);
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (job_registry, executor, marker);
+        let child = match lifetime {
+            JobLifetime::Foreground { .. } => LocalChild::Foreground(
+                command
+                    .spawn_supervised(heel::supervisor::Foreground {
+                        reap_timeout: SUPERVISED_REAP_TIMEOUT,
+                    })
+                    .await
+                    .map_err(|error| TerminalError::Execution(error.to_string()))?,
+            ),
+            JobLifetime::Background => LocalChild::Background(
+                command
+                    .spawn_supervised(heel::supervisor::Background {
+                        reap_timeout: SUPERVISED_REAP_TIMEOUT,
+                    })
+                    .await
+                    .map_err(|error| TerminalError::Execution(error.to_string()))?,
+            ),
+        };
+        let tree = JobTree::supervised(child.tree_control());
+        Ok((child, tree))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = lifetime;
+        let child = command
+            .spawn()
+            .await
+            .map_err(|error| TerminalError::Execution(error.to_string()))?;
+        let pid = child.id();
+        let tree = job_registry.start_process_tree(executor, pid, marker);
+        Ok((LocalChild::Plain(child), tree))
+    }
+}
+
+/// Applies the rule that a job's descendants live exactly as long as the job,
+/// after its top-level shell exited.
+///
+/// A foreground command's surviving descendants are killed and reported in one
+/// [`JobAlert::DescendantsKilled`]; a background job stays running until every
+/// descendant has exited, which its timeout, `terminal_kill` and the registry's
+/// kills end by killing the tree.
+async fn end_descendants(tree: &JobTree, lifetime: &JobLifetime) -> Result<(), TerminalError> {
+    match lifetime {
+        JobLifetime::Foreground { alerts } => {
+            let killed = tree
+                .kill_descendants()
+                .await
+                .map_err(|error| TerminalError::Execution(error.to_string()))?;
+            if !killed.is_empty() {
+                info!(
+                    killed = killed.len(),
+                    "killed descendants of a finished foreground command"
+                );
+                let _ = alerts
+                    .send(JobAlert::DescendantsKilled(DescendantsKilled::new(killed)))
+                    .await;
+            }
+            Ok(())
+        }
+        JobLifetime::Background => tree
+            .wait_descendants_exit()
+            .await
+            .map_err(|error| TerminalError::Execution(error.to_string())),
+    }
+}
+
 /// Waits for the child to exit, raising stdin alerts meanwhile.
+///
+/// On Unix the child is only observed to have exited and stays unreaped (the
+/// answer is `None`); the caller waits for it once its tree is gone. Windows
+/// has no such state and answers the exit status.
+#[cfg_attr(unix, allow(clippy::needless_pass_by_ref_mut))]
 async fn wait_for_local_process_exit(
-    child: &mut heel::Child,
+    child: &mut LocalChild,
     stdin_watch: Option<LocalStdinWatch>,
-) -> Result<std::process::ExitStatus, TerminalError> {
+) -> Result<Option<std::process::ExitStatus>, TerminalError> {
+    #[cfg(unix)]
+    let exit = async {
+        crate::process_tree::wait_for_exit(child.id())
+            .await
+            .map(|()| None)
+            .map_err(|error| TerminalError::Execution(error.to_string()))
+    };
+    #[cfg(not(unix))]
     let exit = async {
         child
-            .wait()
+            .wait_reported()
             .await
+            .map(|(status, _)| Some(status))
             .map_err(|error| TerminalError::Execution(error.to_string()))
     };
     let Some(stdin_watch) = stdin_watch else {
@@ -3755,33 +4133,37 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             None,
         )
         .await;
-    // Every spawned job carries a stdin channel: a job without a stdin
-    // watch (a caller that passed no `stdin_alerts`) gets the channel's EOF
-    // instead, which is what `stdin_alerts: None` means here.
-    let stdin_blocked = if let Some(alerts) = context.stdin_alerts {
+    // A foreground command gets no input channel: the dropped sender is the
+    // EOF its stdin reads. StdinAlerts may ride along either way; they are
+    // the background job's blocked-reader wiring.
+    let exec_lifetime = if let JobLifetime::Foreground { .. } = context.lifetime {
+        drop(input_tx);
+        ExecLifetime::Foreground
+    } else {
         context
             .job_registry
             .attach_terminal_input(pid, input_tx)
             .await;
         let (signal_tx, signal_rx) = async_channel::unbounded::<StdinWatchSignal>();
-        context
-            .executor
-            .clone()
-            .spawn(async move {
-                while let Ok(signal) = signal_rx.recv().await {
-                    match signal {
-                        StdinWatchSignal::Blocked => alerts.raise().await,
-                        StdinWatchSignal::Failed(error) => {
-                            alerts.raise_failure(error).await;
+        if let Some(alerts) = context.stdin_alerts {
+            context
+                .executor
+                .clone()
+                .spawn(async move {
+                    while let Ok(signal) = signal_rx.recv().await {
+                        match signal {
+                            StdinWatchSignal::Blocked => alerts.raise().await,
+                            StdinWatchSignal::Failed(error) => {
+                                alerts.raise_failure(error).await;
+                            }
                         }
                     }
-                }
-            })
-            .detach();
-        Some(signal_tx)
-    } else {
-        drop(input_tx);
-        None
+                })
+                .detach();
+        }
+        ExecLifetime::Background {
+            stdin_blocked: signal_tx,
+        }
     };
     context.job_registry.attach_kill_switch(pid, kill_tx).await;
     context.background_startup.report_ready().await;
@@ -3823,7 +4205,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             working_dir,
             kill_rx,
             input_rx,
-            stdin_blocked,
+            exec_lifetime,
         )
         .await;
 
@@ -3831,7 +4213,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         bridge.stop().await;
     }
 
-    record_container_exec_outcome(context.job_registry, pid, execution).await
+    record_container_exec_outcome(context.job_registry, pid, &context.lifetime, execution).await
 }
 
 /// Records a finished container exec in the job's streams and folds it into
@@ -3839,10 +4221,22 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
 async fn record_container_exec_outcome(
     job_registry: &JobRegistry,
     pid: u32,
+    lifetime: &JobLifetime,
     execution: Result<ContainerExecOutcome, String>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
     match execution {
-        Ok(ContainerExecOutcome::Completed(output)) => {
+        Ok(ContainerExecOutcome::Completed { output, killed }) => {
+            if let JobLifetime::Foreground { alerts } = lifetime
+                && !killed.is_empty()
+            {
+                info!(
+                    killed = killed.len(),
+                    "killed processes of a finished foreground container command"
+                );
+                let _ = alerts
+                    .send(JobAlert::DescendantsKilled(DescendantsKilled::new(killed)))
+                    .await;
+            }
             if !output.stdout.is_empty() {
                 job_registry.append_stdout(pid, output.stdout.clone()).await;
             }
@@ -4755,7 +5149,7 @@ mod tests {
             _working_dir: &str,
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
-            _stdin_blocked: Option<Sender<StdinWatchSignal>>,
+            _lifetime: ExecLifetime,
         ) -> impl std::future::Future<Output = Result<crate::ContainerExecOutcome, String>> + Send
         {
             std::future::ready(Err("adoption never executes in the container".to_string()))
@@ -5795,7 +6189,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let config = SandboxConfig::builder()
             .network(DenyAll)
-            .working_dir(dir.path())
+            .working_dir(
+                std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf()),
+            )
             .security(SecurityConfig::interactive())
             .build();
         let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
@@ -5850,6 +6246,9 @@ mod tests {
             mode: TerminalMode::Sandboxed,
             backend: ExecutionBackend::Local(tool.shell_sessions.local_tools().unwrap().clone()),
             stdin_alerts: None,
+            lifetime: JobLifetime::Foreground {
+                alerts: async_channel::unbounded().0,
+            },
             background_startup: BackgroundStartup::new(startup_tx),
             network_audit: None,
             priority: ProcessPriority::default(),
@@ -6181,29 +6580,23 @@ mod tests {
                 _working_dir: &str,
                 _kill_rx: Receiver<()>,
                 stdin_rx: Receiver<Vec<u8>>,
-                stdin_blocked: Option<Sender<StdinWatchSignal>>,
+                _lifetime: ExecLifetime,
             ) -> Result<ContainerExecOutcome, String> {
-                assert!(
-                    stdin_blocked.is_some(),
-                    "a foreground exec must get a stdin watch channel"
-                );
-                // The channel must pend: an open stdin delivers no EOF and
-                // carries no data until `terminal_input` feeds it.
-                let input =
-                    futures_lite::future::or(async { Some(stdin_rx.recv().await) }, async {
-                        async_io::Timer::after(Duration::from_secs(1)).await;
-                        None
-                    })
-                    .await;
-                assert!(
-                    input.is_none(),
-                    "a foreground exec's stdin must stay open, got {input:?}"
-                );
-                Ok(ContainerExecOutcome::Completed(std::process::Output {
-                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                }))
+                let eof = futures_lite::future::or(async { Some(stdin_rx.recv().await) }, async {
+                    async_io::Timer::after(Duration::from_secs(5)).await;
+                    None
+                })
+                .await
+                .expect("a foreground exec's stdin must be EOF at once, not left open");
+                assert!(eof.is_err(), "a foreground exec's stdin must carry no data");
+                Ok(ContainerExecOutcome::Completed {
+                    output: std::process::Output {
+                        status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    },
+                    killed: Vec::new(),
+                })
             }
         }
 
@@ -6236,10 +6629,11 @@ mod tests {
             ipc_commands: &[],
             job_registry: &job_registry,
             stdin_alerts: Some(StdinAlerts {
-                tx: alert_tx,
+                tx: alert_tx.clone(),
                 task_id: "task-test".to_string(),
                 script: "cat".to_string(),
             }),
+            lifetime: JobLifetime::Foreground { alerts: alert_tx },
             background_startup: &BackgroundStartup::new(startup_tx),
             priority: ProcessPriority::default(),
             confinement: None,
@@ -6450,6 +6844,425 @@ mod tests {
             JobStatus::Killed,
             "the promoted job should be killed at its timeout: {completed:?}"
         );
+    }
+
+    /// What a test leaves running after its shell exits.
+    ///
+    /// `Plain` is a `sleep` in the shell's process group. `Setsid` is a helper
+    /// program that calls `setsid` and stays alive, so it also leaves the
+    /// group and the session. The helper is built here because macOS ships no
+    /// `setsid` binary, and because the kernel withholds the environment of
+    /// Apple's own binaries (`sleep`, `perl`), which is what finds a `setsid`
+    /// descendant once its parent is gone.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum Descendant {
+        Plain,
+        Setsid,
+    }
+
+    /// The name of the `setsid` helper program, and so of its process.
+    #[cfg(unix)]
+    const SETSID_HELPER: &str = "setsid-helper";
+
+    /// The directory the sandbox may execute programs from.
+    #[cfg(unix)]
+    fn exec_dir<P, E>(tool: &TerminalTool<P, E, Configured>) -> PathBuf {
+        tool.shell_sessions
+            .local_tools()
+            .expect("the terminal has local tools")
+            .bin_dir()
+            .clone()
+    }
+
+    /// Builds the `setsid` helper into `dir` and returns its path. The sandbox
+    /// executes only what lies under a granted directory, so `dir` is the
+    /// prepared tools' [`exec_dir`].
+    #[cfg(unix)]
+    fn build_setsid_helper(dir: &Path) -> PathBuf {
+        let source = dir.join("setsid_helper.rs");
+        std::fs::write(
+            &source,
+            "extern \"C\" { fn setsid() -> i32; }\n\
+             fn main() {\n\
+                 let seconds: u64 = std::env::args().nth(1).expect(\"seconds\").parse().expect(\"seconds\");\n\
+                 // SAFETY: `setsid` takes no arguments.\n\
+                 if unsafe { setsid() } < 0 { std::process::exit(1); }\n\
+                 std::thread::sleep(std::time::Duration::from_secs(seconds));\n\
+             }\n",
+        )
+        .expect("helper source should be written");
+        let binary = dir.join(SETSID_HELPER);
+        let status = std::process::Command::new("rustc")
+            .arg("--edition=2021")
+            .arg("-o")
+            .arg(&binary)
+            .arg(&source)
+            .status()
+            .expect("rustc should run");
+        assert!(status.success(), "the setsid helper should compile");
+        binary
+    }
+
+    #[cfg(unix)]
+    impl Descendant {
+        /// The name the descendant's process has once it ran `exec`.
+        const fn process_name(self) -> &'static str {
+            match self {
+                Self::Plain => "sleep",
+                Self::Setsid => SETSID_HELPER,
+            }
+        }
+
+        /// A command that starts the descendant for `seconds` detached from
+        /// the shell's output, records its pid in `child.pid` and returns once
+        /// the child had time to `exec`.
+        fn script(self, exec_dir: &Path, seconds: u32) -> String {
+            match self {
+                Self::Plain => {
+                    format!("sleep {seconds} > /dev/null 2>&1 & echo $! > child.pid; sleep 0.3")
+                }
+                Self::Setsid => format!(
+                    "'{}' {seconds} > /dev/null 2>&1 & echo $! > child.pid; sleep 0.3",
+                    build_setsid_helper(exec_dir).display()
+                ),
+            }
+        }
+    }
+
+    /// The pid `child.pid` in `dir` holds, once the shell wrote it.
+    #[cfg(unix)]
+    async fn recorded_child_pid(dir: &Path) -> i32 {
+        for _ in 0..250 {
+            // The redirect creates the file before `echo` writes it, so an
+            // empty read only means the pid is not there yet.
+            if let Ok(text) = async_fs::read_to_string(dir.join("child.pid")).await
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            async_io::Timer::after(Duration::from_millis(20)).await;
+        }
+        panic!("the descendant never recorded its pid");
+    }
+
+    /// Whether `pid` is a live process.
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        // SAFETY: signal 0 probes process existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Fails unless `pid` is gone within a few seconds.
+    #[cfg(unix)]
+    async fn assert_process_gone(pid: i32, context: &str) {
+        for _ in 0..250 {
+            if !process_exists(pid) {
+                return;
+            }
+            async_io::Timer::after(Duration::from_millis(20)).await;
+        }
+        panic!("process {pid} survived: {context}");
+    }
+
+    #[cfg(unix)]
+    async fn foreground_command_leaving_a_descendant_kills_it_and_alerts_once(
+        descendant: Descendant,
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let receiver = tool.background_receiver();
+
+        let result = tool
+            .call(
+                terminal_args(
+                    "leave a descendant",
+                    &descendant.script(&exec_dir(&tool), 300),
+                ),
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal call should succeed");
+        let command = result.command().expect("terminal returns a command result");
+        assert!(
+            matches!(command.outcome, CommandOutcome::Exited { code: 0 }),
+            "{:?}",
+            command.outcome
+        );
+
+        let child = recorded_child_pid(tool.working_dir()).await;
+        assert_process_gone(
+            child,
+            &format!("{descendant:?} descendant of a foreground command"),
+        )
+        .await;
+        let alerts = receiver.take_job_alerts();
+        match alerts.as_slice() {
+            [JobAlert::DescendantsKilled(killed)] => {
+                assert_eq!(killed.omitted, 0);
+                // The name is read after the freeze, once the child exec'd.
+                assert_eq!(
+                    killed
+                        .processes
+                        .iter()
+                        .map(|process| i64::from(process.pid))
+                        .collect::<Vec<_>>(),
+                    [i64::from(child)]
+                );
+                assert_eq!(killed.processes[0].name, descendant.process_name());
+            }
+            other => panic!("expected one descendants-killed alert, got {other:?}"),
+        }
+        assert!(
+            receiver.take_job_alerts().is_empty(),
+            "the same event must not alert twice"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreground_command_leaving_a_descendant_kills_it_and_alerts_once_plain() {
+        foreground_command_leaving_a_descendant_kills_it_and_alerts_once(Descendant::Plain).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreground_command_leaving_a_setsid_descendant_kills_it_and_alerts_once() {
+        foreground_command_leaving_a_descendant_kills_it_and_alerts_once(Descendant::Setsid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreground_background_jobs_joined_by_wait_run_without_an_alert() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let receiver = tool.background_receiver();
+
+        let result = tool
+            .call(
+                terminal_args(
+                    "run two jobs and join them",
+                    "(sleep 1; echo one > one.txt) & (sleep 1; echo two > two.txt) & wait",
+                ),
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal call should succeed");
+        let command = result.command().expect("terminal returns a command result");
+        assert!(
+            matches!(command.outcome, CommandOutcome::Exited { code: 0 }),
+            "{:?}",
+            command.outcome
+        );
+        for name in ["one.txt", "two.txt"] {
+            assert!(
+                tool.working_dir().join(name).exists(),
+                "{name} must be written before the command returns"
+            );
+        }
+        assert!(
+            receiver.take_job_alerts().is_empty(),
+            "a joined job is no survivor"
+        );
+    }
+
+    /// Starts the background `script`, waits until its shell has exited with the
+    /// descendant still alive, and returns the task id and the descendant's pid.
+    #[cfg(unix)]
+    async fn background_job_whose_shell_exited(
+        tool: &TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+        script: &str,
+        timeout: u64,
+    ) -> (String, i32) {
+        let result = tool
+            .run_background(TerminalArgs {
+                background: true,
+                timeout,
+                ..terminal_args("background job", script)
+            })
+            .await
+            .expect("terminal should start the background job");
+        let task_id = match result.command().map(|command| &command.outcome) {
+            Some(CommandOutcome::Running { task_id, .. }) => task_id.clone(),
+            other => panic!("background job needs a task id, got {other:?}"),
+        };
+        let child = recorded_child_pid(tool.working_dir()).await;
+        // Past the shell's exit and several of the tree's checks.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            process_exists(child),
+            "the descendant must outlive the shell"
+        );
+        (task_id, child)
+    }
+
+    #[cfg(unix)]
+    async fn background_job_stays_running_until_its_descendant_exits(descendant: Descendant) {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let (task_id, child) =
+            background_job_whose_shell_exited(&tool, &descendant.script(&exec_dir(&tool), 3), 30)
+                .await;
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the job is registered");
+        assert_eq!(
+            info.status,
+            JobStatus::Running,
+            "the job runs while its descendant does"
+        );
+        assert!(
+            tool.job_registry()
+                .format_running_jobs()
+                .await
+                .contains(&task_id),
+            "the running-jobs context lists the job"
+        );
+
+        assert_process_gone(child, "the descendant's own exit").await;
+        let receiver = tool.background_receiver();
+        let completed = wait_for_completed_task(&receiver, &task_id).await;
+        assert!(completed.result.is_ok(), "{completed:?}");
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the finished job stays in the registry");
+        assert_eq!(info.status, JobStatus::Completed { exit_code: 0 });
+        assert!(
+            tool.job_registry().format_running_jobs().await.is_empty(),
+            "a finished job is no longer listed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_job_stays_running_until_its_plain_descendant_exits() {
+        background_job_stays_running_until_its_descendant_exits(Descendant::Plain).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_job_stays_running_until_its_setsid_descendant_exits() {
+        background_job_stays_running_until_its_descendant_exits(Descendant::Setsid).await;
+    }
+
+    #[cfg(unix)]
+    async fn killing_a_background_job_kills_its_descendant(descendant: Descendant) {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let (task_id, child) =
+            background_job_whose_shell_exited(&tool, &descendant.script(&exec_dir(&tool), 300), 30)
+                .await;
+        assert!(
+            tool.job_registry().kill_by_task_id(&task_id).await,
+            "a job with a live descendant is killable"
+        );
+        assert_process_gone(
+            child,
+            &format!("terminal_kill of a job with a {descendant:?} descendant"),
+        )
+        .await;
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the killed job stays in the registry");
+        assert_eq!(info.status, JobStatus::Killed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn killing_a_background_job_kills_its_plain_descendant() {
+        killing_a_background_job_kills_its_descendant(Descendant::Plain).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn killing_a_background_job_kills_its_setsid_descendant() {
+        killing_a_background_job_kills_its_descendant(Descendant::Setsid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_timeout_kills_a_descendant_that_outlived_the_shell() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        // The timeout fires while the shell is long gone: the job is only its
+        // descendant by then.
+        let (task_id, child) = background_job_whose_shell_exited(
+            &tool,
+            &Descendant::Setsid.script(&exec_dir(&tool), 300),
+            2,
+        )
+        .await;
+        assert_process_gone(child, "the timeout of a job whose shell exited").await;
+        let receiver = tool.background_receiver();
+        wait_for_completed_task(&receiver, &task_id).await;
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the finished job stays in the registry");
+        assert_eq!(info.status, JobStatus::Killed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagents_cleanup_kills_a_descendant_that_outlived_the_shell() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let (_task_id, child) = background_job_whose_shell_exited(
+            &tool,
+            &Descendant::Plain.script(&exec_dir(&tool), 300),
+            30,
+        )
+        .await;
+        // What `kill_running_terminal_jobs` and the subagent run's cleanup call.
+        assert_eq!(tool.job_registry().kill_running().await, 1);
+        assert_process_gone(child, "the cleanup of a subagent's job").await;
     }
 
     #[cfg(unix)]
@@ -8078,15 +8891,18 @@ mod tests {
             _working_dir: &str,
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
-            _stdin_blocked: Option<Sender<StdinWatchSignal>>,
+            _lifetime: ExecLifetime,
         ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
         {
             self.scripts.lock().unwrap().push(script.to_string());
-            std::future::ready(Ok(ContainerExecOutcome::Completed(std::process::Output {
-                status: std::os::unix::process::ExitStatusExt::from_raw(0),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            })))
+            std::future::ready(Ok(ContainerExecOutcome::Completed {
+                output: std::process::Output {
+                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                killed: Vec::new(),
+            }))
         }
     }
 

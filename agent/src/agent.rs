@@ -43,8 +43,8 @@ use futures_lite::StreamExt;
 use sha2::{Digest, Sha256};
 
 use aither_sandbox::{
-    BackgroundTaskEvent, BackgroundTaskReceiver, DirectoryResetReason, JobAlert, JobRegistry,
-    PermissionEvent, PermissionEventReceiver, PermissionEventStage, TerminalArgs,
+    BackgroundTaskEvent, BackgroundTaskReceiver, DirectoryResetReason, JobAlert, JobProcess,
+    JobRegistry, PermissionEvent, PermissionEventReceiver, PermissionEventStage, TerminalArgs,
     TerminalExecutionMode, TerminalMode,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -390,6 +390,11 @@ struct JobAlertTemplate<'a> {
 
 /// What a background job alert reports.
 enum JobAlertText<'a> {
+    /// A foreground command left processes running; they were killed.
+    DescendantsKilled {
+        processes: &'a [JobProcess],
+        omitted: usize,
+    },
     /// The job crossed the long-running threshold.
     LongRunning { task_id: &'a str, elapsed: String },
     /// The job is waiting for input on its stdin.
@@ -1515,6 +1520,17 @@ where
     /// it is a job blocked on stdin, which wakes a parked wait.
     fn push_job_alert(&mut self, alert: JobAlert) -> bool {
         match alert {
+            JobAlert::DescendantsKilled(killed) => {
+                tracing::info!(
+                    killed = killed.processes.len() + killed.omitted,
+                    "foreground command left processes running; killed"
+                );
+                self.push_system_alert(job_alert_text(&JobAlertText::DescendantsKilled {
+                    processes: &killed.processes,
+                    omitted: killed.omitted,
+                }));
+                false
+            }
             JobAlert::DirectoryReset(reset) => {
                 tracing::info!(dir = %reset.dir.display(), reason = ?reset.reason, "carried working directory reset");
                 self.push_system_alert(job_alert_text(&JobAlertText::DirectoryReset {
@@ -2941,6 +2957,31 @@ mod tests {
             );
             assert!(text.contains(expected), "{text}");
         }
+        let killed = job_alert_text(&JobAlertText::DescendantsKilled {
+            processes: &[
+                JobProcess {
+                    pid: 41,
+                    name: "sleep".to_string(),
+                },
+                JobProcess {
+                    pid: 42,
+                    name: "node".to_string(),
+                },
+            ],
+            omitted: 3,
+        });
+        assert_eq!(
+            killed,
+            "The command ended while sleep (pid 41), node (pid 42) and 3 more kept running, so they were killed with it. A process meant to keep running belongs in terminal_background."
+        );
+        let one = job_alert_text(&JobAlertText::DescendantsKilled {
+            processes: &[JobProcess {
+                pid: 7,
+                name: "sleep".to_string(),
+            }],
+            omitted: 0,
+        });
+        assert!(one.contains("sleep (pid 7) kept running"), "{one}");
         let long = job_alert_text(&JobAlertText::LongRunning {
             task_id: "amber",
             elapsed: "5m".to_string(),
