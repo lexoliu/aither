@@ -827,6 +827,12 @@ struct ToolCatalogTemplate<'a> {
     tools: &'a [ToolInfo],
 }
 
+impl ToolCatalogTemplate<'_> {
+    fn has(&self, command: &str) -> bool {
+        self.tools.iter().any(|tool| tool.command == command)
+    }
+}
+
 impl ToolCatalog {
     /// Renders concise operational instructions without a command-discovery phase.
     ///

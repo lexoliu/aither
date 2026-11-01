@@ -25,7 +25,7 @@ use super::runner::{HookCommand, HookRole, HookRunError, HookRunner};
 /// How many samples run at once.
 const SAMPLE_CONCURRENCY: usize = 4;
 
-/// Arguments of `hook_test`.
+/// Test a configured hook against sample inputs.
 ///
 /// Name the hook and give samples of the kind it takes: `--command` for a
 /// command hook, `--review-command` and `--review-domain` for a reviewer,
