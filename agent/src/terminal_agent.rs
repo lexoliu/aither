@@ -934,6 +934,9 @@ where
             ToolRegistryBuilder::new().build(self.terminal_tool.outputs_dir()),
         ));
         definitions.push(ToolDefinition::new(&terminal));
+        definitions.push(ToolDefinition::new(&aither_sandbox::MonitorTool::new(
+            terminal,
+        )));
         // The registry keys tools by name, so the definition list the built
         // agent sends is name-ordered.
         definitions.sort_by(|a, b| a.name().cmp(b.name()));
@@ -1668,6 +1671,7 @@ mod tests {
         assert_eq!(
             tool_names,
             [
+                "monitor",
                 "terminal",
                 "terminal_input",
                 "terminal_kill",
@@ -1687,6 +1691,7 @@ mod tests {
                 .map(ToolDefinition::name)
                 .collect::<Vec<_>>(),
             vec![
+                "monitor",
                 "terminal",
                 "terminal_input",
                 "terminal_kill",
