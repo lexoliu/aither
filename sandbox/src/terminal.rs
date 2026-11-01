@@ -3817,7 +3817,10 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
                 .unwrap_or_else(|_| context.working_dir.to_path_buf()),
         )
         .grants(grants)
-        .security(SecurityConfig::interactive())
+        // Unsafe is approved host execution — the user runs the script
+        // themselves in every respect except IPC plumbing, so no
+        // credential or filesystem protection may apply.
+        .security(SecurityConfig::permissive())
         .priority(context.priority);
     #[cfg(target_os = "linux")]
     let config_builder = config_builder.supervised_spawn(true);
