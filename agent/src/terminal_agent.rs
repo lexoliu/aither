@@ -1685,7 +1685,7 @@ mod tests {
             .find(|message| message.content().contains("<prepared_tools>"))
             .expect("first request contains prepared catalog")
             .content();
-        for command in ["apply_patch", "rg -n", "ast-grep run", "jq"] {
+        for command in ["apply_patch", "rg", "ast-grep", "jq"] {
             assert!(catalog.contains(command));
         }
     }

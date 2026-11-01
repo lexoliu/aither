@@ -251,9 +251,11 @@ pub enum BrowserServiceResponse {
     },
 }
 
-/// Drive the managed browser: `open` starts the runtime, `read <url>` inspects
-/// a page with structured text and an optional screenshot, `cdp-endpoint`
-/// exposes raw CDP, `close` stops the runtime and releases its resources.
+/// Drive the managed browser.
+///
+/// `open` starts the runtime, `read <url>` inspects a page with structured
+/// text and an optional screenshot, `cdp-endpoint` exposes raw CDP, `close`
+/// stops the runtime and releases its resources.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "command", rename_all = "kebab-case")]
 pub enum BrowserArgs {
