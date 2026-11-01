@@ -2,10 +2,8 @@
 These commands are already on PATH in the initialized execution environment:
 {% for tool in tools %}- {{ tool.command }} {{ tool.version }}
 {% endfor %}
-Code structure: `ast-grep run --lang rust --pattern 'fn $NAME($$$ARGS) { $$$BODY }' src`. Prefer AST patterns when looking for code constructs.
-Text: `rg -n --glob '*.rs' 'pattern' src`; filenames: `rg --files --glob '*.rs'`. Scope searches to relevant paths. Exit 1 means no matches.
-JSON: `jq '.items[] | {id, status}' data.json`; filter large JSON before reading it into context.
-Edits: submit one contextual patch for related hunks/files; apply_patch validates them before writes:
+{% if self.has("ast-grep") %}Prefer `ast-grep` patterns over text search for code constructs (`ast-grep run --lang rust --pattern 'fn $NAME($$$ARGS) { $$$BODY }' src`).
+{% endif %}{% if self.has("apply_patch") %}Edits go through `apply_patch`; it validates a contextual patch before writing:
 ```sh
 apply_patch <<'PATCH'
 *** Begin Patch
@@ -16,5 +14,5 @@ apply_patch <<'PATCH'
 *** End Patch
 PATCH
 ```
-Independent searches can run concurrently in one terminal script using `&` and `wait`; keep their outputs separate and wait for results before dependent edits. Use command help for uncommon options, not to discover these prepared capabilities.
+{% endif %}Use command `--help` for uncommon options, not to discover these prepared capabilities.
 </prepared_tools>

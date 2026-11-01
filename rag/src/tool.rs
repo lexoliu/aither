@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use crate::rag::Rag;
 use crate::types::Metadata;
 
-/// Arguments for the RAG search tool.
+/// Search indexed documents by semantic similarity.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RagToolArgs {
     /// The search query.

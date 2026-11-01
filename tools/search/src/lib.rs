@@ -301,7 +301,7 @@ pub enum SearchOutputMode {
     Chunks,
 }
 
-/// Arguments accepted by the search tool.
+/// Index files and search the index with lexical, semantic or hybrid matching.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SearchArgs {
     /// Shell-like command form, such as `search index src` or `search query foo`.

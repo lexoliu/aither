@@ -2349,11 +2349,6 @@ where
 
         self.context
             .insert_system_named("permissions", include_str!("prompts/permissions.txt"));
-
-        let tool_hints = self.format_tool_hints_block();
-        if !tool_hints.is_empty() {
-            self.context.insert_system_named("tool_hints", &tool_hints);
-        }
     }
 
     /// Registers the context sources the agent itself owns.
@@ -2687,24 +2682,6 @@ where
         Ok(messages)
     }
 
-    fn format_tool_hints_block(&self) -> String {
-        let defs = self.tools.active_definitions();
-        let mut lines = Vec::new();
-
-        for def in defs {
-            let desc = first_paragraph(def.description());
-            if desc.is_empty() {
-                continue;
-            }
-            let mut line = def.name().to_string();
-            line.push_str(": ");
-            line.push_str(desc.as_str());
-            lines.push(line);
-        }
-
-        lines.join("\n")
-    }
-
     async fn emit_checkpoint(
         &self,
         reason: CheckpointReason,
@@ -2852,19 +2829,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
-}
-
-fn first_paragraph(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    if let Some((first, _)) = trimmed.split_once("\n\n") {
-        return first.split_whitespace().collect::<Vec<_>>().join(" ");
-    }
-
-    trimmed.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Truncates a script for display in messages.

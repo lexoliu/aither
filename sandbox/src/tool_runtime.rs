@@ -827,6 +827,12 @@ struct ToolCatalogTemplate<'a> {
     tools: &'a [ToolInfo],
 }
 
+impl ToolCatalogTemplate<'_> {
+    fn has(&self, command: &str) -> bool {
+        self.tools.iter().any(|tool| tool.command == command)
+    }
+}
+
 impl ToolCatalog {
     /// Renders concise operational instructions without a command-discovery phase.
     ///
@@ -1326,10 +1332,12 @@ pub mod tests {
         let catalog = bundle().catalog();
         let first = catalog.render().unwrap();
         assert_eq!(first, catalog.render().unwrap());
+        for command in ManagedTool::ALL {
+            assert!(first.contains(command.command()), "{command:?}");
+        }
         assert!(first.contains("ast-grep run"));
-        assert!(first.contains("rg -n"));
         assert!(first.contains("*** Begin Patch"));
-        assert!(first.contains("wait"));
+        assert!(first.contains("--help"));
         assert!(!first.contains("command -v"));
         assert!(!first.contains("which "));
     }
