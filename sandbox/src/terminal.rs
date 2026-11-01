@@ -2718,6 +2718,26 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
         // The one entry every foreground, background and subagent command on
         // every backend passes through, ahead of permission and execution.
         crate::kill_guard::check(&arguments.script)?;
+        // A foreground `sleep` only waits on something else — the detached
+        // form (`background: true`) stays allowed as a timer or inside a
+        // waiting script.
+        if !arguments.background && crate::poll_guard::contains_sleep(&arguments.script) {
+            return Err(crate::poll_guard::PollRefusal::Sleep.into());
+        }
+        // A command that only re-reads files unchanged since their last read
+        // is polling; refuse it ahead of permission like the other blocks.
+        let file_reads = self.fingerprint_reads(&arguments.script).await;
+        if !file_reads.is_empty()
+            && self
+                .job_registry
+                .file_reads_unchanged(file_reads.clone())
+                .await
+        {
+            return Err(crate::poll_guard::PollRefusal::UnchangedFileRead {
+                paths: file_reads.iter().map(|(path, _)| path.clone()).collect(),
+            }
+            .into());
+        }
         // Ahead of target resolution and permission, so a blocked command
         // never asks the user for anything. The decision carries no grant.
         if let Some(gate) = self.registry.registry().gate()
@@ -2736,6 +2756,9 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
         }
         self.ensure_permission_allowed(target.mode, &arguments.script)
             .await?;
+        if !file_reads.is_empty() {
+            self.job_registry.record_file_reads(file_reads).await;
+        }
         let task_id = random_task_id();
         Ok(ExecutionPreparation {
             target,
@@ -2744,6 +2767,28 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
             store_dir: self.output_store.dir().to_path_buf(),
             max_lines: arguments.max_lines.min(MAX_LINES_CEILING) as usize,
         })
+    }
+
+    /// The `(len, modified)` fingerprint of every file `script` would read,
+    /// relative paths resolved against the working directory. Only files
+    /// that exist now are fingerprinted — everything else stays untracked.
+    async fn fingerprint_reads(
+        &self,
+        script: &str,
+    ) -> Vec<(std::path::PathBuf, crate::job_registry::FileFingerprint)> {
+        let mut reads = Vec::new();
+        for target in crate::poll_guard::file_reads(script) {
+            let mut path = std::path::PathBuf::from(&target);
+            if path.is_relative() {
+                path = self.working_dir.join(path);
+            }
+            if let Ok(meta) = async_fs::metadata(&path).await
+                && meta.is_file()
+            {
+                reads.push((path, (meta.len(), meta.modified().ok())));
+            }
+        }
+        reads
     }
 
     /// Kills the job through the registry once its timeout passes.
@@ -7341,14 +7386,16 @@ mod tests {
 
         /// A command that starts the descendant for `seconds` detached from
         /// the shell's output, records its pid in `child.pid` and returns once
-        /// the child had time to `exec`.
+        /// the child exists.
         fn script(self, exec_dir: &Path, seconds: u32) -> String {
+            // The foreground `sleep` guard refuses a plain `sleep 0.3`, so
+            // the settle wait is a `kill -0` check on the recorded pid.
             match self {
-                Self::Plain => {
-                    format!("sleep {seconds} > /dev/null 2>&1 & echo $! > child.pid; sleep 0.3")
-                }
+                Self::Plain => format!(
+                    "sleep {seconds} > /dev/null 2>&1 & echo $! > child.pid; until kill -0 \"$(cat child.pid)\" 2>/dev/null; do :; done"
+                ),
                 Self::Setsid => format!(
-                    "'{}' {seconds} > /dev/null 2>&1 & echo $! > child.pid; sleep 0.3",
+                    "'{}' {seconds} > /dev/null 2>&1 & echo $! > child.pid; until kill -0 \"$(cat child.pid)\" 2>/dev/null; do :; done",
                     build_setsid_helper(exec_dir).display()
                 ),
             }

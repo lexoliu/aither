@@ -78,11 +78,30 @@ impl std::error::Error for CommandRefusal {}
 /// Returns [`CommandRefusal::KillByName`] when a refused program is invoked,
 /// and [`CommandRefusal::Unparsable`] when the script is not valid shell.
 pub fn check(script: &str) -> Result<(), CommandRefusal> {
+    walk_invocations(script, &|_, _| {})
+}
+
+/// Walks `script` through the shell syntax tree, calling `on_argv` with the
+/// resolved command line of every simple command it would run — wrappers
+/// such as `env`, `sudo`, `timeout`, `xargs` and `find -exec` unwrapped, and
+/// the script strings of `sh -c`, `eval` and shell here-documents followed.
+/// The second argument reports whether the command sits in an
+/// `&`-asynchronous position, so the script itself does not wait on it.
+/// Still refuses the same commands [`check`] does.
+///
+/// # Errors
+/// Returns [`CommandRefusal`] for the same reasons [`check`] fails.
+pub fn walk_invocations(
+    script: &str,
+    on_argv: &dyn Fn(&[String], bool),
+) -> Result<(), CommandRefusal> {
     script_check(
         script,
         Cx {
             depth: 0,
             lookups: &Cell::new(false),
+            on_argv,
+            backgrounded: false,
         },
     )
 }
@@ -93,12 +112,20 @@ fn unparsable(reason: impl Display) -> CommandRefusal {
     }
 }
 
-/// Traversal state: nesting depth, and whether a program that looks processes
-/// up by name (`pgrep`, `pidof`) was met anywhere below.
+/// Traversal state: nesting depth, whether a program that looks processes
+/// up by name (`pgrep`, `pidof`) was met anywhere below, and an observer
+/// shown every resolved command line.
 #[derive(Clone, Copy)]
 struct Cx<'a> {
     depth: usize,
     lookups: &'a Cell<bool>,
+    /// Called with the argv of every simple command the script would run,
+    /// in source order, wrappers unwrapped.
+    on_argv: &'a dyn Fn(&[String], bool),
+    /// Whether the command sits in an `&`-asynchronous position, so the
+    /// script itself does not wait on it. Once a list is detached,
+    /// everything below it runs detached.
+    backgrounded: bool,
 }
 
 impl Cx<'_> {
@@ -106,6 +133,8 @@ impl Cx<'_> {
         Self {
             depth: self.depth + 1,
             lookups: self.lookups,
+            on_argv: self.on_argv,
+            backgrounded: self.backgrounded,
         }
     }
 }
@@ -131,7 +160,13 @@ fn script_check(script: &str, cx: Cx<'_>) -> Result<(), CommandRefusal> {
 
 fn compound_list(list: &CompoundList, cx: Cx<'_>) -> Result<(), CommandRefusal> {
     for item in &list.0 {
-        and_or_list(&item.0, cx)?;
+        // `cmd &` detaches the command: the script does not wait on it, and
+        // everything it nests runs detached as well.
+        let item_cx = Cx {
+            backgrounded: cx.backgrounded || matches!(item.1, ast::SeparatorOperator::Async),
+            ..cx
+        };
+        and_or_list(&item.0, item_cx)?;
     }
     Ok(())
 }
@@ -314,6 +349,8 @@ fn simple_command(simple: &SimpleCommand, cx: Cx<'_>) -> Result<Vec<String>, Com
     let word_cx = Cx {
         depth: cx.depth,
         lookups: &in_words,
+        on_argv: cx.on_argv,
+        backgrounded: cx.backgrounded,
     };
     let prefix = simple.prefix.iter().flat_map(|prefix| &prefix.0);
     let suffix = simple.suffix.iter().flat_map(|suffix| &suffix.0);
@@ -513,7 +550,7 @@ fn parameter_text(expansion: &ParameterExpr, cx: Cx<'_>) -> Result<(), CommandRe
 const KILLERS: &[&str] = &["pkill", "killall", "killall5", "skill"];
 
 /// Lower-cased file name of `program` without a Windows executable suffix.
-fn file_name(program: &str) -> String {
+pub fn file_name(program: &str) -> String {
     let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
     let mut name = name.to_ascii_lowercase();
     if let Some(extension_at) = name.len().checked_sub(".exe".len())
@@ -536,6 +573,7 @@ fn invoked(
     let Some((program, arguments)) = argv.split_first() else {
         return Ok(());
     };
+    (cx.on_argv)(argv, cx.backgrounded);
     let name = file_name(program);
     if kills_by_name(&name, arguments) {
         return Err(CommandRefusal::KillByName { program: name });

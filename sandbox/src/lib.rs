@@ -59,6 +59,7 @@ mod kill_guard;
 mod naming;
 mod output;
 mod output_compress;
+pub(crate) mod poll_guard;
 mod process_tree;
 mod shell_session;
 mod stdin_watch;
