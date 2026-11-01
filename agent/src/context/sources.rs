@@ -141,7 +141,7 @@ impl ContextSource for TasksDocument {
         }
 
         let missing = match &docs.tasks_md {
-            Some(content) if working_docs::has_unchecked_markdown_tasks(content) => false,
+            Some(content) if working_docs::has_unblocked_markdown_tasks(content) => false,
             Some(_) => {
                 self.stale_turns = 0;
                 self.alerted = false;
@@ -169,7 +169,7 @@ impl ContextSource for TasksDocument {
 
     async fn on_final_turn(&mut self) -> Option<Block> {
         let docs = working_docs::read_snapshot(&self.sandbox_dir).await;
-        if !docs.has_unchecked_items() {
+        if !docs.has_unblocked_items() {
             return None;
         }
         Some(block(
@@ -441,6 +441,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_items_hold_no_turn_open() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(
+            root.path(),
+            "- [ ] ship it BLOCKING req-123\n- [ ] pick a topic BLOCKING waiting on the user\n",
+        )
+        .await;
+        let mut source = TasksDocument::new(root.path(), 4);
+        assert!(source.on_final_turn().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_bare_blocking_word_is_not_a_mark() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(root.path(), "- [ ] work BLOCKING\n").await;
+        let mut source = TasksDocument::new(root.path(), 4);
+        assert!(source.on_final_turn().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_blocked_item_among_runnable_ones_still_objects() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(root.path(), "- [ ] work\n- [ ] ship it BLOCKING req-123\n").await;
+        let mut source = TasksDocument::new(root.path(), 4);
+        assert!(source.on_final_turn().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn blocked_items_are_never_stale() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(root.path(), "- [ ] ship it BLOCKING req-123\n").await;
+        let mut source = TasksDocument::new(root.path(), 1);
+
+        assert!(source.on_tool_turn_end().await.is_none());
+        for _ in 0..5 {
+            assert!(source.on_tool_turn_end().await.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn the_continue_alert_holds_work_an_open_question_blocks() {
         let root = tempfile::tempdir().expect("tempdir");
         write_tasks(root.path(), "- [ ] work\n").await;
@@ -448,7 +488,7 @@ mod tests {
         let alert = source.on_final_turn().await.expect("alert fires");
         assert_eq!(
             alert.content(),
-            "<system_reminder>tasks.md still has unchecked items. Continue with the items no open ask_user question blocks. Work that an open question blocks waits for its answer.</system_reminder>"
+            "<system_reminder>tasks.md still has unblocked unchecked items; continue with them. An item waiting on an open ask_user answer — or on anything else the run cannot resolve — is marked BLOCKING <request_id or reason>: blocked items wait for what they name instead of holding the turn open.</system_reminder>"
         );
     }
 }

@@ -16,12 +16,13 @@ pub struct WorkingDocsSnapshot {
 }
 
 impl WorkingDocsSnapshot {
-    /// Returns true when `tasks.md` has unchecked markdown tasks.
+    /// Returns true when `tasks.md` holds unchecked items the run can still
+    /// progress on: not marked `BLOCKING <what>`.
     #[must_use]
-    pub fn has_unchecked_items(&self) -> bool {
+    pub fn has_unblocked_items(&self) -> bool {
         self.tasks_md
             .as_deref()
-            .is_some_and(has_unchecked_markdown_tasks)
+            .is_some_and(has_unblocked_markdown_tasks)
     }
 }
 
@@ -76,16 +77,32 @@ pub fn tasks_md_diff(
     Some(lines.join("\n"))
 }
 
-/// Detects unfinished markdown checklist items (`- [ ]`).
+/// Detects unchecked markdown checklist items (`- [ ]`) a run can still
+/// progress on.
+///
+/// An item whose text carries a `BLOCKING` mark followed by what it waits
+/// on — `BLOCKING <request_id>` while it waits on an open `ask_user`
+/// question, or free text while it waits on anything the run cannot
+/// resolve — is unfinished but not runnable, so it holds no turn open.
 #[must_use]
-pub fn has_unchecked_markdown_tasks(content: &str) -> bool {
-    content.lines().any(is_unchecked_todo_line)
+pub fn has_unblocked_markdown_tasks(content: &str) -> bool {
+    content
+        .lines()
+        .any(|line| is_unchecked_todo_line(line) && !is_blocked_task_line(line))
 }
 
 fn is_unchecked_todo_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     (trimmed.starts_with("- [ ]") || trimmed.starts_with("* [ ]"))
         || (trimmed.starts_with("- [	]") || trimmed.starts_with("* [	]"))
+}
+
+/// A task line is blocked when a `BLOCKING` token is followed by what it
+/// waits on — a request id or a free-text reason. A trailing `BLOCKING`
+/// alone is not a mark.
+fn is_blocked_task_line(line: &str) -> bool {
+    let mut tokens = line.split_whitespace();
+    tokens.any(|token| token == "BLOCKING") && tokens.next().is_some()
 }
 
 async fn read_file_if_exists(path: &Path) -> Option<String> {

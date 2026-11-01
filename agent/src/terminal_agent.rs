@@ -1311,7 +1311,7 @@ mod tests {
         }
         .render()
         .unwrap();
-        assert!(prompt.contains("<continuation>\nIf work is blocked by a missing user decision, use `ask_user`. Work that an open question blocks waits for its answer; continue only with work the question does not block.\nDo not stop while unblocked checklist items remain incomplete.\n</continuation>"));
+        assert!(prompt.contains("<continuation>\nIf work is blocked by a missing user decision, use `ask_user`. An item waiting on an open question — or on anything else the run cannot resolve — is marked `BLOCKING <request_id or reason>` in tasks.md; blocked items wait instead of holding the turn.\nDo not stop while unblocked checklist items remain incomplete.\n</continuation>"));
         assert!(!prompt.contains("use `ask_user` and continue"));
     }
 
