@@ -134,6 +134,9 @@ enum StateCommand {
         error: String,
         output_path: Option<PathBuf>,
     },
+    RecordFileReads {
+        reads: Vec<(PathBuf, FileFingerprint)>,
+    },
 }
 
 /// Registry queries and job-control requests, each answered on `reply`.
@@ -186,6 +189,10 @@ enum JobRequest {
         max_bytes: usize,
         reply: Sender<Result<TerminalDelta, String>>,
     },
+    FileReadsUnchanged {
+        reads: Vec<(PathBuf, FileFingerprint)>,
+        reply: Sender<bool>,
+    },
     TerminalStreamsClosed {
         pid: u32,
         reply: Sender<bool>,
@@ -197,6 +204,10 @@ enum JobRequest {
         reply: Sender<bool>,
     },
 }
+
+/// A file's `(len, modified)` stamp a script read returned with: two reads
+/// whose fingerprints match deliver the same bytes.
+pub type FileFingerprint = (u64, Option<std::time::SystemTime>);
 
 /// How the registry's caller kills a job: the kill itself runs outside the
 /// registry's state actor, which would otherwise stall every other job's
@@ -469,6 +480,26 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
+    /// Whether every `reads` entry matches what the last read of that path
+    /// returned — the fingerprint recorded by [`Self::record_file_reads`].
+    /// `false` for an empty list or a path never recorded.
+    pub async fn file_reads_unchanged(&self, reads: Vec<(PathBuf, FileFingerprint)>) -> bool {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::FileReadsUnchanged {
+            reads,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Records what a just-run script's file reads returned with; the next
+    /// [`Self::file_reads_unchanged`] compares against these.
+    pub async fn record_file_reads(&self, reads: Vec<(PathBuf, FileFingerprint)>) {
+        self.send_command(StateCommand::RecordFileReads { reads })
+            .await;
+    }
+
     /// Marks a job as completed.
     pub async fn complete(&self, pid: u32, exit_code: i32, output_path: Option<PathBuf>) {
         self.send_command(StateCommand::Complete {
@@ -630,21 +661,41 @@ impl JobRegistry {
     }
 }
 
+/// Per-session read tracking behind the unchanged-read refusal: what each
+/// task's last `terminal_read` returned with, and each file's fingerprint
+/// from its last read.
+#[derive(Default)]
+struct ReadTracker {
+    /// Task id → the `(cursor, total_bytes, status)` its last read returned.
+    delta_reads: HashMap<String, (usize, usize, JobStatus)>,
+    /// Path → the fingerprint its last script read carried.
+    file_reads: HashMap<PathBuf, FileFingerprint>,
+}
+
 impl JobRegistryService {
     /// Runs the registry service loop until all senders are dropped.
     pub async fn serve(self) {
         let mut jobs: HashMap<u32, JobState> = HashMap::new();
+        let mut reads = ReadTracker::default();
 
         while let Ok(command) = self.rx.recv().await {
             match command {
-                JobCommand::State(command) => handle_state_command(&mut jobs, command).await,
-                JobCommand::Request(request) => handle_job_request(&mut jobs, request).await,
+                JobCommand::State(command) => {
+                    handle_state_command(&mut jobs, &mut reads, command).await;
+                }
+                JobCommand::Request(request) => {
+                    handle_job_request(&mut jobs, &mut reads, request).await;
+                }
             }
         }
     }
 }
 
-async fn handle_state_command(jobs: &mut HashMap<u32, JobState>, command: StateCommand) {
+async fn handle_state_command(
+    jobs: &mut HashMap<u32, JobState>,
+    reads: &mut ReadTracker,
+    command: StateCommand,
+) {
     match command {
         StateCommand::Register {
             pid,
@@ -686,10 +737,17 @@ async fn handle_state_command(jobs: &mut HashMap<u32, JobState>, command: StateC
             error,
             output_path,
         } => fail_job(jobs, pid, error, output_path).await,
+        StateCommand::RecordFileReads { reads: new_reads } => {
+            reads.file_reads.extend(new_reads);
+        }
     }
 }
 
-async fn handle_job_request(jobs: &mut HashMap<u32, JobState>, request: JobRequest) {
+async fn handle_job_request(
+    jobs: &mut HashMap<u32, JobState>,
+    reads: &mut ReadTracker,
+    request: JobRequest,
+) {
     match request {
         JobRequest::List { reply } => {
             let items = jobs.values().map(|state| state.info.clone()).collect();
@@ -752,8 +810,29 @@ async fn handle_job_request(jobs: &mut HashMap<u32, JobState>, request: JobReque
             max_bytes,
             reply,
         } => {
-            let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes);
+            let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes).and_then(|delta| {
+                // A read returning what the last read of this task
+                // returned is a poll: nothing new arrived. Refuse it so
+                // the agent waits for the completion event instead.
+                let returned = (delta.cursor, delta.total_bytes, delta.status.clone());
+                if reads.delta_reads.get(&task_id) == Some(&returned) {
+                    Err(crate::poll_guard::unchanged_task_read(&task_id))
+                } else {
+                    reads.delta_reads.insert(task_id, returned);
+                    Ok(delta)
+                }
+            });
             let _ = reply.send(result).await;
+        }
+        JobRequest::FileReadsUnchanged {
+            reads: paths,
+            reply,
+        } => {
+            let unchanged = !paths.is_empty()
+                && paths
+                    .iter()
+                    .all(|(path, stamp)| reads.file_reads.get(path) == Some(stamp));
+            let _ = reply.send(unchanged).await;
         }
         JobRequest::TerminalStreamsClosed { pid, reply } => {
             let closed = jobs
@@ -1248,6 +1327,59 @@ mod tests {
     use executor_core::Task;
     use executor_core::tokio::TokioGlobal;
     use tempfile::tempdir;
+
+    fn spawn_registry() -> JobRegistry {
+        let (registry, service) = job_registry_channel();
+        TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
+        registry
+    }
+
+    #[tokio::test]
+    async fn unchanged_terminal_read_is_refused_then_succeeds_after_new_output() {
+        let registry = spawn_registry();
+        registry
+            .register(7, "task-a", "exec-a", "run", TerminalMode::Sandboxed, None)
+            .await;
+        registry.append_stdout(7, b"one".to_vec()).await;
+
+        let first = registry
+            .terminal_read("task-a", 0, 1024)
+            .await
+            .expect("first read succeeds");
+        let second = registry.terminal_read("task-a", first.cursor, 1024).await;
+        assert!(
+            second.is_err(),
+            "an unchanged repeat read must be refused: {second:?}"
+        );
+
+        registry.append_stdout(7, b"two".to_vec()).await;
+        let third = registry
+            .terminal_read("task-a", first.cursor, 1024)
+            .await
+            .expect("read succeeds once output changed");
+        assert_eq!(third.bytes, b"two");
+    }
+
+    #[tokio::test]
+    async fn file_reads_track_unchanged_fingerprints() {
+        let registry = spawn_registry();
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("log.txt");
+        std::fs::write(&path, "v1").expect("write");
+        let meta = std::fs::metadata(&path).expect("metadata");
+        let reads = vec![(path.clone(), (meta.len(), meta.modified().ok()))];
+
+        assert!(!registry.file_reads_unchanged(reads.clone()).await);
+        registry.record_file_reads(reads.clone()).await;
+        assert!(registry.file_reads_unchanged(reads).await);
+
+        std::fs::write(&path, "v1-longer").expect("rewrite");
+        let meta = std::fs::metadata(&path).expect("metadata");
+        let changed = vec![(path, (meta.len(), meta.modified().ok()))];
+        assert!(!registry.file_reads_unchanged(changed).await);
+    }
 
     #[tokio::test]
     async fn test_job_registry_lifecycle() {
