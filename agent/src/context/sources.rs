@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use askama::Template;
 
 use super::source::{Block, ContextSource};
-use crate::working_docs::{self, WorkingDocsSnapshot};
+use crate::working_docs::{self, AnyTaskBlockerResolver, WorkingDocsSnapshot};
 
 #[derive(Template)]
 #[template(path = "tasks_document.txt", escape = "none")]
@@ -89,6 +89,8 @@ pub struct TasksDocument {
     stale_turns: usize,
     /// Whether the current stale episode already alerted.
     alerted: bool,
+    /// Resolves `BLOCKING` marks when the host can say what still waits.
+    blocker_resolver: Option<AnyTaskBlockerResolver>,
 }
 
 impl TasksDocument {
@@ -103,7 +105,17 @@ impl TasksDocument {
             seen: false,
             stale_turns: 0,
             alerted: false,
+            blocker_resolver: None,
         }
+    }
+
+    /// Resolves `BLOCKING` mark payloads through `resolver`: a mark it
+    /// reports dead no longer holds the item. Without it every mark is
+    /// trusted.
+    #[must_use]
+    pub fn with_blocker_resolver(mut self, resolver: AnyTaskBlockerResolver) -> Self {
+        self.blocker_resolver = Some(resolver);
+        self
     }
 }
 
@@ -141,11 +153,19 @@ impl ContextSource for TasksDocument {
         }
 
         let missing = match &docs.tasks_md {
-            Some(content) if working_docs::has_unblocked_markdown_tasks(content) => false,
-            Some(_) => {
-                self.stale_turns = 0;
-                self.alerted = false;
-                return None;
+            Some(content) => {
+                if working_docs::has_unblocked_markdown_tasks(
+                    content,
+                    self.blocker_resolver.as_ref(),
+                )
+                .await
+                {
+                    false
+                } else {
+                    self.stale_turns = 0;
+                    self.alerted = false;
+                    return None;
+                }
             }
             None => true,
         };
@@ -169,7 +189,10 @@ impl ContextSource for TasksDocument {
 
     async fn on_final_turn(&mut self) -> Option<Block> {
         let docs = working_docs::read_snapshot(&self.sandbox_dir).await;
-        if !docs.has_unblocked_items() {
+        if !docs
+            .has_unblocked_items(self.blocker_resolver.as_ref())
+            .await
+        {
             return None;
         }
         Some(block(
@@ -480,6 +503,48 @@ mod tests {
         }
     }
 
+    struct TestResolver;
+    impl crate::working_docs::TaskBlockerResolver for TestResolver {
+        fn is_open(&self, mark: &str) -> impl std::future::Future<Output = bool> + Send {
+            // Mirrors a host resolver: only issued-and-still-open marks
+            // hold; unknown payloads are free text and trusted.
+            std::future::ready(!matches!(mark, "req-answered" | "req-withdrawn"))
+        }
+    }
+
+    fn resolved() -> AnyTaskBlockerResolver {
+        AnyTaskBlockerResolver::new(TestResolver)
+    }
+
+    #[tokio::test]
+    async fn a_dead_mark_leaves_the_item_runnable() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(root.path(), "- [ ] pick a db BLOCKING req-answered\n").await;
+        let mut source = TasksDocument::new(root.path(), 4).with_blocker_resolver(resolved());
+        assert!(source.on_final_turn().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_live_mark_and_free_text_still_hold() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(
+            root.path(),
+            "- [ ] pick a db BLOCKING req-open\n- [ ] write poem BLOCKING waiting on the user\n",
+        )
+        .await;
+        let mut source = TasksDocument::new(root.path(), 4).with_blocker_resolver(resolved());
+        assert!(source.on_final_turn().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dead_mark_counts_toward_staleness() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(root.path(), "- [ ] pick a db BLOCKING req-withdrawn\n").await;
+        let mut source = TasksDocument::new(root.path(), 1).with_blocker_resolver(resolved());
+        assert!(source.on_tool_turn_end().await.is_none());
+        assert!(source.on_tool_turn_end().await.is_some());
+    }
+
     #[tokio::test]
     async fn the_continue_alert_holds_work_an_open_question_blocks() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -488,7 +553,7 @@ mod tests {
         let alert = source.on_final_turn().await.expect("alert fires");
         assert_eq!(
             alert.content(),
-            "<system_reminder>tasks.md still has unblocked unchecked items; continue with them. An item waiting on an open ask_user answer — or on anything else the run cannot resolve — is marked BLOCKING <request_id or reason>: blocked items wait for what they name instead of holding the turn open.</system_reminder>"
+            "<system_reminder>tasks.md still has unblocked unchecked items; continue with them. An item waiting on an open ask_user answer — or on anything else the run cannot resolve — is marked BLOCKING <request_id or reason>: blocked items wait for what they name instead of holding the turn open. A mark naming a request that is no longer open does not hold.</system_reminder>"
         );
     }
 }
