@@ -187,6 +187,9 @@ enum JobRequest {
         task_id: String,
         cursor: usize,
         max_bytes: usize,
+        /// Whether this read is a model read tracked by the
+        /// unchanged-read refusal; a monitor pump's reads are not.
+        tracked: bool,
         reply: Sender<Result<TerminalDelta, String>>,
     },
     FileReadsUnchanged {
@@ -474,6 +477,31 @@ impl JobRegistry {
             task_id: task_id.to_string(),
             cursor,
             max_bytes,
+            tracked: true,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Returns terminal output added since the provided cursor, without
+    /// touching the unchanged-read tracker: the caller is the `monitor`
+    /// pump, whose own cadence is not the model polling.
+    ///
+    /// # Errors
+    /// Returns an error when the task id is unknown.
+    pub async fn monitor_read(
+        &self,
+        task_id: &str,
+        cursor: usize,
+        max_bytes: usize,
+    ) -> Result<TerminalDelta, String> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::ReadTerminalDelta {
+            task_id: task_id.to_string(),
+            cursor,
+            max_bytes,
+            tracked: false,
             reply: reply_tx,
         })
         .await;
@@ -808,20 +836,11 @@ async fn handle_job_request(
             task_id,
             cursor,
             max_bytes,
+            tracked,
             reply,
         } => {
-            let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes).and_then(|delta| {
-                // A read returning what the last read of this task
-                // returned is a poll: nothing new arrived. Refuse it so
-                // the agent waits for the completion event instead.
-                let returned = (delta.cursor, delta.total_bytes, delta.status.clone());
-                if reads.delta_reads.get(&task_id) == Some(&returned) {
-                    Err(crate::poll_guard::unchanged_task_read(&task_id))
-                } else {
-                    reads.delta_reads.insert(task_id, returned);
-                    Ok(delta)
-                }
-            });
+            let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes)
+                .and_then(|delta| tracked_delta(reads, &task_id, delta, tracked));
             let _ = reply.send(result).await;
         }
         JobRequest::FileReadsUnchanged {
@@ -1084,6 +1103,28 @@ async fn redirect_task_output(
         return Err(format!("unknown task_id: {task_id}"));
     };
     start_output_redirect(job, output_path).await
+}
+
+/// A read returning what the last read of this task returned is a poll:
+/// nothing new arrived. Refuse it so the agent waits for the completion
+/// event instead. Untracked reads — the `monitor` pump's own cadence —
+/// neither refuse nor update the tracker.
+fn tracked_delta(
+    reads: &mut ReadTracker,
+    task_id: &str,
+    delta: TerminalDelta,
+    tracked: bool,
+) -> Result<TerminalDelta, String> {
+    let returned = (delta.cursor, delta.total_bytes, delta.status.clone());
+    if !tracked {
+        return Ok(delta);
+    }
+    if reads.delta_reads.get(task_id) == Some(&returned) {
+        Err(crate::poll_guard::unchanged_task_read(task_id))
+    } else {
+        reads.delta_reads.insert(task_id.to_string(), returned);
+        Ok(delta)
+    }
 }
 
 fn read_terminal_delta(

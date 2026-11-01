@@ -56,6 +56,7 @@ mod bollard_exec;
 mod command;
 mod container;
 mod kill_guard;
+pub mod monitor;
 mod naming;
 mod output;
 mod output_compress;
@@ -110,6 +111,10 @@ pub use jobserver::{
     CommandFifo, JobBroker, JobBrokerService, JobPool, JobserverError, job_broker_channel,
 };
 pub use kill_guard::CommandRefusal;
+pub use monitor::{
+    MonitorArgs, MonitorEnd, MonitorEnded, MonitorIncrement, MonitorLanguage, MonitorRefusal,
+    MonitorSource, MonitorStalled, MonitorTool,
+};
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
 };

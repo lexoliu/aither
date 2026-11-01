@@ -31,6 +31,7 @@ async-fs = "2"
 dunce = { version = "1.0.5", default-features = false }
 async-process = "2"
 async-io = "2"
+regex = "1"
 bollard = "0.21"
 
 # Serialization

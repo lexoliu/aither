@@ -44,8 +44,8 @@ use sha2::{Digest, Sha256};
 
 use aither_sandbox::{
     BackgroundTaskEvent, BackgroundTaskReceiver, DirectoryResetReason, JobAlert, JobProcess,
-    JobRegistry, PermissionEvent, PermissionEventReceiver, PermissionEventStage, TerminalArgs,
-    TerminalExecutionMode, TerminalMode,
+    JobRegistry, MonitorEnd, PermissionEvent, PermissionEventReceiver, PermissionEventStage,
+    TerminalArgs, TerminalExecutionMode, TerminalMode,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -406,6 +406,34 @@ enum JobAlertText<'a> {
         dir: String,
         reason: DirectoryResetReason,
     },
+    /// A monitor delivered new output lines.
+    MonitorIncrement {
+        task_id: &'a str,
+        lines: &'a [String],
+    },
+    /// A monitor saw no output for its stall window.
+    MonitorStalled { task_id: &'a str, stall_secs: u64 },
+    /// A monitor ended.
+    MonitorEnded {
+        task_id: &'a str,
+        end: MonitorEndText<'a>,
+    },
+}
+
+/// How a monitor ended, as the alert text reports it.
+enum MonitorEndText<'a> {
+    /// The watched command exited.
+    Exited { exit_code: i32 },
+    /// A `stop_on` line matched.
+    StopMatched { line: &'a str },
+    /// The monitor's `timeout_secs` passed.
+    TimedOut,
+    /// The watched job was killed.
+    Killed,
+    /// The watched job failed.
+    Failed { error: &'a str },
+    /// The job left the registry with no status.
+    Lost,
 }
 
 fn job_alert_text(alert: &JobAlertText<'_>) -> String {
@@ -1569,6 +1597,40 @@ where
                     error: &job.error,
                 }));
                 false
+            }
+            JobAlert::MonitorIncrement(increment) => {
+                tracing::info!(task_id = %increment.task_id, lines = increment.lines.len(), "monitor increment delivered");
+                self.push_system_alert(job_alert_text(&JobAlertText::MonitorIncrement {
+                    task_id: &increment.task_id,
+                    lines: &increment.lines,
+                }));
+                true
+            }
+            JobAlert::MonitorStalled(stalled) => {
+                tracing::info!(task_id = %stalled.task_id, "monitor reports a stall");
+                self.push_system_alert(job_alert_text(&JobAlertText::MonitorStalled {
+                    task_id: &stalled.task_id,
+                    stall_secs: stalled.stall_secs,
+                }));
+                true
+            }
+            JobAlert::MonitorEnded(ended) => {
+                tracing::info!(task_id = %ended.task_id, "monitor ended");
+                let end = match &ended.end {
+                    MonitorEnd::Exited { exit_code } => MonitorEndText::Exited {
+                        exit_code: *exit_code,
+                    },
+                    MonitorEnd::StopMatched { line } => MonitorEndText::StopMatched { line },
+                    MonitorEnd::TimedOut => MonitorEndText::TimedOut,
+                    MonitorEnd::Killed => MonitorEndText::Killed,
+                    MonitorEnd::Failed { error } => MonitorEndText::Failed { error },
+                    MonitorEnd::Lost => MonitorEndText::Lost,
+                };
+                self.push_system_alert(job_alert_text(&JobAlertText::MonitorEnded {
+                    task_id: &ended.task_id,
+                    end,
+                }));
+                true
             }
         }
     }

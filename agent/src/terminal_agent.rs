@@ -987,7 +987,9 @@ where
                     .expect("failed to render knowledge_and_time template"),
             )
         };
-        let inner = inner.terminal(terminal_tool);
+        let inner = inner
+            .terminal(terminal_tool.clone())
+            .tool(aither_sandbox::MonitorTool::new(terminal_tool));
         #[cfg(feature = "skills")]
         let inner = if let Some(registry) = self.skill_registry {
             inner.skill_registry(Arc::new(registry))
