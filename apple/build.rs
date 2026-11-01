@@ -159,18 +159,11 @@ fn check_deployment(sdk_name: &str) {
 
 /// Maps a Rust target triple to (SDK name, Swift target triple), or `None`
 /// for platforms where the provider is unavailable.
-///
-/// Note `x86_64-apple-ios` *is* the Intel iOS simulator target; the
-/// `-sim`-suffixed triple only exists for aarch64.
 fn apple_target(target: &str) -> Option<(&'static str, String)> {
     let min = DEPLOYMENT_TARGET;
     match target {
         "aarch64-apple-darwin" => Some(("macosx", format!("arm64-apple-macos{min}"))),
         "aarch64-apple-ios" => Some(("iphoneos", format!("arm64-apple-ios{min}"))),
-        "x86_64-apple-ios" => Some((
-            "iphonesimulator",
-            format!("x86_64-apple-ios{min}-simulator"),
-        )),
         "aarch64-apple-ios-sim" => {
             Some(("iphonesimulator", format!("arm64-apple-ios{min}-simulator")))
         }
@@ -225,14 +218,9 @@ fn find_swiftinterface(sdk_path: &str, target: &str) -> Option<PathBuf> {
     let (arch, platform) = match target {
         "aarch64-apple-darwin" => ("arm64e", "apple-macos"),
         "aarch64-apple-ios" => ("arm64e", "apple-ios"),
-        "x86_64-apple-ios" | "aarch64-apple-ios-sim" => {
+        "aarch64-apple-ios-sim" => {
             // Simulator slices live under the "-simulator" swiftinterface.
-            let arch = if target.starts_with("x86_64") {
-                "x86_64"
-            } else {
-                "arm64"
-            };
-            return exact_interface(sdk_path, arch, "apple-ios-simulator");
+            return exact_interface(sdk_path, "arm64", "apple-ios-simulator");
         }
         _ => return None,
     };
