@@ -76,7 +76,7 @@ impl ShellSessionRegistry {
                 let bundle = distribution
                     .load(&info.target, &cache_root.join("artifacts"))
                     .await?;
-                let tools = bundle.verify_container_mount(&transport).await?;
+                let tools = bundle.verify_container_image(&transport).await?;
                 Ok::<_, ToolRuntimeError>(Some(PreparedHome::Container {
                     container_id: runtime.container_id().into(),
                     tools,

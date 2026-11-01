@@ -8,7 +8,9 @@ use futures_lite::io::AsyncWriteExt;
 
 use crate::ContainerPath;
 use crate::shell_session::{ContainerShellRuntime, SshServer};
-use crate::tool_runtime::{PreparedTools, ToolBundle, ToolRuntimeError, ToolTarget};
+use crate::tool_runtime::{
+    ImageToolDefect, PreparedTools, ToolBundle, ToolRuntimeError, ToolTarget,
+};
 
 /// Trusted initialization transport, separate from agent command execution.
 pub trait ToolTransport: Send + Sync {
@@ -179,12 +181,6 @@ struct ToolInstallTemplate<'a> {
     probe_only: bool,
 }
 
-/// A container mount point as a POSIX path; `procfs` parses it into a host
-/// [`PathBuf`], whose components follow host separator rules.
-fn mount_point(mount: &procfs_core::process::MountInfo) -> &typed_path::UnixPath {
-    typed_path::UnixPath::new(mount.mount_point.as_os_str().as_encoded_bytes())
-}
-
 #[derive(Template)]
 #[template(path = "tool_verify.sh", escape = "none")]
 struct ToolVerifyTemplate<'a> {
@@ -192,25 +188,40 @@ struct ToolVerifyTemplate<'a> {
     tools: Vec<InstallTool>,
 }
 
+/// The defect `tool_verify.sh` reports on stderr, or `None` for a failure it
+/// did not diagnose (a probe command error, for example).
+fn image_defect(stderr: &str) -> Option<ImageToolDefect> {
+    stderr.lines().find_map(|line| {
+        line.strip_prefix("aither-image:")
+            .and_then(|marker| match marker.split_once(':') {
+                None => {
+                    (marker == "missing-directory").then_some(ImageToolDefect::MissingDirectory)
+                }
+                Some(("missing-binary", command)) => {
+                    Some(ImageToolDefect::MissingBinary(command.to_owned()))
+                }
+                Some(("sha256-mismatch", command)) => {
+                    Some(ImageToolDefect::Sha256Mismatch(command.to_owned()))
+                }
+                _ => None,
+            })
+    })
+}
+
 impl ToolBundle {
-    pub(crate) async fn verify_container_mount(
+    /// Verifies the baseline tools baked into the container image at
+    /// [`Self::container_directory`]: every executable present with its pinned
+    /// SHA-256 and reporting its pinned version.
+    ///
+    /// The image is expected to contain a directory produced by
+    /// [`Self::stage`]; a missing or mismatched directory fails with
+    /// [`ToolRuntimeError::InvalidImageTools`], never a fallback to a host
+    /// download or mount.
+    pub(crate) async fn verify_container_image(
         &self,
         transport: &impl ToolTransport,
     ) -> Result<PreparedTools<ContainerPath>, ToolRuntimeError> {
-        use procfs_core::FromRead;
         let directory = self.container_directory()?;
-        let output = successful_output(transport.run("cat /proc/self/mountinfo", None).await?)?;
-        let mounts = procfs_core::process::MountInfos::from_read(output.as_bytes())?;
-        let tools = typed_path::UnixPath::new(directory.as_str());
-        if !mounts
-            .iter()
-            .any(|mount| mount_point(mount) == tools && mount.mount_options.contains_key("ro"))
-            || mounts.iter().any(|mount| {
-                mount_point(mount).starts_with(tools) && !mount.mount_options.contains_key("ro")
-            })
-        {
-            return Err(ToolRuntimeError::MissingReadonlyMount(directory));
-        }
         let script = ToolVerifyTemplate {
             directory: shell_words::quote(directory.as_str()),
             tools: self
@@ -223,7 +234,18 @@ impl ToolBundle {
                 .collect(),
         }
         .render()?;
-        let output = successful_output(transport.run(&script, None).await?)?;
+        let output = transport.run(&script, None).await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if let Some(defect) = image_defect(&stderr) {
+                return Err(ToolRuntimeError::InvalidImageTools { directory, defect });
+            }
+            return Err(ToolRuntimeError::InitializationCommand {
+                status: output.status.code(),
+                stderr: stderr.into_owned(),
+            });
+        }
+        let output = String::from_utf8(output.stdout)?;
         let catalog = self.catalog();
         catalog.verify_versions(&output)?;
         Ok(PreparedTools {
@@ -314,86 +336,131 @@ fn successful_output(output: Output) -> Result<String, ToolRuntimeError> {
 mod tests {
     use super::*;
 
-    #[derive(Template)]
-    #[template(path = "test_tool_mountinfo.txt", escape = "none")]
-    struct MountInfoTemplate<'a> {
-        directory: &'a str,
-        options: &'a str,
-        nested: bool,
-        nested_options: &'a str,
+    /// macOS lacks `sha256sum`; `shasum -a 256` prints the same `<hash>  <file>` format.
+    const SHA256SUM: &str = if cfg!(target_os = "macos") {
+        "shasum -a 256"
+    } else {
+        "sha256sum"
+    };
+
+    /// The `heel run` wrapper the verify script puts around each version probe.
+    /// Host runs drop it: the staged binaries are the host's own scripts.
+    const HEEL_RUN_PREFIX: &str =
+        "heel run --network deny --working-dir \"$scratch\" --executable \"$directory/bin\" -- ";
+
+    /// Runs the verify script on the host as a container would inside the
+    /// image: the image's `/opt/aither/tools` root is replaced by a directory
+    /// populated via [`ToolBundle::stage`], so the real SHA-256 and version
+    /// checks run against the staged bytes.
+    struct StagedImageTransport {
+        /// Host directory standing in for the image's `/opt/aither/tools`.
+        image_root: PathBuf,
     }
 
-    struct MountTransport {
-        mountinfo: String,
-    }
-
-    impl ToolTransport for MountTransport {
-        fn run(
+    impl ToolTransport for StagedImageTransport {
+        async fn run(
             &self,
             script: &str,
             input: Option<Vec<u8>>,
-        ) -> impl Future<Output = Result<Output, ToolRuntimeError>> + Send {
-            use std::os::unix::process::ExitStatusExt;
+        ) -> Result<Output, ToolRuntimeError> {
             assert!(input.is_none());
-            let stdout = if script == "cat /proc/self/mountinfo" {
-                self.mountinfo.as_bytes().to_vec()
-            } else {
-                assert!(script.contains("heel run --network deny"));
-                let mut versions = Vec::new();
-                for tool in crate::ManagedTool::ALL {
-                    versions.extend_from_slice(tool.command().as_bytes());
-                    versions.extend_from_slice(b" 1.0.0\0");
-                }
-                versions
-            };
-            std::future::ready(Ok(Output {
-                status: std::process::ExitStatus::from_raw(0),
-                stdout,
-                stderr: Vec::new(),
-            }))
+            let script = script
+                .replace("/opt/aither/tools", &self.image_root.to_string_lossy())
+                .replace(HEEL_RUN_PREFIX, "")
+                .replace("sha256sum", SHA256SUM);
+            let mut command = async_process::Command::new("sh");
+            command.args(["-c", &script]);
+            run_command(command, input).await
+        }
+    }
+
+    fn image_transport(root: &tempfile::TempDir) -> StagedImageTransport {
+        StagedImageTransport {
+            image_root: root.path().to_path_buf(),
         }
     }
 
     #[tokio::test]
-    async fn container_tools_require_readonly_mount_and_no_writable_descendants() {
+    async fn image_verification_accepts_a_staged_directory() {
+        let root = tempfile::tempdir().unwrap();
         let bundle = crate::tool_runtime::tests::bundle();
-        let directory = bundle.container_directory().unwrap();
-        for (options, nested, nested_options, accepted) in [
-            ("ro", false, "rw", true),
-            ("ro", true, "ro", true),
-            ("rw", false, "rw", false),
-            ("ro", true, "rw", false),
-        ] {
-            let transport = MountTransport {
-                mountinfo: MountInfoTemplate {
-                    directory: directory.as_str(),
-                    options,
-                    nested,
-                    nested_options,
-                }
-                .render()
-                .unwrap(),
-            };
-            let result = bundle.verify_container_mount(&transport).await;
-            if accepted {
+        bundle.stage(root.path()).await.unwrap();
+        let tools = bundle
+            .verify_container_image(&image_transport(&root))
+            .await
+            .unwrap();
+        assert_eq!(
+            tools.bin_dir().as_str(),
+            format!("{}/bin", bundle.container_directory().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn image_verification_names_a_missing_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = crate::tool_runtime::tests::bundle();
+        let staged = bundle.stage(root.path()).await.unwrap();
+        std::fs::remove_file(staged.join("bin").join("rg")).unwrap();
+        match bundle.verify_container_image(&image_transport(&root)).await {
+            Err(ToolRuntimeError::InvalidImageTools { directory, defect }) => {
                 assert_eq!(
-                    result.unwrap().bin_dir().as_str(),
-                    format!("{directory}/bin")
+                    directory.as_str(),
+                    bundle.container_directory().unwrap().as_str()
                 );
-            } else {
-                assert!(matches!(
-                    result,
-                    Err(ToolRuntimeError::MissingReadonlyMount(_))
-                ));
+                assert_eq!(defect, ImageToolDefect::MissingBinary("rg".to_owned()));
             }
+            other => panic!("expected InvalidImageTools, got {other:?}"),
         }
-        let missing = MountTransport {
-            mountinfo: String::new(),
-        };
-        assert!(matches!(
-            bundle.verify_container_mount(&missing).await,
-            Err(ToolRuntimeError::MissingReadonlyMount(_))
-        ));
+    }
+
+    #[tokio::test]
+    async fn image_verification_names_a_tampered_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = crate::tool_runtime::tests::bundle();
+        let staged = bundle.stage(root.path()).await.unwrap();
+        let binary = staged.join("bin").join("jq");
+        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions = std::fs::Permissions::from_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&binary, permissions).unwrap();
+        std::fs::write(&binary, b"tampered").unwrap();
+        match bundle.verify_container_image(&image_transport(&root)).await {
+            Err(ToolRuntimeError::InvalidImageTools { directory, defect }) => {
+                assert_eq!(
+                    directory.as_str(),
+                    bundle.container_directory().unwrap().as_str()
+                );
+                assert_eq!(defect, ImageToolDefect::Sha256Mismatch("jq".to_owned()));
+            }
+            other => panic!("expected InvalidImageTools, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn image_verification_names_an_absent_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = crate::tool_runtime::tests::bundle();
+        // A bundle pinned to another version stages under a different cache
+        // key, so this bundle's directory is absent even though tools exist.
+        crate::tool_runtime::tests::bundle_pinned("2.0.0")
+            .stage(root.path())
+            .await
+            .unwrap();
+        match bundle.verify_container_image(&image_transport(&root)).await {
+            Err(ToolRuntimeError::InvalidImageTools { directory, defect }) => {
+                assert_eq!(
+                    directory.as_str(),
+                    bundle.container_directory().unwrap().as_str()
+                );
+                assert_eq!(defect, ImageToolDefect::MissingDirectory);
+            }
+            other => panic!("expected InvalidImageTools, got {other:?}"),
+        }
     }
 
     struct LocalTransport;

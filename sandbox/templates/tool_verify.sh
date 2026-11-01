@@ -1,8 +1,9 @@
 set -eu
 directory={{ directory }}
-{% for tool in tools %}[ -f "$directory/bin/{{ tool.command }}" ] && [ ! -L "$directory/bin/{{ tool.command }}" ]
+if [ ! -d "$directory/bin" ]; then echo "aither-image:missing-directory" >&2; exit 1; fi
+{% for tool in tools %}if [ ! -f "$directory/bin/{{ tool.command }}" ] || [ -L "$directory/bin/{{ tool.command }}" ]; then echo "aither-image:missing-binary:{{ tool.command }}" >&2; exit 1; fi
 actual=$(sha256sum "$directory/bin/{{ tool.command }}")
-[ "${actual%% *}" = '{{ tool.sha256 }}' ]
+if [ "${actual%% *}" != '{{ tool.sha256 }}' ]; then echo "aither-image:sha256-mismatch:{{ tool.command }}" >&2; exit 1; fi
 {% endfor %}scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT HUP INT TERM
 set --

@@ -811,27 +811,28 @@ mod tests {
             .prepare_local(&fixture.directory.path().join("local"))
             .await
             .unwrap();
-        let (mount, container) = bundle
-            .prepare_container_mount(&fixture.directory.path().join("container"))
+        let staged = bundle
+            .stage(&fixture.directory.path().join("container"))
             .await
             .unwrap();
-        for tools in [&local, &container] {
-            let names = std::fs::read_dir(tools.bin_dir())
+        let staged_bin = staged.join("bin");
+        for bin_dir in [local.bin_dir().clone(), staged_bin.clone()] {
+            let names = std::fs::read_dir(&bin_dir)
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name())
                 .collect::<Vec<_>>();
             assert!(!names.iter().any(|name| name == "search"));
-            assert!(!prepared.path().starts_with(tools.bin_dir()));
-            assert!(
-                !tools
-                    .prepend_path(None)
-                    .unwrap()
-                    .to_string_lossy()
-                    .contains(prepared.path().parent().unwrap().to_str().unwrap())
-            );
+            assert!(!prepared.path().starts_with(&bin_dir));
         }
-        assert!(!mount.host_path.join("bin").join("search").exists());
-        assert!(!prepared.path().starts_with(mount.host_path));
+        assert!(
+            !local
+                .prepend_path(None)
+                .unwrap()
+                .to_string_lossy()
+                .contains(prepared.path().parent().unwrap().to_str().unwrap())
+        );
+        assert!(!staged_bin.join("search").exists());
+        assert!(!prepared.path().starts_with(&staged));
     }
 
     #[tokio::test]

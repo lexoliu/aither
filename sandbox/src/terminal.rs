@@ -8280,7 +8280,7 @@ mod tests {
     #[cfg(all(unix, aither_container_acceptance))]
     impl TestDockerContainer {
         /// Starts a container with `heel_bin` mounted at `/usr/local/bin/heel`,
-        /// the prepared tool bundle mounted read-only where production mounts
+        /// the staged tool bundle mounted read-only where the image carries
         /// it, and `host.docker.internal` resolving to the docker host gateway,
         /// and prepares the `/workspace` directory container executions run
         /// in. Returns `None` when docker cannot start the container.
@@ -8390,10 +8390,11 @@ mod tests {
     /// a real docker daemon and a Linux `heel` binary, which the dedicated CI
     /// job provides and the feature matrices do not. A missing daemon or
     /// binary fails the test — it is never skipped silently.
-    /// Starts the acceptance container with the test bundle staged and
-    /// mounted read-only as production mounts it, so the wrapped script runs
-    /// a prepared command from that mount. The returned directory holds the
-    /// staged bundle and must outlive the container.
+    /// Starts the acceptance container with the test bundle staged as an
+    /// image build stages it and mounted read-only where the image carries
+    /// it, so the wrapped script runs a prepared command from that directory.
+    /// The returned directory holds the staged bundle and must outlive the
+    /// container.
     #[cfg(all(unix, aither_container_acceptance))]
     async fn start_acceptance_container() -> (
         TestDockerContainer,
@@ -8412,10 +8413,18 @@ mod tests {
             .expect("container acceptance requires a Linux heel binary (set HEEL_BIN)");
         let bundle = crate::tool_runtime::tests::bundle();
         let tools_cache = tempfile::tempdir().expect("tool cache dir should be created");
-        let (tools_mount, _) = bundle
-            .prepare_container_mount(tools_cache.path())
+        let staged = bundle
+            .stage(tools_cache.path())
             .await
-            .expect("test bundle should stage for a container mount");
+            .expect("test bundle should stage for the image");
+        // The image carries tools baked in; the test mounts the staged
+        // directory where the image would contain it.
+        let tools_mount = crate::MountSpec::read_only(
+            &staged,
+            bundle
+                .container_directory()
+                .expect("bundle has a container dir"),
+        );
         let container = TestDockerContainer::start(&heel_bin, &tools_mount)
             .expect("container acceptance could not start ubuntu:24.04");
         (container, bundle, tools_cache)

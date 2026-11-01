@@ -541,7 +541,6 @@ dependencies = [
  "magika",
  "ort",
  "polling",
- "procfs-core",
  "regex",
  "rmp-serde",
  "rs-tree-sitter-languages",
@@ -6992,16 +6991,6 @@ checksum = "f676f11eb0b3e2ea0fbaee218fa6b806689e2297b8c8adc5bf73df465c4f6171"
 dependencies = [
  "libc",
  "winapi",
-]
-
-[[package]]
-name = "procfs-core"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6401bf7b6af22f78b563665d15a22e9aef27775b79b149a66ca022468a4e405"
-dependencies = [
- "bitflags 2.13.2",
- "hex",
 ]
 
 [[package]]

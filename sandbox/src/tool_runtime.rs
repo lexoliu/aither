@@ -426,32 +426,34 @@ impl ToolBundle {
         blocking::unblock(move || bundle.prepare_local_sync(&root)).await
     }
 
-    #[doc = "Prepares target executables on the coordinator and describes their read-only container mount."]
-    #[doc = "# Errors"]
-    #[doc = "Rejects invalid cached content, failed writes or invalid bundle identity."]
-    #[doc = "# Panics"]
-    #[doc = "Panics if the internal prepared directory lacks its required parent."]
-    pub async fn prepare_container_mount(
-        &self,
-        root: &Path,
-    ) -> Result<(crate::MountSpec, PreparedTools<PathBuf>), ToolRuntimeError> {
+    /// Stages the bundle's executables for its own target at `<root>/<cache key>/bin`.
+    ///
+    /// Unlike [`Self::prepare_local`], the bundle's target is not required to be
+    /// the host's: an image build stages e.g. Linux artifacts on any platform
+    /// and copies the returned directory to [`Self::container_directory`] inside
+    /// the image, producing exactly what the backend verifies.
+    ///
+    /// # Errors
+    /// Rejects invalid cached content, failed writes or invalid bundle identity.
+    ///
+    /// # Panics
+    /// Panics if the internal prepared directory lacks its required parent.
+    pub async fn stage(&self, root: &Path) -> Result<PathBuf, ToolRuntimeError> {
         let bundle = self.clone();
         let root = root.to_path_buf();
-        let source = blocking::unblock(move || bundle.prepare_local_sync(&root)).await?;
-        let destination = self.container_directory()?;
-        let host_directory = source
+        let prepared = blocking::unblock(move || bundle.prepare_local_sync(&root)).await?;
+        Ok(prepared
             .bin_dir
             .parent()
             .expect("prepared binaries have a parent directory")
-            .to_path_buf();
-        Ok((
-            crate::MountSpec::read_only(host_directory, destination),
-            source,
-        ))
+            .to_path_buf())
     }
 
-    /// Where the prepared runtime is mounted inside a container.
-    pub(crate) fn container_directory(&self) -> Result<ContainerPath, ToolRuntimeError> {
+    /// Where the staged runtime lives inside a container image: `/opt/aither/tools/<cache key>`.
+    ///
+    /// # Errors
+    /// Returns an error when the bundle identity cannot be hashed.
+    pub fn container_directory(&self) -> Result<ContainerPath, ToolRuntimeError> {
         Ok(ContainerPath::root()
             .join("opt/aither/tools")
             .join(self.cache_key()?))
@@ -489,7 +491,7 @@ impl ToolBundle {
         if let Some(prepared) = self.reusable(&destination)? {
             return Ok(prepared);
         }
-        let stage = self.stage(&root)?;
+        let stage = self.stage_scratch(&root)?;
         let discarded = if destination.try_exists()? {
             let discarded = tempfile::Builder::new()
                 .prefix(".invalid-")
@@ -537,7 +539,7 @@ impl ToolBundle {
     }
 
     /// Writes every executable into a fresh `.initializing-` directory under `root`.
-    fn stage(&self, root: &Path) -> Result<tempfile::TempDir, ToolRuntimeError> {
+    fn stage_scratch(&self, root: &Path) -> Result<tempfile::TempDir, ToolRuntimeError> {
         let stage = tempfile::Builder::new()
             .prefix(".initializing-")
             .tempdir_in(root)?;
@@ -925,12 +927,14 @@ pub enum ToolRuntimeError {
     /// The executable cannot run or does not report the pinned version.
     #[error("prepared tool failed its version probe: {0}")]
     VersionMismatch(String),
-    #[doc = "Container mount metadata could not be parsed."]
-    #[error(transparent)]
-    MountInfo(#[from] procfs_core::ProcError),
-    #[doc = "The tools directory is not protected by a read-only container mount."]
-    #[error("managed tools require a read-only container mount: {0}")]
-    MissingReadonlyMount(ContainerPath),
+    /// The container image does not carry the verified baseline tools the bundle pins.
+    #[error("container image lacks verified baseline tools at {directory}: {defect}")]
+    InvalidImageTools {
+        /// Expected `/opt/aither/tools/<cache key>` directory.
+        directory: ContainerPath,
+        /// Which image verification check failed.
+        defect: ImageToolDefect,
+    },
     /// Required command missing from a bundle.
     #[error("required tool is missing: {0:?}")]
     MissingTool(ManagedTool),
@@ -1007,6 +1011,31 @@ pub enum ToolRuntimeError {
     Template(#[from] askama::Error),
 }
 
+/// The check inside [`ToolRuntimeError::InvalidImageTools`] that failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageToolDefect {
+    /// The `<cache key>/bin` directory does not exist in the image.
+    MissingDirectory,
+    /// A pinned executable is absent or is not a regular file.
+    MissingBinary(String),
+    /// An executable's bytes differ from the pinned SHA-256.
+    Sha256Mismatch(String),
+}
+
+impl std::fmt::Display for ImageToolDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingDirectory => write!(f, "missing bin directory"),
+            Self::MissingBinary(command) => {
+                write!(f, "missing or non-regular executable `{command}`")
+            }
+            Self::Sha256Mismatch(command) => {
+                write!(f, "SHA-256 mismatch for `{command}`")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -1038,7 +1067,7 @@ pub mod tests {
         ToolBundle::new(ToolTarget::native().unwrap(), binaries).unwrap()
     }
 
-    /// Tools as a container sees them once the bundle is mounted read-only.
+    /// Tools as a container sees them once baked into its image.
     pub fn container_tools(bundle: &ToolBundle) -> PreparedTools<ContainerPath> {
         PreparedTools {
             bin_dir: bundle.container_bin_dir().unwrap(),
@@ -1069,16 +1098,19 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn container_mount_targets_the_posix_tool_directory() {
+    async fn stage_produces_the_directory_layout_the_image_verifies() {
         let cache = tempfile::tempdir().unwrap();
         let bundle = bundle();
-        let (mount, host) = bundle.prepare_container_mount(cache.path()).await.unwrap();
+        let staged = bundle.stage(cache.path()).await.unwrap();
         assert_eq!(
-            mount.container_path.as_str(),
-            format!("/opt/aither/tools/{}", bundle.cache_key().unwrap())
+            staged,
+            std::fs::canonicalize(cache.path())
+                .unwrap()
+                .join(bundle.cache_key().unwrap())
         );
-        assert_eq!(Some(mount.host_path.as_path()), host.bin_dir().parent());
-        assert!(mount.access.read_only());
+        for tool in ManagedTool::ALL {
+            assert!(staged.join("bin").join(tool.command()).is_file());
+        }
     }
 
     #[test]
