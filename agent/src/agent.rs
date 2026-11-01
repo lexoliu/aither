@@ -418,6 +418,9 @@ fn job_alert_text(alert: &JobAlertText<'_>) -> String {
 enum BackgroundOutcome<'a> {
     /// The script ran to completion.
     Finished { code: i32 },
+    /// The job was killed — its `timeout` bound or `terminal_kill` — and
+    /// whatever `code` the harness saw means nothing.
+    Killed,
     /// The task could not be run or tracked to completion.
     Failed { error: &'a str },
 }
@@ -2727,6 +2730,11 @@ where
 fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String {
     let error_text;
     let (outcome, output, stderr) = match &task.result {
+        Ok(command) if task.killed => (
+            BackgroundOutcome::Killed,
+            output_block(&command.stdout),
+            command.stderr.as_ref().and_then(output_block),
+        ),
         Ok(command) => (
             BackgroundOutcome::Finished {
                 code: command.exit_code,
@@ -2864,6 +2872,7 @@ mod tests {
             task_id: "amber-forest-thunder-pearl".to_string(),
             script: "make test".to_string(),
             result,
+            killed: false,
         }
     }
 
@@ -2890,6 +2899,20 @@ mod tests {
         assert_eq!(
             format_background_task_result(&task),
             "Background task 'amber-forest-thunder-pearl' (`make test`) finished with exit code 101.\n1 passed\nstderr:\nboom\n"
+        );
+    }
+
+    #[test]
+    fn background_result_killed_reports_the_kill_not_the_exit_code() {
+        let mut task = completed(Ok(CompletedCommand {
+            stdout: inline("partial output"),
+            stderr: None,
+            exit_code: -1,
+        }));
+        task.killed = true;
+        assert_eq!(
+            format_background_task_result(&task),
+            "Background task 'amber-forest-thunder-pearl' (`make test`) was killed.\npartial output\n"
         );
     }
 
@@ -3560,6 +3583,7 @@ mod tests {
                             .send_completed(aither_sandbox::CompletedTask {
                                 task_id: "task-test".to_string(),
                                 script: "cat".to_string(),
+                                killed: false,
                                 result: Err(aither_sandbox::TerminalError::Execution(
                                     "fed and finished".to_string(),
                                 )),
@@ -4903,6 +4927,7 @@ mod tests {
         aither_sandbox::CompletedTask {
             task_id: task_id.to_string(),
             script: "make".to_string(),
+            killed: false,
             result: Err(aither_sandbox::TerminalError::Execution(output.to_string())),
         }
     }

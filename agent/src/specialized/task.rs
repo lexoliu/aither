@@ -2832,6 +2832,7 @@ You are a file-defined agent.
             .send_completed(aither_sandbox::CompletedTask {
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
+                killed: false,
                 result: Ok(aither_sandbox::CompletedCommand {
                     stdout: aither_core::llm::CommandStream::Inline {
                         text: String::new(),
@@ -2914,6 +2915,7 @@ You are a file-defined agent.
             .send_completed(aither_sandbox::CompletedTask {
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
+                killed: false,
                 result: Ok(aither_sandbox::CompletedCommand {
                     stdout: aither_core::llm::CommandStream::Inline {
                         text: String::new(),
