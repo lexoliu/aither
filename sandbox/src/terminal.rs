@@ -716,6 +716,9 @@ pub struct CompletedTask {
     pub script: String,
     /// The result of execution.
     pub result: Result<CompletedCommand, TerminalError>,
+    /// Whether the job was killed — its `timeout` bound or `terminal_kill`
+    /// — rather than exiting on its own.
+    pub killed: bool,
 }
 
 /// Stage of a permission-lifecycle event for `terminal`.
@@ -2335,6 +2338,8 @@ where
                 execution_id,
                 background,
                 carry,
+                carried_dir: self.carried_dir.clone(),
+                alert_tx: self.alert_tx.clone(),
                 script,
                 mode,
                 backend,
@@ -2423,31 +2428,45 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         }
         let outcome =
             wait_for_foreground_result(&spawned.result, self.limits.foreground_wait).await;
-        if let Some(carry) = &carry {
-            let succeeded = matches!(&outcome, Some(Ok(result)) if result.exit_code == 0);
-            self.record_carried_dir(carry, succeeded).await;
-        }
+        // A result that raced in at the window's edge counts as a
+        // foreground finish.
+        let outcome = outcome.or_else(|| spawned.result.try_recv().ok());
         match outcome {
-            Some(Ok(result)) => CommandResult::from(result).into_tool_result(),
-            Some(Err(err)) => Err(anyhow::anyhow!(err)),
-            None => {
-                // The command outlived its foreground window: promote it to a
-                // background task. A result that raced in at the window's
-                // edge is returned directly.
-                match spawned.result.try_recv() {
-                    Ok(Ok(result)) => CommandResult::from(result).into_tool_result(),
-                    Ok(Err(err)) => Err(anyhow::anyhow!(err)),
-                    Err(_) => {
-                        background_terminal_result(
-                            &self.job_registry,
-                            &prepared.store_dir,
-                            &prepared.task_id,
-                            prepared.max_lines,
-                            &self.started_tx,
-                        )
-                        .await
+            Some(Ok(result)) => {
+                let killed = self
+                    .job_registry
+                    .get_by_task_id(&prepared.task_id)
+                    .await
+                    .is_some_and(|job| matches!(job.status, JobStatus::Killed));
+                let command = if killed {
+                    CommandResult {
+                        stdout: result.stdout,
+                        stderr: result.stderr,
+                        outcome: CommandOutcome::Killed {
+                            task_id: prepared.task_id.clone(),
+                            notice: format!(
+                                "Killed when its {}s timeout bound passed.",
+                                arguments.timeout
+                            ),
+                        },
                     }
-                }
+                } else {
+                    CommandResult::from(result)
+                };
+                command.into_tool_result()
+            }
+            Some(Err(err)) => Err(anyhow::anyhow!(err)),
+            // The command outlived its foreground window: promote it to a
+            // background task.
+            None => {
+                background_terminal_result(
+                    &self.job_registry,
+                    &prepared.store_dir,
+                    &prepared.task_id,
+                    prepared.max_lines,
+                    &self.started_tx,
+                )
+                .await
             }
         }
     }
@@ -2481,7 +2500,12 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
                 } else {
                     self.own_dir().await
                 };
-                self.send_directory_reset(dir, DirectoryResetReason::Removed)
+                let _ = self
+                    .alert_tx
+                    .send(JobAlert::DirectoryReset(DirectoryReset {
+                        dir,
+                        reason: DirectoryResetReason::Removed,
+                    }))
                     .await;
                 None
             }
@@ -2518,98 +2542,25 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
     }
 
     /// Makes the directory a finished foreground command ended in the start
-    /// of the next one, when the command succeeded and the directory lies
-    /// inside the paths this terminal may read. The report file is consumed
-    /// either way. When the next command does not start where the shell
-    /// ended, or the shell reported nothing, the model is alerted once.
+    /// of the next one, with the missing-report alert a task end does not
+    /// raise for a killed job. In production the task consumes the report
+    /// (see [`execute_script_standalone`]); tests drive the same logic here.
+    #[cfg(test)]
     async fn record_carried_dir(&self, carry: &CwdCarry, succeeded: bool) {
-        let reported = async_fs::read_to_string(&carry.report).await;
-        let _ = async_fs::remove_file(&carry.report).await;
-        let Some(carried) = &self.carried_dir else {
-            return;
+        let ctx = CarryContext {
+            carried_dir: self.carried_dir.as_ref(),
+            alert_tx: &self.alert_tx,
+            working_dir: &self.working_dir,
+            writable_paths: &self.writable_paths,
+            readable_paths: &self.readable_paths,
         };
-        // A direct command writes no report; a shell that ended through
-        // `exit` or a signal writes none either.
-        let reported = reported
-            .ok()
-            .map(|reported| reported.trim_end_matches('\n').to_owned())
-            .filter(|reported| !reported.is_empty());
-        let Some(reported) = reported else {
+        let Some(reported) = take_cwd_report(carry).await else {
             if carry.shell {
-                self.alert_directory_reset(carry, DirectoryResetReason::Unreported)
-                    .await;
+                alert_directory_reset(carry, DirectoryResetReason::Unreported, &ctx).await;
             }
             return;
         };
-        if !succeeded {
-            if !self.left_in_start(carry, &reported).await {
-                self.alert_directory_reset(carry, DirectoryResetReason::Failed)
-                    .await;
-            }
-            return;
-        }
-        if let Some(container) = &carry.container {
-            // A container is an unconfined main agent: what bounds its
-            // directory is the workspace mount.
-            match ContainerPath::new(reported.as_str())
-                .map_err(drop)
-                .and_then(|dir| container.mount.host_path(&dir).map_err(drop))
-            {
-                Ok(dir) => carried.set(Some(dir)),
-                Err(()) => {
-                    self.alert_directory_reset(carry, DirectoryResetReason::OutsideWorkspace)
-                        .await;
-                }
-            }
-            return;
-        }
-        let Ok(dir) = canonical_path(Path::new(&reported)).await else {
-            self.alert_directory_reset(carry, DirectoryResetReason::Removed)
-                .await;
-            return;
-        };
-        for grant in std::iter::once(&self.working_dir)
-            .chain(&self.writable_paths)
-            .chain(&self.readable_paths)
-        {
-            if canonical_path(grant)
-                .await
-                .is_ok_and(|grant| dir.starts_with(grant))
-            {
-                carried.set(Some(dir));
-                return;
-            }
-        }
-        self.alert_directory_reset(carry, DirectoryResetReason::OutsideReadable)
-            .await;
-    }
-
-    /// Whether the shell ended in the directory the command started in.
-    async fn left_in_start(&self, carry: &CwdCarry, reported: &str) -> bool {
-        if let Some(container) = &carry.container {
-            return reported == container.start.as_str();
-        }
-        let start = carry.start.as_deref().unwrap_or(&self.working_dir);
-        match (
-            canonical_path(Path::new(reported)).await,
-            canonical_path(start).await,
-        ) {
-            (Ok(reported), Ok(start)) => reported == start,
-            _ => false,
-        }
-    }
-
-    /// Alerts the model that the next command starts where `carry` started,
-    /// not where the shell ended.
-    async fn alert_directory_reset(&self, carry: &CwdCarry, reason: DirectoryResetReason) {
-        let dir = match &carry.container {
-            Some(container) => PathBuf::from(container.start.as_str()),
-            None => match &carry.start {
-                Some(start) => start.clone(),
-                None => self.own_dir().await,
-            },
-        };
-        self.send_directory_reset(dir, reason).await;
+        apply_cwd_report(carry, reported, succeeded, &ctx).await;
     }
 
     /// The terminal's own directory as a command sees it.
@@ -2618,13 +2569,120 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
             .await
             .unwrap_or_else(|_| self.working_dir.clone())
     }
+}
 
-    async fn send_directory_reset(&self, dir: PathBuf, reason: DirectoryResetReason) {
-        let _ = self
-            .alert_tx
-            .send(JobAlert::DirectoryReset(DirectoryReset { dir, reason }))
-            .await;
+/// Shared state needed to settle a finished command's directory report,
+/// whether the command finished inside its foreground call or promoted
+/// and ended as a background task.
+struct CarryContext<'a> {
+    carried_dir: Option<&'a CarriedDir>,
+    alert_tx: &'a Sender<JobAlert>,
+    working_dir: &'a Path,
+    writable_paths: &'a [PathBuf],
+    readable_paths: &'a [PathBuf],
+}
+
+/// Reads and removes a command's directory report, returning the directory
+/// the shell ended in when it reported one. The file is consumed either
+/// way so a promoted command never leaves it behind.
+async fn take_cwd_report(carry: &CwdCarry) -> Option<String> {
+    let reported = async_fs::read_to_string(&carry.report).await;
+    let _ = async_fs::remove_file(&carry.report).await;
+    // A direct command writes no report; a shell that ended through
+    // `exit` or a signal writes none either.
+    reported
+        .ok()
+        .map(|reported| reported.trim_end_matches('\n').to_owned())
+        .filter(|reported| !reported.is_empty())
+}
+
+/// Makes the directory a finished command ended in the start of the next
+/// one, when the command succeeded and the directory lies inside the paths
+/// this terminal may read. When the next command does not start where the
+/// shell ended the model is alerted once.
+async fn apply_cwd_report(
+    carry: &CwdCarry,
+    reported: String,
+    succeeded: bool,
+    ctx: &CarryContext<'_>,
+) {
+    let Some(carried) = ctx.carried_dir else {
+        return;
+    };
+    if !succeeded {
+        if !left_in_start(carry, &reported, ctx.working_dir).await {
+            alert_directory_reset(carry, DirectoryResetReason::Failed, ctx).await;
+        }
+        return;
     }
+    if let Some(container) = &carry.container {
+        // A container is an unconfined main agent: what bounds its
+        // directory is the workspace mount.
+        match ContainerPath::new(reported.as_str())
+            .map_err(drop)
+            .and_then(|dir| container.mount.host_path(&dir).map_err(drop))
+        {
+            Ok(dir) => carried.set(Some(dir)),
+            Err(()) => {
+                alert_directory_reset(carry, DirectoryResetReason::OutsideWorkspace, ctx).await;
+            }
+        }
+        return;
+    }
+    let Ok(dir) = canonical_path(Path::new(&reported)).await else {
+        alert_directory_reset(carry, DirectoryResetReason::Removed, ctx).await;
+        return;
+    };
+    for grant in std::iter::once(ctx.working_dir)
+        .chain(ctx.writable_paths.iter().map(PathBuf::as_path))
+        .chain(ctx.readable_paths.iter().map(PathBuf::as_path))
+    {
+        if canonical_path(grant)
+            .await
+            .is_ok_and(|grant| dir.starts_with(grant))
+        {
+            carried.set(Some(dir));
+            return;
+        }
+    }
+    alert_directory_reset(carry, DirectoryResetReason::OutsideReadable, ctx).await;
+}
+
+/// Whether the shell ended in the directory the command started in.
+async fn left_in_start(carry: &CwdCarry, reported: &str, working_dir: &Path) -> bool {
+    if let Some(container) = &carry.container {
+        return reported == container.start.as_str();
+    }
+    let start = carry.start.as_deref().unwrap_or(working_dir);
+    match (
+        canonical_path(Path::new(reported)).await,
+        canonical_path(start).await,
+    ) {
+        (Ok(reported), Ok(start)) => reported == start,
+        _ => false,
+    }
+}
+
+/// Alerts the model that the next command starts where `carry` started,
+/// not where the shell ended.
+async fn alert_directory_reset(
+    carry: &CwdCarry,
+    reason: DirectoryResetReason,
+    ctx: &CarryContext<'_>,
+) {
+    let dir = match &carry.container {
+        Some(container) => PathBuf::from(container.start.as_str()),
+        None => match &carry.start {
+            Some(start) => start.clone(),
+            None => canonical_path(ctx.working_dir)
+                .await
+                .unwrap_or_else(|_| ctx.working_dir.to_path_buf()),
+        },
+    };
+    let _ = ctx
+        .alert_tx
+        .send(JobAlert::DirectoryReset(DirectoryReset { dir, reason }))
+        .await;
 }
 
 impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool<P, E, Configured> {
@@ -2857,6 +2915,8 @@ struct StandaloneExecution<P, E> {
     execution_id: String,
     background: bool,
     carry: Option<CwdCarry>,
+    carried_dir: Option<CarriedDir>,
+    alert_tx: Sender<JobAlert>,
     script: String,
     mode: TerminalMode,
     backend: ExecutionBackend,
@@ -3017,6 +3077,8 @@ struct SpawnedTerminalTask<P, E> {
     execution_id: String,
     background: bool,
     carry: Option<CwdCarry>,
+    carried_dir: Option<CarriedDir>,
+    alert_tx: Sender<JobAlert>,
     script: String,
     mode: TerminalMode,
     backend: ExecutionBackend,
@@ -3054,6 +3116,8 @@ where
         execution_id,
         background,
         carry,
+        carried_dir,
+        alert_tx,
         script,
         mode,
         backend,
@@ -3073,6 +3137,7 @@ where
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
     } = task;
+    let status_registry = job_registry.clone();
     let result = execute_script_standalone(StandaloneExecution {
         working_dir,
         writable_paths,
@@ -3085,6 +3150,8 @@ where
         execution_id,
         background,
         carry,
+        carried_dir,
+        alert_tx,
         script: script.clone(),
         mode,
         backend,
@@ -3108,6 +3175,10 @@ where
         Err(err) => Err(err.to_string()),
     };
     let _ = result_tx.send(quick_result).await;
+    let killed = status_registry
+        .get_by_task_id(&task_id)
+        .await
+        .is_some_and(|job| matches!(job.status, JobStatus::Killed));
     // Every job reports completion; the agent reinjects the result only for
     // tasks it saw promoted or detached (`take_started`), so a plain
     // foreground result is not delivered twice.
@@ -3116,6 +3187,7 @@ where
             task_id,
             script,
             result,
+            killed,
         })
         .await;
     running_tasks.fetch_sub(1, Ordering::AcqRel);
@@ -3141,6 +3213,8 @@ where
         execution_id,
         background,
         carry,
+        carried_dir,
+        alert_tx,
         script,
         mode,
         backend,
@@ -3213,6 +3287,25 @@ where
 
     let output_path = stored_path(&result.stdout);
     job_registry.complete(pid, exit_code, output_path).await;
+
+    // The command's directory report arrives with its end, whether the call
+    // answered in the foreground window or the command promoted: the task
+    // is its sole consumer, so the next command starts where the shell
+    // ended and the report file never lingers.
+    if let Some(carry) = &carry {
+        let ctx = CarryContext {
+            carried_dir: carried_dir.as_ref(),
+            alert_tx: &alert_tx,
+            working_dir: &working_dir,
+            writable_paths: &writable_paths,
+            readable_paths: &readable_paths,
+        };
+        if let Some(reported) = take_cwd_report(carry).await {
+            apply_cwd_report(carry, reported, exit_code == 0, &ctx).await;
+        } else if ctx.carried_dir.is_some() && carry.shell {
+            alert_directory_reset(carry, DirectoryResetReason::Unreported, &ctx).await;
+        }
+    }
 
     Ok(result)
 }
@@ -6559,6 +6652,8 @@ mod tests {
             execution_id: "exec-test".to_string(),
             background: false,
             carry: None,
+            carried_dir: None,
+            alert_tx: async_channel::unbounded().0,
             script: "/bin/pwd".to_string(),
             mode: TerminalMode::Sandboxed,
             backend: ExecutionBackend::Local(tool.shell_sessions.local_tools().unwrap().clone()),
