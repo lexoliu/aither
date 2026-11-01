@@ -527,6 +527,18 @@ where
         self
     }
 
+    /// Resolves `BLOCKING` mark payloads in `tasks.md`: a mark it reports
+    /// dead no longer holds the item. Without a resolver every mark is
+    /// trusted.
+    #[must_use]
+    pub fn blocker_resolver(
+        mut self,
+        resolver: impl crate::working_docs::TaskBlockerResolver,
+    ) -> Self {
+        self.inner = self.inner.blocker_resolver(resolver);
+        self
+    }
+
     /// Publishes every request the agent sends to `source`, which is where
     /// the `fork` subagent kind starts from; take it from
     /// [`SubagentTool::fork_source`](crate::specialized::SubagentTool::fork_source).
@@ -1311,7 +1323,7 @@ mod tests {
         }
         .render()
         .unwrap();
-        assert!(prompt.contains("<continuation>\nIf work is blocked by a missing user decision, use `ask_user`. An item waiting on an open question — or on anything else the run cannot resolve — is marked `BLOCKING <request_id or reason>` in tasks.md; blocked items wait instead of holding the turn.\nDo not stop while unblocked checklist items remain incomplete.\n</continuation>"));
+        assert!(prompt.contains("<continuation>\nIf work is blocked by a missing user decision, use `ask_user`. An item waiting on an open question — or on anything else the run cannot resolve — is marked `BLOCKING <request_id or reason>` in tasks.md; blocked items wait instead of holding the turn. A mark naming a request that is no longer open does not hold.\nDo not stop while unblocked checklist items remain incomplete.\n</continuation>"));
         assert!(!prompt.contains("use `ask_user` and continue"));
     }
 

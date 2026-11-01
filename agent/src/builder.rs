@@ -74,6 +74,9 @@ pub struct AgentBuilder<
     /// Directory whose working documents (`tasks.md`) the agent supervises:
     /// the main agent's sandbox.
     sandbox_dir: Option<std::path::PathBuf>,
+    /// Resolves `BLOCKING` marks in `tasks.md`; a mark it reports dead no
+    /// longer holds the item.
+    blocker_resolver: Option<crate::working_docs::AnyTaskBlockerResolver>,
     /// Directory files are restored from after a forked compaction: the
     /// directory the agent's terminal works in.
     restore_dir: Option<std::path::PathBuf>,
@@ -125,6 +128,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             job_registry: None,
             context_sources: Vec::new(),
             sandbox_dir: None,
+            blocker_resolver: None,
             restore_dir: None,
             fork_source: None,
             inherited: None,
@@ -167,6 +171,7 @@ where
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             inherited: self.inherited,
@@ -200,6 +205,7 @@ where
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             inherited: self.inherited,
@@ -237,6 +243,7 @@ where
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             inherited: self.inherited,
@@ -403,6 +410,7 @@ where
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             inherited: self.inherited,
@@ -461,6 +469,17 @@ where
         let path = path.into();
         self.restore_dir = Some(path.clone());
         self.sandbox_dir = Some(path);
+        self
+    }
+
+    /// Resolves `BLOCKING` mark payloads in `tasks.md`: a mark it reports
+    /// dead no longer holds the item — the work counts as runnable and the
+    /// turn cannot stop on it. Without a resolver every mark is trusted.
+    pub fn blocker_resolver(
+        mut self,
+        resolver: impl crate::working_docs::TaskBlockerResolver,
+    ) -> Self {
+        self.blocker_resolver = Some(crate::working_docs::AnyTaskBlockerResolver::new(resolver));
         self
     }
 
@@ -723,6 +742,7 @@ where
             job_registry: self.job_registry,
             detached_task_ids: std::collections::HashSet::new(),
             sandbox_dir: self.sandbox_dir,
+            blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             last_request_started_at: None,

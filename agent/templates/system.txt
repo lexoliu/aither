@@ -128,7 +128,7 @@ tasks.md -> plans/
 </escalation>
 
 <continuation>
-If work is blocked by a missing user decision, use `ask_user`. An item waiting on an open question — or on anything else the run cannot resolve — is marked `BLOCKING <request_id or reason>` in tasks.md; blocked items wait instead of holding the turn.
+If work is blocked by a missing user decision, use `ask_user`. An item waiting on an open question — or on anything else the run cannot resolve — is marked `BLOCKING <request_id or reason>` in tasks.md; blocked items wait instead of holding the turn. A mark naming a request that is no longer open does not hold.
 Do not stop while unblocked checklist items remain incomplete.
 </continuation>
 </long-tasks>

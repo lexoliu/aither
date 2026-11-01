@@ -616,6 +616,10 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Optional sandbox directory for working-doc supervision (`tasks.md`).
     pub(crate) sandbox_dir: Option<PathBuf>,
 
+    /// Resolves `BLOCKING` marks in `tasks.md`; a mark it reports dead no
+    /// longer holds the item.
+    pub(crate) blocker_resolver: Option<crate::working_docs::AnyTaskBlockerResolver>,
+
     /// Directory files are restored from after a forked compaction.
     pub(crate) restore_dir: Option<PathBuf>,
 
@@ -701,6 +705,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             job_registry: None,
             detached_task_ids: HashSet::new(),
             sandbox_dir: None,
+            blocker_resolver: None,
             restore_dir: None,
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
@@ -2357,11 +2362,11 @@ where
     /// this only adds what the agent has the state for.
     fn register_builtin_context_sources(&mut self) {
         if let Some(sandbox_dir) = self.sandbox_dir.clone() {
-            self.context_sources
-                .push(AnyContextSource::new(TasksDocument::new(
-                    sandbox_dir,
-                    self.config.tasks_stale_after_turns,
-                )));
+            let mut source = TasksDocument::new(sandbox_dir, self.config.tasks_stale_after_turns);
+            if let Some(resolver) = self.blocker_resolver.clone() {
+                source = source.with_blocker_resolver(resolver);
+            }
+            self.context_sources.push(AnyContextSource::new(source));
         }
         if let Some(job_registry) = self.job_registry.clone() {
             self.context_sources
