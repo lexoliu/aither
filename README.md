@@ -31,12 +31,13 @@ Unified Rust traits for building AI applications across providers
 
 ## Highlights
 
-- 🎯 **Provider-agnostic traits** – swap between OpenAI, Gemini, local adapters, or your own.
+- 🎯 **Provider-agnostic traits** – swap between OpenAI, Claude, Gemini, Copilot, Codex, Apple Intelligence, ONNX Runtime, local `llama.cpp`, or your own backend.
+- 🤖 **Agent & Sandbox Runtime (`aither-agent`, `aither-sandbox`)** – terminal-first agent loop, context compaction, subagent orchestration, skills, and isolated command execution with IPC CLI tool bridging via [`heel`](https://github.com/lexoliu/heel) or containers.
+- 🔌 **MCP & ACP Protocols (`aither-mcp`, `aither-acp`)** – first-class Model Context Protocol and Agent Client Protocol support with streaming progress notifications.
 - ⚡ **Streaming-first** – every `LanguageModel::respond` returns a stream of [`Event`]s: visible text deltas, reasoning updates, and tool calls.
 - 🧠 **Reasoning controls** – request chain-of-thought summaries, budgets, or effort tiers without macros.
 - 🛠️ **Tooling & structured output** – JSON-schema tools, builders, and derive macros keep function calling type-safe.
 - 🧱 **No-std capable** – `aither-core` runs in embedded/WASM targets and re-exports only `alloc`.
-- 📦 **Batteries included** – provider crates (`openai`, `gemini`) plus runnable examples (`cargo run --example tool_macro`).
 
 ## Supported Capabilities
 
@@ -88,7 +89,6 @@ async fn basic_chat(api_key: &str) -> anyhow::Result<String> {
 Reasoning-focused models (OpenAI O-series, Gemini Flash Thinking, etc.) expose chain-of-thought summaries as `Event::Reasoning` items in the same stream. You can request a thinking budget or reasoning effort via `Parameters`.
 
 ```rust
-use aither::llm::{LanguageModel, Message, Request, model::Parameters};
 use aither::{LanguageModel, llm::{Event, LLMRequest, Message, model::Parameters}};
 use futures_lite::StreamExt;
 
@@ -201,14 +201,21 @@ async fn generate_image(generator: impl ImageGenerator) -> aither::Result<Vec<u8
 | Crate | Description |
 |-------|-------------|
 | `aither` | Entry crate re-exporting everything from `aither-core` + derive macros |
-| `aither-core` | No-std traits (`LanguageModel`, `Event`, `LLMRequest`, embedders, moderation, …) |
-| `aither-openai` | Provider bindings for OpenAI-compatible chat, images, audio, and moderation |
+| `aither-core` | `#![no_std]` traits (`LanguageModel`, `Event`, `LLMRequest`, `Tool`, embedders, moderation, …) |
+| `aither-agent` | Agent loop, `TerminalAgentBuilder`, context compaction, subagents, hooks, and event streaming |
+| `aither-sandbox` | Sandboxed terminal tool execution, IPC CLI command registry, and container/SSH routing |
+| `aither-cloud` | Unified multi-provider router across Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Groq, etc. |
+| `aither-claude` | Native Anthropic Claude provider bindings with prompt caching and extended thinking |
+| `aither-openai` | Provider bindings for OpenAI-compatible chat, Responses API, images, audio, and moderation |
 | `aither-gemini` | Google Gemini bindings with tool looping and thinking budgets |
+| `aither-copilot` / `aither-codex` | GitHub Copilot and Codex provider integrations |
 | `aither-apple` | On-device Apple Intelligence, native tools and guided output on macOS/iOS 26+; [build and examples](apple/README.md) |
-| `aither-rag` | Retrieval-Augmented Generation helper with a parallel in-memory vector DB |
-| `aither-llama` | Local llama.cpp wrapper that statically links llama.cpp |
+| `aither-ort` / `aither-llama` | Local ONNX Runtime and statically linked `llama.cpp` inference backends |
+| `aither-mcp` / `aither-acp` | Model Context Protocol (MCP) and Agent Client Protocol (ACP) client/server implementations |
+| `aither-models` / `aither-skills` | Model capability/context-window registry and reusable agent skill loader |
+| `aither-rag` / `aither-mem0` | Retrieval-Augmented Generation vector DB and long-term memory adapters |
+| `tools/*` & `patch/` | Built-in agent tools (`browser`, `websearch`, `webfetch`, `search`, `fs`, `command`) and minimal `apply_patch` binary |
 | `derive/` | Proc-macro helpers for tool schemas (`#[tool]`) |
-| `examples/` | Runnable flows for chat, research, and tool macros |
 
 ## Development
 
