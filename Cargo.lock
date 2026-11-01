@@ -542,6 +542,7 @@ dependencies = [
  "ort",
  "polling",
  "procfs-core",
+ "regex",
  "rmp-serde",
  "rs-tree-sitter-languages",
  "rustix",

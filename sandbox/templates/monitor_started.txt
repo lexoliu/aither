@@ -1,0 +1,1 @@
+Monitoring task '{{ task_id }}' — its new output is delivered to you every ~{{ interval_secs }}s and when it ends. Nothing further is needed; do not re-read its output to follow progress (terminal_read still works for a one-off look).
