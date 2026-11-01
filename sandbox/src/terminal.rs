@@ -629,6 +629,12 @@ pub enum JobAlert {
     StdinBlocked(StdinBlockedJob),
     /// Watching the job's stdin failed; no blocked-on-stdin alert can follow.
     StdinProbeFailed(StdinProbeFailedJob),
+    /// A monitor collected new output lines from its watched job.
+    MonitorIncrement(crate::monitor::MonitorIncrement),
+    /// A monitor saw no new output for its stall window.
+    MonitorStalled(crate::monitor::MonitorStalled),
+    /// A monitor ended, reporting why.
+    MonitorEnded(crate::monitor::MonitorEnded),
 }
 
 /// A command that ran to completion.
@@ -1850,6 +1856,22 @@ where
     }
 
     /// Returns a receiver for completed background tasks.
+    /// Sender on the job-alert channel a watch task reports through;
+    /// `monitor` clones it for every pump it spawns.
+    pub(crate) fn job_alert_sender(&self) -> Sender<JobAlert> {
+        self.alert_tx.clone()
+    }
+
+    /// The executor backing this terminal, for spawning watch tasks.
+    pub(crate) const fn executor(&self) -> &E {
+        &self.executor
+    }
+
+    /// Paths mounted readable for commands, besides the working directory.
+    pub fn readable_paths(&self) -> &[PathBuf] {
+        &self.readable_paths
+    }
+
     ///
     /// The returned `BackgroundTaskReceiver` can be used independently of the `TerminalTool`
     /// to poll for completed background tasks. This is useful for integrating with
@@ -10195,5 +10217,267 @@ mod tests {
             "kill <pid> must terminate the process it names: {}",
             render_terminal_result(&result)
         );
+    }
+
+    use crate::monitor::{MonitorArgs, MonitorEnd, MonitorLanguage, MonitorSource, MonitorTool};
+
+    /// Job alerts the monitor produces until `ended` or `duration` passes.
+    async fn monitor_alerts(
+        receiver: &BackgroundTaskReceiver,
+        duration: Duration,
+    ) -> Vec<JobAlert> {
+        let deadline = std::time::Instant::now() + duration;
+        let mut alerts = Vec::new();
+        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+            let Some(event) = receiver.recv_event_timeout(remaining).await else {
+                break;
+            };
+            let BackgroundTaskEvent::Alert(alert) = event else {
+                continue;
+            };
+            let ended = matches!(alert, JobAlert::MonitorEnded(_));
+            alerts.push(alert);
+            if ended {
+                break;
+            }
+        }
+        alerts
+    }
+
+    fn monitor_command(command: &str, timeout_secs: u64) -> MonitorArgs {
+        MonitorArgs {
+            source: MonitorSource::Command {
+                command: command.to_string(),
+                language: MonitorLanguage::Shell,
+            },
+            interval_secs: 1,
+            filter: None,
+            stop_on: None,
+            kill_on_stop: false,
+            stall_secs: None,
+            timeout_secs,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitored_command_delivers_increments_and_its_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let monitor = MonitorTool::new(tool.clone());
+        monitor
+            .call(
+                monitor_command("echo a; sleep 2; echo b", 30),
+                ToolContext::new(),
+            )
+            .await
+            .expect("monitor starts");
+
+        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(20)).await;
+        let increments: Vec<&[String]> = alerts
+            .iter()
+            .filter_map(|alert| match alert {
+                JobAlert::MonitorIncrement(increment) => Some(increment.lines.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            increments.iter().any(|inc| *inc == ["a".to_string()]),
+            "the first line is delivered as it arrives: {alerts:?}"
+        );
+        assert!(
+            increments.iter().any(|inc| *inc == ["b".to_string()]),
+            "the later line is delivered in a following increment: {alerts:?}"
+        );
+        assert!(
+            alerts.iter().any(|alert| matches!(
+                alert,
+                JobAlert::MonitorEnded(ended)
+                    if matches!(ended.end, MonitorEnd::Exited { exit_code: 0 })
+            )),
+            "the monitor reports the command's exit: {alerts:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitor_filter_keeps_matching_lines_and_stop_on_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let monitor = MonitorTool::new(tool.clone());
+        let mut args = monitor_command(
+            "printf 'keep one\\ndrop\\nkeep two\\nlast\\n'; sleep 60",
+            30,
+        );
+        args.filter = Some("^keep".to_string());
+        args.stop_on = Some("two".to_string());
+        monitor
+            .call(args, ToolContext::new())
+            .await
+            .expect("monitor starts");
+
+        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(20)).await;
+        let lines: Vec<&String> = alerts
+            .iter()
+            .filter_map(|alert| match alert {
+                JobAlert::MonitorIncrement(increment) => Some(&increment.lines),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            lines.iter().all(|line| line.starts_with("keep")),
+            "filter drops non-matching lines: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| *line == "last"),
+            "lines after the stop match are not delivered: {lines:?}"
+        );
+        assert!(
+            alerts.iter().any(|alert| matches!(
+                alert,
+                JobAlert::MonitorEnded(ended)
+                    if matches!(&ended.end, MonitorEnd::StopMatched { line } if line == "keep two")
+            )),
+            "the first stop_on match ends the monitor: {alerts:?}"
+        );
+        tool.job_registry().kill_running().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitor_rejects_a_timeout_over_the_cap_and_times_out_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let monitor = MonitorTool::new(tool.clone());
+        let refused = monitor
+            .call(monitor_command("sleep 60", 7201), ToolContext::new())
+            .await;
+        assert!(refused.is_err(), "timeout_secs over the cap is refused");
+
+        monitor
+            .call(monitor_command("sleep 60", 2), ToolContext::new())
+            .await
+            .expect("monitor starts");
+        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
+        assert!(
+            alerts.iter().any(|alert| matches!(
+                alert,
+                JobAlert::MonitorEnded(ended) if matches!(ended.end, MonitorEnd::TimedOut)
+            )),
+            "the deadline kills the run and reports a timeout: {alerts:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitor_reports_a_stall_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let monitor = MonitorTool::new(tool.clone());
+        let mut args = monitor_command("sleep 4; echo done", 30);
+        args.stall_secs = Some(1);
+        monitor
+            .call(args, ToolContext::new())
+            .await
+            .expect("monitor starts");
+
+        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
+        let stalls = alerts
+            .iter()
+            .filter(|alert| matches!(alert, JobAlert::MonitorStalled(_)))
+            .count();
+        assert_eq!(stalls, 1, "a stall is reported once: {alerts:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitored_file_delivers_appends_and_refuses_an_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let monitor = MonitorTool::new(tool.clone());
+        let unreadable = monitor
+            .call(
+                MonitorArgs {
+                    source: MonitorSource::File {
+                        file: "/etc/sudoers".to_string(),
+                    },
+                    ..monitor_command("true", 30)
+                },
+                ToolContext::new(),
+            )
+            .await;
+        assert!(
+            unreadable.is_err(),
+            "a file the sandbox may not read is refused"
+        );
+
+        let path = tool.working_dir().join("followed.log");
+        std::fs::write(&path, "first\n").unwrap();
+        monitor
+            .call(
+                MonitorArgs {
+                    source: MonitorSource::File {
+                        file: "followed.log".to_string(),
+                    },
+                    ..monitor_command("true", 30)
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("monitor starts");
+        async_io::Timer::after(Duration::from_millis(1500)).await;
+        std::fs::write(&path, "first\nsecond\n").unwrap();
+        std::fs::rename(&path, tool.working_dir().join("followed.log.1")).unwrap();
+        std::fs::write(&path, "rotated\n").unwrap();
+        async_io::Timer::after(Duration::from_millis(500)).await;
+        std::fs::write(&path, "rotated\nthird\n").unwrap();
+
+        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
+        let lines: Vec<&String> = alerts
+            .iter()
+            .filter_map(|alert| match alert {
+                JobAlert::MonitorIncrement(increment) => Some(&increment.lines),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for expected in ["first", "second", "third"] {
+            assert!(
+                lines.iter().any(|line| *line == expected),
+                "appended line {expected:?} is delivered, across rotation: {lines:?}"
+            );
+        }
+        tool.job_registry().kill_running().await;
     }
 }
