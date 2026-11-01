@@ -3651,7 +3651,30 @@ fn local_path_grants(
                 .iter()
                 .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE))),
         )
+        .chain(toolchain_grants(resolved))
         .collect()
+}
+
+/// The toolchain directories a sandboxed build needs: package-manager
+/// installs, compilers, and their caches, each rwx since builds both run
+/// the binaries and write the caches. Credential files inside them stay
+/// denied by the security tables, which emit after grants.
+fn toolchain_grants(
+    resolved: impl Fn(&Path) -> heel::Result<ResolvedPath>,
+) -> impl Iterator<Item = heel::Result<Grant>> {
+    let home = std::env::home_dir;
+    [
+        std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home().map(|home| home.join(".cargo"))),
+        std::env::var_os("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home().map(|home| home.join(".rustup"))),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|path| path.is_dir())
+    .map(move |path| Ok(Grant::new(resolved(&path)?, Access::WRITE | Access::EXEC)))
 }
 
 /// Adds a command's private jobserver variables to its process environment.
@@ -5350,6 +5373,31 @@ mod tests {
     #[cfg(unix)]
     use heel::DenyAll;
     use heel::NiceLevel;
+
+    /// Toolchain directories named by `*_HOME` variables become rwx grants;
+    /// ones that do not exist are skipped.
+    #[test]
+    fn toolchain_grants_cover_existing_dirs_rwx() {
+        let cargo = tempfile::tempdir().unwrap();
+        let rustup = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CARGO_HOME", cargo.path());
+            std::env::set_var("RUSTUP_HOME", rustup.path().join("missing"));
+        }
+        let grants: Vec<Grant> = toolchain_grants(|path| {
+            ResolvedPath::new(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+        })
+        .map(|grant| grant.expect("grant"))
+        .collect();
+        assert_eq!(grants.len(), 1, "only the existing dir is granted");
+        let access = grants[0].access();
+        assert!(access.can_write());
+        assert!(access.can_execute());
+        unsafe {
+            std::env::remove_var("CARGO_HOME");
+            std::env::remove_var("RUSTUP_HOME");
+        }
+    }
 
     async fn prepared_test_registry() -> (tempfile::TempDir, ShellSessionRegistry) {
         let cache = tempfile::tempdir().unwrap();
