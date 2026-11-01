@@ -166,7 +166,6 @@ fn apple_target(target: &str) -> Option<(&'static str, String)> {
     let min = DEPLOYMENT_TARGET;
     match target {
         "aarch64-apple-darwin" => Some(("macosx", format!("arm64-apple-macos{min}"))),
-        "x86_64-apple-darwin" => Some(("macosx", format!("x86_64-apple-macos{min}"))),
         "aarch64-apple-ios" => Some(("iphoneos", format!("arm64-apple-ios{min}"))),
         "x86_64-apple-ios" => Some((
             "iphonesimulator",
@@ -225,7 +224,6 @@ fn sdk_defines(sdk_path: &str, target: &str) -> Vec<String> {
 fn find_swiftinterface(sdk_path: &str, target: &str) -> Option<PathBuf> {
     let (arch, platform) = match target {
         "aarch64-apple-darwin" => ("arm64e", "apple-macos"),
-        "x86_64-apple-darwin" => ("x86_64", "apple-macos"),
         "aarch64-apple-ios" => ("arm64e", "apple-ios"),
         "x86_64-apple-ios" | "aarch64-apple-ios-sim" => {
             // Simulator slices live under the "-simulator" swiftinterface.

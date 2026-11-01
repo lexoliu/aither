@@ -45,47 +45,6 @@
       "tool": "ripgrep",
       "version": "15.2.0",
       "target": {
-        "os": "macos",
-        "arch": "x86_64"
-      },
-      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-apple-darwin.tar.gz",
-      "sha256": "af7825fcc69a2afc7a7aea55fc9af90e26421d8f20fe59df32e233c0b8a231c1",
-      "encoding": {
-        "format": "tar_gzip",
-        "executable": "ripgrep-15.2.0-x86_64-apple-darwin/rg"
-      }
-    },
-    {
-      "tool": "ast_grep",
-      "version": "0.45.3",
-      "target": {
-        "os": "macos",
-        "arch": "x86_64"
-      },
-      "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-apple-darwin.zip",
-      "sha256": "b2ffd26f42810340326a9e8a084bdc3647a8795c1a3f21fc06bd7bef3c7c5b2c",
-      "encoding": {
-        "format": "zip",
-        "executable": "ast-grep"
-      }
-    },
-    {
-      "tool": "jq",
-      "version": "1.8.2",
-      "target": {
-        "os": "macos",
-        "arch": "x86_64"
-      },
-      "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-macos-amd64",
-      "sha256": "e94b266e3c26690550006abe63152b782280f4e14374accdf04cbde844f00bc0",
-      "encoding": {
-        "format": "executable"
-      }
-    },
-    {
-      "tool": "ripgrep",
-      "version": "15.2.0",
-      "target": {
         "os": "linux",
         "arch": "aarch64"
       },
