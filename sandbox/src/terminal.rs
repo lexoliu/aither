@@ -10586,7 +10586,7 @@ mod tests {
         );
 
         let path = tool.working_dir().join("followed.log");
-        std::fs::write(&path, "first\n").unwrap();
+        std::fs::write(&path, "existing\n").unwrap();
         monitor
             .call(
                 MonitorArgs {
@@ -10600,11 +10600,19 @@ mod tests {
             .await
             .expect("monitor starts");
         async_io::Timer::after(Duration::from_millis(1500)).await;
-        std::fs::write(&path, "first\nsecond\n").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"appended\n").unwrap();
         std::fs::rename(&path, tool.working_dir().join("followed.log.1")).unwrap();
         std::fs::write(&path, "rotated\n").unwrap();
         async_io::Timer::after(Duration::from_millis(500)).await;
-        std::fs::write(&path, "rotated\nthird\n").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"after\n").unwrap();
 
         let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
         let lines: Vec<&String> = alerts
@@ -10615,7 +10623,11 @@ mod tests {
             })
             .flatten()
             .collect();
-        for expected in ["first", "second", "third"] {
+        assert!(
+            !lines.iter().any(|line| *line == "existing"),
+            "content written before the monitor started is not delivered: {lines:?}"
+        );
+        for expected in ["appended", "rotated", "after"] {
             assert!(
                 lines.iter().any(|line| *line == expected),
                 "appended line {expected:?} is delivered, across rotation: {lines:?}"
