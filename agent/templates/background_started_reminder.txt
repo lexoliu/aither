@@ -3,5 +3,5 @@ A terminal command is running in background (task_id={{ task_id }}).
 Current output snapshot (first max_lines):
 {% if output_preview.is_empty() %}(no output yet){% else %}{{ output_preview }}{% endif %}
 Full redirected output file: {{ output_file.url }} (absolute path: {{ output_file.path }})
-Use terminal_read for incremental reads, read the stored file via terminal commands when needed, use terminal_input for stdin, and terminal_kill to stop it.
+Use terminal_read for incremental reads, read the stored file via terminal commands when needed, use terminal_input for stdin, and terminal_kill to stop it. The task announces itself when it finishes — waiting is an option; you do not need to poll it.
 </system-reminder>
