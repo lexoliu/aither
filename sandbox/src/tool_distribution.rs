@@ -9,8 +9,8 @@ use url::Url;
 use zenwave::Client;
 
 use crate::tool_runtime::{
-    DistributedTool, HostProgram, HostProgramBinary, ManagedTool, ToolBinary, ToolBundle,
-    ToolRuntimeError, ToolTarget, digest,
+    DistributedTool, HostProgram, HostProgramBinary, ImageTool, ImageTools, ManagedTool,
+    ToolBinary, ToolBundle, ToolRuntimeError, ToolTarget, digest,
 };
 
 /// A kind of program a manifest artifact can provide.
@@ -166,16 +166,11 @@ impl ToolDistribution {
         Ok(manifest)
     }
 
-    /// Loads one complete target bundle concurrently, before shell execution.
+    /// The artifacts pinned for `target`, exactly one per managed tool.
     ///
     /// # Errors
-    /// Rejects missing/duplicate tools, failed downloads, oversized artifacts,
-    /// digest mismatch or unsafe/non-regular archive members.
-    pub async fn load(
-        &self,
-        target: &ToolTarget,
-        cache_root: &Path,
-    ) -> Result<ToolBundle, ToolRuntimeError> {
+    /// Rejects missing or duplicate tools for the target.
+    fn select_artifacts(&self, target: &ToolTarget) -> Result<Vec<ToolArtifact>, ToolRuntimeError> {
         let selected = self
             .artifacts
             .iter()
@@ -193,6 +188,80 @@ impl ToolDistribution {
                 _ => return Err(ToolRuntimeError::DuplicateTool(tool)),
             }
         }
+        Ok(selected)
+    }
+
+    /// The tools a container image must carry for `target`, pinned without bytes.
+    ///
+    /// Never touches the network or the filesystem: each entry carries the
+    /// command, the version it must report and the digest of its pinned
+    /// archive, which is all the container backend needs to verify the image.
+    ///
+    /// # Errors
+    /// Rejects missing or duplicate tools for the target, or a manifest pin
+    /// whose version or digest is malformed.
+    pub fn image_tools(&self, target: &ToolTarget) -> Result<ImageTools, ToolRuntimeError> {
+        let tools = self
+            .select_artifacts(target)?
+            .into_iter()
+            .map(|artifact| {
+                let mut archive_sha256 = [0; 32];
+                hex::decode_to_slice(&artifact.sha256, &mut archive_sha256)?;
+                Ok(ImageTool {
+                    tool: artifact.tool,
+                    version: artifact.version.parse()?,
+                    archive_sha256,
+                })
+            })
+            .collect::<Result<Vec<_>, ToolRuntimeError>>()?;
+        Ok(ImageTools::new(target.clone(), tools))
+    }
+
+    /// Stages the executables an image build must place at
+    /// [`ImageTools::container_directory`]: `<out>/<image cache key>/bin`,
+    /// returning that `<out>/<key>` directory.
+    ///
+    /// The bundle is downloaded and digest-verified through [`Self::load`]:
+    /// downloads are expected on the image-build machine, never on the host
+    /// that runs the container.
+    ///
+    /// # Errors
+    /// Rejects missing/duplicate tools, failed downloads, oversized artifacts,
+    /// digest mismatch or failed writes.
+    ///
+    /// # Panics
+    /// Panics if the staged directory lacks its required parent.
+    pub async fn stage_image_tools(
+        &self,
+        target: &ToolTarget,
+        artifact_cache: &Path,
+        out: &Path,
+    ) -> Result<PathBuf, ToolRuntimeError> {
+        let key = self.image_tools(target)?.cache_key()?;
+        let bundle = self.load(target, artifact_cache).await?;
+        let out = out.to_path_buf();
+        blocking::unblock(move || {
+            let prepared = bundle.prepare_local_sync(&out, &key)?;
+            Ok(prepared
+                .bin_dir()
+                .parent()
+                .expect("prepared binaries have a parent directory")
+                .to_path_buf())
+        })
+        .await
+    }
+
+    /// Loads one complete target bundle concurrently, before shell execution.
+    ///
+    /// # Errors
+    /// Rejects missing/duplicate tools, failed downloads, oversized artifacts,
+    /// digest mismatch or unsafe/non-regular archive members.
+    pub async fn load(
+        &self,
+        target: &ToolTarget,
+        cache_root: &Path,
+    ) -> Result<ToolBundle, ToolRuntimeError> {
+        let selected = self.select_artifacts(target)?;
         async_fs::create_dir_all(cache_root).await?;
         let binaries = stream::iter(selected)
             .map(|artifact| {
@@ -505,8 +574,79 @@ fn extract_executable(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
+
+    /// A script executable that reports `<command> <version>` to `--version`.
+    pub fn script_tool(command: &str, version: &str) -> Vec<u8> {
+        format!("#!/bin/sh\nprintf '%s\\n' '{command} {version}'\n").into_bytes()
+    }
+
+    /// A distribution pinning one `script_tool` executable per command for
+    /// `target`, each artifact located by `url` — file URLs for a fixture that
+    /// `load` can read, unreachable URLs where nothing may be downloaded.
+    ///
+    /// The files are written under `dir`; keep `dir` alive while `load` runs.
+    pub fn script_distribution(
+        target: &ToolTarget,
+        version: &str,
+        dir: &Path,
+        url: impl Fn(&Path) -> ToolArtifactLocation,
+    ) -> ToolDistribution {
+        let artifacts = ManagedTool::ALL
+            .into_iter()
+            .map(|tool| {
+                let bytes = script_tool(tool.command(), version);
+                let path = dir.join(tool.command());
+                std::fs::write(&path, &bytes).unwrap();
+                ToolArtifact {
+                    tool,
+                    version: version.into(),
+                    target: target.clone(),
+                    url: url(&path),
+                    sha256: hex::encode(digest(&bytes)),
+                    encoding: ToolArtifactFormat::Executable,
+                }
+            })
+            .collect();
+        ToolDistribution {
+            artifacts,
+            host_programs: Vec::new(),
+        }
+    }
+
+    /// File-backed artifacts for `script_distribution` fixtures that `load` reads.
+    pub fn file_artifact(path: &Path) -> ToolArtifactLocation {
+        ToolArtifactLocation::Download(Url::from_file_path(path).unwrap())
+    }
+
+    /// An artifact URL that can never be fetched, for fixtures that must
+    /// prove nothing is downloaded.
+    pub fn unreachable_artifact(_path: &Path) -> ToolArtifactLocation {
+        ToolArtifactLocation::Download(Url::parse("http://127.0.0.1:9/tool").unwrap())
+    }
+
+    #[tokio::test]
+    async fn stage_image_tools_produces_the_directory_layout_the_image_verifies() {
+        let files = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let target = ToolTarget::native().unwrap();
+        let distribution = script_distribution(&target, "1.0.0", files.path(), file_artifact);
+        let staged = distribution
+            .stage_image_tools(&target, &files.path().join("cache"), out.path())
+            .await
+            .unwrap();
+        let image = distribution.image_tools(&target).unwrap();
+        assert_eq!(
+            staged,
+            std::fs::canonicalize(out.path())
+                .unwrap()
+                .join(image.cache_key().unwrap())
+        );
+        for tool in ManagedTool::ALL {
+            assert!(staged.join("bin").join(tool.command()).is_file());
+        }
+    }
 
     #[tokio::test]
     async fn packaged_distribution_remains_valid_after_relocation() {
@@ -811,8 +951,9 @@ mod tests {
             .prepare_local(&fixture.directory.path().join("local"))
             .await
             .unwrap();
-        let staged = bundle
-            .stage(&fixture.directory.path().join("container"))
+        let staged = fixture
+            .distribution
+            .stage_image_tools(&target, &cache, &fixture.directory.path().join("container"))
             .await
             .unwrap();
         let staged_bin = staged.join("bin");

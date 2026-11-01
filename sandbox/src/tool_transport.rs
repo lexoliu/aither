@@ -9,7 +9,7 @@ use futures_lite::io::AsyncWriteExt;
 use crate::ContainerPath;
 use crate::shell_session::{ContainerShellRuntime, SshServer};
 use crate::tool_runtime::{
-    ImageToolDefect, PreparedTools, ToolBundle, ToolRuntimeError, ToolTarget,
+    ImageToolDefect, ImageTools, PreparedTools, ToolBundle, ToolRuntimeError, ToolTarget,
 };
 
 /// Trusted initialization transport, separate from agent command execution.
@@ -185,7 +185,7 @@ struct ToolInstallTemplate<'a> {
 #[template(path = "tool_verify.sh", escape = "none")]
 struct ToolVerifyTemplate<'a> {
     directory: std::borrow::Cow<'a, str>,
-    tools: Vec<InstallTool>,
+    tools: Vec<&'static str>,
 }
 
 /// The defect `tool_verify.sh` reports on stderr, or `None` for a failure it
@@ -200,38 +200,30 @@ fn image_defect(stderr: &str) -> Option<ImageToolDefect> {
                 Some(("missing-binary", command)) => {
                     Some(ImageToolDefect::MissingBinary(command.to_owned()))
                 }
-                Some(("sha256-mismatch", command)) => {
-                    Some(ImageToolDefect::Sha256Mismatch(command.to_owned()))
-                }
                 _ => None,
             })
     })
 }
 
-impl ToolBundle {
+impl ImageTools {
     /// Verifies the baseline tools baked into the container image at
-    /// [`Self::container_directory`]: every executable present with its pinned
-    /// SHA-256 and reporting its pinned version.
+    /// [`Self::container_directory`]: every pinned command present as a
+    /// regular file and reporting its pinned version.
     ///
     /// The image is expected to contain a directory produced by
-    /// [`Self::stage`]; a missing or mismatched directory fails with
-    /// [`ToolRuntimeError::InvalidImageTools`], never a fallback to a host
+    /// [`crate::tool_distribution::ToolDistribution::stage_image_tools`]; a
+    /// missing directory or binary fails with
+    /// [`ToolRuntimeError::InvalidImageTools`] and a wrong version
+    /// with [`ToolRuntimeError::VersionMismatch`], never a fallback to a host
     /// download or mount.
-    pub(crate) async fn verify_container_image(
+    pub(crate) async fn verify(
         &self,
         transport: &impl ToolTransport,
     ) -> Result<PreparedTools<ContainerPath>, ToolRuntimeError> {
         let directory = self.container_directory()?;
         let script = ToolVerifyTemplate {
             directory: shell_words::quote(directory.as_str()),
-            tools: self
-                .binaries
-                .iter()
-                .map(|binary| InstallTool {
-                    command: binary.tool.command().into(),
-                    sha256: hex::encode(binary.sha256),
-                })
-                .collect(),
+            tools: self.tools.iter().map(|tool| tool.tool.command()).collect(),
         }
         .render()?;
         let output = transport.run(&script, None).await?;
@@ -253,7 +245,9 @@ impl ToolBundle {
             catalog,
         })
     }
+}
 
+impl ToolBundle {
     /// Installs verified artifacts through a backend's independent initialization transport.
     ///
     /// # Errors
@@ -336,13 +330,6 @@ fn successful_output(output: Output) -> Result<String, ToolRuntimeError> {
 mod tests {
     use super::*;
 
-    /// macOS lacks `sha256sum`; `shasum -a 256` prints the same `<hash>  <file>` format.
-    const SHA256SUM: &str = if cfg!(target_os = "macos") {
-        "shasum -a 256"
-    } else {
-        "sha256sum"
-    };
-
     /// The `heel run` wrapper the verify script puts around each version probe.
     /// Host runs drop it: the staged binaries are the host's own scripts.
     const HEEL_RUN_PREFIX: &str =
@@ -350,8 +337,8 @@ mod tests {
 
     /// Runs the verify script on the host as a container would inside the
     /// image: the image's `/opt/aither/tools` root is replaced by a directory
-    /// populated via [`ToolBundle::stage`], so the real SHA-256 and version
-    /// checks run against the staged bytes.
+    /// populated via [`ToolDistribution::stage_image_tools`], so the real
+    /// presence and version checks run against the staged bytes.
     struct StagedImageTransport {
         /// Host directory standing in for the image's `/opt/aither/tools`.
         image_root: PathBuf,
@@ -366,8 +353,7 @@ mod tests {
             assert!(input.is_none());
             let script = script
                 .replace("/opt/aither/tools", &self.image_root.to_string_lossy())
-                .replace(HEEL_RUN_PREFIX, "")
-                .replace("sha256sum", SHA256SUM);
+                .replace(HEEL_RUN_PREFIX, "");
             let mut command = async_process::Command::new("sh");
             command.args(["-c", &script]);
             run_command(command, input).await
@@ -380,32 +366,57 @@ mod tests {
         }
     }
 
+    /// A file-backed `script_distribution`, the directory holding its artifact
+    /// files (keep alive while `load` reads them) and its pinned `ImageTools`.
+    fn script_fixture(
+        version: &str,
+        url: impl Fn(&Path) -> crate::tool_distribution::ToolArtifactLocation,
+    ) -> (
+        tempfile::TempDir,
+        crate::tool_distribution::ToolDistribution,
+        ImageTools,
+    ) {
+        use crate::tool_distribution::tests::script_distribution;
+        let files = tempfile::tempdir().unwrap();
+        let target = ToolTarget::native().unwrap();
+        let distribution = script_distribution(&target, version, files.path(), url);
+        let image = distribution.image_tools(&target).unwrap();
+        (files, distribution, image)
+    }
+
     #[tokio::test]
     async fn image_verification_accepts_a_staged_directory() {
-        let root = tempfile::tempdir().unwrap();
-        let bundle = crate::tool_runtime::tests::bundle();
-        bundle.stage(root.path()).await.unwrap();
-        let tools = bundle
-            .verify_container_image(&image_transport(&root))
+        use crate::tool_distribution::tests::file_artifact;
+        let (files, distribution, image) = script_fixture("1.0.0", file_artifact);
+        let out = tempfile::tempdir().unwrap();
+        let target = ToolTarget::native().unwrap();
+        distribution
+            .stage_image_tools(&target, &files.path().join("cache"), out.path())
             .await
             .unwrap();
+        let tools = image.verify(&image_transport(&out)).await.unwrap();
         assert_eq!(
             tools.bin_dir().as_str(),
-            format!("{}/bin", bundle.container_directory().unwrap())
+            format!("{}/bin", image.container_directory().unwrap())
         );
     }
 
     #[tokio::test]
     async fn image_verification_names_a_missing_binary() {
-        let root = tempfile::tempdir().unwrap();
-        let bundle = crate::tool_runtime::tests::bundle();
-        let staged = bundle.stage(root.path()).await.unwrap();
+        use crate::tool_distribution::tests::file_artifact;
+        let (files, distribution, image) = script_fixture("1.0.0", file_artifact);
+        let out = tempfile::tempdir().unwrap();
+        let target = ToolTarget::native().unwrap();
+        let staged = distribution
+            .stage_image_tools(&target, &files.path().join("cache"), out.path())
+            .await
+            .unwrap();
         std::fs::remove_file(staged.join("bin").join("rg")).unwrap();
-        match bundle.verify_container_image(&image_transport(&root)).await {
+        match image.verify(&image_transport(&out)).await {
             Err(ToolRuntimeError::InvalidImageTools { directory, defect }) => {
                 assert_eq!(
                     directory.as_str(),
-                    bundle.container_directory().unwrap().as_str()
+                    image.container_directory().unwrap().as_str()
                 );
                 assert_eq!(defect, ImageToolDefect::MissingBinary("rg".to_owned()));
             }
@@ -414,53 +425,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_verification_names_a_tampered_binary() {
-        let root = tempfile::tempdir().unwrap();
-        let bundle = crate::tool_runtime::tests::bundle();
-        let staged = bundle.stage(root.path()).await.unwrap();
+    async fn image_verification_names_a_wrong_version() {
+        use crate::tool_distribution::tests::{file_artifact, script_tool};
+        let (files, distribution, image) = script_fixture("1.0.0", file_artifact);
+        let out = tempfile::tempdir().unwrap();
+        let target = ToolTarget::native().unwrap();
+        let staged = distribution
+            .stage_image_tools(&target, &files.path().join("cache"), out.path())
+            .await
+            .unwrap();
+        // A binary reporting a version other than the pin: present, regular,
+        // but rejected by the version probe.
         let binary = staged.join("bin").join("jq");
-        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            permissions = std::fs::Permissions::from_mode(permissions.mode() | 0o200);
+            let mode = std::fs::metadata(&binary).unwrap().permissions().mode();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(mode | 0o200))
+                .unwrap();
         }
-        #[cfg(not(unix))]
-        permissions.set_readonly(false);
-        std::fs::set_permissions(&binary, permissions).unwrap();
-        std::fs::write(&binary, b"tampered").unwrap();
-        match bundle.verify_container_image(&image_transport(&root)).await {
+        std::fs::write(&binary, script_tool("jq", "2.0.0")).unwrap();
+        match image.verify(&image_transport(&out)).await {
+            Err(ToolRuntimeError::VersionMismatch(command)) => assert_eq!(command, "jq"),
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn image_verification_names_an_absent_directory() {
+        use crate::tool_distribution::tests::file_artifact;
+        let (_files, _, image) = script_fixture("1.0.0", file_artifact);
+        let out = tempfile::tempdir().unwrap();
+        let target = ToolTarget::native().unwrap();
+        // Pinned to another version the same executables stage under a
+        // different cache key, so this image's directory is absent.
+        let (other_files, other, _) = script_fixture("2.0.0", file_artifact);
+        other
+            .stage_image_tools(&target, &other_files.path().join("cache"), out.path())
+            .await
+            .unwrap();
+        match image.verify(&image_transport(&out)).await {
             Err(ToolRuntimeError::InvalidImageTools { directory, defect }) => {
                 assert_eq!(
                     directory.as_str(),
-                    bundle.container_directory().unwrap().as_str()
+                    image.container_directory().unwrap().as_str()
                 );
-                assert_eq!(defect, ImageToolDefect::Sha256Mismatch("jq".to_owned()));
+                assert_eq!(defect, ImageToolDefect::MissingDirectory);
             }
             other => panic!("expected InvalidImageTools, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn image_verification_names_an_absent_directory() {
-        let root = tempfile::tempdir().unwrap();
-        let bundle = crate::tool_runtime::tests::bundle();
-        // A bundle pinned to another version stages under a different cache
-        // key, so this bundle's directory is absent even though tools exist.
-        crate::tool_runtime::tests::bundle_pinned("2.0.0")
-            .stage(root.path())
+    async fn image_verification_downloads_nothing() {
+        use crate::tool_distribution::tests::{file_artifact, unreachable_artifact};
+        let (files, distribution, _) = script_fixture("1.0.0", file_artifact);
+        let out = tempfile::tempdir().unwrap();
+        let target = ToolTarget::native().unwrap();
+        distribution
+            .stage_image_tools(&target, &files.path().join("cache"), out.path())
             .await
             .unwrap();
-        match bundle.verify_container_image(&image_transport(&root)).await {
-            Err(ToolRuntimeError::InvalidImageTools { directory, defect }) => {
-                assert_eq!(
-                    directory.as_str(),
-                    bundle.container_directory().unwrap().as_str()
-                );
-                assert_eq!(defect, ImageToolDefect::MissingDirectory);
-            }
-            other => panic!("expected InvalidImageTools, got {other:?}"),
-        }
+        // Identical pins behind unreachable artifact URLs: `image_tools` and
+        // `verify` never touch the network or the artifact cache.
+        let (_, _, image) = script_fixture("1.0.0", unreachable_artifact);
+        image.verify(&image_transport(&out)).await.unwrap();
     }
 
     struct LocalTransport;

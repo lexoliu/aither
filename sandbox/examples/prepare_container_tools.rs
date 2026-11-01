@@ -7,7 +7,7 @@ use aither_sandbox::{ToolDistribution, ToolTarget};
 /// Where the staged directory lives on the host and where the image build
 /// must copy it inside the image.
 #[derive(serde::Serialize)]
-struct ImageTools {
+struct ImageToolsOutput {
     staged: PathBuf,
     container_path: String,
 }
@@ -23,13 +23,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     };
     let distribution = ToolDistribution::from_path(Path::new(manifest)).await?;
-    let bundle = distribution
-        .load(&ToolTarget::from_probe(os, arch)?, Path::new(cache))
+    let target = ToolTarget::from_probe(os, arch)?;
+    let staged = distribution
+        .stage_image_tools(
+            &target,
+            &Path::new(cache).join("artifacts"),
+            Path::new(cache),
+        )
         .await?;
-    let staged = bundle.stage(Path::new(cache)).await?;
-    let tools = ImageTools {
+    let container_path = distribution
+        .image_tools(&target)?
+        .container_directory()?
+        .as_str()
+        .to_owned();
+    let tools = ImageToolsOutput {
         staged,
-        container_path: bundle.container_directory()?.as_str().to_owned(),
+        container_path,
     };
     async_fs::write(output, serde_json::to_vec_pretty(&tools)?).await?;
     Ok(())

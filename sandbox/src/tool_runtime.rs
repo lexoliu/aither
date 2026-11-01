@@ -423,58 +423,27 @@ impl ToolBundle {
         }
         let bundle = self.clone();
         let root = root.to_path_buf();
-        blocking::unblock(move || bundle.prepare_local_sync(&root)).await
+        blocking::unblock(move || {
+            let key = bundle.cache_key()?;
+            bundle.prepare_local_sync(&root, &key)
+        })
+        .await
     }
 
-    /// Stages the bundle's executables for its own target at `<root>/<cache key>/bin`.
-    ///
-    /// Unlike [`Self::prepare_local`], the bundle's target is not required to be
-    /// the host's: an image build stages e.g. Linux artifacts on any platform
-    /// and copies the returned directory to [`Self::container_directory`] inside
-    /// the image, producing exactly what the backend verifies.
-    ///
-    /// # Errors
-    /// Rejects invalid cached content, failed writes or invalid bundle identity.
-    ///
-    /// # Panics
-    /// Panics if the internal prepared directory lacks its required parent.
-    pub async fn stage(&self, root: &Path) -> Result<PathBuf, ToolRuntimeError> {
-        let bundle = self.clone();
-        let root = root.to_path_buf();
-        let prepared = blocking::unblock(move || bundle.prepare_local_sync(&root)).await?;
-        Ok(prepared
-            .bin_dir
-            .parent()
-            .expect("prepared binaries have a parent directory")
-            .to_path_buf())
-    }
-
-    /// Where the staged runtime lives inside a container image: `/opt/aither/tools/<cache key>`.
-    ///
-    /// # Errors
-    /// Returns an error when the bundle identity cannot be hashed.
-    pub fn container_directory(&self) -> Result<ContainerPath, ToolRuntimeError> {
-        Ok(ContainerPath::root()
-            .join("opt/aither/tools")
-            .join(self.cache_key()?))
-    }
-
-    /// The executable directory inside a container, which goes on its `PATH`.
-    pub(crate) fn container_bin_dir(&self) -> Result<ContainerPath, ToolRuntimeError> {
-        Ok(self.container_directory()?.join("bin"))
-    }
-
-    /// Returns the verified runtime at `<root>/<cache key>`, staging it when it is
+    /// Returns the verified runtime at `<root>/<key>`, staging it when it is
     /// missing and replacing it when its contents are invalid.
     ///
     /// Verifying a valid runtime takes no lock. Creation and replacement run under an
-    /// exclusive lock on `<root>/.<cache key>.lock`, so concurrent preparers never
+    /// exclusive lock on `<root>/.<key>.lock`, so concurrent preparers never
     /// discard a runtime another preparer has just activated.
-    fn prepare_local_sync(&self, root: &Path) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
+    pub(crate) fn prepare_local_sync(
+        &self,
+        root: &Path,
+        key: &str,
+    ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
         std::fs::create_dir_all(root)?;
         let root = std::fs::canonicalize(root)?;
-        let key = self.cache_key()?;
-        let destination = root.join(&key);
+        let destination = root.join(key);
         if let Some(prepared) = self.reusable(&destination)? {
             return Ok(prepared);
         }
@@ -590,6 +559,83 @@ impl ToolBundle {
             bin_dir,
             catalog: self.catalog(),
         })
+    }
+}
+
+/// One baseline command a container image must carry, without its bytes.
+#[derive(Debug, Clone)]
+pub struct ImageTool {
+    /// Program the image must provide.
+    pub tool: ManagedTool,
+    /// Version the executable must report to its version probe.
+    pub version: semver::Version,
+    /// SHA-256 of the artifact archive the executable came from.
+    pub archive_sha256: [u8; 32],
+}
+
+/// The baseline tools a container image must carry, pinned without bytes.
+///
+/// Unlike a [`ToolBundle`], this carries no executable content and is built
+/// without touching the network or the artifact cache: the image build is
+/// responsible for placing exactly these commands, at these versions, under
+/// [`ImageTools::container_directory`].
+#[derive(Debug, Clone)]
+pub struct ImageTools {
+    target: ToolTarget,
+    pub(crate) tools: Vec<ImageTool>,
+}
+
+impl ImageTools {
+    pub(crate) const fn new(target: ToolTarget, tools: Vec<ImageTool>) -> Self {
+        Self { target, tools }
+    }
+
+    /// Stable identity of the pinned image tools, for directory naming.
+    pub(crate) fn cache_key(&self) -> Result<String, ToolRuntimeError> {
+        #[derive(Serialize)]
+        struct Identity<'a> {
+            target: &'a ToolTarget,
+            tools: Vec<(&'a str, &'a semver::Version, &'a [u8; 32])>,
+        }
+        let identity = Identity {
+            target: &self.target,
+            tools: self
+                .tools
+                .iter()
+                .map(|tool| (tool.tool.command(), &tool.version, &tool.archive_sha256))
+                .collect(),
+        };
+        Ok(hex::encode(digest(&serde_json::to_vec(&identity)?)))
+    }
+
+    /// Where the image carries these tools: `/opt/aither/tools/<cache key>`.
+    ///
+    /// # Errors
+    /// Returns an error when the identity cannot be hashed.
+    pub fn container_directory(&self) -> Result<ContainerPath, ToolRuntimeError> {
+        Ok(ContainerPath::root()
+            .join("opt/aither/tools")
+            .join(self.cache_key()?))
+    }
+
+    /// The executable directory inside a container, which goes on its `PATH`.
+    pub(crate) fn container_bin_dir(&self) -> Result<ContainerPath, ToolRuntimeError> {
+        Ok(self.container_directory()?.join("bin"))
+    }
+
+    /// Stable operational metadata shared by every prepared backend.
+    #[must_use]
+    pub fn catalog(&self) -> ToolCatalog {
+        ToolCatalog {
+            tools: self
+                .tools
+                .iter()
+                .map(|tool| ToolInfo {
+                    command: tool.tool.command(),
+                    version: tool.version.clone(),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -1018,8 +1064,6 @@ pub enum ImageToolDefect {
     MissingDirectory,
     /// A pinned executable is absent or is not a regular file.
     MissingBinary(String),
-    /// An executable's bytes differ from the pinned SHA-256.
-    Sha256Mismatch(String),
 }
 
 impl std::fmt::Display for ImageToolDefect {
@@ -1028,9 +1072,6 @@ impl std::fmt::Display for ImageToolDefect {
             Self::MissingDirectory => write!(f, "missing bin directory"),
             Self::MissingBinary(command) => {
                 write!(f, "missing or non-regular executable `{command}`")
-            }
-            Self::Sha256Mismatch(command) => {
-                write!(f, "SHA-256 mismatch for `{command}`")
             }
         }
     }
@@ -1067,50 +1108,54 @@ pub mod tests {
         ToolBundle::new(ToolTarget::native().unwrap(), binaries).unwrap()
     }
 
+    /// The `ImageTools` counterpart of [`bundle`]: the same target and pins,
+    /// keyed by the digests of the script bytes a fixture artifact would hold.
+    pub fn image_tools() -> ImageTools {
+        image_tools_pinned("1.0.0")
+    }
+
+    /// [`image_tools`] pinned to another version, for a different cache key.
+    pub fn image_tools_pinned(version: &str) -> ImageTools {
+        let tools = ManagedTool::ALL
+            .into_iter()
+            .map(|tool| {
+                let bytes = format!("#!/bin/sh\nprintf '%s\\n' '{} {version}'\n", tool.command());
+                ImageTool {
+                    tool,
+                    version: semver::Version::parse(version).unwrap(),
+                    archive_sha256: digest(bytes.as_bytes()),
+                }
+            })
+            .collect();
+        ImageTools::new(ToolTarget::native().unwrap(), tools)
+    }
+
     /// Tools as a container sees them once baked into its image.
-    pub fn container_tools(bundle: &ToolBundle) -> PreparedTools<ContainerPath> {
+    pub fn container_tools(tools: &ImageTools) -> PreparedTools<ContainerPath> {
         PreparedTools {
-            bin_dir: bundle.container_bin_dir().unwrap(),
-            catalog: bundle.catalog(),
+            bin_dir: tools.container_bin_dir().unwrap(),
+            catalog: tools.catalog(),
         }
     }
 
     // Runs on every host: Windows must still produce POSIX container paths.
     #[test]
     fn container_tool_paths_are_posix_on_every_host() {
-        let bundle = bundle();
-        let key = bundle.cache_key().unwrap();
+        let tools = image_tools();
+        let key = tools.cache_key().unwrap();
         assert_eq!(
-            bundle.container_directory().unwrap().as_str(),
+            tools.container_directory().unwrap().as_str(),
             format!("/opt/aither/tools/{key}")
         );
         assert_eq!(
-            bundle.container_bin_dir().unwrap().as_str(),
+            tools.container_bin_dir().unwrap().as_str(),
             format!("/opt/aither/tools/{key}/bin")
         );
-        let script = container_tools(&bundle)
-            .wrap_script("rg --version")
-            .unwrap();
+        let script = container_tools(&tools).wrap_script("rg --version").unwrap();
         assert!(
             script.starts_with(&format!("PATH=/opt/aither/tools/{key}/bin")),
             "{script}"
         );
-    }
-
-    #[tokio::test]
-    async fn stage_produces_the_directory_layout_the_image_verifies() {
-        let cache = tempfile::tempdir().unwrap();
-        let bundle = bundle();
-        let staged = bundle.stage(cache.path()).await.unwrap();
-        assert_eq!(
-            staged,
-            std::fs::canonicalize(cache.path())
-                .unwrap()
-                .join(bundle.cache_key().unwrap())
-        );
-        for tool in ManagedTool::ALL {
-            assert!(staged.join("bin").join(tool.command()).is_file());
-        }
     }
 
     #[test]
