@@ -37,7 +37,7 @@ impl ManagedTool {
         }
     }
 
-    fn executable_name(self, target: &ToolTarget) -> String {
+    pub(crate) fn executable_name(self, target: &ToolTarget) -> String {
         executable_name(self.command(), target)
     }
 }
