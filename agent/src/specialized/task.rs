@@ -29,6 +29,7 @@ use serde::Deserialize;
 
 use crate::AgentBuilder;
 use crate::context::CacheLifetime;
+use crate::external_hook::{self, ExternalHooks};
 use crate::fork::{ForkSnapshot, ForkSource};
 use crate::fs_util::path_exists;
 use crate::model_group::ModelTier;
@@ -39,6 +40,10 @@ async fn checked_path_exists(path: &Path) -> anyhow::Result<bool> {
         .await
         .map_err(|error| anyhow::anyhow!("failed to inspect path '{}': {error}", path.display()))
 }
+
+/// The hooks every subagent's agent carries: its own scope of the external
+/// hooks, which holds none when the host configured none.
+pub type SubagentHooks = crate::HCons<ExternalHooks, ()>;
 
 /// Builder function type for configuring a subagent.
 /// Returns an `AgentBuilder` so we can add hooks before building.
@@ -265,8 +270,29 @@ struct SubagentResultTemplate<'a> {
 }
 
 /// The commits listed for one run of a subagent holding a commit grant, or
-/// why they could not be listed.
-type CommitListing = Result<Vec<SubagentCommit>, CommitLedgerError>;
+/// why they could not be listed, and what could not be done to its
+/// repositories before the run.
+struct CommitListing {
+    listed: Result<Vec<SubagentCommit>, CommitLedgerError>,
+    /// Why a repository could not be refreshed or imported when the run
+    /// started: its commits stay in it, out of the main repository.
+    setbacks: Vec<String>,
+}
+
+/// Lists the commits a run made on its granted repositories; `None` when the
+/// run held no commit grant.
+async fn list_commits(
+    ledger: Option<&CommitLedger>,
+    mark: Option<&CommitMark>,
+) -> Option<CommitListing> {
+    match (ledger, mark) {
+        (Some(ledger), Some(mark)) => Some(CommitListing {
+            listed: ledger.since(mark).await,
+            setbacks: mark.setbacks().iter().map(ToString::to_string).collect(),
+        }),
+        _ => None,
+    }
+}
 
 /// What the result text reports about a subagent run.
 enum SubagentReport<'a> {
@@ -513,7 +539,7 @@ where
 
 /// A finished subagent kept so the parent can continue it.
 struct FinishedSubagent<LLM> {
-    agent: crate::Agent<LLM, LLM, LLM, ()>,
+    agent: crate::Agent<LLM, LLM, LLM, SubagentHooks>,
     subagent: String,
     model: Option<String>,
     child_job_registry: Option<aither_sandbox::JobRegistry>,
@@ -691,6 +717,9 @@ pub struct SubagentTool<LLM> {
     /// Whether this tool serves the main agent's terminal, the only one a
     /// fork can continue the context of.
     serves_main: bool,
+    /// The external hooks of the agent this tool serves: told when a
+    /// subagent starts and stops, and the parent of each subagent's own scope.
+    hooks: Option<ExternalHooks>,
 }
 
 impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
@@ -723,6 +752,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             finished: FinishedSubagents::new(),
             fork_source: ForkSource::default(),
             serves_main: true,
+            hooks: None,
         }
     }
 
@@ -787,7 +817,21 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             finished: FinishedSubagents::new(),
             fork_source: self.fork_source.clone(),
             serves_main: binding.role() == CommandRole::Main,
+            hooks: ExternalHooks::of_observer(binding.observer()).or_else(|| {
+                self.hooks
+                    .clone()
+                    .filter(|_| binding.role() == CommandRole::Main)
+            }),
         }
+    }
+
+    /// Tells `hooks` when a subagent starts and stops, and gives each
+    /// subagent a scope of its own derived from it. A tool a terminal serves
+    /// takes the hooks of that terminal's command registry instead.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: ExternalHooks) -> Self {
+        self.hooks = Some(hooks);
+        self
     }
 
     /// Where the main agent publishes its requests for the `fork` subagent
@@ -1189,7 +1233,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         grant: SubagentGrant,
         prompt: &str,
     ) -> anyhow::Result<(
-        crate::Agent<LLM, LLM, LLM, ()>,
+        crate::Agent<LLM, LLM, LLM, SubagentHooks>,
         String,
         String,
         Option<aither_sandbox::JobRegistry>,
@@ -1240,6 +1284,12 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             }) => crate::AgentBuilder::new(selected),
         };
         tracing::info!(subagent = %subagent_id, model = %model, "Starting subagent");
+        let child_hooks = self
+            .hooks
+            .as_ref()
+            .map_or_else(ExternalHooks::none, ExternalHooks::for_subagent);
+        let command_observer = self.hooks.is_some().then(|| child_hooks.command_observer());
+        let command_gate = self.hooks.is_some().then(|| child_hooks.command_gate());
 
         // Launch the subagent's terminal from the terminal this tool serves.
         let (agent_builder, child_job_registry, commit_ledger) = if let Some(binding) =
@@ -1247,7 +1297,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         {
             let dyn_terminal = binding
                 .launcher()
-                .create(grant)
+                .create(grant, command_observer, command_gate)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to create subagent terminal tool: {e}"))?;
             let job_registry = dyn_terminal.job_registry();
@@ -1276,7 +1326,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         };
 
         Ok((
-            agent_builder.build(),
+            agent_builder.hook(child_hooks).build(),
             subagent_id,
             model,
             child_job_registry,
@@ -1457,6 +1507,27 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
     }
 }
 
+/// What the hooks are told about how a subagent's run ended.
+fn subagent_stop_input<E: std::fmt::Display>(
+    subagent: &str,
+    outcome: &SubagentOutcome<E>,
+) -> external_hook::SubagentStop {
+    let (end, result) = match outcome {
+        SubagentOutcome::Cancelled => (external_hook::SubagentEnd::Cancelled, String::new()),
+        SubagentOutcome::Finished(Ok(result)) => {
+            (external_hook::SubagentEnd::Completed, result.clone())
+        }
+        SubagentOutcome::Finished(Err(error)) => {
+            (external_hook::SubagentEnd::Failed, error.to_string())
+        }
+    };
+    external_hook::SubagentStop {
+        subagent: subagent.to_string(),
+        end,
+        result,
+    }
+}
+
 impl<LLM> Tool for SubagentTool<LLM>
 where
     LLM: LanguageModel + Clone + Sync + 'static,
@@ -1488,9 +1559,22 @@ where
             },
             commit_mark,
         ) = self.mark_commits(finished, resumed).await?;
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .fire(&external_hook::SubagentStart {
+                    subagent: subagent_id.clone(),
+                    prompt: prompt.clone(),
+                })
+                .await;
+        }
         let (run_id, cancel_rx) = self.runs.begin(&subagent_id, &prompt);
         let outcome = await_subagent_run(agent.query(&prompt), cancel_rx).await;
         self.runs.finish(run_id);
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .fire(&subagent_stop_input(&subagent_id, &outcome))
+                .await;
+        }
         if let Some(job_registry) = &child_job_registry {
             let killed = job_registry.kill_running().await;
             if killed > 0 {
@@ -1504,10 +1588,7 @@ where
         // Whatever way the run ended, the commits it made are reported; a
         // failure to list them is reported in their place and changes nothing
         // else about the run.
-        let commits = match (&commit_ledger, &commit_mark) {
-            (Some(ledger), Some(mark)) => Some(ledger.since(mark).await),
-            _ => None,
-        };
+        let commits = list_commits(commit_ledger.as_ref(), commit_mark.as_ref()).await;
         let result = match outcome {
             SubagentOutcome::Cancelled => {
                 // The cancelled query left the agent mid-turn; it cannot be continued.
@@ -1576,7 +1657,7 @@ fn failure_text<LLM: LanguageModel + 'static>(
     subagent: &str,
     error: &str,
     commits: Option<&CommitListing>,
-    agent: &crate::Agent<LLM, LLM, LLM, ()>,
+    agent: &crate::Agent<LLM, LLM, LLM, SubagentHooks>,
 ) -> String {
     let history = agent.history();
     let skipped = history.len().saturating_sub(12);
@@ -1745,11 +1826,14 @@ mod tests {
 
     #[test]
     fn commit_listings_render_as_prose() {
-        let listed: CommitListing = Ok(vec![SubagentCommit {
-            worktree: PathBuf::from("/work/tree"),
-            commit: "abc123".to_string(),
-            subject: "fix the parser".to_string(),
-        }]);
+        let listed = CommitListing {
+            listed: Ok(vec![SubagentCommit {
+                worktree: PathBuf::from("/work/tree"),
+                commit: "abc123".to_string(),
+                subject: "fix the parser".to_string(),
+            }]),
+            setbacks: Vec::new(),
+        };
         let completed = SubagentResultTemplate {
             subagent: "worker",
             outcome: SubagentReport::Completed {
@@ -1767,7 +1851,10 @@ mod tests {
             "Subagent 'worker' completed.\n\ndone\n\nContinue this subagent with `subagent resume --id 3` while its prompt cache is still warm.\n\nIt idled too often.\n\nCommits made in the granted worktrees:\n- abc123 fix the parser (in /work/tree)"
         );
 
-        let none: CommitListing = Ok(Vec::new());
+        let none = CommitListing {
+            listed: Ok(Vec::new()),
+            setbacks: Vec::new(),
+        };
         let cancelled = SubagentResultTemplate {
             subagent: "worker",
             outcome: SubagentReport::Cancelled,
@@ -1780,10 +1867,13 @@ mod tests {
             "Subagent 'worker' was cancelled by the user.\n\nNo commits were made in the granted worktrees."
         );
 
-        let failed: CommitListing = Err(CommitLedgerError::Git {
-            repository: PathBuf::from("/repo"),
-            stderr: "boom".to_string(),
-        });
+        let failed = CommitListing {
+            listed: Err(CommitLedgerError::Git {
+                repository: PathBuf::from("/repo"),
+                stderr: "boom".to_string(),
+            }),
+            setbacks: vec!["the repository at /repo is stuck".to_string()],
+        };
         let rendered = SubagentErrorTemplate {
             subagent: "worker",
             error: "model failed",
@@ -1794,7 +1884,7 @@ mod tests {
         .expect("subagent error should render");
         assert_eq!(
             rendered,
-            "Subagent 'worker' error: model failed\n\nThe commits made in the granted worktrees could not be listed: git failed on /repo: boom\n\nRecent subagent history:\n"
+            "Subagent 'worker' error: model failed\n\nThe commits made in the granted worktrees could not be listed: git failed on /repo: boom\n\nBefore the run started: the repository at /repo is stuck\n\nRecent subagent history:\n"
         );
     }
 
@@ -2261,6 +2351,9 @@ mod tests {
             .collect()
     }
 
+    // Sandboxed git runs only off Windows: a package's ancestors carry
+    // traverse alone, and git resolves its paths through a read on each.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_completed_run_lists_the_commits_made_in_its_granted_worktree() {
         let fixture = CommitFixture::new().await;
@@ -2278,6 +2371,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_run_lists_the_commits_made_in_its_granted_worktree() {
         let fixture = CommitFixture::new().await;
@@ -2303,6 +2397,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // A commit grant is refused where no shell can carry its shim.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_listing_failure_keeps_the_runs_outcome() {
         let fixture = CommitFixture::new().await;
@@ -2329,6 +2425,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn cancelled_run_lists_the_commits_made_in_its_granted_worktree() {
         let fixture = CommitFixture::new().await;
@@ -2588,11 +2685,12 @@ You are a file-defined agent.
             let event = match turn {
                 0 => Event::ToolCall(aither_core::llm::ToolCall::new(
                     "bg-1",
-                    "terminal_background",
+                    "terminal",
                     serde_json::json!({
                         "description": "hold the cache window",
                         "script": "sleep 2",
-                        "timeout": 60
+                        "timeout": 60,
+                        "background": true
                     }),
                 )),
                 _ => Event::Text("done".to_string()),
@@ -2734,6 +2832,7 @@ You are a file-defined agent.
             .send_completed(aither_sandbox::CompletedTask {
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
+                killed: false,
                 result: Ok(aither_sandbox::CompletedCommand {
                     stdout: aither_core::llm::CommandStream::Inline {
                         text: String::new(),
@@ -2816,6 +2915,7 @@ You are a file-defined agent.
             .send_completed(aither_sandbox::CompletedTask {
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
+                killed: false,
                 result: Ok(aither_sandbox::CompletedCommand {
                     stdout: aither_core::llm::CommandStream::Inline {
                         text: String::new(),
@@ -3358,9 +3458,10 @@ You are a file-defined agent.
 
     /// A main agent's terminal whose permission requests are recorded.
     struct ForkFixture {
+        _hook_tools: crate::test_support::PreparedFixture,
         _dirs: [tempfile::TempDir; 3],
         terminal: aither_sandbox::TerminalTool<
-            RecordingPermission,
+            crate::ReviewedPermission<RecordingPermission>,
             executor_core::tokio::TokioGlobal,
             aither_sandbox::Configured,
         >,
@@ -3369,6 +3470,11 @@ You are a file-defined agent.
 
     impl ForkFixture {
         async fn new() -> Self {
+            Self::reviewed(Vec::new()).await
+        }
+
+        /// A fixture whose permission requests go through `chain` first.
+        async fn reviewed(reviewers: Vec<crate::external_hook::ReviewerConfig>) -> Self {
             use aither_sandbox::{TerminalTool, ToolRegistryBuilder};
             use executor_core::tokio::TokioGlobal;
 
@@ -3379,6 +3485,22 @@ You are a file-defined agent.
             let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
             let permission = RecordingPermission::default();
             let asked = permission.asked.clone();
+            let hook_tools = crate::test_support::prepared_fixture().await;
+            let permission = crate::ReviewedPermission::new(
+                permission,
+                crate::external_hook::ExternalHooks::new(
+                    &crate::external_hook::LiveHooks::start(
+                        crate::external_hook::HooksConfig {
+                            reviewers,
+                            ..crate::external_hook::HooksConfig::default()
+                        },
+                        &hook_tools.tools,
+                        executor_core::AnyExecutor::new(TokioGlobal),
+                    )
+                    .await
+                    .expect("the hooks start"),
+                ),
+            );
             let terminal = TerminalTool::new_exact(session.path(), permission, TokioGlobal)
                 .await
                 .expect("terminal tool should initialize")
@@ -3388,6 +3510,7 @@ You are a file-defined agent.
             let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
             Self {
                 _dirs: [session, source, cache],
+                _hook_tools: hook_tools,
                 terminal: terminal.with_registry(registry),
                 asked,
             }
@@ -3463,6 +3586,7 @@ You are a file-defined agent.
                 "description": "probe the permission path",
                 "script": "echo forked",
                 "mode": "unsafe",
+                "timeout": 30,
             }),
         ))
     }
@@ -3585,6 +3709,75 @@ You are a file-defined agent.
 
         let _ = std::fs::remove_dir_all(fork_dir);
         let _ = std::fs::remove_dir_all(worker_dir);
+    }
+
+    /// Runs a subagent whose model asks for an out-of-sandbox command, behind
+    /// a chain of one reviewer printing `answer`. Returns what the existing
+    /// route was asked, what the reviewer read, and the text the subagent's
+    /// model got back for its command.
+    #[cfg(unix)]
+    async fn subagent_request_behind_reviewer(answer: &str) -> (usize, String, String) {
+        use crate::external_hook::tests::{logged, reviewers::reviewer};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let fixture =
+            ForkFixture::reviewed(vec![reviewer(dir.path(), "guard", &log, answer)]).await;
+        let (seen_tx, seen_rx) = async_channel::unbounded();
+        let main = ScriptedLlm::new("main", &seen_tx);
+        let tool = fixture.tool(&main, &seen_tx);
+        main.then([
+            vec![unsafe_terminal_call("call-1")],
+            vec![Event::Text("finished".to_string())],
+        ]);
+        let (worker_dir, worker) =
+            start_fork("worker-reviewed", "worker", Some(ModelTier::Advanced));
+        Tool::call(&tool, worker, ToolContext::new())
+            .await
+            .expect("worker call");
+        let requests = drain(&seen_rx);
+        let (_, after_command) = requests.last().expect("the worker sent requests");
+        let seen_by_model = after_command
+            .messages()
+            .iter()
+            .map(|message| message.content().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reviewed = logged(&log);
+        assert_eq!(reviewed.len(), 1, "the reviewer saw the request once");
+        assert_eq!(reviewed[0]["role"], "subagent");
+        assert_eq!(reviewed[0]["script"], "echo forked");
+        let asked = fixture.asked.lock().unwrap().len();
+        let _ = std::fs::remove_dir_all(worker_dir);
+        (asked, reviewed[0].to_string(), seen_by_model)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagents_request_every_reviewer_passes_reaches_the_main_agent() {
+        let (asked, _, _) = subagent_request_behind_reviewer(r#"{"decision":"pass"}"#).await;
+        assert_eq!(asked, 1, "the main agent's permission handler was asked");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reviewer_approving_a_subagents_request_grants_it_without_asking() {
+        let (asked, _, seen) = subagent_request_behind_reviewer(r#"{"decision":"approve"}"#).await;
+        assert_eq!(asked, 0, "the main agent was not asked");
+        assert!(seen.contains("forked"), "the command ran: {seen}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reviewer_denying_a_subagents_request_tells_its_model_why() {
+        let (asked, _, seen) =
+            subagent_request_behind_reviewer(r#"{"decision":"deny","reason":"no escalation"}"#)
+                .await;
+        assert_eq!(asked, 0, "the main agent was not asked");
+        assert!(
+            seen.contains("The permission reviewer guard denied this request: no escalation"),
+            "{seen}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3784,11 +3977,12 @@ You are a file-defined agent.
 
         main.then([vec![Event::ToolCall(aither_core::llm::ToolCall::new(
             "bg-1",
-            "terminal_background",
+            "terminal",
             serde_json::json!({
                 "description": "start a job",
                 "script": "sleep 30",
                 "timeout": 60,
+                "background": true,
             }),
         ))]]);
         main.then_with(|request| {
@@ -3848,5 +4042,85 @@ You are a file-defined agent.
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // The hook fixtures are `sh` scripts (`external_hook::tests`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subagents_actions_reach_hooks_with_the_subagent_role() {
+        use crate::external_hook::LifecycleKind;
+        use crate::external_hook::tests::{logged, recorder};
+
+        let hooks_dir = unique_temp_dir("subagent-hooks");
+        let tools = crate::test_support::prepared_fixture().await;
+        let log = hooks_dir.join("log");
+        let main = crate::external_hook::tests::lifecycle_hooks(
+            vec![recorder(
+                &hooks_dir,
+                &log,
+                &[
+                    LifecycleKind::SessionStart,
+                    LifecycleKind::UserMessage,
+                    LifecycleKind::Stop,
+                    LifecycleKind::SubagentStart,
+                    LifecycleKind::SubagentStop,
+                ],
+            )],
+            &tools,
+        )
+        .await;
+        let tool =
+            worker_tool(SubagentTool::new(TextLlm::new("only-model"))).with_hooks(main.clone());
+        let (dir, prompt_file) = write_prompt_file("subagent-hooks", "do it");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            Tool::call(
+                &tool,
+                SubagentArgs::Start {
+                    worktrees: Vec::new(),
+                    commit_worktrees: Vec::new(),
+                    subagent: "worker".to_string(),
+                    prompt_file: prompt_file.to_string_lossy().into_owned(),
+                    model: Some(ModelTier::Fast),
+                },
+                ToolContext::new(),
+            ),
+        )
+        .await
+        .expect("the subagent finishes within its bound")
+        .expect("the subagent completes");
+
+        let seen: Vec<(String, String)> = logged(&log)
+            .iter()
+            .map(|input| {
+                (
+                    input["event"].as_str().unwrap().to_string(),
+                    input["role"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let expected = [
+            ("subagent_start", "main"),
+            ("session_start", "subagent"),
+            ("user_message", "subagent"),
+            ("stop", "subagent"),
+            ("subagent_stop", "main"),
+        ]
+        .map(|(event, role)| (event.to_string(), role.to_string()));
+        assert_eq!(seen, expected);
+        let inputs = logged(&log);
+        assert_eq!(inputs[0]["subagent"], "worker");
+        assert_eq!(inputs[0]["prompt"], "do it");
+        assert_eq!(inputs[4]["end"], "completed");
+        assert_eq!(inputs[4]["result"], "only-model");
+
+        // Only what happened to the main agent reaches its inbox; the
+        // subagent's context stayed in the subagent's own.
+        let injected = crate::Hook::take_injected_context(&main);
+        assert_eq!(injected.len(), 2);
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(hooks_dir);
     }
 }

@@ -10,6 +10,7 @@
 //! (e.g., `amber-forest-thunder-pearl/`). All terminal executions share this
 //! directory, but each execution gets a fresh sandbox (new TTY/process).
 
+use crate::grants::{GrantSet, TerminalGrants};
 use std::{
     borrow::Cow,
     io::{Read, Write},
@@ -32,11 +33,16 @@ use async_channel::{Receiver, Sender};
 use async_io::Async;
 use executor_core::{Executor, Task};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(target_os = "linux")]
+use heel::supervisor::{TreeControl, TreeReport};
 use heel::{
     Access, AllowAll, Audited, CpuPriority, DomainRequest, Grant, IoPriority, IpcRouter,
-    NetworkAuditLog, NetworkPolicy, ProcessPriority, Sandbox, SandboxConfig, SecurityConfig,
-    StdioConfig, WorkingDir,
+    NetworkAuditLog, NetworkPolicy, ProcessPriority, ResolvedPath, Sandbox, SandboxConfig,
+    SecurityConfig, StdioConfig, WorkingDir,
 };
+/// On platforms without `heel supervise` a wait produces no report.
+#[cfg(not(target_os = "linux"))]
+struct TreeReport;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use shell_words::split as split_shell_words;
@@ -47,25 +53,30 @@ use crate::jobserver::{JobBroker, JobPool, job_broker_channel};
 use crate::{
     ContainerPath, MountRoot, PreparedTools, ToolDistribution, ToolRuntimeError,
     builtin::builtin_router,
-    command::{CommandRole, ToolRegistry},
+    command::{
+        AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandRole, GateDecision, ToolRegistry,
+    },
     job_registry::{JobRegistry, JobStatus, job_registry_channel},
     output::{
-        INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, empty_stream,
-        save_raw_to_file, stored_path,
+        INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, save_raw_to_file,
+        stored_path,
     },
-    permission::{PermissionError, PermissionHandler, TerminalMode},
+    permission::{PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode},
+    process_tree::{JobMarker, JobProcess, JobTree},
     shell_session::{
-        BridgeAddress, ContainerExecOutcome, ContainerShellRuntime, ShellBackend,
+        BridgeAddress, ContainerExecOutcome, ContainerShellRuntime, ExecLifetime, ShellBackend,
         ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile,
     },
     stdin_watch::{
         EpisodeDetector, FeedCounter, LocalStdinProbe, STDIN_WATCH_INTERVAL, StdinWatchSignal,
     },
     subagent::{
-        CommitLedger, CommittingWorktree, LaunchHistory, Launcher, SubagentGrant,
-        SubagentGrantError, canonical as canonical_path,
+        CommitLedger, CommittingWorktree, ImportBudget, ImportLimits, LaunchHistory, Launcher,
+        Spelling, SubagentGit, SubagentGrant, SubagentGrantError, canonical as canonical_path,
     },
 };
+
+mod subagent_git;
 
 pub fn erase_terminal_tool<T>(tool: T) -> crate::command::DynTerminalToolEntry
 where
@@ -132,7 +143,7 @@ struct PermissionNetworkPolicy<P> {
 impl<P: PermissionHandler + 'static> NetworkPolicy for PermissionNetworkPolicy<P> {
     async fn check(&self, request: &DomainRequest) -> bool {
         self.permission_handler
-            .check_domain(request.host(), request.port())
+            .authorize_domain(request.host(), request.port())
             .await
     }
 }
@@ -246,23 +257,36 @@ fn build_terminal_launch(
         ));
     }
 
-    if script_requires_shell(script) {
-        return shell_launch_reporting(script, report);
+    match direct_command(script)? {
+        Some((program, args)) => Ok(TerminalLaunch::Direct { program, args }),
+        None => shell_launch_reporting(script, report),
     }
+}
 
+/// The program and arguments of a script that runs without a shell, or
+/// `None` when it needs one.
+fn direct_command(script: &str) -> Result<Option<(String, Vec<String>)>, TerminalError> {
+    if script_requires_shell(script) {
+        return Ok(None);
+    }
     let (program, args) = parse_direct_command(script)?;
     if looks_like_env_assignment(&program) || is_shell_builtin(&program) {
-        return shell_launch_reporting(script, report);
+        return Ok(None);
     }
+    Ok(Some((program, args)))
+}
 
-    Ok(TerminalLaunch::Direct { program, args })
+/// Whether a local launch of `script` runs in a shell, the only way a
+/// command can change directory.
+fn runs_in_shell(script: &str) -> bool {
+    matches!(direct_command(script.trim()), Ok(None))
 }
 
 #[derive(Template)]
 #[template(path = "carry_cwd.sh", escape = "none")]
 struct CarryCwdTemplate<'a> {
     escaped_report: &'a str,
-    script: &'a str,
+    escaped_script: &'a str,
 }
 
 fn shell_launch_reporting(
@@ -278,13 +302,22 @@ fn shell_launch_reporting(
     Ok(TerminalLaunch::Shell { program, args })
 }
 
-/// `script` followed by nothing but a trap that writes the shell's final
-/// directory to `report`, a path as the shell sees it.
+/// `script`, run through `eval`, followed by a trailer that writes the
+/// shell's final directory to `report`, a path as the shell sees it, and
+/// exits with the script's status.
+///
+/// The report is not written from an `EXIT` trap: setting one makes a
+/// non-interactive bash catch SIGTERM, and a child it has just forked still
+/// carries that handler until it resets its signals, so a `kill` sent in that
+/// window is swallowed and the process it names runs on. `eval` keeps the
+/// trailer out of reach of the script's own syntax, such as an unterminated
+/// here-document. A script that ends through `exit` writes no report.
 fn carry_cwd_script(script: &str, report: &str) -> Result<String, TerminalError> {
     let escaped_report = shell_escape(report);
+    let escaped_script = shell_escape(script);
     CarryCwdTemplate {
         escaped_report: &escaped_report,
-        script,
+        escaped_script: &escaped_script,
     }
     .render()
     .map_err(|error| {
@@ -347,10 +380,16 @@ async fn ensure_mode_allowed<P: PermissionHandler>(
 /// ## Execution Modes
 ///
 /// Each call selects its own runtime mode and starts a fresh shell; only a
-/// successful `cd` carries over to the next call.
-/// A call runs in the foreground and is killed — with its whole process
-/// tree — after 10 seconds. Run long-running commands with
-/// `terminal_background`, which takes an explicit job timeout.
+/// successful `cd` carries over to the next call. `timeout` is required:
+/// it is the job's maximum runtime in seconds — the job and its process
+/// tree are killed when it passes — and it may be at most 120 minutes.
+///
+/// By default the call waits in the foreground for up to 10 seconds. A
+/// command still running then **promotes to a background task**: the call
+/// returns the task id and the output captured so far, and the job keeps
+/// running under its `timeout` bound. Manage it with `terminal_read`
+/// (incremental output), `terminal_input` (stdin) and `terminal_kill`.
+/// Set `background: true` to detach immediately instead of waiting.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TerminalArgs {
     /// Short human-readable explanation of what this command is doing.
@@ -394,9 +433,9 @@ pub struct TerminalArgs {
     /// Maximum number of output lines to include inline.
     /// For foreground executions, this is the inline line budget
     /// before output offloads to file.
-    /// For background executions started with `terminal_background`, only
-    /// the first `max_lines` are returned immediately, while full output is
-    /// redirected to file.
+    /// For executions detached with `background: true` or promoted past
+    /// the foreground window, only the first `max_lines` are returned
+    /// immediately, while full output is redirected to file.
     /// Clamped to 800 max.
     /// Default: 200.
     #[serde(default = "default_max_lines")]
@@ -407,27 +446,18 @@ pub struct TerminalArgs {
     /// (checksums, binary protocols, diff inputs). Default: false.
     #[serde(default)]
     pub raw: bool,
-}
 
-/// Run a terminal command as a background job.
-///
-/// The command starts detached and this call returns immediately with the
-/// job's task id; `terminal` only runs commands in the foreground and kills
-/// them after 10 seconds. Use `terminal_read` for incremental output,
-/// `terminal_input` for stdin, and `terminal_kill` to stop the job early.
-///
-/// `timeout` is the job's maximum runtime in seconds: the job and its
-/// process tree are killed when it passes, and it may be at most 120
-/// minutes. To wait longer than that, schedule a wake-up (cron) rather than
-/// starting a longer job.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct TerminalBackgroundArgs {
-    /// Every argument a foreground `terminal` call takes.
-    #[serde(flatten)]
-    pub terminal: TerminalArgs,
-    /// Maximum runtime of the background job in seconds. The job is killed
-    /// when it passes. At most 7200 (120 minutes).
+    /// Maximum runtime of the command in seconds. Required. The command and
+    /// its process tree are killed when it passes; the value may be at most
+    /// 7200 (120 minutes).
     pub timeout: u64,
+
+    /// Start the command detached and return immediately with its task id
+    /// instead of waiting in the foreground. Default: false — the call
+    /// waits up to the foreground window and promotes a still-running
+    /// command to a background task.
+    #[serde(default)]
+    pub background: bool,
 }
 
 /// Requested terminal execution backend.
@@ -451,31 +481,40 @@ const fn default_max_lines() -> u32 {
 
 const MAX_LINES_CEILING: u32 = 800;
 
-/// How long a foreground `terminal` command may run before it is killed
-/// with its process tree.
-pub const DEFAULT_FOREGROUND_LIMIT: Duration = Duration::from_secs(10);
-/// Largest `timeout` a `terminal_background` job accepts.
-pub const DEFAULT_BACKGROUND_TIMEOUT_CAP: Duration = Duration::from_secs(120 * 60);
+/// How long a `terminal` call waits in the foreground before a still-running
+/// command promotes to a background task.
+pub const DEFAULT_FOREGROUND_WAIT: Duration = Duration::from_secs(10);
+/// The default of the most bytes a subagent's sandbox may send the host while
+/// its commits are imported into the main repository.
+pub const DEFAULT_SUBAGENT_IMPORT_LIMIT: u64 = 1024 * 1024 * 1024;
+/// Largest `timeout` a command accepts.
+pub const DEFAULT_TIMEOUT_CAP: Duration = Duration::from_secs(120 * 60);
 /// A background job still running after this long produces one system alert.
 pub const DEFAULT_LONG_JOB_ALERT_AFTER: Duration = Duration::from_secs(40 * 60);
 
 /// Time bounds applied to every execution this terminal spawns.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TerminalLimits {
-    /// Foreground kill limit for `terminal` calls.
-    foreground: Duration,
-    /// Maximum accepted `timeout` for `terminal_background` jobs.
-    background_timeout_cap: Duration,
+    /// Foreground wait before a `terminal` call promotes to a background
+    /// task.
+    foreground_wait: Duration,
+    /// Maximum accepted `timeout` for a command.
+    timeout_cap: Duration,
     /// Runtime after which a background job produces a long-running alert.
     long_job_alert: Duration,
+    /// Most bytes a subagent's sandbox may send while its commits are
+    /// imported; shared with every terminal derived from this one, and
+    /// adjustable at runtime.
+    subagent_import: ImportBudget,
 }
 
 impl Default for TerminalLimits {
     fn default() -> Self {
         Self {
-            foreground: DEFAULT_FOREGROUND_LIMIT,
-            background_timeout_cap: DEFAULT_BACKGROUND_TIMEOUT_CAP,
+            foreground_wait: DEFAULT_FOREGROUND_WAIT,
+            timeout_cap: DEFAULT_TIMEOUT_CAP,
             long_job_alert: DEFAULT_LONG_JOB_ALERT_AFTER,
+            subagent_import: ImportBudget::new(DEFAULT_SUBAGENT_IMPORT_LIMIT),
         }
     }
 }
@@ -520,16 +559,83 @@ pub struct StdinProbeFailedJob {
     pub error: String,
 }
 
-/// A system alert about a background job, delivered through the terminal's
-/// alert channel.
+/// Why the next foreground command does not start where the last one left
+/// the shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryResetReason {
+    /// The command failed, so the directory it ended in is not carried.
+    Failed,
+    /// The command ended through `exit` or a signal and reported no
+    /// directory.
+    Unreported,
+    /// The directory it ended in lies outside the paths the terminal may
+    /// read.
+    OutsideReadable,
+    /// The directory it ended in lies outside the container's workspace
+    /// mount.
+    OutsideWorkspace,
+    /// The directory no longer exists.
+    Removed,
+}
+
+/// The working directory carried between foreground commands was reset.
+///
+/// Sent once per reset, at the moment it happens.
+#[derive(Debug, Clone)]
+pub struct DirectoryReset {
+    /// The directory the next command runs in, as the command sees it.
+    pub dir: PathBuf,
+    /// Why the shell's directory was not carried.
+    pub reason: DirectoryResetReason,
+}
+
+/// The most processes a [`DescendantsKilled`] alert names.
+const KILLED_PROCESSES_NAMED: usize = 8;
+
+/// Processes a foreground command left running when its shell exited, killed
+/// with it.
+///
+/// Sent once per command, at the moment they were killed.
+#[derive(Debug, Clone)]
+pub struct DescendantsKilled {
+    /// The first processes killed, at most eight.
+    pub processes: Vec<JobProcess>,
+    /// How many more were killed beyond those named.
+    pub omitted: usize,
+}
+
+impl DescendantsKilled {
+    fn new(mut killed: Vec<JobProcess>) -> Self {
+        let omitted = killed.len().saturating_sub(KILLED_PROCESSES_NAMED);
+        killed.truncate(KILLED_PROCESSES_NAMED);
+        Self {
+            processes: killed,
+            omitted,
+        }
+    }
+}
+
+/// A system alert about a background job, or about the carried working
+/// directory, delivered through the terminal's alert channel.
 #[derive(Debug, Clone)]
 pub enum JobAlert {
+    /// A foreground command's shell exited while descendants were still
+    /// running, and they were killed.
+    DescendantsKilled(DescendantsKilled),
+    /// The directory carried between foreground commands was reset.
+    DirectoryReset(DirectoryReset),
     /// The job crossed the long-running threshold.
     LongRunning(LongRunningJob),
     /// The job is waiting for input on its stdin.
     StdinBlocked(StdinBlockedJob),
     /// Watching the job's stdin failed; no blocked-on-stdin alert can follow.
     StdinProbeFailed(StdinProbeFailedJob),
+    /// A monitor collected new output lines from its watched job.
+    MonitorIncrement(crate::monitor::MonitorIncrement),
+    /// A monitor saw no new output for its stall window.
+    MonitorStalled(crate::monitor::MonitorStalled),
+    /// A monitor ended, reporting why.
+    MonitorEnded(crate::monitor::MonitorEnded),
 }
 
 /// A command that ran to completion.
@@ -557,7 +663,8 @@ impl From<CompletedCommand> for CommandResult {
     }
 }
 
-/// A background job that has just been started by `terminal_background`.
+/// A job `terminal` has just detached as a background task — started with
+/// `background: true` or promoted past the foreground window.
 ///
 /// Sent through the terminal's started-task channel once per launched job;
 /// the agent turns it into a durable reminder and a `background_task_started`
@@ -616,6 +723,9 @@ pub struct CompletedTask {
     pub script: String,
     /// The result of execution.
     pub result: Result<CompletedCommand, TerminalError>,
+    /// Whether the job was killed — its `timeout` bound or `terminal_kill`
+    /// — rather than exiting on its own.
+    pub killed: bool,
 }
 
 /// Stage of a permission-lifecycle event for `terminal`.
@@ -755,8 +865,8 @@ impl BackgroundTaskReceiver {
 
     /// Takes all freshly started background tasks without blocking.
     ///
-    /// Each entry names a job `terminal_background` has just launched; a job
-    /// produces exactly one.
+    /// Each entry names a job `terminal` has just detached; a job produces
+    /// exactly one.
     #[must_use]
     pub fn take_started(&self) -> Vec<StartedBackgroundTask> {
         let mut started = Vec::new();
@@ -797,6 +907,29 @@ impl BackgroundTaskReceiver {
             async_io::Timer::after(duration).await;
             None
         })
+        .await
+    }
+
+    /// Waits for the next completed task or job alert.
+    ///
+    /// Cancel-safe: an event is taken only when this future completes, so a
+    /// caller racing it against other work loses nothing. A closed channel
+    /// never ends the wait.
+    pub async fn recv_event(&self) -> BackgroundTaskEvent {
+        futures_lite::future::or(
+            async {
+                match self.rx.recv().await {
+                    Ok(task) => BackgroundTaskEvent::Completed(Box::new(task)),
+                    Err(_) => std::future::pending().await,
+                }
+            },
+            async {
+                match self.alert_rx.recv().await {
+                    Ok(alert) => BackgroundTaskEvent::Alert(alert),
+                    Err(_) => std::future::pending().await,
+                }
+            },
+        )
         .await
     }
 
@@ -901,6 +1034,8 @@ pub struct TerminalToolFactory {
 #[derive(Debug)]
 struct TerminalToolRequest {
     grant: SubagentGrant,
+    observer: Option<AnyCommandObserver>,
+    gate: Option<AnyCommandGate>,
     reply: Sender<Result<crate::command::DynTerminalTool, SubagentGrantError>>,
 }
 
@@ -925,7 +1060,8 @@ impl TerminalToolFactory {
     /// The tool serves the subagent registry and runs in a space of its own
     /// inside the launching terminal's working directory; `grant` is
     /// everything it may write beyond that space, and must lie inside what the
-    /// launching terminal can write.
+    /// launching terminal can write. The commands it calls are told to
+    /// `observer`, and every shell command it runs is put to `gate`.
     ///
     /// # Errors
     /// Returns an error when the launching terminal is gone or does not
@@ -933,10 +1069,17 @@ impl TerminalToolFactory {
     pub async fn create(
         &self,
         grant: SubagentGrant,
+        observer: Option<AnyCommandObserver>,
+        gate: Option<AnyCommandGate>,
     ) -> Result<crate::command::DynTerminalTool, TerminalToolFactoryError> {
         let (reply, reply_rx) = async_channel::bounded(1);
         self.tx
-            .send(TerminalToolRequest { grant, reply })
+            .send(TerminalToolRequest {
+                grant,
+                observer,
+                gate,
+                reply,
+            })
             .await
             .map_err(|_| TerminalToolFactoryError::Unavailable)?;
         Ok(reply_rx
@@ -960,9 +1103,15 @@ async fn serve_launches<P, E>(
     E: Executor + Clone + 'static,
 {
     let mut history = LaunchHistory::default();
-    while let Ok(TerminalToolRequest { grant, reply }) = requests.recv().await {
+    while let Ok(TerminalToolRequest {
+        grant,
+        observer,
+        gate,
+        reply,
+    }) = requests.recv().await
+    {
         let tool = source
-            .subagent(&mut history, grant)
+            .subagent(&mut history, grant, observer, gate)
             .await
             .map(TerminalTool::to_dyn);
         if reply.send(tool).await.is_err() {
@@ -978,6 +1127,7 @@ pub struct TerminalBinding {
     launcher: TerminalToolFactory,
     working_dir: PathBuf,
     role: CommandRole,
+    observer: Option<AnyCommandObserver>,
 }
 
 impl TerminalBinding {
@@ -999,6 +1149,12 @@ impl TerminalBinding {
     #[must_use]
     pub const fn role(&self) -> CommandRole {
         self.role
+    }
+
+    /// The observer told about the commands this terminal's registry serves.
+    #[must_use]
+    pub const fn observer(&self) -> Option<&AnyCommandObserver> {
+        self.observer.as_ref()
     }
 }
 
@@ -1057,6 +1213,8 @@ struct SubagentAuthority {
     /// The worktrees it may commit in, with their git data; it hands on no
     /// other commit grant.
     committing: Vec<CommittingWorktree>,
+    /// Runs git in its sandbox, as it, for the host's view of its commits.
+    git: SubagentGit,
     /// Where its commands run when its home backend is a container: its
     /// space and granted paths, mapped through the container's workspace
     /// mount when it was launched.
@@ -1089,6 +1247,9 @@ struct CwdCarry {
     /// Set for a container command: the workspace mount that maps the host
     /// paths above into the container and back.
     container: Option<ContainerCarry>,
+    /// Whether the command runs in a shell and so writes the report; a
+    /// direct command cannot change directory and writes none.
+    shell: bool,
 }
 
 /// How a container command spells its directory report.
@@ -1132,16 +1293,17 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     permission_rx: Receiver<PermissionEvent>,
     /// Channel sender for permission lifecycle events.
     permission_tx: Sender<PermissionEvent>,
-    /// Additional paths that should be writable in the sandbox.
-    writable_paths: Vec<PathBuf>,
-    /// Additional paths that should be readable (but not writable) in the sandbox.
-    readable_paths: Vec<PathBuf>,
+    /// Filesystem grants, shared by every clone; commands snapshot them at
+    /// launch.
+    grants: TerminalGrants,
     /// Set on a subagent's terminal, never on the main agent's.
     subagent: Option<SubagentAuthority>,
     /// The working directory the next foreground command starts in; held on
     /// the main agent's terminal only, a subagent's commands always start in
     /// its own space.
     carried_dir: Option<CarriedDir>,
+    /// Extra environment variables resolved for each spawned execution.
+    env_source: Option<Arc<dyn TerminalEnvSource>>,
     /// Rolling audit log recording every sandboxed network policy decision.
     network_audit: Option<NetworkAuditLog>,
     /// Scheduling priority applied to every sandboxed execution.
@@ -1169,14 +1331,14 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             alert_tx: self.alert_tx.clone(),
             started_rx: self.started_rx.clone(),
             started_tx: self.started_tx.clone(),
-            limits: self.limits,
+            limits: self.limits.clone(),
             running_tasks: self.running_tasks.clone(),
             permission_rx: self.permission_rx.clone(),
             permission_tx: self.permission_tx.clone(),
-            writable_paths: self.writable_paths.clone(),
-            readable_paths: self.readable_paths.clone(),
+            grants: self.grants.clone(),
             subagent: self.subagent.clone(),
             carried_dir: self.carried_dir.clone(),
+            env_source: self.env_source.clone(),
             network_audit: self.network_audit.clone(),
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1292,10 +1454,10 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             running_tasks,
             permission_rx,
             permission_tx,
-            writable_paths: Vec::new(),
-            readable_paths: Vec::new(),
+            grants: TerminalGrants::new(),
             subagent: None,
             carried_dir: Some(CarriedDir::default()),
+            env_source: None,
             network_audit: None,
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1360,10 +1522,10 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             running_tasks,
             permission_rx,
             permission_tx,
-            writable_paths: Vec::new(),
-            readable_paths: Vec::new(),
+            grants: TerminalGrants::new(),
             subagent: None,
             carried_dir: Some(CarriedDir::default()),
+            env_source: None,
             network_audit: None,
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1393,10 +1555,10 @@ impl<P, E, State> TerminalTool<P, E, State> {
             running_tasks: self.running_tasks,
             permission_rx: self.permission_rx,
             permission_tx: self.permission_tx,
-            writable_paths: self.writable_paths,
-            readable_paths: self.readable_paths,
+            grants: self.grants,
             subagent: self.subagent,
             carried_dir: self.carried_dir,
+            env_source: self.env_source,
             network_audit: self.network_audit,
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1427,6 +1589,24 @@ where
     }
 }
 
+#[cfg(test)]
+impl<P, E> TerminalTool<P, E, Configured>
+where
+    P: PermissionHandler + 'static,
+    E: Executor + Clone + 'static,
+{
+    /// A subagent terminal with an empty grant, told to no observer or gate.
+    async fn subagent_without_grant(&self) -> Result<Self, SubagentGrantError> {
+        self.subagent(
+            &mut LaunchHistory::default(),
+            SubagentGrant::new(),
+            None,
+            None,
+        )
+        .await
+    }
+}
+
 impl<P, E> TerminalTool<P, E, Launching>
 where
     P: PermissionHandler + 'static,
@@ -1439,6 +1619,7 @@ where
             launcher: TerminalToolFactory { tx: launcher },
             working_dir: self.working_dir.clone(),
             role: self.registry.registry.role(),
+            observer: self.registry.registry.observer().cloned(),
         };
         let source = self.clone();
         self.executor
@@ -1451,6 +1632,22 @@ where
     }
 }
 
+/// Supplies extra environment variables resolved for each spawned execution.
+///
+/// Implemented by embedders that need values decided at command time —
+/// secrets read from a live store, per-call overrides — rather than at tool
+/// construction. `Vec<(String, String)>` implements it for static pairs.
+pub trait TerminalEnvSource: std::fmt::Debug + Send + Sync {
+    /// `(name, value)` pairs injected into the spawned command's environment.
+    fn env(&self) -> Vec<(String, String)>;
+}
+
+impl TerminalEnvSource for Vec<(String, String)> {
+    fn env(&self) -> Vec<(String, String)> {
+        self.clone()
+    }
+}
+
 impl<P, E, State> TerminalTool<P, E, State>
 where
     E: Executor + Clone + 'static,
@@ -1460,12 +1657,10 @@ where
     ///
     /// These paths will be writable in sandboxed and network modes.
     #[must_use]
-    pub fn with_writable_paths(
-        mut self,
-        paths: impl IntoIterator<Item = impl Into<PathBuf>>,
-    ) -> Self {
-        self.writable_paths
-            .extend(paths.into_iter().map(Into::into));
+    pub fn with_writable_paths(self, paths: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
+        for path in paths {
+            self.grants.add_writable(path.into());
+        }
         self
     }
 
@@ -1474,13 +1669,32 @@ where
     /// These paths will be readable in all sandbox modes, even in strict
     /// filesystem mode where reads outside the sandbox are normally denied.
     #[must_use]
-    pub fn with_readable_paths(
-        mut self,
-        paths: impl IntoIterator<Item = impl Into<PathBuf>>,
-    ) -> Self {
-        self.readable_paths
-            .extend(paths.into_iter().map(Into::into));
+    pub fn with_readable_paths(self, paths: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
+        for path in paths {
+            self.grants.add_readable(path.into());
+        }
         self
+    }
+
+    /// Injects extra environment variables into every command this tool
+    /// spawns in the home environment.
+    ///
+    /// The source is resolved per execution, so values it returns reflect
+    /// the moment each command launches. Injection applies to the local and
+    /// container backends; SSH targets are deliberately excluded so
+    /// host-side values (for example secrets) never reach remote machines.
+    /// Caller-provided names override the session's computed environment.
+    #[must_use]
+    pub fn with_env_source(mut self, source: impl TerminalEnvSource + 'static) -> Self {
+        self.env_source = Some(Arc::new(source));
+        self
+    }
+
+    /// Injects a fixed set of environment variables into every spawned
+    /// command; a convenience for [`Self::with_env_source`] over static pairs.
+    #[must_use]
+    pub fn with_envs(self, envs: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.with_env_source(envs.into_iter().collect::<Vec<_>>())
     }
 
     /// Lowers the scheduling priority of the commands this tool runs.
@@ -1532,20 +1746,43 @@ where
         Ok(self)
     }
 
-    /// Sets how long a foreground `terminal` command may run before it is
-    /// killed with its process tree. Defaults to [`DEFAULT_FOREGROUND_LIMIT`].
+    /// Sets how long a `terminal` call waits in the foreground before a
+    /// still-running command promotes to a background task. Defaults to
+    /// [`DEFAULT_FOREGROUND_WAIT`].
     #[must_use]
-    pub const fn with_foreground_limit(mut self, limit: Duration) -> Self {
-        self.limits.foreground = limit;
+    pub const fn with_foreground_wait(mut self, wait: Duration) -> Self {
+        self.limits.foreground_wait = wait;
         self
     }
 
-    /// Sets the largest `timeout` a `terminal_background` job accepts.
-    /// Defaults to [`DEFAULT_BACKGROUND_TIMEOUT_CAP`].
+    /// Sets the largest `timeout` a command accepts.
+    /// Defaults to [`DEFAULT_TIMEOUT_CAP`].
     #[must_use]
-    pub const fn with_background_timeout_cap(mut self, cap: Duration) -> Self {
-        self.limits.background_timeout_cap = cap;
+    pub const fn with_timeout_cap(mut self, cap: Duration) -> Self {
+        self.limits.timeout_cap = cap;
         self
+    }
+
+    /// Sets the most bytes a subagent's sandbox may send the host while the
+    /// commits it made are imported into the main repository; a pack or answer
+    /// that exceeds it fails the import. `0` leaves the bytes unbounded.
+    /// Defaults to [`DEFAULT_SUBAGENT_IMPORT_LIMIT`]. Each piece of an import's
+    /// sandboxed work is bounded in time by the foreground limit.
+    ///
+    /// The setting can be changed while the terminal and the subagents it
+    /// launches run, through [`Self::subagent_import_budget`].
+    #[must_use]
+    pub fn with_subagent_import_limit(self, bytes: u64) -> Self {
+        self.limits.subagent_import.set(bytes);
+        self
+    }
+
+    /// A handle on the setting [`Self::with_subagent_import_limit`] sets,
+    /// shared with every subagent this terminal launches: a change through it
+    /// applies to the next import of each of them.
+    #[must_use]
+    pub fn subagent_import_budget(&self) -> ImportBudget {
+        self.limits.subagent_import.clone()
     }
 
     /// Sets how long a background job may run before it produces one system
@@ -1574,7 +1811,7 @@ where
             .initialize_tools(distribution, cache_root)
             .await?;
         if let Some(tools) = self.local_home_tools()? {
-            tools.ensure_readonly(self.writable_grants()).await?;
+            tools.ensure_readonly(self.writable_grants().iter()).await?;
             tools.verify_local_versions(self.executor.clone()).await?;
         }
         Ok(self)
@@ -1603,7 +1840,7 @@ where
         sessions.prepared_catalog()?;
         self.shell_sessions = sessions;
         if let Some(tools) = self.local_home_tools()? {
-            tools.ensure_readonly(self.writable_grants()).await?;
+            tools.ensure_readonly(self.writable_grants().iter()).await?;
         }
         Ok(self)
     }
@@ -1618,8 +1855,11 @@ where
 
     /// The paths this terminal grants write access to, which must not expose
     /// the managed tools.
-    fn writable_grants(&self) -> impl Iterator<Item = &PathBuf> + Send {
-        std::iter::once(&self.working_dir).chain(self.writable_paths.iter())
+    fn writable_grants(&self) -> Vec<PathBuf> {
+        let grants = self.grants.snapshot();
+        std::iter::once(self.working_dir.clone())
+            .chain(grants.writable.iter().cloned())
+            .collect()
     }
 
     /// Initialized session configuration shared with child terminals.
@@ -1657,6 +1897,24 @@ where
     }
 
     /// Returns a receiver for completed background tasks.
+    /// Sender on the job-alert channel a watch task reports through;
+    /// `monitor` clones it for every pump it spawns.
+    pub(crate) fn job_alert_sender(&self) -> Sender<JobAlert> {
+        self.alert_tx.clone()
+    }
+
+    /// The executor backing this terminal, for spawning watch tasks.
+    pub(crate) const fn executor(&self) -> &E {
+        &self.executor
+    }
+
+    /// Paths mounted readable for commands, besides the working directory.
+    /// The shared runtime grant handle: adding a grant through it affects
+    /// every command launched afterwards, on this terminal and its clones.
+    pub fn grants(&self) -> TerminalGrants {
+        self.grants.clone()
+    }
+
     ///
     /// The returned `BackgroundTaskReceiver` can be used independently of the `TerminalTool`
     /// to poll for completed background tasks. This is useful for integrating with
@@ -1722,19 +1980,23 @@ where
     /// or a commit it cannot grant, when the grant cannot be resolved, when a
     /// container session cannot express the subagent's paths, or when the
     /// subagent's space cannot be created.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn subagent(
         &self,
         history: &mut LaunchHistory,
         grant: SubagentGrant,
+        observer: Option<AnyCommandObserver>,
+        gate: Option<AnyCommandGate>,
     ) -> Result<TerminalTool<P, E, Configured>, SubagentGrantError> {
         // Grants are compared by real path, so every path of the subagent's
         // view is canonical.
         let working_dir = canonical_path(&self.working_dir).await?;
         let mut authority = vec![working_dir.clone()];
-        for path in &self.writable_paths {
+        for path in &self.grants.snapshot().writable {
             authority.push(canonical_path(path).await?);
         }
         let spaces_root = working_dir.join(SUBAGENT_SPACES_DIR);
+        let mount = self.container_mount().await?;
         let granted = grant
             .resolve(
                 Launcher {
@@ -1744,15 +2006,22 @@ where
                         .as_ref()
                         .map(|subagent| subagent.committing.as_slice()),
                     spaces_root: &spaces_root,
+                    spelling: mount
+                        .as_ref()
+                        .map_or_else(Spelling::host, Spelling::through),
                 },
                 history,
             )
             .await?;
+        self.registry
+            .registry()
+            .record_committed(&granted.committing);
 
         let space = spaces_root.join(crate::naming::random_word_slug(4));
-        let container = self
-            .container_confinement_for(&space, &granted.writable)
-            .await?;
+        let container = mount
+            .as_ref()
+            .map(|mount| container_confinement_for(mount, &space, &granted.writable))
+            .transpose()?;
         async_fs::create_dir_all(&space)
             .await
             .map_err(|source| SubagentGrantError::Space {
@@ -1769,22 +2038,40 @@ where
         self.executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
-        let readable_paths = self
-            .readable_paths
-            .iter()
-            .cloned()
-            .chain(authority)
-            .collect();
+        let grants = TerminalGrants::derived(&self.grants, authority, granted.writable.clone());
+        let readable_paths = grants.snapshot().readable.clone();
+        let git = match (&container, mount) {
+            (Some(confinement), Some(mount)) => {
+                SubagentGit::new(Arc::new(subagent_git::ContainerGit {
+                    executor: self.executor.clone(),
+                    shell_sessions: self.shell_sessions.clone(),
+                    confinement: confinement.clone(),
+                    mount,
+                    priority: self.priority,
+                }))
+            }
+            _ => SubagentGit::new(Arc::new(subagent_git::LocalGit {
+                executor: self.executor.clone(),
+                working_dir: space.clone(),
+                writable: granted.writable,
+                readable: readable_paths,
+                committing: granted.committing.clone(),
+                priority: self.priority,
+            })),
+        };
         let registry = Arc::new(
             self.registry
                 .registry()
-                .for_subagent()
+                .for_subagent(observer, gate)
                 .with_terminal_controls(job_registry.clone(), self.outputs_dir()),
         );
         let launching = TerminalTool {
             working_dir: space,
             shell_sessions: self.shell_sessions.clone(),
-            permission_handler: self.permission_handler.clone(), // Arc clone - shares handler
+            permission_handler: self
+                .permission_handler
+                .for_subagent()
+                .map_or_else(|| self.permission_handler.clone(), Arc::new),
             executor: self.executor.clone(),
             output_store: self.output_store.clone(),
             job_registry,
@@ -1794,17 +2081,18 @@ where
             alert_tx,
             started_rx,
             started_tx,
-            limits: self.limits,
+            limits: self.limits.clone(),
             running_tasks,
             permission_rx,
             permission_tx,
-            writable_paths: granted.writable,
-            readable_paths,
+            grants,
             subagent: Some(SubagentAuthority {
                 committing: granted.committing,
+                git,
                 container,
             }),
             carried_dir: None,
+            env_source: self.env_source.clone(),
             network_audit: self.network_audit.clone(),
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
@@ -1814,14 +2102,10 @@ where
         Ok(launching.into_served())
     }
 
-    /// The sandbox a subagent's commands run in when this terminal's home
-    /// backend is a container: its space and granted paths, spelled through
-    /// the container's workspace mount. `None` outside a container.
-    async fn container_confinement_for(
-        &self,
-        space: &Path,
-        writable: &[PathBuf],
-    ) -> Result<Option<ContainerConfinement>, SubagentGrantError> {
+    /// The workspace mount of this terminal's home container, with its host
+    /// side canonical, spelling every path of a subagent's view inside the
+    /// container. `None` outside a container.
+    async fn container_mount(&self) -> Result<Option<MountRoot>, SubagentGrantError> {
         if self.shell_sessions.resolve_local_backend() != Ok(ShellBackend::Container) {
             return Ok(None);
         }
@@ -1831,26 +2115,35 @@ where
             .and_then(ContainerShellRuntime::workspace_mount)
             .ok_or(SubagentGrantError::NoContainerMount)?;
         // The mount is compared by real path, like everything it maps.
-        let mount = MountRoot::new(
+        Ok(Some(MountRoot::new(
             canonical_path(&mount.host_root).await?,
             mount.container_root.clone(),
-        );
-        let map = |path: &Path| {
-            mount
-                .container_path(path)
-                .map_err(|source| SubagentGrantError::OutsideContainerMount {
-                    path: path.to_path_buf(),
-                    source,
-                })
-        };
-        Ok(Some(ContainerConfinement {
-            working_dir: map(space)?,
-            writable: writable
-                .iter()
-                .map(|path| map(path))
-                .collect::<Result<_, _>>()?,
-        }))
+        )))
     }
+}
+
+/// The sandbox a subagent's commands run in inside a container: its space and
+/// granted paths, spelled through the container's workspace mount.
+fn container_confinement_for(
+    mount: &MountRoot,
+    space: &Path,
+    writable: &[PathBuf],
+) -> Result<ContainerConfinement, SubagentGrantError> {
+    let map = |path: &Path| {
+        mount
+            .container_path(path)
+            .map_err(|source| SubagentGrantError::OutsideContainerMount {
+                path: path.to_path_buf(),
+                source,
+            })
+    };
+    Ok(ContainerConfinement {
+        working_dir: map(space)?,
+        writable: writable
+            .iter()
+            .map(|path| map(path))
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 impl<P, E> TerminalTool<P, E, Configured>
@@ -1872,9 +2165,16 @@ where
     /// Lists the commits of the subagent this terminal serves, when it holds a
     /// commit grant.
     fn commit_ledger(&self) -> Option<CommitLedger> {
-        self.subagent
-            .as_ref()
-            .and_then(|subagent| CommitLedger::new(&subagent.committing))
+        self.subagent.as_ref().and_then(|subagent| {
+            CommitLedger::new(
+                &subagent.committing,
+                subagent.git.clone(),
+                ImportLimits {
+                    bytes: self.limits.subagent_import.clone(),
+                    time: self.limits.foreground_wait,
+                },
+            )
+        })
     }
 
     /// Converts this `TerminalTool` into a type-erased `DynTerminalTool`.
@@ -1899,11 +2199,7 @@ where
             .prepared_catalog()
             .expect("terminal tools must be initialized before exposing child capabilities")
             .clone();
-        let background_tool = self.background_tool();
-        let entries = vec![
-            erase_terminal_tool(self),
-            erase_terminal_tool(background_tool),
-        ];
+        let entries = vec![erase_terminal_tool(self)];
 
         DynTerminalTool {
             entries,
@@ -1999,6 +2295,21 @@ where
         mode: TerminalMode,
         script: &str,
     ) -> anyhow::Result<()> {
+        if mode.requires_approval() {
+            match self
+                .permission_handler
+                .review(&PermissionRequest::Command { mode, script })
+                .await
+            {
+                Review::Approved => return Ok(()),
+                Review::Denied(reason) => {
+                    return Err(anyhow::Error::new(TerminalError::from(
+                        PermissionError::Denied(reason),
+                    )));
+                }
+                Review::Passed => {}
+            }
+        }
         let permission_waits = self
             .permission_handler
             .will_wait_for_approval(mode, script)
@@ -2043,19 +2354,30 @@ where
             max_lines,
             raw,
             background,
+            timeout,
             carry,
         } = request;
         let ExecutionTarget { mode, backend } = target;
         let (result_tx, result_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
-        // A foreground command reads EOF from a null stdin; only a background
-        // job gets a stdin pipe, fed through `terminal_input` and watched.
-        let stdin_alerts = background.then(|| StdinAlerts {
+        // Every job gets a real stdin pipe: a foreground command that blocks
+        // on it promotes to a background task the model can feed through
+        // `terminal_input`, and a blocked episode raises an alert.
+        let stdin_alerts = Some(StdinAlerts {
             tx: self.alert_tx.clone(),
             task_id: task_id.clone(),
             script: script.clone(),
         });
+        self.spawn_kill_watchdog(&task_id, timeout);
+        self.spawn_long_job_alert(&task_id);
 
+        let lifetime = if background {
+            JobLifetime::Background
+        } else {
+            JobLifetime::Foreground {
+                alerts: self.alert_tx.clone(),
+            }
+        };
         let background_startup = BackgroundStartup::new(startup_tx);
         let running_tasks = self.running_tasks.clone();
         let completed_tx = self.completed_tx.clone();
@@ -2064,8 +2386,9 @@ where
         self.executor
             .spawn(execute_terminal_task(SpawnedTerminalTask {
                 working_dir: self.working_dir.clone(),
-                writable_paths: self.writable_paths.clone(),
-                readable_paths: self.readable_paths.clone(),
+                writable_paths: self.grants.snapshot().writable.clone(),
+                readable_paths: self.grants.snapshot().readable.clone(),
+                env_source: self.env_source.clone(),
                 executor: self.executor.clone(),
                 registry: self.registry().clone(),
                 permission_handler: self.permission_handler.clone(),
@@ -2074,10 +2397,13 @@ where
                 execution_id,
                 background,
                 carry,
+                carried_dir: self.carried_dir.clone(),
+                alert_tx: self.alert_tx.clone(),
                 script,
                 mode,
                 backend,
                 stdin_alerts,
+                lifetime,
                 background_startup,
                 expect,
                 resolution,
@@ -2116,8 +2442,22 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         arguments: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
+        let cap = self.limits.timeout_cap;
+        let timeout = Duration::from_secs(arguments.timeout);
+        if arguments.timeout == 0 || timeout > cap {
+            return Err(anyhow::anyhow!(
+                "terminal timeout must be between 1 and {} seconds",
+                cap.as_secs()
+            ));
+        }
         let prepared = self.prepare_execution(&arguments).await?;
-        let carry = self.cwd_carry(&prepared).await;
+        // A detached job cannot report a directory carry: its final
+        // directory is unknowable when the call returns.
+        let carry = if arguments.background {
+            None
+        } else {
+            self.cwd_carry(&prepared, &arguments.script).await
+        };
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
             task_id: prepared.task_id.clone(),
@@ -2127,24 +2467,65 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             resolution: arguments.resolution,
             max_lines: prepared.max_lines,
             raw: arguments.raw,
-            background: false,
+            background: arguments.background,
+            timeout,
             carry: carry.clone(),
         });
         // Registration precedes `report_ready` on every backend, so once
         // startup returns the job is killable through the registry and the
         // foreground clock only measures the command's own runtime.
         wait_for_background_startup(&spawned.startup).await?;
-        let outcome = wait_for_foreground_result(&spawned.result, self.limits.foreground).await;
-        if let Some(carry) = &carry {
-            let succeeded = matches!(&outcome, Some(Ok(result)) if result.exit_code == 0);
-            self.record_carried_dir(carry, succeeded).await;
+        if arguments.background {
+            return background_terminal_result(
+                &self.job_registry,
+                &prepared.store_dir,
+                &prepared.task_id,
+                prepared.max_lines,
+                &self.started_tx,
+            )
+            .await;
         }
+        let outcome =
+            wait_for_foreground_result(&spawned.result, self.limits.foreground_wait).await;
+        // A result that raced in at the window's edge counts as a
+        // foreground finish.
+        let outcome = outcome.or_else(|| spawned.result.try_recv().ok());
         match outcome {
-            Some(Ok(result)) => CommandResult::from(result).into_tool_result(),
-            Some(Err(err)) => Err(anyhow::anyhow!(err)),
-            None => {
-                self.finish_killed_foreground(&spawned, &prepared.task_id)
+            Some(Ok(result)) => {
+                let killed = self
+                    .job_registry
+                    .get_by_task_id(&prepared.task_id)
                     .await
+                    .is_some_and(|job| matches!(job.status, JobStatus::Killed));
+                let command = if killed {
+                    CommandResult {
+                        stdout: result.stdout,
+                        stderr: result.stderr,
+                        outcome: CommandOutcome::Killed {
+                            task_id: prepared.task_id.clone(),
+                            notice: format!(
+                                "Killed when its {}s timeout bound passed.",
+                                arguments.timeout
+                            ),
+                        },
+                    }
+                } else {
+                    CommandResult::from(result)
+                };
+                command.into_tool_result()
+            }
+            Some(Err(err)) => Err(anyhow::anyhow!(err)),
+            // The command outlived its foreground window: promote it to a
+            // background task.
+            None => {
+                background_terminal_result(
+                    &self.job_registry,
+                    &prepared.store_dir,
+                    &prepared.task_id,
+                    prepared.max_lines,
+                    &self.started_tx,
+                )
+                .await
             }
         }
     }
@@ -2154,7 +2535,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
     /// The directory report of a foreground command on the main agent's
     /// terminal; `None` for a subagent, for an ssh command and for a container
     /// whose workspace mount is not declared.
-    async fn cwd_carry(&self, prepared: &ExecutionPreparation) -> Option<CwdCarry> {
+    async fn cwd_carry(&self, prepared: &ExecutionPreparation, script: &str) -> Option<CwdCarry> {
         let carried = self.carried_dir.as_ref()?;
         let mount = match &prepared.target.backend {
             ExecutionBackend::Local(_) if !cfg!(windows) => None,
@@ -2173,6 +2554,18 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
             }
             Some(_) => {
                 carried.set(None);
+                let dir = if mount.is_some() {
+                    PathBuf::from(CONTAINER_EXEC_WORKING_DIR)
+                } else {
+                    self.own_dir().await
+                };
+                let _ = self
+                    .alert_tx
+                    .send(JobAlert::DirectoryReset(DirectoryReset {
+                        dir,
+                        reason: DirectoryResetReason::Removed,
+                    }))
+                    .await;
                 None
             }
             None => None,
@@ -2198,74 +2591,179 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
                 })
             }
         };
+        let shell = container.is_some() || runs_in_shell(script);
         Some(CwdCarry {
             start,
             report,
             container,
+            shell,
         })
     }
 
     /// Makes the directory a finished foreground command ended in the start
-    /// of the next one, when the command succeeded and the directory lies
-    /// inside the paths this terminal may read. The report file is consumed
-    /// either way.
+    /// of the next one, with the missing-report alert a task end does not
+    /// raise for a killed job. In production the task consumes the report
+    /// (see [`execute_script_standalone`]); tests drive the same logic here.
+    #[cfg(test)]
     async fn record_carried_dir(&self, carry: &CwdCarry, succeeded: bool) {
-        let reported = async_fs::read_to_string(&carry.report).await;
-        let _ = async_fs::remove_file(&carry.report).await;
-        let Some(carried) = &self.carried_dir else {
-            return;
+        let ctx = CarryContext {
+            carried_dir: self.carried_dir.as_ref(),
+            alert_tx: &self.alert_tx,
+            working_dir: &self.working_dir,
+            grants: self.grants.snapshot(),
         };
-        if !succeeded {
-            return;
-        }
-        // A direct command or a shell that did not exit normally writes none.
-        let Ok(reported) = reported else {
-            return;
-        };
-        let reported = reported.trim_end_matches('\n');
-        if reported.is_empty() {
-            return;
-        }
-        if let Some(container) = &carry.container {
-            // A container is an unconfined main agent: what bounds its
-            // directory is the workspace mount.
-            if let Ok(dir) = ContainerPath::new(reported)
-                .map_err(drop)
-                .and_then(|dir| container.mount.host_path(&dir).map_err(drop))
-            {
-                carried.set(Some(dir));
+        let Some(reported) = take_cwd_report(carry).await else {
+            if carry.shell {
+                alert_directory_reset(carry, DirectoryResetReason::Unreported, &ctx).await;
             }
             return;
-        }
-        let Ok(dir) = canonical_path(Path::new(reported)).await else {
-            return;
         };
-        for grant in std::iter::once(&self.working_dir)
-            .chain(&self.writable_paths)
-            .chain(&self.readable_paths)
-        {
-            if canonical_path(grant)
-                .await
-                .is_ok_and(|grant| dir.starts_with(grant))
-            {
-                carried.set(Some(dir));
-                return;
-            }
-        }
+        apply_cwd_report(carry, reported, succeeded, &ctx).await;
+    }
+
+    /// The terminal's own directory as a command sees it.
+    async fn own_dir(&self) -> PathBuf {
+        canonical_path(&self.working_dir)
+            .await
+            .unwrap_or_else(|_| self.working_dir.clone())
     }
 }
 
-impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool<P, E, Configured> {
-    /// Returns the `terminal_background` native tool that starts background
-    /// jobs on this terminal's sandbox and job registry.
-    #[must_use]
-    pub fn background_tool(&self) -> TerminalBackgroundTool<P, E> {
-        TerminalBackgroundTool {
-            terminal: self.clone(),
+/// Shared state needed to settle a finished command's directory report,
+/// whether the command finished inside its foreground call or promoted
+/// and ended as a background task.
+struct CarryContext<'a> {
+    carried_dir: Option<&'a CarriedDir>,
+    alert_tx: &'a Sender<JobAlert>,
+    working_dir: &'a Path,
+    grants: std::sync::Arc<GrantSet>,
+}
+
+/// Reads and removes a command's directory report, returning the directory
+/// the shell ended in when it reported one. The file is consumed either
+/// way so a promoted command never leaves it behind.
+async fn take_cwd_report(carry: &CwdCarry) -> Option<String> {
+    let reported = async_fs::read_to_string(&carry.report).await;
+    let _ = async_fs::remove_file(&carry.report).await;
+    // A direct command writes no report; a shell that ended through
+    // `exit` or a signal writes none either.
+    reported
+        .ok()
+        .map(|reported| reported.trim_end_matches('\n').to_owned())
+        .filter(|reported| !reported.is_empty())
+}
+
+/// Makes the directory a finished command ended in the start of the next
+/// one, when the command succeeded and the directory lies inside the paths
+/// this terminal may read. When the next command does not start where the
+/// shell ended the model is alerted once.
+async fn apply_cwd_report(
+    carry: &CwdCarry,
+    reported: String,
+    succeeded: bool,
+    ctx: &CarryContext<'_>,
+) {
+    let Some(carried) = ctx.carried_dir else {
+        return;
+    };
+    if !succeeded {
+        if !left_in_start(carry, &reported, ctx.working_dir).await {
+            alert_directory_reset(carry, DirectoryResetReason::Failed, ctx).await;
+        }
+        return;
+    }
+    if let Some(container) = &carry.container {
+        // A container is an unconfined main agent: what bounds its
+        // directory is the workspace mount.
+        match ContainerPath::new(reported.as_str())
+            .map_err(drop)
+            .and_then(|dir| container.mount.host_path(&dir).map_err(drop))
+        {
+            Ok(dir) => carried.set(Some(dir)),
+            Err(()) => {
+                alert_directory_reset(carry, DirectoryResetReason::OutsideWorkspace, ctx).await;
+            }
+        }
+        return;
+    }
+    let Ok(dir) = canonical_path(Path::new(&reported)).await else {
+        alert_directory_reset(carry, DirectoryResetReason::Removed, ctx).await;
+        return;
+    };
+    for grant in std::iter::once(ctx.working_dir)
+        .chain(ctx.grants.writable.iter().map(PathBuf::as_path))
+        .chain(ctx.grants.readable.iter().map(PathBuf::as_path))
+    {
+        if canonical_path(grant)
+            .await
+            .is_ok_and(|grant| dir.starts_with(grant))
+        {
+            carried.set(Some(dir));
+            return;
         }
     }
+    alert_directory_reset(carry, DirectoryResetReason::OutsideReadable, ctx).await;
+}
 
-    /// Shared front half of `terminal` and `terminal_background`: argument
+/// Whether the shell ended in the directory the command started in.
+async fn left_in_start(carry: &CwdCarry, reported: &str, working_dir: &Path) -> bool {
+    if let Some(container) = &carry.container {
+        return reported == container.start.as_str();
+    }
+    let start = carry.start.as_deref().unwrap_or(working_dir);
+    match (
+        canonical_path(Path::new(reported)).await,
+        canonical_path(start).await,
+    ) {
+        (Ok(reported), Ok(start)) => reported == start,
+        _ => false,
+    }
+}
+
+/// Alerts the model that the next command starts where `carry` started,
+/// not where the shell ended.
+async fn alert_directory_reset(
+    carry: &CwdCarry,
+    reason: DirectoryResetReason,
+    ctx: &CarryContext<'_>,
+) {
+    let dir = match &carry.container {
+        Some(container) => PathBuf::from(container.start.as_str()),
+        None => match &carry.start {
+            Some(start) => start.clone(),
+            None => canonical_path(ctx.working_dir)
+                .await
+                .unwrap_or_else(|_| ctx.working_dir.to_path_buf()),
+        },
+    };
+    let _ = ctx
+        .alert_tx
+        .send(JobAlert::DirectoryReset(DirectoryReset { dir, reason }))
+        .await;
+}
+
+impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool<P, E, Configured> {
+    /// Runs `script` as a detached background job bounded by `timeout`, for
+    /// embedders that drive the terminal directly rather than through the
+    /// `terminal` tool schema. Shares [`Self::call`]'s `background: true`
+    /// path.
+    ///
+    /// # Errors
+    ///
+    /// Fails the way a `terminal` call does: an invalid `timeout`, a
+    /// refused permission, a blocked command or a spawn failure.
+    pub async fn run_background(&self, arguments: TerminalArgs) -> aither_core::Result<ToolResult> {
+        self.call(
+            TerminalArgs {
+                background: true,
+                ..arguments
+            },
+            ToolContext::new(),
+        )
+        .await
+    }
+
+    /// Shared front half of every `terminal` execution: argument
     /// validation, target resolution, permission and the spawned job's ids.
     async fn prepare_execution(
         &self,
@@ -2277,17 +2775,48 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
         // The one entry every foreground, background and subagent command on
         // every backend passes through, ahead of permission and execution.
         crate::kill_guard::check(&arguments.script)?;
+        // A foreground `sleep` only waits on something else — the detached
+        // form (`background: true`) stays allowed as a timer or inside a
+        // waiting script.
+        if !arguments.background && crate::poll_guard::contains_sleep(&arguments.script) {
+            return Err(crate::poll_guard::PollRefusal::Sleep.into());
+        }
+        // A command that only re-reads files unchanged since their last read
+        // is polling; refuse it ahead of permission like the other blocks.
+        let file_reads = self.fingerprint_reads(&arguments.script).await;
+        if !file_reads.is_empty()
+            && self
+                .job_registry
+                .file_reads_unchanged(file_reads.clone())
+                .await
+        {
+            return Err(crate::poll_guard::PollRefusal::UnchangedFileRead {
+                paths: file_reads.iter().map(|(path, _)| path.clone()).collect(),
+            }
+            .into());
+        }
+        // Ahead of target resolution and permission, so a blocked command
+        // never asks the user for anything. The decision carries no grant.
+        if let Some(gate) = self.registry.registry().gate()
+            && let GateDecision::Block { reason } = gate.check(&arguments.script).await
+        {
+            return Err(CommandBlocked { reason }.into());
+        }
         let target =
             self.resolve_execution_target(arguments.mode, arguments.ssh_server_id.as_deref())?;
         if let ExecutionBackend::Local(tools) = &target.backend {
             tools
                 .ensure_readonly(
-                    std::iter::once(&self.working_dir).chain(self.writable_paths.iter()),
+                    std::iter::once(&self.working_dir)
+                        .chain(self.grants.snapshot().writable.iter()),
                 )
                 .await?;
         }
         self.ensure_permission_allowed(target.mode, &arguments.script)
             .await?;
+        if !file_reads.is_empty() {
+            self.job_registry.record_file_reads(file_reads).await;
+        }
         let task_id = random_task_id();
         Ok(ExecutionPreparation {
             target,
@@ -2298,44 +2827,26 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
         })
     }
 
-    /// Starts `arguments` as a background job, arming its kill watchdog and
-    /// the long-running alert.
-    async fn run_background(
+    /// The `(len, modified)` fingerprint of every file `script` would read,
+    /// relative paths resolved against the working directory. Only files
+    /// that exist now are fingerprinted — everything else stays untracked.
+    async fn fingerprint_reads(
         &self,
-        arguments: TerminalBackgroundArgs,
-    ) -> aither_core::Result<ToolResult> {
-        let cap = self.limits.background_timeout_cap;
-        let timeout = Duration::from_secs(arguments.timeout);
-        if arguments.timeout == 0 || timeout > cap {
-            return Err(anyhow::anyhow!(
-                "terminal_background timeout must be between 1 and {} seconds",
-                cap.as_secs()
-            ));
+        script: &str,
+    ) -> Vec<(std::path::PathBuf, crate::job_registry::FileFingerprint)> {
+        let mut reads = Vec::new();
+        for target in crate::poll_guard::file_reads(script) {
+            let mut path = std::path::PathBuf::from(&target);
+            if path.is_relative() {
+                path = self.working_dir.join(path);
+            }
+            if let Ok(meta) = async_fs::metadata(&path).await
+                && meta.is_file()
+            {
+                reads.push((path, (meta.len(), meta.modified().ok())));
+            }
         }
-        let prepared = self.prepare_execution(&arguments.terminal).await?;
-        let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
-            target: prepared.target,
-            task_id: prepared.task_id.clone(),
-            execution_id: prepared.execution_id,
-            script: arguments.terminal.script,
-            expect: arguments.terminal.expect,
-            resolution: arguments.terminal.resolution,
-            max_lines: prepared.max_lines,
-            raw: arguments.terminal.raw,
-            background: true,
-            carry: None,
-        });
-        wait_for_background_startup(&spawned.startup).await?;
-        self.spawn_kill_watchdog(&prepared.task_id, timeout);
-        self.spawn_long_job_alert(&prepared.task_id);
-        background_terminal_result(
-            &self.job_registry,
-            &prepared.store_dir,
-            &prepared.task_id,
-            prepared.max_lines,
-            &self.started_tx,
-        )
-        .await
+        reads
     }
 
     /// Kills the job through the registry once its timeout passes.
@@ -2377,99 +2888,6 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
                 }
             })
             .detach();
-    }
-
-    /// Kills the registered job behind a foreground call whose limit expired
-    /// and shapes the killed result the model receives.
-    async fn finish_killed_foreground(
-        &self,
-        spawned: &SpawnedTerminal,
-        task_id: &str,
-    ) -> aither_core::Result<ToolResult> {
-        if !self.job_registry.kill_by_task_id(task_id).await
-            && let Ok(result) = spawned.result.try_recv()
-        {
-            // The command finished between the limit expiring and the kill.
-            return match result {
-                Ok(result) => CommandResult::from(result).into_tool_result(),
-                Err(err) => Err(anyhow::anyhow!(err)),
-            };
-        }
-        let notice = format!(
-            "Killed after running {}s in the foreground. Use terminal_background to run a command longer than that.",
-            self.limits.foreground.as_secs()
-        );
-        let partial = spawned.result.recv().await.ok().and_then(Result::ok);
-        let (stdout, stderr) = partial.map_or((empty_stream(), None), |partial| {
-            (partial.stdout, partial.stderr)
-        });
-        CommandResult {
-            stdout,
-            stderr,
-            outcome: CommandOutcome::Killed {
-                task_id: task_id.to_string(),
-                notice,
-            },
-        }
-        .into_tool_result()
-    }
-}
-
-/// Native tool that runs a command as a background job.
-///
-/// Wraps a configured [`TerminalTool`]: jobs share its sandbox, working
-/// directory and job registry. Created by [`TerminalTool::background_tool`]
-/// and registered next to `terminal`.
-pub struct TerminalBackgroundTool<P, E> {
-    terminal: TerminalTool<P, E, Configured>,
-}
-
-impl<P, E: Clone> Clone for TerminalBackgroundTool<P, E> {
-    fn clone(&self) -> Self {
-        Self {
-            terminal: self.terminal.clone(),
-        }
-    }
-}
-
-impl<P, E> std::fmt::Debug for TerminalBackgroundTool<P, E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TerminalBackgroundTool")
-            .finish_non_exhaustive()
-    }
-}
-
-impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
-    for TerminalBackgroundTool<P, E>
-{
-    fn name(&self) -> Cow<'static, str> {
-        "terminal_background".into()
-    }
-
-    fn description(&self) -> Cow<'static, str> {
-        format!(
-            "Run a terminal command as a background job, detached from the \
-             foreground call. Returns immediately with the job's task id; use \
-             terminal_read for incremental output, terminal_input for stdin, \
-             and terminal_kill to stop the job early. The required `timeout` \
-             (seconds) is the job's maximum runtime — it and its process tree \
-             are killed when it passes — and may be at most {} minutes. To \
-             wait longer than that, schedule a wake-up (cron) rather than \
-             starting a longer job.",
-            self.terminal.limits.background_timeout_cap.as_secs() / 60
-        )
-        .into()
-    }
-
-    type Arguments = TerminalBackgroundArgs;
-    type Res = ToolResult;
-
-    async fn call(
-        &self,
-        arguments: Self::Arguments,
-        _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
-        self.terminal.run_background(arguments).await
     }
 }
 
@@ -2592,6 +3010,7 @@ struct StandaloneExecution<P, E> {
     working_dir: PathBuf,
     writable_paths: Vec<PathBuf>,
     readable_paths: Vec<PathBuf>,
+    env_source: Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
     registry: Arc<ToolRegistry>,
     permission_handler: Arc<P>,
@@ -2600,10 +3019,13 @@ struct StandaloneExecution<P, E> {
     execution_id: String,
     background: bool,
     carry: Option<CwdCarry>,
+    carried_dir: Option<CarriedDir>,
+    alert_tx: Sender<JobAlert>,
     script: String,
     mode: TerminalMode,
     backend: ExecutionBackend,
     stdin_alerts: Option<StdinAlerts>,
+    lifetime: JobLifetime,
     background_startup: BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
@@ -2620,6 +3042,7 @@ struct StandaloneStart<'a, P, E> {
     working_dir: &'a Path,
     writable_paths: &'a [PathBuf],
     readable_paths: &'a [PathBuf],
+    env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
     registry: &'a Arc<ToolRegistry>,
     permission_handler: Arc<P>,
@@ -2631,6 +3054,7 @@ struct StandaloneStart<'a, P, E> {
     mode: TerminalMode,
     backend: &'a ExecutionBackend,
     stdin_alerts: Option<StdinAlerts>,
+    lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
@@ -2643,6 +3067,7 @@ struct LocalBackgroundExecution<'a, E> {
     working_dir: &'a Path,
     writable_paths: &'a [PathBuf],
     readable_paths: &'a [PathBuf],
+    env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
     registry: &'a Arc<ToolRegistry>,
     task_id: &'a str,
@@ -2652,6 +3077,7 @@ struct LocalBackgroundExecution<'a, E> {
     mode: TerminalMode,
     job_registry: &'a JobRegistry,
     stdin_alerts: Option<StdinAlerts>,
+    lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
@@ -2660,6 +3086,7 @@ struct LocalBackgroundExecution<'a, E> {
 
 struct ContainerBackgroundExecution<'a, E> {
     executor: E,
+    env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     registry: &'a Arc<ToolRegistry>,
     task_id: &'a str,
     execution_id: &'a str,
@@ -2672,6 +3099,7 @@ struct ContainerBackgroundExecution<'a, E> {
     ipc_commands: &'a [String],
     job_registry: &'a JobRegistry,
     stdin_alerts: Option<StdinAlerts>,
+    lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
     priority: ProcessPriority,
 }
@@ -2735,6 +3163,7 @@ struct TerminalSpawnRequest {
     max_lines: usize,
     raw: bool,
     background: bool,
+    timeout: Duration,
     carry: Option<CwdCarry>,
 }
 
@@ -2755,10 +3184,13 @@ struct SpawnedTerminalTask<P, E> {
     execution_id: String,
     background: bool,
     carry: Option<CwdCarry>,
+    carried_dir: Option<CarriedDir>,
+    alert_tx: Sender<JobAlert>,
     script: String,
     mode: TerminalMode,
     backend: ExecutionBackend,
     stdin_alerts: Option<StdinAlerts>,
+    lifetime: JobLifetime,
     background_startup: BackgroundStartup,
     expect: OutputFormat,
     resolution: MediaResolution,
@@ -2768,6 +3200,7 @@ struct SpawnedTerminalTask<P, E> {
     result_tx: Sender<Result<CompletedCommand, String>>,
     completed_tx: Sender<CompletedTask>,
     running_tasks: Arc<AtomicUsize>,
+    env_source: Option<Arc<dyn TerminalEnvSource>>,
     network_audit: Option<NetworkAuditLog>,
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
@@ -2783,6 +3216,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        env_source,
         executor,
         registry,
         permission_handler,
@@ -2791,10 +3225,13 @@ where
         execution_id,
         background,
         carry,
+        carried_dir,
+        alert_tx,
         script,
         mode,
         backend,
         stdin_alerts,
+        lifetime,
         background_startup,
         expect,
         resolution,
@@ -2809,10 +3246,12 @@ where
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
     } = task;
+    let status_registry = job_registry.clone();
     let result = execute_script_standalone(StandaloneExecution {
         working_dir,
         writable_paths,
         readable_paths,
+        env_source,
         executor,
         registry,
         permission_handler,
@@ -2821,10 +3260,13 @@ where
         execution_id,
         background,
         carry,
+        carried_dir,
+        alert_tx,
         script: script.clone(),
         mode,
         backend,
         stdin_alerts,
+        lifetime,
         background_startup,
         network_audit,
         priority,
@@ -2843,19 +3285,26 @@ where
         Err(err) => Err(err.to_string()),
     };
     let _ = result_tx.send(quick_result).await;
-    if background {
-        let _ = completed_tx
-            .send(CompletedTask {
-                task_id,
-                script,
-                result,
-            })
-            .await;
-    }
+    let killed = status_registry
+        .get_by_task_id(&task_id)
+        .await
+        .is_some_and(|job| matches!(job.status, JobStatus::Killed));
+    // Every job reports completion; the agent reinjects the result only for
+    // tasks it saw promoted or detached (`take_started`), so a plain
+    // foreground result is not delivered twice.
+    let _ = completed_tx
+        .send(CompletedTask {
+            task_id,
+            script,
+            result,
+            killed,
+        })
+        .await;
     running_tasks.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// Standalone script execution that can be spawned in a background task.
+#[allow(clippy::too_many_lines)]
 async fn execute_script_standalone<P, E>(
     request: StandaloneExecution<P, E>,
 ) -> Result<CompletedCommand, TerminalError>
@@ -2867,6 +3316,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        env_source,
         executor,
         registry,
         permission_handler,
@@ -2875,10 +3325,13 @@ where
         execution_id,
         background,
         carry,
+        carried_dir,
+        alert_tx,
         script,
         mode,
         backend,
         stdin_alerts,
+        lifetime,
         background_startup,
         network_audit,
         priority,
@@ -2901,6 +3354,7 @@ where
         working_dir: &working_dir,
         writable_paths: &writable_paths,
         readable_paths: &readable_paths,
+        env_source: &env_source,
         executor,
         registry: &registry,
         permission_handler,
@@ -2912,6 +3366,7 @@ where
         mode,
         backend: &backend,
         stdin_alerts,
+        lifetime,
         background_startup: &background_startup,
         network_audit,
         priority,
@@ -2946,6 +3401,27 @@ where
     let output_path = stored_path(&result.stdout);
     job_registry.complete(pid, exit_code, output_path).await;
 
+    // The command's directory report arrives with its end, whether the call
+    // answered in the foreground window or the command promoted: the task
+    // is its sole consumer, so the next command starts where the shell
+    // ended and the report file never lingers.
+    if let Some(carry) = &carry {
+        let ctx = CarryContext {
+            carried_dir: carried_dir.as_ref(),
+            alert_tx: &alert_tx,
+            working_dir: &working_dir,
+            grants: std::sync::Arc::new(GrantSet {
+                readable: readable_paths.clone(),
+                writable: writable_paths.clone(),
+            }),
+        };
+        if let Some(reported) = take_cwd_report(carry).await {
+            apply_cwd_report(carry, reported, exit_code == 0, &ctx).await;
+        } else if ctx.carried_dir.is_some() && carry.shell {
+            alert_directory_reset(carry, DirectoryResetReason::Unreported, &ctx).await;
+        }
+    }
+
     Ok(result)
 }
 
@@ -2968,6 +3444,7 @@ async fn open_command_fifo(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn start_standalone_execution<P, E>(
     request: StandaloneStart<'_, P, E>,
 ) -> Result<(u32, std::process::Output), TerminalError>
@@ -2990,6 +3467,7 @@ where
             let ipc_commands = request.registry.registered_tool_names();
             return execute_container_background(ContainerBackgroundExecution {
                 executor: request.executor,
+                env_source: request.env_source,
                 registry: request.registry,
                 task_id: request.task_id,
                 execution_id: request.execution_id,
@@ -3002,6 +3480,7 @@ where
                 ipc_commands: &ipc_commands,
                 job_registry: request.job_registry,
                 stdin_alerts: request.stdin_alerts,
+                lifetime: request.lifetime,
                 background_startup: request.background_startup,
                 priority: request.priority,
             })
@@ -3031,6 +3510,7 @@ where
         working_dir: request.working_dir,
         writable_paths: request.writable_paths,
         readable_paths: request.readable_paths,
+        env_source: request.env_source,
         executor: request.executor,
         registry: request.registry,
         task_id: request.task_id,
@@ -3040,6 +3520,7 @@ where
         mode: request.mode,
         job_registry: request.job_registry,
         stdin_alerts: request.stdin_alerts,
+        lifetime: request.lifetime,
         background_startup: request.background_startup,
         priority: request.priority,
         #[cfg(all(unix, feature = "jobserver"))]
@@ -3208,18 +3689,216 @@ async fn save_completed_stderr(
     }
 }
 
-fn local_path_grants<'a>(
-    writable: &'a [PathBuf],
-    readable: &'a [PathBuf],
-    tools: &'a PreparedTools<PathBuf>,
-    job_fifo: Option<&'a Path>,
-) -> impl Iterator<Item = Grant> + 'a {
+/// The `git` shim every sandboxed command's PATH resolves first: a git
+/// run in a committing worktree reads the worktree's host-owned entry
+/// instead of whatever `.git` its subagent wrote.
+#[cfg(unix)]
+const GIT_SHIM: &str = include_str!("../templates/git_shim");
+
+/// Writes the `git` shim into the prepared tools directory once: the
+/// commands' PATH sees it ahead of the system's `git`.
+#[cfg(unix)]
+async fn write_git_shim(tools: &PreparedTools<PathBuf>) -> Result<(), TerminalError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let shim = tools.bin_dir().join("git");
+    match async_fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&shim)
+        .await
+    {
+        Ok(mut file) => {
+            file.write_all(GIT_SHIM.as_bytes()).await.map_err(|error| {
+                TerminalError::Execution(format!("writing {}: {error}", shim.display()))
+            })?;
+            file.flush().await.map_err(|error| {
+                TerminalError::Execution(format!("writing {}: {error}", shim.display()))
+            })?;
+            async_fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .await
+                .map_err(|error| {
+                    TerminalError::Execution(format!("writing {}: {error}", shim.display()))
+                })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(TerminalError::Execution(format!(
+            "writing {}: {error}",
+            shim.display()
+        ))),
+    }
+}
+
+/// Windows commands run no `sh`: no shim, and the worktrees' git map is
+/// never handed out either.
+#[cfg(not(unix))]
+async fn write_git_shim(_tools: &PreparedTools<PathBuf>) -> Result<(), TerminalError> {
+    Ok(())
+}
+
+/// The script a container's command runs ahead of its own: the `git`
+/// shim written into a writable directory it puts first on `PATH`, and
+/// the worktree map as exports. Empty without a map — subagent
+/// containers never see it.
+#[cfg(unix)]
+fn container_git_preamble(
+    registry: &ToolRegistry,
+    mount: Option<&MountRoot>,
+) -> Result<String, TerminalError> {
+    use std::fmt::Write as _;
+    let mut environment = Vec::new();
+    // The shim inside the container compares its working directory against
+    // the map: every path it holds must be spelled the way the container's
+    // workspace mount resolves it, or the worktree goes unprotected.
+    let spell = |path: &Path| -> Result<String, TerminalError> {
+        let mount = mount.ok_or_else(|| {
+            TerminalError::SandboxSetup(format!(
+                "a committing worktree {} has no workspace mount to map through",
+                path.display()
+            ))
+        })?;
+        let host_root =
+            std::fs::canonicalize(&mount.host_root).unwrap_or_else(|_| mount.host_root.clone());
+        MountRoot::new(host_root, mount.container_root.clone())
+            .container_path(path)
+            .map(|path| path.to_string())
+            .map_err(|source| {
+                TerminalError::SandboxSetup(format!(
+                    "{} is outside the container workspace mount: {source}",
+                    path.display()
+                ))
+            })
+    };
+    committed_git_environment(registry, &mut environment, spell)?;
+    if environment.is_empty() {
+        return Ok(String::new());
+    }
+    let mut preamble =
+        "aither_shim=${TMPDIR:-/tmp}/aither-shim-$$\nmkdir -p \"$aither_shim\"\n".to_string();
+    preamble.push_str("cat > \"$aither_shim/git\" <<'AITHER_GIT_SHIM'\n");
+    preamble.push_str(GIT_SHIM);
+    preamble.push_str(
+        "AITHER_GIT_SHIM\nchmod +x \"$aither_shim/git\"\nPATH=\"$aither_shim:$PATH\"\nexport PATH\n",
+    );
+    for (name, value) in &environment {
+        writeln!(preamble, "export {name}={}", shell_words::quote(value))
+            .expect("a string cannot fail a write");
+    }
+    Ok(preamble)
+}
+
+#[cfg(not(unix))]
+fn container_git_preamble(
+    _registry: &ToolRegistry,
+    _mount: Option<&MountRoot>,
+) -> Result<String, TerminalError> {
+    Ok(String::new())
+}
+
+/// Hands the git shim of a main terminal's commands the worktree map,
+/// each path spelled the way `spell` resolves it for the command's
+/// context — a host path locally, a container path inside a container.
+///
+/// A command's `git` in a committing worktree resolves the worktree's
+/// host-owned repository entry through `GIT_DIR`, so nothing a subagent
+/// wrote — a `.git` file, the repository's configuration, hooks,
+/// fsmonitor or filter programs — decides what program git runs. The
+/// map only describes paths the host resolved when the grant was made.
+/// Subagent terminals keep their own repositories' view.
+fn committed_git_environment(
+    registry: &ToolRegistry,
+    environment: &mut Vec<(String, String)>,
+    spell: impl Fn(&Path) -> Result<String, TerminalError>,
+) -> Result<(), TerminalError> {
+    if registry.role() != crate::command::CommandRole::Main {
+        return Ok(());
+    }
+    let committed = registry.committed_worktrees();
+    if committed.is_empty() {
+        return Ok(());
+    }
+    environment.push((
+        "AITHER_GIT_WORKTREES_COUNT".to_string(),
+        committed.len().to_string(),
+    ));
+    for (index, worktree) in committed.iter().enumerate() {
+        environment.push((
+            format!("AITHER_GIT_WORKTREE_PATH_{index}"),
+            spell(worktree.worktree())?,
+        ));
+        environment.push((
+            format!("AITHER_GIT_WORKTREE_GITDIR_{index}"),
+            spell(worktree.git_dir())?,
+        ));
+    }
+    Ok(())
+}
+
+fn local_path_grants(
+    writable: &[PathBuf],
+    readable: &[PathBuf],
+    tools: &PreparedTools<PathBuf>,
+    job_fifo: Option<&Path>,
+) -> heel::Result<Vec<Grant>> {
+    /// The object a spelled path names, in the spelling a resolved grant
+    /// checks: canonicalized, without the verbatim prefix Windows adds — an
+    /// 8.3 alias or a symlinked component does not name the same object.
+    fn resolved(path: &Path) -> heel::Result<ResolvedPath> {
+        ResolvedPath::new(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+    }
     writable
         .iter()
-        .map(|path| Grant::new(path, Access::WRITE))
-        .chain(readable.iter().map(|path| Grant::new(path, Access::READ)))
-        .chain(std::iter::once(Grant::new(tools.bin_dir(), Access::EXEC)))
-        .chain(job_fifo.map(|path| Grant::new(path, Access::WRITE)))
+        // A writable directory also executes: a sandboxed process can already
+        // run anything it writes through an interpreter, and builds must
+        // execute their own outputs.
+        .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE | Access::EXEC)))
+        .chain(
+            readable
+                .iter()
+                .map(|path| Ok(Grant::new(resolved(path)?, Access::READ))),
+        )
+        .chain(std::iter::once(Ok(Grant::new(
+            resolved(tools.bin_dir())?,
+            Access::EXEC,
+        ))))
+        .chain(
+            job_fifo
+                .iter()
+                .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE))),
+        )
+        .chain(toolchain_grants(resolved))
+        .collect()
+}
+
+/// Host toolchain homes a local sandbox reaches: (env var, resolved
+/// existing dir). `CARGO_HOME` and `RUSTUP_HOME` fall back to their
+/// `~/.cargo` / `~/.rustup` defaults; only directories that exist yield, so
+/// a toolchain absent from the host is never granted.
+fn host_toolchain_homes() -> impl Iterator<Item = (&'static str, PathBuf)> {
+    let home = std::env::home_dir;
+    [
+        std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home().map(|home| home.join(".cargo")))
+            .map(|path| ("CARGO_HOME", path)),
+        std::env::var_os("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home().map(|home| home.join(".rustup")))
+            .map(|path| ("RUSTUP_HOME", path)),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|(_, path)| path.is_dir())
+}
+
+/// The toolchain directories a sandboxed build needs: package-manager
+/// installs, compilers, and their caches, each rwx since builds both run
+/// the binaries and write the caches. Credential files inside them stay
+/// denied by the security tables, which emit after grants.
+fn toolchain_grants(
+    resolved: impl Fn(&Path) -> heel::Result<ResolvedPath>,
+) -> impl Iterator<Item = heel::Result<Grant>> {
+    host_toolchain_homes()
+        .map(move |(_, path)| Ok(Grant::new(resolved(&path)?, Access::WRITE | Access::EXEC)))
 }
 
 /// Adds a command's private jobserver variables to its process environment.
@@ -3242,8 +3921,9 @@ where
     E: Executor + Clone + 'static,
     N: NetworkPolicy + 'static,
 {
-    let runtime_environment =
-        prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    let mut runtime_environment = local_runtime_environment(&context).await?;
+    let marker = JobMarker::new();
+    runtime_environment.push(marker.entry());
     #[cfg(all(unix, feature = "jobserver"))]
     let runtime_environment =
         with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
@@ -3254,17 +3934,30 @@ where
         .map(crate::jobserver::CommandFifo::path);
     #[cfg(not(all(unix, feature = "jobserver")))]
     let job_fifo_path: Option<&Path> = None;
+    let grants = local_path_grants(
+        context.writable_paths,
+        context.readable_paths,
+        context.prepared_tools,
+        job_fifo_path,
+    )
+    .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(policy)
-        .working_dir(context.working_dir)
-        .grants(local_path_grants(
-            context.writable_paths,
-            context.readable_paths,
-            context.prepared_tools,
-            job_fifo_path,
-        ))
+        .working_dir(
+            // A symlink in the working directory's spelling fails the
+            // sandbox's own resolution — it does not follow a link a
+            // sandboxed process could have planted.
+            std::fs::canonicalize(context.working_dir)
+                .unwrap_or_else(|_| context.working_dir.to_path_buf()),
+        )
+        .grants(grants)
         .security(SecurityConfig::interactive())
+        // The session's own commands run their build outputs — anything
+        // written here could already run through an interpreter.
+        .executable_working_dir(true)
         .priority(context.priority);
+    #[cfg(target_os = "linux")]
+    let config_builder = config_builder.supervised_spawn(true);
     // `ipc` changes the builder's type, so both arms build where they are.
     let config = match create_ipc_router(context.registry) {
         Some(router) => config_builder.ipc(router).build(),
@@ -3289,26 +3982,29 @@ where
     if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
         command = command.current_dir(start);
     }
-    let child = command
-        .args(args)
-        .envs(runtime_environment)
-        .stdin(local_stdin_config(context.stdin_alerts.as_ref()))
-        .stdout(StdioConfig::Piped)
-        .stderr(StdioConfig::Piped)
-        .spawn()
-        .await
-        .map_err(|e| TerminalError::Execution(e.to_string()))?;
+    let (child, tree) = spawn_local_command(
+        command,
+        args,
+        runtime_environment,
+        context.stdin_alerts.as_ref(),
+        &context.lifetime,
+        context.job_registry,
+        &context.executor,
+        &marker,
+    )
+    .await?;
 
     let pid = child.id();
     context
         .job_registry
-        .register(
+        .register_with_tree(
             pid,
             context.task_id,
             context.execution_id,
             context.script,
             context.mode,
             None,
+            Some(tree.clone()),
         )
         .await;
     context.background_startup.report_ready().await;
@@ -3318,7 +4014,11 @@ where
         context.executor,
         context.job_registry,
         pid,
-        context.stdin_alerts,
+        LocalJob {
+            tree,
+            lifetime: context.lifetime,
+            stdin_alerts: context.stdin_alerts,
+        },
         "missing stdout pipe for sandbox process",
         "missing stderr pipe for sandbox process",
     )
@@ -3330,8 +4030,9 @@ where
 async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let runtime_environment =
-        prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    let mut runtime_environment = local_runtime_environment(&context).await?;
+    let marker = JobMarker::new();
+    runtime_environment.push(marker.entry());
     #[cfg(all(unix, feature = "jobserver"))]
     let runtime_environment =
         with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
@@ -3342,17 +4043,28 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         .map(crate::jobserver::CommandFifo::path);
     #[cfg(not(all(unix, feature = "jobserver")))]
     let job_fifo_path: Option<&Path> = None;
+    let grants = local_path_grants(
+        context.writable_paths,
+        context.readable_paths,
+        context.prepared_tools,
+        job_fifo_path,
+    )
+    .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(AllowAll)
-        .working_dir(context.working_dir)
-        .grants(local_path_grants(
-            context.writable_paths,
-            context.readable_paths,
-            context.prepared_tools,
-            job_fifo_path,
-        ))
-        .security(SecurityConfig::interactive())
+        .working_dir(
+            std::fs::canonicalize(context.working_dir)
+                .unwrap_or_else(|_| context.working_dir.to_path_buf()),
+        )
+        .grants(grants)
+        // Unsafe is approved host execution — the user runs the script
+        // themselves in every respect except IPC plumbing, so no
+        // credential or filesystem protection may apply.
+        .security(SecurityConfig::permissive())
+        .executable_working_dir(true)
         .priority(context.priority);
+    #[cfg(target_os = "linux")]
+    let config_builder = config_builder.supervised_spawn(true);
     // `ipc` changes the builder's type, so both arms build where they are.
     let config = match create_ipc_gateway_router(context.registry) {
         Some(router) => config_builder.ipc(router).build(),
@@ -3377,26 +4089,29 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
         command = command.current_dir(start);
     }
-    let child = command
-        .args(args)
-        .envs(runtime_environment)
-        .stdin(local_stdin_config(context.stdin_alerts.as_ref()))
-        .stdout(StdioConfig::Piped)
-        .stderr(StdioConfig::Piped)
-        .spawn()
-        .await
-        .map_err(|e| TerminalError::Execution(e.to_string()))?;
+    let (child, tree) = spawn_local_command(
+        command,
+        args,
+        runtime_environment,
+        context.stdin_alerts.as_ref(),
+        &context.lifetime,
+        context.job_registry,
+        &context.executor,
+        &marker,
+    )
+    .await?;
 
     let pid = child.id();
     context
         .job_registry
-        .register(
+        .register_with_tree(
             pid,
             context.task_id,
             context.execution_id,
             context.script,
             context.mode,
             None,
+            Some(tree.clone()),
         )
         .await;
     context.background_startup.report_ready().await;
@@ -3406,13 +4121,26 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         context.executor,
         context.job_registry,
         pid,
-        context.stdin_alerts,
+        LocalJob {
+            tree,
+            lifetime: context.lifetime,
+            stdin_alerts: context.stdin_alerts,
+        },
         "missing stdout pipe for unsafe process",
         "missing stderr pipe for unsafe process",
     )
     .await?;
 
     Ok((pid, output))
+}
+
+/// How long a command's descendants may outlive its top-level shell.
+#[derive(Clone)]
+enum JobLifetime {
+    /// None: the survivors are killed and reported on `alerts`.
+    Foreground { alerts: Sender<JobAlert> },
+    /// All of them: the job runs until its whole tree has exited.
+    Background,
 }
 
 /// Where a background job's stdin alerts go.
@@ -3511,14 +4239,19 @@ impl LocalStdinWatch {
 }
 
 async fn collect_local_process_output<E: Executor + Clone + 'static>(
-    mut child: heel::Child,
+    mut child: LocalChild,
     executor: E,
     job_registry: &JobRegistry,
     pid: u32,
-    stdin_alerts: Option<StdinAlerts>,
+    job: LocalJob,
     missing_stdout_message: &'static str,
     missing_stderr_message: &'static str,
 ) -> Result<std::process::Output, TerminalError> {
+    let LocalJob {
+        tree,
+        lifetime,
+        stdin_alerts,
+    } = job;
     let mut stdin_watch = None;
     if let Some(stdin) = child.take_stdin() {
         let feed = FeedCounter::default();
@@ -3551,11 +4284,56 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
         .spawn(drain_terminal_chunks(job_registry.clone(), pid, chunk_rx))
         .detach();
 
-    let status = match wait_for_local_process_exit(&mut child, stdin_watch).await {
-        Ok(status) => status,
+    // The root stays unreaped until its tree is gone, so its pid and process
+    // group stay reserved while the job's descendants are tracked by them.
+    let exited = match wait_for_local_process_exit(&mut child, stdin_watch).await {
+        Ok(exited) => exited,
         Err(error) => {
+            tree.finish().await;
             job_registry.close_stdout(pid).await;
             job_registry.close_stderr(pid).await;
+            return Err(error);
+        }
+    };
+    let descendants = end_descendants(&tree, &lifetime).await;
+    // The task ends first: afterwards the root's pid may belong to anyone.
+    tree.finish().await;
+    let (status, report) = match exited {
+        Some(status) => (Ok(status), None),
+        None => match child.wait_reported().await {
+            Ok((status, report)) => (Ok(status), report),
+            Err(error) => (Err(TerminalError::Execution(error.to_string())), None),
+        },
+    };
+    let _ = &report;
+    #[cfg(target_os = "linux")]
+    if let Some(report) = report {
+        let killed: Vec<JobProcess> = report
+            .killed
+            .into_iter()
+            .map(|process| JobProcess {
+                pid: process.pid,
+                name: process.name,
+            })
+            .collect();
+        if !killed.is_empty() {
+            info!(
+                killed = killed.len(),
+                "the supervisor killed the finished command's descendants"
+            );
+            if let JobLifetime::Foreground { alerts } = &lifetime {
+                let _ = alerts
+                    .send(JobAlert::DescendantsKilled(DescendantsKilled::new(killed)))
+                    .await;
+            }
+        }
+    }
+    let status = match (descendants, status) {
+        (Ok(()), Ok(status)) => status,
+        (Err(error), _) | (Ok(()), Err(error)) => {
+            job_registry.close_stdout(pid).await;
+            job_registry.close_stderr(pid).await;
+            job_registry.fail(pid, &error.to_string(), None).await;
             return Err(error);
         }
     };
@@ -3572,21 +4350,257 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
     Ok(output)
 }
 
+/// A local job's process tree and how long its descendants may live.
+struct LocalJob {
+    tree: JobTree,
+    lifetime: JobLifetime,
+    stdin_alerts: Option<StdinAlerts>,
+}
+
+/// The teardown budget a job's supervisor gives its kills: the time to
+/// freeze the tree, deliver `SIGKILL` and see every killed process exit.
+/// Generous relative to the few milliseconds a `SIGKILL` exit takes, since a
+/// too-short budget reports survivors that are merely still exiting.
+#[cfg(target_os = "linux")]
+const SUPERVISED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A spawned local job: the plain `heel` child on platforms without a
+/// supervisor, or a `heel supervise`-supervised one on Linux, where the
+/// supervisor is the command's parent and owns its whole tree.
+enum LocalChild {
+    /// Everywhere but Linux: the sandboxed process itself.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    Plain(heel::Child),
+    /// Linux, foreground lifetime: `wait` yields the command's status and
+    /// the teardown's report of what it killed.
+    #[cfg(target_os = "linux")]
+    Foreground(heel::supervisor::SupervisedChild<heel::supervisor::Foreground>),
+    /// Linux, background lifetime: `wait` ends only once the last descendant
+    /// of the command has exited.
+    #[cfg(target_os = "linux")]
+    Background(heel::supervisor::SupervisedChild<heel::supervisor::Background>),
+}
+
+impl LocalChild {
+    /// The spawned process's id: the supervisor's on Linux.
+    fn id(&self) -> u32 {
+        match self {
+            Self::Plain(child) => child.id(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) => child.id(),
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => child.id(),
+        }
+    }
+
+    fn take_stdin(&mut self) -> Option<std::fs::File> {
+        match self {
+            Self::Plain(child) => child.take_stdin(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) => child.take_stdin(),
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => child.take_stdin(),
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<std::fs::File> {
+        match self {
+            Self::Plain(child) => child.take_stdout(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) => child.take_stdout(),
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => child.take_stdout(),
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<std::fs::File> {
+        match self {
+            Self::Plain(child) => child.take_stderr(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) => child.take_stderr(),
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => child.take_stderr(),
+        }
+    }
+
+    /// A handle to the supervisor owning the job's tree.
+    #[cfg(target_os = "linux")]
+    fn tree_control(&self) -> TreeControl {
+        match self {
+            Self::Foreground(child) => child.tree_control(),
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => child.tree_control(),
+            Self::Plain(_) => unreachable!("a supervised spawn returns no plain child"),
+        }
+    }
+
+    /// Waits the job out, yielding the command's status and, for a
+    /// supervised foreground job, the supervisor's teardown report: what it
+    /// found still running under the command and killed.
+    async fn wait_reported(
+        &mut self,
+    ) -> Result<(std::process::ExitStatus, Option<TreeReport>), heel::Error> {
+        match self {
+            Self::Plain(child) => Ok((child.wait().await?, None)),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) => {
+                let exit = child.wait().await?;
+                Ok((exit.status, Some(exit.report)))
+            }
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => Ok((child.wait().await?, None)),
+        }
+    }
+}
+
+/// Spawns a local job's command and hands its tree to whoever owns it.
+///
+/// On Linux the sandbox was built with `supervised_spawn(true)`, so the
+/// command runs under `heel supervise`: a child subreaper inside the sandbox
+/// that owns the whole tree however its members change session, group or
+/// environment. Everywhere else the root's process group is watched through
+/// the process table, keyed by the job's marker.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_local_command<E: Executor + Clone + 'static>(
+    command: heel::Command<'_>,
+    args: &[String],
+    environment: Vec<(String, String)>,
+    stdin_alerts: Option<&StdinAlerts>,
+    lifetime: &JobLifetime,
+    job_registry: &JobRegistry,
+    executor: &E,
+    marker: &JobMarker,
+) -> Result<(LocalChild, JobTree), TerminalError> {
+    let command = command
+        .args(args)
+        .envs(environment)
+        .stdin(local_stdin_config(stdin_alerts))
+        .stdout(StdioConfig::Piped)
+        .stderr(StdioConfig::Piped);
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (job_registry, executor, marker);
+        let child = match lifetime {
+            JobLifetime::Foreground { .. } => LocalChild::Foreground(
+                command
+                    .spawn_supervised(heel::supervisor::Foreground {
+                        reap_timeout: SUPERVISED_REAP_TIMEOUT,
+                    })
+                    .await
+                    .map_err(|error| TerminalError::Execution(error.to_string()))?,
+            ),
+            JobLifetime::Background => LocalChild::Background(
+                command
+                    .spawn_supervised(heel::supervisor::Background {
+                        reap_timeout: SUPERVISED_REAP_TIMEOUT,
+                    })
+                    .await
+                    .map_err(|error| TerminalError::Execution(error.to_string()))?,
+            ),
+        };
+        let tree = JobTree::supervised(child.tree_control());
+        Ok((child, tree))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = lifetime;
+        let child = command
+            .spawn()
+            .await
+            .map_err(|error| TerminalError::Execution(error.to_string()))?;
+        let pid = child.id();
+        let tree = job_registry.start_process_tree(executor, pid, marker);
+        Ok((LocalChild::Plain(child), tree))
+    }
+}
+
+/// Applies the rule that a job's descendants live exactly as long as the job,
+/// after its top-level shell exited.
+///
+/// A foreground command's surviving descendants are killed and reported in one
+/// [`JobAlert::DescendantsKilled`]; a background job stays running until every
+/// descendant has exited, which its timeout, `terminal_kill` and the registry's
+/// kills end by killing the tree.
+async fn end_descendants(tree: &JobTree, lifetime: &JobLifetime) -> Result<(), TerminalError> {
+    match lifetime {
+        JobLifetime::Foreground { alerts } => {
+            let killed = tree
+                .kill_descendants()
+                .await
+                .map_err(|error| TerminalError::Execution(error.to_string()))?;
+            if !killed.is_empty() {
+                info!(
+                    killed = killed.len(),
+                    "killed descendants of a finished foreground command"
+                );
+                let _ = alerts
+                    .send(JobAlert::DescendantsKilled(DescendantsKilled::new(killed)))
+                    .await;
+            }
+            Ok(())
+        }
+        JobLifetime::Background => tree
+            .wait_descendants_exit()
+            .await
+            .map_err(|error| TerminalError::Execution(error.to_string())),
+    }
+}
+
 /// Waits for the child to exit, raising stdin alerts meanwhile.
+///
+/// On Unix the child is only observed to have exited and stays unreaped (the
+/// answer is `None`); the caller waits for it once its tree is gone. Windows
+/// has no such state and answers the exit status.
+#[cfg_attr(unix, allow(clippy::needless_pass_by_ref_mut))]
 async fn wait_for_local_process_exit(
-    child: &mut heel::Child,
+    child: &mut LocalChild,
     stdin_watch: Option<LocalStdinWatch>,
-) -> Result<std::process::ExitStatus, TerminalError> {
+) -> Result<Option<std::process::ExitStatus>, TerminalError> {
+    #[cfg(unix)]
+    let exit = async {
+        crate::process_tree::wait_for_exit(child.id())
+            .await
+            .map(|()| None)
+            .map_err(|error| TerminalError::Execution(error.to_string()))
+    };
+    #[cfg(not(unix))]
     let exit = async {
         child
-            .wait()
+            .wait_reported()
             .await
+            .map(|(status, _)| Some(status))
             .map_err(|error| TerminalError::Execution(error.to_string()))
     };
     let Some(stdin_watch) = stdin_watch else {
         return exit.await;
     };
     futures_lite::future::or(exit, async { match stdin_watch.run().await {} }).await
+}
+
+/// A container command's full script. A main terminal's git shim and
+/// worktree map travel inside it: the container's tools mount is
+/// read-only, so the command writes the shim where its own `PATH` can
+/// put it first.
+fn container_exec_script(
+    registry: &ToolRegistry,
+    container_runtime: &ContainerShellRuntime,
+    prepared_tools: &PreparedTools<ContainerPath>,
+    carry: Option<&ContainerCarry>,
+    script: &str,
+) -> Result<String, TerminalError> {
+    let preamble = container_git_preamble(registry, container_runtime.workspace_mount())?;
+    let script = if preamble.is_empty() {
+        script.to_string()
+    } else {
+        format!("{preamble}{script}")
+    };
+    let script = prepared_tools.wrap_script(&script)?;
+    match carry {
+        Some(carry) => carry_cwd_script(&script, carry.report.as_str()),
+        None => Ok(script),
+    }
 }
 
 async fn execute_container_background<E: Executor + Clone + 'static>(
@@ -3614,32 +4628,45 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             None,
         )
         .await;
+    let script = container_exec_script(
+        context.registry,
+        context.container_runtime,
+        context.prepared_tools,
+        context.carry,
+        context.script,
+    )?;
+    let script = inject_env_exports(script, context.env_source.as_ref())?;
     // A foreground command gets no input channel: the dropped sender is the
-    // EOF its stdin reads.
-    let stdin_blocked = if let Some(alerts) = context.stdin_alerts {
+    // EOF its stdin reads. StdinAlerts may ride along either way; they are
+    // the background job's blocked-reader wiring.
+    let exec_lifetime = if let JobLifetime::Foreground { .. } = context.lifetime {
+        drop(input_tx);
+        ExecLifetime::Foreground
+    } else {
         context
             .job_registry
             .attach_terminal_input(pid, input_tx)
             .await;
         let (signal_tx, signal_rx) = async_channel::unbounded::<StdinWatchSignal>();
-        context
-            .executor
-            .clone()
-            .spawn(async move {
-                while let Ok(signal) = signal_rx.recv().await {
-                    match signal {
-                        StdinWatchSignal::Blocked => alerts.raise().await,
-                        StdinWatchSignal::Failed(error) => {
-                            alerts.raise_failure(error).await;
+        if let Some(alerts) = context.stdin_alerts {
+            context
+                .executor
+                .clone()
+                .spawn(async move {
+                    while let Ok(signal) = signal_rx.recv().await {
+                        match signal {
+                            StdinWatchSignal::Blocked => alerts.raise().await,
+                            StdinWatchSignal::Failed(error) => {
+                                alerts.raise_failure(error).await;
+                            }
                         }
                     }
-                }
-            })
-            .detach();
-        Some(signal_tx)
-    } else {
-        drop(input_tx);
-        None
+                })
+                .detach();
+        }
+        ExecLifetime::Background {
+            stdin_blocked: signal_tx,
+        }
     };
     context.job_registry.attach_kill_switch(pid, kill_tx).await;
     context.background_startup.report_ready().await;
@@ -3652,11 +4679,6 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             Arc::clone(context.registry),
             container_runtime.ipc_route().bind(),
         )?)
-    };
-    let script = context.prepared_tools.wrap_script(context.script)?;
-    let script = match context.carry {
-        Some(carry) => carry_cwd_script(&script, carry.report.as_str())?,
-        None => script,
     };
     let working_dir = context
         .carry
@@ -3681,7 +4703,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             working_dir,
             kill_rx,
             input_rx,
-            stdin_blocked,
+            exec_lifetime,
         )
         .await;
 
@@ -3689,7 +4711,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         bridge.stop().await;
     }
 
-    record_container_exec_outcome(context.job_registry, pid, execution).await
+    record_container_exec_outcome(context.job_registry, pid, &context.lifetime, execution).await
 }
 
 /// Records a finished container exec in the job's streams and folds it into
@@ -3697,10 +4719,22 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
 async fn record_container_exec_outcome(
     job_registry: &JobRegistry,
     pid: u32,
+    lifetime: &JobLifetime,
     execution: Result<ContainerExecOutcome, String>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
     match execution {
-        Ok(ContainerExecOutcome::Completed(output)) => {
+        Ok(ContainerExecOutcome::Completed { output, killed }) => {
+            if let JobLifetime::Foreground { alerts } = lifetime
+                && !killed.is_empty()
+            {
+                info!(
+                    killed = killed.len(),
+                    "killed processes of a finished foreground container command"
+                );
+                let _ = alerts
+                    .send(JobAlert::DescendantsKilled(DescendantsKilled::new(killed)))
+                    .await;
+            }
             if !output.stdout.is_empty() {
                 job_registry.append_stdout(pid, output.stdout.clone()).await;
             }
@@ -3818,6 +4852,35 @@ async fn execute_ssh_background(
     }
 }
 
+/// Prepends a source's env pairs to `script` as `export` statements, for
+/// backends (container exec) whose channel accepts only a script — never an
+/// env channel. Names are validated so a provider can't inject shell syntax.
+fn inject_env_exports(
+    script: String,
+    env_source: Option<&Arc<dyn TerminalEnvSource>>,
+) -> Result<String, TerminalError> {
+    let Some(source) = env_source else {
+        return Ok(script);
+    };
+    let mut rendered = String::new();
+    for (name, value) in source.env() {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || name.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            return Err(TerminalError::Execution(format!(
+                "invalid environment variable name for container exec: {name}"
+            )));
+        }
+        rendered.push_str("export ");
+        rendered.push_str(&name);
+        rendered.push('=');
+        rendered.push_str(&shell_escape(&value));
+        rendered.push('\n');
+    }
+    rendered.push_str(&script);
+    Ok(rendered)
+}
+
 fn shell_escape(value: &str) -> String {
     let escaped = value.replace('\'', "'\"'\"'");
     let mut output = String::with_capacity(escaped.len() + 2);
@@ -3825,6 +4888,21 @@ fn shell_escape(value: &str) -> String {
     output.push_str(&escaped);
     output.push('\'');
     output
+}
+
+/// Builds the local session environment: git shim, computed session env,
+/// committed grant vars, then the embedder's extra envs (which override).
+async fn local_runtime_environment<E: Executor>(
+    context: &LocalBackgroundExecution<'_, E>,
+) -> Result<Vec<(String, String)>, TerminalError> {
+    write_git_shim(context.prepared_tools).await?;
+    let mut env =
+        prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    committed_git_environment(context.registry, &mut env, |path| {
+        Ok(path.display().to_string())
+    })?;
+    env.extend(context.env_source.iter().flat_map(|s| s.env()));
+    Ok(env)
 }
 
 async fn prepare_session_runtime_environment(
@@ -3872,12 +4950,19 @@ async fn prepare_session_runtime_environment(
         ))
     })?;
 
-    let sandbox_path = heel::default_sandbox_path();
+    // The managed tools directory leads; the host PATH follows so host
+    // toolchains (cargo, rustup, anything else) stay reachable. The heel
+    // sandbox path is only a fallback for a host without a PATH.
+    let host_path = std::env::var_os("PATH")
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| heel::default_sandbox_path().into());
     let path = tools
-        .prepend_path(Some(std::ffi::OsStr::new(&sandbox_path)))?
+        .prepend_path(Some(host_path.as_os_str()))?
         .into_string()
         .map_err(|_| ToolRuntimeError::InvalidCache(tools.bin_dir().clone()))?;
-    Ok(vec![
+    // Point cargo and rustup at the same host homes the grants cover, so
+    // the remapped HOME does not strand them under the working dir.
+    let mut env = vec![
         ("PATH".to_string(), path),
         ("TMPDIR".to_string(), tmp.clone()),
         ("TMP".to_string(), tmp.clone()),
@@ -3888,7 +4973,11 @@ async fn prepare_session_runtime_environment(
         ("BUN_INSTALL_CACHE_DIR".to_string(), bun),
         ("PLAYWRIGHT_BROWSERS_PATH".to_string(), playwright),
         ("PYTHONPATH".to_string(), python),
-    ])
+    ];
+    for (name, home) in host_toolchain_homes() {
+        env.push((name.to_string(), path_environment_value(name, &home)?));
+    }
+    Ok(env)
 }
 
 fn path_environment_value(name: &str, path: &Path) -> Result<String, TerminalError> {
@@ -4554,9 +5643,35 @@ mod tests {
     use crate::ToolRegistryBuilder;
     #[cfg(unix)]
     use crate::builtin::{InputTerminalArgs, InputTerminalTool};
+    use crate::output::empty_stream;
     #[cfg(unix)]
     use heel::DenyAll;
     use heel::NiceLevel;
+
+    /// Toolchain directories named by `*_HOME` variables become rwx grants;
+    /// ones that do not exist are skipped.
+    #[test]
+    fn toolchain_grants_cover_existing_dirs_rwx() {
+        let cargo = tempfile::tempdir().unwrap();
+        let rustup = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CARGO_HOME", cargo.path());
+            std::env::set_var("RUSTUP_HOME", rustup.path().join("missing"));
+        }
+        let grants: Vec<Grant> = toolchain_grants(|path| {
+            ResolvedPath::new(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+        })
+        .map(|grant| grant.expect("grant"))
+        .collect();
+        assert_eq!(grants.len(), 1, "only the existing dir is granted");
+        let access = grants[0].access();
+        assert!(access.can_write());
+        assert!(access.can_execute());
+        unsafe {
+            std::env::remove_var("CARGO_HOME");
+            std::env::remove_var("RUSTUP_HOME");
+        }
+    }
 
     async fn prepared_test_registry() -> (tempfile::TempDir, ShellSessionRegistry) {
         let cache = tempfile::tempdir().unwrap();
@@ -4612,7 +5727,20 @@ mod tests {
             _working_dir: &str,
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
-            _stdin_blocked: Option<Sender<StdinWatchSignal>>,
+            _lifetime: ExecLifetime,
+        ) -> impl std::future::Future<Output = Result<crate::ContainerExecOutcome, String>> + Send
+        {
+            std::future::ready(Err("adoption never executes in the container".to_string()))
+        }
+
+        fn exec_streamed(
+            &self,
+            _container_id: &str,
+            _script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _stdout: Sender<Vec<u8>>,
         ) -> impl std::future::Future<Output = Result<crate::ContainerExecOutcome, String>> + Send
         {
             std::future::ready(Err("adoption never executes in the container".to_string()))
@@ -4752,6 +5880,8 @@ mod tests {
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
                     raw: true,
+                    timeout: 30,
+                    background: false,
                 },
                 ToolContext::new(),
             )
@@ -4767,6 +5897,52 @@ mod tests {
         }
         assert_eq!(authorizer.connects.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(authorizer.installs.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_container_home_still_gives_the_host_runnable_tools() {
+        let container = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: false,
+            container: true,
+            ssh: false,
+        })
+        .with_container_runtime(test_container_runtime("aither-host-tools"))
+        .with_test_container_tools(
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools()),
+            "aither-host-tools".to_string(),
+        );
+        assert!(
+            matches!(
+                container.local_tools(),
+                Err(ToolRuntimeError::NotInitialized(_))
+            ),
+            "the container's own tools are not host-runnable"
+        );
+
+        let artifacts = tempfile::tempdir().unwrap();
+        let distribution = script_distribution(
+            artifacts.path(),
+            b"#!/bin/sh\nprintf '%s\\n' 'tool 1.0.0'\n",
+        )
+        .await;
+        let cache = tempfile::tempdir().unwrap();
+        let host = container
+            .host_tools(&distribution, cache.path())
+            .await
+            .expect("the distribution prepares the host target");
+        let runtimes = std::fs::canonicalize(cache.path().join("runtimes")).unwrap();
+        assert!(host.bin_dir().starts_with(runtimes));
+        for command in ["apply_patch", "rg", "ast-grep", "jq"] {
+            let output = std::process::Command::new(host.bin_dir().join(command))
+                .output()
+                .expect("the host runs the prepared tool");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "tool 1.0.0\n",
+                "{command}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4795,7 +5971,7 @@ mod tests {
         })
         .with_container_runtime(test_container_runtime("aither-tools-a"))
         .with_test_container_tools(
-            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle()),
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools()),
             "aither-tools-a".to_string(),
         );
 
@@ -4879,6 +6055,31 @@ mod tests {
         assert_eq!(args, ["-c", script]);
     }
 
+    #[test]
+    fn inject_env_exports_prepends_valid_pairs() {
+        let source: Option<Arc<dyn TerminalEnvSource>> = Some(Arc::new(vec![
+            ("MY_KEY".to_string(), "it's".to_string()),
+            ("OTHER".to_string(), "x".to_string()),
+        ]));
+        let rendered = inject_env_exports("echo hi".to_string(), source.as_ref())
+            .expect("valid env names should render");
+        assert_eq!(
+            rendered,
+            "export MY_KEY='it'\"'\"'s'\nexport OTHER='x'\necho hi"
+        );
+    }
+
+    #[test]
+    fn inject_env_exports_rejects_shell_syntax_names() {
+        let source: Option<Arc<dyn TerminalEnvSource>> =
+            Some(Arc::new(vec![("BAD;name".to_string(), "x".to_string())]));
+        assert!(inject_env_exports("echo hi".to_string(), source.as_ref()).is_err());
+        assert_eq!(
+            inject_env_exports("echo hi".to_string(), None).expect("no source passes through"),
+            "echo hi"
+        );
+    }
+
     #[tokio::test]
     async fn session_runtime_environment_is_prepared_without_wrapping_the_script() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -4908,6 +6109,87 @@ mod tests {
         assert!(dir.path().join(".cache/bun").is_dir());
         assert!(dir.path().join(".cache/ms-playwright").is_dir());
         assert!(dir.path().join(".config").is_dir());
+    }
+
+    #[tokio::test]
+    async fn session_runtime_environment_sets_toolchain_homes_and_host_path() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let cache = tempfile::tempdir().unwrap();
+        let cargo_home = tempfile::tempdir().unwrap();
+        let rustup_home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CARGO_HOME", cargo_home.path());
+            std::env::set_var("RUSTUP_HOME", rustup_home.path());
+        }
+        let ready = crate::tool_runtime::tests::bundle()
+            .prepare_local(cache.path())
+            .await
+            .unwrap();
+        let environment = prepare_session_runtime_environment(dir.path(), &ready)
+            .await
+            .expect("session runtime environment should be prepared");
+        unsafe {
+            std::env::remove_var("CARGO_HOME");
+            std::env::remove_var("RUSTUP_HOME");
+        }
+        let value = |name: &str| {
+            environment
+                .iter()
+                .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+                .unwrap_or_else(|| panic!("missing session environment variable {name}"))
+        };
+
+        assert_eq!(
+            value("CARGO_HOME"),
+            cargo_home.path().to_str().expect("UTF-8 temp path")
+        );
+        assert_eq!(
+            value("RUSTUP_HOME"),
+            rustup_home.path().to_str().expect("UTF-8 temp path")
+        );
+        let host_path = std::env::var("PATH").expect("host PATH");
+        let path = value("PATH");
+        assert!(
+            path.starts_with(ready.bin_dir().to_str().expect("UTF-8 tools dir")),
+            "the managed tools dir leads PATH: {path}"
+        );
+        assert!(
+            path.contains(&host_path),
+            "the host PATH follows the tools dir: {path}"
+        );
+    }
+
+    /// Writable working directories execute what they hold — a build output
+    /// or a chmod'd script is runnable.
+    #[tokio::test]
+    async fn local_path_grants_make_writable_dirs_executable() {
+        let workdir = tempfile::tempdir().unwrap();
+        let readonly = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let tools = crate::tool_runtime::tests::bundle()
+            .prepare_local(cache.path())
+            .await
+            .unwrap();
+        let grants = local_path_grants(
+            &[workdir.path().to_path_buf()],
+            &[readonly.path().to_path_buf()],
+            &tools,
+            None,
+        )
+        .expect("grants build");
+        let canonical = |dir: &tempfile::TempDir| std::fs::canonicalize(dir.path()).unwrap();
+        let access_of = |dir: &tempfile::TempDir| {
+            grants
+                .iter()
+                .find(|grant| grant.resolved_path().as_path() == canonical(dir))
+                .map(heel::Grant::access)
+        };
+        let access = access_of(&workdir).expect("workdir grant");
+        assert!(access.can_write());
+        assert!(access.can_execute(), "a writable directory also executes");
+        let access = access_of(&readonly).expect("readonly grant");
+        assert!(!access.can_write());
+        assert!(!access.can_execute());
     }
 
     fn output_text(output: &CommandStream) -> Option<&str> {
@@ -4970,12 +6252,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_args_defaults() {
-        let args: TerminalArgs =
-            serde_json::from_str(r#"{"description":"print a greeting","script":"echo hello"}"#)
-                .unwrap();
+        let args: TerminalArgs = serde_json::from_str(
+            r#"{"description":"print a greeting","script":"echo hello","timeout":30}"#,
+        )
+        .unwrap();
         assert_eq!(args.expect, OutputFormat::Text);
         assert_eq!(args.resolution, MediaResolution::Auto);
         assert_eq!(args.mode, TerminalExecutionMode::Default);
+        assert!(!args.background);
     }
 
     #[test]
@@ -5044,15 +6328,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_terminal_background_args_parsing() {
-        let args: TerminalBackgroundArgs = serde_json::from_str(
-            r#"{"description":"sleep in background","script":"sleep 5","timeout":30}"#,
+    async fn test_terminal_args_parsing() {
+        let args: TerminalArgs = serde_json::from_str(
+            r#"{"description":"sleep in background","script":"sleep 5","timeout":30,"background":true}"#,
         )
         .unwrap();
         assert_eq!(args.timeout, 30);
-        assert_eq!(args.terminal.script, "sleep 5");
+        assert_eq!(args.script, "sleep 5");
+        assert!(args.background);
 
-        let missing_timeout = serde_json::from_str::<TerminalBackgroundArgs>(
+        let missing_timeout = serde_json::from_str::<TerminalArgs>(
             r#"{"description":"sleep in background","script":"sleep 5"}"#,
         )
         .unwrap_err();
@@ -5065,10 +6350,16 @@ mod tests {
     }
 
     #[test]
-    fn terminal_background_args_schema_inlines_terminal_fields() {
-        let schema = serde_json::to_value(schemars::schema_for!(TerminalBackgroundArgs)).unwrap();
+    fn terminal_args_schema_lists_required_fields() {
+        let schema = serde_json::to_value(schemars::schema_for!(TerminalArgs)).unwrap();
         let properties = schema["properties"].as_object().expect("object schema");
-        for field in ["description", "script", "timeout", "max_lines"] {
+        for field in [
+            "description",
+            "script",
+            "timeout",
+            "max_lines",
+            "background",
+        ] {
             assert!(
                 properties.contains_key(field),
                 "{field} missing from schema {schema}"
@@ -5081,11 +6372,15 @@ mod tests {
                 "{field} not required in {schema}"
             );
         }
+        assert!(
+            !required.iter().any(|name| name == "background"),
+            "background must not be required in {schema}"
+        );
     }
 
     /// The tools bin directory a container execution passes to the wrapper.
     fn container_tools_dir() -> ContainerPath {
-        crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle())
+        crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools())
             .bin_dir()
             .clone()
     }
@@ -5201,6 +6496,176 @@ mod tests {
         assert_eq!(handler.domain_checks.load(AtomicOrdering::Relaxed), 1);
     }
 
+    /// A handler whose review step answers `review` and whose own route
+    /// waits for a person.
+    struct ReviewingHandler {
+        review: Review,
+        waits: AtomicUsize,
+        checks: AtomicUsize,
+    }
+
+    impl ReviewingHandler {
+        fn new(review: Review) -> Self {
+            Self {
+                review,
+                waits: AtomicUsize::new(0),
+                checks: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl PermissionHandler for ReviewingHandler {
+        fn review(
+            &self,
+            _request: &PermissionRequest<'_>,
+        ) -> impl std::future::Future<Output = Review> + Send {
+            std::future::ready(self.review.clone())
+        }
+
+        fn check(
+            &self,
+            _mode: TerminalMode,
+            _script: &str,
+        ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
+            self.checks.fetch_add(1, AtomicOrdering::Relaxed);
+            std::future::ready(Ok(true))
+        }
+
+        fn will_wait_for_approval(
+            &self,
+            _mode: TerminalMode,
+            _script: &str,
+        ) -> impl std::future::Future<Output = bool> + Send {
+            self.waits.fetch_add(1, AtomicOrdering::Relaxed);
+            std::future::ready(true)
+        }
+    }
+
+    async fn permission_stages(
+        review: Review,
+    ) -> (Result<(), String>, Vec<PermissionEventStage>, [usize; 2]) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool = TerminalTool::new_exact(
+            dir.path(),
+            ReviewingHandler::new(review),
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let tool = tool.with_registry(registry);
+        let result = tool
+            .ensure_permission_allowed(TerminalMode::Unsafe, "make install")
+            .await
+            .map_err(|error| error.to_string());
+        let stages = tool
+            .permission_receiver()
+            .take_pending()
+            .into_iter()
+            .map(|event| event.stage)
+            .collect();
+        let handler = &tool.permission_handler;
+        (
+            result,
+            stages,
+            [
+                handler.waits.load(AtomicOrdering::Relaxed),
+                handler.checks.load(AtomicOrdering::Relaxed),
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn a_request_a_reviewer_approves_emits_no_permission_event() {
+        let (result, stages, [waits, checks]) = permission_stages(Review::Approved).await;
+        result.expect("approved");
+        assert_eq!(stages, Vec::<PermissionEventStage>::new());
+        assert_eq!([waits, checks], [0, 0], "the route is not asked");
+    }
+
+    #[tokio::test]
+    async fn a_request_a_reviewer_denies_emits_no_permission_event() {
+        let (result, stages, [waits, checks]) =
+            permission_stages(Review::Denied("not today".into())).await;
+        assert!(result.unwrap_err().contains("not today"));
+        assert_eq!(stages, Vec::<PermissionEventStage>::new());
+        assert_eq!([waits, checks], [0, 0], "the route is not asked");
+    }
+
+    #[tokio::test]
+    async fn a_request_every_reviewer_passes_waits_then_resolves() {
+        let (result, stages, [waits, checks]) = permission_stages(Review::Passed).await;
+        result.expect("the route allows");
+        assert_eq!(
+            stages,
+            [
+                PermissionEventStage::Waiting,
+                PermissionEventStage::Resolved
+            ]
+        );
+        assert_eq!([waits, checks], [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn permission_network_policy_reviews_a_domain_before_asking() {
+        struct Domains(Review, AtomicUsize);
+        impl PermissionHandler for Domains {
+            fn check(
+                &self,
+                _mode: TerminalMode,
+                _script: &str,
+            ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send
+            {
+                std::future::ready(Ok(true))
+            }
+            fn review(
+                &self,
+                request: &PermissionRequest<'_>,
+            ) -> impl std::future::Future<Output = Review> + Send {
+                assert_eq!(
+                    *request,
+                    PermissionRequest::Domain {
+                        domain: "example.com",
+                        port: 443
+                    }
+                );
+                std::future::ready(self.0.clone())
+            }
+            fn domain_needs_approval(
+                &self,
+                _domain: &str,
+                _port: u16,
+            ) -> impl std::future::Future<Output = bool> + Send {
+                std::future::ready(true)
+            }
+            fn check_domain(
+                &self,
+                _domain: &str,
+                _port: u16,
+            ) -> impl std::future::Future<Output = bool> + Send {
+                self.1.fetch_add(1, AtomicOrdering::Relaxed);
+                std::future::ready(true)
+            }
+        }
+        let request = DomainRequest::new("example.com", 443);
+        for (review, allowed, asked) in [
+            (Review::Approved, true, 0),
+            (Review::Denied("no".into()), false, 0),
+            (Review::Passed, true, 1),
+        ] {
+            let handler = Arc::new(Domains(review, AtomicUsize::new(0)));
+            let policy = PermissionNetworkPolicy {
+                permission_handler: handler.clone(),
+            };
+            assert_eq!(policy.check(&request).await, allowed);
+            assert_eq!(handler.1.load(AtomicOrdering::Relaxed), asked);
+        }
+    }
+
     #[test]
     fn sandboxed_execution_mode_deserializes() {
         let mode: TerminalExecutionMode =
@@ -5259,7 +6724,7 @@ mod tests {
         let parent_registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
         let parent = tool.with_registry(parent_registry);
         let child = parent
-            .subagent(&mut LaunchHistory::default(), SubagentGrant::new())
+            .subagent_without_grant()
             .await
             .expect("an empty grant is always given");
         assert_eq!(
@@ -5294,7 +6759,7 @@ mod tests {
             .map(|entry| entry.definition.name().to_string())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["terminal", "terminal_background"]);
+        assert_eq!(names, vec!["terminal"]);
     }
 
     async fn query_control(
@@ -5331,28 +6796,23 @@ mod tests {
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
         let parent = tool.with_registry(registry);
         let child = parent
-            .subagent(&mut LaunchHistory::default(), SubagentGrant::new())
+            .subagent_without_grant()
             .await
             .expect("an empty grant is always given");
 
         let result = child
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: TerminalArgs {
-                        description: "echo one stdin line then sleep".to_string(),
-                        script: "read line; printf 'got %s\\n' \"$line\"; sleep 30".to_string(),
-                        mode: TerminalExecutionMode::Sandboxed,
-                        ssh_server_id: None,
-                        expect: OutputFormat::Text,
-                        resolution: MediaResolution::Auto,
-                        max_lines: 50,
-                        raw: false,
-                    },
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                description: "echo one stdin line then sleep".to_string(),
+                script: "read line; printf 'got %s\\n' \"$line\"; sleep 30".to_string(),
+                mode: TerminalExecutionMode::Sandboxed,
+                ssh_server_id: None,
+                expect: OutputFormat::Text,
+                resolution: MediaResolution::Auto,
+                max_lines: 50,
+                raw: false,
+                timeout: 30,
+                background: true,
+            })
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
@@ -5426,7 +6886,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let config = SandboxConfig::builder()
             .network(DenyAll)
-            .working_dir(dir.path())
+            .working_dir(
+                std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf()),
+            )
             .security(SecurityConfig::interactive())
             .build();
         let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
@@ -5469,6 +6931,7 @@ mod tests {
             working_dir: tool.working_dir().clone(),
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
+            env_source: None,
             executor: executor_core::tokio::TokioGlobal,
             registry,
             permission_handler: Arc::new(TestPermissionHandler::default()),
@@ -5477,10 +6940,15 @@ mod tests {
             execution_id: "exec-test".to_string(),
             background: false,
             carry: None,
+            carried_dir: None,
+            alert_tx: async_channel::unbounded().0,
             script: "/bin/pwd".to_string(),
             mode: TerminalMode::Sandboxed,
             backend: ExecutionBackend::Local(tool.shell_sessions.local_tools().unwrap().clone()),
             stdin_alerts: None,
+            lifetime: JobLifetime::Foreground {
+                alerts: async_channel::unbounded().0,
+            },
             background_startup: BackgroundStartup::new(startup_tx),
             network_audit: None,
             priority: ProcessPriority::default(),
@@ -5537,6 +7005,8 @@ mod tests {
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
                     raw: false,
+                    timeout: 30,
+                    background: false,
                 },
                 ToolContext::new(),
             )
@@ -5584,24 +7054,18 @@ mod tests {
         let input_tool = InputTerminalTool::new(tool.job_registry());
 
         let result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: TerminalArgs {
-                        description: "wait for terminal input and echo it back".to_string(),
-                        script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\""
-                            .to_string(),
-                        mode: TerminalExecutionMode::Sandboxed,
-                        ssh_server_id: None,
-                        expect: OutputFormat::Text,
-                        resolution: MediaResolution::Auto,
-                        max_lines: 50,
-                        raw: false,
-                    },
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                description: "wait for terminal input and echo it back".to_string(),
+                script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"".to_string(),
+                mode: TerminalExecutionMode::Sandboxed,
+                ssh_server_id: None,
+                expect: OutputFormat::Text,
+                resolution: MediaResolution::Auto,
+                max_lines: 50,
+                raw: false,
+                timeout: 30,
+                background: true,
+            })
             .await
             .expect("terminal call should succeed");
 
@@ -5662,23 +7126,18 @@ mod tests {
         let child_pid_path = dir.path().join("child.pid");
 
         let result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: TerminalArgs {
-                        description: "start a descendant process".to_string(),
-                        script: "sleep 30 & echo $! > child.pid; wait".to_string(),
-                        mode: TerminalExecutionMode::Sandboxed,
-                        ssh_server_id: None,
-                        expect: OutputFormat::Text,
-                        resolution: MediaResolution::Auto,
-                        max_lines: 50,
-                        raw: false,
-                    },
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                description: "start a descendant process".to_string(),
+                script: "sleep 30 & echo $! > child.pid; wait".to_string(),
+                mode: TerminalExecutionMode::Sandboxed,
+                ssh_server_id: None,
+                expect: OutputFormat::Text,
+                resolution: MediaResolution::Auto,
+                max_lines: 50,
+                raw: false,
+                timeout: 30,
+                background: true,
+            })
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
@@ -5717,19 +7176,22 @@ mod tests {
         panic!("descendant process {child_pid} survived terminal cancellation");
     }
 
+    /// A foreground command blocked on stdin sees no EOF: every job owns a
+    /// live stdin pipe, so at the foreground window the call promotes it to
+    /// a background task the model feeds through `terminal_input`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn foreground_command_reading_stdin_gets_eof_at_once() {
+    async fn foreground_command_blocked_on_stdin_promotes_at_the_window() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, tool) = configured_test_terminal(
             dir.path(),
-            Duration::from_secs(30),
+            Duration::from_secs(1),
             Duration::from_secs(60),
             Duration::from_secs(60),
         )
         .await;
+        let background_receiver = tool.background_receiver();
 
-        let started = std::time::Instant::now();
         let result = tool
             .call(
                 terminal_args("read all of stdin", "cat"),
@@ -5739,14 +7201,17 @@ mod tests {
             .expect("terminal call should succeed");
 
         let command = result.command().expect("terminal returns a command result");
+        let CommandOutcome::Running { task_id, .. } = &command.outcome else {
+            panic!(
+                "cat blocked on stdin must promote to a task, got {:?}",
+                command.outcome
+            );
+        };
+        assert_eq!(started_task_id(&background_receiver), *task_id);
+
         assert!(
-            matches!(command.outcome, CommandOutcome::Exited { code: 0 }),
-            "the call must exit 0, not be killed: {:?}",
-            command.outcome
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "cat must see EOF instead of waiting out the limit"
+            tool.job_registry().kill_by_task_id(task_id).await,
+            "the promoted task must still be running"
         );
     }
 
@@ -5761,6 +7226,8 @@ mod tests {
             resolution: MediaResolution::Auto,
             max_lines: 50,
             raw: false,
+            timeout: 30,
+            background: false,
         }
     }
 
@@ -5771,16 +7238,12 @@ mod tests {
         script: &str,
     ) -> String {
         let result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: terminal_args("background job", script),
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                background: true,
+                ..terminal_args("background job", script)
+            })
             .await
-            .expect("terminal_background should start the job");
+            .expect("terminal should start the job");
         match result.command().map(|command| &command.outcome) {
             Some(CommandOutcome::Running { task_id, .. }) => task_id.clone(),
             other => panic!("background job needs a task id, got {other:?}"),
@@ -5799,17 +7262,17 @@ mod tests {
         alerts
     }
 
-    /// A foreground container command must see stdin EOF at once: the input
-    /// sender is dropped before the exec runs. Catches the regression where
-    /// the sender lived until the call returned and `cat` waited out the
-    /// limit.
+    /// A foreground container command gets a live stdin pipe like every
+    /// other job: no EOF shortcut. The exec's stdin channel stays open and
+    /// its blocked watch channel is wired, so a reader can be fed through
+    /// `terminal_input` once the call promotes.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn container_foreground_command_reading_stdin_gets_eof_at_once() {
-        /// A container executor that asserts its stdin is already at EOF.
-        struct ForegroundStdinEofExec;
+    async fn container_foreground_command_gets_a_live_stdin_pipe() {
+        /// A container executor that asserts stdin is a watched live pipe.
+        struct ForegroundStdinPipeExec;
 
-        impl crate::ContainerExec for ForegroundStdinEofExec {
+        impl crate::ContainerExec for ForegroundStdinPipeExec {
             async fn exec(
                 &self,
                 _container_id: &str,
@@ -5817,7 +7280,7 @@ mod tests {
                 _working_dir: &str,
                 _kill_rx: Receiver<()>,
                 stdin_rx: Receiver<Vec<u8>>,
-                _stdin_blocked: Option<Sender<StdinWatchSignal>>,
+                _lifetime: ExecLifetime,
             ) -> Result<ContainerExecOutcome, String> {
                 let eof = futures_lite::future::or(async { Some(stdin_rx.recv().await) }, async {
                     async_io::Timer::after(Duration::from_secs(5)).await;
@@ -5826,11 +7289,27 @@ mod tests {
                 .await
                 .expect("a foreground exec's stdin must be EOF at once, not left open");
                 assert!(eof.is_err(), "a foreground exec's stdin must carry no data");
-                Ok(ContainerExecOutcome::Completed(std::process::Output {
-                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                }))
+                Ok(ContainerExecOutcome::Completed {
+                    output: std::process::Output {
+                        status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    },
+                    killed: Vec::new(),
+                })
+            }
+
+            fn exec_streamed(
+                &self,
+                _container_id: &str,
+                _script: &str,
+                _working_dir: &str,
+                _kill_rx: Receiver<()>,
+                _stdin_rx: Receiver<Vec<u8>>,
+                _stdout: Sender<Vec<u8>>,
+            ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
+            {
+                std::future::ready(Err("a foreground command does not stream".to_string()))
             }
         }
 
@@ -5839,19 +7318,21 @@ mod tests {
         let (job_registry, job_registry_service) = job_registry_channel();
         tokio::spawn(async move { job_registry_service.serve().await });
         let container_tools =
-            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle());
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
         let runtime = ContainerShellRuntime::new(
-            "aither-test-foreground-eof",
+            "aither-test-foreground-stdin",
             crate::ContainerIpcRoute::new(
                 "host.docker.internal",
                 crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
                     .expect("loopback binds the bridge"),
             ),
-            crate::AnyContainerExec::new(Arc::new(ForegroundStdinEofExec)),
+            crate::AnyContainerExec::new(Arc::new(ForegroundStdinPipeExec)),
         );
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
+        let (alert_tx, _alert_rx) = async_channel::unbounded();
         let (_pid, output) = execute_container_background(ContainerBackgroundExecution {
             executor: executor_core::tokio::TokioGlobal,
+            env_source: &None,
             registry: &registry,
             task_id: "task-test",
             execution_id: "exec-test",
@@ -5861,14 +7342,19 @@ mod tests {
             prepared_tools: &container_tools,
             ipc_commands: &[],
             job_registry: &job_registry,
-            stdin_alerts: None,
+            stdin_alerts: Some(StdinAlerts {
+                tx: alert_tx.clone(),
+                task_id: "task-test".to_string(),
+                script: "cat".to_string(),
+            }),
+            lifetime: JobLifetime::Foreground { alerts: alert_tx },
             background_startup: &BackgroundStartup::new(startup_tx),
             priority: ProcessPriority::default(),
             confinement: None,
             carry: None,
         })
         .await
-        .expect("a foreground container exec should complete at EOF");
+        .expect("a foreground container exec should complete");
         assert_eq!(output.status.code(), Some(0));
     }
 
@@ -5975,8 +7461,8 @@ mod tests {
     #[cfg(unix)]
     async fn configured_test_terminal(
         dir: &Path,
-        foreground: Duration,
-        background_cap: Duration,
+        foreground_wait: Duration,
+        timeout_cap: Duration,
         alert_after: Duration,
     ) -> (
         tempfile::TempDir,
@@ -5993,16 +7479,20 @@ mod tests {
         .adopt_prepared_tools(shell_sessions)
         .await
         .expect("prepared tools should be adopted")
-        .with_foreground_limit(foreground)
-        .with_background_timeout_cap(background_cap)
+        .with_foreground_wait(foreground_wait)
+        .with_timeout_cap(timeout_cap)
         .with_long_job_alert_after(alert_after);
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
         (cache, tool.with_registry(registry))
     }
 
+    /// A foreground command still running at the window promotes to a
+    /// background task instead of dying; its `timeout` then kills it with
+    /// its descendants.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn foreground_command_still_running_at_the_limit_is_killed_with_descendants() {
+    async fn foreground_command_still_running_at_the_window_promotes_and_times_out_with_descendants()
+     {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, tool) = configured_test_terminal(
             dir.path(),
@@ -6011,6 +7501,7 @@ mod tests {
             Duration::from_secs(60),
         )
         .await;
+        let background_receiver = tool.background_receiver();
         let child_pid_path = dir.path().join("child.pid");
 
         let result = tool
@@ -6024,17 +7515,19 @@ mod tests {
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
                     raw: false,
+                    timeout: 3,
+                    background: false,
                 },
                 ToolContext::new(),
             )
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
-        assert!(rendered.contains("Task ID: '"), "{rendered}");
         assert!(
-            rendered.contains("terminal_background"),
-            "rendered result should point to terminal_background: {rendered}"
+            rendered.contains("Started in background as task '"),
+            "the still-running command must promote: {rendered}"
         );
+        let task_id = started_task_id(&background_receiver);
 
         let child_pid = async_fs::read_to_string(&child_pid_path)
             .await
@@ -6042,19 +7535,455 @@ mod tests {
             .trim()
             .parse::<i32>()
             .expect("descendant pid should parse");
-        for _ in 0..100 {
+        for _ in 0..500 {
             // SAFETY: signal 0 probes process existence.
             if unsafe { libc::kill(child_pid, 0) } != 0 {
-                return;
+                break;
             }
             async_io::Timer::after(std::time::Duration::from_millis(20)).await;
         }
-        panic!("descendant process {child_pid} survived the foreground kill");
+        assert!(
+            unsafe { libc::kill(child_pid, 0) } != 0,
+            "descendant process {child_pid} survived the timeout kill"
+        );
+
+        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the finished job stays in the registry");
+        assert_eq!(
+            info.status,
+            JobStatus::Killed,
+            "the promoted job should be killed at its timeout: {completed:?}"
+        );
+    }
+
+    /// What a test leaves running after its shell exits.
+    ///
+    /// `Plain` is a `sleep` in the shell's process group. `Setsid` is a helper
+    /// program that calls `setsid` and stays alive, so it also leaves the
+    /// group and the session. The helper is built here because macOS ships no
+    /// `setsid` binary, and because the kernel withholds the environment of
+    /// Apple's own binaries (`sleep`, `perl`), which is what finds a `setsid`
+    /// descendant once its parent is gone.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum Descendant {
+        Plain,
+        Setsid,
+    }
+
+    /// The name of the `setsid` helper program, and so of its process.
+    #[cfg(unix)]
+    const SETSID_HELPER: &str = "setsid-helper";
+
+    /// The directory the sandbox may execute programs from.
+    #[cfg(unix)]
+    fn exec_dir<P, E>(tool: &TerminalTool<P, E, Configured>) -> PathBuf {
+        tool.shell_sessions
+            .local_tools()
+            .expect("the terminal has local tools")
+            .bin_dir()
+            .clone()
+    }
+
+    /// Builds the `setsid` helper into `dir` and returns its path. The sandbox
+    /// executes only what lies under a granted directory, so `dir` is the
+    /// prepared tools' [`exec_dir`].
+    #[cfg(unix)]
+    fn build_setsid_helper(dir: &Path) -> PathBuf {
+        let source = dir.join("setsid_helper.rs");
+        std::fs::write(
+            &source,
+            "extern \"C\" { fn setsid() -> i32; }\n\
+             fn main() {\n\
+                 let seconds: u64 = std::env::args().nth(1).expect(\"seconds\").parse().expect(\"seconds\");\n\
+                 // SAFETY: `setsid` takes no arguments.\n\
+                 if unsafe { setsid() } < 0 { std::process::exit(1); }\n\
+                 std::thread::sleep(std::time::Duration::from_secs(seconds));\n\
+             }\n",
+        )
+        .expect("helper source should be written");
+        let binary = dir.join(SETSID_HELPER);
+        let status = std::process::Command::new("rustc")
+            .arg("--edition=2021")
+            .arg("-o")
+            .arg(&binary)
+            .arg(&source)
+            .status()
+            .expect("rustc should run");
+        assert!(status.success(), "the setsid helper should compile");
+        binary
+    }
+
+    #[cfg(unix)]
+    impl Descendant {
+        /// The name the descendant's process has once it ran `exec`.
+        const fn process_name(self) -> &'static str {
+            match self {
+                Self::Plain => "sleep",
+                Self::Setsid => SETSID_HELPER,
+            }
+        }
+
+        /// A command that starts the descendant for `seconds` detached from
+        /// the shell's output, records its pid in `child.pid` and returns once
+        /// the child exists.
+        fn script(self, exec_dir: &Path, seconds: u32) -> String {
+            // The foreground `sleep` guard refuses a plain `sleep 0.3`, so
+            // the settle wait is a `kill -0` check on the recorded pid.
+            match self {
+                Self::Plain => format!(
+                    "sleep {seconds} > /dev/null 2>&1 & echo $! > child.pid; until kill -0 \"$(cat child.pid)\" 2>/dev/null; do :; done"
+                ),
+                Self::Setsid => format!(
+                    "'{}' {seconds} > /dev/null 2>&1 & echo $! > child.pid; until kill -0 \"$(cat child.pid)\" 2>/dev/null; do :; done",
+                    build_setsid_helper(exec_dir).display()
+                ),
+            }
+        }
+    }
+
+    /// The pid `child.pid` in `dir` holds, once the shell wrote it.
+    #[cfg(unix)]
+    async fn recorded_child_pid(dir: &Path) -> i32 {
+        for _ in 0..250 {
+            // The redirect creates the file before `echo` writes it, so an
+            // empty read only means the pid is not there yet.
+            if let Ok(text) = async_fs::read_to_string(dir.join("child.pid")).await
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            async_io::Timer::after(Duration::from_millis(20)).await;
+        }
+        panic!("the descendant never recorded its pid");
+    }
+
+    /// Whether `pid` is a live process.
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        // SAFETY: signal 0 probes process existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Fails unless `pid` is gone within a few seconds.
+    #[cfg(unix)]
+    async fn assert_process_gone(pid: i32, context: &str) {
+        for _ in 0..250 {
+            if !process_exists(pid) {
+                return;
+            }
+            async_io::Timer::after(Duration::from_millis(20)).await;
+        }
+        panic!("process {pid} survived: {context}");
+    }
+
+    #[cfg(unix)]
+    async fn foreground_command_leaving_a_descendant_kills_it_and_alerts_once(
+        descendant: Descendant,
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let receiver = tool.background_receiver();
+
+        let result = tool
+            .call(
+                terminal_args(
+                    "leave a descendant",
+                    &descendant.script(&exec_dir(&tool), 300),
+                ),
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal call should succeed");
+        let command = result.command().expect("terminal returns a command result");
+        assert!(
+            matches!(command.outcome, CommandOutcome::Exited { code: 0 }),
+            "{:?}",
+            command.outcome
+        );
+
+        let child = recorded_child_pid(tool.working_dir()).await;
+        assert_process_gone(
+            child,
+            &format!("{descendant:?} descendant of a foreground command"),
+        )
+        .await;
+        let alerts = receiver.take_job_alerts();
+        match alerts.as_slice() {
+            [JobAlert::DescendantsKilled(killed)] => {
+                assert_eq!(killed.omitted, 0);
+                // The name is read after the freeze, once the child exec'd.
+                assert_eq!(
+                    killed
+                        .processes
+                        .iter()
+                        .map(|process| i64::from(process.pid))
+                        .collect::<Vec<_>>(),
+                    [i64::from(child)]
+                );
+                assert_eq!(killed.processes[0].name, descendant.process_name());
+            }
+            other => panic!("expected one descendants-killed alert, got {other:?}"),
+        }
+        assert!(
+            receiver.take_job_alerts().is_empty(),
+            "the same event must not alert twice"
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn terminal_background_rejects_timeout_above_cap_and_kills_at_timeout() {
+    async fn foreground_command_leaving_a_descendant_kills_it_and_alerts_once_plain() {
+        foreground_command_leaving_a_descendant_kills_it_and_alerts_once(Descendant::Plain).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreground_command_leaving_a_setsid_descendant_kills_it_and_alerts_once() {
+        foreground_command_leaving_a_descendant_kills_it_and_alerts_once(Descendant::Setsid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreground_background_jobs_joined_by_wait_run_without_an_alert() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let receiver = tool.background_receiver();
+
+        let result = tool
+            .call(
+                terminal_args(
+                    "run two jobs and join them",
+                    "(sleep 1; echo one > one.txt) & (sleep 1; echo two > two.txt) & wait",
+                ),
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal call should succeed");
+        let command = result.command().expect("terminal returns a command result");
+        assert!(
+            matches!(command.outcome, CommandOutcome::Exited { code: 0 }),
+            "{:?}",
+            command.outcome
+        );
+        for name in ["one.txt", "two.txt"] {
+            assert!(
+                tool.working_dir().join(name).exists(),
+                "{name} must be written before the command returns"
+            );
+        }
+        assert!(
+            receiver.take_job_alerts().is_empty(),
+            "a joined job is no survivor"
+        );
+    }
+
+    /// Starts the background `script`, waits until its shell has exited with the
+    /// descendant still alive, and returns the task id and the descendant's pid.
+    #[cfg(unix)]
+    async fn background_job_whose_shell_exited(
+        tool: &TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+        script: &str,
+        timeout: u64,
+    ) -> (String, i32) {
+        let result = tool
+            .run_background(TerminalArgs {
+                background: true,
+                timeout,
+                ..terminal_args("background job", script)
+            })
+            .await
+            .expect("terminal should start the background job");
+        let task_id = match result.command().map(|command| &command.outcome) {
+            Some(CommandOutcome::Running { task_id, .. }) => task_id.clone(),
+            other => panic!("background job needs a task id, got {other:?}"),
+        };
+        let child = recorded_child_pid(tool.working_dir()).await;
+        // Past the shell's exit and several of the tree's checks.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            process_exists(child),
+            "the descendant must outlive the shell"
+        );
+        (task_id, child)
+    }
+
+    #[cfg(unix)]
+    async fn background_job_stays_running_until_its_descendant_exits(descendant: Descendant) {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let (task_id, child) =
+            background_job_whose_shell_exited(&tool, &descendant.script(&exec_dir(&tool), 3), 30)
+                .await;
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the job is registered");
+        assert_eq!(
+            info.status,
+            JobStatus::Running,
+            "the job runs while its descendant does"
+        );
+        assert!(
+            tool.job_registry()
+                .format_running_jobs()
+                .await
+                .contains(&task_id),
+            "the running-jobs context lists the job"
+        );
+
+        assert_process_gone(child, "the descendant's own exit").await;
+        let receiver = tool.background_receiver();
+        let completed = wait_for_completed_task(&receiver, &task_id).await;
+        assert!(completed.result.is_ok(), "{completed:?}");
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the finished job stays in the registry");
+        assert_eq!(info.status, JobStatus::Completed { exit_code: 0 });
+        assert!(
+            tool.job_registry().format_running_jobs().await.is_empty(),
+            "a finished job is no longer listed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_job_stays_running_until_its_plain_descendant_exits() {
+        background_job_stays_running_until_its_descendant_exits(Descendant::Plain).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_job_stays_running_until_its_setsid_descendant_exits() {
+        background_job_stays_running_until_its_descendant_exits(Descendant::Setsid).await;
+    }
+
+    #[cfg(unix)]
+    async fn killing_a_background_job_kills_its_descendant(descendant: Descendant) {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let (task_id, child) =
+            background_job_whose_shell_exited(&tool, &descendant.script(&exec_dir(&tool), 300), 30)
+                .await;
+        assert!(
+            tool.job_registry().kill_by_task_id(&task_id).await,
+            "a job with a live descendant is killable"
+        );
+        assert_process_gone(
+            child,
+            &format!("terminal_kill of a job with a {descendant:?} descendant"),
+        )
+        .await;
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the killed job stays in the registry");
+        assert_eq!(info.status, JobStatus::Killed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn killing_a_background_job_kills_its_plain_descendant() {
+        killing_a_background_job_kills_its_descendant(Descendant::Plain).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn killing_a_background_job_kills_its_setsid_descendant() {
+        killing_a_background_job_kills_its_descendant(Descendant::Setsid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_timeout_kills_a_descendant_that_outlived_the_shell() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        // The timeout fires while the shell is long gone: the job is only its
+        // descendant by then.
+        let (task_id, child) = background_job_whose_shell_exited(
+            &tool,
+            &Descendant::Setsid.script(&exec_dir(&tool), 300),
+            2,
+        )
+        .await;
+        assert_process_gone(child, "the timeout of a job whose shell exited").await;
+        let receiver = tool.background_receiver();
+        wait_for_completed_task(&receiver, &task_id).await;
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the finished job stays in the registry");
+        assert_eq!(info.status, JobStatus::Killed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagents_cleanup_kills_a_descendant_that_outlived_the_shell() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let (_task_id, child) = background_job_whose_shell_exited(
+            &tool,
+            &Descendant::Plain.script(&exec_dir(&tool), 300),
+            30,
+        )
+        .await;
+        // What `kill_running_terminal_jobs` and the subagent run's cleanup call.
+        assert_eq!(tool.job_registry().kill_running().await, 1);
+        assert_process_gone(child, "the cleanup of a subagent's job").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_rejects_timeout_above_cap_and_kills_at_timeout() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, tool) = configured_test_terminal(
             dir.path(),
@@ -6064,30 +7993,25 @@ mod tests {
         )
         .await;
         let background_receiver = tool.background_receiver();
-        let background_tool = tool.background_tool();
-        let args = |timeout: u64| TerminalBackgroundArgs {
-            terminal: TerminalArgs {
-                description: "sleep in the background".to_string(),
-                script: "sleep 30".to_string(),
-                mode: TerminalExecutionMode::Sandboxed,
-                ssh_server_id: None,
-                expect: OutputFormat::Text,
-                resolution: MediaResolution::Auto,
-                max_lines: 50,
-                raw: false,
-            },
+        let args = |timeout: u64| TerminalArgs {
+            description: "sleep in the background".to_string(),
+            script: "sleep 30".to_string(),
+            mode: TerminalExecutionMode::Sandboxed,
+            ssh_server_id: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            max_lines: 50,
+            raw: false,
             timeout,
+            background: true,
         };
 
         assert!(
-            background_tool
-                .call(args(3), ToolContext::new())
-                .await
-                .is_err(),
+            tool.call(args(3), ToolContext::new()).await.is_err(),
             "a timeout above the cap must be rejected"
         );
 
-        let result = background_tool
+        let result = tool
             .call(args(1), ToolContext::new())
             .await
             .expect("a timeout within the cap should start the job");
@@ -6125,25 +8049,20 @@ mod tests {
         let background_receiver = tool.background_receiver();
 
         let _result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: TerminalArgs {
-                        description: "sleep in the background".to_string(),
-                        script: "sleep 30".to_string(),
-                        mode: TerminalExecutionMode::Sandboxed,
-                        ssh_server_id: None,
-                        expect: OutputFormat::Text,
-                        resolution: MediaResolution::Auto,
-                        max_lines: 50,
-                        raw: false,
-                    },
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                description: "sleep in the background".to_string(),
+                script: "sleep 30".to_string(),
+                mode: TerminalExecutionMode::Sandboxed,
+                ssh_server_id: None,
+                expect: OutputFormat::Text,
+                resolution: MediaResolution::Auto,
+                max_lines: 50,
+                raw: false,
+                timeout: 30,
+                background: true,
+            })
             .await
-            .expect("terminal_background should start the job");
+            .expect("terminal should start the job");
         let task_id = started_task_id(&background_receiver);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -6221,6 +8140,8 @@ mod tests {
             resolution: MediaResolution::Auto,
             max_lines: 50,
             raw: false,
+            timeout: 30,
+            background: false,
         }
     }
 
@@ -6287,23 +8208,18 @@ mod tests {
         // `exec` keeps `$$` — the pid the probe wrote — on the interactive
         // shell the session then drives.
         let result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: TerminalArgs {
-                        description: "start a persistent shell".to_string(),
-                        script: "printf '%s\\n' $$ > \"$PWD/pid\"; exec sh".to_string(),
-                        mode: TerminalExecutionMode::Sandboxed,
-                        ssh_server_id: None,
-                        expect: OutputFormat::Text,
-                        resolution: MediaResolution::Auto,
-                        max_lines: 50,
-                        raw: false,
-                    },
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                description: "start a persistent shell".to_string(),
+                script: "printf '%s\\n' $$ > \"$PWD/pid\"; exec sh".to_string(),
+                mode: TerminalExecutionMode::Sandboxed,
+                ssh_server_id: None,
+                expect: OutputFormat::Text,
+                resolution: MediaResolution::Auto,
+                max_lines: 50,
+                raw: false,
+                timeout: 30,
+                background: true,
+            })
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
@@ -6348,14 +8264,10 @@ mod tests {
         let background_receiver = tool.background_receiver();
 
         let result = tool
-            .background_tool()
-            .call(
-                TerminalBackgroundArgs {
-                    terminal: pid_probe_args(),
-                    timeout: 30,
-                },
-                ToolContext::new(),
-            )
+            .run_background(TerminalArgs {
+                background: true,
+                ..pid_probe_args()
+            })
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
@@ -6590,7 +8502,7 @@ mod tests {
     #[cfg(all(unix, aither_container_acceptance))]
     impl TestDockerContainer {
         /// Starts a container with `heel_bin` mounted at `/usr/local/bin/heel`,
-        /// the prepared tool bundle mounted read-only where production mounts
+        /// the staged tool bundle mounted read-only where the image carries
         /// it, and `host.docker.internal` resolving to the docker host gateway,
         /// and prepares the `/workspace` directory container executions run
         /// in. Returns `None` when docker cannot start the container.
@@ -6700,14 +8612,15 @@ mod tests {
     /// a real docker daemon and a Linux `heel` binary, which the dedicated CI
     /// job provides and the feature matrices do not. A missing daemon or
     /// binary fails the test — it is never skipped silently.
-    /// Starts the acceptance container with the test bundle staged and
-    /// mounted read-only as production mounts it, so the wrapped script runs
-    /// a prepared command from that mount. The returned directory holds the
-    /// staged bundle and must outlive the container.
+    /// Starts the acceptance container with the test bundle staged as an
+    /// image build stages it and mounted read-only where the image carries
+    /// it, so the wrapped script runs a prepared command from that directory.
+    /// The returned directory holds the staged bundle and must outlive the
+    /// container.
     #[cfg(all(unix, aither_container_acceptance))]
     async fn start_acceptance_container() -> (
         TestDockerContainer,
-        crate::tool_runtime::ToolBundle,
+        crate::tool_runtime::ImageTools,
         tempfile::TempDir,
     ) {
         let docker_ready = std::process::Command::new("docker")
@@ -6720,15 +8633,25 @@ mod tests {
         );
         let heel_bin = container_test_heel_binary()
             .expect("container acceptance requires a Linux heel binary (set HEEL_BIN)");
+        let image = crate::tool_runtime::tests::image_tools();
         let bundle = crate::tool_runtime::tests::bundle();
         let tools_cache = tempfile::tempdir().expect("tool cache dir should be created");
-        let (tools_mount, _) = bundle
-            .prepare_container_mount(tools_cache.path())
-            .await
-            .expect("test bundle should stage for a container mount");
+        // Stage the executables under the image's cache key — exactly what
+        // `stage_image_tools` produces — and mount the directory where the
+        // image carries it.
+        let prepared = bundle
+            .prepare_local_sync(tools_cache.path(), &image.cache_key().unwrap())
+            .expect("test bundle should stage for the image");
+        let staged = prepared
+            .bin_dir()
+            .parent()
+            .expect("prepared binaries have a parent directory")
+            .to_path_buf();
+        let tools_mount =
+            crate::MountSpec::read_only(&staged, image.container_directory().unwrap());
         let container = TestDockerContainer::start(&heel_bin, &tools_mount)
             .expect("container acceptance could not start ubuntu:24.04");
-        (container, bundle, tools_cache)
+        (container, image, tools_cache)
     }
 
     /// The shell sessions of a terminal whose home is the acceptance
@@ -6736,7 +8659,7 @@ mod tests {
     #[cfg(all(unix, aither_container_acceptance))]
     async fn acceptance_shell_sessions(
         container: &TestDockerContainer,
-        bundle: &crate::tool_runtime::ToolBundle,
+        image: &crate::tool_runtime::ImageTools,
         workspace: &Path,
     ) -> ShellSessionRegistry {
         let client = Arc::new(
@@ -6762,7 +8685,7 @@ mod tests {
         // The container backend needs its own prepared tools: the registry
         // entry names the container and its `/opt/aither/tools` bin dir, which
         // the wrapped script puts on `PATH` and heel must grant execute on.
-        let container_tools = crate::tool_runtime::tests::container_tools(bundle);
+        let container_tools = crate::tool_runtime::tests::container_tools(image);
         ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,
@@ -6770,6 +8693,64 @@ mod tests {
         })
         .with_container_runtime(runtime)
         .with_test_container_tools(container_tools, container.0.clone())
+    }
+
+    /// The streamed exec of the real docker backend delivers a command's
+    /// stdout in order and whole across chunks, reports its exit status, and
+    /// kills the command when its kill switch is dropped.
+    #[cfg(all(unix, aither_container_acceptance))]
+    #[tokio::test]
+    async fn container_streamed_exec_streams_stdout_reports_status_and_kills_on_drop() {
+        use crate::ContainerExec as _;
+        let (container, _bundle, _tools_cache) = start_acceptance_container().await;
+        let client = Arc::new(
+            bollard::Docker::connect_with_local_defaults().expect("docker client should connect"),
+        );
+        let exec = crate::BollardContainerExec::new(client);
+
+        let (_kill_tx, kill_rx) = async_channel::bounded::<()>(1);
+        let (stdin_tx, stdin_rx) = async_channel::bounded::<Vec<u8>>(1);
+        drop(stdin_tx);
+        let (out_tx, out_rx) = async_channel::bounded::<Vec<u8>>(8);
+        let streaming = exec.exec_streamed(
+            &container.0,
+            "head -c 300000 /dev/zero | tr '\\0' 'x'; exit 3",
+            "/",
+            kill_rx,
+            stdin_rx,
+            out_tx,
+        );
+        let collect = async {
+            let mut total = 0;
+            while let Ok(chunk) = out_rx.recv().await {
+                assert!(chunk.iter().all(|byte| *byte == b'x'));
+                total += chunk.len();
+            }
+            total
+        };
+        let (outcome, total) = futures::join!(streaming, collect);
+        assert_eq!(total, 300_000, "every byte arrives");
+        match outcome.expect("the exec runs") {
+            ContainerExecOutcome::Completed { output, .. } => {
+                assert_eq!(output.status.code(), Some(3));
+            }
+            ContainerExecOutcome::Killed => panic!("nothing killed it"),
+        }
+
+        // A reader that goes away ends the command.
+        let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
+        let (stdin_tx, stdin_rx) = async_channel::bounded::<Vec<u8>>(1);
+        drop(stdin_tx);
+        let (out_tx, out_rx) = async_channel::bounded::<Vec<u8>>(1);
+        drop(out_rx);
+        let outcome = exec
+            .exec_streamed(&container.0, "yes", "/", kill_rx, stdin_rx, out_tx)
+            .await;
+        drop(kill_tx);
+        assert!(
+            matches!(outcome, Ok(ContainerExecOutcome::Killed) | Err(_)),
+            "a gone reader stops the command: {outcome:?}"
+        );
     }
 
     /// In a real container the main agent's command runs unconfined, while a
@@ -6794,7 +8775,7 @@ mod tests {
             .expect("prepared tools should be adopted");
         let parent = tool.with_registry(Arc::new(ToolRegistryBuilder::new().build(dir.path())));
         let child = parent
-            .subagent(&mut LaunchHistory::default(), SubagentGrant::new())
+            .subagent_without_grant()
             .await
             .expect("an empty grant is always given");
         // The acceptance container does not really mount the host workspace,
@@ -6875,6 +8856,8 @@ mod tests {
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
                     raw: false,
+                    timeout: 30,
+                    background: false,
                 },
                 ToolContext::new(),
             )
@@ -6936,13 +8919,91 @@ mod tests {
         .await
     }
 
+    /// A script the sandboxed command writes into its working directory and
+    /// chmods executes — writable space also carries EXEC.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_written_into_the_working_dir_executes() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        assert_eq!(
+            exit_code_of(
+                &tool,
+                "echo '#!/bin/sh\necho ok' > run.sh && chmod +x run.sh && ./run.sh",
+            )
+            .await,
+            0,
+            "a script the command writes and chmods runs"
+        );
+    }
+
+    /// The host Rust toolchain works end to end inside the local sandbox:
+    /// cargo runs, and `cargo test` executes the binary it just built under
+    /// the writable working dir.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_host_rust_toolchain_builds_and_tests_a_crate() {
+        assert!(
+            std::process::Command::new("cargo")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success()),
+            "cargo must be on the host PATH for this test"
+        );
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+
+        assert_eq!(
+            exit_code_of(&tool, "cargo --version").await,
+            0,
+            "cargo is reachable inside the sandbox"
+        );
+
+        let krate = dir.path().join("probe");
+        std::fs::create_dir_all(krate.join("src")).unwrap();
+        std::fs::write(
+            krate.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            krate.join("src/lib.rs"),
+            "#[test]\nfn it_runs() { assert_eq!(1 + 1, 2); }\n",
+        )
+        .unwrap();
+        let script = format!(
+            "cd '{}' && CARGO_TARGET_DIR='{}' cargo test",
+            krate.display(),
+            krate.join("target").display()
+        );
+        assert_eq!(
+            exit_code_of(&tool, &script).await,
+            0,
+            "cargo test executes the binary it built under the working dir"
+        );
+    }
+
+    /// Credential files inside the granted toolchain homes stay unreadable.
+    #[cfg(all(unix, target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cargo_credentials_inside_the_granted_home_stay_unreadable() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let code = exit_code_of(&tool, "cat ~/.cargo/credentials.toml").await;
+        assert_ne!(
+            code, 0,
+            "a credential file under ~/.cargo stays denied inside the sandbox"
+        );
+    }
     /// Launches a subagent of `parent` the way its launcher does, with a
     /// launch history of its own.
     async fn launch(
         parent: &ConfiguredTestTool,
         grant: SubagentGrant,
     ) -> Result<ConfiguredTestTool, SubagentGrantError> {
-        parent.subagent(&mut LaunchHistory::default(), grant).await
+        parent
+            .subagent(&mut LaunchHistory::default(), grant, None, None)
+            .await
     }
 
     #[cfg(unix)]
@@ -7131,20 +9192,142 @@ mod tests {
             .status()
             .expect("sh should run");
         assert!(status.success());
-        let written = std::fs::read_to_string(&report).expect("the trap writes the report");
+        let written = std::fs::read_to_string(&report).expect("the trailer writes the report");
         assert_eq!(
             PathBuf::from(written.trim_end()),
             dunce::canonicalize(dir.path().join("sub")).unwrap()
         );
-        // The script's own exit status survives the trap.
-        let status = std::process::Command::new("sh")
+        // The script's own exit status survives the trailer, whether the
+        // script ends through `exit` or its last command fails.
+        for (script, code) in [("exit 7", 7), ("cd sub; (exit 5)", 5)] {
+            let status = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &carry_cwd_script(script, &report.to_string_lossy()).unwrap(),
+                ])
+                .current_dir(dir.path())
+                .status()
+                .expect("sh should run");
+            assert_eq!(status.code(), Some(code), "{script}");
+        }
+        // The script's own syntax cannot swallow the trailer: an unterminated
+        // here-document holding a quote still ends before the report.
+        std::fs::remove_file(&report).expect("the report exists");
+        let output = std::process::Command::new("sh")
             .args([
                 "-c",
-                &carry_cwd_script("exit 7", &report.to_string_lossy()).unwrap(),
+                &carry_cwd_script("cd sub; cat <<EOF\nit's", &report.to_string_lossy()).unwrap(),
             ])
-            .status()
+            .current_dir(dir.path())
+            .output()
             .expect("sh should run");
-        assert_eq!(status.code(), Some(7));
+        assert!(output.status.success());
+        // bash ends the unterminated body with a newline, dash does not.
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim_end(), "it's");
+        let written = std::fs::read_to_string(&report).expect("the trailer writes the report");
+        assert_eq!(
+            PathBuf::from(written.trim_end()),
+            dunce::canonicalize(dir.path().join("sub")).unwrap()
+        );
+    }
+
+    /// Asserts `receiver` holds exactly one alert: a reset of the carried
+    /// directory to `dir` for `reason`.
+    #[cfg(unix)]
+    fn assert_directory_reset(
+        receiver: &BackgroundTaskReceiver,
+        dir: impl AsRef<Path>,
+        reason: DirectoryResetReason,
+    ) {
+        let alerts = receiver.take_job_alerts();
+        match alerts.as_slice() {
+            [JobAlert::DirectoryReset(reset)] => {
+                assert_eq!(reset.dir, dir.as_ref());
+                assert_eq!(reset.reason, reason);
+            }
+            other => panic!("expected one directory reset, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_carried_directory_raises_no_alert() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let receiver = tool.background_receiver();
+
+        assert_eq!(exit_code_of(&tool, "mkdir sub && cd sub").await, 0);
+        assert_eq!(exit_code_of(&tool, "true").await, 0);
+        assert_eq!(exit_code_of(&tool, "pwd").await, 0);
+        // A failure that stayed in its directory, and a direct command.
+        assert_ne!(exit_code_of(&tool, "false").await, 0);
+        assert_ne!(exit_code_of(&tool, "ls /nonexistent-directory").await, 0);
+        assert!(receiver.take_job_alerts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_command_alerts_once_with_the_directory_commands_run_in() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let receiver = tool.background_receiver();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        assert_ne!(exit_code_of(&tool, "mkdir sub && cd sub && false").await, 0);
+        assert_directory_reset(&receiver, &root, DirectoryResetReason::Failed);
+        assert_eq!(pwd_of(&tool).await, root);
+        assert!(receiver.take_job_alerts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exit_without_a_report_alerts_once() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let receiver = tool.background_receiver();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        assert_eq!(exit_code_of(&tool, "mkdir sub && cd sub").await, 0);
+        assert_eq!(exit_code_of(&tool, "cd ..; exit 0").await, 0);
+        assert_directory_reset(
+            &receiver,
+            root.join("sub"),
+            DirectoryResetReason::Unreported,
+        );
+        assert_eq!(pwd_of(&tool).await, root.join("sub"));
+        assert!(receiver.take_job_alerts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_directory_outside_the_readable_paths_alerts_once() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let receiver = tool.background_receiver();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        // Readable to the sandbox, yet in none of the terminal's grants.
+        assert_eq!(exit_code_of(&tool, "cd /usr").await, 0);
+        assert_directory_reset(&receiver, &root, DirectoryResetReason::OutsideReadable);
+        assert_eq!(pwd_of(&tool).await, root);
+        assert!(receiver.take_job_alerts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_removed_carried_directory_alerts_once() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let receiver = tool.background_receiver();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        assert_eq!(exit_code_of(&tool, "mkdir gone && cd gone").await, 0);
+        assert!(receiver.take_job_alerts().is_empty());
+        std::fs::remove_dir(root.join("gone")).unwrap();
+        assert_eq!(pwd_of(&tool).await, root);
+        assert_directory_reset(&receiver, &root, DirectoryResetReason::Removed);
+        assert_eq!(pwd_of(&tool).await, root);
+        assert!(receiver.take_job_alerts().is_empty());
     }
 
     #[cfg(unix)]
@@ -7167,7 +9350,9 @@ mod tests {
                     .expect("report is in the mount"),
                 start: ContainerPath::new("/workspace").unwrap(),
             }),
+            shell: true,
         };
+        let receiver = tool.background_receiver();
         assert_eq!(
             carry.container.as_ref().unwrap().report.as_str(),
             format!(
@@ -7183,13 +9368,31 @@ mod tests {
         assert_eq!(carried.get(), Some(dir.path().join("sub/dir")));
         assert!(!report.exists(), "the report is consumed");
 
-        // Outside the mount, after a failure and an empty report: unchanged.
+        assert!(
+            receiver.take_job_alerts().is_empty(),
+            "a carried directory raises no alert"
+        );
+
+        // Outside the mount, after a failure and an empty report: unchanged,
+        // and each raises one alert naming where the next command starts.
         std::fs::write(&report, "/etc\n").unwrap();
         tool.record_carried_dir(&carry, true).await;
         assert_eq!(carried.get(), Some(dir.path().join("sub/dir")));
+        assert_directory_reset(
+            &receiver,
+            "/workspace",
+            DirectoryResetReason::OutsideWorkspace,
+        );
         std::fs::write(&report, "/workspace/other\n").unwrap();
         tool.record_carried_dir(&carry, false).await;
         assert_eq!(carried.get(), Some(dir.path().join("sub/dir")));
+        assert_directory_reset(&receiver, "/workspace", DirectoryResetReason::Failed);
+        tool.record_carried_dir(&carry, true).await;
+        assert_directory_reset(&receiver, "/workspace", DirectoryResetReason::Unreported);
+        // A failure that stayed where it started changes nothing.
+        std::fs::write(&report, "/workspace\n").unwrap();
+        tool.record_carried_dir(&carry, false).await;
+        assert!(receiver.take_job_alerts().is_empty());
 
         // The mapping back to the container for the next start.
         assert_eq!(
@@ -7224,60 +9427,657 @@ mod tests {
         )
     }
 
+    /// A repository with a worktree one can commit in, and the paths the
+    /// commit grant is about, all canonical.
+    #[cfg(unix)]
+    struct CommitSetup {
+        dir: tempfile::TempDir,
+        worktree: PathBuf,
+        /// The main repository's git directory.
+        common: PathBuf,
+        /// The worktree's entry in it.
+        entry: PathBuf,
+        /// The subagent's repository.
+        subagent: PathBuf,
+        parent: ConfiguredTestTool,
+        _cache: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl CommitSetup {
+        async fn new(namespace: &str) -> Self {
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let worktree =
+                crate::subagent::tests::repository_with_linked_worktree(dir.path(), namespace);
+            let (cache, parent) = authority_terminal(dir.path()).await;
+            let common = dunce::canonicalize(dir.path().join("repository/.git")).unwrap();
+            let entry = common.join("worktrees").join(namespace);
+            Self {
+                worktree: dunce::canonicalize(worktree).unwrap(),
+                subagent: entry.join("subagent"),
+                common,
+                entry,
+                parent,
+                dir,
+                _cache: cache,
+            }
+        }
+
+        async fn committing_child(&self, launcher: &ConfiguredTestTool) -> ConfiguredTestTool {
+            launch(
+                launcher,
+                SubagentGrant::new().with_committing_worktree(&self.worktree),
+            )
+            .await
+            .expect("the worktree can be granted with commit")
+        }
+
+        fn main_has(&self, id: &str) -> bool {
+            std::process::Command::new("git")
+                .args(["cat-file", "-e", id])
+                .current_dir(&self.common)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        }
+
+        fn main(&self, args: &[&str]) -> String {
+            crate::subagent::tests::git_in(&self.common, args)
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn commit_in_a_linked_worktree_needs_the_commit_grant() {
-        let dir = tempfile::tempdir().expect("temp dir should be created");
-        let worktree = crate::subagent::tests::repository_with_linked_worktree(dir.path(), "one");
-        let (_cache, parent) = authority_terminal(dir.path()).await;
+    async fn a_sandboxed_commit_lands_in_the_subagents_repository_and_the_main_one_is_read_only() {
+        let setup = CommitSetup::new("one").await;
+        let child = setup.committing_child(&setup.parent).await;
+        let ledger = child.commit_ledger().expect("a commit grant has a ledger");
+        let mark = ledger.mark().await.expect("the namespace can be read");
+        let before = setup.main(&["rev-parse", "refs/heads/subagent/one/work"]);
 
-        let without = launch(&parent, SubagentGrant::new().with_worktree(&worktree))
-            .await
-            .expect("the worktree can be granted");
+        assert_eq!(
+            exit_code_of(&child, &commit_script(&setup.worktree, "authorized")).await,
+            0,
+            "a commit grant lets the subagent commit"
+        );
+        assert_eq!(
+            setup.main(&["rev-parse", "refs/heads/subagent/one/work"]),
+            before,
+            "the commit is not in the main repository yet"
+        );
+
+        let commits = ledger.since(&mark).await.expect("commits can be listed");
+        assert_eq!(commits.len(), 1, "{commits:?}");
+        assert_eq!(commits[0].subject, "authorized");
+        assert_eq!(commits[0].worktree, setup.worktree);
+        assert!(setup.main_has(&commits[0].commit));
+        assert_eq!(
+            setup.main(&["rev-parse", "refs/heads/subagent/one/work"]),
+            commits[0].commit
+        );
+        setup.main(&["fsck", "--strict", "--no-dangling"]);
+    }
+
+    /// The main agent's `git` in a committing worktree resolves the
+    /// worktree's host-owned repository entry through the terminal's shim:
+    /// no program the subagent's repository config names — fsmonitor,
+    /// hooks, filters — and no `.git` file it replaced decides what runs.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_main_agents_git_in_a_committing_worktree_runs_nothing_the_subagent_chose() {
+        use std::fmt::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let setup = CommitSetup::new("guarded").await;
+        let _child = setup.committing_child(&setup.parent).await;
+
+        // A program only subagent-chosen configuration can reach.
+        let marker = setup.dir.path().join("subagent-ran");
+        let program = setup.dir.path().join("ran-by-git.sh");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\nprintf ran >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hooks = setup.dir.path().join("evil-hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let pre_commit = hooks.join("pre-commit");
+        std::fs::write(
+            &pre_commit,
+            format!("#!/bin/sh\nprintf hook >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&pre_commit, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Its repository's configuration names the program everywhere a
+        // program can be named; the worktree's attributes bind the filter.
+        let mut config = std::fs::read_to_string(setup.subagent.join("config")).unwrap();
+        write!(
+            config,
+            "\n[core]\n\tfsmonitor = {}\n\thooksPath = {}\n[filter \"pwn\"]\n\tclean = {}\n\trequired = true\n",
+            program.display(),
+            hooks.display(),
+            program.display()
+        )
+        .unwrap();
+        std::fs::write(setup.subagent.join("config"), config).unwrap();
+        std::fs::write(setup.worktree.join(".gitattributes"), "* filter=pwn\n").unwrap();
+
+        let worktree = setup.worktree.display().to_string();
+        for script in [
+            format!("git -C '{worktree}' status"),
+            format!("cd '{worktree}' && git status"),
+            format!(
+                "git -C '{worktree}' add -A && \
+                 git -C '{worktree}' -c user.name=a -c user.email=a@a -c commit.gpgSign=false \
+                 commit --allow-empty -m x"
+            ),
+        ] {
+            assert_eq!(
+                exit_code_of(&setup.parent, &script).await,
+                0,
+                "the ordinary git command should keep working: {script}"
+            );
+        }
+        assert!(
+            !marker.exists(),
+            "no program of the subagent's choosing ran through the worktree's repository"
+        );
+
+        // A replaced `.git` file resolves nothing either: the shim acts on
+        // the worktree's path, not on what its `.git` says.
+        std::fs::write(
+            setup.worktree.join(".git"),
+            format!("gitdir: {}\n", setup.subagent.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            exit_code_of(&setup.parent, &format!("git -C '{worktree}' status")).await,
+            0
+        );
+        assert!(
+            !marker.exists(),
+            "a replaced .git file chose no program either"
+        );
+
+        // Git anywhere else is untouched.
+        let repository = dunce::canonicalize(setup.dir.path().join("repository")).unwrap();
         assert_eq!(
             exit_code_of(
-                &without,
-                &format!("touch '{}'", worktree.join("f.txt").display())
+                &setup.parent,
+                &format!("git -C '{}' log --oneline -1", repository.display())
             )
             .await,
             0,
-            "the worktree itself is writable"
+            "git in unrelated repositories still reaches them"
         );
-        assert_ne!(
-            exit_code_of(&without, &commit_script(&worktree, "denied")).await,
-            0,
-            "its git data lives outside the subagent's space"
+    }
+
+    /// Nothing of the main repository's git directory is writable to a
+    /// committing subagent: each attempt on the main repository fails, and the
+    /// same command shape on the subagent's own repository, its positive
+    /// control, succeeds.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn a_committing_subagent_can_change_nothing_the_main_repository_reads() {
+        let setup = CommitSetup::new("two").await;
+        let child = setup.committing_child(&setup.parent).await;
+
+        // A fan-out directory known to be absent, and a loose object known to
+        // exist, in the main object store.
+        let absent = setup.common.join("objects/ff");
+        let _ = std::fs::remove_dir(&absent);
+        assert!(!absent.exists());
+        let loose_dir = std::fs::read_dir(setup.common.join("objects"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.len() == 2 && name != "ff")
+            })
+            .expect("the initial commit left loose objects");
+        let loose = std::fs::read_dir(&loose_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let loose_name = loose.file_name().unwrap().to_str().unwrap().to_string();
+        let loose_dir_name = loose_dir.file_name().unwrap().to_str().unwrap().to_string();
+        let loose_bytes = std::fs::read(&loose).unwrap();
+
+        // The subagent's own repository, for the controls.
+        let own = &setup.subagent;
+        std::fs::create_dir_all(own.join("objects").join(&loose_dir_name)).unwrap();
+        std::fs::write(
+            own.join("objects").join(&loose_dir_name).join(&loose_name),
+            b"own",
+        )
+        .unwrap();
+
+        let main_objects = setup.common.join("objects");
+        let own_objects = own.join("objects");
+        let attempts: Vec<(&str, String, String)> = vec![
+            (
+                "create a fan-out directory",
+                format!("mkdir '{}'", main_objects.join("ff").display()),
+                format!("mkdir '{}'", own_objects.join("ff").display()),
+            ),
+            (
+                "create an object in an existing fan-out directory",
+                format!(
+                    "touch '{}'",
+                    main_objects.join(&loose_dir_name).join("new").display()
+                ),
+                format!(
+                    "touch '{}'",
+                    own_objects.join(&loose_dir_name).join("new").display()
+                ),
+            ),
+            (
+                "overwrite an existing loose object",
+                format!("echo evil > '{}'", loose.display()),
+                format!(
+                    "echo evil > '{}'",
+                    own_objects
+                        .join(&loose_dir_name)
+                        .join(&loose_name)
+                        .display()
+                ),
+            ),
+            (
+                "replace an existing loose object by renaming over it",
+                format!(
+                    "echo evil > '{}/stage' && mv -f '{}/stage' '{}'",
+                    own_objects.display(),
+                    own_objects.display(),
+                    loose.display()
+                ),
+                format!(
+                    "echo evil > '{}/stage' && mv -f '{}/stage' '{}'",
+                    own_objects.display(),
+                    own_objects.display(),
+                    own_objects
+                        .join(&loose_dir_name)
+                        .join(&loose_name)
+                        .display()
+                ),
+            ),
+            (
+                "remove an existing loose object",
+                format!("rm -f '{}'", loose.display()),
+                format!(
+                    "rm -f '{}'",
+                    own_objects
+                        .join(&loose_dir_name)
+                        .join(&loose_name)
+                        .display()
+                ),
+            ),
+            (
+                "create a pack",
+                format!(
+                    "touch '{}'",
+                    main_objects.join("pack/pack-x.pack").display()
+                ),
+                format!("touch '{}'", own_objects.join("pack/pack-x.pack").display()),
+            ),
+            (
+                "write an alternates file",
+                format!(
+                    "echo /tmp > '{}'",
+                    main_objects.join("info/alternates").display()
+                ),
+                format!(
+                    "echo /tmp > '{}'",
+                    own_objects.join("info/scratch").display()
+                ),
+            ),
+            (
+                "move the worktree's branch",
+                format!(
+                    "echo {} > '{}'",
+                    "a".repeat(40),
+                    setup.common.join("refs/heads/subagent/two/work").display()
+                ),
+                format!(
+                    "echo {} > '{}'",
+                    "a".repeat(40),
+                    own.join("refs/heads/subagent/two/scratch").display()
+                ),
+            ),
+            (
+                "rewrite the entry's HEAD",
+                format!("echo evil >> '{}'", setup.entry.join("HEAD").display()),
+                format!("echo evil >> '{}'", own.join("scratch-head").display()),
+            ),
+            (
+                "rewrite the entry's index",
+                format!("echo evil >> '{}'", setup.entry.join("index").display()),
+                format!("echo evil >> '{}'", own.join("scratch-index").display()),
+            ),
+            (
+                "rewrite the repository's configuration",
+                format!("echo evil >> '{}'", setup.common.join("config").display()),
+                format!("echo evil >> '{}'", own.join("scratch-config").display()),
+            ),
+        ];
+        for (what, denied, control) in attempts {
+            assert_ne!(
+                exit_code_of(&child, &denied).await,
+                0,
+                "must not {what} in the main repository"
+            );
+            assert_eq!(
+                exit_code_of(&child, &control).await,
+                0,
+                "the same command succeeds in the subagent's own repository: {what}"
+            );
+        }
+        assert!(!absent.exists(), "no fan-out directory appeared");
+        assert_eq!(
+            std::fs::read(&loose).unwrap(),
+            loose_bytes,
+            "the object is as it was"
+        );
+        assert!(
+            !std::fs::read_to_string(setup.common.join("config"))
+                .unwrap()
+                .contains("evil")
+        );
+        setup.main(&["fsck", "--strict", "--no-dangling"]);
+    }
+
+    /// Git in a repository the sandbox can read keeps working next to the
+    /// redirected worktree: nothing is set process-wide.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn git_in_another_repository_works_inside_a_committing_subagents_sandbox() {
+        let setup = CommitSetup::new("three").await;
+        let other = setup.dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        crate::subagent::tests::git_in(&other, &["init", "--initial-branch=main"]);
+        crate::subagent::tests::git_in(&other, &["commit", "--allow-empty", "-m", "elsewhere"]);
+        let child = setup.committing_child(&setup.parent).await;
+
+        assert!(
+            stdout_of(
+                &child,
+                &format!("git -C '{}' log --oneline", other.display())
+            )
+            .await
+            .contains("elsewhere")
+        );
+        let clone = child.working_dir().join("clone");
+        assert_eq!(
+            exit_code_of(
+                &child,
+                &format!("git clone '{}' '{}'", other.display(), clone.display())
+            )
+            .await,
+            0
+        );
+        assert!(clone.join(".git").exists());
+    }
+
+    /// A subagent a committing subagent launches with the commit grant it
+    /// holds works in the same repository: it sees its parent's commits and
+    /// the parent's ledger reports both.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_committing_child_shares_its_parents_repository() {
+        let setup = CommitSetup::new("four").await;
+        let parent_subagent = setup.committing_child(&setup.parent).await;
+        let parent_ledger = parent_subagent.commit_ledger().unwrap();
+        let parent_mark = parent_ledger.mark().await.unwrap();
+        assert_eq!(
+            exit_code_of(
+                &parent_subagent,
+                &commit_script(&setup.worktree, "parent work")
+            )
+            .await,
+            0
         );
 
-        let with = launch(
+        let child = setup.committing_child(&parent_subagent).await;
+        let child_ledger = child.commit_ledger().unwrap();
+        let child_mark = child_ledger.mark().await.unwrap();
+        assert!(
+            stdout_of(
+                &child,
+                &format!("git -C '{}' log --oneline", setup.worktree.display())
+            )
+            .await
+            .contains("parent work"),
+            "the child sees its parent's commit"
+        );
+        assert_eq!(
+            exit_code_of(&child, &commit_script(&setup.worktree, "child work")).await,
+            0
+        );
+
+        let child_commits = child_ledger.since(&child_mark).await.unwrap();
+        assert_eq!(
+            child_commits
+                .iter()
+                .map(|commit| commit.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["child work"]
+        );
+        let parent_commits = parent_ledger.since(&parent_mark).await.unwrap();
+        assert_eq!(
+            parent_commits
+                .iter()
+                .map(|commit| commit.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["parent work", "child work"]
+        );
+        for commit in &parent_commits {
+            assert!(setup.main_has(&commit.commit));
+        }
+        setup.main(&["fsck", "--strict", "--no-dangling"]);
+    }
+
+    /// The import asks a sandbox that cannot read another repository for that
+    /// repository's objects: they cannot reach the main one.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objects_the_subagent_cannot_read_never_reach_the_main_repository() {
+        let setup = CommitSetup::new("five").await;
+        let child = setup.committing_child(&setup.parent).await;
+        let outside = tempfile::tempdir().expect("temp dir should be created");
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        crate::subagent::tests::git_in(outside.path(), &["init", "--initial-branch=main"]);
+        crate::subagent::tests::git_in(outside.path(), &["add", "secret.txt"]);
+        crate::subagent::tests::git_in(outside.path(), &["commit", "-m", "secret commit"]);
+        let secret = crate::subagent::tests::git_in(outside.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(
+            exit_code_of(
+                &child,
+                &format!("cat '{}'", outside.path().join("secret.txt").display())
+            )
+            .await,
+            0,
+            "the control: the sandbox cannot read the other repository"
+        );
+
+        let ledger = child.commit_ledger().unwrap();
+        let mark = ledger.mark().await.unwrap();
+        // The subagent's repository names a commit only the other one has,
+        // and reaches its objects through symlinks, as its own: a process
+        // that could read the other repository would pack them (the pack
+        // leaves out only objects borrowed from an alternate).
+        for entry in std::fs::read_dir(outside.path().join(".git/objects")).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.len() == 2 {
+                std::os::unix::fs::symlink(entry.path(), setup.subagent.join("objects").join(name))
+                    .unwrap();
+            }
+        }
+        std::fs::write(
+            setup.subagent.join("refs/heads/subagent/five/stolen"),
+            format!("{secret}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::subagent::tests::git_in(
+                &setup.subagent,
+                &["--git-dir", ".", "cat-file", "-t", &secret]
+            ),
+            "commit",
+            "the control: a git that could read the other repository packs its commit"
+        );
+        let error = ledger
+            .since(&mark)
+            .await
+            .expect_err("the sandbox cannot read the objects it is asked to pack");
+        assert!(
+            matches!(error, crate::CommitLedgerError::Export { .. }),
+            "the sandboxed git is what refuses: {error}"
+        );
+        assert!(!setup.main_has(&secret), "the secret commit never arrives");
+        assert!(
+            !setup
+                .common
+                .join("refs/heads/subagent/five/stolen")
+                .exists(),
+            "and no ref names it"
+        );
+    }
+
+    /// The import budget is the terminal's operator setting: 1 GiB unless set,
+    /// and a change through its handle reaches the subagents already running.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_import_budget_is_a_setting_adjustable_while_subagents_run() {
+        let setup = CommitSetup::new("budget").await;
+        let budget = setup.parent.subagent_import_budget();
+        assert_eq!(budget.get(), DEFAULT_SUBAGENT_IMPORT_LIMIT);
+        let child = setup.committing_child(&setup.parent).await;
+        let ledger = child.commit_ledger().unwrap();
+        let mark = ledger.mark().await.unwrap();
+        assert_eq!(
+            exit_code_of(
+                &child,
+                &commit_script(&setup.worktree, "heavier than 1 byte")
+            )
+            .await,
+            0
+        );
+
+        budget.set(1);
+        let error = ledger
+            .since(&mark)
+            .await
+            .expect_err("the setting changed after the subagent launched applies to it");
+        assert!(
+            matches!(
+                error,
+                crate::CommitLedgerError::Export { .. } | crate::CommitLedgerError::Rejected { .. }
+            ),
+            "{error}"
+        );
+        budget.set(0);
+        let listed = ledger.since(&mark).await.expect("zero bounds nothing");
+        assert_eq!(listed.len(), 1);
+    }
+
+    /// A commit the main agent makes between runs is visible to the next run,
+    /// and what the subagent had not yet shared survives the refresh.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_run_start_refresh_shows_new_main_commits_and_keeps_unimported_work() {
+        let setup = CommitSetup::new("six").await;
+        let child = setup.committing_child(&setup.parent).await;
+        let ledger = child.commit_ledger().unwrap();
+        ledger.mark().await.unwrap();
+        assert_eq!(
+            exit_code_of(&child, &commit_script(&setup.worktree, "unimported")).await,
+            0
+        );
+
+        crate::subagent::tests::git_in(
+            &dunce::canonicalize(setup.dir.path().join("repository")).unwrap(),
+            &["commit", "--allow-empty", "-m", "main moved on"],
+        );
+        let log = |branch: &str| {
+            format!(
+                "git -C '{}' log --format=%s {branch}",
+                setup.worktree.display()
+            )
+        };
+        assert!(
+            !stdout_of(&child, &log("main"))
+                .await
+                .contains("main moved on"),
+            "the snapshot is the one from before"
+        );
+
+        ledger.mark().await.unwrap();
+        assert!(
+            stdout_of(&child, &log("main"))
+                .await
+                .contains("main moved on"),
+            "the next run starts with the main agent's new commit"
+        );
+        assert!(
+            stdout_of(&child, &log("subagent/six/work"))
+                .await
+                .contains("unimported"),
+            "the subagent's own work survives the refresh"
+        );
+    }
+
+    /// A container backend spells the repository's remote and runs the
+    /// refresh, as the subagent, through the confined streamed exec.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_container_commit_grant_refreshes_through_the_confined_streamed_exec() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let worktree = crate::subagent::tests::repository_with_linked_worktree(dir.path(), "seven");
+        let (scripts, parent) = recording_container_terminal(dir.path(), Some(dir.path())).await;
+        let child = launch(
             &parent,
             SubagentGrant::new().with_committing_worktree(&worktree),
         )
         .await
-        .expect("the worktree can be granted with commit");
-        let ledger = with.commit_ledger().expect("a commit grant has a ledger");
-        let mark = ledger.mark().await.expect("the namespace can be read");
-        assert_eq!(
-            exit_code_of(&with, &commit_script(&worktree, "authorized")).await,
-            0,
-            "a commit grant lets the subagent commit"
+        .expect("a worktree inside the workspace can be granted commit");
+
+        let subagent = dunce::canonicalize(dir.path())
+            .unwrap()
+            .join("repository/.git/worktrees/seven/subagent");
+        let config = std::fs::read_to_string(subagent.join("config")).unwrap();
+        assert!(
+            config.contains("url = \"/workspace/repository/.git\""),
+            "the remote is spelled as the container sees it: {config}"
         );
-        assert_ne!(
-            exit_code_of(
-                &with,
-                &format!(
-                    "git -C '{}' update-ref refs/heads/main HEAD",
-                    worktree.display()
-                )
-            )
-            .await,
-            0,
-            "a branch outside the subagent's namespace stays read-only"
+        assert!(
+            config.contains("hooksPath = \"../repository/.git/hooks\""),
+            "{config}"
         );
-        let commits = ledger.since(&mark).await.expect("commits can be listed");
-        assert_eq!(commits.len(), 1, "{commits:?}");
-        assert_eq!(commits[0].subject, "authorized");
-        assert_eq!(commits[0].worktree, dunce::canonicalize(&worktree).unwrap());
+
+        // The recording exec prints nothing, so the import that follows the
+        // refresh finds no report; only the refresh is of interest here.
+        let _ = child.commit_ledger().unwrap().mark().await;
+        let scripts = scripts.lock().unwrap().clone();
+        let refresh = scripts
+            .iter()
+            .find(|script| script.contains("fetch"))
+            .expect("the refresh ran in the container");
+        assert!(refresh.contains("run --working-dir"), "{refresh}");
+        assert!(
+            refresh.contains("--grant '/workspace/repository/.git/worktrees/seven/subagent=rw'"),
+            "{refresh}"
+        );
+        assert!(
+            refresh.contains("git --git-dir /workspace/repository/.git/worktrees/seven/subagent"),
+            "{refresh}"
+        );
+        assert!(refresh.contains("main-repository"), "{refresh}");
     }
 
     #[cfg(unix)]
@@ -7379,7 +10179,10 @@ mod tests {
         )
         .await
         .expect("a subagent hands on the commit grant it holds");
-        assert_eq!(handed_on.writable_paths, committer.writable_paths);
+        assert_eq!(
+            handed_on.grants().snapshot().writable,
+            committer.grants().snapshot().writable
+        );
         assert!(handed_on.working_dir().starts_with(committer.working_dir()));
     }
 
@@ -7413,7 +10216,7 @@ mod tests {
                 .worktree
                 .into_iter()
                 .fold(SubagentGrant::new(), SubagentGrant::with_worktree);
-            let launched = self.binding.launcher().create(grant).await?;
+            let launched = self.binding.launcher().create(grant, None, None).await?;
             Ok(ToolResult::Text {
                 text: launched.working_dir().display().to_string(),
             })
@@ -7549,15 +10352,39 @@ mod tests {
             _working_dir: &str,
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
-            _stdin_blocked: Option<Sender<StdinWatchSignal>>,
+            _lifetime: ExecLifetime,
         ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
         {
             self.scripts.lock().unwrap().push(script.to_string());
-            std::future::ready(Ok(ContainerExecOutcome::Completed(std::process::Output {
-                status: std::os::unix::process::ExitStatusExt::from_raw(0),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            })))
+            std::future::ready(Ok(ContainerExecOutcome::Completed {
+                output: std::process::Output {
+                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                killed: Vec::new(),
+            }))
+        }
+
+        fn exec_streamed(
+            &self,
+            _container_id: &str,
+            script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _stdout: Sender<Vec<u8>>,
+        ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
+        {
+            self.scripts.lock().unwrap().push(script.to_string());
+            std::future::ready(Ok(ContainerExecOutcome::Completed {
+                output: std::process::Output {
+                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                killed: Vec::new(),
+            }))
         }
     }
 
@@ -7588,7 +10415,7 @@ mod tests {
             None => runtime,
         };
         let container_tools =
-            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle());
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,
@@ -7654,6 +10481,53 @@ mod tests {
         assert!(
             sub.contains(&format!("--grant '/workspace/{granted_name}=rw'")),
             "{sub}"
+        );
+    }
+
+    /// The shim inside a container compares its working directory against
+    /// the worktree map: the map must spell the paths the mount resolves —
+    /// host spellings would leave the worktree unprotected, the `git` shim
+    /// unable to hit it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_containers_git_map_spells_the_worktree_and_gitdir_the_container_way() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let worktree =
+            crate::subagent::tests::repository_with_linked_worktree(dir.path(), "mapped");
+        let (scripts, parent) = recording_container_terminal(dir.path(), Some(dir.path())).await;
+        let _child = launch(
+            &parent,
+            SubagentGrant::new().with_committing_worktree(&worktree),
+        )
+        .await
+        .expect("the worktree can be granted with commit");
+
+        assert_eq!(exit_code_of(&parent, "echo mapped-worktree").await, 0);
+
+        let script = scripts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|script| script.contains("mapped-worktree"))
+            .expect("the main agent's command ran")
+            .clone();
+        assert!(
+            script.contains("export AITHER_GIT_WORKTREE_PATH_0=/workspace/mapped"),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "export AITHER_GIT_WORKTREE_GITDIR_0=/workspace/repository/.git/worktrees/mapped"
+            ),
+            "{script}"
+        );
+        let host = dunce::canonicalize(&worktree)
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(
+            !script.contains(&host),
+            "the shim sees no host spelling: {script}"
         );
     }
 
@@ -7749,14 +10623,7 @@ mod tests {
                 "`{killer}` refusal must tell the agent to kill by PID: {error}"
             );
             let error = tool
-                .background_tool()
-                .call(
-                    TerminalBackgroundArgs {
-                        terminal: terminal_args("name-based kill", &script),
-                        timeout: 30,
-                    },
-                    ToolContext::new(),
-                )
+                .run_background(terminal_args("name-based kill", &script))
                 .await
                 .expect_err("a background name-based kill must be refused");
             assert!(
@@ -7804,6 +10671,435 @@ mod tests {
             render_terminal_result(&result).contains("status=143"),
             "kill <pid> must terminate the process it names: {}",
             render_terminal_result(&result)
+        );
+    }
+
+    use crate::monitor::{MonitorArgs, MonitorEnd, MonitorLanguage, MonitorSource, MonitorTool};
+
+    /// Job alerts the monitor produces until `ended` or `duration` passes.
+    async fn monitor_alerts(
+        receiver: &BackgroundTaskReceiver,
+        duration: Duration,
+    ) -> Vec<JobAlert> {
+        let deadline = std::time::Instant::now() + duration;
+        let mut alerts = Vec::new();
+        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+            let Some(event) = receiver.recv_event_timeout(remaining).await else {
+                break;
+            };
+            let BackgroundTaskEvent::Alert(alert) = event else {
+                continue;
+            };
+            let ended = matches!(alert, JobAlert::MonitorEnded(_));
+            alerts.push(alert);
+            if ended {
+                break;
+            }
+        }
+        alerts
+    }
+
+    fn monitor_command(command: &str, timeout_secs: u64) -> MonitorArgs {
+        MonitorArgs {
+            source: MonitorSource::Command {
+                command: command.to_string(),
+                language: MonitorLanguage::Shell,
+            },
+            interval_secs: 1,
+            filter: None,
+            stop_on: None,
+            kill_on_stop: false,
+            stall_secs: None,
+            timeout_secs,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitored_command_delivers_increments_and_its_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let monitor = MonitorTool::new(tool.clone());
+        monitor
+            .call(
+                monitor_command("echo a; sleep 2; echo b", 30),
+                ToolContext::new(),
+            )
+            .await
+            .expect("monitor starts");
+
+        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(20)).await;
+        let increments: Vec<&[String]> = alerts
+            .iter()
+            .filter_map(|alert| match alert {
+                JobAlert::MonitorIncrement(increment) => Some(increment.lines.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            increments.iter().any(|inc| *inc == ["a".to_string()]),
+            "the first line is delivered as it arrives: {alerts:?}"
+        );
+        assert!(
+            increments.iter().any(|inc| *inc == ["b".to_string()]),
+            "the later line is delivered in a following increment: {alerts:?}"
+        );
+        assert!(
+            alerts.iter().any(|alert| matches!(
+                alert,
+                JobAlert::MonitorEnded(ended)
+                    if matches!(ended.end, MonitorEnd::Exited { exit_code: 0 })
+            )),
+            "the monitor reports the command's exit: {alerts:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitor_filter_keeps_matching_lines_and_stop_on_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let monitor = MonitorTool::new(tool.clone());
+        let mut args = monitor_command(
+            "printf 'keep one\\ndrop\\nkeep two\\nlast\\n'; sleep 60",
+            30,
+        );
+        args.filter = Some("^keep".to_string());
+        args.stop_on = Some("two".to_string());
+        monitor
+            .call(args, ToolContext::new())
+            .await
+            .expect("monitor starts");
+
+        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(20)).await;
+        let lines: Vec<&String> = alerts
+            .iter()
+            .filter_map(|alert| match alert {
+                JobAlert::MonitorIncrement(increment) => Some(&increment.lines),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            lines.iter().all(|line| line.starts_with("keep")),
+            "filter drops non-matching lines: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| *line == "last"),
+            "lines after the stop match are not delivered: {lines:?}"
+        );
+        assert!(
+            alerts.iter().any(|alert| matches!(
+                alert,
+                JobAlert::MonitorEnded(ended)
+                    if matches!(&ended.end, MonitorEnd::StopMatched { line } if line == "keep two")
+            )),
+            "the first stop_on match ends the monitor: {alerts:?}"
+        );
+        tool.job_registry().kill_running().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitor_rejects_a_timeout_over_the_cap_and_times_out_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let monitor = MonitorTool::new(tool.clone());
+        let refused = monitor
+            .call(monitor_command("sleep 60", 7201), ToolContext::new())
+            .await;
+        assert!(refused.is_err(), "timeout_secs over the cap is refused");
+
+        monitor
+            .call(monitor_command("sleep 60", 2), ToolContext::new())
+            .await
+            .expect("monitor starts");
+        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
+        assert!(
+            alerts.iter().any(|alert| matches!(
+                alert,
+                JobAlert::MonitorEnded(ended) if matches!(ended.end, MonitorEnd::TimedOut)
+            )),
+            "the deadline kills the run and reports a timeout: {alerts:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitor_reports_a_stall_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let monitor = MonitorTool::new(tool.clone());
+        let mut args = monitor_command("sleep 4; echo done", 30);
+        args.stall_secs = Some(1);
+        monitor
+            .call(args, ToolContext::new())
+            .await
+            .expect("monitor starts");
+
+        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
+        let stalls = alerts
+            .iter()
+            .filter(|alert| matches!(alert, JobAlert::MonitorStalled(_)))
+            .count();
+        assert_eq!(stalls, 1, "a stall is reported once: {alerts:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitored_file_delivers_appends_and_refuses_an_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let monitor = MonitorTool::new(tool.clone());
+        let unreadable = monitor
+            .call(
+                MonitorArgs {
+                    source: MonitorSource::File {
+                        file: "/etc/sudoers".to_string(),
+                    },
+                    ..monitor_command("true", 30)
+                },
+                ToolContext::new(),
+            )
+            .await;
+        assert!(
+            unreadable.is_err(),
+            "a file the sandbox may not read is refused"
+        );
+
+        let path = tool.working_dir().join("followed.log");
+        std::fs::write(&path, "existing\n").unwrap();
+        monitor
+            .call(
+                MonitorArgs {
+                    source: MonitorSource::File {
+                        file: "followed.log".to_string(),
+                    },
+                    ..monitor_command("true", 30)
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("monitor starts");
+        async_io::Timer::after(Duration::from_millis(1500)).await;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"appended\n").unwrap();
+        std::fs::rename(&path, tool.working_dir().join("followed.log.1")).unwrap();
+        std::fs::write(&path, "rotated\n").unwrap();
+        async_io::Timer::after(Duration::from_millis(500)).await;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"after\n").unwrap();
+
+        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
+        let lines: Vec<&String> = alerts
+            .iter()
+            .filter_map(|alert| match alert {
+                JobAlert::MonitorIncrement(increment) => Some(&increment.lines),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !lines.iter().any(|line| *line == "existing"),
+            "content written before the monitor started is not delivered: {lines:?}"
+        );
+        for expected in ["appended", "rotated", "after"] {
+            assert!(
+                lines.iter().any(|line| *line == expected),
+                "appended line {expected:?} is delivered, across rotation: {lines:?}"
+            );
+        }
+        tool.job_registry().kill_running().await;
+    }
+
+    // ---- runtime grants -----------------------------------------------------
+
+    /// The done-when case: a writable grant added at runtime reaches every
+    /// command launched afterwards, while a command already running keeps
+    /// the grants it launched with.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runtime_writable_grant_reaches_new_commands_not_running_ones() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let outside = tempfile::tempdir().expect("outside dir should be created");
+        let late_target = outside.path().join("late.txt");
+        // Launched before the grant; its write happens after the grant is
+        // added but its grant snapshot was taken at launch.
+        let task_id = start_background_job(
+            &tool,
+            &format!("sleep 2; echo x > '{}'", late_target.display()),
+        )
+        .await;
+        let receiver = tool.background_receiver();
+
+        assert_ne!(
+            exit_code_of(
+                &tool,
+                &format!("echo x > '{}'", outside.path().join("denied.txt").display())
+            )
+            .await,
+            0,
+            "a write outside the sandbox is denied before the grant"
+        );
+        tool.grants().add_writable(outside.path());
+        assert_eq!(
+            exit_code_of(
+                &tool,
+                &format!(
+                    "echo x > '{}'",
+                    outside.path().join("granted.txt").display()
+                )
+            )
+            .await,
+            0,
+            "the command after the grant writes the approved dir"
+        );
+
+        let completed = wait_for_completed_task(&receiver, &task_id).await;
+        let _ = completed.result;
+        assert!(
+            !late_target.exists(),
+            "a command launched before the grant keeps its launch grants"
+        );
+    }
+
+    /// Cloned terminals share one grant store: a grant added through the
+    /// original's handle reaches the clone's next command.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cloned_terminal_sees_runtime_grants() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let clone = tool.clone();
+        let outside = tempfile::tempdir().expect("outside dir should be created");
+        tool.grants().add_writable(outside.path());
+        assert_eq!(
+            exit_code_of(
+                &clone,
+                &format!("touch '{}'", outside.path().join("shared.txt").display())
+            )
+            .await,
+            0,
+            "the clone's commands carry grants added through the original"
+        );
+    }
+
+    /// A subagent's derived grants follow its parent's readable list live:
+    /// a readable grant added to the parent after the subagent launches is
+    /// readable inside it; a writable grant on the parent never becomes
+    /// writable in the subagent (it lands on the subagent's readable side).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_sees_runtime_readable_but_never_writable_parent_grants() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, parent) = authority_terminal(dir.path()).await;
+        let readable_dir = tempfile::tempdir().expect("readable dir");
+        let writable_dir = tempfile::tempdir().expect("writable dir");
+        std::fs::write(readable_dir.path().join("r.txt"), "data").unwrap();
+        std::fs::write(writable_dir.path().join("w.txt"), "data").unwrap();
+
+        let child = launch(&parent, SubagentGrant::new())
+            .await
+            .expect("subagent launches");
+        parent.grants().add_readable(readable_dir.path());
+        parent.grants().add_writable(writable_dir.path());
+
+        assert_eq!(
+            exit_code_of(
+                &child,
+                &format!("cat '{}'", readable_dir.path().join("r.txt").display())
+            )
+            .await,
+            0,
+            "a runtime readable grant on the parent reaches the subagent"
+        );
+        assert_ne!(
+            exit_code_of(
+                &child,
+                &format!("cat '{}'", writable_dir.path().join("w.txt").display())
+            )
+            .await,
+            0,
+            "a writable grant added after launch grants the parent's sandbox alone"
+        );
+        assert_ne!(
+            exit_code_of(
+                &child,
+                &format!("touch '{}'", writable_dir.path().join("x.txt").display())
+            )
+            .await,
+            0,
+            "a parent writable grant is never writable inside the subagent"
+        );
+    }
+
+    /// A shell launched before the grant keeps the grants it started
+    /// with — its sandbox was fixed when it spawned — while every new
+    /// command picks the grant up (`add_writable` documents this).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_running_shell_keeps_the_grants_it_started_with() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let outside = tempfile::tempdir().expect("outside dir should be created");
+        let shell_target = outside.path().join("from_shell.txt");
+
+        // A shell session launched before the grant: its write lands after
+        // the grant was added, but inside its launch-time sandbox.
+        let task_id = start_background_job(
+            &tool,
+            &format!("sleep 2; touch '{}'", shell_target.display()),
+        )
+        .await;
+        let receiver = tool.background_receiver();
+        tool.grants().add_writable(outside.path());
+        let fresh_target = outside.path().join("fresh.txt");
+        assert_eq!(
+            exit_code_of(&tool, &format!("touch '{}'", fresh_target.display())).await,
+            0,
+            "a fresh command picks up the grant"
+        );
+        let _ = wait_for_completed_task(&receiver, &task_id).await;
+        assert!(
+            !shell_target.exists(),
+            "the shell launched before the grant is still sandboxed without it"
         );
     }
 }

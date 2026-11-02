@@ -7,18 +7,33 @@
 //!
 //! A linked worktree keeps its git data in the main repository, outside the
 //! worktree, so a worktree grant alone leaves `git commit` failing. A commit
-//! grant adds write access to that worktree's own git directory, to the
-//! loose-object directories and to one branch namespace,
-//! `refs/heads/subagent/<id>/`, that the worktree's branch lives in. The
-//! repository configuration, the packs, the object store's `info` directory
-//! and every other ref stay read-only, so nothing the subagent writes can
-//! redirect or reconfigure the host-side [`CommitLedger`] that lists its
-//! commits.
+//! grant gives the worktree a repository of its own, created by the host when
+//! the grant is first given, that the worktree's `.git` file names: it holds
+//! the worktree's `HEAD`, index, refs and new objects, reads the main object
+//! store as a read-only alternate and includes the main repository's
+//! configuration. It is the only path the grant makes writable, so nothing a
+//! subagent writes can change what the main repository reads. The commits
+//! reach the main repository only through the [`CommitLedger`]'s import, which
+//! packs them inside the subagent's sandbox and verifies the pack on the host
+//! before any ref moves.
+
+mod host_git;
+mod import;
+mod repository;
+mod sandboxed;
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use futures::future::try_join_all;
+use futures::future::join_all;
+
+pub use repository::Spelling;
+use sandboxed::Bounds;
+pub use sandboxed::ExportError;
+pub use sandboxed::{SandboxedExit, SandboxedGitImpl, SandboxedRun, SubagentGit};
 
 /// What a launcher grants a subagent beyond its own space.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -182,10 +197,46 @@ pub enum SubagentGrantError {
         /// The failure.
         source: io::Error,
     },
+    /// The repository of a committing worktree could not be created.
+    #[error("cannot create the subagent repository at {}: {source}", .path.display())]
+    Repository {
+        /// The path being written.
+        path: PathBuf,
+        /// The failure.
+        source: io::Error,
+    },
+    /// A path the repository of a committing worktree must spell out is not
+    /// text on one line.
+    #[error("{} cannot be written into a subagent repository", .0.display())]
+    UnrepresentablePath(PathBuf),
+    /// A path handed out with a plain grant contains the committing
+    /// worktree, so a subagent holding that grant could replace the worktree
+    /// and make the host write its `.git` file elsewhere.
+    #[error(
+        "{} contains worktree {}, which is granted commit, and is writable by a subagent",
+        .writable.display(),
+        .worktree.display()
+    )]
+    WorktreeExposed {
+        /// The worktree.
+        worktree: PathBuf,
+        /// The writable path that contains it.
+        writable: PathBuf,
+    },
+    /// The git on the host is older than a commit grant works with.
+    #[error("a commit grant needs git 2.29 or later; the host has `{found}`")]
+    GitTooOld {
+        /// What `git --version` printed.
+        found: String,
+    },
+    /// A commit grant was asked for somewhere the terminal can run no git
+    /// shim, so the isolation the grant promises could not be kept.
+    #[error("a commit grant needs a POSIX shell for its git shim; this platform has none")]
+    CommitGrantUnsupported,
 }
 
 /// What a launching terminal may hand on.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Launcher<'a> {
     /// The canonical paths the launcher can write, its working directory
     /// included.
@@ -196,6 +247,8 @@ pub struct Launcher<'a> {
     pub committing: Option<&'a [CommittingWorktree]>,
     /// The directory every subagent space of the session lives under.
     pub spaces_root: &'a Path,
+    /// How the subagents' backend spells host paths.
+    pub(crate) spelling: Spelling<'a>,
 }
 
 /// What the main agent's terminal has handed to subagents so far.
@@ -226,17 +279,72 @@ pub struct ResolvedGrant {
 pub struct CommittingWorktree {
     /// The worktree.
     worktree: PathBuf,
-    /// Its per-worktree git directory: index, `HEAD`, locks.
+    /// Its entry in the repository's `worktrees`: git's own files for it,
+    /// `HEAD` mirrored by the import. Nothing in it is granted.
     git_dir: PathBuf,
     /// The repository's shared git directory.
     common_dir: PathBuf,
+    /// The repository the host created for the worktree, inside its entry.
+    /// The one path the commit grant makes writable.
+    repository: PathBuf,
     /// The `<id>` of the worktree's branch namespace `refs/heads/subagent/<id>/`.
     namespace: String,
 }
 
-/// The two-hex-digit loose-object directories git writes new objects into.
-fn fan_out_dirs(objects: &Path) -> impl Iterator<Item = PathBuf> + '_ {
-    (0..=u8::MAX).map(move |byte| objects.join(hex::encode([byte])))
+/// The most bytes a subagent's sandbox may send the host while the commits it
+/// made are imported: the pack, and every answer to a question about its
+/// repository.
+///
+/// The budget is an operator setting. Every clone is a handle on the same
+/// value, so a change through any of them applies to the next import of every
+/// terminal that holds one. There is no ceiling, and `0` means the bytes are
+/// not bounded at all.
+#[derive(Debug, Clone)]
+pub struct ImportBudget(Arc<AtomicU64>);
+
+impl ImportBudget {
+    /// A budget of `bytes`; `0` is unbounded.
+    #[must_use]
+    pub fn new(bytes: u64) -> Self {
+        Self(Arc::new(AtomicU64::new(bytes)))
+    }
+
+    /// Changes the budget for every handle; `0` is unbounded.
+    pub fn set(&self, bytes: u64) {
+        self.0.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The budget now, `0` being unbounded.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// The byte bound of an import that starts now.
+    fn limit(&self) -> Option<u64> {
+        Some(self.get()).filter(|bytes| *bytes != 0)
+    }
+}
+
+/// What bounds one import of a subagent's commits.
+#[derive(Debug, Clone)]
+pub struct ImportLimits {
+    /// The most bytes of pack, or of any answer, the subagent's sandbox may
+    /// send the host.
+    pub bytes: ImportBudget,
+    /// How long each piece of sandboxed work of an import may take: every
+    /// question to the subagent's repository, the pack, and the tidying after.
+    pub time: Duration,
+}
+
+impl ImportLimits {
+    /// The bounds an import that starts now runs under.
+    fn bounds(&self) -> Bounds {
+        Bounds {
+            bytes: self.bytes.limit(),
+            time: self.time,
+        }
+    }
 }
 
 /// Whether one path lies inside the other.
@@ -249,48 +357,55 @@ fn inside_any(path: &Path, roots: &[PathBuf]) -> bool {
 }
 
 impl CommittingWorktree {
+    /// The worktree.
+    pub(crate) fn worktree(&self) -> &Path {
+        &self.worktree
+    }
+
+    /// Its entry in the repository's `worktrees`: the host-owned git
+    /// directory a main agent's `git` in the worktree resolves to.
+    pub(crate) fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
     /// `refs/heads/subagent/<id>/`, as git spells the namespace.
     fn ref_prefix(&self) -> String {
         format!("refs/heads/subagent/{}/", self.namespace)
     }
 
-    fn namespace_dir(&self, root: &Path) -> PathBuf {
-        root.join("refs")
-            .join("heads")
-            .join("subagent")
-            .join(&self.namespace)
-    }
-
-    /// The directories a commit writes: the worktree's git directory, the
-    /// loose-object directories, and the branch namespace with its reflogs.
+    /// The directories a commit writes: the worktree's repository, and
+    /// nothing else.
     pub fn writable(&self) -> Vec<PathBuf> {
-        let mut paths = vec![
-            self.git_dir.clone(),
-            self.namespace_dir(&self.common_dir),
-            self.namespace_dir(&self.common_dir.join("logs")),
-        ];
-        paths.extend(fan_out_dirs(&self.common_dir.join("objects")));
-        paths
+        vec![self.repository.clone()]
     }
 
-    /// Creates the granted directories git would otherwise create on demand
-    /// in a directory the subagent cannot write.
-    async fn prepare(&self) -> Result<(), SubagentGrantError> {
-        try_join_all(self.writable().into_iter().map(|path| async move {
-            async_fs::create_dir_all(&path)
-                .await
-                .map_err(|source| SubagentGrantError::Inspect { path, source })
-        }))
-        .await
-        .map(drop)
+    fn layout(&self) -> repository::Layout<'_> {
+        repository::Layout {
+            worktree: &self.worktree,
+            entry: &self.git_dir,
+            common: &self.common_dir,
+            repository: &self.repository,
+            namespace: &self.namespace,
+        }
+    }
+
+    /// Gives the worktree its repository, if it has none yet, and points the
+    /// worktree's `.git` file at it.
+    async fn prepare(&self, spelling: Spelling<'_>) -> Result<(), SubagentGrantError> {
+        repository::ensure(self.layout(), spelling).await
     }
 
     /// Reads the git data of the linked worktree at `worktree` from the
     /// repository, for a commit grant the main agent gives.
+    ///
+    /// `exposed` are the paths a subagent can write that must not overlap the
+    /// worktree's git data; `plain` those among them that were handed out
+    /// whole, which must not contain the worktree either.
     async fn discover(
         worktree: &Path,
         git: Option<WorktreeGit>,
         exposed: impl Iterator<Item = &Path>,
+        plain: impl Iterator<Item = &Path>,
     ) -> Result<Self, SubagentGrantError> {
         let malformed = |reason| SubagentGrantError::MalformedGitData {
             path: worktree.to_path_buf(),
@@ -299,6 +414,7 @@ impl CommittingWorktree {
         let WorktreeGit {
             git_dir,
             common_dir,
+            converted,
         } = git.ok_or_else(|| SubagentGrantError::NotAWorktree(worktree.to_path_buf()))?;
 
         // The repository must list this worktree back: its git directory is
@@ -333,6 +449,39 @@ impl CommittingWorktree {
                 }
             }
         }
+        // The host writes the worktree's `.git` file; a subagent that could
+        // swap the worktree for a symlink first would redirect that write.
+        for writable in plain {
+            if worktree.starts_with(writable) {
+                return Err(SubagentGrantError::WorktreeExposed {
+                    worktree: worktree.to_path_buf(),
+                    writable: writable.to_path_buf(),
+                });
+            }
+        }
+
+        let repository = git_dir.join(repository::REPOSITORY_DIR);
+        if converted {
+            // The namespace was fixed when the repository was created, in a
+            // file only the host writes; the repository itself says what a
+            // subagent made it say.
+            let namespace = read_file(&git_dir.join(repository::NAMESPACE_FILE)).await?;
+            let namespace = namespace.trim();
+            if namespace.is_empty()
+                || namespace.contains('/')
+                || namespace == "."
+                || namespace == ".."
+            {
+                return Err(malformed("its recorded branch namespace is not valid"));
+            }
+            return Ok(Self {
+                worktree: worktree.to_path_buf(),
+                git_dir,
+                common_dir,
+                repository,
+                namespace: namespace.to_string(),
+            });
+        }
 
         let head = read_file(&git_dir.join("HEAD")).await?;
         let head = head.trim();
@@ -351,6 +500,7 @@ impl CommittingWorktree {
             worktree: worktree.to_path_buf(),
             git_dir,
             common_dir,
+            repository,
             namespace,
         };
         // The namespace is the worktree's own: nothing else lives in it, so
@@ -375,7 +525,7 @@ impl CommittingWorktree {
     /// repository.
     async fn namespace_refs(&self) -> Result<Vec<(String, String)>, CommitLedgerError> {
         let prefix = self.ref_prefix();
-        let output = git(
+        let output = host_git::git(
             &self.common_dir,
             &[
                 "for-each-ref",
@@ -398,7 +548,8 @@ impl CommittingWorktree {
     }
 
     /// The commits the worktree's refs point at now: every ref in the branch
-    /// namespace and a detached `HEAD`.
+    /// namespace and a detached `HEAD`. Both live in the main repository,
+    /// where only the host writes.
     async fn tips(&self) -> Result<Vec<String>, CommitLedgerError> {
         let mut tips: Vec<String> = self
             .namespace_refs()
@@ -445,7 +596,7 @@ impl CommittingWorktree {
         args.extend(now.iter().map(String::as_str));
         args.push("--not");
         args.extend(before.iter().map(String::as_str));
-        let output = git(&self.common_dir, &args).await?;
+        let output = host_git::git(&self.common_dir, &args).await?;
         output
             .lines()
             .map(|line| {
@@ -478,6 +629,10 @@ struct WorktreeGit {
     git_dir: PathBuf,
     /// The repository's shared git directory.
     common_dir: PathBuf,
+    /// Whether the `.git` file names the worktree's own repository inside
+    /// that directory, as a commit grant leaves it, rather than the directory
+    /// itself.
+    converted: bool,
 }
 
 /// `path` resolved to its canonical form, without the Windows verbatim
@@ -501,15 +656,94 @@ async fn read_file(path: &Path) -> Result<String, SubagentGrantError> {
         })
 }
 
+/// The most bytes of a worktree's `.git` file the host reads: a `gitdir:` line
+/// holds one path.
+const DOT_GIT_LIMIT: u64 = 16 * 1024;
+
+/// What a worktree's `.git` is.
+enum DotGit {
+    Missing,
+    Directory,
+    /// A regular file and what it holds.
+    File(String),
+}
+
+/// Reads the worktree's `.git`, which a subagent can write, without ever
+/// following a symlink in its place, waiting on a FIFO, or reading more than
+/// [`DOT_GIT_LIMIT`] bytes.
+async fn read_dot_git(dot_git: &Path) -> io::Result<DotGit> {
+    use std::io::Read as _;
+
+    let path = dot_git.to_path_buf();
+    blocking::unblock(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DotGit::Missing),
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
+            return Ok(DotGit::Directory);
+        }
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        let mut content = Vec::new();
+        file.take(DOT_GIT_LIMIT + 1).read_to_end(&mut content)?;
+        if u64::try_from(content.len()).map_or(true, |len| len > DOT_GIT_LIMIT) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "longer than a gitdir line can be",
+            ));
+        }
+        String::from_utf8(content)
+            .map(DotGit::File)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    })
+    .await
+}
+
+/// `path` resolved like [`canonical`], except that its last component may be
+/// missing: the repository of a worktree that was deleted, to be created
+/// again.
+async fn canonical_with_missing_leaf(path: &Path) -> Result<PathBuf, SubagentGrantError> {
+    match canonical(path).await {
+        Err(SubagentGrantError::Inspect { source, .. })
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
+            match (path.parent(), path.file_name()) {
+                (Some(parent), Some(name)) => Ok(canonical(parent).await?.join(name)),
+                _ => canonical(path).await,
+            }
+        }
+        other => other,
+    }
+}
+
 /// Reads the git data the `.git` file of `worktree` names.
 ///
 /// `None` when `worktree` is not a git working tree at all; an error when it is
 /// a repository checkout rather than a linked worktree.
 async fn read_worktree_git(worktree: &Path) -> Result<Option<WorktreeGit>, SubagentGrantError> {
     let dot_git = worktree.join(".git");
-    let metadata = match async_fs::metadata(&dot_git).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+    let content = match read_dot_git(&dot_git).await {
+        Ok(DotGit::Missing) => return Ok(None),
+        Ok(DotGit::Directory) => {
+            return Err(SubagentGrantError::RepositoryCheckout(
+                worktree.to_path_buf(),
+            ));
+        }
+        Ok(DotGit::File(content)) => content,
         Err(source) => {
             return Err(SubagentGrantError::Inspect {
                 path: dot_git,
@@ -517,22 +751,36 @@ async fn read_worktree_git(worktree: &Path) -> Result<Option<WorktreeGit>, Subag
             });
         }
     };
-    if metadata.is_dir() {
-        return Err(SubagentGrantError::RepositoryCheckout(
-            worktree.to_path_buf(),
-        ));
-    }
     let malformed = |reason| SubagentGrantError::MalformedGitData {
         path: worktree.to_path_buf(),
         reason,
     };
-    let content = read_file(&dot_git).await?;
     let git_dir = content
         .trim()
         .strip_prefix("gitdir:")
         .map(str::trim)
         .ok_or_else(|| malformed("`.git` has no `gitdir:` line"))?;
-    let git_dir = canonical(&worktree.join(git_dir)).await?;
+    let named = canonical_with_missing_leaf(&worktree.join(git_dir)).await?;
+    // A worktree granted commit names its own repository, which sits inside
+    // its entry in the main repository and has no `commondir` of its own.
+    let (git_dir, converted) = match async_fs::metadata(named.join("commondir")).await {
+        Ok(_) => (named, false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match named
+                .parent()
+                .filter(|_| named.file_name() == Some(repository::REPOSITORY_DIR.as_ref()))
+            {
+                Some(entry) => (entry.to_path_buf(), true),
+                None => return Err(malformed("the git directory has no `commondir`")),
+            }
+        }
+        Err(source) => {
+            return Err(SubagentGrantError::Inspect {
+                path: named.join("commondir"),
+                source,
+            });
+        }
+    };
     let common_dir = match async_fs::read_to_string(git_dir.join("commondir")).await {
         Ok(relative) => canonical(&git_dir.join(relative.trim())).await?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -548,6 +796,7 @@ async fn read_worktree_git(worktree: &Path) -> Result<Option<WorktreeGit>, Subag
     Ok(Some(WorktreeGit {
         git_dir,
         common_dir,
+        converted,
     }))
 }
 
@@ -561,6 +810,7 @@ impl CommittingWorktree {
         launcher: Launcher<'_>,
         history: &LaunchHistory,
         granted: &[PathBuf],
+        plain: &[PathBuf],
     ) -> Result<Self, SubagentGrantError> {
         if let Some(held) = launcher.committing {
             return held
@@ -581,6 +831,12 @@ impl CommittingWorktree {
                 .chain(granted)
                 .map(PathBuf::as_path)
                 .chain([launcher.spaces_root]),
+            history
+                .handed_out
+                .iter()
+                .chain(plain)
+                .map(PathBuf::as_path)
+                .chain([launcher.spaces_root]),
         )
         .await
     }
@@ -593,6 +849,7 @@ impl SubagentGrant {
     /// lie inside what the launcher can write; a subagent launcher hands on
     /// only the commit grants it holds itself. The main agent's grants are
     /// recorded in `history`.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn resolve(
         &self,
         launcher: Launcher<'_>,
@@ -607,21 +864,45 @@ impl SubagentGrant {
             paths.push((path, grant.commit));
         }
         let granted: Vec<PathBuf> = paths.iter().map(|(path, _)| path.clone()).collect();
+        let plain: Vec<PathBuf> = paths
+            .iter()
+            .filter(|(_, commit)| !commit)
+            .map(|(path, _)| path.clone())
+            .collect();
 
         let mut writable = Vec::new();
         let mut committing: Vec<CommittingWorktree> = Vec::new();
         for (path, commit) in &paths {
-            let git = read_worktree_git(path).await?;
+            // A worktree already granted commit has its git data resolved;
+            // its `.git`, which a subagent may have replaced, is not read
+            // again.
+            let known = commit
+                .then(|| {
+                    launcher
+                        .committing
+                        .unwrap_or(&history.committed)
+                        .iter()
+                        .find(|held| held.worktree == *path)
+                })
+                .flatten();
+            let git = if known.is_some() {
+                None
+            } else {
+                read_worktree_git(path).await?
+            };
             // A worktree's git data inside another granted path would be
             // writable whatever the commit grant says.
-            if let Some(git) = &git
-                && let Some(exposing) = granted.iter().find(|granted| {
-                    overlaps(granted, &git.git_dir) || overlaps(granted, &git.common_dir)
-                })
+            let data = known
+                .map(|held| (&held.git_dir, &held.common_dir))
+                .or_else(|| git.as_ref().map(|git| (&git.git_dir, &git.common_dir)));
+            if let Some((git_dir, common_dir)) = data
+                && let Some(exposing) = granted
+                    .iter()
+                    .find(|granted| overlaps(granted, git_dir) || overlaps(granted, common_dir))
             {
                 return Err(SubagentGrantError::GitDataExposed {
                     worktree: path.clone(),
-                    git_data: git.common_dir.clone(),
+                    git_data: common_dir.clone(),
                     writable: exposing.clone(),
                 });
             }
@@ -639,12 +920,27 @@ impl SubagentGrant {
                         writable: path.clone(),
                     });
                 }
+                // Nor does it contain a committing worktree, which a subagent
+                // could then replace under the host's `.git` file.
+                if let Some(held) = history
+                    .committed
+                    .iter()
+                    .find(|held| held.worktree.starts_with(path))
+                {
+                    return Err(SubagentGrantError::WorktreeExposed {
+                        worktree: held.worktree.clone(),
+                        writable: path.clone(),
+                    });
+                }
                 writable.push(path.clone());
                 continue;
             }
 
+            if launcher.committing.is_none() {
+                host_git::require_supported_version().await?;
+            }
             let worktree =
-                CommittingWorktree::granted(path, git, launcher, history, &granted).await?;
+                CommittingWorktree::granted(path, git, launcher, history, &granted, &plain).await?;
             if let Some(part) = worktree
                 .writable()
                 .into_iter()
@@ -661,9 +957,18 @@ impl SubagentGrant {
                     other: shared.worktree.display().to_string(),
                 });
             }
-            worktree.prepare().await?;
-            writable.push(path.clone());
-            committing.push(worktree);
+            // Off Unix the terminal runs no `sh`, so nothing guards a
+            // committing worktree's git data — refused only once every real
+            // refusal had its say.
+            if cfg!(unix) {
+                if launcher.committing.is_none() {
+                    worktree.prepare(launcher.spelling).await?;
+                }
+                writable.push(path.clone());
+                committing.push(worktree);
+            } else {
+                return Err(SubagentGrantError::CommitGrantUnsupported);
+            }
         }
 
         if launcher.committing.is_none() {
@@ -733,6 +1038,68 @@ pub enum CommitLedgerError {
         /// The failure.
         source: io::Error,
     },
+    /// A subagent's repository reported a ref or object id that is malformed
+    /// or lies outside the subagent's branch namespace.
+    #[error("the subagent repository {} reported {line:?}, which is not a ref of its namespace. {}", .repository.display(), unimported(.repository))]
+    Report {
+        /// The subagent's repository.
+        repository: PathBuf,
+        /// What it reported.
+        line: String,
+    },
+    /// Git could not run in the subagent's sandbox, failed there, or did not
+    /// finish in time.
+    #[error("cannot export from the subagent repository {}: {source}. {}", .repository.display(), unimported(.repository))]
+    Export {
+        /// The subagent's repository.
+        repository: PathBuf,
+        /// Why.
+        source: ExportError,
+    },
+    /// The pack the subagent's sandbox sent was refused: an object that is
+    /// not what it claims to be, a broken link, or more than the import
+    /// allows.
+    #[error("the pack from the subagent repository {} was refused: {stderr}. {}", .repository.display(), unimported(.repository))]
+    Rejected {
+        /// The subagent's repository.
+        repository: PathBuf,
+        /// What git said.
+        stderr: String,
+    },
+    /// A tip the subagent reported is missing after indexing, is no commit,
+    /// or reaches objects that are not there.
+    #[error("the subagent repository {} reported commits that did not arrive whole: {detail}. {}", .repository.display(), unimported(.repository))]
+    Incomplete {
+        /// The subagent's repository.
+        repository: PathBuf,
+        /// The object or the git message that says what is missing.
+        detail: String,
+    },
+    /// A ref of the main repository moved while the import was under way.
+    #[error("`{reference}` moved in the main repository while the commits of {} were imported", .repository.display())]
+    Moved {
+        /// The subagent's repository.
+        repository: PathBuf,
+        /// The ref.
+        reference: String,
+    },
+    /// The directory a pack is indexed in could not be set up, or the indexed
+    /// pack could not be moved into the main store.
+    #[error("cannot use {} to import a pack: {source}", .path.display())]
+    Quarantine {
+        /// The path.
+        path: PathBuf,
+        /// The failure.
+        source: io::Error,
+    },
+}
+
+/// What becomes of commits a repository holds that could not be imported.
+fn unimported(repository: &Path) -> String {
+    format!(
+        "Its commits that were not imported stay in {}; deleting that directory discards them, and granting the worktree again gives it a fresh repository",
+        repository.display()
+    )
 }
 
 /// Where a ledger's worktrees stood at one moment: the commits their branch
@@ -740,52 +1107,143 @@ pub enum CommitLedgerError {
 #[derive(Debug, Clone)]
 pub struct CommitMark {
     tips: Vec<Vec<String>>,
+    setbacks: Arc<[CommitLedgerError]>,
 }
 
-/// Lists the commits a subagent holding a commit grant made.
+impl CommitMark {
+    /// What could not be done to the subagent's repositories before the run.
+    ///
+    /// A repository the host cannot refresh or import never keeps a
+    /// subagent from running; it keeps its commits in itself, out of the main
+    /// repository, and the run is told here. The commits that failed to
+    /// import are listed with the next run's when a later import succeeds.
+    #[must_use]
+    pub fn setbacks(&self) -> &[CommitLedgerError] {
+        &self.setbacks
+    }
+}
+
+/// Lists the commits a subagent holding a commit grant made, and brings them
+/// into the main repository.
 ///
-/// It reads only the repository each grant was resolved against, through
-/// paths fixed when the grant was given: never a worktree's `.git` file, and
-/// never configuration a subagent can write.
+/// The main repository's refs, and so the listing, change only in the import
+/// that [`Self::since`] runs; it reads nothing a subagent wrote, and the
+/// subagent's own git runs only inside the subagent's sandbox.
 #[derive(Debug, Clone)]
 pub struct CommitLedger {
     worktrees: Vec<CommittingWorktree>,
+    git: SubagentGit,
+    limits: ImportLimits,
 }
 
 impl CommitLedger {
     /// The ledger of `worktrees`; `None` when there are none.
-    pub(crate) fn new(worktrees: &[CommittingWorktree]) -> Option<Self> {
+    pub(crate) fn new(
+        worktrees: &[CommittingWorktree],
+        git: SubagentGit,
+        limits: ImportLimits,
+    ) -> Option<Self> {
         (!worktrees.is_empty()).then(|| Self {
             worktrees: worktrees.to_vec(),
+            git,
+            limits,
         })
     }
 
-    /// Records where every worktree stands now. A branch not yet born simply
-    /// has no tip.
+    /// Starts a run: refreshes each worktree's view of the main repository's
+    /// refs inside the subagent's sandbox, imports what its repository
+    /// already holds, then records where every worktree stands. A branch not
+    /// yet born simply has no tip.
+    ///
+    /// What the subagent's repository does or holds never keeps a run from
+    /// starting. A repository that cannot be refreshed or imported (a stalled
+    /// or refused one) is left as it is, the run starts from what the main
+    /// repository holds, and the failure is in [`CommitMark::setbacks`] for the
+    /// run's report; its commits stay in that repository, which the error
+    /// names. The mark's tips are always the main repository's, so a later
+    /// import that succeeds lists the commits an earlier holder left too,
+    /// never dropping them.
     ///
     /// # Errors
-    /// Fails when git cannot list a worktree's refs.
+    /// Fails when git cannot list the main repository's refs.
     pub async fn mark(&self) -> Result<CommitMark, CommitLedgerError> {
-        let tips = try_join_all(self.worktrees.iter().map(CommittingWorktree::tips)).await?;
-        Ok(CommitMark { tips })
+        // Every worktree is carried through before an error is looked at, so
+        // none is dropped partway.
+        let prepared = join_all(self.worktrees.iter().map(|worktree| async move {
+            refresh(&self.git, worktree, &self.limits).await?;
+            // Whatever an earlier holder of the repository left is imported
+            // now, so it counts as before this run, not as made in it.
+            worktree.import(&self.git, &self.limits).await
+        }))
+        .await;
+        let setbacks: Vec<CommitLedgerError> =
+            prepared.into_iter().filter_map(Result::err).collect();
+        for setback in &setbacks {
+            tracing::warn!(%setback, "a subagent repository could not be prepared for a run");
+        }
+        let tips = join_all(self.worktrees.iter().map(CommittingWorktree::tips))
+            .await
+            .into_iter()
+            .collect::<Result<_, _>>()?;
+        Ok(CommitMark {
+            tips,
+            setbacks: setbacks.into(),
+        })
     }
 
     /// The commits made since `mark`, oldest first per worktree: everything
     /// the worktree's branch namespace or detached head reaches now and did
     /// not reach then, whatever the subagent did with `HEAD` in between.
     ///
+    /// The subagent's commits are imported into the main repository first.
+    /// Every worktree's import runs to its end before an error is returned.
+    ///
     /// # Errors
-    /// Fails when git cannot list a worktree's refs or commits.
+    /// Fails when a subagent's commits cannot be imported or git cannot list
+    /// a worktree's refs or commits.
     pub async fn since(&self, mark: &CommitMark) -> Result<Vec<SubagentCommit>, CommitLedgerError> {
-        let listed = try_join_all(self.worktrees.iter().zip(&mark.tips).map(
+        let listed = join_all(self.worktrees.iter().zip(&mark.tips).map(
             |(worktree, before)| async move {
+                worktree.import(&self.git, &self.limits).await?;
                 let now = worktree.tips().await?;
                 worktree.commits_between(before, &now).await
             },
         ))
-        .await?;
-        Ok(listed.into_iter().flatten().collect())
+        .await;
+        let mut commits = Vec::new();
+        for listed in listed {
+            commits.extend(listed?);
+        }
+        Ok(commits)
     }
+}
+
+/// Refreshes the subagent repository's snapshot of the main repository's refs
+/// with a fetch that runs in the subagent's sandbox, so whatever it does stays
+/// inside what the subagent can write.
+async fn refresh(
+    git: &SubagentGit,
+    worktree: &CommittingWorktree,
+    limits: &ImportLimits,
+) -> Result<(), CommitLedgerError> {
+    git.succeed(
+        &worktree.repository,
+        &[
+            "fetch",
+            "--quiet",
+            "--prune",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            repository::MAIN_REMOTE,
+        ],
+        limits.bounds(),
+    )
+    .await
+    .map(drop)
+    .map_err(|source| CommitLedgerError::Export {
+        repository: worktree.repository.clone(),
+        source,
+    })
 }
 
 /// The null device, which stands in for the global git configuration.
@@ -794,382 +1252,5 @@ const NULL_DEVICE: &str = "NUL";
 #[cfg(not(windows))]
 const NULL_DEVICE: &str = "/dev/null";
 
-/// Runs a read-only git query against the repository at `common_dir`, on the
-/// host and outside any sandbox.
-///
-/// Git is pointed at the repository directly, never through a worktree, so
-/// no `.git` file, `commondir` or per-worktree configuration a subagent wrote
-/// is consulted. The only configuration read is the repository's own, which
-/// a commit grant never makes writable; system and global configuration and
-/// every inherited `GIT_*` variable are dropped, and signature display and
-/// lazy fetching, the paths by which a query could start another program,
-/// are off.
-async fn git(common_dir: &Path, args: &[&str]) -> Result<String, CommitLedgerError> {
-    let mut command = async_process::Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(|key| key.starts_with("GIT_")) {
-            command.env_remove(key);
-        }
-    }
-    let output = command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .current_dir(common_dir)
-        .arg("--git-dir")
-        .arg(common_dir)
-        .args([
-            "-c",
-            "log.showSignature=false",
-            "-c",
-            "core.fsmonitor=false",
-        ])
-        .args(args)
-        .stdin(async_process::Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|source| CommitLedgerError::Spawn {
-            repository: common_dir.to_path_buf(),
-            source,
-        })?;
-    if !output.status.success() {
-        return Err(CommitLedgerError::Git {
-            repository: common_dir.to_path_buf(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
 #[cfg(test)]
-pub mod tests {
-    use super::*;
-
-    /// Runs git in `dir` with a fixed identity and no user configuration.
-    pub fn git_in(dir: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
-            .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
-            .args(["-c", "commit.gpgSign=false"])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git runs");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    /// A repository with one commit and a linked worktree on the branch
-    /// `subagent/<namespace>/work`, both inside `root`; returns the worktree.
-    pub fn repository_with_linked_worktree(root: &Path, namespace: &str) -> PathBuf {
-        let repository = root.join("repository");
-        std::fs::create_dir_all(&repository).unwrap();
-        git_in(&repository, &["init", "--initial-branch=main"]);
-        git_in(&repository, &["commit", "--allow-empty", "-m", "initial"]);
-        let worktree = root.join(namespace);
-        let branch = format!("subagent/{namespace}/work");
-        git_in(
-            &repository,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch.as_str(),
-                worktree.to_str().unwrap(),
-            ],
-        );
-        worktree
-    }
-
-    async fn main_launch(
-        root: &Path,
-        grant: &SubagentGrant,
-        history: &mut LaunchHistory,
-    ) -> Result<ResolvedGrant, SubagentGrantError> {
-        let writable = [dunce::canonicalize(root).unwrap()];
-        let spaces_root = writable[0].join("subagent-spaces");
-        grant
-            .resolve(
-                Launcher {
-                    writable: &writable,
-                    committing: None,
-                    spaces_root: &spaces_root,
-                },
-                history,
-            )
-            .await
-    }
-
-    #[tokio::test]
-    async fn a_commit_grant_covers_one_branch_namespace_and_no_repository_configuration() {
-        let dir = tempfile::tempdir().unwrap();
-        let worktree = repository_with_linked_worktree(dir.path(), "alpha");
-        let resolved = main_launch(
-            dir.path(),
-            &SubagentGrant::new().with_committing_worktree(&worktree),
-            &mut LaunchHistory::default(),
-        )
-        .await
-        .expect("a worktree on a namespaced branch can be granted commit");
-        let common = dunce::canonicalize(dir.path().join("repository/.git")).unwrap();
-        let writable = &resolved.writable;
-        assert!(writable.contains(&common.join("refs/heads/subagent/alpha")));
-        assert!(writable.contains(&common.join("objects/ab")));
-        for forbidden in [
-            common.clone(),
-            common.join("config"),
-            common.join("objects"),
-            common.join("objects/info"),
-            common.join("objects/pack"),
-            common.join("refs/heads"),
-            common.join("refs/heads/main"),
-            common.join("packed-refs"),
-            common.join("hooks"),
-        ] {
-            assert!(
-                !writable.iter().any(|path| forbidden.starts_with(path)),
-                "{} must stay read-only",
-                forbidden.display()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_branch_outside_a_subagent_namespace_cannot_be_granted_commit() {
-        let dir = tempfile::tempdir().unwrap();
-        let repository = dir.path().join("repository");
-        std::fs::create_dir_all(&repository).unwrap();
-        git_in(&repository, &["init", "--initial-branch=main"]);
-        git_in(&repository, &["commit", "--allow-empty", "-m", "initial"]);
-        let worktree = dir.path().join("feature");
-        git_in(
-            &repository,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "feature",
-                worktree.to_str().unwrap(),
-            ],
-        );
-        let error = main_launch(
-            dir.path(),
-            &SubagentGrant::new().with_committing_worktree(&worktree),
-            &mut LaunchHistory::default(),
-        )
-        .await
-        .expect_err("a plain branch is not a subagent namespace");
-        assert!(
-            matches!(error, SubagentGrantError::BranchOutsideNamespace { .. }),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_namespace_holding_another_branch_is_not_the_worktrees_own() {
-        let dir = tempfile::tempdir().unwrap();
-        let worktree = repository_with_linked_worktree(dir.path(), "beta");
-        git_in(
-            &dir.path().join("repository"),
-            &["branch", "subagent/beta/other", "main"],
-        );
-        let error = main_launch(
-            dir.path(),
-            &SubagentGrant::new().with_committing_worktree(&worktree),
-            &mut LaunchHistory::default(),
-        )
-        .await
-        .expect_err("a shared namespace is refused");
-        assert!(
-            matches!(error, SubagentGrantError::SharedNamespace { .. }),
-            "{error}"
-        );
-    }
-
-    /// A subagent with a commit grant rewrites the worktree's `.git` file and
-    /// its git directory's `commondir` to a repository of its own whose
-    /// configuration runs a program for every signed commit `git log` shows.
-    /// The ledger keeps reading the real repository and runs nothing.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn the_ledger_ignores_a_redirected_git_directory_and_runs_no_program() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let worktree = repository_with_linked_worktree(dir.path(), "gamma");
-        let resolved = main_launch(
-            dir.path(),
-            &SubagentGrant::new().with_committing_worktree(&worktree),
-            &mut LaunchHistory::default(),
-        )
-        .await
-        .unwrap();
-        let ledger = CommitLedger::new(&resolved.committing).expect("one committing worktree");
-        let mark = ledger.mark().await.unwrap();
-        git_in(&worktree, &["commit", "--allow-empty", "-m", "real work"]);
-
-        // The decoy: a repository whose config runs `program` to show a
-        // signature, with a commit carrying a `gpgsig` header.
-        let decoy = dir.path().join("decoy");
-        std::fs::create_dir_all(&decoy).unwrap();
-        git_in(&decoy, &["init", "--initial-branch=main"]);
-        let marker = dir.path().join("ran");
-        let program = dir.path().join("gpg-program");
-        std::fs::write(
-            &program,
-            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        git_in(&decoy, &["config", "log.showSignature", "true"]);
-        git_in(
-            &decoy,
-            &["config", "gpg.program", program.to_str().unwrap()],
-        );
-        let tree = git_in(&decoy, &["mktree"]);
-        let signed = format!(
-            "tree {tree}\nauthor a <a@a> 0 +0000\ncommitter a <a@a> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n -----END PGP SIGNATURE-----\n\nsigned decoy\n"
-        );
-        let object = dir.path().join("signed-commit");
-        std::fs::write(&object, signed).unwrap();
-        let signed = git_in(
-            &decoy,
-            &[
-                "hash-object",
-                "-t",
-                "commit",
-                "-w",
-                object.to_str().unwrap(),
-            ],
-        );
-        git_in(&decoy, &["update-ref", "HEAD", signed.as_str()]);
-        let decoy_git = dunce::canonicalize(decoy.join(".git")).unwrap();
-        let worktree_git = &resolved.committing[0].git_dir;
-        std::fs::write(
-            worktree.join(".git"),
-            format!("gitdir: {}\n", decoy_git.display()),
-        )
-        .unwrap();
-        std::fs::write(
-            worktree_git.join("commondir"),
-            format!("{}\n", decoy_git.display()),
-        )
-        .unwrap();
-
-        let commits = ledger
-            .since(&mark)
-            .await
-            .expect("the real repository is read");
-        assert_eq!(commits.len(), 1, "{commits:?}");
-        assert_eq!(commits[0].subject, "real work");
-        assert!(
-            !marker.exists(),
-            "the ledger ran a program the subagent chose"
-        );
-    }
-
-    /// Commits made on another branch of the namespace, or left behind by
-    /// resetting the worktree's branch and detaching `HEAD`, are still listed;
-    /// a branch moved back to where it was lists nothing.
-    #[tokio::test]
-    async fn the_ledger_lists_commits_whatever_head_does() {
-        let dir = tempfile::tempdir().unwrap();
-        let worktree = repository_with_linked_worktree(dir.path(), "delta");
-        let resolved = main_launch(
-            dir.path(),
-            &SubagentGrant::new().with_committing_worktree(&worktree),
-            &mut LaunchHistory::default(),
-        )
-        .await
-        .unwrap();
-        let ledger = CommitLedger::new(&resolved.committing).unwrap();
-        let mark = ledger.mark().await.unwrap();
-
-        git_in(&worktree, &["switch", "-c", "subagent/delta/side"]);
-        git_in(
-            &worktree,
-            &["commit", "--allow-empty", "-m", "on a side branch"],
-        );
-        git_in(&worktree, &["switch", "subagent/delta/work"]);
-        git_in(
-            &worktree,
-            &["commit", "--allow-empty", "-m", "detached later"],
-        );
-        git_in(&worktree, &["switch", "--detach"]);
-        git_in(&worktree, &["branch", "-f", "subagent/delta/work", "main"]);
-
-        let mut subjects: Vec<String> = ledger
-            .since(&mark)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|commit| commit.subject)
-            .collect();
-        subjects.sort();
-        assert_eq!(subjects, ["detached later", "on a side branch"]);
-    }
-
-    #[tokio::test]
-    async fn a_plain_grant_cannot_reach_git_data_commits_are_listed_from() {
-        let dir = tempfile::tempdir().unwrap();
-        let worktree = repository_with_linked_worktree(dir.path(), "epsilon");
-        let mut history = LaunchHistory::default();
-        main_launch(
-            dir.path(),
-            &SubagentGrant::new().with_committing_worktree(&worktree),
-            &mut history,
-        )
-        .await
-        .unwrap();
-        let objects_info = dir.path().join("repository/.git/objects/info");
-        std::fs::create_dir_all(&objects_info).unwrap();
-        let error = main_launch(
-            dir.path(),
-            &SubagentGrant::new().with_worktree(&objects_info),
-            &mut history,
-        )
-        .await
-        .expect_err("the object store's info directory stays read-only");
-        assert!(
-            matches!(error, SubagentGrantError::GitDataExposed { .. }),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn git_data_a_subagent_could_write_is_not_trusted_for_a_commit_grant() {
-        let dir = tempfile::tempdir().unwrap();
-        // The repository itself lies inside a directory handed out earlier.
-        let shared = dir.path().join("shared");
-        std::fs::create_dir_all(&shared).unwrap();
-        let worktree = repository_with_linked_worktree(&shared, "zeta");
-        let mut history = LaunchHistory::default();
-        main_launch(
-            dir.path(),
-            &SubagentGrant::new().with_worktree(&shared),
-            &mut history,
-        )
-        .await
-        .unwrap();
-        let error = main_launch(
-            dir.path(),
-            &SubagentGrant::new().with_committing_worktree(&worktree),
-            &mut history,
-        )
-        .await
-        .expect_err("a subagent could have rewritten that repository");
-        assert!(
-            matches!(error, SubagentGrantError::GitDataExposed { .. }),
-            "{error}"
-        );
-    }
-}
+pub mod tests;

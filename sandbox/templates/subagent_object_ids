@@ -1,0 +1,2 @@
+{% for id in ids %}{{ id }}
+{% endfor %}

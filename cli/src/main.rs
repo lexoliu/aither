@@ -155,18 +155,29 @@ impl PermissionHandler for InteractivePermissionHandler {
     ) -> impl std::future::Future<Output = bool> + Send {
         std::future::ready(true)
     }
+
+    fn domain_needs_approval(
+        &self,
+        domain: &str,
+        _port: u16,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        std::future::ready(!self.domain_is_allowed(domain))
+    }
+
+    fn remember_domain(
+        &self,
+        domain: &str,
+        _port: u16,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        self.approve_domain(domain);
+        std::future::ready(())
+    }
 }
 
 impl InteractivePermissionHandler {
     /// Prompts once per new domain, remembering the answer.
     fn prompt_for_domain(&self, domain: &str) -> bool {
-        // Check default whitelist
-        if DEFAULT_DOMAIN_WHITELIST.contains(&domain) {
-            return true;
-        }
-
-        // Check if already approved
-        if self.approved_domains.load().contains(domain) {
+        if self.domain_is_allowed(domain) {
             return true;
         }
 
@@ -179,16 +190,23 @@ impl InteractivePermissionHandler {
         eprintln!();
 
         if approved {
-            // Cache approval for this domain
-            self.approved_domains.rcu(|domains| {
-                let mut next = HashSet::clone(domains);
-                next.insert(domain.to_string());
-                next
-            });
-            true
-        } else {
-            false
+            self.approve_domain(domain);
         }
+        approved
+    }
+
+    /// Whether the default whitelist or an earlier approval allows `domain`.
+    fn domain_is_allowed(&self, domain: &str) -> bool {
+        DEFAULT_DOMAIN_WHITELIST.contains(&domain) || self.approved_domains.load().contains(domain)
+    }
+
+    /// Caches an approval for `domain`.
+    fn approve_domain(&self, domain: &str) {
+        self.approved_domains.rcu(|domains| {
+            let mut next = HashSet::clone(domains);
+            next.insert(domain.to_string());
+            next
+        });
     }
 }
 

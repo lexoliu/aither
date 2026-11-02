@@ -212,8 +212,8 @@ where
 {
     /// Creates a new terminal-first agent builder.
     ///
-    /// Creates the agent with native tools (`terminal_background`,
-    /// `terminal_kill`, `terminal_input`, `terminal_read`, `terminal`) and IPC commands accessible through
+    /// Creates the agent with native tools (`terminal`, `terminal_kill`,
+    /// `terminal_input`, `terminal_read`) and IPC commands accessible through
     /// `terminal` (registered via `.tool()`). The native control tools address
     /// the same background jobs as `terminal` and are not advertised as commands.
     pub fn new(llm: LLM, mut terminal_tool: TerminalTool<P, E, Unconfigured>) -> Self {
@@ -527,6 +527,18 @@ where
         self
     }
 
+    /// Resolves `BLOCKING` mark payloads in `tasks.md`: a mark it reports
+    /// dead no longer holds the item. Without a resolver every mark is
+    /// trusted.
+    #[must_use]
+    pub fn blocker_resolver(
+        mut self,
+        resolver: impl crate::working_docs::TaskBlockerResolver,
+    ) -> Self {
+        self.inner = self.inner.blocker_resolver(resolver);
+        self
+    }
+
     /// Publishes every request the agent sends to `source`, which is where
     /// the `fork` subagent kind starts from; take it from
     /// [`SubagentTool::fork_source`](crate::specialized::SubagentTool::fork_source).
@@ -830,6 +842,64 @@ where
         self
     }
 
+    /// Overrides the session's prompt-cache controller.
+    ///
+    /// See [`AgentBuilder::prompt_cache`].
+    #[must_use]
+    pub fn prompt_cache(mut self, cache: crate::context::PromptCache) -> Self {
+        self.inner = self.inner.prompt_cache(cache);
+        self
+    }
+
+    /// Sets the conversation's cache lifetime, which idle compaction, idle
+    /// reassembly and keep-alive follow.
+    ///
+    /// See [`AgentBuilder::cache_lifetime`].
+    #[must_use]
+    pub fn cache_lifetime(mut self, lifetime: crate::context::CacheLifetime) -> Self {
+        self.inner = self.inner.cache_lifetime(lifetime);
+        self
+    }
+
+    /// Sets the Claude cache retention of the session's prompt cache.
+    ///
+    /// See [`AgentBuilder::claude_cache_ttl`].
+    #[must_use]
+    pub fn claude_cache_ttl(mut self, ttl: aither_core::llm::model::ClaudePromptCacheTtl) -> Self {
+        self.inner = self.inner.claude_cache_ttl(ttl);
+        self
+    }
+
+    /// Enables prompt-cache keep-alive while the run waits on its own
+    /// background commands.
+    ///
+    /// See [`AgentBuilder::cache_keep_alive`].
+    #[must_use]
+    pub fn cache_keep_alive(mut self, keep_alive: crate::config::CacheKeepAlive) -> Self {
+        self.inner = self.inner.cache_keep_alive(keep_alive);
+        self
+    }
+
+    /// Sets what a run does with background commands still running when the
+    /// model ends its turn.
+    ///
+    /// See [`AgentBuilder::background_jobs`].
+    #[must_use]
+    pub fn background_jobs(mut self, policy: crate::BackgroundJobPolicy) -> Self {
+        self.inner = self.inner.background_jobs(policy);
+        self
+    }
+
+    /// Sets the time source idle compaction, idle reassembly and cache
+    /// keep-alive read; the system clock by default.
+    ///
+    /// See [`AgentBuilder::clock`].
+    #[must_use]
+    pub fn clock(mut self, clock: impl crate::Clock) -> Self {
+        self.inner = self.inner.clock(clock);
+        self
+    }
+
     /// Sets the maximum number of iterations.
     #[must_use]
     pub fn max_iterations(mut self, limit: usize) -> Self {
@@ -848,8 +918,7 @@ where
     /// the model.
     ///
     /// The list covers every tool registered on the inner [`AgentBuilder`]
-    /// (`terminal_background`, `terminal_kill`, `terminal_input`, `terminal_read`)
-    /// plus `terminal`,
+    /// (`terminal_kill`, `terminal_input`, `terminal_read`) plus `terminal`,
     /// which `build()` registers last, in the order the built agent's tool
     /// registry holds them.
     ///
@@ -865,7 +934,9 @@ where
             ToolRegistryBuilder::new().build(self.terminal_tool.outputs_dir()),
         ));
         definitions.push(ToolDefinition::new(&terminal));
-        definitions.push(ToolDefinition::new(&terminal.background_tool()));
+        definitions.push(ToolDefinition::new(&aither_sandbox::MonitorTool::new(
+            terminal,
+        )));
         // The registry keys tools by name, so the definition list the built
         // agent sends is name-ordered.
         definitions.sort_by(|a, b| a.name().cmp(b.name()));
@@ -919,7 +990,9 @@ where
                     .expect("failed to render knowledge_and_time template"),
             )
         };
-        let inner = inner.terminal(terminal_tool);
+        let inner = inner
+            .terminal(terminal_tool.clone())
+            .tool(aither_sandbox::MonitorTool::new(terminal_tool));
         #[cfg(feature = "skills")]
         let inner = if let Some(registry) = self.skill_registry {
             inner.skill_registry(Arc::new(registry))
@@ -1235,6 +1308,30 @@ mod tests {
             "Shell runtime: user_local_machine. Local backend: available. SSH backend: unavailable."
         );
     }
+    #[test]
+    fn continuation_block_holds_work_an_open_question_blocks() {
+        let prompt = SystemPrompt {
+            os: String::new(),
+            os_version: String::new(),
+            arch: "",
+            user_cwd: String::new(),
+            sandbox_dir: String::new(),
+            tools: String::new(),
+            host_profile: "heel",
+            host_runtime_context: String::new(),
+            skills: String::new(),
+            has_skills: false,
+            subagents: String::new(),
+            has_subagents: false,
+            is_macos: false,
+            has_websearch_command: false,
+        }
+        .render()
+        .unwrap();
+        assert!(prompt.contains("<continuation>\nIf work is blocked by a missing user decision, use `ask_user`. An item waiting on an open question — or on anything else the run cannot resolve — is marked `BLOCKING <request_id or reason>` in tasks.md; blocked items wait instead of holding the turn. A mark naming a request that is no longer open does not hold.\nDo not stop while unblocked checklist items remain incomplete.\n</continuation>"));
+        assert!(!prompt.contains("use `ask_user` and continue"));
+    }
+
     use std::borrow::Cow;
 
     use crate::test_support::{compile_baseline_fixture, fixture_distribution};
@@ -1416,7 +1513,8 @@ mod tests {
                         "description": "Run every baseline command",
                         "script": "apply_patch --version && rg --version && ast-grep --version && jq --version",
                         "mode": "sandboxed",
-                        "raw": true
+                        "raw": true,
+                        "timeout": 30
                     }),
                 ))
             } else {
@@ -1573,8 +1671,8 @@ mod tests {
         assert_eq!(
             tool_names,
             [
+                "monitor",
                 "terminal",
-                "terminal_background",
                 "terminal_input",
                 "terminal_kill",
                 "terminal_read"
@@ -1593,8 +1691,8 @@ mod tests {
                 .map(ToolDefinition::name)
                 .collect::<Vec<_>>(),
             vec![
+                "monitor",
                 "terminal",
-                "terminal_background",
                 "terminal_input",
                 "terminal_kill",
                 "terminal_read"
@@ -1606,7 +1704,7 @@ mod tests {
             .find(|message| message.content().contains("<prepared_tools>"))
             .expect("first request contains prepared catalog")
             .content();
-        for command in ["apply_patch", "rg -n", "ast-grep run", "jq"] {
+        for command in ["apply_patch", "rg", "ast-grep", "jq"] {
             assert!(catalog.contains(command));
         }
     }

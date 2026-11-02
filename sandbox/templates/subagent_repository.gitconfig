@@ -1,0 +1,14 @@
+[core]
+	repositoryformatversion = {{ format_version }}
+	hooksPath = {{ hooks_path }}
+{% if !extensions.is_empty() %}[extensions]
+{% for extension in extensions %}	{{ extension.key }} = {{ extension.value }}
+{% endfor %}{% endif %}[include]
+	path = {{ include_path }}
+[core]
+	bare = false
+[remote "main-repository"]
+	url = {{ url }}
+	fetch = {{ positive_refspec }}
+	fetch = {{ negative_refspec }}
+

@@ -17,7 +17,7 @@ name = "apply_patch"
 # printed by `apply_patch --version` after the executable name.
 # Published download URL pattern on the patch-v<version> GitHub release;
 # the authoritative URLs + hashes live in its tool-distribution manifest.
-distribution = "https://github.com/lexoliu/aither/releases/download/patch-v{version}/apply_patch-{version}-{target}.tar.gz"
+distribution = "https://github.com/May-Agent/aither/releases/download/patch-v{version}/apply_patch-{version}-{target}.tar.gz"
 # Cargo package whose [[bin]] produces the executable.
 package = "aither-patch"
 crate_dir = "patch"
@@ -29,7 +29,7 @@ crate_dir = "patch"
 linux = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 # Additional targets may be added by repeating the build on a host that has
 # that target's toolchain prerequisites (e.g. cross libc for gnu targets).
-other = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc"]
+other = ["aarch64-apple-darwin", "aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc"]
 
 [build]
 # Reproducible artifact build; executed once per target.

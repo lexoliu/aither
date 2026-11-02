@@ -45,47 +45,6 @@
       "tool": "ripgrep",
       "version": "15.2.0",
       "target": {
-        "os": "macos",
-        "arch": "x86_64"
-      },
-      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-apple-darwin.tar.gz",
-      "sha256": "af7825fcc69a2afc7a7aea55fc9af90e26421d8f20fe59df32e233c0b8a231c1",
-      "encoding": {
-        "format": "tar_gzip",
-        "executable": "ripgrep-15.2.0-x86_64-apple-darwin/rg"
-      }
-    },
-    {
-      "tool": "ast_grep",
-      "version": "0.45.3",
-      "target": {
-        "os": "macos",
-        "arch": "x86_64"
-      },
-      "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-apple-darwin.zip",
-      "sha256": "b2ffd26f42810340326a9e8a084bdc3647a8795c1a3f21fc06bd7bef3c7c5b2c",
-      "encoding": {
-        "format": "zip",
-        "executable": "ast-grep"
-      }
-    },
-    {
-      "tool": "jq",
-      "version": "1.8.2",
-      "target": {
-        "os": "macos",
-        "arch": "x86_64"
-      },
-      "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-macos-amd64",
-      "sha256": "e94b266e3c26690550006abe63152b782280f4e14374accdf04cbde844f00bc0",
-      "encoding": {
-        "format": "executable"
-      }
-    },
-    {
-      "tool": "ripgrep",
-      "version": "15.2.0",
-      "target": {
         "os": "linux",
         "arch": "aarch64"
       },
@@ -260,7 +219,8 @@
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-apple-darwin/search"
-      }
+      },
+      "executable_sha256": "94c8d3999976b958d70c7a7c8a4d55f111919a3cc430d1055222af8cbe5f8f30"
     },
     {
       "tool": "repo_search",
@@ -274,7 +234,8 @@
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-unknown-linux-gnu/search"
-      }
+      },
+      "executable_sha256": "af2a1077cdbaa3ea039db21a621e53f2e768bc2d17641503e220767a593bc8a3"
     },
     {
       "tool": "repo_search",
@@ -288,7 +249,8 @@
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-x86_64-unknown-linux-gnu/search"
-      }
+      },
+      "executable_sha256": "5b1ad75db27f8c603cd717d810ab0f64e28da8f3e55fe2926f227a03f516db4f"
     }
   ]
 }

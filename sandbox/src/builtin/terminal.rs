@@ -136,7 +136,7 @@ impl ReadTerminalDeltaTool {
     }
 }
 
-/// Arguments for [`ReadTerminalDeltaTool`].
+/// Read incremental output from a background terminal task.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReadTerminalDeltaArgs {
     /// Task identifier returned by terminal when the task is backgrounded.

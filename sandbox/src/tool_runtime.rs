@@ -37,7 +37,7 @@ impl ManagedTool {
         }
     }
 
-    fn executable_name(self, target: &ToolTarget) -> String {
+    pub(crate) fn executable_name(self, target: &ToolTarget) -> String {
         executable_name(self.command(), target)
     }
 }
@@ -208,94 +208,71 @@ fn verify_executable(
     Ok((version, bytes.into()))
 }
 
-/// A verified host program for one platform.
-///
-/// This type has no way into a [`ToolBundle`], [`PreparedTools`] or
-/// [`ToolCatalog`]: a host program cannot reach a sandbox `PATH` or the
-/// model's command list.
-#[derive(Debug, Clone)]
-pub struct HostProgramBinary {
-    program: HostProgram,
-    target: ToolTarget,
-    version: semver::Version,
-    sha256: [u8; 32],
-    bytes: Arc<[u8]>,
+/// The verified path of a prepared host program, for the harness to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostProgramPath(PathBuf);
+
+impl HostProgramPath {
+    /// The read-only executable on the host.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
-impl HostProgramBinary {
-    /// Verifies executable bytes against the distribution's trusted digest.
-    ///
-    /// # Errors
-    /// Rejects an invalid version, oversized artifact or mismatched SHA-256.
-    pub fn verify(
+impl HostProgramPath {
+    /// The prepared executable at `<root>/<sha256>/<command>`, when it is a
+    /// regular read-only executable with the trusted digest.
+    pub(crate) fn cached(
+        root: &Path,
         program: HostProgram,
-        target: ToolTarget,
-        version: &str,
-        expected: &[u8; 32],
-        bytes: Vec<u8>,
+        target: &ToolTarget,
+        sha256: &[u8; 32],
+    ) -> Result<Option<Self>, ToolRuntimeError> {
+        let path = Self::location(root, program, target, sha256)?;
+        Ok(Self::is_prepared(&path, sha256)?.then_some(Self(path)))
+    }
+
+    /// Writes `bytes` to `<root>/<sha256>/<command>`, read-only, replacing
+    /// whatever is there. The directory holds nothing else and is not shared
+    /// with any sandbox `PATH` directory.
+    pub(crate) fn write(
+        root: &Path,
+        program: HostProgram,
+        target: &ToolTarget,
+        sha256: &[u8; 32],
+        bytes: &[u8],
     ) -> Result<Self, ToolRuntimeError> {
-        let (version, bytes) = verify_executable(program.into(), version, expected, bytes)?;
-        Ok(Self {
-            program,
-            target,
-            version,
-            sha256: *expected,
-            bytes,
-        })
-    }
-
-    /// The program this executable implements.
-    #[must_use]
-    pub const fn program(&self) -> HostProgram {
-        self.program
-    }
-
-    /// The pinned version of the program.
-    #[must_use]
-    pub const fn version(&self) -> &semver::Version {
-        &self.version
-    }
-
-    /// Writes the executable to `<root>/<sha256>/<command>`, read-only, or
-    /// verifies the copy already there, and returns its path.
-    ///
-    /// The directory holds nothing else, is not shared with any sandbox
-    /// `PATH` directory and is replaced when its contents are invalid.
-    ///
-    /// # Errors
-    /// Fails when this is not the host's platform or on I/O failure.
-    pub async fn prepare_local(&self, root: &Path) -> Result<HostProgramPath, ToolRuntimeError> {
-        if self.target != ToolTarget::native()? {
-            return Err(ToolRuntimeError::TargetMismatch);
-        }
-        let binary = self.clone();
-        let root = root.to_path_buf();
-        blocking::unblock(move || binary.prepare_local_sync(&root)).await
-    }
-
-    fn prepare_local_sync(&self, root: &Path) -> Result<HostProgramPath, ToolRuntimeError> {
-        std::fs::create_dir_all(root)?;
-        let directory = std::fs::canonicalize(root)?.join(hex::encode(self.sha256));
-        let path = directory.join(self.program.executable_name(&self.target));
-        if self.is_prepared(&path)? {
-            return Ok(HostProgramPath(path));
-        }
-        std::fs::create_dir_all(&directory)?;
-        let mut stage = tempfile::NamedTempFile::new_in(&directory)?;
-        std::io::Write::write_all(&mut stage, &self.bytes)?;
+        let path = Self::location(root, program, target, sha256)?;
+        let directory = path.parent().ok_or(ToolRuntimeError::InvalidArchive)?;
+        std::fs::create_dir_all(directory)?;
+        let mut stage = tempfile::NamedTempFile::new_in(directory)?;
+        std::io::Write::write_all(&mut stage, bytes)?;
         drop(stage.persist(&path).map_err(|error| error.error)?);
         // After the rename: persisting may reset the file's attributes on
         // Windows, which would clear a read-only bit set on the staged file.
         set_executable_readonly(&path)?;
-        if self.is_prepared(&path)? {
-            Ok(HostProgramPath(path))
+        if Self::is_prepared(&path, sha256)? {
+            Ok(Self(path))
         } else {
             Err(ToolRuntimeError::InvalidCache(path))
         }
     }
 
+    fn location(
+        root: &Path,
+        program: HostProgram,
+        target: &ToolTarget,
+        sha256: &[u8; 32],
+    ) -> Result<PathBuf, ToolRuntimeError> {
+        std::fs::create_dir_all(root)?;
+        Ok(std::fs::canonicalize(root)?
+            .join(hex::encode(sha256))
+            .join(program.executable_name(target)))
+    }
+
     /// Whether `path` is a regular read-only executable with the trusted digest.
-    fn is_prepared(&self, path: &Path) -> Result<bool, ToolRuntimeError> {
+    fn is_prepared(path: &Path, sha256: &[u8; 32]) -> Result<bool, ToolRuntimeError> {
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -305,7 +282,7 @@ impl HostProgramBinary {
                 };
             }
         };
-        if !metadata.file_type().is_file() || digest(&std::fs::read(path)?) != self.sha256 {
+        if !metadata.file_type().is_file() || digest(&std::fs::read(path)?) != *sha256 {
             return Ok(false);
         }
         #[cfg(unix)]
@@ -316,18 +293,6 @@ impl HostProgramBinary {
         }
         #[cfg(not(unix))]
         Ok(metadata.permissions().readonly())
-    }
-}
-
-/// The verified path of a prepared host program, for the harness to run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostProgramPath(PathBuf);
-
-impl HostProgramPath {
-    /// The read-only executable on the host.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.0
     }
 }
 
@@ -423,56 +388,27 @@ impl ToolBundle {
         }
         let bundle = self.clone();
         let root = root.to_path_buf();
-        blocking::unblock(move || bundle.prepare_local_sync(&root)).await
+        blocking::unblock(move || {
+            let key = bundle.cache_key()?;
+            bundle.prepare_local_sync(&root, &key)
+        })
+        .await
     }
 
-    #[doc = "Prepares target executables on the coordinator and describes their read-only container mount."]
-    #[doc = "# Errors"]
-    #[doc = "Rejects invalid cached content, failed writes or invalid bundle identity."]
-    #[doc = "# Panics"]
-    #[doc = "Panics if the internal prepared directory lacks its required parent."]
-    pub async fn prepare_container_mount(
-        &self,
-        root: &Path,
-    ) -> Result<(crate::MountSpec, PreparedTools<PathBuf>), ToolRuntimeError> {
-        let bundle = self.clone();
-        let root = root.to_path_buf();
-        let source = blocking::unblock(move || bundle.prepare_local_sync(&root)).await?;
-        let destination = self.container_directory()?;
-        let host_directory = source
-            .bin_dir
-            .parent()
-            .expect("prepared binaries have a parent directory")
-            .to_path_buf();
-        Ok((
-            crate::MountSpec::read_only(host_directory, destination),
-            source,
-        ))
-    }
-
-    /// Where the prepared runtime is mounted inside a container.
-    pub(crate) fn container_directory(&self) -> Result<ContainerPath, ToolRuntimeError> {
-        Ok(ContainerPath::root()
-            .join("opt/aither/tools")
-            .join(self.cache_key()?))
-    }
-
-    /// The executable directory inside a container, which goes on its `PATH`.
-    pub(crate) fn container_bin_dir(&self) -> Result<ContainerPath, ToolRuntimeError> {
-        Ok(self.container_directory()?.join("bin"))
-    }
-
-    /// Returns the verified runtime at `<root>/<cache key>`, staging it when it is
+    /// Returns the verified runtime at `<root>/<key>`, staging it when it is
     /// missing and replacing it when its contents are invalid.
     ///
     /// Verifying a valid runtime takes no lock. Creation and replacement run under an
-    /// exclusive lock on `<root>/.<cache key>.lock`, so concurrent preparers never
+    /// exclusive lock on `<root>/.<key>.lock`, so concurrent preparers never
     /// discard a runtime another preparer has just activated.
-    fn prepare_local_sync(&self, root: &Path) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
+    pub(crate) fn prepare_local_sync(
+        &self,
+        root: &Path,
+        key: &str,
+    ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
         std::fs::create_dir_all(root)?;
         let root = std::fs::canonicalize(root)?;
-        let key = self.cache_key()?;
-        let destination = root.join(&key);
+        let destination = root.join(key);
         if let Some(prepared) = self.reusable(&destination)? {
             return Ok(prepared);
         }
@@ -489,7 +425,7 @@ impl ToolBundle {
         if let Some(prepared) = self.reusable(&destination)? {
             return Ok(prepared);
         }
-        let stage = self.stage(&root)?;
+        let stage = self.stage_scratch(&root)?;
         let discarded = if destination.try_exists()? {
             let discarded = tempfile::Builder::new()
                 .prefix(".invalid-")
@@ -537,7 +473,7 @@ impl ToolBundle {
     }
 
     /// Writes every executable into a fresh `.initializing-` directory under `root`.
-    fn stage(&self, root: &Path) -> Result<tempfile::TempDir, ToolRuntimeError> {
+    fn stage_scratch(&self, root: &Path) -> Result<tempfile::TempDir, ToolRuntimeError> {
         let stage = tempfile::Builder::new()
             .prefix(".initializing-")
             .tempdir_in(root)?;
@@ -588,6 +524,83 @@ impl ToolBundle {
             bin_dir,
             catalog: self.catalog(),
         })
+    }
+}
+
+/// One baseline command a container image must carry, without its bytes.
+#[derive(Debug, Clone)]
+pub struct ImageTool {
+    /// Program the image must provide.
+    pub tool: ManagedTool,
+    /// Version the executable must report to its version probe.
+    pub version: semver::Version,
+    /// SHA-256 of the artifact archive the executable came from.
+    pub archive_sha256: [u8; 32],
+}
+
+/// The baseline tools a container image must carry, pinned without bytes.
+///
+/// Unlike a [`ToolBundle`], this carries no executable content and is built
+/// without touching the network or the artifact cache: the image build is
+/// responsible for placing exactly these commands, at these versions, under
+/// [`ImageTools::container_directory`].
+#[derive(Debug, Clone)]
+pub struct ImageTools {
+    target: ToolTarget,
+    pub(crate) tools: Vec<ImageTool>,
+}
+
+impl ImageTools {
+    pub(crate) const fn new(target: ToolTarget, tools: Vec<ImageTool>) -> Self {
+        Self { target, tools }
+    }
+
+    /// Stable identity of the pinned image tools, for directory naming.
+    pub(crate) fn cache_key(&self) -> Result<String, ToolRuntimeError> {
+        #[derive(Serialize)]
+        struct Identity<'a> {
+            target: &'a ToolTarget,
+            tools: Vec<(&'a str, &'a semver::Version, &'a [u8; 32])>,
+        }
+        let identity = Identity {
+            target: &self.target,
+            tools: self
+                .tools
+                .iter()
+                .map(|tool| (tool.tool.command(), &tool.version, &tool.archive_sha256))
+                .collect(),
+        };
+        Ok(hex::encode(digest(&serde_json::to_vec(&identity)?)))
+    }
+
+    /// Where the image carries these tools: `/opt/aither/tools/<cache key>`.
+    ///
+    /// # Errors
+    /// Returns an error when the identity cannot be hashed.
+    pub fn container_directory(&self) -> Result<ContainerPath, ToolRuntimeError> {
+        Ok(ContainerPath::root()
+            .join("opt/aither/tools")
+            .join(self.cache_key()?))
+    }
+
+    /// The executable directory inside a container, which goes on its `PATH`.
+    pub(crate) fn container_bin_dir(&self) -> Result<ContainerPath, ToolRuntimeError> {
+        Ok(self.container_directory()?.join("bin"))
+    }
+
+    /// Stable operational metadata shared by every prepared backend.
+    #[must_use]
+    pub fn catalog(&self) -> ToolCatalog {
+        ToolCatalog {
+            tools: self
+                .tools
+                .iter()
+                .map(|tool| ToolInfo {
+                    command: tool.tool.command(),
+                    version: tool.version.clone(),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -653,8 +666,15 @@ impl PreparedTools<PathBuf> {
         use futures::{StreamExt, TryStreamExt};
         let scratch = blocking::unblock(tempfile::tempdir).await?;
         let config = heel::SandboxConfig::builder()
-            .working_dir(scratch.path())
-            .grant(&self.bin_dir, heel::Access::READ | heel::Access::EXEC)
+            .working_dir(
+                std::fs::canonicalize(scratch.path())
+                    .unwrap_or_else(|_| scratch.path().to_path_buf()),
+            )
+            .grant(
+                heel::ResolvedPath::new(std::fs::canonicalize(&self.bin_dir)?)
+                    .map_err(|error| ToolRuntimeError::SshBootstrap(error.to_string()))?,
+                heel::Access::READ | heel::Access::EXEC,
+            )
             .build();
         let sandbox = std::sync::Arc::new(
             heel::Sandbox::with_config_and_executor(config, executor)
@@ -820,6 +840,12 @@ struct ToolCatalogTemplate<'a> {
     tools: &'a [ToolInfo],
 }
 
+impl ToolCatalogTemplate<'_> {
+    fn has(&self, command: &str) -> bool {
+        self.tools.iter().any(|tool| tool.command == command)
+    }
+}
+
 impl ToolCatalog {
     /// Renders concise operational instructions without a command-discovery phase.
     ///
@@ -912,12 +938,14 @@ pub enum ToolRuntimeError {
     /// The executable cannot run or does not report the pinned version.
     #[error("prepared tool failed its version probe: {0}")]
     VersionMismatch(String),
-    #[doc = "Container mount metadata could not be parsed."]
-    #[error(transparent)]
-    MountInfo(#[from] procfs_core::ProcError),
-    #[doc = "The tools directory is not protected by a read-only container mount."]
-    #[error("managed tools require a read-only container mount: {0}")]
-    MissingReadonlyMount(ContainerPath),
+    /// The container image does not carry the verified baseline tools the bundle pins.
+    #[error("container image lacks verified baseline tools at {directory}: {defect}")]
+    InvalidImageTools {
+        /// Expected `/opt/aither/tools/<cache key>` directory.
+        directory: ContainerPath,
+        /// Which image verification check failed.
+        defect: ImageToolDefect,
+    },
     /// Required command missing from a bundle.
     #[error("required tool is missing: {0:?}")]
     MissingTool(ManagedTool),
@@ -994,6 +1022,26 @@ pub enum ToolRuntimeError {
     Template(#[from] askama::Error),
 }
 
+/// The check inside [`ToolRuntimeError::InvalidImageTools`] that failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageToolDefect {
+    /// The `<cache key>/bin` directory does not exist in the image.
+    MissingDirectory,
+    /// A pinned executable is absent or is not a regular file.
+    MissingBinary(String),
+}
+
+impl std::fmt::Display for ImageToolDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingDirectory => write!(f, "missing bin directory"),
+            Self::MissingBinary(command) => {
+                write!(f, "missing or non-regular executable `{command}`")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -1025,47 +1073,54 @@ pub mod tests {
         ToolBundle::new(ToolTarget::native().unwrap(), binaries).unwrap()
     }
 
-    /// Tools as a container sees them once the bundle is mounted read-only.
-    pub fn container_tools(bundle: &ToolBundle) -> PreparedTools<ContainerPath> {
+    /// The `ImageTools` counterpart of [`bundle`]: the same target and pins,
+    /// keyed by the digests of the script bytes a fixture artifact would hold.
+    pub fn image_tools() -> ImageTools {
+        image_tools_pinned("1.0.0")
+    }
+
+    /// [`image_tools`] pinned to another version, for a different cache key.
+    pub fn image_tools_pinned(version: &str) -> ImageTools {
+        let tools = ManagedTool::ALL
+            .into_iter()
+            .map(|tool| {
+                let bytes = format!("#!/bin/sh\nprintf '%s\\n' '{} {version}'\n", tool.command());
+                ImageTool {
+                    tool,
+                    version: semver::Version::parse(version).unwrap(),
+                    archive_sha256: digest(bytes.as_bytes()),
+                }
+            })
+            .collect();
+        ImageTools::new(ToolTarget::native().unwrap(), tools)
+    }
+
+    /// Tools as a container sees them once baked into its image.
+    pub fn container_tools(tools: &ImageTools) -> PreparedTools<ContainerPath> {
         PreparedTools {
-            bin_dir: bundle.container_bin_dir().unwrap(),
-            catalog: bundle.catalog(),
+            bin_dir: tools.container_bin_dir().unwrap(),
+            catalog: tools.catalog(),
         }
     }
 
     // Runs on every host: Windows must still produce POSIX container paths.
     #[test]
     fn container_tool_paths_are_posix_on_every_host() {
-        let bundle = bundle();
-        let key = bundle.cache_key().unwrap();
+        let tools = image_tools();
+        let key = tools.cache_key().unwrap();
         assert_eq!(
-            bundle.container_directory().unwrap().as_str(),
+            tools.container_directory().unwrap().as_str(),
             format!("/opt/aither/tools/{key}")
         );
         assert_eq!(
-            bundle.container_bin_dir().unwrap().as_str(),
+            tools.container_bin_dir().unwrap().as_str(),
             format!("/opt/aither/tools/{key}/bin")
         );
-        let script = container_tools(&bundle)
-            .wrap_script("rg --version")
-            .unwrap();
+        let script = container_tools(&tools).wrap_script("rg --version").unwrap();
         assert!(
             script.starts_with(&format!("PATH=/opt/aither/tools/{key}/bin")),
             "{script}"
         );
-    }
-
-    #[tokio::test]
-    async fn container_mount_targets_the_posix_tool_directory() {
-        let cache = tempfile::tempdir().unwrap();
-        let bundle = bundle();
-        let (mount, host) = bundle.prepare_container_mount(cache.path()).await.unwrap();
-        assert_eq!(
-            mount.container_path.as_str(),
-            format!("/opt/aither/tools/{}", bundle.cache_key().unwrap())
-        );
-        assert_eq!(Some(mount.host_path.as_path()), host.bin_dir().parent());
-        assert!(mount.access.read_only());
     }
 
     #[test]
@@ -1319,10 +1374,12 @@ pub mod tests {
         let catalog = bundle().catalog();
         let first = catalog.render().unwrap();
         assert_eq!(first, catalog.render().unwrap());
+        for command in ManagedTool::ALL {
+            assert!(first.contains(command.command()), "{command:?}");
+        }
         assert!(first.contains("ast-grep run"));
-        assert!(first.contains("rg -n"));
         assert!(first.contains("*** Begin Patch"));
-        assert!(first.contains("wait"));
+        assert!(first.contains("--help"));
         assert!(!first.contains("command -v"));
         assert!(!first.contains("which "));
     }
@@ -1355,8 +1412,18 @@ pub mod tests {
         let path = ready.prepend_path(Some(OsStr::new(&sandbox_path))).unwrap();
         let config = heel::SandboxConfig::builder()
             .network(heel::DenyAll)
-            .working_dir(workspace.path())
-            .grants([heel::Grant::new(ready.bin_dir(), heel::Access::EXEC)])
+            .working_dir(
+                std::fs::canonicalize(workspace.path())
+                    .unwrap_or_else(|_| workspace.path().to_path_buf()),
+            )
+            .grants([heel::Grant::new(
+                heel::ResolvedPath::new(
+                    std::fs::canonicalize(ready.bin_dir())
+                        .unwrap_or_else(|_| ready.bin_dir().clone()),
+                )
+                .unwrap(),
+                heel::Access::EXEC,
+            )])
             .ipc(heel::IpcRouter::new().register(RuntimeProbe))
             .security(heel::SecurityConfig::interactive())
             .build();

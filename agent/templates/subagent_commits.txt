@@ -1,4 +1,6 @@
 {% if let Some(listing) = commits %}
 
-{% match listing %}{% when Ok(list) %}{% if list.is_empty() %}No commits were made in the granted worktrees.{% else %}Commits made in the granted worktrees:{% for commit in list %}
-- {{ commit.commit }} {{ commit.subject }} (in {{ commit.worktree.display() }}){% endfor %}{% endif %}{% when Err(error) %}The commits made in the granted worktrees could not be listed: {{ error }}{% endmatch %}{% endif %}
+{% match listing.listed %}{% when Ok(list) %}{% if list.is_empty() %}No commits were made in the granted worktrees.{% else %}Commits made in the granted worktrees:{% for commit in list %}
+- {{ commit.commit }} {{ commit.subject }} (in {{ commit.worktree.display() }}){% endfor %}{% endif %}{% when Err(error) %}The commits made in the granted worktrees could not be listed: {{ error }}{% endmatch %}{% for setback in listing.setbacks %}
+
+Before the run started: {{ setback }}{% endfor %}{% endif %}

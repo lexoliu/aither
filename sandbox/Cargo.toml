@@ -16,10 +16,11 @@ categories = ["api-bindings"]
 ignored = ["ort"]
 
 [dependencies]
+arc-swap.workspace = true
 aither-core.workspace = true
 
 # Sandboxing
-heel = "0.5"
+heel = "0.7.4"
 rmp-serde = "1"
 
 # Executor for tokio integration
@@ -31,6 +32,7 @@ async-fs = "2"
 dunce = { version = "1.0.5", default-features = false }
 async-process = "2"
 async-io = "2"
+regex = "1"
 bollard = "0.21"
 
 # Serialization
@@ -92,7 +94,6 @@ lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", 
 zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 url = { version = "2.5.8", features = ["serde"] }
-procfs-core = { version = "0.18.0", default-features = false }
 fd-lock = "4"
 typed-path = "0.12.3"
 

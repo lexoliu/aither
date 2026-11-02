@@ -66,6 +66,7 @@ pub struct AgentBuilder<
     config: AgentConfig,
     context: Context,
     prompt_cache: crate::context::PromptCache,
+    clock: crate::AnyClock,
     background_receiver: Option<BackgroundTaskReceiver>,
     permission_receiver: Option<PermissionEventReceiver>,
     job_registry: Option<JobRegistry>,
@@ -73,6 +74,9 @@ pub struct AgentBuilder<
     /// Directory whose working documents (`tasks.md`) the agent supervises:
     /// the main agent's sandbox.
     sandbox_dir: Option<std::path::PathBuf>,
+    /// Resolves `BLOCKING` marks in `tasks.md`; a mark it reports dead no
+    /// longer holds the item.
+    blocker_resolver: Option<crate::working_docs::AnyTaskBlockerResolver>,
     /// Directory files are restored from after a forked compaction: the
     /// directory the agent's terminal works in.
     restore_dir: Option<std::path::PathBuf>,
@@ -118,11 +122,13 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             config: AgentConfig::default(),
             context: Context::default(),
             prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
+            clock: crate::AnyClock::default(),
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
             context_sources: Vec::new(),
             sandbox_dir: None,
+            blocker_resolver: None,
             restore_dir: None,
             fork_source: None,
             inherited: None,
@@ -159,11 +165,13 @@ where
             config: self.config,
             context: self.context,
             prompt_cache: self.prompt_cache,
+            clock: self.clock,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             inherited: self.inherited,
@@ -191,11 +199,13 @@ where
             config: self.config,
             context: self.context,
             prompt_cache: self.prompt_cache,
+            clock: self.clock,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             inherited: self.inherited,
@@ -227,11 +237,13 @@ where
             config: self.config,
             context: self.context,
             prompt_cache: self.prompt_cache,
+            clock: self.clock,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             inherited: self.inherited,
@@ -392,11 +404,13 @@ where
             config: self.config,
             context: self.context,
             prompt_cache: self.prompt_cache,
+            clock: self.clock,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
+            blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             inherited: self.inherited,
@@ -455,6 +469,17 @@ where
         let path = path.into();
         self.restore_dir = Some(path.clone());
         self.sandbox_dir = Some(path);
+        self
+    }
+
+    /// Resolves `BLOCKING` mark payloads in `tasks.md`: a mark it reports
+    /// dead no longer holds the item — the work counts as runnable and the
+    /// turn cannot stop on it. Without a resolver every mark is trusted.
+    pub fn blocker_resolver(
+        mut self,
+        resolver: impl crate::working_docs::TaskBlockerResolver,
+    ) -> Self {
+        self.blocker_resolver = Some(crate::working_docs::AnyTaskBlockerResolver::new(resolver));
         self
     }
 
@@ -594,9 +619,6 @@ where
         self.sandbox_dir = Some(terminal_tool.working_dir().clone());
         self.restore_dir = Some(terminal_tool.working_dir().clone());
         self.tools
-            .register(terminal_tool.background_tool())
-            .expect("tool registration must succeed: duplicate name or missing description");
-        self.tools
             .register(terminal_tool)
             .expect("tool registration must succeed: duplicate name or missing description");
         self.background_receiver = Some(background_receiver);
@@ -629,6 +651,20 @@ where
         self
     }
 
+    /// Sets the conversation's cache lifetime, keeping the rest of its
+    /// prompt cache. Idle compaction, idle reassembly and keep-alive follow it.
+    pub fn cache_lifetime(mut self, lifetime: crate::context::CacheLifetime) -> Self {
+        self.prompt_cache = self.prompt_cache.with_lifetime(lifetime);
+        self
+    }
+
+    /// Sets the time source idle compaction, idle reassembly and cache
+    /// keep-alive read; the system clock by default.
+    pub fn clock(mut self, clock: impl crate::Clock) -> Self {
+        self.clock = crate::AnyClock::new(clock);
+        self
+    }
+
     /// Enables prompt-cache keep-alive while the run waits on its own
     /// background commands.
     ///
@@ -636,6 +672,15 @@ where
     /// off. It is a no-op unless the run's model is an Anthropic one.
     pub const fn cache_keep_alive(mut self, keep_alive: crate::config::CacheKeepAlive) -> Self {
         self.config.cache_keep_alive = Some(keep_alive);
+        self
+    }
+
+    /// Sets what a run does with background commands still running when the
+    /// model ends its turn; [`BackgroundJobPolicy::Await`] by default.
+    ///
+    /// [`BackgroundJobPolicy::Await`]: crate::BackgroundJobPolicy::Await
+    pub const fn background_jobs(mut self, policy: crate::BackgroundJobPolicy) -> Self {
+        self.config.background_jobs = policy;
         self
     }
 
@@ -672,6 +717,7 @@ where
             fast: std::sync::Arc::new(self.fast),
             compaction_model: self.compaction_model.map(std::sync::Arc::new),
             idle_compacted: false,
+            session: crate::agent::SessionPhase::NotStarted,
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,
@@ -694,10 +740,13 @@ where
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
+            detached_task_ids: std::collections::HashSet::new(),
             sandbox_dir: self.sandbox_dir,
+            blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             last_request_started_at: None,
+            clock: self.clock,
             last_request: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
             cache_stats: crate::CacheStats::new(),
@@ -917,7 +966,7 @@ mod tests {
         let subagent = terminal
             .binding()
             .launcher()
-            .create(SubagentGrant::new())
+            .create(SubagentGrant::new(), None, None)
             .await
             .unwrap();
         let space = subagent.working_dir().clone();

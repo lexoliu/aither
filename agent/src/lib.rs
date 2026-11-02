@@ -36,14 +36,18 @@ mod browser_backend;
 mod builder;
 mod cache_stats;
 mod checkpoint;
+mod clock;
 mod config;
 pub mod context;
 mod context_window;
 mod error;
 mod event;
+pub mod external_hook;
 mod fork;
 mod fs_util;
 mod hook;
+#[cfg(test)]
+mod idle_compaction_tests;
 mod model_group;
 mod output_urls;
 mod stream;
@@ -76,12 +80,13 @@ pub use aither_websearch as websearch;
 pub use aither_sandbox as sandbox;
 
 // Public API
-pub use agent::{Agent, CompactResult};
+pub use agent::{Agent, BackgroundWake, CompactResult};
 pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser};
 pub use builder::AgentBuilder;
 pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
-pub use config::{AgentConfig, AgentKind};
+pub use clock::{AnyClock, Clock, ManualClock, SystemClock};
+pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy};
 #[cfg(feature = "skills")]
 pub use context::ActiveSkills;
 pub use context::{
@@ -92,6 +97,10 @@ pub use context::{
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;
 pub use event::{AgentEvent, TimedEvent};
+pub use external_hook::{
+    ExternalHooks, HookTestTool, HooksConfig, LifecycleHookConfig, LiveHooks, ReviewedPermission,
+    ReviewerConfig,
+};
 pub use fork::{ForkSnapshot, ForkSource};
 pub use hook::{
     CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction, StopContext,
@@ -101,6 +110,7 @@ pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
 pub use stream::AgentStream;
 pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};
 pub use tools::AgentTools;
+pub use working_docs::{AnyTaskBlockerResolver, TaskBlockerResolver};
 
 // Model groups for budget tracking and fallback
 pub use model_group::{
