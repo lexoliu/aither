@@ -250,10 +250,47 @@ fn kill_group(pid: u32) -> Result<(), KillTreeError> {
 pub async fn wait_for_exit(pid: u32) -> std::io::Result<()> {
     // Registered before the first check, so an exit between them is not missed.
     let watch = platform::ExitWatch::new(pid)?;
-    while !exited_unreaped(pid)? {
-        watch.exited().await?;
+    if exited_unreaped(pid)? {
+        return Ok(());
     }
-    Ok(())
+    // The kernel signals the exit before the child becomes waitable (XNU
+    // posts `NOTE_EXIT` before marking it a zombie), and signals it once. A
+    // child that is gone to the watch is past that point too. Either way it
+    // has stopped running, so the wait that follows is the last instants of
+    // its teardown, taken off the executor.
+    if watch.watched() {
+        watch.exited().await?;
+        if exited_unreaped(pid)? {
+            return Ok(());
+        }
+    }
+    blocking::unblock(move || wait_exited(pid)).await
+}
+
+/// Blocks until the child `pid` is waitable, without reaping it.
+#[cfg(unix)]
+fn wait_exited(pid: u32) -> std::io::Result<()> {
+    loop {
+        // SAFETY: `siginfo_t` is plain data for which all-zero bytes are valid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is live memory of the type `waitid` writes; `WNOWAIT`
+        // leaves the child waitable.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 /// Whether the child `pid` has exited, without reaping it.
@@ -958,6 +995,13 @@ mod unix {
                     watch.rest(started.elapsed());
                 }
             }
+            // Closed before the acknowledgement, so a command sent once
+            // `finish` returned is refused rather than queued. A command
+            // queued before the close is dropped here: the channel's buffer
+            // lives as long as its senders do, and would keep its reply
+            // pending forever.
+            inbox.close();
+            while inbox.try_recv().is_ok() {}
             if let Some(ack) = finished {
                 let _ = ack.send(()).await;
             }
@@ -1376,6 +1420,11 @@ mod platform {
             Ok(Self {
                 pidfd: Async::new(pidfd)?,
             })
+        }
+
+        /// A pidfd follows its process whatever state it is in.
+        pub(super) const fn watched(&self) -> bool {
+            true
         }
 
         pub(super) async fn exited(&self) -> io::Result<()> {
@@ -1914,14 +1963,14 @@ mod platform {
             Ok(Self { queue, watched })
         }
 
-        /// Returns once the child exited. A child the kernel could not watch
-        /// had exited before, so waiting for it is a caller's error.
+        /// Whether the kernel follows the child; it does not follow one that
+        /// was already exiting when the watch was made.
+        pub(super) const fn watched(&self) -> bool {
+            self.watched
+        }
+
+        /// Returns once a [`watched`](Self::watched) child exited.
         pub(super) async fn exited(&self) -> io::Result<()> {
-            if !self.watched {
-                return Err(io::Error::other(
-                    "the process is gone but is not a child that can be waited for",
-                ));
-            }
             loop {
                 self.queue.readable().await?;
                 if drain(&self.queue)? {
