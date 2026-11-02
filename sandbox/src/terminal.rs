@@ -10,6 +10,7 @@
 //! (e.g., `amber-forest-thunder-pearl/`). All terminal executions share this
 //! directory, but each execution gets a fresh sandbox (new TTY/process).
 
+use crate::grants::{GrantSet, TerminalGrants};
 use std::{
     borrow::Cow,
     io::{Read, Write},
@@ -1292,10 +1293,9 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     permission_rx: Receiver<PermissionEvent>,
     /// Channel sender for permission lifecycle events.
     permission_tx: Sender<PermissionEvent>,
-    /// Additional paths that should be writable in the sandbox.
-    writable_paths: Vec<PathBuf>,
-    /// Additional paths that should be readable (but not writable) in the sandbox.
-    readable_paths: Vec<PathBuf>,
+    /// Filesystem grants, shared by every clone; commands snapshot them at
+    /// launch.
+    grants: TerminalGrants,
     /// Set on a subagent's terminal, never on the main agent's.
     subagent: Option<SubagentAuthority>,
     /// The working directory the next foreground command starts in; held on
@@ -1335,8 +1335,7 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             running_tasks: self.running_tasks.clone(),
             permission_rx: self.permission_rx.clone(),
             permission_tx: self.permission_tx.clone(),
-            writable_paths: self.writable_paths.clone(),
-            readable_paths: self.readable_paths.clone(),
+            grants: self.grants.clone(),
             subagent: self.subagent.clone(),
             carried_dir: self.carried_dir.clone(),
             env_source: self.env_source.clone(),
@@ -1455,8 +1454,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             running_tasks,
             permission_rx,
             permission_tx,
-            writable_paths: Vec::new(),
-            readable_paths: Vec::new(),
+            grants: TerminalGrants::new(),
             subagent: None,
             carried_dir: Some(CarriedDir::default()),
             env_source: None,
@@ -1524,8 +1522,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             running_tasks,
             permission_rx,
             permission_tx,
-            writable_paths: Vec::new(),
-            readable_paths: Vec::new(),
+            grants: TerminalGrants::new(),
             subagent: None,
             carried_dir: Some(CarriedDir::default()),
             env_source: None,
@@ -1558,8 +1555,7 @@ impl<P, E, State> TerminalTool<P, E, State> {
             running_tasks: self.running_tasks,
             permission_rx: self.permission_rx,
             permission_tx: self.permission_tx,
-            writable_paths: self.writable_paths,
-            readable_paths: self.readable_paths,
+            grants: self.grants,
             subagent: self.subagent,
             carried_dir: self.carried_dir,
             env_source: self.env_source,
@@ -1661,12 +1657,10 @@ where
     ///
     /// These paths will be writable in sandboxed and network modes.
     #[must_use]
-    pub fn with_writable_paths(
-        mut self,
-        paths: impl IntoIterator<Item = impl Into<PathBuf>>,
-    ) -> Self {
-        self.writable_paths
-            .extend(paths.into_iter().map(Into::into));
+    pub fn with_writable_paths(self, paths: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
+        for path in paths {
+            self.grants.add_writable(path.into());
+        }
         self
     }
 
@@ -1675,12 +1669,10 @@ where
     /// These paths will be readable in all sandbox modes, even in strict
     /// filesystem mode where reads outside the sandbox are normally denied.
     #[must_use]
-    pub fn with_readable_paths(
-        mut self,
-        paths: impl IntoIterator<Item = impl Into<PathBuf>>,
-    ) -> Self {
-        self.readable_paths
-            .extend(paths.into_iter().map(Into::into));
+    pub fn with_readable_paths(self, paths: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
+        for path in paths {
+            self.grants.add_readable(path.into());
+        }
         self
     }
 
@@ -1819,7 +1811,7 @@ where
             .initialize_tools(distribution, cache_root)
             .await?;
         if let Some(tools) = self.local_home_tools()? {
-            tools.ensure_readonly(self.writable_grants()).await?;
+            tools.ensure_readonly(self.writable_grants().iter()).await?;
             tools.verify_local_versions(self.executor.clone()).await?;
         }
         Ok(self)
@@ -1848,7 +1840,7 @@ where
         sessions.prepared_catalog()?;
         self.shell_sessions = sessions;
         if let Some(tools) = self.local_home_tools()? {
-            tools.ensure_readonly(self.writable_grants()).await?;
+            tools.ensure_readonly(self.writable_grants().iter()).await?;
         }
         Ok(self)
     }
@@ -1863,8 +1855,11 @@ where
 
     /// The paths this terminal grants write access to, which must not expose
     /// the managed tools.
-    fn writable_grants(&self) -> impl Iterator<Item = &PathBuf> + Send {
-        std::iter::once(&self.working_dir).chain(self.writable_paths.iter())
+    fn writable_grants(&self) -> Vec<PathBuf> {
+        let grants = self.grants.snapshot();
+        std::iter::once(self.working_dir.clone())
+            .chain(grants.writable.iter().cloned())
+            .collect()
     }
 
     /// Initialized session configuration shared with child terminals.
@@ -1914,8 +1909,10 @@ where
     }
 
     /// Paths mounted readable for commands, besides the working directory.
-    pub fn readable_paths(&self) -> &[PathBuf] {
-        &self.readable_paths
+    /// The shared runtime grant handle: adding a grant through it affects
+    /// every command launched afterwards, on this terminal and its clones.
+    pub fn grants(&self) -> TerminalGrants {
+        self.grants.clone()
     }
 
     ///
@@ -1995,7 +1992,7 @@ where
         // view is canonical.
         let working_dir = canonical_path(&self.working_dir).await?;
         let mut authority = vec![working_dir.clone()];
-        for path in &self.writable_paths {
+        for path in &self.grants.snapshot().writable {
             authority.push(canonical_path(path).await?);
         }
         let spaces_root = working_dir.join(SUBAGENT_SPACES_DIR);
@@ -2041,12 +2038,8 @@ where
         self.executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
-        let readable_paths: Vec<PathBuf> = self
-            .readable_paths
-            .iter()
-            .cloned()
-            .chain(authority)
-            .collect();
+        let grants = TerminalGrants::derived(&self.grants, authority, granted.writable.clone());
+        let readable_paths = grants.snapshot().readable.clone();
         let git = match (&container, mount) {
             (Some(confinement), Some(mount)) => {
                 SubagentGit::new(Arc::new(subagent_git::ContainerGit {
@@ -2060,8 +2053,8 @@ where
             _ => SubagentGit::new(Arc::new(subagent_git::LocalGit {
                 executor: self.executor.clone(),
                 working_dir: space.clone(),
-                writable: granted.writable.clone(),
-                readable: readable_paths.clone(),
+                writable: granted.writable,
+                readable: readable_paths,
                 committing: granted.committing.clone(),
                 priority: self.priority,
             })),
@@ -2092,8 +2085,7 @@ where
             running_tasks,
             permission_rx,
             permission_tx,
-            writable_paths: granted.writable,
-            readable_paths,
+            grants,
             subagent: Some(SubagentAuthority {
                 committing: granted.committing,
                 git,
@@ -2394,8 +2386,8 @@ where
         self.executor
             .spawn(execute_terminal_task(SpawnedTerminalTask {
                 working_dir: self.working_dir.clone(),
-                writable_paths: self.writable_paths.clone(),
-                readable_paths: self.readable_paths.clone(),
+                writable_paths: self.grants.snapshot().writable.clone(),
+                readable_paths: self.grants.snapshot().readable.clone(),
                 env_source: self.env_source.clone(),
                 executor: self.executor.clone(),
                 registry: self.registry().clone(),
@@ -2618,8 +2610,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
             carried_dir: self.carried_dir.as_ref(),
             alert_tx: &self.alert_tx,
             working_dir: &self.working_dir,
-            writable_paths: &self.writable_paths,
-            readable_paths: &self.readable_paths,
+            grants: self.grants.snapshot(),
         };
         let Some(reported) = take_cwd_report(carry).await else {
             if carry.shell {
@@ -2645,8 +2636,7 @@ struct CarryContext<'a> {
     carried_dir: Option<&'a CarriedDir>,
     alert_tx: &'a Sender<JobAlert>,
     working_dir: &'a Path,
-    writable_paths: &'a [PathBuf],
-    readable_paths: &'a [PathBuf],
+    grants: std::sync::Arc<GrantSet>,
 }
 
 /// Reads and removes a command's directory report, returning the directory
@@ -2701,8 +2691,8 @@ async fn apply_cwd_report(
         return;
     };
     for grant in std::iter::once(ctx.working_dir)
-        .chain(ctx.writable_paths.iter().map(PathBuf::as_path))
-        .chain(ctx.readable_paths.iter().map(PathBuf::as_path))
+        .chain(ctx.grants.writable.iter().map(PathBuf::as_path))
+        .chain(ctx.grants.readable.iter().map(PathBuf::as_path))
     {
         if canonical_path(grant)
             .await
@@ -2817,7 +2807,8 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
         if let ExecutionBackend::Local(tools) = &target.backend {
             tools
                 .ensure_readonly(
-                    std::iter::once(&self.working_dir).chain(self.writable_paths.iter()),
+                    std::iter::once(&self.working_dir)
+                        .chain(self.grants.snapshot().writable.iter()),
                 )
                 .await?;
         }
@@ -3419,8 +3410,10 @@ where
             carried_dir: carried_dir.as_ref(),
             alert_tx: &alert_tx,
             working_dir: &working_dir,
-            writable_paths: &writable_paths,
-            readable_paths: &readable_paths,
+            grants: std::sync::Arc::new(GrantSet {
+                readable: readable_paths.clone(),
+                writable: writable_paths.clone(),
+            }),
         };
         if let Some(reported) = take_cwd_report(carry).await {
             apply_cwd_report(carry, reported, exit_code == 0, &ctx).await;
@@ -10001,7 +9994,10 @@ mod tests {
         )
         .await
         .expect("a subagent hands on the commit grant it holds");
-        assert_eq!(handed_on.writable_paths, committer.writable_paths);
+        assert_eq!(
+            handed_on.grants().snapshot().writable,
+            committer.grants().snapshot().writable
+        );
         assert!(handed_on.working_dir().starts_with(committer.working_dir()));
     }
 
@@ -10765,5 +10761,160 @@ mod tests {
             );
         }
         tool.job_registry().kill_running().await;
+    }
+
+    // ---- runtime grants -----------------------------------------------------
+
+    /// The done-when case: a writable grant added at runtime reaches every
+    /// command launched afterwards, while a command already running keeps
+    /// the grants it launched with.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runtime_writable_grant_reaches_new_commands_not_running_ones() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let outside = tempfile::tempdir().expect("outside dir should be created");
+        let late_target = outside.path().join("late.txt");
+        // Launched before the grant; its write happens after the grant is
+        // added but its grant snapshot was taken at launch.
+        let task_id = start_background_job(
+            &tool,
+            &format!("sleep 2; echo x > '{}'", late_target.display()),
+        )
+        .await;
+        let receiver = tool.background_receiver();
+
+        assert_ne!(
+            exit_code_of(
+                &tool,
+                &format!("echo x > '{}'", outside.path().join("denied.txt").display())
+            )
+            .await,
+            0,
+            "a write outside the sandbox is denied before the grant"
+        );
+        tool.grants().add_writable(outside.path());
+        assert_eq!(
+            exit_code_of(
+                &tool,
+                &format!(
+                    "echo x > '{}'",
+                    outside.path().join("granted.txt").display()
+                )
+            )
+            .await,
+            0,
+            "the command after the grant writes the approved dir"
+        );
+
+        let completed = wait_for_completed_task(&receiver, &task_id).await;
+        let _ = completed.result;
+        assert!(
+            !late_target.exists(),
+            "a command launched before the grant keeps its launch grants"
+        );
+    }
+
+    /// Cloned terminals share one grant store: a grant added through the
+    /// original's handle reaches the clone's next command.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cloned_terminal_sees_runtime_grants() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let clone = tool.clone();
+        let outside = tempfile::tempdir().expect("outside dir should be created");
+        tool.grants().add_writable(outside.path());
+        assert_eq!(
+            exit_code_of(
+                &clone,
+                &format!("touch '{}'", outside.path().join("shared.txt").display())
+            )
+            .await,
+            0,
+            "the clone's commands carry grants added through the original"
+        );
+    }
+
+    /// A subagent's derived grants follow its parent's readable list live:
+    /// a readable grant added to the parent after the subagent launches is
+    /// readable inside it; a writable grant on the parent never becomes
+    /// writable in the subagent (it lands on the subagent's readable side).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_sees_runtime_readable_but_never_writable_parent_grants() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, parent) = authority_terminal(dir.path()).await;
+        let readable_dir = tempfile::tempdir().expect("readable dir");
+        let writable_dir = tempfile::tempdir().expect("writable dir");
+        std::fs::write(readable_dir.path().join("r.txt"), "data").unwrap();
+        std::fs::write(writable_dir.path().join("w.txt"), "data").unwrap();
+
+        let child = launch(&parent, SubagentGrant::new())
+            .await
+            .expect("subagent launches");
+        parent.grants().add_readable(readable_dir.path());
+        parent.grants().add_writable(writable_dir.path());
+
+        assert_eq!(
+            exit_code_of(
+                &child,
+                &format!("cat '{}'", readable_dir.path().join("r.txt").display())
+            )
+            .await,
+            0,
+            "a runtime readable grant on the parent reaches the subagent"
+        );
+        assert_ne!(
+            exit_code_of(
+                &child,
+                &format!("cat '{}'", writable_dir.path().join("w.txt").display())
+            )
+            .await,
+            0,
+            "a writable grant added after launch grants the parent's sandbox alone"
+        );
+        assert_ne!(
+            exit_code_of(
+                &child,
+                &format!("touch '{}'", writable_dir.path().join("x.txt").display())
+            )
+            .await,
+            0,
+            "a parent writable grant is never writable inside the subagent"
+        );
+    }
+
+    /// A shell launched before the grant keeps the grants it started
+    /// with — its sandbox was fixed when it spawned — while every new
+    /// command picks the grant up (`add_writable` documents this).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_running_shell_keeps_the_grants_it_started_with() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let outside = tempfile::tempdir().expect("outside dir should be created");
+        let shell_target = outside.path().join("from_shell.txt");
+
+        // A shell session launched before the grant: its write lands after
+        // the grant was added, but inside its launch-time sandbox.
+        let task_id = start_background_job(
+            &tool,
+            &format!("sleep 2; touch '{}'", shell_target.display()),
+        )
+        .await;
+        let receiver = tool.background_receiver();
+        tool.grants().add_writable(outside.path());
+        let fresh_target = outside.path().join("fresh.txt");
+        assert_eq!(
+            exit_code_of(&tool, &format!("touch '{}'", fresh_target.display())).await,
+            0,
+            "a fresh command picks up the grant"
+        );
+        let _ = wait_for_completed_task(&receiver, &task_id).await;
+        assert!(
+            !shell_target.exists(),
+            "the shell launched before the grant is still sandboxed without it"
+        );
     }
 }

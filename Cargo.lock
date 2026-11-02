@@ -517,6 +517,7 @@ version = "0.11.0"
 dependencies = [
  "aither-core",
  "anyhow",
+ "arc-swap",
  "askama 0.16.1",
  "async-channel",
  "async-fs",

@@ -266,7 +266,9 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<
                     && (path.starts_with(self.terminal.working_dir())
                         || self
                             .terminal
-                            .readable_paths()
+                            .grants()
+                            .snapshot()
+                            .readable
                             .iter()
                             .any(|dir| path.starts_with(dir)));
                 if !readable {
