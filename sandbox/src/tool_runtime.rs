@@ -208,94 +208,71 @@ fn verify_executable(
     Ok((version, bytes.into()))
 }
 
-/// A verified host program for one platform.
-///
-/// This type has no way into a [`ToolBundle`], [`PreparedTools`] or
-/// [`ToolCatalog`]: a host program cannot reach a sandbox `PATH` or the
-/// model's command list.
-#[derive(Debug, Clone)]
-pub struct HostProgramBinary {
-    program: HostProgram,
-    target: ToolTarget,
-    version: semver::Version,
-    sha256: [u8; 32],
-    bytes: Arc<[u8]>,
+/// The verified path of a prepared host program, for the harness to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostProgramPath(PathBuf);
+
+impl HostProgramPath {
+    /// The read-only executable on the host.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
-impl HostProgramBinary {
-    /// Verifies executable bytes against the distribution's trusted digest.
-    ///
-    /// # Errors
-    /// Rejects an invalid version, oversized artifact or mismatched SHA-256.
-    pub fn verify(
+impl HostProgramPath {
+    /// The prepared executable at `<root>/<sha256>/<command>`, when it is a
+    /// regular read-only executable with the trusted digest.
+    pub(crate) fn cached(
+        root: &Path,
         program: HostProgram,
-        target: ToolTarget,
-        version: &str,
-        expected: &[u8; 32],
-        bytes: Vec<u8>,
+        target: &ToolTarget,
+        sha256: &[u8; 32],
+    ) -> Result<Option<Self>, ToolRuntimeError> {
+        let path = Self::location(root, program, target, sha256)?;
+        Ok(Self::is_prepared(&path, sha256)?.then_some(Self(path)))
+    }
+
+    /// Writes `bytes` to `<root>/<sha256>/<command>`, read-only, replacing
+    /// whatever is there. The directory holds nothing else and is not shared
+    /// with any sandbox `PATH` directory.
+    pub(crate) fn write(
+        root: &Path,
+        program: HostProgram,
+        target: &ToolTarget,
+        sha256: &[u8; 32],
+        bytes: &[u8],
     ) -> Result<Self, ToolRuntimeError> {
-        let (version, bytes) = verify_executable(program.into(), version, expected, bytes)?;
-        Ok(Self {
-            program,
-            target,
-            version,
-            sha256: *expected,
-            bytes,
-        })
-    }
-
-    /// The program this executable implements.
-    #[must_use]
-    pub const fn program(&self) -> HostProgram {
-        self.program
-    }
-
-    /// The pinned version of the program.
-    #[must_use]
-    pub const fn version(&self) -> &semver::Version {
-        &self.version
-    }
-
-    /// Writes the executable to `<root>/<sha256>/<command>`, read-only, or
-    /// verifies the copy already there, and returns its path.
-    ///
-    /// The directory holds nothing else, is not shared with any sandbox
-    /// `PATH` directory and is replaced when its contents are invalid.
-    ///
-    /// # Errors
-    /// Fails when this is not the host's platform or on I/O failure.
-    pub async fn prepare_local(&self, root: &Path) -> Result<HostProgramPath, ToolRuntimeError> {
-        if self.target != ToolTarget::native()? {
-            return Err(ToolRuntimeError::TargetMismatch);
-        }
-        let binary = self.clone();
-        let root = root.to_path_buf();
-        blocking::unblock(move || binary.prepare_local_sync(&root)).await
-    }
-
-    fn prepare_local_sync(&self, root: &Path) -> Result<HostProgramPath, ToolRuntimeError> {
-        std::fs::create_dir_all(root)?;
-        let directory = std::fs::canonicalize(root)?.join(hex::encode(self.sha256));
-        let path = directory.join(self.program.executable_name(&self.target));
-        if self.is_prepared(&path)? {
-            return Ok(HostProgramPath(path));
-        }
-        std::fs::create_dir_all(&directory)?;
-        let mut stage = tempfile::NamedTempFile::new_in(&directory)?;
-        std::io::Write::write_all(&mut stage, &self.bytes)?;
+        let path = Self::location(root, program, target, sha256)?;
+        let directory = path.parent().ok_or(ToolRuntimeError::InvalidArchive)?;
+        std::fs::create_dir_all(directory)?;
+        let mut stage = tempfile::NamedTempFile::new_in(directory)?;
+        std::io::Write::write_all(&mut stage, bytes)?;
         drop(stage.persist(&path).map_err(|error| error.error)?);
         // After the rename: persisting may reset the file's attributes on
         // Windows, which would clear a read-only bit set on the staged file.
         set_executable_readonly(&path)?;
-        if self.is_prepared(&path)? {
-            Ok(HostProgramPath(path))
+        if Self::is_prepared(&path, sha256)? {
+            Ok(Self(path))
         } else {
             Err(ToolRuntimeError::InvalidCache(path))
         }
     }
 
+    fn location(
+        root: &Path,
+        program: HostProgram,
+        target: &ToolTarget,
+        sha256: &[u8; 32],
+    ) -> Result<PathBuf, ToolRuntimeError> {
+        std::fs::create_dir_all(root)?;
+        Ok(std::fs::canonicalize(root)?
+            .join(hex::encode(sha256))
+            .join(program.executable_name(target)))
+    }
+
     /// Whether `path` is a regular read-only executable with the trusted digest.
-    fn is_prepared(&self, path: &Path) -> Result<bool, ToolRuntimeError> {
+    fn is_prepared(path: &Path, sha256: &[u8; 32]) -> Result<bool, ToolRuntimeError> {
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -305,7 +282,7 @@ impl HostProgramBinary {
                 };
             }
         };
-        if !metadata.file_type().is_file() || digest(&std::fs::read(path)?) != self.sha256 {
+        if !metadata.file_type().is_file() || digest(&std::fs::read(path)?) != *sha256 {
             return Ok(false);
         }
         #[cfg(unix)]
@@ -316,18 +293,6 @@ impl HostProgramBinary {
         }
         #[cfg(not(unix))]
         Ok(metadata.permissions().readonly())
-    }
-}
-
-/// The verified path of a prepared host program, for the harness to run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostProgramPath(PathBuf);
-
-impl HostProgramPath {
-    /// The read-only executable on the host.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.0
     }
 }
 

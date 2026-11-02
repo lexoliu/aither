@@ -151,9 +151,9 @@ pub use tool_distribution::{
     ToolDistribution,
 };
 pub use tool_runtime::{
-    DistributedTool, HostProgram, HostProgramBinary, HostProgramPath, ImageTool, ImageToolDefect,
-    ImageTools, ManagedTool, PreparedEnvironment, PreparedTools, ToolBinary, ToolBundle,
-    ToolCatalog, ToolRuntimeError, ToolTarget,
+    DistributedTool, HostProgram, HostProgramPath, ImageTool, ImageToolDefect, ImageTools,
+    ManagedTool, PreparedEnvironment, PreparedTools, ToolBinary, ToolBundle, ToolCatalog,
+    ToolRuntimeError, ToolTarget,
 };
 pub use tool_transport::{
     ContainerToolTransport, SshToolTransport, ToolEnvironmentInfo, ToolTransport,
