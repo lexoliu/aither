@@ -248,28 +248,44 @@ fn kill_group(pid: u32) -> Result<(), KillTreeError> {
 /// Returns the OS error when `pid` is not a child of this process.
 #[cfg(unix)]
 pub async fn wait_for_exit(pid: u32) -> std::io::Result<()> {
-    // Registered before the first check, so an exit between them is not missed.
+    // Registered before the check, so an exit between them is not missed.
     let watch = platform::ExitWatch::new(pid)?;
-    while !exited_unreaped(pid)? {
-        watch.exited().await?;
+    if exited_unreaped(pid)? {
+        return Ok(());
     }
-    Ok(())
+    watch.exited().await
 }
 
 /// Whether the child `pid` has exited, without reaping it.
 #[cfg(unix)]
 fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    wait_unreaped(pid, libc::WNOHANG)
+}
+
+/// Blocks until the child `pid` has exited, without reaping it.
+///
+/// Called only once the kernel reported the child exiting, so it returns
+/// within the kernel's own exit teardown.
+#[cfg(target_os = "macos")]
+fn block_until_exited_unreaped(pid: u32) -> std::io::Result<()> {
+    wait_unreaped(pid, 0).map(drop)
+}
+
+/// `waitid` for the exit of the child `pid` with `WNOWAIT` and `flags`;
+/// whether it reported the exit.
+#[cfg(unix)]
+fn wait_unreaped(pid: u32, flags: libc::c_int) -> std::io::Result<bool> {
     loop {
         // SAFETY: `siginfo_t` is plain data for which all-zero bytes are valid.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is live memory of the type `waitid` writes; `WNOWAIT`
-        // leaves the child waitable and `WNOHANG` does not block.
+        // leaves the child waitable.
         let result = unsafe {
             libc::waitid(
                 libc::P_PID,
                 pid,
                 &raw mut info,
-                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                libc::WEXITED | libc::WNOWAIT | flags,
             )
         };
         if result == 0 {
@@ -835,6 +851,20 @@ mod unix {
         Finish(Sender<()>),
     }
 
+    /// The task's end of its command channel. Dropping it closes the channel
+    /// and drops every command still queued, whose asker then learns that the
+    /// task ended: async-channel keeps a queued message, and the reply sender
+    /// inside it, alive for as long as any sender does, so a command left in
+    /// the queue would otherwise wait for its answer forever.
+    struct Inbox(Receiver<Command>);
+
+    impl Drop for Inbox {
+        fn drop(&mut self) {
+            self.0.close();
+            while self.0.try_recv().is_ok() {}
+        }
+    }
+
     enum Event {
         Command(Command),
         Changed(io::Result<()>),
@@ -912,7 +942,18 @@ mod unix {
             }
         }
 
-        pub(super) async fn run(mut self, inbox: Receiver<Command>) {
+        /// The task's loop. `inbox` is wrapped before the returned future is
+        /// first polled, so even a task dropped unpolled leaves no command
+        /// waiting for an answer.
+        pub(super) fn run(
+            self,
+            inbox: Receiver<Command>,
+        ) -> impl std::future::Future<Output = ()> + Send + 'static {
+            self.serve(Inbox(inbox))
+        }
+
+        async fn serve(mut self, inbox: Inbox) {
+            let inbox = &inbox.0;
             let mut finished = None;
             loop {
                 let next = async { inbox.recv().await.map_or(Event::Closed, Event::Command) };
@@ -937,6 +978,10 @@ mod unix {
                         let _ = reply.send(result).await;
                     }
                     Event::Command(Command::Finish(ack)) => {
+                        // Closed before the finish is acknowledged, so a
+                        // command sent once `finish` returned is refused and
+                        // reads as the job having ended.
+                        inbox.close();
                         finished = Some(ack);
                         break;
                     }
@@ -1360,6 +1405,7 @@ mod platform {
 
     /// A pidfd of a child, readable once the child has exited.
     pub(super) struct ExitWatch {
+        pid: u32,
         pidfd: Async<OwnedFd>,
     }
 
@@ -1374,12 +1420,25 @@ mod platform {
             // SAFETY: `fd` is a new descriptor nothing else owns.
             let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
             Ok(Self {
+                pid,
                 pidfd: Async::new(pidfd)?,
             })
         }
 
-        pub(super) async fn exited(&self) -> io::Result<()> {
-            self.pidfd.readable().await
+        /// Returns once the child has exited and can be waited for. The
+        /// kernel makes a pidfd readable once the process is a zombie or
+        /// reaped, so the check that follows fails only for a child that
+        /// something else reaped.
+        pub(super) async fn exited(self) -> io::Result<()> {
+            self.pidfd.readable().await?;
+            if super::exited_unreaped(self.pid)? {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "the pidfd of {} is readable but waitid reports no exit",
+                    self.pid
+                )))
+            }
         }
     }
 
@@ -1903,6 +1962,7 @@ mod platform {
 
     /// A kqueue that signals when one child exits.
     pub(super) struct ExitWatch {
+        pid: u32,
         queue: Async<OwnedFd>,
         watched: bool,
     }
@@ -1911,23 +1971,33 @@ mod platform {
         pub(super) fn new(pid: u32) -> io::Result<Self> {
             let queue = new_queue()?;
             let watched = register(&queue, pid, libc::NOTE_EXIT)?;
-            Ok(Self { queue, watched })
+            Ok(Self {
+                pid,
+                queue,
+                watched,
+            })
         }
 
-        /// Returns once the child exited. A child the kernel could not watch
-        /// had exited before, so waiting for it is a caller's error.
-        pub(super) async fn exited(&self) -> io::Result<()> {
-            if !self.watched {
-                return Err(io::Error::other(
-                    "the process is gone but is not a child that can be waited for",
-                ));
-            }
-            loop {
-                self.queue.readable().await?;
-                if drain(&self.queue)? {
-                    return Ok(());
+        /// Returns once the child has exited and can be waited for.
+        ///
+        /// xnu refuses a new watch (`P_REF_DEAD`, `proc_prepareexit`) and then
+        /// posts `NOTE_EXIT` (`proc_exit`) before it marks the process a
+        /// zombie, so neither an exit event nor a refused watch means the
+        /// child is waitable yet, and no further event follows. The wait for
+        /// that last step blocks, which takes a pool thread only for the
+        /// remainder of the kernel's exit teardown. A pid that is no child
+        /// of this process fails that wait.
+        pub(super) async fn exited(self) -> io::Result<()> {
+            if self.watched {
+                loop {
+                    self.queue.readable().await?;
+                    if drain(&self.queue)? {
+                        break;
+                    }
                 }
             }
+            let pid = self.pid;
+            blocking::unblock(move || super::block_until_exited_unreaped(pid)).await
         }
     }
 
@@ -2093,6 +2163,26 @@ mod platform {
             child.wait().expect("sh is reaped");
         }
 
+        /// A watch made after the child exited is refused by the kernel; it
+        /// still ends once the child is waitable rather than failing.
+        #[tokio::test]
+        async fn a_watch_made_after_the_exit_ends_with_the_waitable_child() {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .expect("sh should start");
+            super::super::wait_for_exit(child.id())
+                .await
+                .expect("the exit is observed");
+            let watch = super::ExitWatch::new(child.id()).expect("kqueue should open");
+            assert!(!watch.watched, "the kernel watches no zombie");
+            tokio::time::timeout(std::time::Duration::from_secs(5), watch.exited())
+                .await
+                .expect("the exited child is waitable")
+                .expect("the zombie is this process's child");
+            child.wait().expect("sh is reaped");
+        }
+
         /// A process that exits while the table is read is dropped, not a
         /// reason to fall back.
         #[test]
@@ -2116,7 +2206,7 @@ mod tests {
     use super::{
         JobMarker, JobProcess, JobTree, KillTreeError, ProcessScanner, ProcessTableError, platform,
         unix::{
-            Birth, Identity, Member, Proc, Signals, Table, Task, members, signal,
+            Birth, Command, Identity, Member, Proc, Signals, Table, Task, members, signal,
             signal_foreign_for_test,
         },
         wait_for_exit,
@@ -2442,6 +2532,40 @@ mod tests {
         assert_eq!(tree.kill_descendants().await.expect("nothing"), []);
     }
 
+    /// A command still queued when the task ends is dropped with the task,
+    /// so its asker learns the task ended instead of waiting forever, and a
+    /// command sent afterwards is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_queued_behind_the_finish_is_not_left_unanswered() {
+        let marker = JobMarker::new();
+        let mut root = spawn_group_leader("exit 0", &marker);
+        let (commands, inbox) = async_channel::unbounded();
+        let task = Task::new(root.id(), marker.entry().1, ProcessScanner::default());
+        let (ack, finished) = async_channel::bounded(1);
+        let (reply, answer) = async_channel::bounded(1);
+        commands
+            .send(Command::Finish(ack))
+            .await
+            .expect("the task's inbox is open");
+        commands
+            .send(Command::Kill { group: true, reply })
+            .await
+            .expect("the task's inbox is open");
+        task.run(inbox).await;
+        finished.try_recv().expect("the finish is acknowledged");
+        assert!(
+            matches!(answer.try_recv(), Err(async_channel::TryRecvError::Closed)),
+            "the queued kill's reply must be dropped with the task"
+        );
+        let (late, _) = async_channel::bounded(1);
+        assert!(
+            commands.send(Command::Finish(late)).await.is_err(),
+            "a command sent after the task ended must be refused"
+        );
+        wait_for_exit(root.id()).await.expect("root exit observed");
+        root.wait().expect("root is reaped");
+    }
+
     /// A process that cannot be signalled is an error naming it, not a
     /// success. Signal 0 delivers nothing.
     #[test]
@@ -2596,6 +2720,7 @@ mod tests {
     }
 
     /// Reads the pid a helper wrote to `file`, waiting for it to appear.
+    #[cfg(target_os = "macos")]
     async fn pid_from(file: &std::path::Path) -> u32 {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -2614,6 +2739,7 @@ mod tests {
     }
 
     /// Kills `pid` whatever a test found, so a failed assertion leaks nothing.
+    #[cfg(target_os = "macos")]
     fn kill_leftover(pid: u32) {
         // SAFETY: plain integers; a pid that is gone is no harm.
         unsafe { libc::kill(pid.cast_signed(), libc::SIGKILL) };
