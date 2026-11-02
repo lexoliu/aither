@@ -3952,6 +3952,9 @@ where
         )
         .grants(grants)
         .security(SecurityConfig::interactive())
+        // The session's own commands run their build outputs — anything
+        // written here could already run through an interpreter.
+        .executable_working_dir(true)
         .priority(context.priority);
     #[cfg(target_os = "linux")]
     let config_builder = config_builder.supervised_spawn(true);
@@ -4058,6 +4061,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         // themselves in every respect except IPC plumbing, so no
         // credential or filesystem protection may apply.
         .security(SecurityConfig::permissive())
+        .executable_working_dir(true)
         .priority(context.priority);
     #[cfg(target_os = "linux")]
     let config_builder = config_builder.supervised_spawn(true);
