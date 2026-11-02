@@ -88,11 +88,13 @@ impl ModelRegistry {
     /// Exact match on the `LiteLLM` key, then version-suffix normalization.
     ///
     /// Normalization strips trailing `-vN[:M]`, `-YYYYMMDD`, `-YYYY-MM-DD`,
-    /// and `@YYYYMMDD` suffixes, so dated or versioned aliases resolve to
-    /// the base model's record. It never binds a bare query to a
-    /// provider-scoped key (`github_copilot/claude-sonnet-4` only answers
-    /// `github_copilot/` lookups) and never changes the model family: an
-    /// unknown or retired ID returns `None`.
+    /// `@YYYYMMDD`, and compact `-MMDD` checkpoint dates, rewrites a
+    /// `vMAJOR-MINOR` token to `vMAJOR.MINOR`, and collapses `vMAJOR.MINOR`
+    /// to `vMAJOR` when the dotted form is also a miss, so dated or versioned
+    /// aliases resolve to the base model's record. It never binds a bare
+    /// query to a provider-scoped key (`github_copilot/claude-sonnet-4` only
+    /// answers `github_copilot/` lookups) and never changes the model family:
+    /// an unknown or retired ID returns `None`.
     #[must_use]
     pub fn lookup(&self, model_id: &str) -> Option<&ModelEntry> {
         let mut id = model_id.to_lowercase();
@@ -100,8 +102,7 @@ impl ModelRegistry {
             if let Some(&idx) = self.index.get(id.as_str()) {
                 return Some(&self.entries[idx]);
             }
-            let stripped = strip_version_suffix(&id)?;
-            id = stripped.to_owned();
+            id = next_lookup_form(&id)?;
         }
     }
 
@@ -168,9 +169,31 @@ fn is_first_party(entry: &ModelEntry) -> bool {
             .any(|prefix| entry.litellm_id().starts_with(prefix))
 }
 
+/// Next more-general form of a lookup id, or `None` when none apply.
+///
+/// Order: trailing version/date suffix, then `vMAJOR-MINOR` → `vMAJOR.MINOR`,
+/// then `vMAJOR.MINOR` → `vMAJOR`. Each step is tried only after the previous
+/// form missed in the index.
+fn next_lookup_form(id: &str) -> Option<String> {
+    if let Some(stripped) = strip_version_suffix(id) {
+        return Some(stripped.to_owned());
+    }
+    let minor = find_v_minor(id)?;
+    if minor.sep_byte == b'-' {
+        let mut dotted = id.to_owned();
+        dotted.replace_range(minor.sep..=minor.sep, ".");
+        return Some(dotted);
+    }
+    let mut collapsed = String::with_capacity(id.len() - (minor.minor_end - minor.sep));
+    collapsed.push_str(&id[..minor.sep]);
+    collapsed.push_str(&id[minor.minor_end..]);
+    Some(collapsed)
+}
+
 /// Strip one trailing version suffix from a model ID: `-vN` / `-vN:M`
-/// (Bedrock), `-YYYYMMDD` / `-YYYY-MM-DD` (dated snapshots), or `@YYYYMMDD`
-/// (Vertex). Returns the base ID, or `None` when no suffix is recognized.
+/// (Bedrock), `-YYYYMMDD` / `-YYYY-MM-DD` (dated snapshots), `@YYYYMMDD`
+/// (Vertex), or compact `-MMDD` (month 01–12, day 01–31). Returns the base
+/// ID, or `None` when no suffix is recognized.
 fn strip_version_suffix(id: &str) -> Option<&str> {
     let bytes = id.as_bytes();
     let n = bytes.len();
@@ -195,6 +218,78 @@ fn strip_version_suffix(id: &str) -> Option<&str> {
         && bytes[n - 2..].iter().all(u8::is_ascii_digit)
     {
         return Some(&id[..n - 11]);
+    }
+    if n > 5 && bytes[n - 5] == b'-' && is_compact_month_day(&bytes[n - 4..]) {
+        return Some(&id[..n - 5]);
+    }
+    None
+}
+
+/// Four ASCII digits that are a calendar month and day (`01`–`12`, `01`–`31`).
+fn is_compact_month_day(digits: &[u8]) -> bool {
+    if digits.len() != 4 || !digits.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let month = (digits[0] - b'0') * 10 + (digits[1] - b'0');
+    let day = (digits[2] - b'0') * 10 + (digits[3] - b'0');
+    (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
+/// Location of a `vMAJOR-MINOR` or `vMAJOR.MINOR` token inside a model id.
+struct VMinor {
+    /// Byte index of the `-` or `.` between major and minor.
+    sep: usize,
+    /// Byte index after the minor digits.
+    minor_end: usize,
+    /// The separator between major and minor.
+    sep_byte: u8,
+}
+
+/// First `vMAJOR-MINOR` / `vMAJOR.MINOR` token whose minor is one or two digits.
+fn find_v_minor(id: &str) -> Option<VMinor> {
+    let bytes = id.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_token_start = i == 0 || bytes[i - 1] == b'-' || bytes[i - 1] == b'/';
+        if bytes[i] != b'v' || !at_token_start {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        if j >= bytes.len() || !bytes[j].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        let Some(&sep_byte) = bytes.get(j) else {
+            i += 1;
+            continue;
+        };
+        if sep_byte != b'-' && sep_byte != b'.' {
+            i += 1;
+            continue;
+        }
+        let mut k = j + 1;
+        let minor_start = k;
+        while k < bytes.len() && bytes[k].is_ascii_digit() {
+            k += 1;
+        }
+        let minor_len = k - minor_start;
+        if !(1..=2).contains(&minor_len) {
+            i += 1;
+            continue;
+        }
+        if k != bytes.len() && bytes[k] != b'-' {
+            i += 1;
+            continue;
+        }
+        return Some(VMinor {
+            sep: j,
+            minor_end: k,
+            sep_byte,
+        });
     }
     None
 }
@@ -321,7 +416,7 @@ pub mod tests {
     #[test]
     fn fixture_skips_sample_spec_and_unknown_modes() {
         let registry = fixture();
-        assert_eq!(registry.len(), 12);
+        assert_eq!(registry.len(), 13);
         assert!(registry.lookup("sample_spec").is_none());
         assert!(registry.lookup("fixture-unknown-mode").is_none());
     }
@@ -371,6 +466,7 @@ pub mod tests {
             "fixture-gpt@20240513",
             "fixture-gpt-v2",
             "fixture-gpt-v2:1",
+            "fixture-gpt-1017",
         ] {
             assert_eq!(
                 litellm_id_of(&registry, alias).as_deref(),
@@ -383,6 +479,77 @@ pub mod tests {
             litellm_id_of(&registry, "fixture-gpt-mini-20250101").as_deref(),
             Some("fixture-gpt-mini")
         );
+    }
+
+    #[test]
+    fn hyphenated_v_minor_and_compact_date_normalize_to_base() {
+        let registry = fixture();
+        for alias in [
+            "fixture-v4-flash-1017",
+            "fixture-v4-1-flash",
+            "fixture-v4.1-flash",
+            "fixture-v4-1-flash-1017",
+        ] {
+            assert_eq!(
+                litellm_id_of(&registry, alias).as_deref(),
+                Some("fixture-v4-flash"),
+                "{alias} should normalize to fixture-v4-flash"
+            );
+            assert_eq!(
+                registry
+                    .lookup(alias)
+                    .and_then(ModelEntry::max_input_tokens),
+                Some(1_000_000),
+                "{alias} should inherit the 1M window"
+            );
+        }
+    }
+
+    #[test]
+    fn hyphenated_v_minor_prefers_dotted_record_when_present() {
+        let registry = ModelRegistry::from_litellm_json(
+            br#"{
+                "fixture-v4-flash": {
+                    "litellm_provider": "deepseek",
+                    "mode": "chat",
+                    "max_input_tokens": 1000000,
+                    "input_cost_per_token": 3e-07,
+                    "output_cost_per_token": 1.2e-06
+                },
+                "fixture-v4.1-flash": {
+                    "litellm_provider": "deepseek",
+                    "mode": "chat",
+                    "max_input_tokens": 1048576,
+                    "input_cost_per_token": 3e-07,
+                    "output_cost_per_token": 1.2e-06
+                }
+            }"#,
+        );
+        assert_eq!(
+            litellm_id_of(&registry, "fixture-v4-1-flash").as_deref(),
+            Some("fixture-v4.1-flash")
+        );
+        assert_eq!(
+            registry
+                .lookup("fixture-v4-1-flash")
+                .and_then(ModelEntry::max_input_tokens),
+            Some(1_048_576)
+        );
+    }
+
+    #[test]
+    fn compact_month_day_must_be_a_valid_calendar_date() {
+        let registry = fixture();
+        assert!(registry.lookup("fixture-gpt-1301").is_none());
+        assert!(registry.lookup("fixture-gpt-0001").is_none());
+        assert!(registry.lookup("fixture-gpt-4096").is_none());
+    }
+
+    #[test]
+    fn numeric_minor_without_v_prefix_does_not_collapse() {
+        let registry = fixture();
+        assert!(registry.lookup("fixture-gpt-4-1").is_none());
+        assert!(registry.lookup("fixture-gpt-4.1").is_none());
     }
 
     #[test]
