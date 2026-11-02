@@ -3847,7 +3847,10 @@ fn local_path_grants(
     }
     writable
         .iter()
-        .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE)))
+        // A writable directory also executes: a sandboxed process can already
+        // run anything it writes through an interpreter, and builds must
+        // execute their own outputs.
+        .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE | Access::EXEC)))
         .chain(
             readable
                 .iter()
@@ -3866,6 +3869,27 @@ fn local_path_grants(
         .collect()
 }
 
+/// Host toolchain homes a local sandbox reaches: (env var, resolved
+/// existing dir). `CARGO_HOME` and `RUSTUP_HOME` fall back to their
+/// `~/.cargo` / `~/.rustup` defaults; only directories that exist yield, so
+/// a toolchain absent from the host is never granted.
+fn host_toolchain_homes() -> impl Iterator<Item = (&'static str, PathBuf)> {
+    let home = std::env::home_dir;
+    [
+        std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home().map(|home| home.join(".cargo")))
+            .map(|path| ("CARGO_HOME", path)),
+        std::env::var_os("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home().map(|home| home.join(".rustup")))
+            .map(|path| ("RUSTUP_HOME", path)),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|(_, path)| path.is_dir())
+}
+
 /// The toolchain directories a sandboxed build needs: package-manager
 /// installs, compilers, and their caches, each rwx since builds both run
 /// the binaries and write the caches. Credential files inside them stay
@@ -3873,19 +3897,8 @@ fn local_path_grants(
 fn toolchain_grants(
     resolved: impl Fn(&Path) -> heel::Result<ResolvedPath>,
 ) -> impl Iterator<Item = heel::Result<Grant>> {
-    let home = std::env::home_dir;
-    [
-        std::env::var_os("CARGO_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home().map(|home| home.join(".cargo"))),
-        std::env::var_os("RUSTUP_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home().map(|home| home.join(".rustup"))),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|path| path.is_dir())
-    .map(move |path| Ok(Grant::new(resolved(&path)?, Access::WRITE | Access::EXEC)))
+    host_toolchain_homes()
+        .map(move |(_, path)| Ok(Grant::new(resolved(&path)?, Access::WRITE | Access::EXEC)))
 }
 
 /// Adds a command's private jobserver variables to its process environment.
@@ -3939,6 +3952,9 @@ where
         )
         .grants(grants)
         .security(SecurityConfig::interactive())
+        // The session's own commands run their build outputs — anything
+        // written here could already run through an interpreter.
+        .executable_working_dir(true)
         .priority(context.priority);
     #[cfg(target_os = "linux")]
     let config_builder = config_builder.supervised_spawn(true);
@@ -4045,6 +4061,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         // themselves in every respect except IPC plumbing, so no
         // credential or filesystem protection may apply.
         .security(SecurityConfig::permissive())
+        .executable_working_dir(true)
         .priority(context.priority);
     #[cfg(target_os = "linux")]
     let config_builder = config_builder.supervised_spawn(true);
@@ -4933,12 +4950,19 @@ async fn prepare_session_runtime_environment(
         ))
     })?;
 
-    let sandbox_path = heel::default_sandbox_path();
+    // The managed tools directory leads; the host PATH follows so host
+    // toolchains (cargo, rustup, anything else) stay reachable. The heel
+    // sandbox path is only a fallback for a host without a PATH.
+    let host_path = std::env::var_os("PATH")
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| heel::default_sandbox_path().into());
     let path = tools
-        .prepend_path(Some(std::ffi::OsStr::new(&sandbox_path)))?
+        .prepend_path(Some(host_path.as_os_str()))?
         .into_string()
         .map_err(|_| ToolRuntimeError::InvalidCache(tools.bin_dir().clone()))?;
-    Ok(vec![
+    // Point cargo and rustup at the same host homes the grants cover, so
+    // the remapped HOME does not strand them under the working dir.
+    let mut env = vec![
         ("PATH".to_string(), path),
         ("TMPDIR".to_string(), tmp.clone()),
         ("TMP".to_string(), tmp.clone()),
@@ -4949,7 +4973,11 @@ async fn prepare_session_runtime_environment(
         ("BUN_INSTALL_CACHE_DIR".to_string(), bun),
         ("PLAYWRIGHT_BROWSERS_PATH".to_string(), playwright),
         ("PYTHONPATH".to_string(), python),
-    ])
+    ];
+    for (name, home) in host_toolchain_homes() {
+        env.push((name.to_string(), path_environment_value(name, &home)?));
+    }
+    Ok(env)
 }
 
 fn path_environment_value(name: &str, path: &Path) -> Result<String, TerminalError> {
@@ -6081,6 +6109,87 @@ mod tests {
         assert!(dir.path().join(".cache/bun").is_dir());
         assert!(dir.path().join(".cache/ms-playwright").is_dir());
         assert!(dir.path().join(".config").is_dir());
+    }
+
+    #[tokio::test]
+    async fn session_runtime_environment_sets_toolchain_homes_and_host_path() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let cache = tempfile::tempdir().unwrap();
+        let cargo_home = tempfile::tempdir().unwrap();
+        let rustup_home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("CARGO_HOME", cargo_home.path());
+            std::env::set_var("RUSTUP_HOME", rustup_home.path());
+        }
+        let ready = crate::tool_runtime::tests::bundle()
+            .prepare_local(cache.path())
+            .await
+            .unwrap();
+        let environment = prepare_session_runtime_environment(dir.path(), &ready)
+            .await
+            .expect("session runtime environment should be prepared");
+        unsafe {
+            std::env::remove_var("CARGO_HOME");
+            std::env::remove_var("RUSTUP_HOME");
+        }
+        let value = |name: &str| {
+            environment
+                .iter()
+                .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+                .unwrap_or_else(|| panic!("missing session environment variable {name}"))
+        };
+
+        assert_eq!(
+            value("CARGO_HOME"),
+            cargo_home.path().to_str().expect("UTF-8 temp path")
+        );
+        assert_eq!(
+            value("RUSTUP_HOME"),
+            rustup_home.path().to_str().expect("UTF-8 temp path")
+        );
+        let host_path = std::env::var("PATH").expect("host PATH");
+        let path = value("PATH");
+        assert!(
+            path.starts_with(ready.bin_dir().to_str().expect("UTF-8 tools dir")),
+            "the managed tools dir leads PATH: {path}"
+        );
+        assert!(
+            path.contains(&host_path),
+            "the host PATH follows the tools dir: {path}"
+        );
+    }
+
+    /// Writable working directories execute what they hold — a build output
+    /// or a chmod'd script is runnable.
+    #[tokio::test]
+    async fn local_path_grants_make_writable_dirs_executable() {
+        let workdir = tempfile::tempdir().unwrap();
+        let readonly = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let tools = crate::tool_runtime::tests::bundle()
+            .prepare_local(cache.path())
+            .await
+            .unwrap();
+        let grants = local_path_grants(
+            &[workdir.path().to_path_buf()],
+            &[readonly.path().to_path_buf()],
+            &tools,
+            None,
+        )
+        .expect("grants build");
+        let canonical = |dir: &tempfile::TempDir| std::fs::canonicalize(dir.path()).unwrap();
+        let access_of = |dir: &tempfile::TempDir| {
+            grants
+                .iter()
+                .find(|grant| grant.resolved_path().as_path() == canonical(dir))
+                .map(heel::Grant::access)
+        };
+        let access = access_of(&workdir).expect("workdir grant");
+        assert!(access.can_write());
+        assert!(access.can_execute(), "a writable directory also executes");
+        let access = access_of(&readonly).expect("readonly grant");
+        assert!(!access.can_write());
+        assert!(!access.can_execute());
     }
 
     fn output_text(output: &CommandStream) -> Option<&str> {
@@ -8810,6 +8919,82 @@ mod tests {
         .await
     }
 
+    /// A script the sandboxed command writes into its working directory and
+    /// chmods executes — writable space also carries EXEC.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_written_into_the_working_dir_executes() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        assert_eq!(
+            exit_code_of(
+                &tool,
+                "echo '#!/bin/sh\necho ok' > run.sh && chmod +x run.sh && ./run.sh",
+            )
+            .await,
+            0,
+            "a script the command writes and chmods runs"
+        );
+    }
+
+    /// The host Rust toolchain works end to end inside the local sandbox:
+    /// cargo runs, and `cargo test` executes the binary it just built under
+    /// the writable working dir.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_host_rust_toolchain_builds_and_tests_a_crate() {
+        assert!(
+            std::process::Command::new("cargo")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success()),
+            "cargo must be on the host PATH for this test"
+        );
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+
+        assert_eq!(
+            exit_code_of(&tool, "cargo --version").await,
+            0,
+            "cargo is reachable inside the sandbox"
+        );
+
+        let krate = dir.path().join("probe");
+        std::fs::create_dir_all(krate.join("src")).unwrap();
+        std::fs::write(
+            krate.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            krate.join("src/lib.rs"),
+            "#[test]\nfn it_runs() { assert_eq!(1 + 1, 2); }\n",
+        )
+        .unwrap();
+        let script = format!(
+            "cd '{}' && CARGO_TARGET_DIR='{}' cargo test",
+            krate.display(),
+            krate.join("target").display()
+        );
+        assert_eq!(
+            exit_code_of(&tool, &script).await,
+            0,
+            "cargo test executes the binary it built under the working dir"
+        );
+    }
+
+    /// Credential files inside the granted toolchain homes stay unreadable.
+    #[cfg(all(unix, target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cargo_credentials_inside_the_granted_home_stay_unreadable() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let code = exit_code_of(&tool, "cat ~/.cargo/credentials.toml").await;
+        assert_ne!(
+            code, 0,
+            "a credential file under ~/.cargo stays denied inside the sandbox"
+        );
+    }
     /// Launches a subagent of `parent` the way its launcher does, with a
     /// launch history of its own.
     async fn launch(
