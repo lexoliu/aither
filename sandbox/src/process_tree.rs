@@ -258,7 +258,7 @@ pub async fn wait_for_exit(pid: u32) -> std::io::Result<()> {
     // child that is gone to the watch is past that point too. Either way it
     // has stopped running, so the wait that follows is the last instants of
     // its teardown, taken off the executor.
-    if watch.watched() {
+    if let Some(watch) = watch {
         watch.exited().await?;
         if exited_unreaped(pid)? {
             return Ok(());
@@ -1408,7 +1408,8 @@ mod platform {
     }
 
     impl ExitWatch {
-        pub(super) fn new(pid: u32) -> io::Result<Self> {
+        /// A pidfd follows its process whatever state it is in.
+        pub(super) fn new(pid: u32) -> io::Result<Option<Self>> {
             // SAFETY: `pidfd_open` takes plain integers.
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.cast_signed(), 0) };
             if fd < 0 {
@@ -1417,14 +1418,9 @@ mod platform {
             let fd = libc::c_int::try_from(fd).expect("a descriptor fits c_int");
             // SAFETY: `fd` is a new descriptor nothing else owns.
             let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
-            Ok(Self {
+            Ok(Some(Self {
                 pidfd: Async::new(pidfd)?,
-            })
-        }
-
-        /// A pidfd follows its process whatever state it is in.
-        pub(super) const fn watched(&self) -> bool {
-            true
+            }))
         }
 
         pub(super) async fn exited(&self) -> io::Result<()> {
@@ -1953,23 +1949,17 @@ mod platform {
     /// A kqueue that signals when one child exits.
     pub(super) struct ExitWatch {
         queue: Async<OwnedFd>,
-        watched: bool,
     }
 
     impl ExitWatch {
-        pub(super) fn new(pid: u32) -> io::Result<Self> {
+        /// `None` when the kernel does not follow the child: it was already
+        /// exiting when the watch was made.
+        pub(super) fn new(pid: u32) -> io::Result<Option<Self>> {
             let queue = new_queue()?;
-            let watched = register(&queue, pid, libc::NOTE_EXIT)?;
-            Ok(Self { queue, watched })
+            Ok(register(&queue, pid, libc::NOTE_EXIT)?.then_some(Self { queue }))
         }
 
-        /// Whether the kernel follows the child; it does not follow one that
-        /// was already exiting when the watch was made.
-        pub(super) const fn watched(&self) -> bool {
-            self.watched
-        }
-
-        /// Returns once a [`watched`](Self::watched) child exited.
+        /// Returns once the child exited.
         pub(super) async fn exited(&self) -> io::Result<()> {
             loop {
                 self.queue.readable().await?;
@@ -2134,7 +2124,9 @@ mod platform {
                 .args(["-c", "/bin/sleep 0.3"])
                 .spawn()
                 .expect("sh should start");
-            let watch = super::ExitWatch::new(child.id()).expect("kqueue should open");
+            let watch = super::ExitWatch::new(child.id())
+                .expect("kqueue should open")
+                .expect("a running child is followed");
             tokio::time::timeout(std::time::Duration::from_secs(5), watch.exited())
                 .await
                 .expect("no event for the exit")
