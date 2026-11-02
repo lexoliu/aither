@@ -219,7 +219,8 @@
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-apple-darwin/search"
-      }
+      },
+      "executable_sha256": "94c8d3999976b958d70c7a7c8a4d55f111919a3cc430d1055222af8cbe5f8f30"
     },
     {
       "tool": "repo_search",
@@ -233,7 +234,8 @@
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-unknown-linux-gnu/search"
-      }
+      },
+      "executable_sha256": "af2a1077cdbaa3ea039db21a621e53f2e768bc2d17641503e220767a593bc8a3"
     },
     {
       "tool": "repo_search",
@@ -247,7 +249,8 @@
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-x86_64-unknown-linux-gnu/search"
-      }
+      },
+      "executable_sha256": "5b1ad75db27f8c603cd717d810ab0f64e28da8f3e55fe2926f227a03f516db4f"
     }
   ]
 }
