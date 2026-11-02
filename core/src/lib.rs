@@ -154,8 +154,8 @@
 //!
 
 #![doc(
-    html_logo_url = "https://raw.githubusercontent.com/lexoliu/aither/main/logo.svg",
-    html_favicon_url = "https://raw.githubusercontent.com/lexoliu/aither/main/logo.svg"
+    html_logo_url = "https://raw.githubusercontent.com/May-Agent/aither/main/logo.svg",
+    html_favicon_url = "https://raw.githubusercontent.com/May-Agent/aither/main/logo.svg"
 )]
 #![no_std]
 extern crate alloc;

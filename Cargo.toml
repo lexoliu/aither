@@ -37,7 +37,7 @@ version = "0.11.0"
 edition = "2024"
 authors = ["Lexo Liu <me@lexo.cool>"]
 license = "MIT"
-repository = "https://github.com/lexoliu/aither"
+repository = "https://github.com/May-Agent/aither"
 rust-version = "1.88"
 
 # Artifact build profile for the `apply_patch` executable (aither-patch).

@@ -17,7 +17,7 @@ name = "apply_patch"
 # printed by `apply_patch --version` after the executable name.
 # Published download URL pattern on the patch-v<version> GitHub release;
 # the authoritative URLs + hashes live in its tool-distribution manifest.
-distribution = "https://github.com/lexoliu/aither/releases/download/patch-v{version}/apply_patch-{version}-{target}.tar.gz"
+distribution = "https://github.com/May-Agent/aither/releases/download/patch-v{version}/apply_patch-{version}-{target}.tar.gz"
 # Cargo package whose [[bin]] produces the executable.
 package = "aither-patch"
 crate_dir = "patch"
