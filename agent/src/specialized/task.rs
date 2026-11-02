@@ -20,13 +20,14 @@ use aither_core::{
     llm::{Tool, ToolResult, oneshot},
 };
 use aither_sandbox::{
-    CommandRole, CommitLedger, CommitLedgerError, CommitMark, SubagentCommit, SubagentGrant,
-    TerminalBinding,
+    CommandRole, CommitLedger, CommitLedgerError, CommitMark, DynTerminalTool, SubagentCommit,
+    SubagentGrant, TerminalBinding,
 };
 use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use super::external::{AnyExternalSession, AnyExternalSubagent, ExternalStart, ExternalSubagent};
 use crate::AgentBuilder;
 use crate::context::CacheLifetime;
 use crate::external_hook::{self, ExternalHooks};
@@ -66,6 +67,8 @@ enum Origin<LLM> {
     Builder(SubagentBuilder<LLM>),
     /// A copy of the main agent's request and model.
     Fork,
+    /// An agent that runs outside aither.
+    External(Arc<AnyExternalSubagent>),
 }
 
 impl<LLM> Clone for Origin<LLM> {
@@ -73,6 +76,7 @@ impl<LLM> Clone for Origin<LLM> {
         match self {
             Self::Builder(builder) => Self::Builder(Arc::clone(builder)),
             Self::Fork => Self::Fork,
+            Self::External(backend) => Self::External(Arc::clone(backend)),
         }
     }
 }
@@ -151,6 +155,20 @@ impl<LLM: Clone> SubagentType<LLM> {
         }
     }
 
+    /// A subagent whose turns run outside aither, on `backend`.
+    ///
+    /// The tool opens one [`ExternalSession`](super::ExternalSession) per
+    /// `start` call and prompts it again on `resume`; a turn's final message
+    /// is the result. The external agent picks its own model, so a `start`
+    /// call that names one is refused, and its sessions never expire.
+    pub fn external(description: impl Into<String>, backend: impl ExternalSubagent) -> Self {
+        Self {
+            description: description.into(),
+            model: None,
+            origin: Origin::External(Arc::new(AnyExternalSubagent::new(backend))),
+        }
+    }
+
     /// Declare the model tier this subagent runs on unless the caller
     /// overrides it with the `model` argument of a `start` call.
     #[must_use]
@@ -225,13 +243,25 @@ impl SubagentArgs {
     /// What a start call grants beyond the subagent's own space, with
     /// relative paths resolved against the caller's working directory.
     fn grant(&self, working_dir: Option<&Path>) -> SubagentGrant {
+        let (worktrees, commit_worktrees) = self.granted_paths(working_dir);
+        let grant = worktrees
+            .into_iter()
+            .fold(SubagentGrant::new(), SubagentGrant::with_worktree);
+        commit_worktrees
+            .into_iter()
+            .fold(grant, SubagentGrant::with_committing_worktree)
+    }
+
+    /// The writable and the committing directories a start call grants, with
+    /// relative paths resolved against the caller's working directory.
+    fn granted_paths(&self, working_dir: Option<&Path>) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let Self::Start {
             worktrees,
             commit_worktrees,
             ..
         } = self
         else {
-            return SubagentGrant::new();
+            return (Vec::new(), Vec::new());
         };
         let resolve = |path: &String| {
             let path = Path::new(path);
@@ -240,14 +270,10 @@ impl SubagentArgs {
                 _ => path.to_path_buf(),
             }
         };
-        let grant = worktrees
-            .iter()
-            .map(resolve)
-            .fold(SubagentGrant::new(), SubagentGrant::with_worktree);
-        commit_worktrees
-            .iter()
-            .map(resolve)
-            .fold(grant, SubagentGrant::with_committing_worktree)
+        (
+            worktrees.iter().map(resolve).collect(),
+            commit_worktrees.iter().map(resolve).collect(),
+        )
     }
 
     /// The prompt file either call shape carries.
@@ -302,8 +328,11 @@ enum SubagentReport<'a> {
     Completed {
         model: Option<&'a str>,
         result: &'a str,
-        /// Id to continue this subagent with while its prompt cache is warm.
+        /// Id to continue this subagent with.
         id: u64,
+        /// Whether the id expires with the subagent's prompt cache; an
+        /// external session's never does.
+        cache_bound: bool,
         /// Set when the run crossed the frequent-idle threshold: the subagent
         /// kept needing prompt-cache keep-alives and this says why.
         alert: Option<&'a str>,
@@ -539,26 +568,48 @@ where
 
 /// A finished subagent kept so the parent can continue it.
 struct FinishedSubagent<LLM> {
-    agent: crate::Agent<LLM, LLM, LLM, SubagentHooks>,
     subagent: String,
     model: Option<String>,
-    child_job_registry: Option<aither_sandbox::JobRegistry>,
     /// Lists the commits the subagent makes; set when it was launched with a
     /// commit grant.
     commit_ledger: Option<CommitLedger>,
-    /// How long the provider keeps this subagent's prompt cache warm — the
-    /// [`PromptCache`](crate::context::PromptCache) lifetime the subagent
-    /// ran with. The continuation id expires with the cache entry.
-    lifetime: CacheLifetime,
+    body: SubagentBody<LLM>,
+}
+
+/// What runs a subagent's turns.
+enum SubagentBody<LLM> {
+    /// An aither agent.
+    Agent {
+        agent: Box<crate::Agent<LLM, LLM, LLM, SubagentHooks>>,
+        child_job_registry: Option<aither_sandbox::JobRegistry>,
+        /// How long the provider keeps this subagent's prompt cache warm — the
+        /// [`PromptCache`](crate::context::PromptCache) lifetime the subagent
+        /// ran with. The continuation id expires with the cache entry.
+        lifetime: CacheLifetime,
+    },
+    /// A session that runs outside aither; it lives until it is closed.
+    External {
+        session: AnyExternalSession,
+        /// The terminal that holds the subagent's grant and commit ledger.
+        _terminal: Option<Box<DynTerminalTool>>,
+    },
 }
 
 impl<LLM: LanguageModel + 'static> FinishedSubagent<LLM> {
-    /// Whether the cache entry's lifetime passed since it was last
-    /// refreshed (the later of the last request and the last keep-alive).
-    fn expired(&self) -> bool {
-        self.agent
+    /// The cache lifetime this subagent outlived, when it did: the later of
+    /// its last request and its last keep-alive is older than that. An
+    /// external session never expires.
+    fn expired(&self) -> Option<CacheLifetime> {
+        let SubagentBody::Agent {
+            agent, lifetime, ..
+        } = &self.body
+        else {
+            return None;
+        };
+        agent
             .cache_entry_started_at()
-            .is_none_or(|started| self.lifetime.is_cold(started.elapsed()))
+            .is_none_or(|started| lifetime.is_cold(started.elapsed()))
+            .then_some(*lifetime)
     }
 }
 
@@ -598,9 +649,9 @@ impl<LLM: LanguageModel + 'static> FinishedSubagents<LLM> {
     fn expire(inner: &mut FinishedInner<LLM>) {
         for slot in inner.slots.values_mut() {
             if let FinishedSlot::Idle(finished) = slot
-                && finished.expired()
+                && let Some(lifetime) = finished.expired()
             {
-                *slot = FinishedSlot::Expired(finished.lifetime);
+                *slot = FinishedSlot::Expired(lifetime);
             }
         }
     }
@@ -1224,11 +1275,90 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         Ok(snapshot)
     }
 
+    /// Launches the terminal a subagent holding `grant` works from, within the
+    /// authority of the terminal this tool serves; `None` for a tool bound to
+    /// no terminal when nothing is granted.
+    async fn launch_terminal(
+        &self,
+        grant: SubagentGrant,
+        observer: Option<aither_sandbox::AnyCommandObserver>,
+        gate: Option<aither_sandbox::AnyCommandGate>,
+    ) -> anyhow::Result<Option<DynTerminalTool>> {
+        if let Some(binding) = &self.binding {
+            let terminal = binding
+                .launcher()
+                .create(grant, observer, gate)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to create subagent terminal tool: {e}"))?;
+            Ok(Some(terminal))
+        } else if grant == SubagentGrant::new() {
+            Ok(None)
+        } else {
+            anyhow::bail!("worktrees can only be granted to a subagent launched from a terminal");
+        }
+    }
+
+    /// Opens a session of an external subagent.
+    ///
+    /// The grant is given through a terminal like any subagent's, which also
+    /// gives the commit ledger; the session works in the directories granted.
+    async fn start_external(
+        &self,
+        subagent_id: String,
+        backend: &AnyExternalSubagent,
+        args: &SubagentArgs,
+    ) -> anyhow::Result<FinishedSubagent<LLM>> {
+        let SubagentArgs::Start { model, .. } = args else {
+            unreachable!("only a start call opens a session");
+        };
+        if model.is_some() {
+            anyhow::bail!(
+                "subagent type '{subagent_id}' runs an external agent that picks its own model; start it without `model`"
+            );
+        }
+        let working_dir = self
+            .binding
+            .as_ref()
+            .map(TerminalBinding::working_dir)
+            .or(self.base_dir.as_deref())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "subagent type '{subagent_id}' needs a working directory: the tool is bound to no terminal and has no base directory"
+                )
+            })?;
+        let grant = args.grant(Some(working_dir));
+        let (worktrees, commit_worktrees) = args.granted_paths(Some(working_dir));
+        let terminal = self.launch_terminal(grant, None, None).await?.map(Box::new);
+        let commit_ledger = terminal
+            .as_ref()
+            .and_then(|terminal| terminal.commit_ledger().cloned());
+        let session = backend
+            .open(ExternalStart {
+                working_dir,
+                worktrees: &worktrees,
+                commit_worktrees: &commit_worktrees,
+            })
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to open a '{subagent_id}' session: {error}")
+            })?;
+        tracing::info!(subagent = %subagent_id, "Starting external subagent");
+        Ok(FinishedSubagent {
+            subagent: subagent_id,
+            model: session.model(),
+            commit_ledger,
+            body: SubagentBody::External {
+                session,
+                _terminal: terminal,
+            },
+        })
+    }
+
     /// Builds a fresh agent for `subagent`, selecting its model from `chosen`
     /// or by routing `prompt`.
     async fn start_agent(
         &self,
-        subagent: &str,
+        (subagent_id, declared_model, source): (String, Option<ModelTier>, Source<'_, LLM>),
         chosen: Option<ModelTier>,
         grant: SubagentGrant,
         prompt: &str,
@@ -1239,8 +1369,6 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         Option<aither_sandbox::JobRegistry>,
         Option<CommitLedger>,
     )> {
-        let (subagent_id, declared_model, source) = self.resolve_source(subagent).await?;
-
         // A fork is checked before anything is started, and runs on the
         // main agent's model.
         let fork = match &source {
@@ -1282,6 +1410,10 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                 origin: Origin::Fork,
                 ..
             }) => crate::AgentBuilder::new(selected),
+            Source::Registered(SubagentType {
+                origin: Origin::External(_),
+                ..
+            }) => unreachable!("an external type starts through `start_external`"),
         };
         tracing::info!(subagent = %subagent_id, model = %model, "Starting subagent");
         let child_hooks = self
@@ -1292,25 +1424,20 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         let command_gate = self.hooks.is_some().then(|| child_hooks.command_gate());
 
         // Launch the subagent's terminal from the terminal this tool serves.
-        let (agent_builder, child_job_registry, commit_ledger) = if let Some(binding) =
-            &self.binding
+        let (agent_builder, child_job_registry, commit_ledger) = match self
+            .launch_terminal(grant, command_observer, command_gate)
+            .await?
         {
-            let dyn_terminal = binding
-                .launcher()
-                .create(grant, command_observer, command_gate)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to create subagent terminal tool: {e}"))?;
-            let job_registry = dyn_terminal.job_registry();
-            let commit_ledger = dyn_terminal.commit_ledger().cloned();
-            let agent_builder = match &fork {
-                Some(fork) => agent_builder.forked_from(fork, dyn_terminal),
-                None => agent_builder.dyn_terminal(dyn_terminal),
-            };
-            (agent_builder, Some(job_registry), commit_ledger)
-        } else if grant == SubagentGrant::new() {
-            (agent_builder, None, None)
-        } else {
-            anyhow::bail!("worktrees can only be granted to a subagent launched from a terminal");
+            Some(dyn_terminal) => {
+                let job_registry = dyn_terminal.job_registry();
+                let commit_ledger = dyn_terminal.commit_ledger().cloned();
+                let agent_builder = match &fork {
+                    Some(fork) => agent_builder.forked_from(fork, dyn_terminal),
+                    None => agent_builder.dyn_terminal(dyn_terminal),
+                };
+                (agent_builder, Some(job_registry), commit_ledger)
+            }
+            None => (agent_builder, None, None),
         };
 
         // Keep-alive is configured only for the Claude client, whose
@@ -1349,6 +1476,21 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                 model,
                 ..
             } => {
+                let resolved = self.resolve_source(subagent).await?;
+                if let (
+                    subagent_id,
+                    _,
+                    Source::Registered(SubagentType {
+                        origin: Origin::External(backend),
+                        ..
+                    }),
+                ) = &resolved
+                {
+                    let finished = self
+                        .start_external(subagent_id.clone(), backend, &args)
+                        .await?;
+                    return Ok((finished, None));
+                }
                 let grant = args.grant(
                     self.binding
                         .as_ref()
@@ -1356,16 +1498,18 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                         .or(self.base_dir.as_deref()),
                 );
                 let (agent, subagent, model, child_job_registry, commit_ledger) =
-                    self.start_agent(subagent, model, grant, prompt).await?;
+                    self.start_agent(resolved, model, grant, prompt).await?;
                 let lifetime = agent.cache_lifetime();
                 Ok((
                     FinishedSubagent {
-                        agent,
                         subagent,
                         model: Some(model),
-                        child_job_registry,
                         commit_ledger,
-                        lifetime,
+                        body: SubagentBody::Agent {
+                            agent: Box::new(agent),
+                            child_job_registry,
+                            lifetime,
+                        },
                     },
                     None,
                 ))
@@ -1550,12 +1694,10 @@ where
         let (finished, resumed) = self.acquire(args, &prompt).await?;
         let (
             FinishedSubagent {
-                mut agent,
                 subagent: subagent_id,
                 model,
-                child_job_registry,
                 commit_ledger,
-                lifetime,
+                mut body,
             },
             commit_mark,
         ) = self.mark_commits(finished, resumed).await?;
@@ -1568,14 +1710,14 @@ where
                 .await;
         }
         let (run_id, cancel_rx) = self.runs.begin(&subagent_id, &prompt);
-        let outcome = await_subagent_run(agent.query(&prompt), cancel_rx).await;
+        let outcome = body.run(&prompt, cancel_rx).await;
         self.runs.finish(run_id);
         if let Some(hooks) = &self.hooks {
             hooks
                 .fire(&subagent_stop_input(&subagent_id, &outcome))
                 .await;
         }
-        if let Some(job_registry) = &child_job_registry {
+        if let Some(job_registry) = body.job_registry() {
             let killed = job_registry.kill_running().await;
             if killed > 0 {
                 tracing::info!(
@@ -1595,6 +1737,7 @@ where
                 if let Some(id) = resumed {
                     self.finished.release(id);
                 }
+                body.end(true).await;
                 tracing::info!(subagent = %subagent_id, "Subagent cancelled");
                 return Ok(ToolResult::text(
                     SubagentResultTemplate {
@@ -1611,27 +1754,28 @@ where
                 if let Some(id) = resumed {
                     self.finished.release(id);
                 }
-                let error_text =
-                    failure_text(&subagent_id, &error.to_string(), commits.as_ref(), &agent);
+                let history = body.recent_history();
+                let error_text = failure_text(&subagent_id, &error, commits.as_ref(), &history);
+                body.end(false).await;
                 return Err(anyhow::anyhow!(error_text));
             }
         };
 
         tracing::info!(subagent = %subagent_id, "Subagent completed");
 
-        let alert = idle_alert(&subagent_id, agent.cache_keep_alive_state());
+        let alert = body.idle_alert(&subagent_id);
+        let cache_bound = matches!(body, SubagentBody::Agent { .. });
 
         // A finished subagent stays continuable on every provider until
-        // its prompt-cache lifetime passes.
+        // its prompt-cache lifetime passes; an external session, until the
+        // tool is dropped.
         let id = self.finished.store(
             resumed,
             FinishedSubagent {
-                agent,
                 subagent: subagent_id.clone(),
                 model: model.clone(),
-                child_job_registry,
                 commit_ledger,
-                lifetime,
+                body,
             },
         );
 
@@ -1642,6 +1786,7 @@ where
                     model: model.as_deref(),
                     result: &result,
                     id,
+                    cache_bound,
                     alert: alert.as_deref(),
                 },
                 commits: commits.as_ref(),
@@ -1653,35 +1798,104 @@ where
 }
 
 /// The error text for a failed run, with the tail of its history.
-fn failure_text<LLM: LanguageModel + 'static>(
+fn failure_text(
     subagent: &str,
     error: &str,
     commits: Option<&CommitListing>,
-    agent: &crate::Agent<LLM, LLM, LLM, SubagentHooks>,
+    history: &[HistoryEntry],
 ) -> String {
-    let history = agent.history();
-    let skipped = history.len().saturating_sub(12);
-    let recent = history
-        .iter()
-        .skip(skipped)
-        .map(|message| HistoryEntry {
-            role: message.role(),
-            content: message.content().to_string(),
-            tool_names: message
-                .tool_calls()
-                .iter()
-                .map(|call| call.name.clone())
-                .collect(),
-        })
-        .collect::<Vec<_>>();
     SubagentErrorTemplate {
         subagent,
         error,
         commits,
-        history: &recent,
+        history,
     }
     .render()
     .expect("subagent error template must render")
+}
+
+impl<LLM: LanguageModel + 'static> SubagentBody<LLM> {
+    /// Runs one turn on `prompt` until it ends or `cancel_rx` fires.
+    async fn run(
+        &mut self,
+        prompt: &str,
+        cancel_rx: async_channel::Receiver<()>,
+    ) -> SubagentOutcome<String> {
+        match self {
+            Self::Agent { agent, .. } => {
+                await_subagent_run(
+                    async { agent.query(prompt).await.map_err(|error| error.to_string()) },
+                    cancel_rx,
+                )
+                .await
+            }
+            Self::External { session, .. } => {
+                await_subagent_run(
+                    async {
+                        session
+                            .prompt(prompt)
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                    cancel_rx,
+                )
+                .await
+            }
+        }
+    }
+
+    /// The registry of the terminal jobs an aither agent can leave running.
+    fn job_registry(&self) -> Option<aither_sandbox::JobRegistry> {
+        match self {
+            Self::Agent {
+                child_job_registry, ..
+            } => child_job_registry.clone(),
+            Self::External { .. } => None,
+        }
+    }
+
+    /// Ends a subagent that cannot be continued: an external session is
+    /// told to stop its turn first when `cancelled`, then closed.
+    async fn end(self, cancelled: bool) {
+        if let Self::External { mut session, .. } = self {
+            if cancelled {
+                session.cancel().await;
+            }
+            session.close().await;
+        }
+    }
+
+    /// The alert for an aither agent that kept needing prompt-cache
+    /// keep-alives; an external session has no prompt cache of ours.
+    fn idle_alert(&self, subagent: &str) -> Option<String> {
+        let Self::Agent { agent, .. } = self else {
+            return None;
+        };
+        idle_alert(subagent, agent.cache_keep_alive_state())
+    }
+
+    /// The tail of the conversation, for a failed run's error text; an
+    /// external session keeps its history to itself.
+    fn recent_history(&self) -> Vec<HistoryEntry> {
+        let Self::Agent { agent, .. } = self else {
+            return Vec::new();
+        };
+        let history = agent.history();
+        let skipped = history.len().saturating_sub(12);
+        history
+            .iter()
+            .skip(skipped)
+            .map(|message| HistoryEntry {
+                role: message.role(),
+                content: message.content().to_string(),
+                tool_names: message
+                    .tool_calls()
+                    .iter()
+                    .map(|call| call.name.clone())
+                    .collect(),
+            })
+            .collect()
+    }
 }
 
 /// The alert telling the parent a run kept needing prompt-cache keep-alives,
@@ -1786,6 +2000,7 @@ mod tests {
                 model: Some("test-model"),
                 result: "done",
                 id: 7,
+                cache_bound: true,
                 alert: None,
             },
             commits: None,
@@ -1803,6 +2018,7 @@ mod tests {
                 model: None,
                 result: "done",
                 id: 7,
+                cache_bound: true,
                 alert: Some("It idled too often."),
             },
             commits: None,
@@ -1840,6 +2056,7 @@ mod tests {
                 model: None,
                 result: "done",
                 id: 3,
+                cache_bound: true,
                 alert: Some("It idled too often."),
             },
             commits: Some(&listed),
@@ -3190,7 +3407,10 @@ You are a file-defined agent.
         let Some(FinishedSlot::Idle(finished)) = inner.slots.get_mut(&id) else {
             panic!("subagent {id} is not idle");
         };
-        finished.agent.last_request_started_at = Instant::now().checked_sub(age);
+        let SubagentBody::Agent { agent, .. } = &mut finished.body else {
+            panic!("subagent {id} is not an aither agent");
+        };
+        agent.last_request_started_at = Instant::now().checked_sub(age);
         drop(inner);
     }
 
@@ -4122,5 +4342,261 @@ You are a file-defined agent.
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(hooks_dir);
+    }
+
+    type EventLog = Arc<Mutex<Vec<String>>>;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("backend refused: {0}")]
+    struct BackendError(String);
+
+    /// Opens sessions that log what they are asked to do. A prompt `hang`
+    /// never ends and a prompt `fail` errors; any other is answered with the
+    /// session's turn count.
+    struct TestBackend {
+        log: EventLog,
+        opened: Arc<AtomicU64>,
+    }
+
+    struct TestSession {
+        number: u64,
+        turns: u64,
+        log: EventLog,
+    }
+
+    impl TestSession {
+        fn record(&self, event: String) {
+            self.log.lock().expect("log lock").push(event);
+        }
+    }
+
+    impl ExternalSubagent for TestBackend {
+        type Session = TestSession;
+        type Error = BackendError;
+
+        fn open(
+            &self,
+            start: ExternalStart<'_>,
+        ) -> impl Future<Output = Result<TestSession, BackendError>> + Send {
+            let number = self.opened.fetch_add(1, Ordering::Relaxed);
+            self.log
+                .lock()
+                .expect("log lock")
+                .push(format!("open {number} in {}", start.working_dir.display()));
+            std::future::ready(Ok(TestSession {
+                number,
+                turns: 0,
+                log: self.log.clone(),
+            }))
+        }
+    }
+
+    impl crate::specialized::ExternalSession for TestSession {
+        type Error = BackendError;
+
+        async fn prompt(&mut self, prompt: &str) -> Result<String, BackendError> {
+            self.turns += 1;
+            self.record(format!("prompt {} {prompt}", self.number));
+            match prompt {
+                "hang" => std::future::pending().await,
+                "fail" => Err(BackendError("fail".to_string())),
+                _ => Ok(format!(
+                    "turn {} of session {}: {prompt}",
+                    self.turns, self.number
+                )),
+            }
+        }
+
+        async fn cancel(&mut self) {
+            self.record(format!("cancel {}", self.number));
+        }
+
+        async fn close(self) {
+            self.record(format!("close {}", self.number));
+        }
+
+        fn model(&self) -> Option<String> {
+            Some("external-model".to_string())
+        }
+    }
+
+    fn external_tool(dir: &Path) -> (SubagentTool<PendingLlm>, SubagentRuns, EventLog) {
+        let log = EventLog::default();
+        let runs = SubagentRuns::default();
+        let tool = SubagentTool::new(PendingLlm)
+            .with_base_dir(dir)
+            .with_runs(runs.clone())
+            .with_type(
+                "outside",
+                SubagentType::external(
+                    "runs outside aither",
+                    TestBackend {
+                        log: log.clone(),
+                        opened: Arc::default(),
+                    },
+                ),
+            );
+        (tool, runs, log)
+    }
+
+    fn external_start(prompt_file: &Path, model: Option<ModelTier>) -> SubagentArgs {
+        SubagentArgs::Start {
+            worktrees: Vec::new(),
+            commit_worktrees: Vec::new(),
+            subagent: "outside".to_string(),
+            prompt_file: prompt_file.to_string_lossy().into_owned(),
+            model,
+        }
+    }
+
+    fn events(log: &EventLog) -> Vec<String> {
+        log.lock().expect("log lock").clone()
+    }
+
+    async fn call_text(
+        tool: &SubagentTool<PendingLlm>,
+        args: SubagentArgs,
+    ) -> aither_core::Result<String> {
+        match Tool::call(tool, args, ToolContext::new()).await? {
+            ToolResult::Text { text } => Ok(text),
+            other => panic!("expected a text result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn external_subagent_starts_and_resumes_the_same_session() {
+        let (dir, first) = write_prompt_file("external-resume", "first");
+        let second = dir.join("second.txt");
+        std::fs::write(&second, "second").expect("write prompt file");
+        let (tool, runs, log) = external_tool(&dir);
+
+        let text = call_text(&tool, external_start(&first, None))
+            .await
+            .expect("start succeeds");
+        assert!(text.contains("turn 1 of session 0: first"), "{text}");
+        assert!(text.contains("(model: external-model)"), "{text}");
+        assert!(!text.contains("keep-alives"), "{text}");
+        assert!(!text.contains("prompt cache"), "{text}");
+        assert!(runs.list().is_empty());
+
+        let id = continuation_id(&text);
+        let text = call_text(&tool, resume_args(&second, id))
+            .await
+            .expect("resume succeeds");
+        assert!(text.contains("turn 2 of session 0: second"), "{text}");
+        assert_eq!(continuation_id(&text), id);
+        assert_eq!(
+            events(&log),
+            [
+                format!("open 0 in {}", dir.display()),
+                "prompt 0 first".to_string(),
+                "prompt 0 second".to_string(),
+            ]
+        );
+        assert!(
+            tool.type_descriptions()
+                .contains(&("outside", "runs outside aither"))
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn external_subagent_refuses_an_explicit_model() {
+        let (dir, prompt_file) = write_prompt_file("external-model", "first");
+        let (tool, _runs, log) = external_tool(&dir);
+
+        let error = call_text(&tool, external_start(&prompt_file, Some(ModelTier::Fast)))
+            .await
+            .expect_err("a model tier is refused");
+        let message = error.to_string();
+        assert!(message.contains("outside"), "{message}");
+        assert!(message.contains("model"), "{message}");
+        assert!(events(&log).is_empty(), "no session was opened");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn external_subagent_run_can_be_cancelled() {
+        let (dir, prompt_file) = write_prompt_file("external-cancel", "hang");
+        let (tool, runs, log) = external_tool(&dir);
+
+        let call =
+            tokio::spawn(async move { call_text(&tool, external_start(&prompt_file, None)).await });
+        let run = loop {
+            match runs.list().as_slice() {
+                [run] => break run.clone(),
+                [] => tokio::task::yield_now().await,
+                other => panic!("expected one registered run, got {}", other.len()),
+            }
+        };
+        assert_eq!(run.subagent, "outside");
+        assert!(runs.cancel(run.id));
+
+        let text = call
+            .await
+            .expect("call task panicked")
+            .expect("a cancelled run is a result");
+        assert!(text.contains("was cancelled"), "{text}");
+        assert!(runs.list().is_empty());
+        assert_eq!(
+            events(&log),
+            [
+                format!("open 0 in {}", dir.display()),
+                "prompt 0 hang".to_string(),
+                "cancel 0".to_string(),
+                "close 0".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn external_subagent_prompt_error_closes_the_session() {
+        let (dir, prompt_file) = write_prompt_file("external-error", "fail");
+        let (tool, runs, log) = external_tool(&dir);
+
+        let error = call_text(&tool, external_start(&prompt_file, None))
+            .await
+            .expect_err("a failed turn is an error");
+        assert!(
+            error.to_string().contains("backend refused: fail"),
+            "{error}"
+        );
+        assert!(runs.list().is_empty());
+        assert_eq!(
+            events(&log),
+            [
+                format!("open 0 in {}", dir.display()),
+                "prompt 0 fail".to_string(),
+                "close 0".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn external_subagent_needs_a_working_directory() {
+        let (dir, prompt_file) = write_prompt_file("external-no-dir", "first");
+        let tool = SubagentTool::new(PendingLlm).with_type(
+            "outside",
+            SubagentType::external(
+                "runs outside aither",
+                TestBackend {
+                    log: EventLog::default(),
+                    opened: Arc::default(),
+                },
+            ),
+        );
+
+        let error = call_text(&tool, external_start(&prompt_file, None))
+            .await
+            .expect_err("no working directory is an error");
+        assert!(error.to_string().contains("working directory"), "{error}");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
