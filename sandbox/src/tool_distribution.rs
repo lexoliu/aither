@@ -644,7 +644,12 @@ pub mod tests {
                 .join(image.cache_key().unwrap())
         );
         for tool in ManagedTool::ALL {
-            assert!(staged.join("bin").join(tool.command()).is_file());
+            assert!(
+                staged
+                    .join("bin")
+                    .join(tool.executable_name(&target))
+                    .is_file()
+            );
         }
     }
 
