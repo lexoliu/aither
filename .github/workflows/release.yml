@@ -204,6 +204,7 @@ jobs:
           manifest="tool-distribution-${VERSION}.json"
           jq -e --slurpfile third_party patch/third-party-tools.json '
             ([.artifacts[].sha256] | all(test("^[0-9a-f]{64}$"))) and
+            ([.host_programs[] | .sha256, .executable_sha256] | all(test("^[0-9a-f]{64}$"))) and
             ([.artifacts[] | select(.tool == "apply_patch") | .target] | sort
               == ($third_party[0].artifacts | map(.target) | unique | sort))
           ' "${manifest}" > /dev/null
