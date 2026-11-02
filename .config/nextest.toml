@@ -1,0 +1,5 @@
+# A hung process-tree test fails within seconds instead of holding the job
+# until its timeout; these tests normally finish in under 4 s.
+[[profile.default.overrides]]
+filter = 'package(aither-sandbox) & test(/^process_tree::/)'
+slow-timeout = { period = "10s", terminate-after = 3 }
