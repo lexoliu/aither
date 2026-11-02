@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Lookup strips compact `-MMDD` checkpoint dates and collapses `vMAJOR-MINOR` / `vMAJOR.MINOR` onto the `vMAJOR` record
+
 ## [0.10.0](https://github.com/lexoliu/aither/compare/models-v0.9.2...models-v0.10.0) - 2026-10-18
 
 ### Other

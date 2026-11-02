@@ -26,7 +26,8 @@ pub use registry::ModelRegistry;
 pub use tier::ModelTier;
 pub use types::{ModelEntry, ModelMode, Pricing, Provider};
 
-/// Look up a model by `LiteLLM` ID or a dated/versioned alias.
+/// Look up a model by `LiteLLM` ID or a dated/versioned alias
+/// (`-YYYYMMDD`, `-MMDD`, `vMAJOR-MINOR`).
 ///
 /// Returns `None` when the ID is unknown to the registry — see
 /// [`ModelRegistry::lookup`] for the normalization rules.
