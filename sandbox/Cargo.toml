@@ -93,7 +93,6 @@ lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", 
 zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 url = { version = "2.5.8", features = ["serde"] }
-procfs-core = { version = "0.18.0", default-features = false }
 fd-lock = "4"
 typed-path = "0.12.3"
 

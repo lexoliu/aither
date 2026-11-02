@@ -5795,7 +5795,7 @@ mod tests {
         })
         .with_container_runtime(test_container_runtime("aither-host-tools"))
         .with_test_container_tools(
-            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle()),
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools()),
             "aither-host-tools".to_string(),
         );
         assert!(
@@ -5857,7 +5857,7 @@ mod tests {
         })
         .with_container_runtime(test_container_runtime("aither-tools-a"))
         .with_test_container_tools(
-            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle()),
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools()),
             "aither-tools-a".to_string(),
         );
 
@@ -6160,7 +6160,7 @@ mod tests {
 
     /// The tools bin directory a container execution passes to the wrapper.
     fn container_tools_dir() -> ContainerPath {
-        crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle())
+        crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools())
             .bin_dir()
             .clone()
     }
@@ -7097,7 +7097,7 @@ mod tests {
         let (job_registry, job_registry_service) = job_registry_channel();
         tokio::spawn(async move { job_registry_service.serve().await });
         let container_tools =
-            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle());
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
         let runtime = ContainerShellRuntime::new(
             "aither-test-foreground-stdin",
             crate::ContainerIpcRoute::new(
@@ -8280,7 +8280,7 @@ mod tests {
     #[cfg(all(unix, aither_container_acceptance))]
     impl TestDockerContainer {
         /// Starts a container with `heel_bin` mounted at `/usr/local/bin/heel`,
-        /// the prepared tool bundle mounted read-only where production mounts
+        /// the staged tool bundle mounted read-only where the image carries
         /// it, and `host.docker.internal` resolving to the docker host gateway,
         /// and prepares the `/workspace` directory container executions run
         /// in. Returns `None` when docker cannot start the container.
@@ -8390,14 +8390,15 @@ mod tests {
     /// a real docker daemon and a Linux `heel` binary, which the dedicated CI
     /// job provides and the feature matrices do not. A missing daemon or
     /// binary fails the test — it is never skipped silently.
-    /// Starts the acceptance container with the test bundle staged and
-    /// mounted read-only as production mounts it, so the wrapped script runs
-    /// a prepared command from that mount. The returned directory holds the
-    /// staged bundle and must outlive the container.
+    /// Starts the acceptance container with the test bundle staged as an
+    /// image build stages it and mounted read-only where the image carries
+    /// it, so the wrapped script runs a prepared command from that directory.
+    /// The returned directory holds the staged bundle and must outlive the
+    /// container.
     #[cfg(all(unix, aither_container_acceptance))]
     async fn start_acceptance_container() -> (
         TestDockerContainer,
-        crate::tool_runtime::ToolBundle,
+        crate::tool_runtime::ImageTools,
         tempfile::TempDir,
     ) {
         let docker_ready = std::process::Command::new("docker")
@@ -8410,15 +8411,25 @@ mod tests {
         );
         let heel_bin = container_test_heel_binary()
             .expect("container acceptance requires a Linux heel binary (set HEEL_BIN)");
+        let image = crate::tool_runtime::tests::image_tools();
         let bundle = crate::tool_runtime::tests::bundle();
         let tools_cache = tempfile::tempdir().expect("tool cache dir should be created");
-        let (tools_mount, _) = bundle
-            .prepare_container_mount(tools_cache.path())
-            .await
-            .expect("test bundle should stage for a container mount");
+        // Stage the executables under the image's cache key — exactly what
+        // `stage_image_tools` produces — and mount the directory where the
+        // image carries it.
+        let prepared = bundle
+            .prepare_local_sync(tools_cache.path(), &image.cache_key().unwrap())
+            .expect("test bundle should stage for the image");
+        let staged = prepared
+            .bin_dir()
+            .parent()
+            .expect("prepared binaries have a parent directory")
+            .to_path_buf();
+        let tools_mount =
+            crate::MountSpec::read_only(&staged, image.container_directory().unwrap());
         let container = TestDockerContainer::start(&heel_bin, &tools_mount)
             .expect("container acceptance could not start ubuntu:24.04");
-        (container, bundle, tools_cache)
+        (container, image, tools_cache)
     }
 
     /// The shell sessions of a terminal whose home is the acceptance
@@ -8426,7 +8437,7 @@ mod tests {
     #[cfg(all(unix, aither_container_acceptance))]
     async fn acceptance_shell_sessions(
         container: &TestDockerContainer,
-        bundle: &crate::tool_runtime::ToolBundle,
+        image: &crate::tool_runtime::ImageTools,
         workspace: &Path,
     ) -> ShellSessionRegistry {
         let client = Arc::new(
@@ -8452,7 +8463,7 @@ mod tests {
         // The container backend needs its own prepared tools: the registry
         // entry names the container and its `/opt/aither/tools` bin dir, which
         // the wrapped script puts on `PATH` and heel must grant execute on.
-        let container_tools = crate::tool_runtime::tests::container_tools(bundle);
+        let container_tools = crate::tool_runtime::tests::container_tools(image);
         ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,
@@ -10103,7 +10114,7 @@ mod tests {
             None => runtime,
         };
         let container_tools =
-            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::bundle());
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,

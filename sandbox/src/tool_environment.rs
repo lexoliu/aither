@@ -73,10 +73,10 @@ impl ShellSessionRegistry {
                     .ok_or(ToolRuntimeError::MissingContainerRuntime)?;
                 let transport = ContainerToolTransport::new(runtime.clone());
                 let info = probe_tool_environment(&transport).await?;
-                let bundle = distribution
-                    .load(&info.target, &cache_root.join("artifacts"))
+                let tools = distribution
+                    .image_tools(&info.target)?
+                    .verify(&transport)
                     .await?;
-                let tools = bundle.verify_container_mount(&transport).await?;
                 Ok::<_, ToolRuntimeError>(Some(PreparedHome::Container {
                     container_id: runtime.container_id().into(),
                     tools,
