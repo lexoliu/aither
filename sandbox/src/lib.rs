@@ -70,6 +70,7 @@ mod subagent;
 mod terminal;
 mod tool_distribution;
 mod tool_environment;
+mod tool_python;
 mod tool_runtime;
 mod tool_transport;
 
@@ -153,8 +154,8 @@ pub use tool_distribution::{
 };
 pub use tool_runtime::{
     DistributedTool, HostProgram, HostProgramPath, ImageTool, ImageToolDefect, ImageTools,
-    ManagedTool, PreparedEnvironment, PreparedTools, ToolBinary, ToolBundle, ToolCatalog,
-    ToolRuntimeError, ToolTarget,
+    ManagedTool, PreparedEnvironment, PreparedTools, PythonPin, PythonRuntime, ToolBinary,
+    ToolBundle, ToolCatalog, ToolRuntimeError, ToolTarget,
 };
 pub use tool_transport::{
     ContainerToolTransport, SshToolTransport, ToolEnvironmentInfo, ToolTransport,

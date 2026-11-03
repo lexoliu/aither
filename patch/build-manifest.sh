@@ -10,8 +10,8 @@
 # records emitted by patch/build-bash.sh; the release tag and repo
 # ("owner/name") fix the asset download base URL. The manifest —
 # patch/third-party-tools.json's pinned entries plus one apply_patch or bash
-# entry per metadata record, and its pinned host programs — is written to
-# stdout.
+# entry per metadata record, and its pinned host programs and interpreter
+# pins — is written to stdout.
 #
 # os/arch are derived from the target triple itself (arch is its first
 # component), not from a lookup table.
@@ -58,4 +58,5 @@ jq -n --slurpfile third_party "$root/patch/third-party-tools.json" \
       --argjson apply_patch "$apply_patch_entries" \
       --argjson bash "$bash_entries" \
       '{artifacts: ($third_party[0].artifacts + $apply_patch + $bash),
-        host_programs: $third_party[0].host_programs}'
+        host_programs: $third_party[0].host_programs,
+        python: $third_party[0].python}'

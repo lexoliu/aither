@@ -46,4 +46,28 @@ timeout 1 tail -f size.txt || status=$?
 [ "$status" = 124 ]
 [ "$(printf 'a\0b' | xargs -0 echo)" = 'a b' ]
 [ "$(fd -t f '^main\.rs$' src)" = src/main.rs ]
+# The managed uv and python3 lead PATH; the versions they report are the pins
+# the caller compares.
+uv --version
+python3 --version
+[ "$(command -v python3)" = "$(dirname "$(command -v uv)")/python3" ]
+# uv keeps its cache and the Pythons it installs in one directory shared by
+# every session, outside the session's HOME.
+[ -n "$UV_CACHE_DIR" ] && [ -n "$UV_PYTHON_INSTALL_DIR" ]
+case "$UV_CACHE_DIR:$UV_PYTHON_INSTALL_DIR" in *"$HOME"/*) false;; esac
+# A project's own Python wins over the managed one. This needs network access
+# the first time: uv downloads the pinned CPython into UV_PYTHON_INSTALL_DIR.
+mkdir pinned
+printf '3.12\n' >pinned/.python-version
+(cd pinned && uv run python --version) | rg -q '^Python 3\.12\.[0-9]+$'
+mkdir venv-project
+(
+    cd venv-project
+    uv venv --python 3.12 -q
+    printf '[project]\nname = "venv-project"\nversion = "0"\nrequires-python = ">=3.12"\n' >pyproject.toml
+    uv run python --version | rg -q '^Python 3\.12\.[0-9]+$'
+)
+# Without one, uv run uses the managed python3.
+mkdir unpinned
+(cd unpinned && uv run python --version) | rg -q "^$(python3 --version)\$"
 printf 'baseline acceptance passed\n'
