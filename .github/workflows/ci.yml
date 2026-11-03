@@ -12,10 +12,13 @@ on:
 # reads as broken when it is fine, and how much of the run got cancelled
 # decides how red it looks. Minutes are free on a public repository; a red tick
 # on a release branch is not. Within a single event a run still cancels the one
-# it supersedes, which is the case that actually wastes a runner.
+# it supersedes, which is the case that actually wastes a runner. A dev push
+# run is the only one that saves the Rust caches, so dev runs queue instead:
+# cancelling one mid-build leaves no cache for the runs after it. A newer
+# push still replaces a dev run that has not started.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/dev' }}
 
 env:
   CARGO_TERM_COLOR: always
