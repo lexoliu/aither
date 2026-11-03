@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [dev]
   pull_request:
 
 # Keyed per event, so a branch with a pull request open runs the suite twice --
