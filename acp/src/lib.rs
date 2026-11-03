@@ -97,6 +97,11 @@
 //!     }
 //! }
 //! impl std::error::Error for EchoError {}
+//! impl aither_core::llm::Classify for EchoError {
+//!     fn failure(&self) -> aither_core::llm::Failure {
+//!         aither_core::llm::Failure::permanent()
+//!     }
+//! }
 //!
 //! impl LanguageModel for EchoModel {
 //!     type Error = EchoError;

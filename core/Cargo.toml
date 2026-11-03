@@ -17,11 +17,13 @@ anyhow = { version = "1.0", default-features = false }
 askama = { version = "0.16", default-features = false, features = ["alloc", "derive"] }
 futures-core = { version = "0.3.34", default-features = false}
 futures-lite = { version = "2.6"}
+httpdate = { version = "1.0", optional = true }
 mime = "0.3"
 schemars = { version = "1.2", default-features = false, features = ["derive"] }
 serde = { version = "1.0", default-features = false}
 serde_json = { version = "1.0", default-features = false }
 url = { version = "2.5", default-features = false }
+zenwave = { workspace = true, optional = true, features = ["hyper-backend", "rustls"] }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread"] }
@@ -34,6 +36,8 @@ futures-lite = { version = "2.6"}
 default = ["derive", "serde"]
 serde = ["serde/derive","url/serde"]
 derive = ["aither-derive"]
+# HTTP failure classification for providers built on zenwave.
+zenwave = ["dep:zenwave", "dep:httpdate"]
 
 [lints]
 workspace = true

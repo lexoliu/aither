@@ -12,7 +12,7 @@ keywords = ["ai", "llm", "openai", "chatgpt"]
 categories = ["api-bindings"]
 
 [dependencies]
-aither-core.workspace = true
+aither-core = { workspace = true, features = ["zenwave"] }
 aither-models.workspace = true
 aither-attachments.workspace = true
 async-stream = "0.3"

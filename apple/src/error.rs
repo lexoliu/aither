@@ -158,3 +158,18 @@ pub enum AppleError {
         message: String,
     },
 }
+
+impl aither_core::llm::Classify for AppleError {
+    /// The on-device model has no network; it fails transiently only when it
+    /// is still preparing, rate-limited or busy with another request.
+    fn failure(&self) -> aither_core::llm::Failure {
+        use aither_core::llm::Failure;
+        match self {
+            Self::Unavailable(UnavailableReason::ModelNotReady) | Self::RateLimited(_) => {
+                Failure::transient()
+            }
+            Self::Native { code, .. } if code == "concurrent_requests" => Failure::transient(),
+            _ => Failure::permanent(),
+        }
+    }
+}
