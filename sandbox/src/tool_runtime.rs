@@ -34,7 +34,8 @@ pub enum ManagedTool {
 /// Excludes the `[` and `more` entries of `coreutils --list` (not utilities
 /// of GNU coreutils) and every name the managed set replaces with a modern
 /// tool (`grep`, `sed`, `awk`, `find`), none of which coreutils provides.
-/// Staging checks each name against the `coreutils --list` of the pinned
+/// `stdbuf` is left out too: the musl builds omit it (it needs a cdylib), and
+/// the set is the same on every platform. Staging checks each name against the `coreutils --list` of the pinned
 /// binary, so a name the binary does not provide is never shadowed.
 pub const COREUTILS_ALIASES: &[&str] = &[
     "arch",
@@ -116,7 +117,6 @@ pub const COREUTILS_ALIASES: &[&str] = &[
     "sort",
     "split",
     "stat",
-    "stdbuf",
     "stty",
     "sum",
     "sync",
@@ -1530,7 +1530,7 @@ pub mod tests {
                 "{alias}"
             );
         }
-        for excluded in ["grep", "sed", "awk", "find", "xargs", "fd", "["] {
+        for excluded in ["grep", "sed", "awk", "find", "xargs", "fd", "[", "stdbuf"] {
             assert!(!COREUTILS_ALIASES.contains(&excluded), "{excluded}");
             assert!(!alias_path(&prepared, excluded).is_symlink(), "{excluded}");
         }
