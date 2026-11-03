@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/May-Agent/aither/compare/agent-v0.11.0...agent-v0.12.0) - 2026-11-03
+
+### Added
+
+- *(sandbox)* monitor tool delivering a watched job's new output as it arrives ([#316](https://github.com/May-Agent/aither/pull/316))
+- *(agent)* validate BLOCKING marks through a host resolver
+- *(sandbox)* give a committing subagent its own repository ([#298](https://github.com/May-Agent/aither/pull/298))
+- *(agent)* let a run end with the model's turn while its background jobs run
+- *(sandbox)* [**breaking**] merge terminal_background into terminal with required timeout and promote-at-wait
+- apply external hook changes live
+- *(agent)* command hooks on every shell command
+- *(agent)* external hook runner and lifecycle hooks
+- *(agent)* set the cache lifetime on TerminalAgentBuilder and inject the idle clock
+- *(agent)* fork subagent that inherits the main agent's context and model
+- *(agent)* compact before sending on a cold cache with a compaction model
+- *(agent)* compact an idle session before its cache expires
+- *(agent,sandbox)* keep subagents inside the main agent's authority
+
+### Fixed
+
+- *(terminal)* report promoted and killed jobs correctly
+- *(agent)* honor BLOCKING marks in tasks.md supervision
+- *(sandbox)* a command's descendants live exactly as long as its job ([#296](https://github.com/May-Agent/aither/pull/296))
+- *(agent)* reviewers run through the shared hook runner
+- *(agent)* pair every tool call with a result after a cancelled run
+- *(agent,sandbox)* resolve canonical paths without the Windows verbatim prefix
+
+### Other
+
+- refresh README with agent, sandbox, MCP/ACP, and provider crates
+- Drop the tool_hints block; give tools model-facing descriptions ([#303](https://github.com/May-Agent/aither/pull/303))
+- Merge pull request #290 from lexoliu/feat/279-live-hooks
+- build the fork fixture's reviewer hooks without the unix-only helpers
+- Merge remote-tracking branch 'origin/dev' into feat/277-hooks
+- *(agent)* run the sh-script hook tests on unix only
+- Merge pull request #260 from lexoliu/feat/238-fork-subagent
+- *(agent)* run the fork terminal-controls test on unix only
+- *(agent)* satisfy clippy in the fork task-id diagnostic
+- *(agent)* show the fork's messages when no task id is reported
+- *(agent)* run the fork's background job with sleep so it starts on every platform
+- Merge pull request #251 from lexoliu/feat/227-subagent-authority
+- Merge origin/dev into feat/227-subagent-authority
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/agent-v0.10.1...agent-v0.11.0) - 2026-10-29
 
 ### Added

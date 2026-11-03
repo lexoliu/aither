@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/May-Agent/aither/compare/browser-v0.11.0...browser-v0.12.0) - 2026-11-03
+
+### Other
+
+- refresh README with agent, sandbox, MCP/ACP, and provider crates
+- Drop the tool_hints block; give tools model-facing descriptions ([#303](https://github.com/May-Agent/aither/pull/303))
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/browser-v0.10.1...browser-v0.11.0) - 2026-10-29
 
 ### Fixed
