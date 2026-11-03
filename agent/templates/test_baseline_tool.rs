@@ -22,6 +22,19 @@ fn main() {
     let mut args = std::env::args_os();
     let program = args.next().unwrap();
     let name = Path::new(&program).file_name().unwrap().to_str().unwrap();
+    // The managed shell reports its banner; any other invocation is the
+    // host's bash, so scripts launched through it still run.
+    #[cfg(unix)]
+    if name == "bash" {
+        use std::os::unix::process::CommandExt;
+        let args = args.collect::<Vec<_>>();
+        if args.first().is_some_and(|argument| argument == "--version") {
+            println!("GNU bash, version 1.0.0(1)-release (fixture)");
+            return;
+        }
+        let error = std::process::Command::new("/bin/bash").args(args).exec();
+        panic!("cannot run the host's bash: {error}");
+    }
     // The installed interpreter is a copy of this program.
     if name.starts_with("python") {
         println!("Python {}", env!("BASELINE_PYTHON_VERSION"));

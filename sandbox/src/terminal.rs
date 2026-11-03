@@ -232,16 +232,22 @@ fn is_shell_builtin(program: &str) -> bool {
     )
 }
 
-fn shell_launch(script: &str) -> (String, Vec<String>) {
+/// The program and arguments that run `script` in a shell. Windows runs
+/// `cmd.exe`; every other platform runs `managed_shell`, the managed bash.
+fn shell_launch(managed_shell: &str, script: &str) -> (String, Vec<String>) {
     #[cfg(windows)]
     {
+        let _ = managed_shell;
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
         return (shell, vec!["/C".to_string(), script.to_string()]);
     }
 
     #[cfg(not(windows))]
     {
-        ("sh".to_string(), vec!["-c".to_string(), script.to_string()])
+        (
+            managed_shell.to_string(),
+            crate::tool_runtime::shell_arguments(script),
+        )
     }
 }
 
@@ -249,6 +255,7 @@ fn shell_launch(script: &str) -> (String, Vec<String>) {
 /// file records the shell's final directory there when it exits; a direct
 /// command cannot change directory, so it reports nothing.
 fn build_terminal_launch(
+    managed_shell: &str,
     script: &str,
     report: Option<&Path>,
 ) -> Result<TerminalLaunch, TerminalError> {
@@ -261,7 +268,7 @@ fn build_terminal_launch(
 
     match direct_command(script)? {
         Some((program, args)) => Ok(TerminalLaunch::Direct { program, args }),
-        None => shell_launch_reporting(script, report),
+        None => shell_launch_reporting(managed_shell, script, report),
     }
 }
 
@@ -292,15 +299,16 @@ struct CarryCwdTemplate<'a> {
 }
 
 fn shell_launch_reporting(
+    managed_shell: &str,
     script: &str,
     report: Option<&Path>,
 ) -> Result<TerminalLaunch, TerminalError> {
     let Some(report) = report else {
-        let (program, args) = shell_launch(script);
+        let (program, args) = shell_launch(managed_shell, script);
         return Ok(TerminalLaunch::Shell { program, args });
     };
     let script = carry_cwd_script(script, &report.to_string_lossy())?;
-    let (program, args) = shell_launch(&script);
+    let (program, args) = shell_launch(managed_shell, &script);
     Ok(TerminalLaunch::Shell { program, args })
 }
 
@@ -4015,6 +4023,7 @@ where
         .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
 
     let launch = build_terminal_launch(
+        &context.prepared_tools.shell()?,
         context.script,
         context.carry.map(|carry| carry.report.as_path()),
     )?;
@@ -4122,6 +4131,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
 
     let launch = build_terminal_launch(
+        &context.prepared_tools.shell()?,
         context.script,
         context.carry.map(|carry| carry.report.as_path()),
     )?;
@@ -4643,10 +4653,11 @@ fn container_exec_script(
         format!("{preamble}{script}")
     };
     let script = prepared_tools.wrap_script(&script)?;
-    match carry {
-        Some(carry) => carry_cwd_script(&script, carry.report.as_str()),
-        None => Ok(script),
-    }
+    let script = match carry {
+        Some(carry) => carry_cwd_script(&script, carry.report.as_str())?,
+        None => script,
+    };
+    Ok(prepared_tools.shell_command(&script)?)
 }
 
 async fn execute_container_background<E: Executor + Clone + 'static>(
@@ -4823,7 +4834,7 @@ async fn execute_ssh_background(
     let remote_cmd = match (context.ssh_runtime, context.mode) {
         (SshRuntimeProfile::Heel { binary }, TerminalMode::Sandboxed) => {
             let script = context.prepared_tools.wrap_script(context.script)?;
-            let (program, args) = shell_launch(&script);
+            let (program, args) = shell_launch(&context.prepared_tools.shell()?, &script);
             let directory = context.prepared_tools.script_bin_dir()?;
             let uv_grant = context
                 .prepared_tools
@@ -5883,7 +5894,11 @@ mod tests {
         // As `uv`, `python install <request>` installs a copy of the script as
         // the interpreter, which reports the Python version below.
         let script = format!(
-            "#!/bin/sh\ncase \"${{0##*/}}\" in python*) printf '%s\\n' 'Python 3.13.1'; exit 0;; esac\n\
+            "#!/bin/sh\n\
+             case \"${{0##*/}}\" in bash)\n\
+               case \"$1\" in --version) printf '%s\\n' 'GNU bash, version 1.0.0(1)-release (fixture)'; exit 0;; esac\n\
+               AITHER_FIXTURE_BASH=1.0.0; export AITHER_FIXTURE_BASH; exec /bin/bash \"$@\";; esac\n\
+             case \"${{0##*/}}\" in python*) printf '%s\\n' 'Python 3.13.1'; exit 0;; esac\n\
              case \"${{0##*/}}\" in {}) ;; *) PATH=/usr/bin:/bin exec \"${{0##*/}}\" \"$@\";; esac\n\
              case \"$1\" in --list) printf '%s\\n' {}; exit 0;; esac\n\
              case \"$1\" in python) PATH=/usr/bin:/bin; for request; do :; done; \
@@ -5920,6 +5935,53 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    /// A script runs through the managed bash, not the host's `sh`: the
+    /// fixture bash marks its environment with the pinned version, and the
+    /// script's shell is a real bash.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_script_runs_in_the_managed_bash() {
+        let authorizer = Arc::new(CountingSshAuthorizer::default());
+        let tools_cache = tempfile::tempdir().unwrap();
+        let tools = crate::tool_runtime::tests::bundle()
+            .prepare_local(tools_cache.path())
+            .await
+            .unwrap();
+        let prepared = local_and_ssh_registry(&authorizer)
+            .with_test_tools(tools.clone())
+            .with_test_ssh(build_server(), tools);
+        let directory = tempfile::tempdir().unwrap();
+        let terminal = fresh_terminal(directory.path())
+            .await
+            .adopt_prepared_tools(prepared)
+            .await
+            .expect("a prepared registry should be adopted");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+        let terminal = terminal.with_registry(registry);
+        let result = terminal
+            .call(
+                TerminalArgs {
+                    description: "report the shell".to_string(),
+                    script: "[[ -n $BASH_VERSION ]] && echo \"managed=$AITHER_FIXTURE_BASH bash\""
+                        .to_string(),
+                    mode: TerminalExecutionMode::Sandboxed,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    max_lines: 50,
+                    raw: true,
+                    timeout: 30,
+                    background: false,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("the script should run");
+        let stdout = render_terminal_result(&result);
+        assert!(!stdout.contains("Exit code:"), "{stdout}");
+        assert!(stdout.contains("managed=1.0.0 bash"), "{stdout}");
     }
 
     #[cfg(unix)]
@@ -6147,12 +6209,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn shell_launch_uses_a_stable_posix_contract() {
+    fn shell_launch_runs_the_managed_bash_without_startup_files() {
         let script = "printf '%s\\n' hello | sed -n '1p'";
-        let (program, args) = shell_launch(script);
+        let (program, args) = shell_launch("/tools/bin/bash", script);
 
-        assert_eq!(program, "sh");
-        assert_eq!(args, ["-c", script]);
+        assert_eq!(program, "/tools/bin/bash");
+        assert_eq!(args, ["--noprofile", "--norc", "-c", script]);
     }
 
     #[test]

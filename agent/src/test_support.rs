@@ -157,8 +157,8 @@ pub async fn fixture_distribution(
 /// The distribution of the real baseline tools: the repository's
 /// hash-pinned release artifacts and interpreter pins
 /// (`patch/third-party-tools.json`, downloaded and verified on first use like
-/// any distribution), with `binary` standing in for `apply_patch`, which is
-/// only published with a release.
+/// any distribution), with `binary` standing in for `apply_patch` and `bash`,
+/// which are only published with a release.
 pub async fn real_distribution(binary: &std::path::Path) -> aither_sandbox::ToolDistribution {
     let pinned =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../patch/third-party-tools.json");
@@ -166,10 +166,17 @@ pub async fn real_distribution(binary: &std::path::Path) -> aither_sandbox::Tool
         serde_json::from_slice(&async_fs::read(pinned).await.unwrap()).unwrap();
     let mut artifacts = pinned["artifacts"].as_array().unwrap().clone();
     artifacts.extend(
-        fixture_artifacts(binary, "1.0.0", &[aither_sandbox::ManagedTool::ApplyPatch])
-            .await
-            .iter()
-            .map(|artifact| serde_json::to_value(artifact).unwrap()),
+        fixture_artifacts(
+            binary,
+            "1.0.0",
+            &[
+                aither_sandbox::ManagedTool::ApplyPatch,
+                aither_sandbox::ManagedTool::Bash,
+            ],
+        )
+        .await
+        .iter()
+        .map(|artifact| serde_json::to_value(artifact).unwrap()),
     );
     distribution_of(&artifacts, pinned["python"].as_array().unwrap())
 }

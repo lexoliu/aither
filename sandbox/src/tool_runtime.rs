@@ -22,6 +22,8 @@ pub enum ManagedTool {
     AstGrep,
     /// JSON selection and transformation.
     Jq,
+    /// GNU bash, the shell every terminal script runs in on Unix.
+    Bash,
     /// The uutils coreutils multicall binary, reached through [`COREUTILS_ALIASES`].
     Coreutils,
     /// `xargs` from uutils findutils.
@@ -152,11 +154,12 @@ pub const COREUTILS_ALIASES: &[&str] = &[
 impl ManagedTool {
     /// Every managed tool, in stable prompt order. The tools a platform must
     /// provide are [`ToolTarget::required_tools`].
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::ApplyPatch,
         Self::Ripgrep,
         Self::AstGrep,
         Self::Jq,
+        Self::Bash,
         Self::Coreutils,
         Self::Xargs,
         Self::Fd,
@@ -174,6 +177,7 @@ impl ManagedTool {
             Self::Ripgrep => "rg",
             Self::AstGrep => "ast-grep",
             Self::Jq => "jq",
+            Self::Bash => "bash",
             Self::Coreutils => "coreutils",
             Self::Xargs => "xargs",
             Self::Fd => "fd",
@@ -198,7 +202,8 @@ impl ManagedTool {
     /// The version this tool's `--version` output reports.
     ///
     /// The banners differ: `jq-1.8.2`, `coreutils 0.12.0 (multi-call binary)`,
-    /// `fd 10.5.0`, `xargs 0.11.0`, `uv 0.13.7 (316c827e0 2026-11-03 aarch64-apple-darwin)`;
+    /// `fd 10.5.0`, `xargs 0.11.0`, `uv 0.13.7 (316c827e0 2026-11-03 aarch64-apple-darwin)`,
+    /// `GNU bash, version 5.3.20(1)-release (...)`;
     /// the others report `<name> <version>`.
     fn reported_version(self, output: &str) -> Option<semver::Version> {
         let line = output.lines().next()?;
@@ -206,6 +211,7 @@ impl ManagedTool {
         let version = match self {
             // The baseline test fixtures report `jq <version>`.
             Self::Jq => line.strip_prefix("jq-").or_else(second_word)?,
+            Self::Bash => line.strip_prefix("GNU bash, version ")?.split_once('(')?.0,
             Self::Coreutils
             | Self::Xargs
             | Self::Fd
@@ -337,7 +343,7 @@ impl ToolTarget {
     }
 
     /// The tools every environment of this platform must provide: Windows
-    /// has no `coreutils`, `xargs`, `fd` or `uv` artifacts, every other
+    /// has no `bash`, `coreutils`, `xargs`, `fd` or `uv` artifacts, every other
     /// platform the complete set.
     #[must_use]
     pub fn required_tools(&self) -> &'static [ManagedTool] {
@@ -1214,12 +1220,44 @@ impl PreparedTools<PathBuf> {
             .transpose()?;
         render_tool_path(self.script_bin_dir()?, uv, script)
     }
+
+    /// The managed bash executable terminal scripts run in.
+    pub(crate) fn shell(&self) -> Result<String, ToolRuntimeError> {
+        self.bin_dir
+            .join(ManagedTool::Bash.command())
+            .into_os_string()
+            .into_string()
+            .map_err(|path| ToolRuntimeError::InvalidCache(path.into()))
+    }
 }
 
 impl PreparedTools<ContainerPath> {
     pub(crate) fn wrap_script(&self, script: &str) -> Result<String, ToolRuntimeError> {
         render_tool_path(self.bin_dir.as_str(), None, script)
     }
+
+    /// A command line running `script` in the managed bash of the container.
+    pub(crate) fn shell_command(&self, script: &str) -> Result<String, ToolRuntimeError> {
+        #[derive(Template)]
+        #[template(path = "managed_shell.sh", escape = "none")]
+        struct ManagedShellTemplate<'a> {
+            shell: std::borrow::Cow<'a, str>,
+            arguments: String,
+        }
+        Ok(ManagedShellTemplate {
+            shell: shell_words::quote(self.bin_dir.join(ManagedTool::Bash.command()).as_str()),
+            arguments: shell_words::join(shell_arguments(script)),
+        }
+        .render()?)
+    }
+}
+
+/// The arguments with which the managed bash runs `script`: no startup file
+/// is read, so a script behaves the same on every host.
+pub fn shell_arguments(script: &str) -> Vec<String> {
+    ["--noprofile", "--norc", "-c", script]
+        .map(Into::into)
+        .into()
 }
 
 /// Prepends `bin_dir` to a POSIX shell script's `PATH`.
@@ -1669,7 +1707,18 @@ pub mod tests {
     ///
     /// Invoked through one of its aliases it runs the host's command of that
     /// name, as the real multicall binary would.
+    ///
+    /// The `bash` fixture reports its banner to `--version` and otherwise
+    /// runs the host's bash, with `AITHER_FIXTURE_BASH` set to the pinned
+    /// version so a script can tell it ran through the managed shell.
     pub fn script_tool(tool: ManagedTool, version: &str) -> Vec<u8> {
+        if tool == ManagedTool::Bash {
+            return format!(
+                "#!/bin/sh\ncase \"$1\" in --version) printf '%s\\n' 'GNU bash, version {version}(1)-release (fixture)'; exit 0;; esac\n\
+                 AITHER_FIXTURE_BASH={version}\nexport AITHER_FIXTURE_BASH\nexec /bin/bash \"$@\"\n"
+            )
+            .into_bytes();
+        }
         if tool == ManagedTool::Uv {
             return fixture_uv(version, "");
         }
@@ -1829,6 +1878,7 @@ printf '%s\n' 'uv @VERSION@'
             ]
         );
         assert!(!windows.contains(&ManagedTool::Coreutils));
+        assert!(!windows.contains(&ManagedTool::Bash));
     }
 
     fn script_binaries(tools: &[ManagedTool]) -> Vec<ToolBinary> {
@@ -1852,7 +1902,7 @@ printf '%s\n' 'uv @VERSION@'
         .unwrap();
         assert!(matches!(
             ToolBundle::new(windows.clone(), script_binaries(&ManagedTool::ALL), None),
-            Err(ToolRuntimeError::UnexpectedTool(ManagedTool::Coreutils))
+            Err(ToolRuntimeError::UnexpectedTool(ManagedTool::Bash))
         ));
         // Windows has no managed `uv`, so no interpreter pin either.
         assert!(matches!(
@@ -1906,6 +1956,11 @@ printf '%s\n' 'uv @VERSION@'
                 "0.12.0",
             ),
             (ManagedTool::Xargs, "xargs 0.11.0\n", "0.11.0"),
+            (
+                ManagedTool::Bash,
+                "GNU bash, version 5.3.20(1)-release (aarch64-apple-darwin25.0.0)\nCopyright (C) 2025 Free Software Foundation, Inc.\n",
+                "5.3.20",
+            ),
             (ManagedTool::Fd, "fd 10.5.0\n", "10.5.0"),
             (
                 ManagedTool::Ripgrep,
@@ -1930,6 +1985,11 @@ printf '%s\n' 'uv @VERSION@'
         assert_eq!(ManagedTool::Fd.reported_version("fd-10.5.0\n"), None);
         assert_eq!(ManagedTool::Coreutils.reported_version("coreutils\n"), None);
         assert_eq!(ManagedTool::Xargs.reported_version(""), None);
+        assert_eq!(ManagedTool::Bash.reported_version("bash 5.3.20\n"), None);
+        assert_eq!(
+            ManagedTool::Bash.reported_version("GNU bash, version 5.3.20\n"),
+            None
+        );
         assert_eq!(ManagedTool::Uv.reported_version("uv\n"), None);
         assert_eq!(ManagedTool::Uv.reported_version("uv-0.13.7\n"), None);
     }
@@ -2613,6 +2673,7 @@ printf '%s\n' 'uv @VERSION@'
         let catalog = image.catalog();
         let banner = |tool: ManagedTool| match tool {
             ManagedTool::Jq => "jq-1.0.0".to_owned(),
+            ManagedTool::Bash => "GNU bash, version 1.0.0(1)-release (fixture)".to_owned(),
             tool => format!("{} 1.0.0", tool.command()),
         };
         let reports = |python: &str| {

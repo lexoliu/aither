@@ -241,6 +241,11 @@ jobs:
           pattern: apply-patch-*-immediate
           path: artifacts
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bash-*
+          path: artifacts
+          merge-multiple: true
       - name: Build the tool-distribution manifest
         run: >-
           patch/build-manifest.sh artifacts "${TAG}" "${GITHUB_REPOSITORY}"
@@ -256,9 +261,11 @@ jobs:
             ([.artifacts[].sha256] | all(test("^[0-9a-f]{64}$"))) and
             ([.host_programs[] | .sha256, .executable_sha256] | all(test("^[0-9a-f]{64}$"))) and
             ([.artifacts[] | select(.tool == "apply_patch") | .target] | sort
-              == ($third_party[0].artifacts | map(.target) | unique | sort))
+              == ($third_party[0].artifacts | map(.target) | unique | sort)) and
+            ([.artifacts[] | select(.tool == "bash") | .target] | sort
+              == ($third_party[0].artifacts | map(.target | select(.os != "windows")) | unique | sort))
           ' "${manifest}" > /dev/null
-          for meta in artifacts/apply_patch-*.json; do
+          for meta in artifacts/apply_patch-*.json artifacts/bash-*.json; do
             file="$(jq -r .file "${meta}")"
             [ -f "artifacts/${file}" ] && [ -f "artifacts/${file}.sha256" ] \
               || { echo "missing staged asset for ${file}" >&2; exit 1; }

@@ -26,6 +26,55 @@ permissions:
   contents: read
 
 jobs:
+  # GNU bash for the platforms that run terminal scripts through it; Windows
+  # has none. Each target builds on a runner of its own architecture.
+  bash:
+    name: bash / ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Build bash
+        timeout-minutes: 20
+        run: patch/build-bash.sh "${{ matrix.target }}" "${{ runner.temp }}/bash-artifacts"
+      - name: Verify archive checksum
+        working-directory: ${{ runner.temp }}/bash-artifacts
+        run: |
+          if [[ "${RUNNER_OS}" == Linux ]]; then
+            sha256sum -c ./*.sha256
+          else
+            shasum -a 256 -c ./*.sha256
+          fi
+      - name: Verify the packaged executable runs
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bash-check"
+          tar -xzf "${RUNNER_TEMP}"/bash-artifacts/bash-*.tar.gz -C "${RUNNER_TEMP}/bash-check"
+          "${RUNNER_TEMP}/bash-check/bash" --noprofile --norc -c '[[ "$BASH_VERSION" == 5.3.* ]] && echo "$BASH_VERSION"'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bash-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/bash-artifacts/*.tar.gz
+            ${{ runner.temp }}/bash-artifacts/*.sha256
+            ${{ runner.temp }}/bash-artifacts/*.json
+
   artifact:
     name: ${{ matrix.target }} / ${{ matrix.abort }}
     runs-on: ${{ matrix.runner }}
