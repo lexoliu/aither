@@ -1,0 +1,25 @@
+[package]
+name = "aither-sed"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "aither-sed: the read-only sed that prints line ranges in sandboxed agent scripts"
+readme = "../README.md"
+keywords = ["sed", "sandbox", "agent", "tooling"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+thiserror = "2"
+
+[[bin]]
+name = "aither-sed"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
