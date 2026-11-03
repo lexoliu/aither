@@ -9,6 +9,10 @@
 # `patch/build-artifact.sh` and uploads the `.tar.gz` + `.sha256` output
 # plus a tool-distribution-<version>.json manifest as assets on that
 # release (#113).
+#
+# The same script builds every aither-built tool listed in
+# patch/built-tools.json (each with its own targets), one tarball per tool;
+# this file describes the `apply_patch` entry.
 
 [artifact]
 # Executable filename as installed into the managed tools directory.
@@ -39,9 +43,9 @@ toolchain = "nightly-2026-10-01"
 rustup_components = ["rust-src"]
 rustup_targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 # Cargo profile (workspace Cargo.toml): opt-level=z, lto, codegen-units=1,
-# strip symbols, panic=abort. APPLY_PATCH_ABORT=immediate additionally sets
+# strip symbols, panic=abort. ARTIFACT_ABORT=immediate additionally sets
 # -Cpanic=immediate-abort (default); =panic keeps standard abort messages.
-profile = "apply-patch"
+profile = "artifact"
 panic = "abort (immediate-abort default; panic diagnostics still get a location but no message text)"
 # Output layout under <out-dir>:
 #   apply_patch-<version>-<target>.tar.gz        (contains `apply_patch`)

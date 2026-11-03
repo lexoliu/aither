@@ -157,8 +157,8 @@ pub async fn fixture_distribution(
 /// The distribution of the real baseline tools: the repository's
 /// hash-pinned release artifacts and interpreter pins
 /// (`patch/third-party-tools.json`, downloaded and verified on first use like
-/// any distribution), with `binary` standing in for `apply_patch` and `bash`,
-/// which are only published with a release.
+/// any distribution), with `binary` standing in for `apply_patch`, `aither-sed`
+/// and `bash`, which are only published with a release.
 pub async fn real_distribution(binary: &std::path::Path) -> aither_sandbox::ToolDistribution {
     let pinned =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../patch/third-party-tools.json");
@@ -171,6 +171,7 @@ pub async fn real_distribution(binary: &std::path::Path) -> aither_sandbox::Tool
             "1.0.0",
             &[
                 aither_sandbox::ManagedTool::ApplyPatch,
+                aither_sandbox::ManagedTool::Sed,
                 aither_sandbox::ManagedTool::Bash,
             ],
         )

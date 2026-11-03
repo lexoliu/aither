@@ -1,0 +1,1 @@
+`sed` in scripts only prints line ranges (`sed -n 'N,Mp' file`). Use `apply_patch` to edit files or `python3` to transform text.

@@ -759,7 +759,7 @@ pub mod tests {
         ToolArtifactLocation::Download(Url::parse("http://127.0.0.1:9/tool").unwrap())
     }
 
-    /// The repository's pinned third-party tools; `apply_patch` and `bash` are added by a release.
+    /// The repository's pinned third-party tools; `apply_patch`, `aither-sed` and `bash` are added by a release.
     fn pinned_distribution() -> ToolDistribution {
         ToolDistribution::from_json(include_bytes!("../../patch/third-party-tools.json")).unwrap()
     }
@@ -782,9 +782,11 @@ pub mod tests {
                     .iter()
                     .filter(|artifact| artifact.target == target && artifact.tool == tool)
                     .count();
-                // A release supplies `apply_patch` and `bash`.
-                let expected =
-                    usize::from(!matches!(tool, ManagedTool::ApplyPatch | ManagedTool::Bash));
+                // A release supplies `apply_patch`, `aither-sed` and `bash`.
+                let expected = usize::from(!matches!(
+                    tool,
+                    ManagedTool::ApplyPatch | ManagedTool::Sed | ManagedTool::Bash
+                ));
                 assert_eq!(
                     count,
                     expected,

@@ -30,6 +30,8 @@ pub enum ManagedTool {
     Xargs,
     /// Fast file finder.
     Fd,
+    /// `aither-sed`, the `sed` of terminal scripts, which only prints line ranges.
+    Sed,
     /// The `uv` Python package and project manager, which installs the
     /// managed `python3` ([`PythonRuntime`]) when the tools are prepared.
     Uv,
@@ -154,7 +156,7 @@ pub const COREUTILS_ALIASES: &[&str] = &[
 impl ManagedTool {
     /// Every managed tool, in stable prompt order. The tools a platform must
     /// provide are [`ToolTarget::required_tools`].
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::ApplyPatch,
         Self::Ripgrep,
         Self::AstGrep,
@@ -163,6 +165,7 @@ impl ManagedTool {
         Self::Coreutils,
         Self::Xargs,
         Self::Fd,
+        Self::Sed,
         Self::Uv,
     ];
 
@@ -181,6 +184,7 @@ impl ManagedTool {
             Self::Coreutils => "coreutils",
             Self::Xargs => "xargs",
             Self::Fd => "fd",
+            Self::Sed => "aither-sed",
             Self::Uv => "uv",
         }
     }
@@ -215,6 +219,7 @@ impl ManagedTool {
             Self::Coreutils
             | Self::Xargs
             | Self::Fd
+            | Self::Sed
             | Self::Uv
             | Self::ApplyPatch
             | Self::Ripgrep
@@ -343,7 +348,7 @@ impl ToolTarget {
     }
 
     /// The tools every environment of this platform must provide: Windows
-    /// has no `bash`, `coreutils`, `xargs`, `fd` or `uv` artifacts, every other
+    /// has no `bash`, `coreutils`, `xargs`, `fd`, `aither-sed` or `uv` artifacts, every other
     /// platform the complete set.
     #[must_use]
     pub fn required_tools(&self) -> &'static [ManagedTool] {
@@ -1253,19 +1258,20 @@ impl PreparedTools<ContainerPath> {
 }
 
 /// Host commands a script must not call, each with what to use instead.
-const BLOCKED_COMMANDS: [(&str, &str); 4] = [
+const BLOCKED_COMMANDS: [(&str, &str); 3] = [
     ("grep", "`rg`"),
-    (
-        "sed",
-        "`apply_patch` to edit files or `python3` to process text",
-    ),
     ("awk", "`python3` or `jq`"),
     ("find", "`fd`"),
 ];
 
-/// Whether `command` is one the managed shell refuses in a script.
+/// The host command the managed shell replaces with a function running
+/// [`ManagedTool::Sed`], which prints line ranges and refuses the rest.
+const SED_FUNCTION: &str = "sed";
+
+/// Whether `command` is one the managed shell refuses or replaces in a
+/// script, so only a shell can run it.
 pub fn is_blocked_command(command: &str) -> bool {
-    BLOCKED_COMMANDS.iter().any(|(name, _)| *name == command)
+    command == SED_FUNCTION || BLOCKED_COMMANDS.iter().any(|(name, _)| *name == command)
 }
 
 #[derive(Template)]
@@ -1284,16 +1290,20 @@ struct BlockedCommandFunction {
 #[template(path = "blocked_commands.sh", escape = "none")]
 struct BlockedCommandsTemplate<'a> {
     commands: Vec<BlockedCommandFunction>,
+    sed: &'a str,
+    sed_tool: &'a str,
     script: &'a str,
 }
 
 /// `script` behind shell functions that make the blocked commands fail with a
-/// message naming their replacement. They are not exported, so only the
-/// script's own shell sees them: child processes still reach the host
-/// programs.
+/// message naming their replacement, and a `sed` that runs the managed
+/// `aither-sed`. They are not exported, so only the script's own shell sees
+/// them: child processes still reach the host programs.
 fn with_blocked_commands(script: &str) -> String {
     BlockedCommandsTemplate {
         script,
+        sed: SED_FUNCTION,
+        sed_tool: ManagedTool::Sed.command(),
         commands: BLOCKED_COMMANDS
             .iter()
             .map(|&(name, replacement)| {
@@ -1685,12 +1695,7 @@ pub mod tests {
     #[cfg(unix)]
     #[test]
     fn blocked_commands_fail_with_their_replacement() {
-        for (name, replacement) in [
-            ("grep", "`rg`"),
-            ("sed", "`apply_patch`"),
-            ("awk", "`jq`"),
-            ("find", "`fd`"),
-        ] {
+        for (name, replacement) in [("grep", "`rg`"), ("awk", "`jq`"), ("find", "`fd`")] {
             let output = run_in_shell(&format!("{name} x"));
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(!output.status.success(), "{name} should fail");
@@ -1701,6 +1706,31 @@ pub mod tests {
             );
             assert!(stderr.contains(replacement), "{name}: {stderr}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sed_runs_the_managed_aither_sed_with_its_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let managed = directory.path().join(ManagedTool::Sed.command());
+        std::fs::write(&managed, "#!/bin/sh\nprintf 'managed:%s\\n' \"$*\"\n").expect("write");
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path = format!(
+            "{}:{}",
+            directory.path().display(),
+            std::env::var("PATH").expect("PATH")
+        );
+        let output = std::process::Command::new("bash")
+            .args(shell_arguments("sed -n '2,3p' file"))
+            .env("PATH", path)
+            .output()
+            .expect("bash should run");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "managed:-n 2,3p file\n"
+        );
     }
 
     #[cfg(unix)]
@@ -2078,6 +2108,7 @@ printf '%s\n' 'uv @VERSION@'
                 "5.3.20",
             ),
             (ManagedTool::Fd, "fd 10.5.0\n", "10.5.0"),
+            (ManagedTool::Sed, "aither-sed 0.13.0\n", "0.13.0"),
             (
                 ManagedTool::Ripgrep,
                 "ripgrep 15.2.0\nfeatures:+pcre2\n",
