@@ -5,6 +5,10 @@
 # the job's script with it in AITHER_JOB, so the job's processes are found
 # wherever they went — a process that outlives its shell is reparented to the
 # container's init, and one that calls setsid leaves the shell's process group.
+# An exec does not hide a process: from the moment its new image replaces the
+# old one until the kernel has laid out the new environment, /proc reads its
+# environment as empty, and a read that began before the exec comes back empty
+# or cut short; the scan tells both from the process's stat and looks again.
 # A process that cleared the variable from its environment, or whose
 # environment this script cannot read, is not found; nor is one the scan
 # could not reach through parentage before its chain back to the wrapper
@@ -58,29 +62,116 @@ alive() {
   [ "$1" != Z ]
 }
 
-# Succeeds when process $1 carries the job's marker in its environment. tr
-# turns the NUL separators into spaces, which a shell can match and a
-# command substitution can hold.
-marked() {
-  marked_env=$(tr '\0' ' ' 2>/dev/null < "/proc/$1/environ") || return 1
-  case " $marked_env " in
-    *" AITHER_JOB=$pid_file "*) return 0 ;;
+# Copies stdin to stdout with each NUL turned into a space and every other
+# byte outside printable ASCII into a printable one, so that a command
+# substitution can hold the result and every shell, whatever its locale,
+# counts one character per byte of it. The C locale makes tr read the sets and
+# its input as bytes.
+envmap() {
+  LC_ALL=C tr '\000-\037\177-\377' ' \041-\176\041-\142'
+}
+
+# The job's marker as an environment reads through envmap, between the
+# spaces that stand for its NUL separators.
+marker=" $(printf '%s' "AITHER_JOB=$pid_file" | envmap) "
+
+# Sets $snap to the fields of process $1's stat that an exec or a reused pid
+# changes (start time, start_code, startstack, env_start, env_end), and
+# $snap_vsize, $snap_code, $snap_stack, $snap_env_start and $snap_env_end to
+# some of them; fails when the process has exited or is a zombie.
+snapshot() {
+  snap_pid=$1
+  read -r snap_line 2>/dev/null < "/proc/$snap_pid/stat" || return 1
+  set -- ${snap_line##*) }
+  case $1 in
+    Z|X) return 1 ;;
   esac
-  return 1
+  [ -n "${49-}" ] || {
+    echo "/proc/$snap_pid/stat has no environment bounds; the job script needs Linux 3.5 or later"
+    exit 1
+  }
+  snap_vsize=${21}
+  snap_code=${24}
+  snap_stack=${26}
+  snap_env_start=${48}
+  snap_env_end=${49}
+  snap="${20} ${24} ${26} ${48} ${49}"
+}
+
+# Sets $member for process $1: "yes" when it carries the job's marker; "no"
+# when it has exited, carries none, or cannot be read; "moving" when it is in
+# an exec, or exec'd while it was read, so its environment is not known yet.
+membership() {
+  member=no
+  snapshot "$1" || return 0
+  if [ "$snap_stack" = 0 ]; then
+    # The kernel sets startstack after it has laid out a new image's
+    # environment. stat prints 0 for it without an mm — a kernel thread, or
+    # a process that released its memory on its way out, both with vsize 0 —
+    # and for a process the caller may not inspect, whose start_code then
+    # reads 1; otherwise the process is in an exec, past the point where its
+    # new, empty mm replaced the old one.
+    [ "$snap_vsize" = 0 ] || [ "$snap_code" = 1 ] || member=moving
+    return 0
+  fi
+  member_snap=$snap
+  # Whatever the read returns is bytes the process's environment held, so a
+  # marker found in them is the answer.
+  if member_env=$(envmap 2>/dev/null < "/proc/$1/environ"); then
+    case " $member_env" in
+      *"$marker"*) member=yes; return 0 ;;
+    esac
+    member_read=1
+  else
+    member_read=0
+  fi
+  # No marker is the answer only when the read saw one image whole. An exec
+  # in between changes startstack and the environment bounds, or leaves
+  # startstack 0; a read that began before it comes back empty or cut short.
+  snapshot "$1" || return 0
+  if [ "$snap" != "$member_snap" ]; then
+    member=moving
+    return 0
+  fi
+  # The caller may not open the environment of this image.
+  [ "$member_read" = 1 ] || return 0
+  [ "${#member_env}" = $((snap_env_end - snap_env_start)) ] || {
+    echo "read ${#member_env} of the $((snap_env_end - snap_env_start)) environment bytes of process $1"
+    exit 1
+  }
+}
+
+# Adds process $1 to $tree when it carries the job's marker, and to $moving
+# when it must be looked at again.
+seed() {
+  case $tree in
+    *" $1 "*) return 0 ;;
+  esac
+  membership "$1"
+  case $member in
+    yes) tree="$tree$1 " ;;
+    moving) moving="$moving $1" ;;
+  esac
 }
 
 # Sets $tree to " <root> <descendant> ... ": the root $1 (none when empty) and
 # every live process carrying the job's marker, then every process whose
-# parent is in the tree, until a pass adds none.
+# parent is in the tree, until a pass adds none. A process in an exec is
+# looked at again until its new image is in place.
 job_tree() {
   tree=" $1 "
+  moving=
   for seed_stat in /proc/[0-9]*/stat; do
     seed_pid=${seed_stat#/proc/}
     seed_pid=${seed_pid%/stat}
-    case $tree in
-      *" $seed_pid "*) continue ;;
-    esac
-    alive "$seed_pid" && marked "$seed_pid" && tree="$tree$seed_pid "
+    seed "$seed_pid"
+  done
+  while [ -n "$moving" ]; do
+    again=$moving
+    moving=
+    for seed_pid in $again; do
+      seed "$seed_pid"
+    done
   done
   grown=1
   while [ "$grown" = 1 ]; do
