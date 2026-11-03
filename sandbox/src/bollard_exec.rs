@@ -968,7 +968,7 @@ mod tests {
         let started = std::time::Instant::now();
         let run = run_wrapper_as(
             &pid_file,
-            r#"(unset AITHER_JOB; export ODD="$(printf 'caf\303\251\nx\001\177')"; exec sleep 30) > /dev/null 2>&1 & echo $! > escaped; env -i sleep 30 > /dev/null 2>&1 & echo $! >> escaped"#,
+            r#"(unset AITHER_JOB; export ODD="$(printf '\303\251t\303\251\nx\001\177')"; exec sleep 30) > /dev/null 2>&1 & echo $! > escaped; env -i sleep 30 > /dev/null 2>&1 & echo $! >> escaped"#,
             "background",
             dir.path(),
         );
