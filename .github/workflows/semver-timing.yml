@@ -1,0 +1,30 @@
+name: Semver timing
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/semver-timing.yml
+
+jobs:
+  semver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../semver-target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-semver-checks
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Per-crate check-release against crates.io
+        run: |
+          set -uo pipefail
+          for pkg in $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name'); do
+            start=$(date +%s)
+            cargo semver-checks check-release -p "${pkg}" --verbose 2>&1 | grep -E 'Building|Built|Parsing|Parsed|Checking|Checked|Summary|FAIL|error' || true
+            echo "TIMING ${pkg} $(( $(date +%s) - start ))s"
+          done
+          df -h /
+          du -sh "${CARGO_TARGET_DIR}"
