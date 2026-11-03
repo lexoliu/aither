@@ -216,9 +216,13 @@ jobs:
             echo "publish=${publish}"
           } >> "${GITHUB_OUTPUT}"
 
+  # A manual run skips release-plz, which would skip every job downstream of
+  # it unless the condition checks the needed job's result itself.
   apply-patch-artifacts:
     needs: patch-release
-    if: needs.patch-release.outputs.publish == 'true'
+    if: >-
+      always() && !cancelled() && needs.patch-release.result == 'success'
+      && needs.patch-release.outputs.publish == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/patch-artifacts.yml
@@ -229,7 +233,9 @@ jobs:
   publish-patch-assets:
     name: Publish apply_patch assets
     needs: [patch-release, apply-patch-artifacts]
-    if: needs.patch-release.outputs.publish == 'true'
+    if: >-
+      always() && !cancelled() && needs.apply-patch-artifacts.result == 'success'
+      && needs.patch-release.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
