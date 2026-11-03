@@ -169,6 +169,8 @@ pub async fn probe_tool_environment(
 struct InstallTool {
     command: String,
     sha256: String,
+    /// Commands installed as relative links to `command`, space separated.
+    aliases: String,
 }
 
 #[derive(Template)]
@@ -185,7 +187,13 @@ struct ToolInstallTemplate<'a> {
 #[template(path = "tool_verify.sh", escape = "none")]
 struct ToolVerifyTemplate<'a> {
     directory: std::borrow::Cow<'a, str>,
-    tools: Vec<&'static str>,
+    tools: Vec<VerifyTool>,
+}
+
+struct VerifyTool {
+    command: &'static str,
+    /// Commands that must be relative links to `command`, space separated.
+    aliases: String,
 }
 
 /// The defect `tool_verify.sh` reports on stderr, or `None` for a failure it
@@ -199,6 +207,9 @@ fn image_defect(stderr: &str) -> Option<ImageToolDefect> {
                 }
                 Some(("missing-binary", command)) => {
                     Some(ImageToolDefect::MissingBinary(command.to_owned()))
+                }
+                Some(("invalid-alias", alias)) => {
+                    Some(ImageToolDefect::InvalidAlias(alias.to_owned()))
                 }
                 _ => None,
             })
@@ -223,7 +234,14 @@ impl ImageTools {
         let directory = self.container_directory()?;
         let script = ToolVerifyTemplate {
             directory: shell_words::quote(directory.as_str()),
-            tools: self.tools.iter().map(|tool| tool.tool.command()).collect(),
+            tools: self
+                .tools
+                .iter()
+                .map(|tool| VerifyTool {
+                    command: tool.tool.command(),
+                    aliases: tool.tool.aliases().join(" "),
+                })
+                .collect(),
         }
         .render()?;
         let output = transport.run(&script, None).await?;
@@ -272,6 +290,7 @@ impl ToolBundle {
                 .map(|binary| InstallTool {
                     command: binary.tool.command().into(),
                     sha256: hex::encode(binary.sha256),
+                    aliases: binary.tool.aliases().join(" "),
                 })
                 .collect(),
             macos: self.target().os() == "macos",
@@ -311,6 +330,17 @@ impl ToolBundle {
                 Path::new("bin").join(binary.tool.command()),
                 binary.bytes.as_ref(),
             )?;
+            for alias in binary.tool.aliases() {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                archive.append_link(
+                    &mut header,
+                    Path::new("bin").join(alias),
+                    binary.tool.command(),
+                )?;
+            }
         }
         Ok(archive.into_inner()?)
     }
@@ -443,7 +473,7 @@ mod tests {
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(mode | 0o200))
                 .unwrap();
         }
-        std::fs::write(&binary, script_tool("jq", "2.0.0")).unwrap();
+        std::fs::write(&binary, script_tool(crate::ManagedTool::Jq, "2.0.0")).unwrap();
         match image.verify(&image_transport(&out)).await {
             Err(ToolRuntimeError::VersionMismatch(command)) => assert_eq!(command, "jq"),
             other => panic!("expected VersionMismatch, got {other:?}"),
@@ -521,9 +551,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.bin_dir(), second.bin_dir());
-        for tool in crate::ManagedTool::ALL {
+        for &tool in crate::tool_runtime::tests::native_tools() {
             assert!(first.bin_dir().join(tool.command()).is_file());
         }
+        for alias in crate::tool_runtime::COREUTILS_ALIASES {
+            assert_eq!(
+                std::fs::read_link(first.bin_dir().join(alias)).unwrap(),
+                Path::new("coreutils"),
+                "{alias}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_install_rejects_a_tampered_alias_in_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = crate::tool_runtime::tests::bundle();
+        let installed = bundle
+            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
+            .await
+            .unwrap();
+        let alias = installed.bin_dir().join("date");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(installed.bin_dir(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink("rg", &alias).unwrap();
+        let result = bundle
+            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(ToolRuntimeError::InitializationCommand { ref stderr, .. })
+                    if stderr.contains("tool cache integrity failure")
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_verification_rejects_a_tampered_alias() {
+        use crate::tool_distribution::tests::file_artifact;
+        let (files, distribution, image) = script_fixture("1.0.0", file_artifact);
+        let out = tempfile::tempdir().unwrap();
+        let target = ToolTarget::native().unwrap();
+        let staged = distribution
+            .stage_image_tools(&target, &files.path().join("cache"), out.path())
+            .await
+            .unwrap();
+        image.verify(&image_transport(&out)).await.unwrap();
+        let alias = staged.join("bin").join("date");
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink("rg", &alias).unwrap();
+        match image.verify(&image_transport(&out)).await {
+            Err(ToolRuntimeError::InvalidImageTools { defect, .. }) => {
+                assert_eq!(defect, ImageToolDefect::InvalidAlias("date".to_owned()));
+            }
+            other => panic!("expected InvalidImageTools, got {other:?}"),
+        }
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::write(&alias, b"#!/bin/sh\n").unwrap();
+        assert!(matches!(
+            image.verify(&image_transport(&out)).await,
+            Err(ToolRuntimeError::InvalidImageTools {
+                defect: ImageToolDefect::InvalidAlias(_),
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

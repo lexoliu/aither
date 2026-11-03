@@ -42,6 +42,48 @@
       }
     },
     {
+      "tool": "coreutils",
+      "version": "0.12.0",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/uutils/coreutils/releases/download/0.12.0/coreutils-0.12.0-aarch64-apple-darwin.tar.gz",
+      "sha256": "7caea447564405b3eb50cce2a89d314df07d1b7a67090dc4cc7c82eba7014052",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "coreutils-0.12.0-aarch64-apple-darwin/coreutils"
+      }
+    },
+    {
+      "tool": "xargs",
+      "version": "0.11.0",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/uutils/findutils/releases/download/0.11.0/findutils-aarch64-apple-darwin.tar.xz",
+      "sha256": "e42773942fba2f0cd115b9f4a3c9637c0cfc54a30279d6a58819d0e51f27f327",
+      "encoding": {
+        "format": "tar_xz",
+        "executable": "findutils-aarch64-apple-darwin/xargs"
+      }
+    },
+    {
+      "tool": "fd",
+      "version": "10.5.0",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-aarch64-apple-darwin.tar.gz",
+      "sha256": "b67e1836c468e42e411984b56e52fa7abec08c2bd22c867398e7cc134aac5e12",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "fd-v10.5.0-aarch64-apple-darwin/fd"
+      }
+    },
+    {
       "tool": "ripgrep",
       "version": "15.2.0",
       "target": {
@@ -83,6 +125,48 @@
       }
     },
     {
+      "tool": "coreutils",
+      "version": "0.12.0",
+      "target": {
+        "os": "linux",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/uutils/coreutils/releases/download/0.12.0/coreutils-0.12.0-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "614a0224ea49f85020cfc30ca980599965fa8501131f9588db4fa41c125a7805",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "coreutils-0.12.0-aarch64-unknown-linux-musl/coreutils"
+      }
+    },
+    {
+      "tool": "xargs",
+      "version": "0.11.0",
+      "target": {
+        "os": "linux",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/uutils/findutils/releases/download/0.11.0/findutils-aarch64-unknown-linux-musl.tar.xz",
+      "sha256": "667554a89d7961ebfa46325bb68795e4107b1a3bc4552657ef51408ae056acea",
+      "encoding": {
+        "format": "tar_xz",
+        "executable": "findutils-aarch64-unknown-linux-musl/xargs"
+      }
+    },
+    {
+      "tool": "fd",
+      "version": "10.5.0",
+      "target": {
+        "os": "linux",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "d76c4317f7d5dba69f8a2a15856c90c777e7f0dd4e85f0de8c76de6992c374d4",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "fd-v10.5.0-aarch64-unknown-linux-musl/fd"
+      }
+    },
+    {
       "tool": "ripgrep",
       "version": "15.2.0",
       "target": {
@@ -121,6 +205,48 @@
       "sha256": "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f",
       "encoding": {
         "format": "executable"
+      }
+    },
+    {
+      "tool": "coreutils",
+      "version": "0.12.0",
+      "target": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/uutils/coreutils/releases/download/0.12.0/coreutils-0.12.0-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "9b555b01457279bcc3e46753f0ef324fd3d02a0535111200a4632d1297263b54",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "coreutils-0.12.0-x86_64-unknown-linux-musl/coreutils"
+      }
+    },
+    {
+      "tool": "xargs",
+      "version": "0.11.0",
+      "target": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/uutils/findutils/releases/download/0.11.0/findutils-x86_64-unknown-linux-musl.tar.xz",
+      "sha256": "e27232099ede5166efe22c5c84a3880ac7278a56ce46a51a732d647eae846bdb",
+      "encoding": {
+        "format": "tar_xz",
+        "executable": "findutils-x86_64-unknown-linux-musl/xargs"
+      }
+    },
+    {
+      "tool": "fd",
+      "version": "10.5.0",
+      "target": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "761c72dc8e120d85b22292063be8a796e2eeb20eb3e4f38b8fa2343ccf3514a7",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "fd-v10.5.0-x86_64-unknown-linux-musl/fd"
       }
     },
     {

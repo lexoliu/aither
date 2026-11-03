@@ -19,7 +19,10 @@ verify_tools() {
 {% else %}    actual=$(sha256sum "$bin/{{ tool.command }}")
     mode=$(stat -c '%a' "$bin/{{ tool.command }}")
 {% endif %}    [ "${actual%% *}" = '{{ tool.sha256 }}' ] && [ "$mode" = '555' ] || return 1
-{% endfor %}}
+{% if !tool.aliases.is_empty() %}    for alias in {{ tool.aliases }}; do
+        [ -L "$bin/$alias" ] && [ "$(readlink "$bin/$alias")" = '{{ tool.command }}' ] || return 1
+    done
+{% endif %}{% endfor %}}
 if [ -e "$destination" ] || [ -L "$destination" ]; then
     [ -L "$destination" ] && verify_tools "$destination" || { echo 'tool cache integrity failure' >&2; exit 1; }
 {% if !probe_only %}    cat >/dev/null

@@ -205,18 +205,20 @@ impl ToolDistribution {
         Ok(manifest)
     }
 
-    /// The artifacts pinned for `target`, exactly one per managed tool.
+    /// The artifacts pinned for `target`, exactly one per tool the target
+    /// requires; pins of other tools for it are not selected.
     ///
     /// # Errors
-    /// Rejects missing or duplicate tools for the target.
+    /// Rejects missing or duplicate required tools for the target.
     fn select_artifacts(&self, target: &ToolTarget) -> Result<Vec<ToolArtifact>, ToolRuntimeError> {
+        let required = target.required_tools();
         let selected = self
             .artifacts
             .iter()
-            .filter(|artifact| &artifact.target == target)
+            .filter(|artifact| &artifact.target == target && required.contains(&artifact.tool))
             .cloned()
             .collect::<Vec<_>>();
-        for tool in ManagedTool::ALL {
+        for &tool in required {
             match selected
                 .iter()
                 .filter(|artifact| artifact.tool == tool)
@@ -643,10 +645,7 @@ fn extract_executable(
 pub mod tests {
     use super::*;
 
-    /// A script executable that reports `<command> <version>` to `--version`.
-    pub fn script_tool(command: &str, version: &str) -> Vec<u8> {
-        format!("#!/bin/sh\nprintf '%s\\n' '{command} {version}'\n").into_bytes()
-    }
+    pub use crate::tool_runtime::tests::{native_tools, script_tool};
 
     /// A distribution pinning one `script_tool` executable per command for
     /// `target`, each artifact located by `url` — file URLs for a fixture that
@@ -659,10 +658,11 @@ pub mod tests {
         dir: &Path,
         url: impl Fn(&Path) -> ToolArtifactLocation,
     ) -> ToolDistribution {
-        let artifacts = ManagedTool::ALL
-            .into_iter()
-            .map(|tool| {
-                let bytes = script_tool(tool.command(), version);
+        let artifacts = target
+            .required_tools()
+            .iter()
+            .map(|&tool| {
+                let bytes = script_tool(tool, version);
                 let path = dir.join(tool.command());
                 std::fs::write(&path, &bytes).unwrap();
                 ToolArtifact {
@@ -692,6 +692,72 @@ pub mod tests {
         ToolArtifactLocation::Download(Url::parse("http://127.0.0.1:9/tool").unwrap())
     }
 
+    /// The repository's pinned third-party tools; `apply_patch` is added by a release.
+    fn pinned_distribution() -> ToolDistribution {
+        ToolDistribution::from_json(include_bytes!("../../patch/third-party-tools.json")).unwrap()
+    }
+
+    #[test]
+    fn pinned_tools_cover_the_required_set_of_every_platform() {
+        let pinned = pinned_distribution();
+        let mut targets = pinned
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.target.clone())
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|target| (target.os().to_owned(), target.arch().to_owned()));
+        targets.dedup();
+        assert_eq!(targets.len(), 5);
+        for target in targets {
+            for &tool in target.required_tools() {
+                let count = pinned
+                    .artifacts
+                    .iter()
+                    .filter(|artifact| artifact.target == target && artifact.tool == tool)
+                    .count();
+                // A release supplies `apply_patch`.
+                let expected = usize::from(tool != ManagedTool::ApplyPatch);
+                assert_eq!(
+                    count,
+                    expected,
+                    "{tool:?} for {}/{}",
+                    target.os(),
+                    target.arch()
+                );
+            }
+            let pinned_coreutils = pinned.artifacts.iter().any(|artifact| {
+                artifact.target == target && artifact.tool == ManagedTool::Coreutils
+            });
+            assert_eq!(pinned_coreutils, target.os() != "windows");
+        }
+    }
+
+    #[test]
+    fn a_windows_target_selects_only_its_portable_pins() {
+        let windows = ToolTarget::from_probe("Windows_NT", "x86_64").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut distribution = script_distribution(&windows, "1.0.0", dir.path(), file_artifact);
+        // A pin for a tool the platform does not provide is ignored, not required.
+        distribution.artifacts.push(ToolArtifact {
+            tool: ManagedTool::Coreutils,
+            ..distribution.artifacts[0].clone()
+        });
+        let selected = distribution.select_artifacts(&windows).unwrap();
+        assert_eq!(selected.len(), windows.required_tools().len());
+        assert!(
+            selected
+                .iter()
+                .all(|artifact| artifact.tool != ManagedTool::Coreutils)
+        );
+        distribution
+            .artifacts
+            .retain(|artifact| artifact.tool != ManagedTool::Jq);
+        assert!(matches!(
+            distribution.select_artifacts(&windows),
+            Err(ToolRuntimeError::MissingTool(ManagedTool::Jq))
+        ));
+    }
+
     #[tokio::test]
     async fn stage_image_tools_produces_the_directory_layout_the_image_verifies() {
         let files = tempfile::tempdir().unwrap();
@@ -709,7 +775,7 @@ pub mod tests {
                 .unwrap()
                 .join(image.cache_key().unwrap())
         );
-        for tool in ManagedTool::ALL {
+        for &tool in native_tools() {
             assert!(
                 staged
                     .join("bin")
@@ -728,9 +794,9 @@ pub mod tests {
         let binary = source.path().join("tool");
         async_fs::write(&binary, bytes).await.unwrap();
         let distribution = ToolDistribution {
-            artifacts: ManagedTool::ALL
-                .into_iter()
-                .map(|tool| ToolArtifact {
+            artifacts: native_tools()
+                .iter()
+                .map(|&tool| ToolArtifact {
                     tool,
                     version: "1.0.0".into(),
                     target: ToolTarget::native().unwrap(),
@@ -933,27 +999,13 @@ pub mod tests {
         async fn new() -> Self {
             let directory = tempfile::tempdir().unwrap();
             let target = ToolTarget::native().unwrap();
-            let command = b"baseline command fixture";
-            let command_path = directory.path().join("command");
-            async_fs::write(&command_path, command).await.unwrap();
             let executable: &'static [u8] = b"host program fixture";
             let archive = directory.path().join("search.tar.xz");
             let encoded = tar_xz("repo-search/search", executable);
             async_fs::write(&archive, &encoded).await.unwrap();
             let distribution = ToolDistribution {
-                artifacts: ManagedTool::ALL
-                    .into_iter()
-                    .map(|tool| ToolArtifact {
-                        tool,
-                        version: "1.0.0".into(),
-                        target: target.clone(),
-                        url: ToolArtifactLocation::Download(
-                            Url::from_file_path(&command_path).unwrap(),
-                        ),
-                        sha256: hex::encode(digest(command)),
-                        encoding: ToolArtifactFormat::Executable,
-                    })
-                    .collect(),
+                artifacts: script_distribution(&target, "1.0.0", directory.path(), file_artifact)
+                    .artifacts,
                 host_programs: vec![HostProgramArtifact {
                     artifact: PinnedArtifact {
                         tool: HostProgram::RepoSearch,

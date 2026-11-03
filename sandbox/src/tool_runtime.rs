@@ -20,11 +20,145 @@ pub enum ManagedTool {
     AstGrep,
     /// JSON selection and transformation.
     Jq,
+    /// The uutils coreutils multicall binary, reached through [`COREUTILS_ALIASES`].
+    Coreutils,
+    /// `xargs` from uutils findutils.
+    Xargs,
+    /// Fast file finder.
+    Fd,
 }
 
+/// The coreutils utilities exposed as relative symlinks `bin/<name> -> coreutils`,
+/// through [`ManagedTool::aliases`].
+///
+/// Excludes the `[` and `more` entries of `coreutils --list` (not utilities
+/// of GNU coreutils) and every name the managed set replaces with a modern
+/// tool (`grep`, `sed`, `awk`, `find`), none of which coreutils provides.
+/// Staging checks each name against the `coreutils --list` of the pinned
+/// binary, so a name the binary does not provide is never shadowed.
+pub const COREUTILS_ALIASES: &[&str] = &[
+    "arch",
+    "b2sum",
+    "base32",
+    "base64",
+    "basename",
+    "basenc",
+    "cat",
+    "chgrp",
+    "chmod",
+    "chown",
+    "chroot",
+    "cksum",
+    "comm",
+    "cp",
+    "csplit",
+    "cut",
+    "date",
+    "dd",
+    "df",
+    "dir",
+    "dircolors",
+    "dirname",
+    "du",
+    "echo",
+    "env",
+    "expand",
+    "expr",
+    "factor",
+    "false",
+    "fmt",
+    "fold",
+    "groups",
+    "head",
+    "hostid",
+    "hostname",
+    "id",
+    "install",
+    "join",
+    "kill",
+    "link",
+    "ln",
+    "logname",
+    "ls",
+    "md5sum",
+    "mkdir",
+    "mkfifo",
+    "mknod",
+    "mktemp",
+    "mv",
+    "nice",
+    "nl",
+    "nohup",
+    "nproc",
+    "numfmt",
+    "od",
+    "paste",
+    "pathchk",
+    "pinky",
+    "pr",
+    "printenv",
+    "printf",
+    "ptx",
+    "pwd",
+    "readlink",
+    "realpath",
+    "rm",
+    "rmdir",
+    "seq",
+    "sha1sum",
+    "sha224sum",
+    "sha256sum",
+    "sha384sum",
+    "sha512sum",
+    "shred",
+    "shuf",
+    "sleep",
+    "sort",
+    "split",
+    "stat",
+    "stdbuf",
+    "stty",
+    "sum",
+    "sync",
+    "tac",
+    "tail",
+    "tee",
+    "test",
+    "timeout",
+    "touch",
+    "tr",
+    "true",
+    "truncate",
+    "tsort",
+    "tty",
+    "uname",
+    "unexpand",
+    "uniq",
+    "unlink",
+    "uptime",
+    "users",
+    "vdir",
+    "wc",
+    "who",
+    "whoami",
+    "yes",
+];
+
 impl ManagedTool {
-    /// The complete baseline, in stable prompt order.
-    pub const ALL: [Self; 4] = [Self::ApplyPatch, Self::Ripgrep, Self::AstGrep, Self::Jq];
+    /// Every managed tool, in stable prompt order. The tools a platform must
+    /// provide are [`ToolTarget::required_tools`].
+    pub const ALL: [Self; 7] = [
+        Self::ApplyPatch,
+        Self::Ripgrep,
+        Self::AstGrep,
+        Self::Jq,
+        Self::Coreutils,
+        Self::Xargs,
+        Self::Fd,
+    ];
+
+    /// The tools with an artifact on every platform, Windows included.
+    const PORTABLE: [Self; 4] = [Self::ApplyPatch, Self::Ripgrep, Self::AstGrep, Self::Jq];
 
     /// Name used by the model in every execution environment.
     #[must_use]
@@ -34,11 +168,44 @@ impl ManagedTool {
             Self::Ripgrep => "rg",
             Self::AstGrep => "ast-grep",
             Self::Jq => "jq",
+            Self::Coreutils => "coreutils",
+            Self::Xargs => "xargs",
+            Self::Fd => "fd",
+        }
+    }
+
+    /// Commands exposed as relative symlinks `bin/<alias> -> <command>` to
+    /// this tool's executable; empty for every tool but `coreutils`.
+    #[must_use]
+    pub const fn aliases(self) -> &'static [&'static str] {
+        match self {
+            Self::Coreutils => COREUTILS_ALIASES,
+            _ => &[],
         }
     }
 
     pub(crate) fn executable_name(self, target: &ToolTarget) -> String {
         executable_name(self.command(), target)
+    }
+
+    /// The version this tool's `--version` output reports.
+    ///
+    /// The banners differ: `jq-1.8.2`, `coreutils 0.12.0 (multi-call binary)`,
+    /// `fd 10.5.0`, `xargs 0.11.0`; the others report `<name> <version>`.
+    fn reported_version(self, output: &str) -> Option<semver::Version> {
+        let line = output.lines().next()?;
+        let second_word = || line.split_whitespace().nth(1);
+        let version = match self {
+            // The baseline test fixtures report `jq <version>`.
+            Self::Jq => line.strip_prefix("jq-").or_else(second_word)?,
+            Self::Coreutils
+            | Self::Xargs
+            | Self::Fd
+            | Self::ApplyPatch
+            | Self::Ripgrep
+            | Self::AstGrep => second_word()?,
+        };
+        semver::Version::parse(version).ok()
     }
 }
 
@@ -158,6 +325,18 @@ impl ToolTarget {
     #[must_use]
     pub fn arch(&self) -> &str {
         &self.arch
+    }
+
+    /// The tools every environment of this platform must provide: Windows
+    /// has no `coreutils`, `xargs` or `fd` artifacts, every other platform
+    /// the complete set.
+    #[must_use]
+    pub fn required_tools(&self) -> &'static [ManagedTool] {
+        if self.os == "windows" {
+            &ManagedTool::PORTABLE
+        } else {
+            &ManagedTool::ALL
+        }
     }
 }
 
@@ -318,7 +497,14 @@ impl ToolBundle {
                 return Err(ToolRuntimeError::DuplicateTool(pair[0].tool));
             }
         }
-        for tool in ManagedTool::ALL {
+        let required = target.required_tools();
+        if let Some(binary) = binaries
+            .iter()
+            .find(|binary| !required.contains(&binary.tool))
+        {
+            return Err(ToolRuntimeError::UnexpectedTool(binary.tool));
+        }
+        for &tool in required {
             if !binaries.iter().any(|binary| binary.tool == tool) {
                 return Err(ToolRuntimeError::MissingTool(tool));
             }
@@ -343,6 +529,7 @@ impl ToolBundle {
                 .binaries
                 .iter()
                 .map(|binary| ToolInfo {
+                    tool: binary.tool,
                     command: binary.tool.command(),
                     version: binary.version.clone(),
                 })
@@ -483,6 +670,16 @@ impl ToolBundle {
             let path = bin.join(binary.tool.executable_name(&self.target));
             std::fs::write(&path, &binary.bytes)?;
             set_executable_readonly(&path)?;
+            if !binary.tool.aliases().is_empty() {
+                // A foreign target's executable cannot run here; an image
+                // build for one stages the aliases unchecked.
+                if self.target == ToolTarget::native()? {
+                    ensure_aliases_provided(binary.tool, &path)?;
+                }
+                for alias in binary.tool.aliases() {
+                    link_alias(binary.tool, &bin.join(alias))?;
+                }
+            }
         }
         Ok(stage)
     }
@@ -518,6 +715,14 @@ impl ToolBundle {
             #[cfg(not(unix))]
             if !metadata.permissions().readonly() {
                 return Err(ToolRuntimeError::InvalidCache(path));
+            }
+            for alias in binary.tool.aliases() {
+                let alias = bin_dir.join(alias);
+                let target =
+                    std::fs::read_link(&alias).map_err(|error| alias_entry_error(&alias, error))?;
+                if target != Path::new(binary.tool.command()) {
+                    return Err(ToolRuntimeError::InvalidCache(alias));
+                }
             }
         }
         Ok(PreparedTools {
@@ -596,6 +801,7 @@ impl ImageTools {
                 .tools
                 .iter()
                 .map(|tool| ToolInfo {
+                    tool: tool.tool,
                     command: tool.tool.command(),
                     version: tool.version.clone(),
                 })
@@ -617,6 +823,54 @@ fn cache_entry_error(path: &Path, error: std::io::Error) -> ToolRuntimeError {
         }
         _ => ToolRuntimeError::Io(error),
     }
+}
+
+/// Maps what `read_link` reports for a missing or non-link alias to an
+/// invalid cache entry; any other failure stays an I/O error.
+fn alias_entry_error(path: &Path, error: std::io::Error) -> ToolRuntimeError {
+    match error.kind() {
+        // `read_link` fails with `InvalidInput` (EINVAL) on a regular file.
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::NotADirectory
+        | std::io::ErrorKind::InvalidInput => ToolRuntimeError::InvalidCache(path.to_path_buf()),
+        _ => ToolRuntimeError::Io(error),
+    }
+}
+
+/// Creates `alias` as a relative symlink to its sibling `tool` executable.
+fn link_alias(tool: ManagedTool, alias: &Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(tool.command(), alias)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (tool, alias);
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// Fails unless every alias of `tool` is a command its executable at `path`
+/// reports in `--list`, so the managed directory never shadows a command the
+/// pinned binary lacks.
+fn ensure_aliases_provided(tool: ManagedTool, path: &Path) -> Result<(), ToolRuntimeError> {
+    let output = std::process::Command::new(path).arg("--list").output()?;
+    if !output.status.success() {
+        return Err(ToolRuntimeError::AliasList(tool.command().into()));
+    }
+    let listed = String::from_utf8(output.stdout)?;
+    let listed = listed.lines().collect::<std::collections::HashSet<_>>();
+    if let Some(alias) = tool
+        .aliases()
+        .iter()
+        .find(|alias| !listed.contains(**alias))
+    {
+        return Err(ToolRuntimeError::UnprovidedAlias {
+            tool,
+            alias: (*alias).into(),
+        });
+    }
+    Ok(())
 }
 
 fn set_executable_readonly(path: &Path) -> Result<(), std::io::Error> {
@@ -800,6 +1054,7 @@ pub struct ToolCatalog {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolInfo {
+    tool: ManagedTool,
     command: &'static str,
     version: semver::Version,
 }
@@ -819,14 +1074,7 @@ impl ToolCatalog {
 
 impl ToolInfo {
     fn verify_version(&self, output: &str) -> Result<(), ToolRuntimeError> {
-        let reported = output
-            .lines()
-            .next()
-            .and_then(|line| {
-                line.strip_prefix("jq-")
-                    .or_else(|| line.split_whitespace().nth(1))
-            })
-            .and_then(|version| semver::Version::parse(version).ok());
+        let reported = self.tool.reported_version(output);
         if reported.as_ref() != Some(&self.version) {
             return Err(ToolRuntimeError::VersionMismatch(self.command.into()));
         }
@@ -952,6 +1200,20 @@ pub enum ToolRuntimeError {
     /// A bundle declares the same command twice.
     #[error("duplicate managed tool: {0:?}")]
     DuplicateTool(ManagedTool),
+    /// A bundle carries a tool its platform does not provide.
+    #[error("tool is not provided on this platform: {0:?}")]
+    UnexpectedTool(ManagedTool),
+    /// A multicall tool's `--list` failed.
+    #[error("`{0} --list` failed")]
+    AliasList(String),
+    /// An alias names a command its multicall binary does not provide.
+    #[error("{tool:?} does not provide the aliased command `{alias}`")]
+    UnprovidedAlias {
+        /// The multicall tool.
+        tool: ManagedTool,
+        /// The command it lacks.
+        alias: String,
+    },
     /// The distribution has no artifact of a host program for the target.
     #[error("host program `{}` has no artifact for {os}/{arch}", .program.command())]
     MissingHostProgram {
@@ -1029,6 +1291,8 @@ pub enum ImageToolDefect {
     MissingDirectory,
     /// A pinned executable is absent or is not a regular file.
     MissingBinary(String),
+    /// An alias is absent or is not a symlink to its multicall executable.
+    InvalidAlias(String),
 }
 
 impl std::fmt::Display for ImageToolDefect {
@@ -1037,6 +1301,9 @@ impl std::fmt::Display for ImageToolDefect {
             Self::MissingDirectory => write!(f, "missing bin directory"),
             Self::MissingBinary(command) => {
                 write!(f, "missing or non-regular executable `{command}`")
+            }
+            Self::InvalidAlias(alias) => {
+                write!(f, "missing or mislinked alias `{alias}`")
             }
         }
     }
@@ -1062,15 +1329,42 @@ pub mod tests {
     /// A bundle pinned to `version` whose commands all report version 1.0.0,
     /// so any other pin fails the version probe while passing integrity checks.
     pub fn bundle_pinned(version: &str) -> ToolBundle {
-        let binaries = ManagedTool::ALL
-            .into_iter()
-            .map(|tool| {
-                let bytes =
-                    format!("#!/bin/sh\nprintf '%s\\n' '{} 1.0.0'\n", tool.command()).into_bytes();
+        let binaries = native_tools()
+            .iter()
+            .map(|&tool| {
+                let bytes = script_tool(tool, "1.0.0");
                 ToolBinary::verify(tool, version, &digest(&bytes), bytes).unwrap()
             })
             .collect();
         ToolBundle::new(ToolTarget::native().unwrap(), binaries).unwrap()
+    }
+
+    /// The tools the test host's platform must provide.
+    pub fn native_tools() -> &'static [ManagedTool] {
+        ToolTarget::native().unwrap().required_tools()
+    }
+
+    /// A script executable that reports `<command> <version>` to `--version`
+    /// and, as a multicall tool, lists its aliases to `--list`.
+    ///
+    /// Invoked through one of its aliases it runs the host's command of that
+    /// name, as the real multicall binary would.
+    pub fn script_tool(tool: ManagedTool, version: &str) -> Vec<u8> {
+        let multicall = if tool.aliases().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "case \"${{0##*/}}\" in {}) ;; *) PATH=/usr/bin:/bin exec \"${{0##*/}}\" \"$@\";; esac\n\
+                 case \"$1\" in --list) printf '%s\\n' {}; exit 0;; esac\n",
+                tool.command(),
+                tool.aliases().join(" ")
+            )
+        };
+        format!(
+            "#!/bin/sh\n{multicall}printf '%s\\n' '{} {version}'\n",
+            tool.command()
+        )
+        .into_bytes()
     }
 
     /// The `ImageTools` counterpart of [`bundle`]: the same target and pins,
@@ -1081,15 +1375,12 @@ pub mod tests {
 
     /// [`image_tools`] pinned to another version, for a different cache key.
     pub fn image_tools_pinned(version: &str) -> ImageTools {
-        let tools = ManagedTool::ALL
-            .into_iter()
-            .map(|tool| {
-                let bytes = format!("#!/bin/sh\nprintf '%s\\n' '{} {version}'\n", tool.command());
-                ImageTool {
-                    tool,
-                    version: semver::Version::parse(version).unwrap(),
-                    archive_sha256: digest(bytes.as_bytes()),
-                }
+        let tools = native_tools()
+            .iter()
+            .map(|&tool| ImageTool {
+                tool,
+                version: semver::Version::parse(version).unwrap(),
+                archive_sha256: digest(&script_tool(tool, version)),
             })
             .collect();
         ImageTools::new(ToolTarget::native().unwrap(), tools)
@@ -1126,10 +1417,192 @@ pub mod tests {
     #[test]
     fn missing_baseline_tool_is_an_initialization_error() {
         let mut binaries = bundle().binaries.to_vec();
-        binaries.pop();
+        let removed = binaries.pop().unwrap().tool;
         assert!(matches!(
             ToolBundle::new(ToolTarget::native().unwrap(), binaries),
-            Err(ToolRuntimeError::MissingTool(ManagedTool::Jq))
+            Err(ToolRuntimeError::MissingTool(missing)) if missing == removed
+        ));
+    }
+
+    fn target(os: &str) -> ToolTarget {
+        ToolTarget::from_probe(os, "x86_64").unwrap()
+    }
+
+    #[test]
+    fn required_tools_depend_on_the_platform() {
+        for os in ["Darwin", "Linux"] {
+            assert_eq!(target(os).required_tools(), ManagedTool::ALL, "{os}");
+        }
+        let windows = target("Windows_NT").required_tools();
+        assert_eq!(
+            windows,
+            [
+                ManagedTool::ApplyPatch,
+                ManagedTool::Ripgrep,
+                ManagedTool::AstGrep,
+                ManagedTool::Jq,
+            ]
+        );
+        assert!(!windows.contains(&ManagedTool::Coreutils));
+    }
+
+    fn script_binaries(tools: &[ManagedTool]) -> Vec<ToolBinary> {
+        tools
+            .iter()
+            .map(|&tool| {
+                let bytes = script_tool(tool, "1.0.0");
+                ToolBinary::verify(tool, "1.0.0", &digest(&bytes), bytes).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn windows_bundle_needs_only_the_portable_tools() {
+        let windows = target("Windows_NT");
+        ToolBundle::new(windows.clone(), script_binaries(windows.required_tools())).unwrap();
+        assert!(matches!(
+            ToolBundle::new(windows, script_binaries(&ManagedTool::ALL)),
+            Err(ToolRuntimeError::UnexpectedTool(ManagedTool::Coreutils))
+        ));
+    }
+
+    #[test]
+    fn unix_bundle_without_coreutils_is_incomplete() {
+        let linux = target("Linux");
+        let tools = ManagedTool::ALL
+            .into_iter()
+            .filter(|tool| *tool != ManagedTool::Coreutils)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            ToolBundle::new(linux, script_binaries(&tools)),
+            Err(ToolRuntimeError::MissingTool(ManagedTool::Coreutils))
+        ));
+    }
+
+    #[test]
+    fn each_tool_parses_its_own_version_banner() {
+        let version = |text| semver::Version::parse(text).unwrap();
+        let cases = [
+            (ManagedTool::Jq, "jq-1.8.2\n", "1.8.2"),
+            (
+                ManagedTool::Coreutils,
+                "coreutils 0.12.0 (multi-call binary)\n",
+                "0.12.0",
+            ),
+            (ManagedTool::Xargs, "xargs 0.11.0\n", "0.11.0"),
+            (ManagedTool::Fd, "fd 10.5.0\n", "10.5.0"),
+            (
+                ManagedTool::Ripgrep,
+                "ripgrep 15.2.0\nfeatures:+pcre2\n",
+                "15.2.0",
+            ),
+            (ManagedTool::AstGrep, "ast-grep 0.45.3\n", "0.45.3"),
+        ];
+        for (tool, output, expected) in cases {
+            assert_eq!(
+                tool.reported_version(output),
+                Some(version(expected)),
+                "{tool:?}"
+            );
+        }
+        // A banner in another tool's format is not accepted.
+        assert_eq!(ManagedTool::Fd.reported_version("fd-10.5.0\n"), None);
+        assert_eq!(ManagedTool::Coreutils.reported_version("coreutils\n"), None);
+        assert_eq!(ManagedTool::Xargs.reported_version(""), None);
+    }
+
+    #[cfg(unix)]
+    fn alias_path(prepared: &PreparedTools<PathBuf>, alias: &str) -> PathBuf {
+        prepared.bin_dir().join(alias)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn coreutils_aliases_are_relative_links_to_the_multicall_binary() {
+        let cache = tempfile::tempdir().unwrap();
+        let bundle = bundle();
+        let prepared = bundle.prepare_local(cache.path()).await.unwrap();
+        assert_ne!(COREUTILS_ALIASES.len(), 0);
+        for alias in COREUTILS_ALIASES {
+            assert_eq!(
+                std::fs::read_link(alias_path(&prepared, alias)).unwrap(),
+                Path::new("coreutils"),
+                "{alias}"
+            );
+        }
+        for excluded in ["grep", "sed", "awk", "find", "xargs", "fd", "["] {
+            assert!(!COREUTILS_ALIASES.contains(&excluded), "{excluded}");
+            assert!(!alias_path(&prepared, excluded).is_symlink(), "{excluded}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tampered_aliases_are_rejected_and_repaired() {
+        type Tamper = fn(&Path, &Path);
+        let cache = tempfile::tempdir().unwrap();
+        let bundle = bundle();
+        let prepared = bundle.prepare_local(cache.path()).await.unwrap();
+        let runtime = prepared.bin_dir().parent().unwrap().to_path_buf();
+        let bin = prepared.bin_dir().clone();
+        let alias = bin.join("date");
+        // Each tampering replaces the alias, given its path and the bin directory.
+        let tamper: [(&str, Tamper); 4] = [
+            ("retargeted link", |alias, _| {
+                std::os::unix::fs::symlink("rg", alias).unwrap();
+            }),
+            ("absolute link", |alias, bin| {
+                std::os::unix::fs::symlink(bin.join("coreutils"), alias).unwrap();
+            }),
+            ("regular file", |alias, _| {
+                std::fs::write(alias, b"#!/bin/sh\n").unwrap();
+            }),
+            ("missing", |_, _| {}),
+        ];
+        for (name, apply) in tamper {
+            std::fs::remove_file(&alias).ok();
+            std::os::unix::fs::symlink("coreutils", &alias).unwrap();
+            bundle.verify_prepared(&runtime).unwrap();
+            std::fs::remove_file(&alias).unwrap();
+            apply(&alias, &bin);
+            assert!(
+                matches!(
+                    bundle.verify_prepared(&runtime),
+                    Err(ToolRuntimeError::InvalidCache(path)) if path == alias
+                ),
+                "{name} was accepted"
+            );
+        }
+        std::fs::remove_file(&alias).ok();
+        std::os::unix::fs::symlink("rg", &alias).unwrap();
+        let repaired = bundle.prepare_local(cache.path()).await.unwrap();
+        assert_prepared(&bundle, &repaired);
+        assert_eq!(
+            std::fs::read_link(bin.join("date")).unwrap(),
+            Path::new("coreutils")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn alias_the_binary_does_not_provide_is_a_staging_error() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut binaries = script_binaries(&ManagedTool::ALL);
+        let limited = b"#!/bin/sh\ncase \"$1\" in --list) printf 'cat\\n'; exit 0;; esac\nprintf '%s\\n' 'coreutils 1.0.0'\n".to_vec();
+        let position = binaries
+            .iter()
+            .position(|binary| binary.tool == ManagedTool::Coreutils)
+            .unwrap();
+        binaries[position] =
+            ToolBinary::verify(ManagedTool::Coreutils, "1.0.0", &digest(&limited), limited)
+                .unwrap();
+        let bundle = ToolBundle::new(ToolTarget::native().unwrap(), binaries).unwrap();
+        assert!(matches!(
+            bundle.prepare_local(cache.path()).await,
+            Err(ToolRuntimeError::UnprovidedAlias {
+                tool: ManagedTool::Coreutils,
+                ..
+            })
         ));
     }
 
@@ -1151,7 +1624,7 @@ pub mod tests {
         let second = bundle.prepare_local(cache.path()).await.unwrap();
         assert_eq!(first.bin_dir(), second.bin_dir());
         assert_eq!(first.catalog(), second.catalog());
-        for tool in ManagedTool::ALL {
+        for &tool in native_tools() {
             let path = first.bin_dir().join(tool.executable_name(&bundle.target));
             assert_eq!(
                 async_fs::read(path).await.unwrap().as_slice(),
@@ -1181,7 +1654,7 @@ pub mod tests {
         let left = left.unwrap();
         let right = right.unwrap();
         assert_eq!(left.bin_dir(), right.bin_dir());
-        for tool in ManagedTool::ALL {
+        for &tool in native_tools() {
             assert!(
                 left.bin_dir()
                     .join(tool.executable_name(&bundle.target))
@@ -1221,7 +1694,7 @@ pub mod tests {
     }
 
     fn assert_prepared(bundle: &ToolBundle, prepared: &PreparedTools<PathBuf>) {
-        for tool in ManagedTool::ALL {
+        for &tool in native_tools() {
             let path = prepared
                 .bin_dir()
                 .join(tool.executable_name(&bundle.target));
@@ -1333,7 +1806,7 @@ pub mod tests {
         let snapshot = |prepared: &PreparedTools<PathBuf>| {
             let mut entries = vec![prepared.bin_dir().parent().unwrap().to_path_buf()];
             entries.push(prepared.bin_dir().clone());
-            entries.extend(ManagedTool::ALL.into_iter().map(|tool| {
+            entries.extend(native_tools().iter().map(|tool| {
                 prepared
                     .bin_dir()
                     .join(tool.executable_name(&bundle.target))
@@ -1374,7 +1847,7 @@ pub mod tests {
         let catalog = bundle().catalog();
         let first = catalog.render().unwrap();
         assert_eq!(first, catalog.render().unwrap());
-        for command in ManagedTool::ALL {
+        for command in native_tools() {
             assert!(first.contains(command.command()), "{command:?}");
         }
         assert!(first.contains("ast-grep run"));

@@ -5832,14 +5832,26 @@ mod tests {
         .expect("terminal tool should initialize")
     }
 
-    /// A trusted manifest serving `script` for every managed tool at version 1.0.0.
+    /// A trusted manifest serving one script, which reports `tool 1.0.0` and
+    /// lists the coreutils aliases, for every managed tool at version 1.0.0.
     #[cfg(unix)]
-    async fn script_distribution(directory: &Path, script: &[u8]) -> ToolDistribution {
+    async fn script_distribution(directory: &Path) -> ToolDistribution {
+        // Invoked through a coreutils alias it runs the host's command of
+        // that name, so the scripts of these tests still find `pwd` and `cat`.
+        let commands = crate::ManagedTool::ALL.map(crate::ManagedTool::command);
+        let script = format!(
+            "#!/bin/sh\ncase \"${{0##*/}}\" in {}) ;; *) PATH=/usr/bin:/bin exec \"${{0##*/}}\" \"$@\";; esac\n\
+             case \"$1\" in --list) printf '%s\\n' {}; exit 0;; esac\nprintf '%s\\n' 'tool 1.0.0'\n",
+            commands.join("|"),
+            crate::tool_runtime::COREUTILS_ALIASES.join(" ")
+        )
+        .into_bytes();
+        let script = script.as_slice();
         let path = directory.join("baseline-tool");
         async_fs::write(&path, script).await.unwrap();
-        let artifacts = crate::ManagedTool::ALL
-            .into_iter()
-            .map(|tool| crate::ToolArtifact {
+        let artifacts = crate::tool_runtime::tests::native_tools()
+            .iter()
+            .map(|&tool| crate::ToolArtifact {
                 tool,
                 version: "1.0.0".into(),
                 target: crate::ToolTarget::native().unwrap(),
@@ -5864,11 +5876,7 @@ mod tests {
         // Full preparation asks the authorizer before connecting to every
         // server; the denial ends it.
         let artifacts = tempfile::tempdir().unwrap();
-        let distribution = script_distribution(
-            artifacts.path(),
-            b"#!/bin/sh\nprintf '%s\\n' 'tool 1.0.0'\n",
-        )
-        .await;
+        let distribution = script_distribution(artifacts.path()).await;
         let first = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let denied = fresh_terminal(first.path())
@@ -5963,11 +5971,7 @@ mod tests {
         );
 
         let artifacts = tempfile::tempdir().unwrap();
-        let distribution = script_distribution(
-            artifacts.path(),
-            b"#!/bin/sh\nprintf '%s\\n' 'tool 1.0.0'\n",
-        )
-        .await;
+        let distribution = script_distribution(artifacts.path()).await;
         let cache = tempfile::tempdir().unwrap();
         let host = container
             .host_tools(&distribution, cache.path())

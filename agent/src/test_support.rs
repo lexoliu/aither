@@ -14,6 +14,16 @@ pub async fn compile_baseline_fixture(source: &std::path::Path) -> std::path::Pa
         .join("baseline-tool")
         .with_extension(std::env::consts::EXE_EXTENSION);
     let compiled = async_process::Command::new("rustc")
+        .env(
+            "BASELINE_ALIASES",
+            aither_sandbox::ManagedTool::Coreutils.aliases().join("\n"),
+        )
+        .env(
+            "BASELINE_COMMANDS",
+            aither_sandbox::ManagedTool::ALL
+                .map(aither_sandbox::ManagedTool::command)
+                .join("\n"),
+        )
         .arg("--crate-name")
         .arg("baseline_tool")
         .arg(&fixture)
@@ -63,7 +73,8 @@ pub async fn fixture_distribution(
     binary: &std::path::Path,
     version: &str,
 ) -> aither_sandbox::ToolDistribution {
-    let artifacts = fixture_artifacts(binary, version, &aither_sandbox::ManagedTool::ALL).await;
+    let native = aither_sandbox::ToolTarget::native().unwrap();
+    let artifacts = fixture_artifacts(binary, version, native.required_tools()).await;
     distribution_of(
         &artifacts
             .iter()
