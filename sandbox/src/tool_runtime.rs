@@ -665,20 +665,28 @@ impl ToolBundle {
             Ok(()) => {}
             Err(error) if destination.try_exists()? => {
                 tracing::debug!(%error, "another initializer activated the tool bundle");
-                unlock_tree(stage.path())?;
+                self.unlock_python(stage.path())?;
             }
             Err(error) => {
-                unlock_tree(stage.path())?;
+                self.unlock_python(stage.path())?;
                 return Err(error.into());
             }
         }
         if let Some(discarded) = discarded {
-            // The managed interpreter tree is read-only; opening it up is what
-            // lets the discarded copy be deleted.
-            unlock_tree(&discarded.path().join("runtime"))?;
+            self.unlock_python(&discarded.path().join("runtime"))?;
             discarded.close()?;
         }
         self.verify_prepared(&destination)
+    }
+
+    /// Opens up the read-only managed interpreter tree under `runtime` so the
+    /// runtime can be deleted. A bundle without Python has no such tree, and
+    /// its platform may have no permission modes to change.
+    fn unlock_python(&self, runtime: &Path) -> Result<(), ToolRuntimeError> {
+        if self.python.is_some() {
+            unlock_tree(runtime)?;
+        }
+        Ok(())
     }
 
     /// Verifies an existing runtime; `None` when it is absent or must be replaced.
