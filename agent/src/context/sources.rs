@@ -230,7 +230,7 @@ impl ContextSource for BackgroundJobs {
             "system_reminder",
             &SystemReminderTemplate {
                 content: format!(
-                    "Running background terminals:\n{running}Use terminal_read for incremental output, read redirected output files via terminal commands like head/tail/grep/cat when needed, terminal_input for stdin, and terminal_kill to stop tasks."
+                    "Running background terminals:\n{running}Use terminal_read for incremental output, read redirected output files via terminal commands like head/tail/rg/cat when needed, terminal_input for stdin, and terminal_kill to stop tasks."
                 ),
             },
         ))

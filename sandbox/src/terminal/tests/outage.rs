@@ -8,7 +8,10 @@ use super::*;
 type Terminal = TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>;
 
 /// A terminal recording `connectivity`; the cache directory must outlive it.
-async fn terminal(dir: &Path, connectivity: &Connectivity) -> (tempfile::TempDir, Terminal) {
+async fn terminal(
+    dir: &Path,
+    connectivity: &Connectivity,
+) -> (crate::tool_runtime::tests::UnlockingTempDir, Terminal) {
     let (cache, shell_sessions) = prepared_test_registry().await;
     let tool = TerminalTool::new_exact(
         dir,

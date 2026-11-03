@@ -1,0 +1,58 @@
+# Determinator rules for the CI scope job (ci.yml `scope`).
+#
+# A changed file under a package's directory already belongs to that package
+# (the determinator's ancestor matching), so these rules only map what lies
+# outside every package. The root `aither` package's directory is the
+# repository root, so a top-level path no rule names resolves only to it by
+# directory and the tool reports it as unmatched, which selects the whole
+# workspace: an unlisted path widens the run rather than narrowing it.
+
+# The lockfile, workspace manifest, toolchain and cargo-level configuration
+# can change every build a job runs.
+[[path-rule]]
+globs = [
+    "Cargo.lock",
+    "Cargo.toml",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+    ".cargo/**",
+]
+mark-changed = "all"
+
+# Lint, format, typo and test-runner configuration applies to every crate's
+# gate run. The determinator's defaults mark `clippy.toml` and `rustfmt.toml`
+# as changing nothing, which is wrong for these jobs.
+[[path-rule]]
+globs = [
+    "clippy.toml",
+    "Clippy.toml",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+    "_typos.toml",
+    ".typos.toml",
+    ".config/**",
+]
+mark-changed = "all"
+
+# Workflows, composite actions, their tests and this file can rewrite what a
+# run does, so a change there is verified against the whole workspace.
+[[path-rule]]
+globs = [
+    ".github/workflows/**",
+    ".github/actions/**",
+    ".github/tests/**",
+    ".github/affected-rules.toml",
+]
+mark-changed = "all"
+
+# Prose outside every package selects nothing. These globs are deliberately
+# not `**/`: a markdown file inside a package is owned by that package,
+# because `include_str!` and `#![doc]` may compile it into a crate.
+[[path-rule]]
+globs = [
+    "*.md",
+    "LICENSE*",
+    "logo.svg",
+    ".github/ISSUE_TEMPLATE/**",
+]
+mark-changed = []

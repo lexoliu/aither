@@ -17,6 +17,14 @@ on:
         description: JSON array of runners to test on.
         required: true
         type: string
+      filterset:
+        description: >-
+          Nextest filterset naming the affected packages, empty to run every
+          test. It narrows what runs, never what is built, so the build keeps
+          the `flags` feature resolution the saved caches were built with.
+        required: false
+        default: ''
+        type: string
       free-disk:
         description: Reclaim runner disk before building. Ubuntu only.
         required: false
@@ -58,7 +66,10 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: taiki-e/install-action@nextest
       - uses: ./.github/actions/install-heel
-      - run: cargo nextest run ${{ inputs.flags }}
+      - shell: bash
+        env:
+          FILTERSET: ${{ inputs.filterset }}
+        run: cargo nextest run ${{ inputs.flags }} ${FILTERSET:+--no-tests=pass -E "$FILTERSET"}
       # cargo test never ran proc-macro doctests; keep aither-derive excluded so
       # this step covers exactly the doctests the previous job did.
       - run: cargo test --doc ${{ inputs.flags }} --exclude aither-derive

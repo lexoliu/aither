@@ -7,7 +7,7 @@ on:
     inputs:
       patch-tag:
         description: >-
-          An existing patch-v<version> release to publish apply_patch assets and
+          An existing patch-v<version> release to publish the tool assets and
           the tool-distribution manifest for, built from the commit its tag
           points at. Leave empty for a normal release run.
         type: string
@@ -53,31 +53,9 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: ci-ubuntu
-      # The water-rs fork of release-plz (from release-plz-v0.3.161, the
-      # version release-plz-action@v0.5 pins) treats a package it cannot
-      # compare with the registry as changed instead of aborting the whole
-      # run. Stock release-plz walks back to the commit that last touched a
-      # crate and runs `cargo package` there; older commits of this workspace
-      # referenced sibling checkouts by path, so that packaging fails and the
-      # release never gets past the first crate.
-      # The fork ships no binaries, so build-release-tools.yml compiles each
-      # revision once and hosts the tarball on the `devtools` release — the
-      # Actions cache cannot hold it across the weeks between releases.
-      # After a fork rebase, run that workflow with the new rev, then bump it
-      # here.
-      - name: Install release-plz (prebuilt)
-        env:
-          REV: cc554a52e97e0ee359e45c7801d770895247cf27
-        run: |
-          set -euo pipefail
-          asset="release-plz-${REV}-x86_64-unknown-linux-gnu.tar.gz"
-          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/devtools"
-          curl -fsSL "${base}/${asset}" -o "${RUNNER_TEMP}/${asset}"
-          curl -fsSL "${base}/${asset}.sha256" -o "${RUNNER_TEMP}/${asset}.sha256"
-          cd "${RUNNER_TEMP}"
-          sha256sum -c "${asset}.sha256"
-          tar -xzf "${asset}" -C "${CARGO_HOME}/bin"
-          release-plz --version
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: release-plz@0.4.3
       - uses: release-plz/git-config@v0.1.2
       # release-pr semver-checks every changed library against its registry
       # version, one cargo-semver-checks process per crate. Each builds a
@@ -184,7 +162,7 @@ jobs:
             echo "released=${released}"
           } >> "${GITHUB_OUTPUT}"
 
-  # Rebuilt-std `apply_patch` binaries ship as assets on the patch-v<version>
+  # Rebuilt-std binaries of the aither-built tools (patch/built-tools.json) ship as assets on the patch-v<version>
   # GitHub release, next to the tool-distribution manifest may's initializer
   # consumes (aither #104/#113). The PR-time build+verify matrix is reused
   # through workflow_call, restricted to the `immediate` abort variant that
@@ -229,7 +207,7 @@ jobs:
 
   # A manual run skips release-plz, which would skip every job downstream of
   # it unless the condition checks the needed job's result itself.
-  apply-patch-artifacts:
+  tool-artifacts:
     needs: patch-release
     if: >-
       always() && !cancelled() && needs.patch-release.result == 'success'
@@ -242,14 +220,16 @@ jobs:
       ref: ${{ needs.patch-release.outputs.tag }}
 
   publish-patch-assets:
-    name: Publish apply_patch assets
-    needs: [patch-release, apply-patch-artifacts]
+    name: Publish tool assets
+    needs: [patch-release, tool-artifacts]
     if: >-
-      always() && !cancelled() && needs.apply-patch-artifacts.result == 'success'
+      always() && !cancelled() && needs.tool-artifacts.result == 'success'
       && needs.patch-release.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      attestations: write
+      id-token: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ needs.patch-release.outputs.tag }}
@@ -260,31 +240,51 @@ jobs:
           ref: ${{ needs.patch-release.outputs.tag }}
       - uses: actions/download-artifact@v4
         with:
-          pattern: apply-patch-*-immediate
+          pattern: tools-*-immediate
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bash-*
           path: artifacts
           merge-multiple: true
       - name: Build the tool-distribution manifest
         run: >-
           patch/build-manifest.sh artifacts "${TAG}" "${GITHUB_REPOSITORY}"
           > "tool-distribution-${VERSION}.json"
-      # Every sha256 is 64 lowercase hex, and apply_patch coverage must span
-      # the same (os, arch) set the pinned third-party entries do — the
-      # expected targets come from that data file, not a duplicated list.
+      # Every sha256 is 64 lowercase hex, and each aither-built tool must
+      # cover exactly the targets patch/built-tools.json lists for it. Bash
+      # must span the non-Windows (os, arch) set the pinned third-party
+      # entries do — its expected targets come from that data file, not a
+      # duplicated list.
       - name: Validate the manifest and staged assets
         run: |
           set -euo pipefail
           manifest="tool-distribution-${VERSION}.json"
-          jq -e --slurpfile third_party patch/third-party-tools.json '
+          jq -e -L patch --slurpfile third_party patch/third-party-tools.json --slurpfile built patch/built-tools.json '
+            include "targets";
             ([.artifacts[].sha256] | all(test("^[0-9a-f]{64}$"))) and
             ([.host_programs[] | .sha256, .executable_sha256] | all(test("^[0-9a-f]{64}$"))) and
-            ([.artifacts[] | select(.tool == "apply_patch") | .target] | sort
-              == ($third_party[0].artifacts | map(.target) | unique | sort))
+            (. as $manifest | $built[0].tools | all(
+              . as $listed
+              | ([$manifest.artifacts[] | select(.tool == $listed.tool) | .target] | sort)
+                == ($listed.targets | map(platform_of) | sort))) and
+            ([.artifacts[] | select(.tool == "bash") | .target] | sort
+              == ($third_party[0].artifacts | map(.target | select(.os != "windows")) | unique | sort))
           ' "${manifest}" > /dev/null
-          for meta in artifacts/apply_patch-*.json; do
+          tools="$(jq -r '.tools[].tool' patch/built-tools.json)"
+          for meta in $(for tool in ${tools} bash; do ls artifacts/"${tool}"-[0-9]*.json; done); do
             file="$(jq -r .file "${meta}")"
             [ -f "artifacts/${file}" ] && [ -f "artifacts/${file}.sha256" ] \
               || { echo "missing staged asset for ${file}" >&2; exit 1; }
           done
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+            tool-distribution-${{ needs.patch-release.outputs.version }}.json
       - name: Upload release assets
         run: >-
           gh release upload "${TAG}" --clobber

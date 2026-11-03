@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::{
-    TerminalArgs, TerminalTool, ToolDistribution, ToolRegistryBuilder,
+    TerminalArgs, TerminalTool, ToolDistribution, ToolRegistryBuilder, ToolTarget,
     permission::NoopPermissionHandler,
 };
 
@@ -20,6 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     };
+    let pinned: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
     let distribution = ToolDistribution::from_path(&PathBuf::from(manifest)).await?;
     let terminal = TerminalTool::new_exact(
         PathBuf::from(workspace),
@@ -35,11 +36,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "description": "Verify prepared search, JSON and edit commands",
         "script": include_str!("../templates/verify_baseline_tools.sh"),
         "mode": "sandboxed",
-        "raw": true
+        "raw": true,
+        "timeout": 120
     }))?;
     let result = terminal.call(arguments, ToolContext::new()).await?;
     let output = result.render_for_model();
     assert!(output.contains("baseline acceptance passed"), "{output}");
+    // `uv --version` and `python3 --version` report the manifest's pins.
+    let target = ToolTarget::native()?;
+    if target.provides_python() {
+        let pin_of = |entries: &str, key: &str, matches: &dyn Fn(&serde_json::Value) -> bool| {
+            pinned[entries]
+                .as_array()
+                .and_then(|entries| entries.iter().find(|entry| matches(entry)))
+                .and_then(|entry| entry[key].as_str())
+                .map(str::to_owned)
+        };
+        let on_target = |entry: &serde_json::Value| {
+            entry["target"]["os"] == target.os() && entry["target"]["arch"] == target.arch()
+        };
+        let uv = pin_of("artifacts", "version", &|entry| {
+            entry["tool"] == "uv" && on_target(entry)
+        })
+        .expect("the manifest pins uv for the host");
+        let python =
+            pin_of("python", "version", &on_target).expect("the manifest pins python for the host");
+        assert!(
+            output.contains(&format!("uv {uv} ")),
+            "uv {uv} missing: {output}"
+        );
+        assert!(
+            output.contains(&format!("Python {python}")),
+            "Python {python} missing: {output}"
+        );
+    }
     assert!(!output.contains("Exit code:"), "{output}");
     assert!(!output.contains("Started in background"), "{output}");
     Ok(())

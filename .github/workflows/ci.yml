@@ -4,6 +4,7 @@ on:
   push:
     branches: [dev]
   pull_request:
+  merge_group:
 
 # Keyed per event, so a branch with a pull request open runs the suite twice --
 # once for the push, once for the pull request. Keying on the head branch
@@ -12,20 +13,120 @@ on:
 # reads as broken when it is fine, and how much of the run got cancelled
 # decides how red it looks. Minutes are free on a public repository; a red tick
 # on a release branch is not. Within a single event a run still cancels the one
-# it supersedes, which is the case that actually wastes a runner.
+# it supersedes, which is the case that actually wastes a runner. A dev push
+# run is the only one that saves the Rust caches, so dev runs queue instead:
+# cancelling one mid-build leaves no cache for the runs after it. A newer
+# push still replaces a dev run that has not started.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/dev' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ---------------------------------------------------------------------- scope
+  # Which crates this change can reach: the changed crates plus everything that
+  # depends on them. A pull request measures against its base branch; a push to
+  # dev has no base, so the tool selects the whole workspace and the full suite
+  # runs unchanged. Workflows, the toolchain, the lockfile, cargo and nextest
+  # configuration, and any path the rules do not name select the whole
+  # workspace; prose selects nothing (.github/affected-rules.toml). A merge
+  # group has no base either, so the queue runs the full suite on the exact
+  # commit that lands on dev.
+  #
+  # A pull request from dev into main proposes a commit dev's merge queue
+  # already tested, so it selects nothing and only the feature checks, which
+  # the queue does not run, still run on it.
+  #
+  # Scoped runs keep dev's cache-saved feature resolution where they can: build
+  # commands keep their `--workspace` / `--all-features` flags, and the test
+  # jobs narrow only which tests run, with a nextest filterset. A cargo `-p` or
+  # `--exclude` list changes which packages' features are unified into the
+  # dependency graph, which changes build units and misses the cache, so no
+  # job narrows its build that way.
+  scope:
+    name: Scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      queued: ${{ steps.jobs.outputs.queued }}
+      workspace: ${{ steps.jobs.outputs.workspace }}
+      packages: ${{ steps.scope.outputs.packages }}
+      package-args: ${{ steps.scope.outputs.package-args }}
+      features: ${{ steps.jobs.outputs.features }}
+      rust: ${{ steps.jobs.outputs.rust }}
+      wasm: ${{ steps.jobs.outputs.wasm }}
+      sandbox: ${{ steps.jobs.outputs.sandbox }}
+      apple: ${{ steps.jobs.outputs.apple }}
+      filterset: ${{ steps.jobs.outputs.filterset }}
+    steps:
+      # The tool diffs from the merge-base with the base branch, which needs
+      # the history rather than a shallow clone.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - id: scope
+        uses: lexoliu/affected-crates@v0.0.0
+        with:
+          base: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+          rules: .github/affected-rules.toml
+      # Turns the affected set into what each job reads. `rust` is any affected
+      # crate (nothing at all for a prose-only change); `wasm`, `sandbox` and
+      # `apple` are true when a crate the matching job builds is affected, which
+      # a changed dependency of it also makes true. `filterset` narrows nextest
+      # to the affected packages and is empty for the whole workspace.
+      # `features` is `rust` on a pull request into main; `queued` (a pull
+      # request from dev into main) then clears every other output.
+      - id: jobs
+        env:
+          WORKSPACE: ${{ steps.scope.outputs.workspace }}
+          PACKAGES: ${{ steps.scope.outputs.packages }}
+          INTO_MAIN: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' }}
+          QUEUED: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'dev' }}
+        run: |
+          set -euo pipefail
+          rust=$([ "${WORKSPACE}" = true ] || [ -n "${PACKAGES}" ] && echo true || echo false)
+          features=$([ "${INTO_MAIN}" = true ] && [ "${rust}" = true ] && echo true || echo false)
+          if [ "${QUEUED}" = true ]; then
+            WORKSPACE=false
+            PACKAGES=""
+            rust=false
+          fi
+          has() {
+            [ "${WORKSPACE}" = true ] && return 0
+            for want in "$@"; do
+              case " ${PACKAGES} " in *" ${want} "*) return 0 ;; esac
+            done
+            return 1
+          }
+          flag() { if "$@"; then echo true; else echo false; fi; }
+          filterset=""
+          if [ "${WORKSPACE}" != true ]; then
+            for name in ${PACKAGES}; do
+              filterset="${filterset:+${filterset} | }package(=${name})"
+            done
+          fi
+          {
+            echo "queued=${QUEUED}"
+            echo "workspace=${WORKSPACE}"
+            echo "features=${features}"
+            echo "rust=${rust}"
+            echo "wasm=$(flag has aither-core aither-openai aither-gemini aither-claude)"
+            echo "sandbox=$(flag has aither-sandbox)"
+            echo "apple=$(flag has aither-apple)"
+            echo "filterset=${filterset}"
+          } >> "${GITHUB_OUTPUT}"
+          cat "${GITHUB_OUTPUT}"
+
   # ---------------------------------------------------------------- fast gates
   # These need no build, so they answer in seconds and catch the cheap mistakes
   # before anyone waits on a compile.
   typos:
     name: Typos
+    needs: scope
+    if: needs.scope.outputs.queued != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -34,6 +135,8 @@ jobs:
 
   audit:
     name: Security Audit
+    needs: scope
+    if: needs.scope.outputs.workspace == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # audit-check reports through a check run, which the default read-only
@@ -51,6 +154,8 @@ jobs:
 
   format:
     name: Format
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -62,6 +167,8 @@ jobs:
 
   workflow-gates:
     name: Workflow Gates
+    needs: scope
+    if: needs.scope.outputs.workspace == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -71,6 +178,8 @@ jobs:
 
   unused-deps:
     name: Unused Dependencies
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -83,6 +192,8 @@ jobs:
   # branch nobody lints, and platform-gated code is where that bites.
   lint:
     name: Lint
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -110,6 +221,8 @@ jobs:
 
   wasm:
     name: WASM
+    needs: scope
+    if: needs.scope.outputs.wasm == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -138,6 +251,8 @@ jobs:
   # this way compiles 132 packages instead of 487.
   test-portability:
     name: Test
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     uses: ./.github/workflows/test.yml
     with:
       flags: >-
@@ -147,6 +262,7 @@ jobs:
         --exclude aither-apple
         --no-default-features --features derive,serde,agent,mcp,skills
       cache-key: portable
+      filterset: ${{ needs.scope.outputs.filterset }}
       os: '["ubuntu-latest", "windows-latest", "macos-latest"]'
 
   # aither-apple compiles a Swift bridge against the Foundation Models
@@ -156,6 +272,8 @@ jobs:
   # runs deterministic native tests while deployment targets remain OS 26.
   test-apple:
     name: Apple Intelligence (native)
+    needs: scope
+    if: needs.scope.outputs.apple == 'true'
     runs-on: xcode-27
     timeout-minutes: 30
     env:
@@ -178,10 +296,13 @@ jobs:
 
   test-full:
     name: Test (all features)
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     uses: ./.github/workflows/test.yml
     with:
       flags: --workspace --all-features
       cache-key: full
+      filterset: ${{ needs.scope.outputs.filterset }}
       os: '["ubuntu-latest"]'
       free-disk: true
 
@@ -191,6 +312,8 @@ jobs:
   # by `--all-features` in test-full, where no docker daemon exists.
   container-acceptance:
     name: Container Acceptance
+    needs: scope
+    if: needs.scope.outputs.sandbox == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -217,7 +340,8 @@ jobs:
   # requests bound for main, not on routine dev pushes and PRs.
   feature-checks:
     name: Features (${{ matrix.part }}/8)
-    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    needs: scope
+    if: needs.scope.outputs.features == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -273,6 +397,8 @@ jobs:
   # knowing, so llama and ort stay out of it.
   coverage:
     name: Coverage
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -297,11 +423,18 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       # `full` would re-enable llama and ort, and --exclude only skips testing
       # a package, not building it as a dependency. So the set is spelled out.
-      - run: >
+      # Narrowed by filterset like the test jobs, so the build keeps the
+      # `--workspace` resolution dev's cache holds; a scoped report covers only
+      # the affected crates.
+      - shell: bash
+        env:
+          FILTERSET: ${{ needs.scope.outputs.filterset }}
+        run: >
           cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
           --no-default-features
           --features derive,serde,openai,claude,gemini,agent,rag,mem0,skills,mcp,browser,websearch,webfetch,search,fs,command
           --exclude aither-llama --exclude aither-ort
+          ${FILTERSET:+--no-tests=pass -E "$FILTERSET"}
       - uses: codecov/codecov-action@v4
         with:
           files: lcov.info

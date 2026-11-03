@@ -120,6 +120,10 @@ name = "aither-search"
 git_tag_name = "search-v{{ version }}"
 
 [[package]]
+name = "aither-sed"
+git_tag_name = "sed-v{{ version }}"
+
+[[package]]
 name = "aither-skills"
 git_tag_name = "skills-v{{ version }}"
 

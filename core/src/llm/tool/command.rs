@@ -266,7 +266,7 @@ mod tests {
         };
         assert_eq!(
             result(stored, None, CommandOutcome::Exited { code: 0 }),
-            "head\n[Partial view: the full output is saved to outputs/x.txt (absolute path: /sandbox/outputs/x.txt). Use head/tail/grep/sed on that file to read the rest.]\n"
+            "head\n[Partial view: the full output is saved to outputs/x.txt (absolute path: /sandbox/outputs/x.txt). Use head/tail/rg on that file to read the rest.]\n"
         );
         let image = CommandStream::Image {
             media_type: "image/png".to_string(),

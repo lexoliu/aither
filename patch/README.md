@@ -45,10 +45,11 @@ preservation, all-or-nothing validation — live in `src/lib.rs`.
 ## Artifact build
 
 Prebuilt delivery lets us optimize the whole artifact. `build-artifact.sh
-<target>` builds only this binary with the pinned nightly
+<target>` builds the binaries of every tool `built-tools.json` lists for the
+target (this one among them) with the pinned nightly
 `nightly-2026-10-01` (+`rust-src`), `-Zbuild-std=std,panic_abort` and the
-workspace `apply-patch` profile (`opt-level=z`, `lto`, `codegen-units=1`,
-`strip=symbols`, `panic=abort`; `APPLY_PATCH_ABORT=immediate` adds
+workspace `artifact` profile (`opt-level=z`, `lto`, `codegen-units=1`,
+`strip=symbols`, `panic=abort`; `ARTIFACT_ABORT=immediate` adds
 `-Cpanic=immediate-abort`). Neither MSRV nor any other crate's release
 behavior is affected; ordinary development stays on stable.
 
@@ -57,7 +58,7 @@ Measured executable bytes (`apply_patch` 0.6.0, x86-64):
 | build | size |
 | --- | --- |
 | stable `--release`, stripped | 494,928 |
-| `apply-patch` profile (`z`, lto, cu=1) | 394,624 |
+| `artifact` profile (`z`, lto, cu=1) | 394,624 |
 | + `panic=abort` | 384,360 |
 | + nightly `-Zbuild-std` (panic_unwind abort shim) | 360,440 |
 | + `-Zbuild-std` `panic_abort` | 336,240 |
@@ -75,7 +76,7 @@ Notes from the experiment:
   with a location but no message); ordinary patch errors are returned
   `Result`s and keep their full text. It is the shipped default because
   this binary's error surface is validation failures, not panics; set
-  `APPLY_PATCH_ABORT=panic` for standard abort diagnostics.
+  `ARTIFACT_ABORT=panic` for standard abort diagnostics.
 - No packer and no exotic linking: the Linux artifacts are ordinary
   static musl executables (the native Linux build links plain glibc).
 - `rust-lld` supplies the linker so musl targets build without a system

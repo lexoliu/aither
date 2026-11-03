@@ -232,16 +232,22 @@ fn is_shell_builtin(program: &str) -> bool {
     )
 }
 
-fn shell_launch(script: &str) -> (String, Vec<String>) {
+/// The program and arguments that run `script` in a shell. Windows runs
+/// `cmd.exe`; every other platform runs `managed_shell`, the managed bash.
+fn shell_launch(managed_shell: &str, script: &str) -> (String, Vec<String>) {
     #[cfg(windows)]
     {
+        let _ = managed_shell;
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
         return (shell, vec!["/C".to_string(), script.to_string()]);
     }
 
     #[cfg(not(windows))]
     {
-        ("sh".to_string(), vec!["-c".to_string(), script.to_string()])
+        (
+            managed_shell.to_string(),
+            crate::tool_runtime::shell_arguments(script),
+        )
     }
 }
 
@@ -249,6 +255,7 @@ fn shell_launch(script: &str) -> (String, Vec<String>) {
 /// file records the shell's final directory there when it exits; a direct
 /// command cannot change directory, so it reports nothing.
 fn build_terminal_launch(
+    managed_shell: &str,
     script: &str,
     report: Option<&Path>,
 ) -> Result<TerminalLaunch, TerminalError> {
@@ -261,7 +268,7 @@ fn build_terminal_launch(
 
     match direct_command(script)? {
         Some((program, args)) => Ok(TerminalLaunch::Direct { program, args }),
-        None => shell_launch_reporting(script, report),
+        None => shell_launch_reporting(managed_shell, script, report),
     }
 }
 
@@ -272,7 +279,10 @@ fn direct_command(script: &str) -> Result<Option<(String, Vec<String>)>, Termina
         return Ok(None);
     }
     let (program, args) = parse_direct_command(script)?;
-    if looks_like_env_assignment(&program) || is_shell_builtin(&program) {
+    if looks_like_env_assignment(&program)
+        || is_shell_builtin(&program)
+        || crate::tool_runtime::is_blocked_command(&program)
+    {
         return Ok(None);
     }
     Ok(Some((program, args)))
@@ -292,15 +302,16 @@ struct CarryCwdTemplate<'a> {
 }
 
 fn shell_launch_reporting(
+    managed_shell: &str,
     script: &str,
     report: Option<&Path>,
 ) -> Result<TerminalLaunch, TerminalError> {
     let Some(report) = report else {
-        let (program, args) = shell_launch(script);
+        let (program, args) = shell_launch(managed_shell, script);
         return Ok(TerminalLaunch::Shell { program, args });
     };
     let script = carry_cwd_script(script, &report.to_string_lossy())?;
-    let (program, args) = shell_launch(&script);
+    let (program, args) = shell_launch(managed_shell, &script);
     Ok(TerminalLaunch::Shell { program, args })
 }
 
@@ -3899,6 +3910,13 @@ fn local_path_grants(
             resolved(tools.bin_dir())?,
             Access::EXEC,
         ))))
+        // The shared `uv` cache and project Python installs, which `uv`
+        // writes and the interpreters it installs execute.
+        .chain(
+            tools
+                .uv_dir()
+                .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE | Access::EXEC))),
+        )
         .chain(
             job_fifo
                 .iter()
@@ -4008,6 +4026,7 @@ where
         .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
 
     let launch = build_terminal_launch(
+        &context.prepared_tools.shell()?,
         context.script,
         context.carry.map(|carry| carry.report.as_path()),
     )?;
@@ -4115,6 +4134,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
 
     let launch = build_terminal_launch(
+        &context.prepared_tools.shell()?,
         context.script,
         context.carry.map(|carry| carry.report.as_path()),
     )?;
@@ -4636,10 +4656,11 @@ fn container_exec_script(
         format!("{preamble}{script}")
     };
     let script = prepared_tools.wrap_script(&script)?;
-    match carry {
-        Some(carry) => carry_cwd_script(&script, carry.report.as_str()),
-        None => Ok(script),
-    }
+    let script = match carry {
+        Some(carry) => carry_cwd_script(&script, carry.report.as_str())?,
+        None => script,
+    };
+    Ok(prepared_tools.shell_command(&script)?)
 }
 
 async fn execute_container_background<E: Executor + Clone + 'static>(
@@ -4803,6 +4824,8 @@ async fn record_container_exec_outcome(
 struct SshToolExecutionTemplate<'a> {
     binary: Cow<'a, str>,
     tools_dir: Cow<'a, str>,
+    /// Read, write and execute access to the shared `uv` directory, quoted.
+    uv_grant: Option<String>,
     program: Cow<'a, str>,
     arguments: String,
 }
@@ -4814,11 +4837,24 @@ async fn execute_ssh_background(
     let remote_cmd = match (context.ssh_runtime, context.mode) {
         (SshRuntimeProfile::Heel { binary }, TerminalMode::Sandboxed) => {
             let script = context.prepared_tools.wrap_script(context.script)?;
-            let (program, args) = shell_launch(&script);
+            let (program, args) = shell_launch(&context.prepared_tools.shell()?, &script);
             let directory = context.prepared_tools.script_bin_dir()?;
+            let uv_grant = context
+                .prepared_tools
+                .uv_dir()
+                .map(|dir| {
+                    let dir = dir
+                        .to_str()
+                        .ok_or_else(|| ToolRuntimeError::InvalidCache(dir.clone()))?;
+                    Ok::<_, ToolRuntimeError>(
+                        shell_words::quote(&format!("{dir}=rwx")).into_owned(),
+                    )
+                })
+                .transpose()?;
             SshToolExecutionTemplate {
                 binary: shell_words::quote(binary),
                 tools_dir: shell_words::quote(directory),
+                uv_grant,
                 program: shell_words::quote(&program),
                 arguments: shell_words::join(&args),
             }
@@ -5013,6 +5049,22 @@ async fn prepare_session_runtime_environment(
         ("PLAYWRIGHT_BROWSERS_PATH".to_string(), playwright),
         ("PYTHONPATH".to_string(), python),
     ];
+    // `uv` keeps its cache and the Pythons it installs for projects in one
+    // directory shared by every session, not under the remapped HOME.
+    if let Some(uv) = tools.uv_environment() {
+        env.push((
+            "UV_CACHE_DIR".to_string(),
+            path_environment_value("UV_CACHE_DIR", &uv.cache)?,
+        ));
+        env.push((
+            "UV_PYTHON_INSTALL_DIR".to_string(),
+            path_environment_value("UV_PYTHON_INSTALL_DIR", &uv.python_installs)?,
+        ));
+        env.push((
+            "UV_PYTHON_PREFERENCE".to_string(),
+            crate::tool_runtime::UV_PYTHON_PREFERENCE.to_string(),
+        ));
+    }
     for (name, home) in host_toolchain_homes() {
         env.push((name.to_string(), path_environment_value(name, &home)?));
     }
@@ -5715,8 +5767,11 @@ mod tests {
         }
     }
 
-    async fn prepared_test_registry() -> (tempfile::TempDir, ShellSessionRegistry) {
-        let cache = tempfile::tempdir().unwrap();
+    async fn prepared_test_registry() -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        ShellSessionRegistry,
+    ) {
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
         let tools = crate::tool_runtime::tests::bundle()
             .prepare_local(cache.path())
             .await
@@ -5832,14 +5887,38 @@ mod tests {
         .expect("terminal tool should initialize")
     }
 
-    /// A trusted manifest serving `script` for every managed tool at version 1.0.0.
+    /// A trusted manifest serving one script, which reports `tool 1.0.0` and
+    /// lists the coreutils aliases, for every managed tool at version 1.0.0.
     #[cfg(unix)]
-    async fn script_distribution(directory: &Path, script: &[u8]) -> ToolDistribution {
+    async fn script_distribution(directory: &Path) -> ToolDistribution {
+        // Invoked through a coreutils alias it runs the host's command of
+        // that name, so the scripts of these tests still find `pwd` and `cat`.
+        let commands = crate::ManagedTool::ALL.map(crate::ManagedTool::command);
+        // As `uv`, `python install <request>` installs a copy of the script as
+        // the interpreter, which reports the Python version below.
+        let script = format!(
+            "#!/bin/sh\n\
+             case \"${{0##*/}}\" in bash)\n\
+               case \"$1\" in --version) printf '%s\\n' 'GNU bash, version 1.0.0(1)-release (fixture)'; exit 0;; esac\n\
+               AITHER_FIXTURE_BASH=1.0.0; export AITHER_FIXTURE_BASH; exec /bin/bash \"$@\";; esac\n\
+             case \"${{0##*/}}\" in python*) printf '%s\\n' 'Python 3.13.1'; exit 0;; esac\n\
+             case \"${{0##*/}}\" in {}) ;; *) PATH=/usr/bin:/bin exec \"${{0##*/}}\" \"$@\";; esac\n\
+             case \"$1\" in --list) printf '%s\\n' {}; exit 0;; esac\n\
+             case \"$1\" in python) PATH=/usr/bin:/bin; for request; do :; done; \
+             dir=\"$UV_PYTHON_INSTALL_DIR/$request\"; mkdir -p \"$dir/bin\"; \
+             cp \"$0\" \"$dir/bin/python3.13\"; chmod 755 \"$dir/bin/python3.13\"; \
+             ln -s python3.13 \"$dir/bin/python3\"; exit 0;; esac\n\
+             printf '%s\\n' 'tool 1.0.0'\n",
+            commands.join("|"),
+            crate::tool_runtime::COREUTILS_ALIASES.join(" ")
+        )
+        .into_bytes();
+        let script = script.as_slice();
         let path = directory.join("baseline-tool");
         async_fs::write(&path, script).await.unwrap();
-        let artifacts = crate::ManagedTool::ALL
-            .into_iter()
-            .map(|tool| crate::ToolArtifact {
+        let artifacts = crate::tool_runtime::tests::native_tools()
+            .iter()
+            .map(|&tool| crate::ToolArtifact {
                 tool,
                 version: "1.0.0".into(),
                 target: crate::ToolTarget::native().unwrap(),
@@ -5850,10 +5929,62 @@ mod tests {
                 encoding: crate::ToolArtifactFormat::Executable,
             })
             .collect::<Vec<_>>();
+        let python = crate::tool_runtime::tests::python_pins_for(
+            crate::tool_runtime::digest(script),
+            "3.13.1",
+        );
         ToolDistribution::from_json(
-            &serde_json::to_vec(&serde_json::json!({ "artifacts": artifacts })).unwrap(),
+            &serde_json::to_vec(&serde_json::json!({ "artifacts": artifacts, "python": python }))
+                .unwrap(),
         )
         .unwrap()
+    }
+
+    /// A script runs through the managed bash, not the host's `sh`: the
+    /// fixture bash marks its environment with the pinned version, and the
+    /// script's shell is a real bash.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_script_runs_in_the_managed_bash() {
+        let authorizer = Arc::new(CountingSshAuthorizer::default());
+        let tools_cache = tempfile::tempdir().unwrap();
+        let tools = crate::tool_runtime::tests::bundle()
+            .prepare_local(tools_cache.path())
+            .await
+            .unwrap();
+        let prepared = local_and_ssh_registry(&authorizer)
+            .with_test_tools(tools.clone())
+            .with_test_ssh(build_server(), tools);
+        let directory = tempfile::tempdir().unwrap();
+        let terminal = fresh_terminal(directory.path())
+            .await
+            .adopt_prepared_tools(prepared)
+            .await
+            .expect("a prepared registry should be adopted");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+        let terminal = terminal.with_registry(registry);
+        let result = terminal
+            .call(
+                TerminalArgs {
+                    description: "report the shell".to_string(),
+                    script: "[[ -n $BASH_VERSION ]] && echo \"managed=$AITHER_FIXTURE_BASH bash\""
+                        .to_string(),
+                    mode: TerminalExecutionMode::Sandboxed,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    max_lines: 50,
+                    raw: true,
+                    timeout: 30,
+                    background: false,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("the script should run");
+        let stdout = render_terminal_result(&result);
+        assert!(!stdout.contains("Exit code:"), "{stdout}");
+        assert!(stdout.contains("managed=1.0.0 bash"), "{stdout}");
     }
 
     #[cfg(unix)]
@@ -5864,13 +5995,9 @@ mod tests {
         // Full preparation asks the authorizer before connecting to every
         // server; the denial ends it.
         let artifacts = tempfile::tempdir().unwrap();
-        let distribution = script_distribution(
-            artifacts.path(),
-            b"#!/bin/sh\nprintf '%s\\n' 'tool 1.0.0'\n",
-        )
-        .await;
+        let distribution = script_distribution(artifacts.path()).await;
         let first = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
         let denied = fresh_terminal(first.path())
             .await
             .with_shell_sessions(local_and_ssh_registry(&authorizer))
@@ -5884,7 +6011,7 @@ mod tests {
 
         // Tools pinned to a version their commands do not report: the version
         // probe of full preparation rejects them.
-        let tools_cache = tempfile::tempdir().unwrap();
+        let tools_cache = crate::tool_runtime::tests::unlocking_tempdir();
         let tools = crate::tool_runtime::tests::bundle_pinned("2.0.0")
             .prepare_local(tools_cache.path())
             .await
@@ -5963,12 +6090,8 @@ mod tests {
         );
 
         let artifacts = tempfile::tempdir().unwrap();
-        let distribution = script_distribution(
-            artifacts.path(),
-            b"#!/bin/sh\nprintf '%s\\n' 'tool 1.0.0'\n",
-        )
-        .await;
-        let cache = tempfile::tempdir().unwrap();
+        let distribution = script_distribution(artifacts.path()).await;
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
         let host = container
             .host_tools(&distribution, cache.path())
             .await
@@ -5990,7 +6113,7 @@ mod tests {
     #[tokio::test]
     async fn adoption_rejects_a_registry_changed_after_preparation() {
         let authorizer = Arc::new(CountingSshAuthorizer::default());
-        let tools_cache = tempfile::tempdir().unwrap();
+        let tools_cache = crate::tool_runtime::tests::unlocking_tempdir();
         let tools = crate::tool_runtime::tests::bundle()
             .prepare_local(tools_cache.path())
             .await
@@ -6089,12 +6212,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn shell_launch_uses_a_stable_posix_contract() {
-        let script = "printf '%s\\n' hello | sed -n '1p'";
-        let (program, args) = shell_launch(script);
+    fn shell_launch_runs_the_managed_bash_without_startup_files() {
+        let script = "printf '%s\\n' hello | cat";
+        let (program, args) = shell_launch("/tools/bin/bash", script);
 
-        assert_eq!(program, "sh");
-        assert_eq!(args, ["-c", script]);
+        assert_eq!(program, "/tools/bin/bash");
+        assert_eq!(args[..3], ["--noprofile", "--norc", "-c"]);
+        assert!(args[3].ends_with(script));
+        assert_eq!(args.len(), 4);
+    }
+
+    #[test]
+    fn blocked_commands_always_run_in_the_shell() {
+        for name in ["grep", "sed", "awk", "find"] {
+            assert_eq!(direct_command(&format!("{name} x")).unwrap(), None);
+        }
     }
 
     #[test]
@@ -6125,7 +6257,7 @@ mod tests {
     #[tokio::test]
     async fn session_runtime_environment_is_prepared_without_wrapping_the_script() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
         let ready = crate::tool_runtime::tests::bundle()
             .prepare_local(cache.path())
             .await
@@ -6151,12 +6283,50 @@ mod tests {
         assert!(dir.path().join(".cache/bun").is_dir());
         assert!(dir.path().join(".cache/ms-playwright").is_dir());
         assert!(dir.path().join(".config").is_dir());
+        // `uv` keeps its state in the shared directory, not in the session's HOME.
+        if let Some(uv) = ready.uv_dir() {
+            assert_eq!(
+                value("UV_CACHE_DIR"),
+                uv.join("cache").to_str().expect("UTF-8 temp path")
+            );
+            assert_eq!(
+                value("UV_PYTHON_INSTALL_DIR"),
+                uv.join("python").to_str().expect("UTF-8 temp path")
+            );
+            assert_eq!(value("UV_PYTHON_PREFERENCE"), "system");
+            assert!(!uv.starts_with(dir.path()));
+        }
+    }
+
+    /// The shared `uv` directory is writable and executable beside the
+    /// read-only tools directory, and nothing else of the cache is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_shared_uv_directory_is_a_writable_grant_apart_from_the_tools() {
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
+        let ready = crate::tool_runtime::tests::bundle()
+            .prepare_local(cache.path())
+            .await
+            .unwrap();
+        let uv = ready.uv_dir().expect("the test host has a managed uv");
+        let grants = local_path_grants(&[], &[], &ready, None).expect("grants build");
+        let access_of = |path: &Path| {
+            let path = std::fs::canonicalize(path).unwrap();
+            grants
+                .iter()
+                .find(|grant| grant.resolved_path().as_path() == path)
+                .map(heel::Grant::access)
+        };
+        assert_eq!(access_of(uv), Some(Access::WRITE | Access::EXEC));
+        assert_eq!(access_of(ready.bin_dir()), Some(Access::EXEC));
+        // Neither grant exposes the other.
+        assert!(!ready.bin_dir().starts_with(uv) && !uv.starts_with(ready.bin_dir()));
     }
 
     #[tokio::test]
     async fn session_runtime_environment_sets_toolchain_homes_and_host_path() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
         let cargo_home = tempfile::tempdir().unwrap();
         let rustup_home = tempfile::tempdir().unwrap();
         unsafe {
@@ -6207,7 +6377,7 @@ mod tests {
     async fn local_path_grants_make_writable_dirs_executable() {
         let workdir = tempfile::tempdir().unwrap();
         let readonly = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
         let tools = crate::tool_runtime::tests::bundle()
             .prepare_local(cache.path())
             .await
@@ -6836,7 +7006,10 @@ mod tests {
     /// it without a grant. The directories live as long as the guards.
     #[cfg(unix)]
     async fn parent_and_child_terminals() -> (
-        [tempfile::TempDir; 2],
+        (
+            tempfile::TempDir,
+            crate::tool_runtime::tests::UnlockingTempDir,
+        ),
         ConfiguredTestTool,
         ConfiguredTestTool,
     ) {
@@ -6864,7 +7037,7 @@ mod tests {
             .subagent_without_grant()
             .await
             .expect("an empty grant is always given");
-        ([dir, cache], parent, child)
+        ((dir, cache), parent, child)
     }
 
     /// A child terminal's `terminal_input` and `terminal_read` reach its own
@@ -7547,7 +7720,7 @@ mod tests {
         timeout_cap: Duration,
         alert_after: Duration,
     ) -> (
-        tempfile::TempDir,
+        crate::tool_runtime::tests::UnlockingTempDir,
         TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
@@ -8183,7 +8356,7 @@ mod tests {
         dir: &Path,
         priority: ProcessPriority,
     ) -> (
-        tempfile::TempDir,
+        crate::tool_runtime::tests::UnlockingTempDir,
         TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
@@ -8703,7 +8876,7 @@ mod tests {
     async fn start_acceptance_container() -> (
         TestDockerContainer,
         crate::tool_runtime::ImageTools,
-        tempfile::TempDir,
+        crate::tool_runtime::tests::UnlockingTempDir,
     ) {
         let docker_ready = std::process::Command::new("docker")
             .arg("info")
@@ -8717,12 +8890,12 @@ mod tests {
             .expect("container acceptance requires a Linux heel binary (set HEEL_BIN)");
         let image = crate::tool_runtime::tests::image_tools();
         let bundle = crate::tool_runtime::tests::bundle();
-        let tools_cache = tempfile::tempdir().expect("tool cache dir should be created");
+        let tools_cache = crate::tool_runtime::tests::unlocking_tempdir();
         // Stage the executables under the image's cache key — exactly what
         // `stage_image_tools` produces — and mount the directory where the
         // image carries it.
         let prepared = bundle
-            .prepare_local_sync(tools_cache.path(), &image.cache_key().unwrap())
+            .prepare_local_sync(tools_cache.path(), &image.cache_key().unwrap(), None)
             .expect("test bundle should stage for the image");
         let staged = prepared
             .bin_dir()
@@ -8991,7 +9164,12 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn authority_terminal(dir: &Path) -> (tempfile::TempDir, ConfiguredTestTool) {
+    async fn authority_terminal(
+        dir: &Path,
+    ) -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        ConfiguredTestTool,
+    ) {
         configured_test_terminal(
             dir,
             Duration::from_secs(30),
@@ -9522,7 +9700,7 @@ mod tests {
         /// The subagent's repository.
         subagent: PathBuf,
         parent: ConfiguredTestTool,
-        _cache: tempfile::TempDir,
+        _cache: crate::tool_runtime::tests::UnlockingTempDir,
     }
 
     #[cfg(unix)]
@@ -10648,7 +10826,7 @@ mod tests {
     async fn kill_guard_tool(
         dir: &Path,
     ) -> (
-        tempfile::TempDir,
+        crate::tool_runtime::tests::UnlockingTempDir,
         TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;

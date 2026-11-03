@@ -9,8 +9,8 @@ use url::Url;
 use zenwave::Client;
 
 use crate::tool_runtime::{
-    DistributedTool, HostProgram, HostProgramPath, ImageTool, ImageTools, ManagedTool, ToolBinary,
-    ToolBundle, ToolRuntimeError, ToolTarget, digest,
+    DistributedTool, HostProgram, HostProgramPath, ImageTool, ImageTools, ManagedTool, PythonPin,
+    PythonRuntime, ToolBinary, ToolBundle, ToolRuntimeError, ToolTarget, check_python, digest,
 };
 
 /// A kind of program a manifest artifact can provide.
@@ -105,6 +105,9 @@ pub struct ToolDistribution {
     artifacts: Vec<ToolArtifact>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     host_programs: Vec<HostProgramArtifact>,
+    /// The interpreter the pinned `uv` installs, per platform that has one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    python: Vec<PythonPin>,
 }
 
 impl ToolDistribution {
@@ -144,7 +147,31 @@ impl ToolDistribution {
             validate_artifact(&artifact.artifact)?;
             hex::decode_to_slice(&artifact.executable_sha256, &mut [0; 32])?;
         }
+        for pin in &self.python {
+            pin.runtime()?;
+        }
         Ok(())
+    }
+
+    /// The interpreter pinned for `target`: present exactly on the platforms
+    /// that provide `uv`. A pin for a platform that does not is not selected.
+    ///
+    /// # Errors
+    /// Rejects a missing or duplicate pin for a platform that needs one.
+    fn select_python(
+        &self,
+        target: &ToolTarget,
+    ) -> Result<Option<PythonRuntime>, ToolRuntimeError> {
+        let mut pins = self
+            .python
+            .iter()
+            .filter(|pin| &pin.target == target && target.provides_python());
+        let runtime = pins.next().map(PythonPin::runtime).transpose()?;
+        if pins.next().is_some() {
+            return Err(ToolRuntimeError::DuplicatePython);
+        }
+        check_python(target, runtime.as_ref())?;
+        Ok(runtime)
     }
 
     /// Packages hash-verified executables and a relocatable manifest for installation.
@@ -191,6 +218,7 @@ impl ToolDistribution {
         let content = serde_json::to_vec_pretty(&Self {
             artifacts,
             host_programs,
+            python: self.python.clone(),
         })?;
         let destination = manifest.clone();
         let directory = directory.to_path_buf();
@@ -205,18 +233,20 @@ impl ToolDistribution {
         Ok(manifest)
     }
 
-    /// The artifacts pinned for `target`, exactly one per managed tool.
+    /// The artifacts pinned for `target`, exactly one per tool the target
+    /// requires; pins of other tools for it are not selected.
     ///
     /// # Errors
-    /// Rejects missing or duplicate tools for the target.
+    /// Rejects missing or duplicate required tools for the target.
     fn select_artifacts(&self, target: &ToolTarget) -> Result<Vec<ToolArtifact>, ToolRuntimeError> {
+        let required = target.required_tools();
         let selected = self
             .artifacts
             .iter()
-            .filter(|artifact| &artifact.target == target)
+            .filter(|artifact| &artifact.target == target && required.contains(&artifact.tool))
             .cloned()
             .collect::<Vec<_>>();
-        for tool in ManagedTool::ALL {
+        for &tool in required {
             match selected
                 .iter()
                 .filter(|artifact| artifact.tool == tool)
@@ -253,7 +283,11 @@ impl ToolDistribution {
                 })
             })
             .collect::<Result<Vec<_>, ToolRuntimeError>>()?;
-        Ok(ImageTools::new(target.clone(), tools))
+        Ok(ImageTools::new(
+            target.clone(),
+            tools,
+            self.select_python(target)?,
+        ))
     }
 
     /// Stages the executables an image build must place at
@@ -278,9 +312,16 @@ impl ToolDistribution {
     ) -> Result<PathBuf, ToolRuntimeError> {
         let key = self.image_tools(target)?.cache_key()?;
         let bundle = self.load(target, artifact_cache).await?;
+        // The interpreter of an image for another platform is still installed
+        // by a `uv` that runs here.
+        let installer = if target.provides_python() && *target != ToolTarget::native()? {
+            Some(self.load_native_installer(artifact_cache).await?)
+        } else {
+            None
+        };
         let out = out.to_path_buf();
         blocking::unblock(move || {
-            let prepared = bundle.prepare_local_sync(&out, &key)?;
+            let prepared = bundle.prepare_local_sync(&out, &key, installer.as_deref())?;
             Ok(prepared
                 .bin_dir()
                 .parent()
@@ -313,7 +354,23 @@ impl ToolDistribution {
             .buffer_unordered(ManagedTool::ALL.len())
             .try_collect::<Vec<_>>()
             .await?;
-        ToolBundle::new(target.clone(), binaries)
+        ToolBundle::new(target.clone(), binaries, self.select_python(target)?)
+    }
+
+    /// The bytes of the `uv` pinned for the machine running this build, which
+    /// installs the interpreter of an image for another platform.
+    async fn load_native_installer(
+        &self,
+        artifact_cache: &Path,
+    ) -> Result<Vec<u8>, ToolRuntimeError> {
+        let native = ToolTarget::native()?;
+        let artifact = self
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.tool == ManagedTool::Uv && artifact.target == native)
+            .ok_or(ToolRuntimeError::MissingTool(ManagedTool::Uv))?;
+        async_fs::create_dir_all(artifact_cache).await?;
+        load_artifact(artifact, artifact_cache).await
     }
 
     /// Prepares one host program for the host's platform and returns the path
@@ -643,10 +700,9 @@ fn extract_executable(
 pub mod tests {
     use super::*;
 
-    /// A script executable that reports `<command> <version>` to `--version`.
-    pub fn script_tool(command: &str, version: &str) -> Vec<u8> {
-        format!("#!/bin/sh\nprintf '%s\\n' '{command} {version}'\n").into_bytes()
-    }
+    pub use crate::tool_runtime::tests::{
+        UnlockingTempDir, fixture_python_pin, native_tools, script_tool, unlocking_tempdir,
+    };
 
     /// A distribution pinning one `script_tool` executable per command for
     /// `target`, each artifact located by `url` — file URLs for a fixture that
@@ -659,10 +715,11 @@ pub mod tests {
         dir: &Path,
         url: impl Fn(&Path) -> ToolArtifactLocation,
     ) -> ToolDistribution {
-        let artifacts = ManagedTool::ALL
-            .into_iter()
-            .map(|tool| {
-                let bytes = script_tool(tool.command(), version);
+        let artifacts = target
+            .required_tools()
+            .iter()
+            .map(|&tool| {
+                let bytes = script_tool(tool, version);
                 let path = dir.join(tool.command());
                 std::fs::write(&path, &bytes).unwrap();
                 ToolArtifact {
@@ -678,7 +735,17 @@ pub mod tests {
         ToolDistribution {
             artifacts,
             host_programs: Vec::new(),
+            python: python_pins(target),
         }
+    }
+
+    /// The interpreter pins of `target`: one where it provides `python3`.
+    pub fn python_pins(target: &ToolTarget) -> Vec<PythonPin> {
+        target
+            .provides_python()
+            .then(|| fixture_python_pin(target))
+            .into_iter()
+            .collect()
     }
 
     /// File-backed artifacts for `script_distribution` fixtures that `load` reads.
@@ -692,10 +759,199 @@ pub mod tests {
         ToolArtifactLocation::Download(Url::parse("http://127.0.0.1:9/tool").unwrap())
     }
 
+    /// The repository's pinned third-party tools; `apply_patch`, `aither-sed` and `bash` are added by a release.
+    fn pinned_distribution() -> ToolDistribution {
+        ToolDistribution::from_json(include_bytes!("../../patch/third-party-tools.json")).unwrap()
+    }
+
+    #[test]
+    fn pinned_tools_cover_the_required_set_of_every_platform() {
+        let pinned = pinned_distribution();
+        let mut targets = pinned
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.target.clone())
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|target| (target.os().to_owned(), target.arch().to_owned()));
+        targets.dedup();
+        assert_eq!(targets.len(), 5);
+        for target in targets {
+            for &tool in target.required_tools() {
+                let count = pinned
+                    .artifacts
+                    .iter()
+                    .filter(|artifact| artifact.target == target && artifact.tool == tool)
+                    .count();
+                // A release supplies `apply_patch`, `aither-sed` and `bash`.
+                let expected = usize::from(!matches!(
+                    tool,
+                    ManagedTool::ApplyPatch | ManagedTool::Sed | ManagedTool::Bash
+                ));
+                assert_eq!(
+                    count,
+                    expected,
+                    "{tool:?} for {}/{}",
+                    target.os(),
+                    target.arch()
+                );
+            }
+            let pinned_coreutils = pinned.artifacts.iter().any(|artifact| {
+                artifact.target == target && artifact.tool == ManagedTool::Coreutils
+            });
+            assert_eq!(pinned_coreutils, target.os() != "windows");
+        }
+    }
+
+    #[test]
+    fn a_windows_target_selects_only_its_portable_pins() {
+        let windows = ToolTarget::from_probe("Windows_NT", "x86_64").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut distribution = script_distribution(&windows, "1.0.0", dir.path(), file_artifact);
+        // A pin for a tool the platform does not provide is ignored, not required.
+        distribution.artifacts.push(ToolArtifact {
+            tool: ManagedTool::Coreutils,
+            ..distribution.artifacts[0].clone()
+        });
+        let selected = distribution.select_artifacts(&windows).unwrap();
+        assert_eq!(selected.len(), windows.required_tools().len());
+        assert!(
+            selected
+                .iter()
+                .all(|artifact| artifact.tool != ManagedTool::Coreutils)
+        );
+        distribution
+            .artifacts
+            .retain(|artifact| artifact.tool != ManagedTool::Jq);
+        assert!(matches!(
+            distribution.select_artifacts(&windows),
+            Err(ToolRuntimeError::MissingTool(ManagedTool::Jq))
+        ));
+    }
+
+    #[test]
+    fn the_pinned_uv_and_python_cover_exactly_the_unix_targets() {
+        let pinned = pinned_distribution();
+        let unix = [
+            ("macos", "aarch64"),
+            ("linux", "aarch64"),
+            ("linux", "x86_64"),
+        ];
+        for (os, arch) in unix {
+            let target = ToolTarget::from_probe(os, arch).unwrap();
+            let uv = pinned
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.target == target && artifact.tool == ManagedTool::Uv)
+                .collect::<Vec<_>>();
+            assert_eq!(uv.len(), 1, "{os}/{arch}");
+            assert_eq!(uv[0].version, "0.13.7");
+            let ToolArtifactLocation::Download(url) = &uv[0].url else {
+                panic!("pinned artifacts are downloads");
+            };
+            assert!(
+                url.path()
+                    .starts_with("/astral-sh/uv/releases/download/0.13.7/"),
+                "{os}/{arch}"
+            );
+            let python = pinned.select_python(&target).unwrap().unwrap();
+            assert_eq!(python.version(), &semver::Version::new(3, 13, 18));
+            // The pinned request is what `uv python list` offers for the target.
+            let request = python.request(&target).unwrap();
+            assert!(request.starts_with("cpython-3.13.18-"), "{request}");
+            assert!(
+                request.ends_with(if os == "macos" { "-none" } else { "-gnu" }),
+                "{request}"
+            );
+        }
+        let digests = pinned
+            .python
+            .iter()
+            .map(|pin| pin.interpreter_sha256.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(digests.len(), pinned.python.len());
+        assert_eq!(pinned.python.len(), unix.len());
+        let windows = ToolTarget::from_probe("Windows_NT", "x86_64").unwrap();
+        assert!(pinned.select_python(&windows).unwrap().is_none());
+        assert!(
+            !pinned
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.tool == ManagedTool::Uv && artifact.target == windows)
+        );
+    }
+
+    #[test]
+    fn a_missing_or_duplicate_python_pin_is_an_error_where_uv_is_provided() {
+        let linux = ToolTarget::from_probe("Linux", "x86_64").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut distribution = script_distribution(&linux, "1.0.0", dir.path(), file_artifact);
+        distribution.select_python(&linux).unwrap().unwrap();
+        distribution.python.push(distribution.python[0].clone());
+        assert!(matches!(
+            distribution.select_python(&linux),
+            Err(ToolRuntimeError::DuplicatePython)
+        ));
+        distribution.python.clear();
+        assert!(matches!(
+            distribution.select_python(&linux),
+            Err(ToolRuntimeError::MissingPython)
+        ));
+        // A pin for a platform without `uv` is not selected.
+        let windows = ToolTarget::from_probe("Windows_NT", "x86_64").unwrap();
+        distribution.python.push(fixture_python_pin(&windows));
+        assert!(distribution.select_python(&windows).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_malformed_python_pin_is_rejected_when_the_manifest_loads() {
+        let manifest = |version: &str, digest: &str| {
+            format!(
+                r#"{{"artifacts":[],"python":[{{"version":"{version}",
+                "target":{{"os":"linux","arch":"x86_64"}},"interpreter_sha256":"{digest}"}}]}}"#
+            )
+        };
+        ToolDistribution::from_json(manifest("3.13.18", &"0".repeat(64)).as_bytes()).unwrap();
+        for (version, digest) in [
+            ("3.13", "0".repeat(64)),
+            ("three", "0".repeat(64)),
+            ("3.13.18", "0".repeat(63)),
+            ("3.13.18", "z".repeat(64)),
+        ] {
+            assert!(
+                ToolDistribution::from_json(manifest(version, &digest).as_bytes()).is_err(),
+                "{version} {digest}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_tools_carry_the_python_pin_and_catalog_entry() {
+        let target = ToolTarget::native().unwrap();
+        if !target.provides_python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let distribution = script_distribution(&target, "1.0.0", dir.path(), file_artifact);
+        let image = distribution.image_tools(&target).unwrap();
+        assert_eq!(
+            image
+                .python
+                .as_ref()
+                .map(|python| python.version().to_string()),
+            Some(crate::tool_runtime::tests::FIXTURE_PYTHON_VERSION.to_owned())
+        );
+        let mut without = distribution;
+        without.python[0].version = "3.13.2".into();
+        assert_ne!(
+            without.image_tools(&target).unwrap().cache_key().unwrap(),
+            image.cache_key().unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn stage_image_tools_produces_the_directory_layout_the_image_verifies() {
         let files = tempfile::tempdir().unwrap();
-        let out = tempfile::tempdir().unwrap();
+        let out = unlocking_tempdir();
         let target = ToolTarget::native().unwrap();
         let distribution = script_distribution(&target, "1.0.0", files.path(), file_artifact);
         let staged = distribution
@@ -709,7 +965,7 @@ pub mod tests {
                 .unwrap()
                 .join(image.cache_key().unwrap())
         );
-        for tool in ManagedTool::ALL {
+        for &tool in native_tools() {
             assert!(
                 staged
                     .join("bin")
@@ -728,9 +984,9 @@ pub mod tests {
         let binary = source.path().join("tool");
         async_fs::write(&binary, bytes).await.unwrap();
         let distribution = ToolDistribution {
-            artifacts: ManagedTool::ALL
-                .into_iter()
-                .map(|tool| ToolArtifact {
+            artifacts: native_tools()
+                .iter()
+                .map(|&tool| ToolArtifact {
                     tool,
                     version: "1.0.0".into(),
                     target: ToolTarget::native().unwrap(),
@@ -740,6 +996,7 @@ pub mod tests {
                 })
                 .collect(),
             host_programs: Vec::new(),
+            python: python_pins(&ToolTarget::native().unwrap()),
         };
         let manifest = distribution
             .package_into(installation.path())
@@ -800,6 +1057,7 @@ pub mod tests {
                 encoding: ToolArtifactFormat::Executable,
             }],
             host_programs: Vec::new(),
+            python: Vec::new(),
         };
         let path = root.path().join("distribution.json");
         async_fs::write(&path, serde_json::to_vec(&distribution).unwrap())
@@ -825,6 +1083,7 @@ pub mod tests {
                 encoding: ToolArtifactFormat::Executable,
             }],
             host_programs: Vec::new(),
+            python: Vec::new(),
         };
         let error =
             ToolDistribution::from_json(&serde_json::to_vec(&manifest).unwrap()).unwrap_err();
@@ -923,7 +1182,7 @@ pub mod tests {
 
     /// A distribution of fixture sandbox commands plus a tar.xz `search` host program.
     struct HostFixture {
-        directory: tempfile::TempDir,
+        directory: UnlockingTempDir,
         distribution: ToolDistribution,
         executable: &'static [u8],
         archive: PathBuf,
@@ -931,29 +1190,17 @@ pub mod tests {
 
     impl HostFixture {
         async fn new() -> Self {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = unlocking_tempdir();
             let target = ToolTarget::native().unwrap();
-            let command = b"baseline command fixture";
-            let command_path = directory.path().join("command");
-            async_fs::write(&command_path, command).await.unwrap();
             let executable: &'static [u8] = b"host program fixture";
             let archive = directory.path().join("search.tar.xz");
             let encoded = tar_xz("repo-search/search", executable);
             async_fs::write(&archive, &encoded).await.unwrap();
+            let fixture_tools =
+                script_distribution(&target, "1.0.0", directory.path(), file_artifact);
             let distribution = ToolDistribution {
-                artifacts: ManagedTool::ALL
-                    .into_iter()
-                    .map(|tool| ToolArtifact {
-                        tool,
-                        version: "1.0.0".into(),
-                        target: target.clone(),
-                        url: ToolArtifactLocation::Download(
-                            Url::from_file_path(&command_path).unwrap(),
-                        ),
-                        sha256: hex::encode(digest(command)),
-                        encoding: ToolArtifactFormat::Executable,
-                    })
-                    .collect(),
+                artifacts: fixture_tools.artifacts,
+                python: fixture_tools.python,
                 host_programs: vec![HostProgramArtifact {
                     artifact: PinnedArtifact {
                         tool: HostProgram::RepoSearch,

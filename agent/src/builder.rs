@@ -976,7 +976,7 @@ mod tests {
         use executor_core::tokio::TokioGlobal;
 
         let source = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::test_support::TempDir::new();
         let session = tempfile::tempdir().unwrap();
         let binary = crate::test_support::compile_baseline_fixture(source.path()).await;
         let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;

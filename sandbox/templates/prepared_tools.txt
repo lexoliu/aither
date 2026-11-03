@@ -3,7 +3,7 @@ These commands are already on PATH in the initialized execution environment:
 {% for tool in tools %}- {{ tool.command }} {{ tool.version }}
 {% endfor %}
 {% if self.has("ast-grep") %}Prefer `ast-grep` patterns over text search for code constructs (`ast-grep run --lang rust --pattern 'fn $NAME($$$ARGS) { $$$BODY }' src`).
-{% endif %}{% if self.has("apply_patch") %}Edits go through `apply_patch`; it validates a contextual patch before writing:
+{% endif %}{% if self.has("apply_patch") %}Every change to an existing file goes through `apply_patch`; it validates a contextual patch before writing. Never rewrite an existing file with `sed -i`, a Python script, a shell redirect or any other command:
 ```sh
 apply_patch <<'PATCH'
 *** Begin Patch
@@ -14,5 +14,7 @@ apply_patch <<'PATCH'
 *** End Patch
 PATCH
 ```
+{% endif %}{% if self.has("uv") %}`python3` is the managed interpreter; a project's own `.venv` and `.python-version` still decide what `uv run` uses.
+{% endif %}{% if self.has("bash") %}`grep`, `awk` and `find` fail in scripts; use `rg`, `python3` or `jq`, and `fd`. `sed` in scripts only prints line ranges (`sed -n 'N,Mp' file`).
 {% endif %}Use command `--help` for uncommon options, not to discover these prepared capabilities.
 </prepared_tools>

@@ -624,6 +624,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aither-sed"
+version = "0.13.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "aither-skills"
 version = "0.13.0"
 dependencies = [
