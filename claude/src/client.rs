@@ -257,7 +257,7 @@ impl LanguageModel for Claude {
                 let next = futures_lite::future::or(
                     async { Some(sse_stream.next().await) },
                     async {
-                        async_io::Timer::after(cfg.idle_timeout).await;
+                        aither_core::time::sleep(cfg.idle_timeout).await;
                         None
                     },
                 )

@@ -12,7 +12,7 @@ keywords = ["ai", "llm", "gemini", "google"]
 categories = ["api-bindings"]
 
 [dependencies]
-aither-core = { workspace = true, features = ["zenwave"] }
+aither-core = { workspace = true, features = ["zenwave", "timer"] }
 aither-models.workspace = true
 aither-attachments.workspace = true
 async-stream = "0.3"
@@ -29,13 +29,7 @@ zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 tracing.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-async-io = "2.6.0"
 async-fs = "2"
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-gloo-timers = { version = "0.4", features = ["futures"] }
-wasm-bindgen-futures = "0.4"
-async-channel = "2"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }

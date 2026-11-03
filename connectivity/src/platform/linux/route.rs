@@ -43,7 +43,7 @@ impl Watcher {
         loop {
             match self
                 .events
-                .read_with(|socket| socket.recv_from_full())
+                .read_with(netlink_sys::Socket::recv_from_full)
                 .await
             {
                 Ok(_) => {}
