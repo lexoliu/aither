@@ -215,5 +215,7 @@ impl<W: Write> Printer<'_, W> {
     }
 }
 
-#[cfg(test)]
+// aither-sed ships only on Unix, where its diagnostics carry the system's
+// wording GNU sed prints.
+#[cfg(all(test, unix))]
 mod tests;

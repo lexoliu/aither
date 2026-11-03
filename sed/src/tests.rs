@@ -211,8 +211,6 @@ fn an_unreadable_file_is_reported_and_the_rest_still_print() {
     );
 }
 
-/// Unix reports reading a directory as such; aither-sed ships only there.
-#[cfg(unix)]
 #[test]
 fn a_directory_is_a_read_error() {
     let directory = fixture();
