@@ -123,6 +123,7 @@ dependencies = [
  "jiff",
  "notify",
  "num-traits",
+ "rustix",
  "schemars 1.2.3",
  "serde",
  "serde_json",
@@ -136,6 +137,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

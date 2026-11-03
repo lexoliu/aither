@@ -311,8 +311,6 @@ pub struct CompactResult {
 /// [`CacheLifetime`]: crate::context::CacheLifetime
 #[derive(Debug, Default)]
 pub struct CacheKeepAliveState {
-    /// When the most recent keep-alive was sent.
-    last_sent_at: Option<Instant>,
     /// Keep-alives sent so far this run.
     pub(crate) sent: usize,
     /// Whether the frequent-idle threshold was already crossed this run.
@@ -654,11 +652,10 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Directory files are restored from after a forked compaction.
     pub(crate) restore_dir: Option<PathBuf>,
 
-    /// Start time of the most recent LLM request issued by this agent.
-    pub(crate) last_request_started_at: Option<Instant>,
-
-    /// Time source of every idle-timing read.
-    pub(crate) clock: crate::AnyClock,
+    /// Whether the provider's prompt-cache entry is warm; stamped on every
+    /// request and keep-alive, shared with hosts through
+    /// [`Agent::cache_warmth`].
+    pub(crate) warmth: crate::CacheWarmth,
 
     /// The most recent LLM request issued by this agent, retained so a
     /// prompt-cache keep-alive can re-send it verbatim.
@@ -708,7 +705,9 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
     /// All model tiers (advanced/balanced/fast) use the same model.
     #[must_use]
     pub fn with_config(llm: LLM, config: AgentConfig) -> Self {
+        let prompt_cache = PromptCache::new(uuid::Uuid::new_v4().to_string());
         Self {
+            warmth: crate::CacheWarmth::new(prompt_cache.lifetime(), crate::AnyClock::default()),
             advanced: Arc::new(llm.clone()),
             balanced: Arc::new(llm.clone()),
             fast: Arc::new(llm),
@@ -720,7 +719,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             config,
             context: Context::default(),
             budget: ContextBudget::default(),
-            prompt_cache: PromptCache::new(uuid::Uuid::new_v4().to_string()),
+            prompt_cache,
             context_sources: Vec::new(),
             reassembled: false,
             pending_compaction: None,
@@ -729,8 +728,6 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             profile: None,
             initialized: false,
             session: SessionPhase::NotStarted,
-            last_request_started_at: None,
-            clock: crate::AnyClock::default(),
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
@@ -1454,13 +1451,11 @@ where
         let Some(keep_alive) = self.config.cache_keep_alive.clone() else {
             return Ok(());
         };
-        let CacheLifetime::Limited(lifetime) = self.prompt_cache.lifetime() else {
+        // A cold entry is past saving by a keep-alive; a permanent one needs none.
+        let Some(cold_in) = self.warmth.cold_in() else {
             return Ok(());
         };
-        let Some(entry_started_at) = self.cache_entry_started_at() else {
-            return Ok(());
-        };
-        if self.clock.since(entry_started_at) + keep_alive.send_before_expiry < lifetime {
+        if cold_in > keep_alive.send_before_expiry {
             return Ok(());
         }
         let Some(last_request) = self.last_request.clone() else {
@@ -1485,7 +1480,7 @@ where
                 Err(error) => return Err(error),
             }
         }
-        self.cache_keep_alive.last_sent_at = Some(self.clock.now());
+        self.warmth.start_entry_now();
         self.cache_keep_alive.sent += 1;
         self.cache_keep_alive.last_reason = self.format_wait_reason().await;
         if self.cache_keep_alive.sent >= keep_alive.frequent_idle_threshold {
@@ -1513,16 +1508,34 @@ where
         ))
     }
 
-    /// When the provider's prompt-cache entry for this agent's context was
-    /// last started or refreshed: the later of the last request's start and
-    /// the last keep-alive send. `None` before the first request.
+    /// A shared handle on whether the provider's prompt-cache entry for this
+    /// agent's context is warm and how long until it goes cold. It keeps
+    /// tracking this agent's later requests and keep-alives.
     #[must_use]
-    pub fn cache_entry_started_at(&self) -> Option<Instant> {
-        self.cache_keep_alive
-            .last_sent_at
-            .into_iter()
-            .chain(self.last_request_started_at)
-            .max()
+    pub fn cache_warmth(&self) -> crate::CacheWarmth {
+        self.warmth.clone()
+    }
+
+    /// Pretends the cache entry was started `age` ago.
+    ///
+    /// The system clock counts from boot, so a freshly booted machine cannot
+    /// stand `age` back; the entry moves to a manual clock standing `age`
+    /// past its origin, with the entry at the origin.
+    #[cfg(test)]
+    pub(crate) fn backdate_cache_entry(&mut self, age: Duration) {
+        let clock = crate::ManualClock::new();
+        clock.advance(age);
+        self.warmth =
+            crate::CacheWarmth::new(self.prompt_cache.lifetime(), crate::AnyClock::new(clock));
+        self.warmth
+            .start_entry(crate::clock::Instant::from_nanos(0));
+    }
+
+    /// Swaps the cache lifetime, forgetting any started entry.
+    #[cfg(test)]
+    pub(crate) fn use_cache_lifetime(&mut self, lifetime: CacheLifetime) {
+        self.prompt_cache = self.prompt_cache.clone().with_lifetime(lifetime);
+        self.warmth = self.warmth.with_lifetime(lifetime);
     }
 
     /// How long the provider's prompt-cache entry for this agent's context
@@ -2015,15 +2028,8 @@ where
         {
             return None;
         }
-        let CacheLifetime::Limited(lifetime) = self.prompt_cache.lifetime() else {
-            return None;
-        };
-        let idle = self.clock.since(self.cache_entry_started_at()?);
-        if idle >= lifetime {
-            return None;
-        }
-        let due_at = lifetime.saturating_sub(self.config.context_policy.idle_compact_before_expiry);
-        Some(due_at.saturating_sub(idle))
+        let cold_in = self.warmth.cold_in()?;
+        Some(cold_in.saturating_sub(self.config.context_policy.idle_compact_before_expiry))
     }
 
     /// Compacts the idle session once its cache is about to expire.
@@ -2523,7 +2529,7 @@ where
         }
 
         self.commit_tail(&tail).await;
-        self.last_request_started_at = Some(self.clock.now());
+        self.warmth.start_entry_now();
         self.idle_compacted = false;
         self.publish_fork_snapshot(&tail, &definitions);
 
@@ -2592,14 +2598,7 @@ where
         if self.compaction_model.is_none() || self.pending_compaction.is_some() {
             return Ok(());
         }
-        let Some(entry_started_at) = self.cache_entry_started_at() else {
-            return Ok(());
-        };
-        if !self
-            .prompt_cache
-            .lifetime()
-            .is_cold(self.clock.since(entry_started_at))
-        {
+        if !self.warmth.has_expired() {
             return Ok(());
         }
         if self.context.is_conversation_empty() {
@@ -2631,14 +2630,7 @@ where
     /// [`CacheLifetime`]: crate::context::CacheLifetime
     fn reassemble_if_cache_is_cold(&mut self) -> crate::context::ReassemblyReport {
         let unchanged = crate::context::ReassemblyReport::default();
-        let Some(entry_started_at) = self.cache_entry_started_at() else {
-            return unchanged;
-        };
-        if !self
-            .prompt_cache
-            .lifetime()
-            .is_cold(self.clock.since(entry_started_at))
-        {
+        if !self.warmth.has_expired() {
             return unchanged;
         }
         let report = self.context.reassemble();
@@ -2702,10 +2694,7 @@ where
             return ContextWindowPhase::Compacting;
         }
         if metrics.has_staged_system_updates
-            || (self.compaction_model.is_some()
-                && self
-                    .cache_entry_started_at()
-                    .is_some_and(|at| self.prompt_cache.lifetime().is_cold(self.clock.since(at))))
+            || (self.compaction_model.is_some() && self.warmth.has_expired())
         {
             return ContextWindowPhase::ReassemblyDue;
         }
@@ -4182,7 +4171,7 @@ mod tests {
         ));
 
         // The default lifetime is one hour: five minutes is nothing.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(300));
+        agent.backdate_cache_entry(Duration::from_secs(300));
         assert!(
             agent
                 .prepare_request()
@@ -4193,7 +4182,7 @@ mod tests {
         assert_eq!(agent.context().count_recent_system_messages(), 1);
 
         // Fifty-nine minutes is still inside the hour.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3540));
+        agent.backdate_cache_entry(Duration::from_secs(3540));
         assert!(
             agent
                 .prepare_request()
@@ -4205,7 +4194,7 @@ mod tests {
 
         // Sixty-one minutes is past it: the cached prefix is gone anyway,
         // so the compromises the append-only log forced get cleaned up.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
         assert!(
             agent
                 .prepare_request()
@@ -4228,10 +4217,7 @@ mod tests {
         })
         .build();
         agent.ensure_initialized().await.expect("agent initializes");
-        agent.prompt_cache = agent
-            .prompt_cache
-            .clone()
-            .with_lifetime(CacheLifetime::Permanent);
+        agent.use_cache_lifetime(CacheLifetime::Permanent);
         agent.push_message(Message::user("hello"));
         agent.push_message(Message::system(
             "<system-reminder>ephemeral</system-reminder>",
@@ -4239,7 +4225,7 @@ mod tests {
 
         // Rewriting the prefix always costs a permanent cache, so no idle
         // gap ever justifies it — even a day later.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        agent.backdate_cache_entry(Duration::from_secs(86_400));
         assert!(
             agent
                 .prepare_request()
@@ -4273,7 +4259,7 @@ mod tests {
         let mut agent = agent_after_one_request(llm.clone()).await;
 
         // Fifty-three minutes of a one-hour lifetime: not yet due.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3180));
+        agent.backdate_cache_entry(Duration::from_secs(3180));
         let due_in = agent
             .idle_compaction_due_in()
             .expect("a compaction is pending");
@@ -4282,7 +4268,7 @@ mod tests {
         assert!(llm.recorded().is_empty());
 
         // Fifty-four minutes: due now.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
+        agent.backdate_cache_entry(Duration::from_secs(3240));
         assert_eq!(agent.idle_compaction_due_in(), Some(Duration::ZERO));
         let result = agent
             .compact_when_idle()
@@ -4294,7 +4280,7 @@ mod tests {
         assert!(agent.context().handoff().is_some());
 
         // Still idle: nothing more, however long the gap grows inside the hour.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3300));
+        agent.backdate_cache_entry(Duration::from_secs(3300));
         assert_eq!(agent.idle_compaction_due_in(), None);
         assert!(agent.compact_when_idle().await.expect("no-op").is_none());
         assert_eq!(llm.recorded().len(), 1, "one compaction per idle gap");
@@ -4306,7 +4292,7 @@ mod tests {
             .await
             .expect("request boundary")
             .expect("request after idle");
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
+        agent.backdate_cache_entry(Duration::from_secs(3240));
         assert_eq!(agent.idle_compaction_due_in(), Some(Duration::ZERO));
     }
 
@@ -4316,7 +4302,7 @@ mod tests {
     async fn an_expired_cache_is_not_idle_compacted() {
         let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let mut agent = agent_after_one_request(llm.clone()).await;
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
         assert_eq!(agent.idle_compaction_due_in(), None);
         assert!(agent.compact_when_idle().await.expect("no-op").is_none());
         assert!(llm.recorded().is_empty());
@@ -4328,11 +4314,8 @@ mod tests {
 
         let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let mut agent = agent_after_one_request(llm.clone()).await;
-        agent.prompt_cache = agent
-            .prompt_cache
-            .clone()
-            .with_lifetime(CacheLifetime::Permanent);
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        agent.use_cache_lifetime(CacheLifetime::Permanent);
+        agent.backdate_cache_entry(Duration::from_secs(86_400));
         assert_eq!(agent.idle_compaction_due_in(), None);
         assert!(agent.compact_when_idle().await.expect("no-op").is_none());
         assert!(llm.recorded().is_empty());
@@ -4355,7 +4338,7 @@ mod tests {
             .expect("request boundary")
             .expect("first request");
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
+        agent.backdate_cache_entry(Duration::from_secs(3240));
         assert_eq!(agent.idle_compaction_due_in(), None);
         assert!(agent.compact_when_idle().await.expect("no-op").is_none());
         assert!(main.recorded().is_empty() && compactor.recorded().is_empty());
@@ -4395,7 +4378,7 @@ mod tests {
             agent.push_message(Message::system(
                 "<system-reminder>ephemeral</system-reminder>",
             ));
-            agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+            agent.backdate_cache_entry(Duration::from_secs(3660));
             assert!(
                 agent
                     .prepare_request()
@@ -4457,7 +4440,7 @@ mod tests {
             agent_with_compactor_after_one_request(main.clone(), Some(compactor.clone())).await;
         assert!(compactor.recorded().is_empty());
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
         let request = agent
             .prepare_request()
             .await
@@ -4496,7 +4479,7 @@ mod tests {
             "<system-reminder>ephemeral</system-reminder>",
         ));
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
         agent
             .prepare_request()
             .await
@@ -4520,7 +4503,7 @@ mod tests {
         )
         .await;
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3540));
+        agent.backdate_cache_entry(Duration::from_secs(3540));
         let request = agent
             .prepare_request()
             .await
@@ -4536,7 +4519,7 @@ mod tests {
         let main = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let mut agent = agent_with_compactor_after_one_request(main.clone(), None).await;
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        agent.backdate_cache_entry(Duration::from_secs(86_400));
         let request = agent
             .prepare_request()
             .await
@@ -4557,12 +4540,9 @@ mod tests {
             Some(compactor.clone()),
         )
         .await;
-        agent.prompt_cache = agent
-            .prompt_cache
-            .clone()
-            .with_lifetime(CacheLifetime::Permanent);
+        agent.use_cache_lifetime(CacheLifetime::Permanent);
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        agent.backdate_cache_entry(Duration::from_secs(86_400));
         let request = agent
             .prepare_request()
             .await
@@ -4584,7 +4564,7 @@ mod tests {
         )
         .await;
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
         assert!(agent.prepare_request().await.is_err());
     }
 
@@ -4714,7 +4694,7 @@ mod tests {
             .expect("request boundary")
             .expect("first request");
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
         let request = agent
             .prepare_request()
             .await
