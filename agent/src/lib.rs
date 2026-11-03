@@ -38,6 +38,7 @@ mod cache_stats;
 mod checkpoint;
 mod clock;
 mod config;
+mod connectivity;
 pub mod context;
 mod context_window;
 mod error;

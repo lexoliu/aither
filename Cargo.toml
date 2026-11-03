@@ -15,6 +15,7 @@ members = [
     "llama",
     "ort",
     "agent",
+    "connectivity",
     "rag",
     "mem0",
     "skills",
@@ -88,6 +89,7 @@ aither-command = { path = "./tools/command", version = "0.11.0" }
 aither-mcp = { path = "./mcp", version = "0.11.0" }
 aither-acp = { path = "./acp", version = "0.11.0" }
 aither-sandbox = { path = "./sandbox", version = "0.11.0" }
+aither-connectivity = { path = "./connectivity", version = "0.11.0" }
 aither-agent = { path = "./agent", version = "0.11.0", default-features = false }
 aither-openai = { path = "./openai", version = "0.11.0" }
 aither-claude = { path = "./claude", version = "0.11.0" }
@@ -120,6 +122,7 @@ aither-ort = { workspace = true, optional = true }
 # High-level features
 aither-agent = { workspace = true, optional = true, default-features = true }
 aither-rag = { workspace = true, optional = true }
+aither-connectivity = { workspace = true, optional = true }
 aither-mem0 = { workspace = true, optional = true }
 aither-skills = { workspace = true, optional = true }
 
@@ -203,6 +206,7 @@ apple = ["dep:aither-apple"]
 # High-level features
 agent = ["aither-agent"]
 rag = ["aither-rag"]
+connectivity = ["dep:aither-connectivity"]
 mem0 = ["aither-mem0"]
 skills = ["aither-skills"]
 
@@ -224,7 +228,7 @@ all-providers = ["openai", "claude", "gemini", "llama", "ort", "apple"]
 all-tools = ["browser", "websearch", "webfetch", "search", "fs", "command"]
 
 # Convenience feature to enable everything
-full = ["all-providers", "all-tools", "agent", "rag", "mem0", "skills", "mcp"]
+full = ["all-providers", "all-tools", "agent", "rag", "mem0", "skills", "mcp", "connectivity"]
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 //! Claude API client implementation.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use aither_core::{
     LanguageModel,
@@ -16,7 +16,9 @@ use tracing::debug;
 use zenwave::{Client, client, header};
 
 use crate::{
-    constant::{ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL},
+    constant::{
+        ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_TOKENS, DEFAULT_MODEL,
+    },
     error::ClaudeError,
     request::{
         MessagesRequest, ParameterSnapshot, apply_cache_strategy, build_output_config,
@@ -78,6 +80,15 @@ impl Claude {
     #[must_use]
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         Arc::make_mut(&mut self.inner).default_max_tokens = max_tokens;
+        self
+    }
+
+    /// Override how long a response stream may stay silent before it ends with
+    /// a [`FailureKind::Network`](aither_core::llm::FailureKind::Network)
+    /// error. Defaults to 90 seconds.
+    #[must_use]
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        Arc::make_mut(&mut self.inner).idle_timeout = idle_timeout;
         self
     }
 
@@ -240,7 +251,22 @@ impl LanguageModel for Claude {
 
             let mut state = StreamState::new();
 
-            while let Some(event) = sse_stream.next().await {
+            loop {
+                // Bytes that never come are the signature of a socket that
+                // died while the machine slept.
+                let next = futures_lite::future::or(
+                    async { Some(sse_stream.next().await) },
+                    async {
+                        async_io::Timer::after(cfg.idle_timeout).await;
+                        None
+                    },
+                )
+                .await;
+                let Some(event) = next else {
+                    yield Err(ClaudeError::IdleTimeout { idle: cfg.idle_timeout });
+                    return;
+                };
+                let Some(event) = event else { break };
                 let event = match event {
                     Ok(event) => event,
                     Err(e) => {
@@ -404,6 +430,7 @@ pub struct Builder {
     model: String,
     default_max_tokens: u32,
     native_abilities: Vec<Ability>,
+    idle_timeout: Duration,
 }
 
 impl Builder {
@@ -414,6 +441,7 @@ impl Builder {
             model: DEFAULT_MODEL.to_string(),
             default_max_tokens: DEFAULT_MAX_TOKENS,
             native_abilities: Vec::new(),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
 
@@ -435,6 +463,15 @@ impl Builder {
     #[must_use]
     pub const fn max_tokens(mut self, max_tokens: u32) -> Self {
         self.default_max_tokens = max_tokens;
+        self
+    }
+
+    /// Set how long a response stream may stay silent before it ends with a
+    /// [`FailureKind::Network`](aither_core::llm::FailureKind::Network) error;
+    /// 90 seconds by default.
+    #[must_use]
+    pub const fn idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
         self
     }
 
@@ -465,6 +502,7 @@ impl Builder {
                 model: self.model,
                 default_max_tokens: self.default_max_tokens,
                 native_abilities: self.native_abilities,
+                idle_timeout: self.idle_timeout,
             }),
         }
     }
@@ -478,6 +516,7 @@ pub struct Config {
     pub(crate) model: String,
     pub(crate) default_max_tokens: u32,
     pub(crate) native_abilities: Vec<Ability>,
+    pub(crate) idle_timeout: Duration,
 }
 
 impl Config {

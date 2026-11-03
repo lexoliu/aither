@@ -900,6 +900,17 @@ where
         self
     }
 
+    /// Ends a provider response stream in flight when the machine wakes from
+    /// sleep or loses its network.
+    ///
+    /// See [`AgentBuilder::connectivity`].
+    #[cfg(feature = "connectivity")]
+    #[must_use]
+    pub fn connectivity(mut self, connectivity: aither_connectivity::Connectivity) -> Self {
+        self.inner = self.inner.connectivity(connectivity);
+        self
+    }
+
     /// Sets the maximum number of iterations.
     #[must_use]
     pub fn max_iterations(mut self, limit: usize) -> Self {
