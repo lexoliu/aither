@@ -11,12 +11,19 @@ fn aither_sed(args: &[&str], stdin: &str) -> std::process::Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn aither-sed");
-    child
+    // A refused script exits without reading its input, which then meets a
+    // closed pipe.
+    match child
         .stdin
         .take()
         .expect("stdin")
         .write_all(stdin.as_bytes())
-        .expect("write stdin");
+    {
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => {
+            panic!("write stdin: {error}")
+        }
+        _ => {}
+    }
     child.wait_with_output().expect("wait")
 }
 
