@@ -9,7 +9,10 @@ import yaml
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "workflows"
 PREFIX = r"""
 gh() {
-  printf '%s' "${FIXTURE_CHECKS}"
+  case "$*" in
+    */pulls*) printf '%s' "${FIXTURE_MERGED_HEAD}" ;;
+    *) printf '%s' "${FIXTURE_CHECKS}" ;;
+  esac
   return "${FIXTURE_GH_STATUS}"
 }
 sleep() {
@@ -30,7 +33,11 @@ def main():
         "failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale",
     ]:
         cases[conclusion] = (f"Test\t{conclusion}\n", 0, 1)
-    for filename in ["release.yml", "pr-base-gate.yml"]:
+    # release.yml waits on the head of the pull request whose merge produced
+    # the pushed commit, which always carries checks: none, or no such pull
+    # request, is an error rather than something to wait for.
+    release_cases = dict(cases, empty=("", 0, 1), not_merged=("Test\tsuccess\n", 0, 1))
+    for filename, file_cases in [("release.yml", release_cases), ("pr-base-gate.yml", cases)]:
         workflow = yaml.safe_load((ROOT / filename).read_text())
         steps = next(iter(workflow["jobs"].values()))["steps"]
         step = next(
@@ -38,7 +45,7 @@ def main():
             if step.get("name", "").lower().startswith("wait for")
         )
         script = PREFIX + step["run"]
-        for name, (checks, api_status, expected_status) in cases.items():
+        for name, (checks, api_status, expected_status) in file_cases.items():
             env = os.environ.copy()
             env.update({
                 "GITHUB_REPOSITORY": "fixture/repo",
@@ -46,6 +53,7 @@ def main():
                 "HEAD_SHA": "fixture-head",
                 "MERGE_SHA": "",
                 "FIXTURE_CHECKS": checks,
+                "FIXTURE_MERGED_HEAD": "" if name == "not_merged" else "fixture-pr-head",
                 "FIXTURE_GH_STATUS": str(api_status),
             })
             with tempfile.TemporaryDirectory() as directory:

@@ -95,35 +95,43 @@ jobs:
           --git-token "${GITHUB_TOKEN}"
           --repo-url "https://github.com/${GITHUB_REPOSITORY}"
           --forge github
-      # main only accepts merges from dev whose CI went green, but publishing
-      # still waits for this exact commit's own checks: the ruleset is the
-      # gate, this wait is what makes the release follow the tested commit
-      # rather than whatever push happened to land. This job's own check run
-      # is excluded so it cannot wait on itself.
-      - name: Wait for CI on this commit
+      # main takes changes only through pull requests that are up to date with
+      # it, so the pushed tree is the one CI tested on the pull request whose
+      # merge produced this commit, and CI does not run again on the push.
+      # Publishing follows that pull request's checks, waiting for any still
+      # running.
+      - name: Wait for CI on the merged pull request
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          tested="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+            --jq '[.[] | select(.base.ref == "main" and .merged_at != null) | .head.sha] | first // empty')"
+          if [ -z "${tested}" ]; then
+            echo "::error::${GITHUB_SHA} was not produced by merging a pull request into main"
+            exit 1
+          fi
+          echo "${GITHUB_SHA} merges ${tested}"
           deadline=$(( $(date +%s) + 5400 ))
           # Outside the checkout: `cargo publish` refuses a dirty package dir,
           # and the root crate's package dir is the repository root.
           checks_file="${RUNNER_TEMP}/checks.tsv"
           while :; do
-            gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100" \
-              --jq '.check_runs[] | select(.name != "Release") | [.name, (.conclusion // "pending")] | @tsv' \
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${tested}/check-runs?per_page=100" \
+              --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv' \
               > "${checks_file}"
             if [ ! -s "${checks_file}" ]; then
-              echo "no check runs on ${GITHUB_SHA} yet"
+              echo "::error::${tested} has no check runs"
+              exit 1
             elif grep -E $'\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' "${checks_file}"; then
-              echo "::error::a check on ${GITHUB_SHA} did not pass (see list above)"
+              echo "::error::a check on ${tested} did not pass (see list above)"
               exit 1
             elif ! grep -q $'\tpending$' "${checks_file}"; then
-              echo "all checks on ${GITHUB_SHA} passed"
+              echo "all checks on ${tested} passed"
               exit 0
             fi
             if [ "$(date +%s)" -gt "${deadline}" ]; then
-              echo "::error::timed out waiting for checks on ${GITHUB_SHA}"
+              echo "::error::timed out waiting for checks on ${tested}"
               cat "${checks_file}"
               exit 1
             fi
