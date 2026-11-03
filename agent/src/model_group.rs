@@ -379,6 +379,15 @@ impl<E: std::fmt::Display> std::fmt::Display for ModelGroupError<E> {
     }
 }
 
+impl<E: aither_core::llm::Classify> aither_core::llm::Classify for ModelGroupError<E> {
+    fn failure(&self) -> aither_core::llm::Failure {
+        match self {
+            Self::AllModelsExhausted => aither_core::llm::Failure::quota(),
+            Self::Model(e) => e.failure(),
+        }
+    }
+}
+
 impl<E: std::error::Error + 'static> std::error::Error for ModelGroupError<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -518,6 +527,12 @@ mod tests {
     }
 
     impl std::error::Error for DummyError {}
+
+    impl aither_core::llm::Classify for DummyError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
 
     impl LanguageModel for DummyModel {
         type Error = DummyError;

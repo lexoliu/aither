@@ -3,11 +3,15 @@
 // few of them.
 #![allow(dead_code)]
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
+use aither_core::llm::{
+    Classify, Failure, FailureKind,
+    failure::zenwave::{body_failure, failure as http_failure, sse_failure},
+};
 use base64::DecodeError;
 use serde::Deserialize;
-use zenwave::{BodyError, Error as ZenwaveError};
+use zenwave::{BodyError, Error as ZenwaveError, sse::ParseError as SseParseError};
 
 /// Errors raised by the Gemini backend.
 #[derive(Debug)]
@@ -22,14 +26,22 @@ pub enum GeminiError {
     Decode(DecodeError),
     /// API level errors or unsupported operations.
     Api(String),
-    /// SSE stream parsing errors.
+    /// Other parsing errors.
     Parse(String),
+    /// SSE stream failures.
+    Stream(SseParseError),
     /// Rate limit exceeded (includes retry delay if available).
     RateLimit {
         /// What the API said about the limit.
         message: String,
         /// How long the API asked us to wait, when it said.
-        retry_after_secs: Option<u64>,
+        retry_after: Option<Duration>,
+    },
+    /// A quota that resets on a long horizon, such as the daily one, is
+    /// exhausted.
+    QuotaExceeded {
+        /// What the API said about the quota.
+        message: String,
     },
 }
 
@@ -54,24 +66,22 @@ pub struct ApiErrorDetail {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-#[serde(untagged)]
+#[serde(tag = "@type")]
 pub enum ApiErrorInfo {
     /// A quota was exceeded; names which one.
+    #[serde(rename = "type.googleapis.com/google.rpc.QuotaFailure")]
     QuotaFailure(QuotaFailureInfo),
     /// The API suggested when to retry.
+    #[serde(rename = "type.googleapis.com/google.rpc.RetryInfo")]
     RetryInfo(RetryInfoDetail),
-    /// Any other detail payload, kept verbatim.
-    Other(serde_json::Value),
+    /// Any other detail payload.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct QuotaFailureInfo {
-    /// Type URL identifying this detail payload.
-    #[serde(rename = "@type")]
-    /// Detail type URL.
-    pub type_url: Option<String>,
     /// The specific quotas that were exceeded.
     pub violations: Option<Vec<QuotaViolation>>,
 }
@@ -93,10 +103,6 @@ pub struct QuotaViolation {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct RetryInfoDetail {
-    /// Type URL identifying this detail payload.
-    #[serde(rename = "@type")]
-    /// Detail type URL.
-    pub type_url: Option<String>,
     /// How long the API suggests waiting before retrying.
     #[serde(rename = "retryDelay")]
     /// Retry delay duration.
@@ -121,10 +127,6 @@ impl ApiErrorResponse {
         if let Some(details) = &error.details {
             for detail in details {
                 if let ApiErrorInfo::QuotaFailure(quota) = detail
-                    && quota
-                        .type_url
-                        .as_deref()
-                        .is_some_and(|t| t.contains("QuotaFailure"))
                     && let Some(violations) = &quota.violations
                     && let Some(v) = violations.first()
                 {
@@ -146,19 +148,33 @@ impl ApiErrorResponse {
         base_msg
     }
 
-    /// Extract retry delay in seconds from the error response.
+    /// The retry delay from the error response, in the API's `"20s"` format.
     #[must_use]
-    pub fn retry_delay_secs(&self) -> Option<u64> {
+    pub fn retry_delay(&self) -> Option<Duration> {
         let details = self.error.as_ref()?.details.as_ref()?;
         for detail in details {
             if let ApiErrorInfo::RetryInfo(info) = detail
                 && let Some(delay) = &info.retry_delay
             {
-                // Parse "20s" format
-                return delay.trim_end_matches('s').parse().ok();
+                let seconds: f64 = delay.trim_end_matches('s').parse().ok()?;
+                return Duration::try_from_secs_f64(seconds).ok();
             }
         }
         None
+    }
+
+    /// Whether the error says a per-day quota is exhausted, which a retry
+    /// within the day cannot cure.
+    #[must_use]
+    pub fn is_daily_quota(&self) -> bool {
+        let Some(details) = self.error.as_ref().and_then(|error| error.details.as_ref()) else {
+            return false;
+        };
+        details.iter().any(|detail| {
+            matches!(detail, ApiErrorInfo::QuotaFailure(quota)
+                if quota.violations.iter().flatten().any(|violation|
+                    violation.quota_id.as_deref().is_some_and(|id| id.contains("PerDay"))))
+        })
     }
 }
 
@@ -175,14 +191,15 @@ impl fmt::Display for GeminiError {
             Self::Body(err) => write!(f, "Request failed: {err}"),
             Self::Json(err) => write!(f, "Invalid response format: {err}"),
             Self::Decode(err) => write!(f, "Decode error: {err}"),
-            Self::Api(message) => write!(f, "{message}"),
+            Self::Api(message) | Self::QuotaExceeded { message } => write!(f, "{message}"),
             Self::Parse(message) => write!(f, "Parse error: {message}"),
+            Self::Stream(err) => write!(f, "Parse error: {err}"),
             Self::RateLimit {
                 message,
-                retry_after_secs,
+                retry_after,
             } => {
-                if let Some(secs) = retry_after_secs {
-                    write!(f, "{message} (retry after {secs}s)")
+                if let Some(delay) = retry_after {
+                    write!(f, "{message} (retry after {}s)", delay.as_secs())
                 } else {
                     write!(f, "{message}")
                 }
@@ -228,64 +245,57 @@ fn parse_http_error_message(err: &ZenwaveError) -> String {
 impl std::error::Error for GeminiError {}
 
 impl GeminiError {
-    /// Check if this error is retryable.
-    #[must_use]
-    pub const fn is_retryable(&self) -> bool {
-        match self {
-            Self::Http(err) => {
-                // Retry on rate limit, server errors, network errors, and timeouts
-                if let zenwave::Error::Http { status, .. } = err {
-                    return status.as_u16() == 429
-                        || status.as_u16() >= 500
-                        || status.as_u16() == 408;
-                }
-                err.is_network_error() || err.is_timeout()
-            }
-            Self::RateLimit { .. } => true,
-            _ => false,
-        }
-    }
-
-    /// Get suggested retry delay in seconds.
-    #[must_use]
-    pub fn retry_delay_secs(&self) -> Option<u64> {
-        match self {
-            Self::RateLimit {
-                retry_after_secs, ..
-            } => *retry_after_secs,
-            Self::Http(err) => {
-                // Try to parse from response body
-                if let Some(body) = err.response_body()
-                    && let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body)
-                {
-                    return api_error.retry_delay_secs();
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    /// Convert a zenwave error to a `GeminiError`, detecting rate limits.
+    /// Convert a zenwave error to a `GeminiError`, detecting rate limits and
+    /// exhausted quotas.
     pub(crate) fn from_http(err: ZenwaveError) -> Self {
-        // Check if it's a rate limit error
         if let zenwave::Error::Http { status, .. } = &err
             && status.as_u16() == 429
         {
+            let header_delay = http_failure(&err).retry_after;
             if let Some(body) = err.response_body()
                 && let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body)
             {
+                let message = api_error.friendly_message();
+                if api_error.is_daily_quota() {
+                    return Self::QuotaExceeded { message };
+                }
                 return Self::RateLimit {
-                    message: api_error.friendly_message(),
-                    retry_after_secs: api_error.retry_delay_secs(),
+                    message,
+                    retry_after: api_error.retry_delay().or(header_delay),
                 };
             }
             return Self::RateLimit {
                 message: "Rate limit exceeded".to_string(),
-                retry_after_secs: None,
+                retry_after: header_delay,
             };
         }
         Self::Http(err)
+    }
+}
+
+impl Classify for GeminiError {
+    fn failure(&self) -> Failure {
+        match self {
+            Self::Http(err) => {
+                let mut failure = http_failure(err);
+                if let Some(body) = err.response_body()
+                    && let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body)
+                {
+                    if api_error.is_daily_quota() {
+                        failure.kind = FailureKind::Quota;
+                    }
+                    failure.retry_after = failure.retry_after.or_else(|| api_error.retry_delay());
+                }
+                failure
+            }
+            Self::Body(err) => body_failure(err),
+            Self::Stream(err) => sse_failure(err),
+            Self::Json(_) | Self::Decode(_) | Self::Api(_) | Self::Parse(_) => Failure::permanent(),
+            Self::RateLimit { retry_after, .. } => {
+                Failure::transient().with_retry_after(*retry_after)
+            }
+            Self::QuotaExceeded { .. } => Failure::quota(),
+        }
     }
 }
 
@@ -304,5 +314,94 @@ impl From<serde_json::Error> for GeminiError {
 impl From<DecodeError> for GeminiError {
     fn from(value: DecodeError) -> Self {
         Self::Decode(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use aither_core::{
+        LanguageModel,
+        llm::{Classify, FailureKind, failure::zenwave::http_error, oneshot},
+    };
+    use futures_lite::StreamExt;
+
+    use super::GeminiError;
+    use crate::Gemini;
+
+    const PER_MINUTE: &str = r#"{"error":{"code":429,"message":"quota","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"20s"}]}}"#;
+    const PER_DAY: &str = r#"{"error":{"code":429,"message":"quota","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}}"#;
+
+    fn http(status: u16, headers: &[(&str, &str)], body: &str) -> GeminiError {
+        GeminiError::Http(http_error(status, headers, body))
+    }
+
+    fn from_http(status: u16, headers: &[(&str, &str)], body: &str) -> GeminiError {
+        GeminiError::from_http(http_error(status, headers, body))
+    }
+
+    #[test]
+    fn server_errors_are_transient() {
+        assert_eq!(http(500, &[], "").failure().kind, FailureKind::Transient);
+        assert_eq!(http(503, &[], "").failure().kind, FailureKind::Transient);
+        assert_eq!(http(529, &[], "").failure().kind, FailureKind::Transient);
+    }
+
+    #[test]
+    fn per_minute_429_is_transient_with_body_delay() {
+        for error in [http(429, &[], PER_MINUTE), from_http(429, &[], PER_MINUTE)] {
+            let failure = error.failure();
+            assert_eq!(failure.kind, FailureKind::Transient);
+            assert_eq!(failure.retry_after, Some(Duration::from_secs(20)));
+        }
+    }
+
+    #[test]
+    fn daily_429_is_quota() {
+        assert_eq!(http(429, &[], PER_DAY).failure().kind, FailureKind::Quota);
+        assert_eq!(
+            from_http(429, &[], PER_DAY).failure().kind,
+            FailureKind::Quota
+        );
+    }
+
+    #[test]
+    fn unauthorized_is_permanent() {
+        assert_eq!(http(401, &[], "").failure().kind, FailureKind::Permanent);
+        assert_eq!(
+            from_http(401, &[], "").failure().kind,
+            FailureKind::Permanent
+        );
+    }
+
+    #[test]
+    fn retry_after_header_seconds_and_date() {
+        let failure = from_http(429, &[("retry-after", "9")], "").failure();
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(9)));
+        let failure = http(503, &[("retry-after", "Fri, 01 Jan 2100 00:00:00 GMT")], "").failure();
+        assert!(
+            failure
+                .retry_after
+                .is_some_and(|d| d > Duration::from_secs(3600))
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_connection_is_network() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = Gemini::new("key").with_base_url(format!("http://127.0.0.1:{port}"));
+        let stream = client.respond(oneshot("system", "hello"));
+        futures_lite::pin!(stream);
+        let error = stream
+            .next()
+            .await
+            .expect("stream yields")
+            .expect_err("connection is refused");
+        assert_eq!(error.failure().kind, FailureKind::Network, "{error}");
     }
 }

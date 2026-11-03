@@ -12,7 +12,7 @@ keywords = ["ai", "llm", "openai", "chatgpt", "codex"]
 categories = ["api-bindings"]
 
 [dependencies]
-aither-core.workspace = true
+aither-core = { workspace = true, features = ["zenwave"] }
 aither-models.workspace = true
 aither-openai.workspace = true
 async-io = "2"
@@ -29,6 +29,9 @@ thiserror = "2"
 tracing = "0.1"
 url = { version = "2.5", default-features = false }
 zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["macros", "rt"] }
 
 [lints]
 workspace = true

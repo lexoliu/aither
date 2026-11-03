@@ -30,6 +30,12 @@ impl std::fmt::Display for MockError {
 
 impl std::error::Error for MockError {}
 
+impl aither_core::llm::Classify for MockError {
+    fn failure(&self) -> aither_core::llm::Failure {
+        aither_core::llm::Failure::permanent()
+    }
+}
+
 /// Replies "ok" to the run, then the handoff document to a compaction, and
 /// counts the requests it received.
 #[derive(Clone, Default)]

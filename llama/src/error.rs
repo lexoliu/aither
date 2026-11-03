@@ -22,3 +22,11 @@ pub enum LlamaError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }
+
+impl aither_core::llm::Classify for LlamaError {
+    /// Local inference has no network and no upstream: every failure is
+    /// permanent.
+    fn failure(&self) -> aither_core::llm::Failure {
+        aither_core::llm::Failure::permanent()
+    }
+}

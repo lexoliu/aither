@@ -259,6 +259,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "url",
  "zenwave",
@@ -291,6 +292,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "url",
  "zenwave",
@@ -305,6 +307,7 @@ dependencies = [
  "askama 0.16.1",
  "futures-core",
  "futures-lite",
+ "httpdate",
  "mime",
  "schemars 1.2.3",
  "serde",
@@ -312,6 +315,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "url",
+ "zenwave",
 ]
 
 [[package]]

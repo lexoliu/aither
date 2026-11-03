@@ -1355,6 +1355,12 @@ mod tests {
 
     impl std::error::Error for MockError {}
 
+    impl aither_core::llm::Classify for MockError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
+
     #[derive(Clone)]
     struct MockLlm {
         requests: async_channel::Sender<LLMRequest>,

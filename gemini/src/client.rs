@@ -1,3 +1,4 @@
+use aither_core::llm::Classify;
 use std::time::Duration;
 
 /// Waits out a retry backoff.
@@ -98,8 +99,11 @@ pub async fn stream_generate(
             Ok(stream) => break stream,
             Err(e) => {
                 let err = GeminiError::from_http(e);
-                if err.is_retryable() && attempt < MAX_RETRIES {
-                    let delay_secs = err.retry_delay_secs().unwrap_or_else(|| 2u64.pow(attempt));
+                let failure = err.failure();
+                if failure.is_retryable() && attempt < MAX_RETRIES {
+                    let delay_secs = failure
+                        .retry_after
+                        .map_or_else(|| 2u64.pow(attempt), |delay| delay.as_secs());
                     if debug {
                         tracing::info!(
                             "Gemini streaming error (attempt {}/{}), retrying in {}s: {}",
@@ -128,7 +132,7 @@ pub async fn stream_generate(
                         let event = match result {
                             Ok(e) => e,
                             Err(e) => {
-                                return Some((Err(GeminiError::Parse(e.to_string())), stream));
+                                return Some((Err(GeminiError::Stream(e)), stream));
                             }
                         };
                         let data = event.text_data();
@@ -226,8 +230,11 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
             }
             Err(e) => {
                 let err = GeminiError::from_http(e);
-                if err.is_retryable() && attempt < MAX_RETRIES {
-                    let delay_secs = err.retry_delay_secs().unwrap_or_else(|| 2u64.pow(attempt));
+                let failure = err.failure();
+                if failure.is_retryable() && attempt < MAX_RETRIES {
+                    let delay_secs = failure
+                        .retry_after
+                        .map_or_else(|| 2u64.pow(attempt), |delay| delay.as_secs());
                     if debug {
                         tracing::info!(
                             "Gemini POST error (attempt {}/{}), retrying in {}s: {}",
