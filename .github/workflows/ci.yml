@@ -4,6 +4,7 @@ on:
   push:
     branches: [dev]
   pull_request:
+  merge_group:
 
 # Keyed per event, so a branch with a pull request open runs the suite twice --
 # once for the push, once for the pull request. Keying on the head branch
@@ -30,7 +31,13 @@ jobs:
   # dev has no base, so the tool selects the whole workspace and the full suite
   # runs unchanged. Workflows, the toolchain, the lockfile, cargo and nextest
   # configuration, and any path the rules do not name select the whole
-  # workspace; prose selects nothing (.github/affected-rules.toml).
+  # workspace; prose selects nothing (.github/affected-rules.toml). A merge
+  # group has no base either, so the queue runs the full suite on the exact
+  # commit that lands on dev.
+  #
+  # A pull request from dev into main proposes a commit dev's merge queue
+  # already tested, so it selects nothing and only the feature checks, which
+  # the queue does not run, still run on it.
   #
   # Scoped runs keep dev's cache-saved feature resolution where they can: build
   # commands keep their `--workspace` / `--all-features` flags, and the test
@@ -43,9 +50,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      workspace: ${{ steps.scope.outputs.workspace }}
+      queued: ${{ steps.jobs.outputs.queued }}
+      workspace: ${{ steps.jobs.outputs.workspace }}
       packages: ${{ steps.scope.outputs.packages }}
       package-args: ${{ steps.scope.outputs.package-args }}
+      features: ${{ steps.jobs.outputs.features }}
       rust: ${{ steps.jobs.outputs.rust }}
       wasm: ${{ steps.jobs.outputs.wasm }}
       sandbox: ${{ steps.jobs.outputs.sandbox }}
@@ -68,12 +77,23 @@ jobs:
       # `apple` are true when a crate the matching job builds is affected, which
       # a changed dependency of it also makes true. `filterset` narrows nextest
       # to the affected packages and is empty for the whole workspace.
+      # `features` is `rust` on a pull request into main; `queued` (a pull
+      # request from dev into main) then clears every other output.
       - id: jobs
         env:
           WORKSPACE: ${{ steps.scope.outputs.workspace }}
           PACKAGES: ${{ steps.scope.outputs.packages }}
+          INTO_MAIN: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' }}
+          QUEUED: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'dev' }}
         run: |
           set -euo pipefail
+          rust=$([ "${WORKSPACE}" = true ] || [ -n "${PACKAGES}" ] && echo true || echo false)
+          features=$([ "${INTO_MAIN}" = true ] && [ "${rust}" = true ] && echo true || echo false)
+          if [ "${QUEUED}" = true ]; then
+            WORKSPACE=false
+            PACKAGES=""
+            rust=false
+          fi
           has() {
             [ "${WORKSPACE}" = true ] && return 0
             for want in "$@"; do
@@ -89,7 +109,10 @@ jobs:
             done
           fi
           {
-            echo "rust=$([ "${WORKSPACE}" = true ] || [ -n "${PACKAGES}" ] && echo true || echo false)"
+            echo "queued=${QUEUED}"
+            echo "workspace=${WORKSPACE}"
+            echo "features=${features}"
+            echo "rust=${rust}"
             echo "wasm=$(flag has aither-core aither-openai aither-gemini aither-claude)"
             echo "sandbox=$(flag has aither-sandbox)"
             echo "apple=$(flag has aither-apple)"
@@ -102,6 +125,8 @@ jobs:
   # before anyone waits on a compile.
   typos:
     name: Typos
+    needs: scope
+    if: needs.scope.outputs.queued != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -316,7 +341,7 @@ jobs:
   feature-checks:
     name: Features (${{ matrix.part }}/8)
     needs: scope
-    if: needs.scope.outputs.rust == 'true' && github.event_name == 'pull_request' && github.base_ref == 'main'
+    if: needs.scope.outputs.features == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
