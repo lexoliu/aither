@@ -68,18 +68,6 @@ impl CacheWarmth {
             .store(at.as_nanos(), Ordering::Relaxed);
     }
 
-    /// Pretends the entry was started `age` ago.
-    #[cfg(test)]
-    pub(crate) fn backdate_entry(&self, age: Duration) {
-        let at = self
-            .inner
-            .clock
-            .now()
-            .checked_sub(age)
-            .expect("the clock stands further from its origin than the age");
-        self.start_entry(at);
-    }
-
     /// A handle on a never-started entry with another lifetime, same clock.
     #[cfg(test)]
     pub(crate) fn with_lifetime(&self, lifetime: CacheLifetime) -> Self {

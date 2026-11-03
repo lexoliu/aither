@@ -1517,9 +1517,18 @@ where
     }
 
     /// Pretends the cache entry was started `age` ago.
+    ///
+    /// The system clock counts from boot, so a freshly booted machine cannot
+    /// stand `age` back; the entry moves to a manual clock standing `age`
+    /// past its origin, with the entry at the origin.
     #[cfg(test)]
-    pub(crate) fn backdate_cache_entry(&self, age: Duration) {
-        self.warmth.backdate_entry(age);
+    pub(crate) fn backdate_cache_entry(&mut self, age: Duration) {
+        let clock = crate::ManualClock::new();
+        clock.advance(age);
+        self.warmth =
+            crate::CacheWarmth::new(self.prompt_cache.lifetime(), crate::AnyClock::new(clock));
+        self.warmth
+            .start_entry(crate::clock::Instant::from_nanos(0));
     }
 
     /// Swaps the cache lifetime, forgetting any started entry.
