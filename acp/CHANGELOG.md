@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/May-Agent/aither/compare/acp-v0.11.0...acp-v0.12.0) - 2026-11-03
+
+### Added
+
+- *(sandbox)* [**breaking**] merge terminal_background into terminal with required timeout and promote-at-wait
+
+### Fixed
+
+- declare default-features on workspace aither-agent for Cargo 1.85-1.98 ([#293](https://github.com/May-Agent/aither/pull/293))
+
+### Other
+
+- refresh README with agent, sandbox, MCP/ACP, and provider crates
+- Merge remote-tracking branch 'origin/main' into chore/merge-main-into-dev-0.11
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/acp-v0.10.1...acp-v0.11.0) - 2026-10-29
 
 ### Added

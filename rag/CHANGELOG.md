@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/May-Agent/aither/compare/rag-v0.11.0...rag-v0.12.0) - 2026-11-03
+
+### Other
+
+- Drop the tool_hints block; give tools model-facing descriptions ([#303](https://github.com/May-Agent/aither/pull/303))
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/rag-v0.10.1...rag-v0.11.0) - 2026-10-29
 
 ### Fixed
