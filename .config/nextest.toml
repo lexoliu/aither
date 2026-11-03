@@ -1,3 +1,8 @@
+# A hung test fails within minutes instead of holding its job until the job
+# timeout. The slowest test takes about 35 s on any CI platform.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }
+
 # A hung process-tree test fails within seconds instead of holding the job
 # until its timeout; these tests normally finish in under 4 s.
 [[profile.default.overrides]]
