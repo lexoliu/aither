@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/May-Agent/aither/compare/cloud-v0.12.0...cloud-v0.13.0) - 2026-11-03
+
+### Added
+
+- *(core)* [**breaking**] classify provider failures and carry Retry-After
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/cloud-v0.10.1...cloud-v0.11.0) - 2026-10-29
 
 ### Fixed
