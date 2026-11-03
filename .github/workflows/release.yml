@@ -49,6 +49,7 @@ jobs:
       # never hit.
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: ci-ubuntu
       # The water-rs fork of release-plz (from release-plz-v0.3.161, the
       # version release-plz-action@v0.5 pins) treats a package it cannot

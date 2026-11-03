@@ -95,8 +95,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Only dev saves caches. A pull request restores dev's and saves none:
+      # its copy would be reachable from that pull request alone, and those
+      # copies push dev's caches past the repository limit, where they are
+      # evicted and every job compiles from scratch.
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: ci-ubuntu
       - uses: arduino/setup-protoc@v3
         with:
@@ -114,6 +119,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: ci-wasm
       # `aither` itself is not wasm-buildable: the agent, sandbox, and CLI need
       # a filesystem and processes. Build the crates that are meant to run in a
@@ -163,6 +169,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: ci-apple
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --locked -p aither-apple --features test --run-ignored all
@@ -191,6 +198,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: ci-container-acceptance
       - uses: ./.github/actions/install-heel
       - run: >
@@ -235,6 +243,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           # Each partition gets its own cache: eight jobs sharing one key
           # would evict each other's artifacts on every save.
           shared-key: ci-features-${{ matrix.part }}
@@ -278,6 +287,7 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: ci-coverage
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
