@@ -1,1 +1,1 @@
-[... lines {{ first }}-{{ last }} of {{ total }} omitted; read them with sed -n '{{ first }},{{ last }}p' on the file named below ...]
+[... lines {{ first }}-{{ last }} of {{ total }} omitted; read them with head -n {{ last }} on the file named below, piped to tail -n +{{ first }} ...]

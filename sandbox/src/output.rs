@@ -255,7 +255,7 @@ impl OutputStore {
     /// Saves output data with an explicit size limit.
     ///
     /// When output exceeds the limit, it's saved to file and only a reference is returned.
-    /// The LLM must use head/tail/grep to read the file content like a human.
+    /// The LLM must use head/tail/rg to read the file content like a human.
     ///
     /// # Errors
     ///
@@ -816,7 +816,7 @@ mod tests {
             rendered.contains(&file.url) && rendered.contains(&file.path),
             "guidance must reference the saved file: {rendered}"
         );
-        assert!(rendered.contains("Use head/tail/grep/sed"));
+        assert!(rendered.contains("Use head/tail/rg"));
     }
 
     #[tokio::test]
