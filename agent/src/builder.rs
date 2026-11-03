@@ -712,6 +712,7 @@ where
     /// Builds the agent.
     pub fn build(self) -> Agent<Advanced, Balanced, Fast, H, Compactor> {
         Agent {
+            warmth: crate::CacheWarmth::new(self.prompt_cache.lifetime(), self.clock.clone()),
             advanced: std::sync::Arc::new(self.advanced),
             balanced: std::sync::Arc::new(self.balanced),
             fast: std::sync::Arc::new(self.fast),
@@ -745,8 +746,6 @@ where
             blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
-            last_request_started_at: None,
-            clock: self.clock,
             last_request: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
             cache_stats: crate::CacheStats::new(),

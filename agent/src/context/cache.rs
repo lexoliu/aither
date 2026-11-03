@@ -37,17 +37,6 @@ pub enum CacheLifetime {
     Permanent,
 }
 
-impl CacheLifetime {
-    /// Whether `idle` is long enough that the cached prefix is gone.
-    #[must_use]
-    pub fn is_cold(&self, idle: Duration) -> bool {
-        match self {
-            Self::Limited(lifetime) => idle >= *lifetime,
-            Self::Permanent => false,
-        }
-    }
-}
-
 /// Derives per-request cache controls for one agent session.
 #[derive(Debug, Clone)]
 pub struct PromptCache {
@@ -298,18 +287,6 @@ mod tests {
             }),
             "breakpoint must land on the last stable message, not the tail"
         );
-    }
-
-    #[test]
-    fn the_idle_gap_follows_the_cache_lifetime() {
-        let lifetime = CacheLifetime::Limited(Duration::from_secs(3600));
-        assert!(!lifetime.is_cold(Duration::from_secs(300)));
-        assert!(!lifetime.is_cold(Duration::from_secs(3540)));
-        assert!(lifetime.is_cold(Duration::from_secs(3660)));
-
-        // A permanent cache is never cold: rewriting the prefix always
-        // invalidates something, so an idle gap never justifies it.
-        assert!(!CacheLifetime::Permanent.is_cold(Duration::from_secs(86_400)));
     }
 
     #[test]

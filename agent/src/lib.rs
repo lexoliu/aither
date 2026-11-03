@@ -57,6 +57,7 @@ mod terminal_agent;
 mod test_support;
 pub mod tool_request;
 mod tools;
+mod warmth;
 pub mod working_docs;
 pub mod workspace_request;
 
@@ -85,7 +86,7 @@ pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser}
 pub use builder::AgentBuilder;
 pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
-pub use clock::{AnyClock, Clock, ManualClock, SystemClock};
+pub use clock::{AnyClock, Clock, Instant, ManualClock, SystemClock};
 pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy};
 #[cfg(feature = "skills")]
 pub use context::ActiveSkills;
@@ -110,6 +111,7 @@ pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
 pub use stream::AgentStream;
 pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};
 pub use tools::AgentTools;
+pub use warmth::{CacheState, CacheWarmth};
 pub use working_docs::{AnyTaskBlockerResolver, TaskBlockerResolver};
 
 // Model groups for budget tracking and fallback

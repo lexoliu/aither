@@ -596,8 +596,8 @@ enum SubagentBody<LLM> {
 }
 
 impl<LLM: LanguageModel + 'static> FinishedSubagent<LLM> {
-    /// The cache lifetime this subagent outlived, when it did: the later of
-    /// its last request and its last keep-alive is older than that. An
+    /// The cache lifetime this subagent outlived, when it did: its cache is
+    /// cold (never started, or past its lifetime). An
     /// external session never expires.
     fn expired(&self) -> Option<CacheLifetime> {
         let SubagentBody::Agent {
@@ -606,10 +606,7 @@ impl<LLM: LanguageModel + 'static> FinishedSubagent<LLM> {
         else {
             return None;
         };
-        agent
-            .cache_entry_started_at()
-            .is_none_or(|started| lifetime.is_cold(started.elapsed()))
-            .then_some(*lifetime)
+        (!agent.cache_warmth().is_warm()).then_some(*lifetime)
     }
 }
 
@@ -3410,7 +3407,7 @@ You are a file-defined agent.
         let SubagentBody::Agent { agent, .. } = &mut finished.body else {
             panic!("subagent {id} is not an aither agent");
         };
-        agent.last_request_started_at = Instant::now().checked_sub(age);
+        agent.backdate_cache_entry(age);
         drop(inner);
     }
 
