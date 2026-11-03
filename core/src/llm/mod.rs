@@ -116,8 +116,8 @@ pub use researcher::{
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 pub use tool::{
-    CommandOutcome, CommandResult, CommandStream, IntoToolResult, StoredFile, Tool, ToolContext,
-    ToolResult,
+    CommandOutcome, CommandResult, CommandStream, Interruption, InterruptionCause, IntoToolResult,
+    StoredFile, Tool, ToolContext, ToolResult, render_interruptions,
 };
 
 use crate::llm::model::Profile;

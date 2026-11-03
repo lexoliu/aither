@@ -543,6 +543,7 @@ dependencies = [
 name = "aither-sandbox"
 version = "0.12.0"
 dependencies = [
+ "aither-connectivity",
  "aither-core",
  "anyhow",
  "arc-swap",
@@ -565,6 +566,7 @@ dependencies = [
  "hex",
  "human-hash",
  "image",
+ "jiff",
  "libc",
  "lzma-rust2 0.24.0",
  "magika",

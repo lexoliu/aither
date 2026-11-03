@@ -368,6 +368,7 @@ struct BackgroundTerminalResultTemplate<'a> {
     outcome: BackgroundOutcome<'a>,
     output: Option<&'a str>,
     stderr: Option<&'a str>,
+    interruptions: &'a str,
 }
 
 /// Whether the session's first run has begun.
@@ -2818,12 +2819,17 @@ fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String
             (BackgroundOutcome::Failed { error: &error_text }, None, None)
         }
     };
+    let interruptions = task.result.as_ref().map_or_else(
+        |_| String::new(),
+        |command| aither_core::llm::render_interruptions(&command.interruptions),
+    );
     BackgroundTerminalResultTemplate {
         task_id: &task.task_id,
         script: truncate_script(&task.script, 100),
         outcome,
         output: output.as_deref(),
         stderr: stderr.as_deref(),
+        interruptions: &interruptions,
     }
     .render()
     .expect("background terminal result template must render")
@@ -2948,11 +2954,31 @@ mod tests {
     }
 
     #[test]
+    fn background_result_states_the_outages_it_ran_through() {
+        use aither_core::llm::{Interruption, InterruptionCause};
+        let task = completed(Ok(CompletedCommand {
+            stdout: inline("all green"),
+            stderr: None,
+            exit_code: 0,
+            interruptions: vec![Interruption {
+                cause: InterruptionCause::Offline,
+                from: "14:02:11".to_string(),
+                to: "14:31:40".to_string(),
+            }],
+        }));
+        assert_eq!(
+            format_background_task_result(&task),
+            "Background task 'amber-forest-thunder-pearl' (`make test`) finished with exit code 0.\nall green\nThe network was offline from 14:02:11 to 14:31:40 while this ran.\n"
+        );
+    }
+
+    #[test]
     fn background_result_exit_zero_with_output() {
         let task = completed(Ok(CompletedCommand {
             stdout: inline("all green"),
             stderr: None,
             exit_code: 0,
+            interruptions: Vec::new(),
         }));
         assert_eq!(
             format_background_task_result(&task),
@@ -2966,6 +2992,7 @@ mod tests {
             stdout: inline("1 passed"),
             stderr: Some(inline("boom")),
             exit_code: 101,
+            interruptions: Vec::new(),
         }));
         assert_eq!(
             format_background_task_result(&task),
@@ -2979,6 +3006,7 @@ mod tests {
             stdout: inline("partial output"),
             stderr: None,
             exit_code: -1,
+            interruptions: Vec::new(),
         }));
         task.killed = true;
         assert_eq!(

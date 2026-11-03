@@ -59,6 +59,7 @@ mod grants;
 mod kill_guard;
 pub mod monitor;
 mod naming;
+mod outage;
 mod output;
 mod output_compress;
 pub(crate) mod poll_guard;

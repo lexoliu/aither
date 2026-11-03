@@ -3059,6 +3059,7 @@ You are a file-defined agent.
                     },
                     stderr: None,
                     exit_code: 0,
+                    interruptions: Vec::new(),
                 }),
             })
             .await;
@@ -3142,6 +3143,7 @@ You are a file-defined agent.
                     },
                     stderr: None,
                     exit_code: 0,
+                    interruptions: Vec::new(),
                 }),
             })
             .await;

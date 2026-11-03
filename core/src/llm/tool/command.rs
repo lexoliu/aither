@@ -4,6 +4,7 @@
 //! these fields; hosts read the fields and never parse that prose.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use askama::Template;
 
@@ -72,6 +73,46 @@ pub enum CommandOutcome {
     },
 }
 
+/// What was unavailable during an [`Interruption`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum InterruptionCause {
+    /// The machine was asleep.
+    Asleep,
+    /// The machine had no route to the network.
+    Offline,
+}
+
+/// A span of a command's run during which the machine was asleep or offline.
+///
+/// The times are wall-clock times of day in the machine's local time zone,
+/// exactly as the model reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Interruption {
+    /// What was unavailable.
+    pub cause: InterruptionCause,
+    /// When the span began, or when the command started if it began earlier.
+    pub from: String,
+    /// When the span ended, or when the command ended if it ended earlier.
+    pub to: String,
+}
+
+/// Renders `interruptions` as one line each; the empty string when there are
+/// none.
+///
+/// # Panics
+///
+/// Panics if the template fails to render, which formatting in-memory
+/// strings cannot do.
+#[must_use]
+pub fn render_interruptions(interruptions: &[Interruption]) -> String {
+    InterruptionsTemplate { interruptions }
+        .render()
+        .expect("interruptions template must render")
+}
+
 /// Complete typed record of one command run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -82,6 +123,15 @@ pub struct CommandResult {
     pub stderr: Option<CommandStream>,
     /// How the run ended.
     pub outcome: CommandOutcome,
+    /// Spans of the run during which the machine was asleep or offline.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub interruptions: Vec<Interruption>,
+}
+
+#[derive(Template)]
+#[template(path = "command_interruptions.txt", escape = "none")]
+struct InterruptionsTemplate<'a> {
+    interruptions: &'a [Interruption],
 }
 
 #[derive(Template)]
@@ -96,6 +146,7 @@ struct CommandResultTemplate<'a> {
     stdout: &'a str,
     stderr: Option<&'a str>,
     outcome: &'a CommandOutcome,
+    interruptions: &'a str,
 }
 
 impl CommandStream {
@@ -146,6 +197,7 @@ impl CommandResult {
             stdout: &stdout,
             stderr: stderr.as_deref(),
             outcome: &self.outcome,
+            interruptions: &render_interruptions(&self.interruptions),
         }
         .render()
         .expect("command result template must render")
@@ -174,6 +226,7 @@ mod tests {
             stdout,
             stderr,
             outcome,
+            interruptions: Vec::new(),
         }
         .render_for_model()
     }
@@ -252,6 +305,33 @@ mod tests {
                 },
             ),
             "partial\nKilled at the time bound.\nTask ID: 't2'.\n"
+        );
+    }
+
+    #[test]
+    fn interruptions_render_one_line_each_after_the_outcome() {
+        let command = CommandResult {
+            stdout: CommandStream::Inline {
+                text: "out\n".to_string(),
+            },
+            stderr: None,
+            outcome: CommandOutcome::Exited { code: 1 },
+            interruptions: alloc::vec![
+                Interruption {
+                    cause: InterruptionCause::Asleep,
+                    from: "14:02:11".to_string(),
+                    to: "14:31:40".to_string(),
+                },
+                Interruption {
+                    cause: InterruptionCause::Offline,
+                    from: "14:31:40".to_string(),
+                    to: "14:32:05".to_string(),
+                },
+            ],
+        };
+        assert_eq!(
+            command.render_for_model(),
+            "out\nExit code: 1.\nThe machine was asleep from 14:02:11 to 14:31:40 while this ran.\nThe network was offline from 14:31:40 to 14:32:05 while this ran.\n"
         );
     }
 }

@@ -1,0 +1,2 @@
+{% for interruption in interruptions %}{% match interruption.cause %}{% when InterruptionCause::Asleep %}The machine was asleep{% when InterruptionCause::Offline %}The network was offline{% endmatch %} from {{ interruption.from }} to {{ interruption.to }} while this ran.
+{% endfor %}
