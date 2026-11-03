@@ -228,6 +228,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      attestations: write
+      id-token: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ needs.patch-release.outputs.tag }}
@@ -270,6 +272,13 @@ jobs:
             [ -f "artifacts/${file}" ] && [ -f "artifacts/${file}.sha256" ] \
               || { echo "missing staged asset for ${file}" >&2; exit 1; }
           done
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+            tool-distribution-${{ needs.patch-release.outputs.version }}.json
       - name: Upload release assets
         run: >-
           gh release upload "${TAG}" --clobber
