@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/May-Agent/aither/compare/cli-v0.11.0...cli-v0.12.0) - 2026-11-03
+
+### Added
+
+- *(agent)* external reviewers on the permission path
+- *(agent,sandbox)* keep subagents inside the main agent's authority
+
+### Fixed
+
+- declare default-features on workspace aither-agent for Cargo 1.85-1.98 ([#293](https://github.com/May-Agent/aither/pull/293))
+
+### Other
+
+- refresh README with agent, sandbox, MCP/ACP, and provider crates
+- Merge pull request #260 from lexoliu/feat/238-fork-subagent
+- Merge remote-tracking branch 'origin/main' into chore/merge-main-into-dev-0.11
+- Merge origin/dev into feat/227-subagent-authority
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/cli-v0.10.1...cli-v0.11.0) - 2026-10-29
 
 ### Added
