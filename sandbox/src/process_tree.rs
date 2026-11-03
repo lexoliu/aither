@@ -2482,10 +2482,13 @@ mod tests {
             .expect("the supervised command spawns");
         let exit = child.wait().await.expect("the supervisor tears down");
         assert_eq!(exit.report.killed.len(), 1, "{:?}", exit.report.killed);
-        // The name is read at kill time: caught between `setsid`'s fork and
-        // exec it is still "setsid", after it "sleep".
+        // The name is read at kill time, and the background command passes
+        // through `sh` (forked, before its exec), `env`, `setsid` and `sleep`.
         assert!(
-            matches!(exit.report.killed[0].name.as_str(), "setsid" | "sleep"),
+            matches!(
+                exit.report.killed[0].name.as_str(),
+                "sh" | "env" | "setsid" | "sleep"
+            ),
             "{:?}",
             exit.report.killed[0]
         );
