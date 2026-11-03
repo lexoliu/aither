@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/May-Agent/aither/compare/apple-v0.11.0...apple-v0.12.0) - 2026-11-03
+
+### Other
+
+- drop x86_64-apple-ios support in aither-apple
+- drop macos-x86_64 artifacts and float the arm64 lane on latest
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/apple-v0.10.1...apple-v0.11.0) - 2026-10-29
 
 ### Fixed

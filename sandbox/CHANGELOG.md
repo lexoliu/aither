@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/May-Agent/aither/compare/sandbox-v0.11.0...sandbox-v0.12.0) - 2026-11-03
+
+### Added
+
+- *(sandbox)* [**breaking**] prepare a cached host program without re-extracting its archive
+- *(sandbox)* give a committing subagent its own repository ([#298](https://github.com/May-Agent/aither/pull/298))
+- *(agent)* let a run end with the model's turn while its background jobs run
+- *(sandbox)* [**breaking**] merge terminal_background into terminal with required timeout and promote-at-wait
+- *(agent)* command hooks on every shell command
+- *(agent)* external hook runner and lifecycle hooks
+- *(sandbox)* carry the main agent's working directory across commands
+- *(sandbox)* refuse name- and pattern-based kills
+- *(agent,sandbox)* keep subagents inside the main agent's authority
+
+### Fixed
+
+- *(sandbox)* a command's descendants live exactly as long as its job ([#296](https://github.com/May-Agent/aither/pull/296))
+- *(sandbox)* record the carried working directory without an EXIT trap
+- *(sandbox)* spell unparsable consistently and let typos skip option strings
+- *(agent,sandbox)* resolve canonical paths without the Windows verbatim prefix
+
+### Other
+
+- Run the host Rust toolchain inside the local terminal
+- host toolchain in the local terminal (needs heel#149)
+- Add runtime grants to TerminalTool
+- Merge pull request #204 from lexoliu/feat/terminal-env-inject
+- Add TerminalEnvSource env injection to terminal tool
+- refresh README with agent, sandbox, MCP/ACP, and provider crates
+- Run approved-unsafe terminal commands under a permissive heel profile ([#304](https://github.com/May-Agent/aither/pull/304))
+- Drop the tool_hints block; give tools model-facing descriptions ([#303](https://github.com/May-Agent/aither/pull/303))
+- Merge remote-tracking branch 'origin/dev' into feat/277-hooks
+- Merge pull request #267 from lexoliu/fix/265-kill-pid-race
+- *(sandbox)* compare the unterminated here-document output without its trailing newline
+- Merge pull request #260 from lexoliu/feat/238-fork-subagent
+- Merge remote-tracking branch 'origin/main' into chore/merge-main-into-dev-0.11
+- Merge pull request #251 from lexoliu/feat/227-subagent-authority
+- *(sandbox)* gate the recording container exec to unix like its only user
+- Merge origin/dev into feat/227-subagent-authority
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/sandbox-v0.10.1...sandbox-v0.11.0) - 2026-10-29
 
 ### Added
