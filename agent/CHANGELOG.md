@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/May-Agent/aither/compare/agent-v0.13.0...agent-v0.14.0) - 2026-11-03
+
+### Added
+
+- *(sed)* aither-sed prints line ranges for sed in agent scripts
+- *(sandbox)* managed uv and a pinned python3
+- *(sandbox)* build bash 5.3 in CI and run terminal scripts through it
+- *(sandbox)* managed uutils coreutils, findutils xargs and fd
+
+### Fixed
+
+- *(sandbox)* read hints name head, tail and rg, not the blocked commands
+
+### Other
+
+- Merge origin/dev into feat/387-managed-bash
+- Merge pull request #392 from May-Agent/feat/386-managed-coreutils
+
 ## [0.13.0](https://github.com/May-Agent/aither/compare/agent-v0.12.0...agent-v0.13.0) - 2026-11-03
 
 ### Added
