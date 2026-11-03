@@ -202,7 +202,7 @@ async fn handle_model_event<H: Hook>(
     hooks: &H,
     cache_stats: &mut crate::CacheStats,
     budget: &mut ContextBudget,
-    event: Result<Event, String>,
+    event: Result<Event, AgentError>,
     text_chunks: &mut Vec<String>,
     tool_calls: &mut Vec<ToolCall>,
     reasoning: &mut Vec<ReasoningState>,
@@ -260,11 +260,11 @@ async fn handle_model_event<H: Hook>(
             budget.calibrate(&usage);
             Ok(ModelEventAction::Emit(AgentEvent::Usage(usage)))
         }
-        Err(error) if error.contains("malformed function call") => {
+        Err(AgentError::Llm { message, .. }) if message.contains("malformed function call") => {
             tracing::warn!("Model generated malformed function call, retrying...");
             Ok(ModelEventAction::RetryMalformed)
         }
-        Err(error) => Err(AgentError::Llm(error)),
+        Err(error) => Err(error),
     }
 }
 
@@ -285,7 +285,7 @@ fn ensure_non_empty_tool_call_ids(
         .map(|call| format!("{} ({})", call.name, call.id))
         .collect::<Vec<_>>()
         .join(", ");
-    Err(AgentError::Llm(format!(
+    Err(AgentError::llm_local(format!(
         "provider emitted tool call with empty id; response_text={response_text:?}; tool_calls=[{tool_calls_text}]"
     )))
 }
@@ -779,21 +779,21 @@ where
         balanced: &'a Arc<Balanced>,
         fast: &'a Arc<Fast>,
         request: LLMRequest,
-    ) -> Pin<Box<dyn Stream<Item = Result<Event, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<Event, AgentError>> + Send + 'a>> {
         match tier {
             ModelTier::Advanced => Box::pin(
                 advanced
                     .respond(request)
-                    .map(|event| event.map_err(|error| error.to_string())),
+                    .map(|event| event.map_err(|error| AgentError::from_model_error(&error))),
             ),
             ModelTier::Balanced => Box::pin(
                 balanced
                     .respond(request)
-                    .map(|event| event.map_err(|error| error.to_string())),
+                    .map(|event| event.map_err(|error| AgentError::from_model_error(&error))),
             ),
             ModelTier::Fast => Box::pin(
                 fast.respond(request)
-                    .map(|event| event.map_err(|error| error.to_string())),
+                    .map(|event| event.map_err(|error| AgentError::from_model_error(&error))),
             ),
         }
     }
@@ -1482,7 +1482,7 @@ where
             match event {
                 Ok(Event::Usage(usage)) => self.cache_stats.record(&usage),
                 Ok(_) => {}
-                Err(error) => return Err(AgentError::Llm(error)),
+                Err(error) => return Err(error),
             }
         }
         self.cache_keep_alive.last_sent_at = Some(self.clock.now());
@@ -1936,12 +1936,12 @@ where
             focus,
             &skills,
         )
-        .map_err(|error| AgentError::Llm(error.to_string()))?;
+        .map_err(AgentError::from)?;
         let fork_point = fork.fork_point();
         let handoff = self
             .compaction_future(fork)
             .await
-            .map_err(|error| AgentError::Llm(error.to_string()))?;
+            .map_err(AgentError::from)?;
         let summary = handoff.render_markdown();
 
         self.completed_compaction = Some(CompletedCompaction {
@@ -2365,11 +2365,22 @@ where
         // spend: compaction replays the main request's prefix through the
         // same model, so no second profile is involved.
         let profile = match self.tier {
-            ModelTier::Advanced => self.advanced.profile().await.map_err(|e| e.to_string()),
-            ModelTier::Balanced => self.balanced.profile().await.map_err(|e| e.to_string()),
-            ModelTier::Fast => self.fast.profile().await.map_err(|e| e.to_string()),
-        }
-        .map_err(AgentError::Llm)?;
+            ModelTier::Advanced => self
+                .advanced
+                .profile()
+                .await
+                .map_err(|e| AgentError::from_model_error(&e)),
+            ModelTier::Balanced => self
+                .balanced
+                .profile()
+                .await
+                .map_err(|e| AgentError::from_model_error(&e)),
+            ModelTier::Fast => self
+                .fast
+                .profile()
+                .await
+                .map_err(|e| AgentError::from_model_error(&e)),
+        }?;
         self.budget.set_window(profile.context_length);
         self.profile = Some(profile);
 
@@ -3094,6 +3105,12 @@ mod tests {
     }
 
     impl std::error::Error for MockError {}
+
+    impl aither_core::llm::Classify for MockError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
 
     #[derive(Clone)]
     struct MockLlm {

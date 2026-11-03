@@ -15,7 +15,7 @@ pub use aither_openai::{self as openai, OpenAI, OpenAIProvider};
 use aither_core::{
     EmbeddingModel, LanguageModel,
     llm::{
-        Event, LLMRequest, LanguageModelProvider, model::Profile,
+        Classify, Event, LLMRequest, LanguageModelProvider, model::Profile,
         provider::Profile as ProviderProfile,
     },
 };
@@ -193,6 +193,18 @@ pub enum CloudError {
     /// `ChatGPT` Codex API error.
     #[error("Codex error: {0}")]
     Codex(#[from] aither_codex::CodexError),
+}
+
+impl Classify for CloudError {
+    fn failure(&self) -> aither_core::llm::Failure {
+        match self {
+            Self::OpenAI(error) => error.failure(),
+            Self::Claude(error) => error.failure(),
+            Self::Gemini(error) => error.failure(),
+            Self::Copilot(error) => error.failure(),
+            Self::Codex(error) => error.failure(),
+        }
+    }
 }
 
 impl LanguageModel for CloudProvider {

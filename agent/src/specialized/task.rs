@@ -2205,6 +2205,12 @@ mod tests {
 
     impl std::error::Error for NeverError {}
 
+    impl aither_core::llm::Classify for NeverError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
+
     /// A model whose `respond` stream never yields, so the child query
     /// stays in flight until the run is cancelled.
     #[derive(Clone)]
