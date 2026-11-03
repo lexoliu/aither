@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      patch-tag:
+        description: >-
+          An existing patch-v<version> release to publish apply_patch assets and
+          the tool-distribution manifest for, built from the commit its tag
+          points at. Leave empty for a normal release run.
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -13,6 +22,7 @@ permissions:
 jobs:
   release-plz:
     name: Release
+    if: github.event_name == 'push' || inputs.patch-tag == ''
     runs-on: ubuntu-latest
     # release-plz/git-config reads GITHUB_TOKEN to name the bot committer, and
     # both release-plz commands take it, so it is a job-level variable.
@@ -135,9 +145,11 @@ jobs:
           --forge github
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-      # release-plz tags the commit it released — this job's checkout — so a
-      # patch-v<version> tag resolving to GITHUB_SHA means this run cut the
-      # aither-patch release; an earlier release's tag points at the commit
+      # release-plz tags the commit it released: this job's checkout, or, when
+      # a release pull request was merged with a merge commit, that pull
+      # request's head, a parent of the checkout. A patch-v<version> tag on
+      # either means this run cut the aither-patch release; an earlier
+      # release's tag points at the commit
       # that cut it and does not retrigger asset publishing. The GitHub
       # release is checked rather than assumed (release-plz creates it with
       # the tag).
@@ -149,7 +161,9 @@ jobs:
             | jq -r '.packages[] | select(.name == "aither-patch") | .version')"
           tag="patch-v${version}"
           released=false
-          if [ "$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq .sha 2>/dev/null || true)" = "${GITHUB_SHA}" ] \
+          tagged="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq .sha 2>/dev/null || true)"
+          if [ -n "${tagged}" ] \
+              && git rev-parse "${GITHUB_SHA}" "${GITHUB_SHA}^@" | grep -qx "${tagged}" \
               && gh release view "${tag}" --json tagName >/dev/null 2>&1; then
             released=true
           fi
@@ -164,28 +178,69 @@ jobs:
   # consumes (aither #104/#113). The PR-time build+verify matrix is reused
   # through workflow_call, restricted to the `immediate` abort variant that
   # is the published executable.
-  apply-patch-artifacts:
+  # The aither-patch release whose assets to publish: the one this push cut,
+  # or the existing one a manual run names.
+  patch-release:
+    name: aither-patch release
     needs: release-plz
-    if: needs.release-plz.outputs.patch-released == 'true'
+    if: >-
+      always() && !cancelled()
+      && (needs.release-plz.result == 'success' || needs.release-plz.result == 'skipped')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REQUESTED: ${{ inputs.patch-tag }}
+      CUT_TAG: ${{ needs.release-plz.outputs.patch-tag }}
+      CUT_VERSION: ${{ needs.release-plz.outputs.patch-version }}
+      CUT: ${{ needs.release-plz.outputs.patch-released }}
+    outputs:
+      tag: ${{ steps.target.outputs.tag }}
+      version: ${{ steps.target.outputs.version }}
+      publish: ${{ steps.target.outputs.publish }}
+    steps:
+      - name: Resolve the release
+        id: target
+        run: |
+          set -euo pipefail
+          if [ -n "${REQUESTED}" ]; then
+            [[ "${REQUESTED}" =~ ^patch-v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              || { echo "::error::${REQUESTED} is not a patch-v<version> tag" >&2; exit 1; }
+            gh release view "${REQUESTED}" -R "${GITHUB_REPOSITORY}" --json tagName >/dev/null
+            tag="${REQUESTED}"; version="${REQUESTED#patch-v}"; publish=true
+          else
+            tag="${CUT_TAG}"; version="${CUT_VERSION}"; publish="${CUT}"
+          fi
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "publish=${publish}"
+          } >> "${GITHUB_OUTPUT}"
+
+  apply-patch-artifacts:
+    needs: patch-release
+    if: needs.patch-release.outputs.publish == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/patch-artifacts.yml
     with:
       abort_variants: '["immediate"]'
+      ref: ${{ needs.patch-release.outputs.tag }}
 
   publish-patch-assets:
     name: Publish apply_patch assets
-    needs: [release-plz, apply-patch-artifacts]
-    if: needs.release-plz.outputs.patch-released == 'true'
+    needs: [patch-release, apply-patch-artifacts]
+    if: needs.patch-release.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ needs.release-plz.outputs.patch-tag }}
-      VERSION: ${{ needs.release-plz.outputs.patch-version }}
+      TAG: ${{ needs.patch-release.outputs.tag }}
+      VERSION: ${{ needs.patch-release.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.patch-release.outputs.tag }}
       - uses: actions/download-artifact@v4
         with:
           pattern: apply-patch-*-immediate

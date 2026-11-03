@@ -16,6 +16,11 @@ on:
         type: string
         required: false
         default: '["immediate", "panic"]'
+      # Commit to build; empty builds the triggering commit.
+      ref:
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -55,6 +60,8 @@ jobs:
             suffix: .exe
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: dtolnay/rust-toolchain@master
         with:
