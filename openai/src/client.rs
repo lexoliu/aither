@@ -14,10 +14,11 @@ use crate::{
         ResponsesStreamEvent, ResponsesUsage, should_skip_event,
     },
 };
+use aither_core::time::sleep;
 use aither_core::{
     LanguageModel,
     llm::{
-        Event, LLMRequest, ReasoningState, ToolCall, Usage,
+        Classify, Event, LLMRequest, ReasoningState, ToolCall, Usage,
         model::{Ability, Profile as ModelProfile, ToolChoice},
         oneshot,
     },
@@ -76,49 +77,19 @@ impl RetryConfig {
     }
 }
 
-fn is_retryable_json_error(error: &serde_json::Error) -> bool {
-    matches!(error.classify(), serde_json::error::Category::Eof)
-}
-
-/// Check if an error is retryable.
+/// Whether a failed request is worth sending again: the network dropped it or
+/// the upstream answered with a temporary fault.
 fn is_retryable_error(err: &OpenAIError) -> bool {
-    match err {
-        OpenAIError::Http(_)
-        | OpenAIError::Body(_)
-        | OpenAIError::Stream(_)
-        | OpenAIError::RateLimit { .. }
-        | OpenAIError::ServerError { .. }
-        | OpenAIError::Timeout => true,
-        // API and decode errors are generally not retryable.
-        OpenAIError::Api(_) | OpenAIError::Decode(_) => false,
-        // EOF while parsing JSON is typically a truncated/empty upstream body.
-        OpenAIError::Json(error) => is_retryable_json_error(error),
-    }
+    err.failure().is_retryable()
 }
 
 /// Get retry delay for an error, respecting Retry-After header for rate limits.
 fn get_retry_delay(err: &OpenAIError, attempt: u32, config: &RetryConfig) -> Duration {
-    if let OpenAIError::RateLimit {
-        retry_after: Some(delay),
-        ..
-    } = err
-    {
+    if let Some(delay) = err.failure().retry_after {
         // Respect Retry-After header, but cap at max_delay
-        return (*delay).min(config.max_delay);
+        return delay.min(config.max_delay);
     }
     config.delay_for_attempt(attempt)
-}
-
-/// Sleep for the given duration (runtime-agnostic).
-async fn sleep(duration: Duration) {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        async_io::Timer::after(duration).await;
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = duration;
-    }
 }
 
 fn map_zenwave_error(error: zenwave::Error) -> OpenAIError {
@@ -133,40 +104,14 @@ async fn request_with_timeout<T>(
     timeout: Duration,
     fut: impl Future<Output = Result<T, zenwave::Error>>,
 ) -> Result<T, OpenAIError> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        futures_lite::future::or(
-            async move { fut.await.map_err(map_zenwave_error) },
-            async move {
-                async_io::Timer::after(timeout).await;
-                Err(OpenAIError::Timeout)
-            },
-        )
-        .await
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        // The browser timer is not `Send`, and `LanguageModel` requires the
-        // futures built on top of this one to be. Run the timer on the JS event
-        // loop where it belongs and wait on a channel, which is `Send`.
-        let millis = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-        let (expired_tx, expired_rx) = async_channel::bounded::<()>(1);
-        wasm_bindgen_futures::spawn_local(async move {
-            gloo_timers::future::TimeoutFuture::new(millis).await;
-            let _ = expired_tx.send(()).await;
-        });
-
-        futures_lite::future::or(
-            async move { fut.await.map_err(map_zenwave_error) },
-            async move {
-                // A closed channel means the timer task was dropped, which can
-                // only happen once the whole request is being torn down.
-                let _ = expired_rx.recv().await;
-                Err(OpenAIError::Timeout)
-            },
-        )
-        .await
-    }
+    futures_lite::future::or(
+        async move { fut.await.map_err(map_zenwave_error) },
+        async move {
+            sleep(timeout).await;
+            Err(OpenAIError::Timeout)
+        },
+    )
+    .await
 }
 
 /// Result of attempting to establish an SSE stream.
@@ -728,10 +673,7 @@ fn chat_completions_stream_inner(
                     // Check for API error response
                     if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data)
                         && let Some(error) = error_obj.get("error") {
-                            let msg = error.get("message")
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("Unknown API error");
-                            yield Err(OpenAIError::Api(msg.to_string()));
+                            yield Err(OpenAIError::from_stream_event(error));
                             return;
                         }
 
@@ -1144,16 +1086,15 @@ fn responses_stream_inner(
                     // Check for API error response
                     if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data)
                         && let Some(error) = error_obj.get("error") {
-                            let msg = error.get("message")
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("Unknown API error");
-                            if msg.contains("call_id") {
-                                yield Err(OpenAIError::Api(format!(
-                                    "{msg}\nSerialized responses request: {serialized_request}"
-                                )));
-                            } else {
-                                yield Err(OpenAIError::Api(msg.to_string()));
+                            let mut event_error = OpenAIError::from_stream_event(error);
+                            if let OpenAIError::StreamEvent { message, .. } = &mut event_error
+                                && message.contains("call_id")
+                            {
+                                *message = format!(
+                                    "{message}\nSerialized responses request: {serialized_request}"
+                                );
                             }
+                            yield Err(event_error);
                             return;
                         }
 

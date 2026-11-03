@@ -202,7 +202,7 @@ async fn handle_model_event<H: Hook>(
     hooks: &H,
     cache_stats: &mut crate::CacheStats,
     budget: &mut ContextBudget,
-    event: Result<Event, String>,
+    event: Result<Event, AgentError>,
     text_chunks: &mut Vec<String>,
     tool_calls: &mut Vec<ToolCall>,
     reasoning: &mut Vec<ReasoningState>,
@@ -260,11 +260,11 @@ async fn handle_model_event<H: Hook>(
             budget.calibrate(&usage);
             Ok(ModelEventAction::Emit(AgentEvent::Usage(usage)))
         }
-        Err(error) if error.contains("malformed function call") => {
+        Err(AgentError::Llm { message, .. }) if message.contains("malformed function call") => {
             tracing::warn!("Model generated malformed function call, retrying...");
             Ok(ModelEventAction::RetryMalformed)
         }
-        Err(error) => Err(AgentError::Llm(error)),
+        Err(error) => Err(error),
     }
 }
 
@@ -285,7 +285,7 @@ fn ensure_non_empty_tool_call_ids(
         .map(|call| format!("{} ({})", call.name, call.id))
         .collect::<Vec<_>>()
         .join(", ");
-    Err(AgentError::Llm(format!(
+    Err(AgentError::llm_local(format!(
         "provider emitted tool call with empty id; response_text={response_text:?}; tool_calls=[{tool_calls_text}]"
     )))
 }
@@ -311,8 +311,6 @@ pub struct CompactResult {
 /// [`CacheLifetime`]: crate::context::CacheLifetime
 #[derive(Debug, Default)]
 pub struct CacheKeepAliveState {
-    /// When the most recent keep-alive was sent.
-    last_sent_at: Option<Instant>,
     /// Keep-alives sent so far this run.
     pub(crate) sent: usize,
     /// Whether the frequent-idle threshold was already crossed this run.
@@ -370,6 +368,7 @@ struct BackgroundTerminalResultTemplate<'a> {
     outcome: BackgroundOutcome<'a>,
     output: Option<&'a str>,
     stderr: Option<&'a str>,
+    interruptions: &'a str,
 }
 
 /// Whether the session's first run has begun.
@@ -654,11 +653,14 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Directory files are restored from after a forked compaction.
     pub(crate) restore_dir: Option<PathBuf>,
 
-    /// Start time of the most recent LLM request issued by this agent.
-    pub(crate) last_request_started_at: Option<Instant>,
+    /// Whether the provider's prompt-cache entry is warm; stamped on every
+    /// request and keep-alive, shared with hosts through
+    /// [`Agent::cache_warmth`].
+    pub(crate) warmth: crate::CacheWarmth,
 
-    /// Time source of every idle-timing read.
-    pub(crate) clock: crate::AnyClock,
+    /// Ends a provider stream in flight when the machine wakes or goes
+    /// offline.
+    pub(crate) connectivity: crate::connectivity::Watch,
 
     /// The most recent LLM request issued by this agent, retained so a
     /// prompt-cache keep-alive can re-send it verbatim.
@@ -708,7 +710,9 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
     /// All model tiers (advanced/balanced/fast) use the same model.
     #[must_use]
     pub fn with_config(llm: LLM, config: AgentConfig) -> Self {
+        let prompt_cache = PromptCache::new(uuid::Uuid::new_v4().to_string());
         Self {
+            warmth: crate::CacheWarmth::new(prompt_cache.lifetime(), crate::AnyClock::default()),
             advanced: Arc::new(llm.clone()),
             balanced: Arc::new(llm.clone()),
             fast: Arc::new(llm),
@@ -720,7 +724,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             config,
             context: Context::default(),
             budget: ContextBudget::default(),
-            prompt_cache: PromptCache::new(uuid::Uuid::new_v4().to_string()),
+            prompt_cache,
             context_sources: Vec::new(),
             reassembled: false,
             pending_compaction: None,
@@ -729,8 +733,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             profile: None,
             initialized: false,
             session: SessionPhase::NotStarted,
-            last_request_started_at: None,
-            clock: crate::AnyClock::default(),
+            connectivity: crate::connectivity::Watch::default(),
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
@@ -778,24 +781,26 @@ where
         advanced: &'a Arc<Advanced>,
         balanced: &'a Arc<Balanced>,
         fast: &'a Arc<Fast>,
+        connectivity: &crate::connectivity::Watch,
         request: LLMRequest,
-    ) -> Pin<Box<dyn Stream<Item = Result<Event, String>> + Send + 'a>> {
-        match tier {
+    ) -> Pin<Box<dyn Stream<Item = Result<Event, AgentError>> + Send + 'a>> {
+        let stream: crate::connectivity::EventStream<'a> = match tier {
             ModelTier::Advanced => Box::pin(
                 advanced
                     .respond(request)
-                    .map(|event| event.map_err(|error| error.to_string())),
+                    .map(|event| event.map_err(|error| AgentError::from_model_error(&error))),
             ),
             ModelTier::Balanced => Box::pin(
                 balanced
                     .respond(request)
-                    .map(|event| event.map_err(|error| error.to_string())),
+                    .map(|event| event.map_err(|error| AgentError::from_model_error(&error))),
             ),
             ModelTier::Fast => Box::pin(
                 fast.respond(request)
-                    .map(|event| event.map_err(|error| error.to_string())),
+                    .map(|event| event.map_err(|error| AgentError::from_model_error(&error))),
             ),
-        }
+        };
+        connectivity.guard(stream)
     }
 
     async fn collect_model_turn(
@@ -813,6 +818,7 @@ where
             &self.advanced,
             &self.balanced,
             &self.fast,
+            &self.connectivity,
             request,
         );
         futures_lite::pin!(stream);
@@ -1454,13 +1460,11 @@ where
         let Some(keep_alive) = self.config.cache_keep_alive.clone() else {
             return Ok(());
         };
-        let CacheLifetime::Limited(lifetime) = self.prompt_cache.lifetime() else {
+        // A cold entry is past saving by a keep-alive; a permanent one needs none.
+        let Some(cold_in) = self.warmth.cold_in() else {
             return Ok(());
         };
-        let Some(entry_started_at) = self.cache_entry_started_at() else {
-            return Ok(());
-        };
-        if self.clock.since(entry_started_at) + keep_alive.send_before_expiry < lifetime {
+        if cold_in > keep_alive.send_before_expiry {
             return Ok(());
         }
         let Some(last_request) = self.last_request.clone() else {
@@ -1475,6 +1479,7 @@ where
             &self.advanced,
             &self.balanced,
             &self.fast,
+            &self.connectivity,
             request,
         );
         futures_lite::pin!(stream);
@@ -1482,10 +1487,10 @@ where
             match event {
                 Ok(Event::Usage(usage)) => self.cache_stats.record(&usage),
                 Ok(_) => {}
-                Err(error) => return Err(AgentError::Llm(error)),
+                Err(error) => return Err(error),
             }
         }
-        self.cache_keep_alive.last_sent_at = Some(self.clock.now());
+        self.warmth.start_entry_now();
         self.cache_keep_alive.sent += 1;
         self.cache_keep_alive.last_reason = self.format_wait_reason().await;
         if self.cache_keep_alive.sent >= keep_alive.frequent_idle_threshold {
@@ -1513,16 +1518,34 @@ where
         ))
     }
 
-    /// When the provider's prompt-cache entry for this agent's context was
-    /// last started or refreshed: the later of the last request's start and
-    /// the last keep-alive send. `None` before the first request.
+    /// A shared handle on whether the provider's prompt-cache entry for this
+    /// agent's context is warm and how long until it goes cold. It keeps
+    /// tracking this agent's later requests and keep-alives.
     #[must_use]
-    pub fn cache_entry_started_at(&self) -> Option<Instant> {
-        self.cache_keep_alive
-            .last_sent_at
-            .into_iter()
-            .chain(self.last_request_started_at)
-            .max()
+    pub fn cache_warmth(&self) -> crate::CacheWarmth {
+        self.warmth.clone()
+    }
+
+    /// Pretends the cache entry was started `age` ago.
+    ///
+    /// The system clock counts from boot, so a freshly booted machine cannot
+    /// stand `age` back; the entry moves to a manual clock standing `age`
+    /// past its origin, with the entry at the origin.
+    #[cfg(test)]
+    pub(crate) fn backdate_cache_entry(&mut self, age: Duration) {
+        let clock = crate::ManualClock::new();
+        clock.advance(age);
+        self.warmth =
+            crate::CacheWarmth::new(self.prompt_cache.lifetime(), crate::AnyClock::new(clock));
+        self.warmth
+            .start_entry(crate::clock::Instant::from_nanos(0));
+    }
+
+    /// Swaps the cache lifetime, forgetting any started entry.
+    #[cfg(test)]
+    pub(crate) fn use_cache_lifetime(&mut self, lifetime: CacheLifetime) {
+        self.prompt_cache = self.prompt_cache.clone().with_lifetime(lifetime);
+        self.warmth = self.warmth.with_lifetime(lifetime);
     }
 
     /// How long the provider's prompt-cache entry for this agent's context
@@ -1936,12 +1959,12 @@ where
             focus,
             &skills,
         )
-        .map_err(|error| AgentError::Llm(error.to_string()))?;
+        .map_err(AgentError::from)?;
         let fork_point = fork.fork_point();
         let handoff = self
             .compaction_future(fork)
             .await
-            .map_err(|error| AgentError::Llm(error.to_string()))?;
+            .map_err(AgentError::from)?;
         let summary = handoff.render_markdown();
 
         self.completed_compaction = Some(CompletedCompaction {
@@ -2015,15 +2038,8 @@ where
         {
             return None;
         }
-        let CacheLifetime::Limited(lifetime) = self.prompt_cache.lifetime() else {
-            return None;
-        };
-        let idle = self.clock.since(self.cache_entry_started_at()?);
-        if idle >= lifetime {
-            return None;
-        }
-        let due_at = lifetime.saturating_sub(self.config.context_policy.idle_compact_before_expiry);
-        Some(due_at.saturating_sub(idle))
+        let cold_in = self.warmth.cold_in()?;
+        Some(cold_in.saturating_sub(self.config.context_policy.idle_compact_before_expiry))
     }
 
     /// Compacts the idle session once its cache is about to expire.
@@ -2365,11 +2381,22 @@ where
         // spend: compaction replays the main request's prefix through the
         // same model, so no second profile is involved.
         let profile = match self.tier {
-            ModelTier::Advanced => self.advanced.profile().await.map_err(|e| e.to_string()),
-            ModelTier::Balanced => self.balanced.profile().await.map_err(|e| e.to_string()),
-            ModelTier::Fast => self.fast.profile().await.map_err(|e| e.to_string()),
-        }
-        .map_err(AgentError::Llm)?;
+            ModelTier::Advanced => self
+                .advanced
+                .profile()
+                .await
+                .map_err(|e| AgentError::from_model_error(&e)),
+            ModelTier::Balanced => self
+                .balanced
+                .profile()
+                .await
+                .map_err(|e| AgentError::from_model_error(&e)),
+            ModelTier::Fast => self
+                .fast
+                .profile()
+                .await
+                .map_err(|e| AgentError::from_model_error(&e)),
+        }?;
         self.budget.set_window(profile.context_length);
         self.profile = Some(profile);
 
@@ -2512,7 +2539,7 @@ where
         }
 
         self.commit_tail(&tail).await;
-        self.last_request_started_at = Some(self.clock.now());
+        self.warmth.start_entry_now();
         self.idle_compacted = false;
         self.publish_fork_snapshot(&tail, &definitions);
 
@@ -2581,14 +2608,7 @@ where
         if self.compaction_model.is_none() || self.pending_compaction.is_some() {
             return Ok(());
         }
-        let Some(entry_started_at) = self.cache_entry_started_at() else {
-            return Ok(());
-        };
-        if !self
-            .prompt_cache
-            .lifetime()
-            .is_cold(self.clock.since(entry_started_at))
-        {
+        if !self.warmth.has_expired() {
             return Ok(());
         }
         if self.context.is_conversation_empty() {
@@ -2620,14 +2640,7 @@ where
     /// [`CacheLifetime`]: crate::context::CacheLifetime
     fn reassemble_if_cache_is_cold(&mut self) -> crate::context::ReassemblyReport {
         let unchanged = crate::context::ReassemblyReport::default();
-        let Some(entry_started_at) = self.cache_entry_started_at() else {
-            return unchanged;
-        };
-        if !self
-            .prompt_cache
-            .lifetime()
-            .is_cold(self.clock.since(entry_started_at))
-        {
+        if !self.warmth.has_expired() {
             return unchanged;
         }
         let report = self.context.reassemble();
@@ -2691,10 +2704,7 @@ where
             return ContextWindowPhase::Compacting;
         }
         if metrics.has_staged_system_updates
-            || (self.compaction_model.is_some()
-                && self
-                    .cache_entry_started_at()
-                    .is_some_and(|at| self.prompt_cache.lifetime().is_cold(self.clock.since(at))))
+            || (self.compaction_model.is_some() && self.warmth.has_expired())
         {
             return ContextWindowPhase::ReassemblyDue;
         }
@@ -2809,12 +2819,17 @@ fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String
             (BackgroundOutcome::Failed { error: &error_text }, None, None)
         }
     };
+    let interruptions = task.result.as_ref().map_or_else(
+        |_| String::new(),
+        |command| aither_core::llm::render_interruptions(&command.interruptions),
+    );
     BackgroundTerminalResultTemplate {
         task_id: &task.task_id,
         script: truncate_script(&task.script, 100),
         outcome,
         output: output.as_deref(),
         stderr: stderr.as_deref(),
+        interruptions: &interruptions,
     }
     .render()
     .expect("background terminal result template must render")
@@ -2939,11 +2954,31 @@ mod tests {
     }
 
     #[test]
+    fn background_result_states_the_outages_it_ran_through() {
+        use aither_core::llm::{Interruption, InterruptionCause};
+        let task = completed(Ok(CompletedCommand {
+            stdout: inline("all green"),
+            stderr: None,
+            exit_code: 0,
+            interruptions: vec![Interruption {
+                cause: InterruptionCause::Offline,
+                from: "14:02:11".to_string(),
+                to: "14:31:40".to_string(),
+            }],
+        }));
+        assert_eq!(
+            format_background_task_result(&task),
+            "Background task 'amber-forest-thunder-pearl' (`make test`) finished with exit code 0.\nall green\nThe network was offline from 14:02:11 to 14:31:40 while this ran.\n"
+        );
+    }
+
+    #[test]
     fn background_result_exit_zero_with_output() {
         let task = completed(Ok(CompletedCommand {
             stdout: inline("all green"),
             stderr: None,
             exit_code: 0,
+            interruptions: Vec::new(),
         }));
         assert_eq!(
             format_background_task_result(&task),
@@ -2957,6 +2992,7 @@ mod tests {
             stdout: inline("1 passed"),
             stderr: Some(inline("boom")),
             exit_code: 101,
+            interruptions: Vec::new(),
         }));
         assert_eq!(
             format_background_task_result(&task),
@@ -2970,6 +3006,7 @@ mod tests {
             stdout: inline("partial output"),
             stderr: None,
             exit_code: -1,
+            interruptions: Vec::new(),
         }));
         task.killed = true;
         assert_eq!(
@@ -3094,6 +3131,12 @@ mod tests {
     }
 
     impl std::error::Error for MockError {}
+
+    impl aither_core::llm::Classify for MockError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
 
     #[derive(Clone)]
     struct MockLlm {
@@ -4165,7 +4208,7 @@ mod tests {
         ));
 
         // The default lifetime is one hour: five minutes is nothing.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(300));
+        agent.backdate_cache_entry(Duration::from_secs(300));
         assert!(
             agent
                 .prepare_request()
@@ -4176,7 +4219,7 @@ mod tests {
         assert_eq!(agent.context().count_recent_system_messages(), 1);
 
         // Fifty-nine minutes is still inside the hour.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3540));
+        agent.backdate_cache_entry(Duration::from_secs(3540));
         assert!(
             agent
                 .prepare_request()
@@ -4188,7 +4231,7 @@ mod tests {
 
         // Sixty-one minutes is past it: the cached prefix is gone anyway,
         // so the compromises the append-only log forced get cleaned up.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
         assert!(
             agent
                 .prepare_request()
@@ -4211,10 +4254,7 @@ mod tests {
         })
         .build();
         agent.ensure_initialized().await.expect("agent initializes");
-        agent.prompt_cache = agent
-            .prompt_cache
-            .clone()
-            .with_lifetime(CacheLifetime::Permanent);
+        agent.use_cache_lifetime(CacheLifetime::Permanent);
         agent.push_message(Message::user("hello"));
         agent.push_message(Message::system(
             "<system-reminder>ephemeral</system-reminder>",
@@ -4222,7 +4262,7 @@ mod tests {
 
         // Rewriting the prefix always costs a permanent cache, so no idle
         // gap ever justifies it — even a day later.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        agent.backdate_cache_entry(Duration::from_secs(86_400));
         assert!(
             agent
                 .prepare_request()
@@ -4256,7 +4296,7 @@ mod tests {
         let mut agent = agent_after_one_request(llm.clone()).await;
 
         // Fifty-three minutes of a one-hour lifetime: not yet due.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3180));
+        agent.backdate_cache_entry(Duration::from_secs(3180));
         let due_in = agent
             .idle_compaction_due_in()
             .expect("a compaction is pending");
@@ -4265,7 +4305,7 @@ mod tests {
         assert!(llm.recorded().is_empty());
 
         // Fifty-four minutes: due now.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
+        agent.backdate_cache_entry(Duration::from_secs(3240));
         assert_eq!(agent.idle_compaction_due_in(), Some(Duration::ZERO));
         let result = agent
             .compact_when_idle()
@@ -4277,7 +4317,7 @@ mod tests {
         assert!(agent.context().handoff().is_some());
 
         // Still idle: nothing more, however long the gap grows inside the hour.
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3300));
+        agent.backdate_cache_entry(Duration::from_secs(3300));
         assert_eq!(agent.idle_compaction_due_in(), None);
         assert!(agent.compact_when_idle().await.expect("no-op").is_none());
         assert_eq!(llm.recorded().len(), 1, "one compaction per idle gap");
@@ -4289,7 +4329,7 @@ mod tests {
             .await
             .expect("request boundary")
             .expect("request after idle");
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
+        agent.backdate_cache_entry(Duration::from_secs(3240));
         assert_eq!(agent.idle_compaction_due_in(), Some(Duration::ZERO));
     }
 
@@ -4299,7 +4339,7 @@ mod tests {
     async fn an_expired_cache_is_not_idle_compacted() {
         let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let mut agent = agent_after_one_request(llm.clone()).await;
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
         assert_eq!(agent.idle_compaction_due_in(), None);
         assert!(agent.compact_when_idle().await.expect("no-op").is_none());
         assert!(llm.recorded().is_empty());
@@ -4311,11 +4351,8 @@ mod tests {
 
         let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let mut agent = agent_after_one_request(llm.clone()).await;
-        agent.prompt_cache = agent
-            .prompt_cache
-            .clone()
-            .with_lifetime(CacheLifetime::Permanent);
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        agent.use_cache_lifetime(CacheLifetime::Permanent);
+        agent.backdate_cache_entry(Duration::from_secs(86_400));
         assert_eq!(agent.idle_compaction_due_in(), None);
         assert!(agent.compact_when_idle().await.expect("no-op").is_none());
         assert!(llm.recorded().is_empty());
@@ -4338,7 +4375,7 @@ mod tests {
             .expect("request boundary")
             .expect("first request");
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3240));
+        agent.backdate_cache_entry(Duration::from_secs(3240));
         assert_eq!(agent.idle_compaction_due_in(), None);
         assert!(agent.compact_when_idle().await.expect("no-op").is_none());
         assert!(main.recorded().is_empty() && compactor.recorded().is_empty());
@@ -4378,7 +4415,7 @@ mod tests {
             agent.push_message(Message::system(
                 "<system-reminder>ephemeral</system-reminder>",
             ));
-            agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+            agent.backdate_cache_entry(Duration::from_secs(3660));
             assert!(
                 agent
                     .prepare_request()
@@ -4440,7 +4477,7 @@ mod tests {
             agent_with_compactor_after_one_request(main.clone(), Some(compactor.clone())).await;
         assert!(compactor.recorded().is_empty());
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
         let request = agent
             .prepare_request()
             .await
@@ -4479,7 +4516,7 @@ mod tests {
             "<system-reminder>ephemeral</system-reminder>",
         ));
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
         agent
             .prepare_request()
             .await
@@ -4503,7 +4540,7 @@ mod tests {
         )
         .await;
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3540));
+        agent.backdate_cache_entry(Duration::from_secs(3540));
         let request = agent
             .prepare_request()
             .await
@@ -4519,7 +4556,7 @@ mod tests {
         let main = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let mut agent = agent_with_compactor_after_one_request(main.clone(), None).await;
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        agent.backdate_cache_entry(Duration::from_secs(86_400));
         let request = agent
             .prepare_request()
             .await
@@ -4540,12 +4577,9 @@ mod tests {
             Some(compactor.clone()),
         )
         .await;
-        agent.prompt_cache = agent
-            .prompt_cache
-            .clone()
-            .with_lifetime(CacheLifetime::Permanent);
+        agent.use_cache_lifetime(CacheLifetime::Permanent);
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(86_400));
+        agent.backdate_cache_entry(Duration::from_secs(86_400));
         let request = agent
             .prepare_request()
             .await
@@ -4567,7 +4601,7 @@ mod tests {
         )
         .await;
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
         assert!(agent.prepare_request().await.is_err());
     }
 
@@ -4697,7 +4731,7 @@ mod tests {
             .expect("request boundary")
             .expect("first request");
 
-        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(3660));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
         let request = agent
             .prepare_request()
             .await

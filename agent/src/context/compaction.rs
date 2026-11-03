@@ -22,7 +22,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use aither_core::llm::{Event, LLMRequest, Message, Role};
+use aither_core::llm::{Classify, Event, Failure, LLMRequest, Message, Role};
 use aither_core::{LanguageModel, llm::GenerateError};
 use askama::Template;
 use futures_lite::StreamExt as _;
@@ -154,6 +154,8 @@ pub enum CompactionError {
     Provider {
         /// The provider's error message.
         message: String,
+        /// How the provider error classifies.
+        failure: Failure,
     },
 
     /// The model answered, but not with a usable handoff document.
@@ -364,6 +366,7 @@ impl CompactionFork {
             Err(GenerateError::Provider(error)) => {
                 return Err(CompactionError::Provider {
                     message: error.to_string(),
+                    failure: error.failure(),
                 });
             }
             Err(error @ GenerateError::Parse { .. }) => error.to_string(),
@@ -488,6 +491,7 @@ async fn collect_text<M: LanguageModel>(
             Err(error) => {
                 return Err(CompactionError::Provider {
                     message: error.to_string(),
+                    failure: error.failure(),
                 });
             }
         }

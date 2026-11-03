@@ -1,0 +1,51 @@
+[package]
+name = "aither-connectivity"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Network reachability and system sleep/wake notifications for aither"
+readme = "../README.md"
+keywords = ["network", "connectivity", "sleep", "wake"]
+categories = ["os", "network-programming"]
+
+[dependencies]
+async-broadcast = "0.7.2"
+event-listener = "5.4.2"
+futures-core = { version = "0.3.34", default-features = false }
+jiff = { version = "0.2.39", default-features = false, features = ["std"] }
+thiserror = "2.0.21"
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.6.2", default-features = false, features = ["alloc"] }
+dispatch2 = { version = "0.3.1", default-features = false, features = ["alloc", "block2", "objc2"] }
+objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "libc", "pwr_mgt", "dispatch2", "objc2"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+async-channel = "2.5.0"
+async-io = "2.6.0"
+libc = "0.2.191"
+futures-lite = "2.6.1"
+netlink-packet-core = "0.9.0"
+netlink-packet-route = "0.33.0"
+netlink-sys = "0.9.0"
+zbus = { version = "6.2.1", default-features = false, features = ["default-rt", "proxy"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Power",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+futures-lite = "2.6.1"
+tokio = { version = "1.53", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

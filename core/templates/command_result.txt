@@ -4,4 +4,4 @@
 {% when CommandOutcome::Running { task_id, output } %}Started in background as task '{{ task_id }}'; output is being written to {{ output.url }} (absolute path: {{ output.path }}).
 {% when CommandOutcome::Killed { task_id, notice } %}{{ notice }}
 Task ID: '{{ task_id }}'.
-{% endmatch %}
+{% endmatch %}{{ interruptions }}

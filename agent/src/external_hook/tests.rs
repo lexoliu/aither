@@ -33,6 +33,12 @@ impl std::fmt::Display for MockError {
 
 impl std::error::Error for MockError {}
 
+impl aither_core::llm::Classify for MockError {
+    fn failure(&self) -> aither_core::llm::Failure {
+        aither_core::llm::Failure::permanent()
+    }
+}
+
 /// Answers each run with the next queued text and each compaction with a
 /// handoff document.
 #[derive(Clone)]

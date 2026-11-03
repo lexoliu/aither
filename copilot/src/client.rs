@@ -4,6 +4,7 @@ use crate::{
     CopilotError,
     constant::{COPILOT_BASE_URL, COPILOT_INTEGRATION_ID, DEFAULT_MODEL, EDITOR_VERSION},
 };
+use aither_core::time::sleep;
 use aither_core::{
     LanguageModel,
     llm::{
@@ -14,7 +15,6 @@ use aither_core::{
         tool::ToolDefinition,
     },
 };
-use async_io::Timer;
 use futures_core::Stream;
 use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -646,7 +646,7 @@ async fn next_sse_event(
                 .map_or(SseStep::Closed, SseStep::Event)
         },
         async {
-            Timer::after(timeout.saturating_sub(elapsed)).await;
+            sleep(timeout.saturating_sub(elapsed)).await;
             if saw_payload {
                 SseStep::IdleTimeout
             } else {

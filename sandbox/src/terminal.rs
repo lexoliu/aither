@@ -11,6 +11,7 @@
 //! directory, but each execution gets a fresh sandbox (new TTY/process).
 
 use crate::grants::{GrantSet, TerminalGrants};
+use crate::outage::Outages;
 use std::{
     borrow::Cow,
     io::{Read, Write},
@@ -26,7 +27,8 @@ use std::{
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::{
-    CommandOutcome, CommandResult, CommandStream, IntoToolResult, StoredFile, Tool, ToolResult,
+    CommandOutcome, CommandResult, CommandStream, Interruption, IntoToolResult, StoredFile, Tool,
+    ToolResult,
 };
 use askama::Template;
 use async_channel::{Receiver, Sender};
@@ -649,6 +651,9 @@ pub struct CompletedCommand {
 
     /// Exit code of the script.
     pub exit_code: i32,
+
+    /// Sleep and offline intervals the command ran through.
+    pub interruptions: Vec<Interruption>,
 }
 
 impl From<CompletedCommand> for CommandResult {
@@ -659,6 +664,7 @@ impl From<CompletedCommand> for CommandResult {
             outcome: CommandOutcome::Exited {
                 code: command.exit_code,
             },
+            interruptions: command.interruptions,
         }
     }
 }
@@ -1311,6 +1317,8 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     /// Shared jobserver token broker, when configured.
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
+    /// Records the outages commands run through.
+    outages: Outages,
     /// Tool registry state.
     registry: State,
 }
@@ -1343,6 +1351,7 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver.clone(),
+            outages: self.outages.clone(),
             registry: self.registry.clone(),
         }
     }
@@ -1462,6 +1471,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
+            outages: Outages::none(),
             registry: Unconfigured,
         })
     }
@@ -1530,6 +1540,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
+            outages: Outages::none(),
             registry: Unconfigured,
         })
     }
@@ -1563,6 +1574,7 @@ impl<P, E, State> TerminalTool<P, E, State> {
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver,
+            outages: self.outages,
             registry: state(self.registry),
         }
     }
@@ -1790,6 +1802,19 @@ where
     #[must_use]
     pub const fn with_long_job_alert_after(mut self, after: Duration) -> Self {
         self.limits.long_job_alert = after;
+        self
+    }
+
+    /// Records the sleep and offline intervals `connectivity` reports during
+    /// each command, and states them in the command's result and, for a
+    /// background job, its completion alert.
+    ///
+    /// Terminals launched for subagents share the record. Only commands that
+    /// start after this call are recorded.
+    #[cfg(feature = "connectivity")]
+    #[must_use]
+    pub fn with_connectivity(mut self, connectivity: &aither_connectivity::Connectivity) -> Self {
+        self.outages = Outages::watching(connectivity, &self.executor);
         self
     }
 
@@ -2097,6 +2122,7 @@ where
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver.clone(),
+            outages: self.outages.clone(),
             registry: Launching { registry },
         };
         Ok(launching.into_served())
@@ -2381,6 +2407,8 @@ where
         let background_startup = BackgroundStartup::new(startup_tx);
         let running_tasks = self.running_tasks.clone();
         let completed_tx = self.completed_tx.clone();
+        let outages = self.outages.clone();
+        outages.begin(&task_id);
 
         running_tasks.fetch_add(1, Ordering::AcqRel);
         self.executor
@@ -2417,6 +2445,7 @@ where
                 priority: self.priority,
                 #[cfg(all(unix, feature = "jobserver"))]
                 jobserver: self.jobserver.clone(),
+                outages,
             }))
             .detach();
 
@@ -2501,6 +2530,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                     CommandResult {
                         stdout: result.stdout,
                         stderr: result.stderr,
+                        interruptions: result.interruptions,
                         outcome: CommandOutcome::Killed {
                             task_id: prepared.task_id.clone(),
                             notice: format!(
@@ -2956,6 +2986,7 @@ async fn background_terminal_result(
     CommandResult {
         stdout,
         stderr: None,
+        interruptions: Vec::new(),
         outcome: CommandOutcome::Running {
             task_id: task_id.to_string(),
             output: redirect.file,
@@ -3205,6 +3236,7 @@ struct SpawnedTerminalTask<P, E> {
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
+    outages: Outages,
 }
 
 async fn execute_terminal_task<P, E>(task: SpawnedTerminalTask<P, E>)
@@ -3245,6 +3277,7 @@ where
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
+        outages,
     } = task;
     let status_registry = job_registry.clone();
     let result = execute_script_standalone(StandaloneExecution {
@@ -3279,6 +3312,11 @@ where
         raw,
     })
     .await;
+    let interruptions = outages.end(&task_id).await;
+    let result = result.map(|command| CompletedCommand {
+        interruptions,
+        ..command
+    });
 
     let quick_result = match &result {
         Ok(ok) => Ok(ok.clone()),
@@ -3594,6 +3632,7 @@ async fn save_completed_process_output(
         stdout,
         stderr,
         exit_code,
+        interruptions: Vec::new(),
     })
 }
 
@@ -5648,6 +5687,9 @@ mod tests {
     use heel::DenyAll;
     use heel::NiceLevel;
 
+    #[cfg(all(unix, feature = "connectivity"))]
+    mod outage;
+
     /// Toolchain directories named by `*_HOME` variables become rwx grants;
     /// ones that do not exist are skipped.
     #[test]
@@ -6286,6 +6328,7 @@ mod tests {
             stdout,
             stderr,
             exit_code,
+            interruptions: Vec::new(),
         }
         .into()
     }
@@ -6772,11 +6815,33 @@ mod tests {
             .expect("command envelope should serialize")
     }
 
+    /// Background terminal arguments for `script`.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn configured_child_terminal_controls_address_child_jobs() {
+    fn background_args(description: &str, script: &str) -> TerminalArgs {
+        TerminalArgs {
+            description: description.to_string(),
+            script: script.to_string(),
+            mode: TerminalExecutionMode::Sandboxed,
+            ssh_server_id: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            max_lines: 50,
+            raw: false,
+            timeout: 30,
+            background: true,
+        }
+    }
+
+    /// A parent terminal serving a registry and a child terminal launched from
+    /// it without a grant. The directories live as long as the guards.
+    #[cfg(unix)]
+    async fn parent_and_child_terminals() -> (
+        [tempfile::TempDir; 2],
+        ConfiguredTestTool,
+        ConfiguredTestTool,
+    ) {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let (cache, shell_sessions) = prepared_test_registry().await;
         let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
             TerminalTool::new_exact(
                 dir.path(),
@@ -6799,20 +6864,57 @@ mod tests {
             .subagent_without_grant()
             .await
             .expect("an empty grant is always given");
+        ([dir, cache], parent, child)
+    }
 
+    /// A child terminal's `terminal_input` and `terminal_read` reach its own
+    /// job.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_child_terminal_input_and_read_address_child_jobs() {
+        let (_dirs, _parent, child) = parent_and_child_terminals().await;
+
+        // The echo job exits once its stdin line arrives, so its completion
+        // event is the signal that its output exists; the read after it is the
+        // first read of that task and cannot be refused as unchanged.
+        let receiver = child.background_receiver();
         let result = child
-            .run_background(TerminalArgs {
-                description: "echo one stdin line then sleep".to_string(),
-                script: "read line; printf 'got %s\\n' \"$line\"; sleep 30".to_string(),
-                mode: TerminalExecutionMode::Sandboxed,
-                ssh_server_id: None,
-                expect: OutputFormat::Text,
-                resolution: MediaResolution::Auto,
-                max_lines: 50,
-                raw: false,
-                timeout: 30,
-                background: true,
-            })
+            .run_background(background_args(
+                "echo one stdin line",
+                "read line; printf 'got %s\\n' \"$line\"",
+            ))
+            .await
+            .expect("terminal call should succeed");
+        let rendered = render_terminal_result(&result);
+        assert!(
+            rendered.contains("Started in background as task '"),
+            "{rendered}"
+        );
+        let echo_id = started_task_id(&receiver);
+
+        let input = query_control(
+            child.registry(),
+            "terminal_input",
+            &["--task-id", &echo_id, "--input", "ping"],
+        )
+        .await;
+        assert_eq!(input["ok"], true, "child terminal_input failed: {input}");
+
+        wait_for_completed_task(&receiver, &echo_id).await;
+        let echoed =
+            query_control(child.registry(), "terminal_read", &["--task-id", &echo_id]).await;
+        assert_eq!(echoed["ok"], true, "child terminal_read failed: {echoed}");
+        assert!(echoed.to_string().contains("got ping"), "{echoed}");
+    }
+
+    /// A child terminal's job is invisible to the parent's controls and
+    /// stopped by the child's own `terminal_kill`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_child_terminal_kill_addresses_child_jobs() {
+        let (_dirs, parent, child) = parent_and_child_terminals().await;
+        let result = child
+            .run_background(background_args("sleep", "sleep 30"))
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
@@ -6821,30 +6923,10 @@ mod tests {
             "{rendered}"
         );
         let task_id = started_task_id(&child.background_receiver());
-
-        let input = query_control(
-            child.registry(),
-            "terminal_input",
-            &["--task-id", &task_id, "--input", "ping"],
-        )
-        .await;
-        assert_eq!(input["ok"], true, "child terminal_input failed: {input}");
-
-        let echoed = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let read =
-                    query_control(child.registry(), "terminal_read", &["--task-id", &task_id])
-                        .await;
-                assert_eq!(read["ok"], true, "child terminal_read failed: {read}");
-                if read.to_string().contains("got ping") {
-                    return read;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("child terminal_read should observe the echoed line");
-        assert!(echoed.to_string().contains("running"), "{echoed}");
+        let running =
+            query_control(child.registry(), "terminal_read", &["--task-id", &task_id]).await;
+        assert_eq!(running["ok"], true, "child terminal_read failed: {running}");
+        assert!(running.to_string().contains("running"), "{running}");
 
         let parent_read =
             query_control(parent.registry(), "terminal_read", &["--task-id", &task_id]).await;

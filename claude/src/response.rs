@@ -495,12 +495,17 @@ fn parse_error_event(data: &str) -> ClaudeError {
     }
     #[derive(Deserialize)]
     struct ErrorDetail {
+        #[serde(rename = "type")]
+        error_type: String,
         message: String,
     }
 
     serde_json::from_str::<ErrorEvent>(data).map_or_else(
         |_| ClaudeError::Api(data.to_string()),
-        |ev| ClaudeError::Api(ev.error.message),
+        |ev| ClaudeError::StreamEvent {
+            error_type: ev.error.error_type,
+            message: ev.error.message,
+        },
     )
 }
 

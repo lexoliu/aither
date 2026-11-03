@@ -30,6 +30,12 @@ impl std::fmt::Display for MockError {
 
 impl std::error::Error for MockError {}
 
+impl aither_core::llm::Classify for MockError {
+    fn failure(&self) -> aither_core::llm::Failure {
+        aither_core::llm::Failure::permanent()
+    }
+}
+
 /// Replies "ok" to the run, then the handoff document to a compaction, and
 /// counts the requests it received.
 #[derive(Clone, Default)]
@@ -158,4 +164,31 @@ async fn the_default_lifetime_is_one_hour() {
         agent.cache_lifetime(),
         CacheLifetime::Limited(Duration::from_secs(3600))
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agent_hands_hosts_a_warmth_handle_that_follows_its_requests() {
+    use crate::CacheState;
+
+    let clock = ManualClock::new();
+    let lifetime = CacheLifetime::Limited(Duration::from_secs(600));
+    let mut agent = agent_after_one_turn(ScriptedLlm::default(), Some(lifetime), &clock).await;
+    let warmth = agent.cache_warmth();
+    assert_eq!(
+        warmth.state(),
+        CacheState::Warm {
+            cold_in: Some(Duration::from_secs(600))
+        }
+    );
+
+    clock.advance(Duration::from_secs(600));
+    assert!(!warmth.is_warm());
+
+    // A request after the entry went cold refreshes it for the same handle.
+    {
+        let events = agent.run("again", []);
+        futures_lite::pin!(events);
+        while futures_lite::StreamExt::next(&mut events).await.is_some() {}
+    }
+    assert_eq!(warmth.cold_in(), Some(Duration::from_secs(600)));
 }

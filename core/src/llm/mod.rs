@@ -78,6 +78,8 @@
 pub mod assistant;
 /// Event types for streaming responses.
 pub mod event;
+/// Classification of provider failures.
+pub mod failure;
 /// Message types and conversation handling.
 pub mod message;
 /// Model profiles and capabilities.
@@ -101,6 +103,7 @@ use alloc::{
 };
 use core::{any::TypeId, future::Future};
 pub use event::{Event, ToolCall, Usage};
+pub use failure::{Classify, Failure, FailureKind};
 use futures_core::Stream;
 use futures_lite::{StreamExt, pin};
 pub use message::{Attachment, Message, Role};
@@ -113,8 +116,8 @@ pub use researcher::{
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 pub use tool::{
-    CommandOutcome, CommandResult, CommandStream, IntoToolResult, StoredFile, Tool, ToolContext,
-    ToolResult,
+    CommandOutcome, CommandResult, CommandStream, Interruption, InterruptionCause, IntoToolResult,
+    StoredFile, Tool, ToolContext, ToolResult, render_interruptions,
 };
 
 use crate::llm::model::Profile;
@@ -308,7 +311,7 @@ impl<'tools> LLMRequestWithTools<'tools> {
 /// See the [module documentation](crate::llm) for examples and usage patterns.
 pub trait LanguageModel: Sized + Send + Sync {
     /// The error type returned by this language model.
-    type Error: core::error::Error + Send + Sync + 'static;
+    type Error: core::error::Error + Classify + Send + Sync + 'static;
 
     /// Generates a streaming response to a conversation.
     ///

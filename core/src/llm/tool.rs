@@ -224,7 +224,10 @@ use serde::de::DeserializeOwned;
 mod command;
 mod context;
 
-pub use command::{CommandOutcome, CommandResult, CommandStream, StoredFile};
+pub use command::{
+    CommandOutcome, CommandResult, CommandStream, Interruption, InterruptionCause, StoredFile,
+    render_interruptions,
+};
 pub use context::{Progress, ProgressError, ProgressSink, ToolContext};
 
 /// Final structured result from a tool execution.
@@ -1615,6 +1618,7 @@ mod tests {
             },
             stderr: None,
             outcome: CommandOutcome::Exited { code: 3 },
+            interruptions: Vec::new(),
         }));
         assert_eq!(result.render_for_model(), "hi\nExit code: 3.\n");
         assert_eq!(
@@ -1639,6 +1643,7 @@ mod tests {
                     text: "oops".to_string(),
                 }),
                 outcome: CommandOutcome::Exited { code: 1 },
+                interruptions: Vec::new(),
             },
             CommandResult {
                 stdout: CommandStream::Stored {
@@ -1648,6 +1653,7 @@ mod tests {
                 },
                 stderr: None,
                 outcome: CommandOutcome::Exited { code: 0 },
+                interruptions: Vec::new(),
             },
             CommandResult {
                 stdout: CommandStream::Image {
@@ -1659,6 +1665,7 @@ mod tests {
                     task_id: "t1".to_string(),
                     output: file(),
                 },
+                interruptions: Vec::new(),
             },
         ];
         for command in results {

@@ -67,6 +67,7 @@ pub struct AgentBuilder<
     context: Context,
     prompt_cache: crate::context::PromptCache,
     clock: crate::AnyClock,
+    connectivity: crate::connectivity::Watch,
     background_receiver: Option<BackgroundTaskReceiver>,
     permission_receiver: Option<PermissionEventReceiver>,
     job_registry: Option<JobRegistry>,
@@ -123,6 +124,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             context: Context::default(),
             prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
             clock: crate::AnyClock::default(),
+            connectivity: crate::connectivity::Watch::default(),
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
@@ -166,6 +168,7 @@ where
             context: self.context,
             prompt_cache: self.prompt_cache,
             clock: self.clock,
+            connectivity: self.connectivity,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -200,6 +203,7 @@ where
             context: self.context,
             prompt_cache: self.prompt_cache,
             clock: self.clock,
+            connectivity: self.connectivity,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -238,6 +242,7 @@ where
             context: self.context,
             prompt_cache: self.prompt_cache,
             clock: self.clock,
+            connectivity: self.connectivity,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -405,6 +410,7 @@ where
             context: self.context,
             prompt_cache: self.prompt_cache,
             clock: self.clock,
+            connectivity: self.connectivity,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -665,6 +671,20 @@ where
         self
     }
 
+    /// Ends a provider response stream in flight when the machine wakes from
+    /// sleep or loses its network.
+    ///
+    /// The attempt fails with an [`AgentError::Llm`](crate::AgentError::Llm)
+    /// whose failure is
+    /// [`FailureKind::Network`](aither_core::llm::FailureKind::Network), so the
+    /// caller retries instead of sitting on a dead socket. Nothing about the
+    /// change reaches the agent's context.
+    #[cfg(feature = "connectivity")]
+    pub fn connectivity(mut self, connectivity: aither_connectivity::Connectivity) -> Self {
+        self.connectivity = crate::connectivity::Watch::new(connectivity);
+        self
+    }
+
     /// Enables prompt-cache keep-alive while the run waits on its own
     /// background commands.
     ///
@@ -712,6 +732,7 @@ where
     /// Builds the agent.
     pub fn build(self) -> Agent<Advanced, Balanced, Fast, H, Compactor> {
         Agent {
+            warmth: crate::CacheWarmth::new(self.prompt_cache.lifetime(), self.clock.clone()),
             advanced: std::sync::Arc::new(self.advanced),
             balanced: std::sync::Arc::new(self.balanced),
             fast: std::sync::Arc::new(self.fast),
@@ -745,8 +766,7 @@ where
             blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
-            last_request_started_at: None,
-            clock: self.clock,
+            connectivity: self.connectivity,
             last_request: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
             cache_stats: crate::CacheStats::new(),
@@ -783,6 +803,12 @@ mod tests {
     }
 
     impl std::error::Error for MockError {}
+
+    impl aither_core::llm::Classify for MockError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
 
     // Mock LLM for testing
     #[derive(Clone)]

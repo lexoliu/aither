@@ -1,26 +1,7 @@
+use aither_core::llm::Classify;
 use std::time::Duration;
 
-/// Waits out a retry backoff.
-///
-/// wasm32 has no reactor to park on, so the browser timer runs on the JS event
-/// loop and the delay is awaited through a channel — skipping the wait there
-/// would turn exponential backoff into a hot retry loop against a rate-limited
-/// API.
-async fn sleep(duration: Duration) {
-    #[cfg(not(target_arch = "wasm32"))]
-    async_io::Timer::after(duration).await;
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        let millis = u32::try_from(duration.as_millis()).unwrap_or(u32::MAX);
-        let (elapsed_tx, elapsed_rx) = async_channel::bounded::<()>(1);
-        wasm_bindgen_futures::spawn_local(async move {
-            gloo_timers::future::TimeoutFuture::new(millis).await;
-            let _ = elapsed_tx.send(()).await;
-        });
-        let _ = elapsed_rx.recv().await;
-    }
-}
+use aither_core::time::sleep;
 
 use serde::{Deserialize, Serialize};
 use zenwave::{Client, client, header};
@@ -98,8 +79,11 @@ pub async fn stream_generate(
             Ok(stream) => break stream,
             Err(e) => {
                 let err = GeminiError::from_http(e);
-                if err.is_retryable() && attempt < MAX_RETRIES {
-                    let delay_secs = err.retry_delay_secs().unwrap_or_else(|| 2u64.pow(attempt));
+                let failure = err.failure();
+                if failure.is_retryable() && attempt < MAX_RETRIES {
+                    let delay_secs = failure
+                        .retry_after
+                        .map_or_else(|| 2u64.pow(attempt), |delay| delay.as_secs());
                     if debug {
                         tracing::info!(
                             "Gemini streaming error (attempt {}/{}), retrying in {}s: {}",
@@ -128,7 +112,7 @@ pub async fn stream_generate(
                         let event = match result {
                             Ok(e) => e,
                             Err(e) => {
-                                return Some((Err(GeminiError::Parse(e.to_string())), stream));
+                                return Some((Err(GeminiError::Stream(e)), stream));
                             }
                         };
                         let data = event.text_data();
@@ -226,8 +210,11 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
             }
             Err(e) => {
                 let err = GeminiError::from_http(e);
-                if err.is_retryable() && attempt < MAX_RETRIES {
-                    let delay_secs = err.retry_delay_secs().unwrap_or_else(|| 2u64.pow(attempt));
+                let failure = err.failure();
+                if failure.is_retryable() && attempt < MAX_RETRIES {
+                    let delay_secs = failure
+                        .retry_after
+                        .map_or_else(|| 2u64.pow(attempt), |delay| delay.as_secs());
                     if debug {
                         tracing::info!(
                             "Gemini POST error (attempt {}/{}), retrying in {}s: {}",

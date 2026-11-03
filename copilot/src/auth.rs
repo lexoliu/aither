@@ -30,6 +30,7 @@ use crate::{
     CopilotError,
     constant::{COPILOT_CLIENT_ID, GITHUB_DEVICE_CODE_URL, GITHUB_TOKEN_URL},
 };
+use aither_core::time::sleep;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use zenwave::{Client, client};
@@ -213,18 +214,6 @@ pub async fn try_get_token(device_code: &str) -> Result<CopilotToken, CopilotErr
         scope,
         expires_at: None, // GitHub doesn't return expiration for Copilot tokens
     })
-}
-
-/// Sleep for the given duration (runtime-agnostic).
-async fn sleep(duration: Duration) {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        async_io::Timer::after(duration).await;
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        gloo_timers::future::TimeoutFuture::new(duration.as_millis() as u32).await;
-    }
 }
 
 /// Session token for Copilot API calls.

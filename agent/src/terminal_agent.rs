@@ -900,6 +900,20 @@ where
         self
     }
 
+    /// Ends a provider response stream in flight when the machine wakes from
+    /// sleep or loses its network, and has the terminal state the sleep and
+    /// offline intervals each command ran through.
+    ///
+    /// See [`AgentBuilder::connectivity`] and
+    /// [`TerminalTool::with_connectivity`].
+    #[cfg(feature = "connectivity")]
+    #[must_use]
+    pub fn connectivity(mut self, connectivity: aither_connectivity::Connectivity) -> Self {
+        self.terminal_tool = self.terminal_tool.with_connectivity(&connectivity);
+        self.inner = self.inner.connectivity(connectivity);
+        self
+    }
+
     /// Sets the maximum number of iterations.
     #[must_use]
     pub fn max_iterations(mut self, limit: usize) -> Self {
@@ -1354,6 +1368,12 @@ mod tests {
     }
 
     impl std::error::Error for MockError {}
+
+    impl aither_core::llm::Classify for MockError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
 
     #[derive(Clone)]
     struct MockLlm {
