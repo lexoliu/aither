@@ -8,6 +8,7 @@ use futures_lite::io::AsyncWriteExt;
 
 use crate::ContainerPath;
 use crate::shell_session::{ContainerShellRuntime, SshServer};
+use crate::tool_python::PythonScript;
 use crate::tool_runtime::{
     ImageToolDefect, ImageTools, PreparedTools, ToolBundle, ToolRuntimeError, ToolTarget,
 };
@@ -223,6 +224,7 @@ struct ToolInstallTemplate<'a> {
     root: std::borrow::Cow<'a, str>,
     cache_key: String,
     tools: Vec<InstallTool>,
+    python: Option<PythonScript>,
     macos: bool,
     probe_only: bool,
 }
@@ -232,6 +234,7 @@ struct ToolInstallTemplate<'a> {
 struct ToolVerifyTemplate<'a> {
     directory: std::borrow::Cow<'a, str>,
     tools: Vec<VerifyTool>,
+    python: Option<PythonScript>,
 }
 
 struct VerifyTool {
@@ -246,9 +249,11 @@ fn image_defect(stderr: &str) -> Option<ImageToolDefect> {
     stderr.lines().find_map(|line| {
         line.strip_prefix("aither-image:")
             .and_then(|marker| match marker.split_once(':') {
-                None => {
-                    (marker == "missing-directory").then_some(ImageToolDefect::MissingDirectory)
-                }
+                None => match marker {
+                    "missing-directory" => Some(ImageToolDefect::MissingDirectory),
+                    "invalid-python" => Some(ImageToolDefect::InvalidPython),
+                    _ => None,
+                },
                 Some(("missing-binary", command)) => {
                     Some(ImageToolDefect::MissingBinary(command.to_owned()))
                 }
@@ -286,6 +291,11 @@ impl ImageTools {
                     aliases: tool.tool.aliases().join(" "),
                 })
                 .collect(),
+            python: self
+                .python
+                .as_ref()
+                .map(|python| python.script(&self.target))
+                .transpose()?,
         }
         .render()?;
         let output = transport.run(&script, None).await?;
@@ -304,6 +314,7 @@ impl ImageTools {
         catalog.verify_versions(&output)?;
         Ok(PreparedTools {
             bin_dir: self.container_bin_dir()?,
+            uv_dir: None,
             catalog,
         })
     }
@@ -337,6 +348,11 @@ impl ToolBundle {
                     aliases: binary.tool.aliases().join(" "),
                 })
                 .collect(),
+            python: self
+                .python
+                .as_ref()
+                .map(|python| python.script(self.target()))
+                .transpose()?,
             macos: self.target().os() == "macos",
             probe_only: true,
         };
@@ -358,6 +374,11 @@ impl ToolBundle {
         }
         Ok(PreparedTools {
             bin_dir: bin_dir.into(),
+            // The install script creates it beside the runtimes.
+            uv_dir: self
+                .python
+                .is_some()
+                .then(|| root.join(crate::tool_runtime::UV_STATE_DIRECTORY)),
             catalog: self.catalog(),
         })
     }
@@ -462,7 +483,7 @@ mod tests {
     async fn image_verification_accepts_a_staged_directory() {
         use crate::tool_distribution::tests::file_artifact;
         let (files, distribution, image) = script_fixture("1.0.0", file_artifact);
-        let out = tempfile::tempdir().unwrap();
+        let out = crate::tool_runtime::tests::unlocking_tempdir();
         let target = ToolTarget::native().unwrap();
         distribution
             .stage_image_tools(&target, &files.path().join("cache"), out.path())
@@ -479,7 +500,7 @@ mod tests {
     async fn image_verification_names_a_missing_binary() {
         use crate::tool_distribution::tests::file_artifact;
         let (files, distribution, image) = script_fixture("1.0.0", file_artifact);
-        let out = tempfile::tempdir().unwrap();
+        let out = crate::tool_runtime::tests::unlocking_tempdir();
         let target = ToolTarget::native().unwrap();
         let staged = distribution
             .stage_image_tools(&target, &files.path().join("cache"), out.path())
@@ -502,7 +523,7 @@ mod tests {
     async fn image_verification_names_a_wrong_version() {
         use crate::tool_distribution::tests::{file_artifact, script_tool};
         let (files, distribution, image) = script_fixture("1.0.0", file_artifact);
-        let out = tempfile::tempdir().unwrap();
+        let out = crate::tool_runtime::tests::unlocking_tempdir();
         let target = ToolTarget::native().unwrap();
         let staged = distribution
             .stage_image_tools(&target, &files.path().join("cache"), out.path())
@@ -528,7 +549,7 @@ mod tests {
     async fn image_verification_names_an_absent_directory() {
         use crate::tool_distribution::tests::file_artifact;
         let (_files, _, image) = script_fixture("1.0.0", file_artifact);
-        let out = tempfile::tempdir().unwrap();
+        let out = crate::tool_runtime::tests::unlocking_tempdir();
         let target = ToolTarget::native().unwrap();
         // Pinned to another version the same executables stage under a
         // different cache key, so this image's directory is absent.
@@ -553,7 +574,7 @@ mod tests {
     async fn image_verification_downloads_nothing() {
         use crate::tool_distribution::tests::{file_artifact, unreachable_artifact};
         let (files, distribution, _) = script_fixture("1.0.0", file_artifact);
-        let out = tempfile::tempdir().unwrap();
+        let out = crate::tool_runtime::tests::unlocking_tempdir();
         let target = ToolTarget::native().unwrap();
         distribution
             .stage_image_tools(&target, &files.path().join("cache"), out.path())
@@ -580,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialization_script_installs_and_warm_cache_skips_transfer() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::tool_runtime::tests::unlocking_tempdir();
         let bundle = crate::tool_runtime::tests::bundle();
         let first = bundle
             .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
@@ -609,7 +630,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_install_rejects_a_tampered_alias_in_the_cache() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::tool_runtime::tests::unlocking_tempdir();
         let bundle = crate::tool_runtime::tests::bundle();
         let installed = bundle
             .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
@@ -640,7 +661,7 @@ mod tests {
     async fn image_verification_rejects_a_tampered_alias() {
         use crate::tool_distribution::tests::file_artifact;
         let (files, distribution, image) = script_fixture("1.0.0", file_artifact);
-        let out = tempfile::tempdir().unwrap();
+        let out = crate::tool_runtime::tests::unlocking_tempdir();
         let target = ToolTarget::native().unwrap();
         let staged = distribution
             .stage_image_tools(&target, &files.path().join("cache"), out.path())
@@ -668,8 +689,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_install_places_the_managed_python_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::tool_runtime::tests::unlocking_tempdir();
+        let bundle = crate::tool_runtime::tests::bundle();
+        let prepared = bundle
+            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
+            .await
+            .unwrap();
+        let request = bundle
+            .python
+            .as_ref()
+            .unwrap()
+            .request(bundle.target())
+            .unwrap();
+        let link = format!(".python/{request}/bin/python3.13");
+        let bin = prepared.bin_dir();
+        assert_eq!(
+            std::fs::read_link(bin.join("python3")).unwrap(),
+            Path::new(&link)
+        );
+        let interpreter = bin.join(&link);
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&interpreter), 0o555);
+        // The interpreter tree, its directories included, has no write bit.
+        for directory in [
+            bin.join(".python"),
+            interpreter.parent().unwrap().to_path_buf(),
+        ] {
+            assert_eq!(mode(&directory) & 0o222, 0, "{}", directory.display());
+        }
+        assert_eq!(mode(bin), 0o555);
+        // Only the tree was kept of what uv wrote.
+        assert!(!bin.join(".python-install").exists());
+        // The shared uv directory sits beside the runtimes, writable by the user only.
+        assert_eq!(prepared.uv_dir(), Some(&root.path().join("uv")));
+        assert_eq!(mode(&root.path().join("uv")), 0o700);
+        let output = std::process::Command::new(bin.join("python3"))
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "Python 3.13.1\n");
+    }
+
+    #[tokio::test]
+    async fn remote_cache_with_a_tampered_python_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::tool_runtime::tests::unlocking_tempdir();
+        let bundle = crate::tool_runtime::tests::bundle();
+        let installed = bundle
+            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
+            .await
+            .unwrap();
+        let python = installed.bin_dir().join("python3");
+        let interpreter = installed
+            .bin_dir()
+            .join(std::fs::read_link(&python).unwrap());
+        let rejected = |result: Result<PreparedTools<PathBuf>, ToolRuntimeError>| {
+            matches!(
+                result,
+                Err(ToolRuntimeError::InitializationCommand { ref stderr, .. })
+                    if stderr.contains("tool cache integrity failure")
+            )
+        };
+        // The interpreter's bytes change.
+        let parent = interpreter.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&interpreter, b"#!/bin/sh\necho Python 9.9.9\n").unwrap();
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = bundle
+            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
+            .await;
+        assert!(rejected(result), "a replaced interpreter was accepted");
+        // The link points elsewhere.
+        std::fs::set_permissions(installed.bin_dir(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::remove_file(&python).unwrap();
+        std::os::unix::fs::symlink("../elsewhere", &python).unwrap();
+        let result = bundle
+            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
+            .await;
+        assert!(rejected(result), "a retargeted python3 was accepted");
+    }
+
+    #[tokio::test]
+    async fn remote_install_stops_on_a_failed_or_unacceptable_python() {
+        for (name, extra) in [
+            ("uv fails", "echo 'no route' >&2; exit 3"),
+            ("absolute link", r#"ln -s /etc/passwd "$dir/bin/escape""#),
+            (
+                "link out of the tree",
+                r#"ln -s ../../../outside "$dir/lib""#,
+            ),
+            ("named pipe", r#"mkfifo "$dir/pipe""#),
+        ] {
+            let root = crate::tool_runtime::tests::unlocking_tempdir();
+            let bundle = crate::tool_runtime::tests::bundle_with_uv(
+                crate::tool_runtime::tests::fixture_uv("1.0.0", extra),
+            );
+            let result = bundle
+                .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(ToolRuntimeError::InitializationCommand { ref stderr, .. })
+                        if stderr.contains("python installation failed")
+                ),
+                "{name}: {result:?}"
+            );
+            // Nothing is activated and the stage is gone again.
+            let names = std::fs::read_dir(root.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(names, [std::ffi::OsString::from("uv")], "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_install_rejects_an_interpreter_that_is_not_the_pinned_one() {
+        let root = crate::tool_runtime::tests::unlocking_tempdir();
+        let bundle =
+            crate::tool_runtime::tests::bundle_with_uv(crate::tool_runtime::tests::fixture_uv(
+                "1.0.0",
+                r#"printf 'other' > "$dir/bin/python3.13""#,
+            ));
+        let result = bundle
+            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(ToolRuntimeError::InitializationCommand { ref stderr, .. })
+                    if stderr.contains("python installation integrity failure")
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_verification_checks_the_python_link_and_version() {
+        use crate::tool_distribution::tests::file_artifact;
+        let (files, distribution, image) = script_fixture("1.0.0", file_artifact);
+        let out = crate::tool_runtime::tests::unlocking_tempdir();
+        let target = ToolTarget::native().unwrap();
+        let staged = distribution
+            .stage_image_tools(&target, &files.path().join("cache"), out.path())
+            .await
+            .unwrap();
+        let tools = image.verify(&image_transport(&out)).await.unwrap();
+        assert!(tools.catalog().render().unwrap().contains("python3 3.13.1"));
+        // An interpreter reporting another version is a version mismatch.
+        let link = std::fs::read_link(staged.join("bin/python3")).unwrap();
+        let interpreter = staged.join("bin").join(&link);
+        crate::tool_python::unlock_tree(&staged.join("bin/.python")).unwrap();
+        std::fs::write(&interpreter, b"#!/bin/sh\necho Python 3.12.0\n").unwrap();
+        match image.verify(&image_transport(&out)).await {
+            Err(ToolRuntimeError::VersionMismatch(command)) => assert_eq!(command, "python3"),
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+        // A python3 that is not the link to the pinned tree is named.
+        std::fs::remove_file(staged.join("bin/python3")).unwrap();
+        std::os::unix::fs::symlink("../elsewhere", staged.join("bin/python3")).unwrap();
+        match image.verify(&image_transport(&out)).await {
+            Err(ToolRuntimeError::InvalidImageTools { defect, .. }) => {
+                assert_eq!(defect, ImageToolDefect::InvalidPython);
+            }
+            other => panic!("expected InvalidImageTools, got {other:?}"),
+        }
+        std::fs::remove_file(staged.join("bin/python3")).unwrap();
+        assert!(matches!(
+            image.verify(&image_transport(&out)).await,
+            Err(ToolRuntimeError::InvalidImageTools {
+                defect: ImageToolDefect::InvalidPython,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn denied_remote_install_never_activates_tools() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::tool_runtime::tests::unlocking_tempdir();
         let bundle = crate::tool_runtime::tests::bundle();
         let result = bundle
             .prepare_remote(&LocalTransport, root.path(), || async {
@@ -689,7 +891,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_remote_activation_is_atomic() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::tool_runtime::tests::unlocking_tempdir();
         let bundle = crate::tool_runtime::tests::bundle();
         let (first, second) = futures_lite::future::zip(
             bundle.prepare_remote(&LocalTransport, root.path(), || async { Ok(()) }),

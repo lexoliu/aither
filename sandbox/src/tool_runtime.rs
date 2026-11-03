@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ContainerPath;
+use crate::tool_python::{PYTHON_COMMAND, unlock_tree};
+pub use crate::tool_python::{PythonPin, PythonRuntime};
 
 /// Commands guaranteed by a prepared execution environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -26,6 +28,9 @@ pub enum ManagedTool {
     Xargs,
     /// Fast file finder.
     Fd,
+    /// The `uv` Python package and project manager, which installs the
+    /// managed `python3` ([`PythonRuntime`]) when the tools are prepared.
+    Uv,
 }
 
 /// The coreutils utilities exposed as relative symlinks `bin/<name> -> coreutils`,
@@ -147,7 +152,7 @@ pub const COREUTILS_ALIASES: &[&str] = &[
 impl ManagedTool {
     /// Every managed tool, in stable prompt order. The tools a platform must
     /// provide are [`ToolTarget::required_tools`].
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::ApplyPatch,
         Self::Ripgrep,
         Self::AstGrep,
@@ -155,6 +160,7 @@ impl ManagedTool {
         Self::Coreutils,
         Self::Xargs,
         Self::Fd,
+        Self::Uv,
     ];
 
     /// The tools with an artifact on every platform, Windows included.
@@ -171,6 +177,7 @@ impl ManagedTool {
             Self::Coreutils => "coreutils",
             Self::Xargs => "xargs",
             Self::Fd => "fd",
+            Self::Uv => "uv",
         }
     }
 
@@ -191,7 +198,8 @@ impl ManagedTool {
     /// The version this tool's `--version` output reports.
     ///
     /// The banners differ: `jq-1.8.2`, `coreutils 0.12.0 (multi-call binary)`,
-    /// `fd 10.5.0`, `xargs 0.11.0`; the others report `<name> <version>`.
+    /// `fd 10.5.0`, `xargs 0.11.0`, `uv 0.13.7 (316c827e0 2026-11-03 aarch64-apple-darwin)`;
+    /// the others report `<name> <version>`.
     fn reported_version(self, output: &str) -> Option<semver::Version> {
         let line = output.lines().next()?;
         let second_word = || line.split_whitespace().nth(1);
@@ -201,6 +209,7 @@ impl ManagedTool {
             Self::Coreutils
             | Self::Xargs
             | Self::Fd
+            | Self::Uv
             | Self::ApplyPatch
             | Self::Ripgrep
             | Self::AstGrep => second_word()?,
@@ -328,8 +337,8 @@ impl ToolTarget {
     }
 
     /// The tools every environment of this platform must provide: Windows
-    /// has no `coreutils`, `xargs` or `fd` artifacts, every other platform
-    /// the complete set.
+    /// has no `coreutils`, `xargs`, `fd` or `uv` artifacts, every other
+    /// platform the complete set.
     #[must_use]
     pub fn required_tools(&self) -> &'static [ManagedTool] {
         if self.os == "windows" {
@@ -337,6 +346,13 @@ impl ToolTarget {
         } else {
             &ManagedTool::ALL
         }
+    }
+
+    /// Whether the environment of this platform carries the managed
+    /// `python3`, which exactly the platforms that provide `uv` do.
+    #[must_use]
+    pub fn provides_python(&self) -> bool {
+        self.required_tools().contains(&ManagedTool::Uv)
     }
 }
 
@@ -480,16 +496,20 @@ impl HostProgramPath {
 pub struct ToolBundle {
     target: ToolTarget,
     pub(crate) binaries: Arc<[ToolBinary]>,
+    pub(crate) python: Option<PythonRuntime>,
 }
 
 impl ToolBundle {
-    /// Constructs a complete baseline from verified binaries.
+    /// Constructs a complete baseline from verified binaries and, on a
+    /// platform that provides one, the interpreter its `uv` installs.
     ///
     /// # Errors
-    /// Rejects missing or duplicate commands; partial bundles cannot become ready.
+    /// Rejects missing or duplicate commands, and a missing or unexpected
+    /// interpreter pin; partial bundles cannot become ready.
     pub fn new(
         target: ToolTarget,
         mut binaries: Vec<ToolBinary>,
+        python: Option<PythonRuntime>,
     ) -> Result<Self, ToolRuntimeError> {
         binaries.sort_by_key(|binary| binary.tool);
         for pair in binaries.windows(2) {
@@ -509,9 +529,11 @@ impl ToolBundle {
                 return Err(ToolRuntimeError::MissingTool(tool));
             }
         }
+        check_python(&target, python.as_ref())?;
         Ok(Self {
             target,
             binaries: binaries.into(),
+            python,
         })
     }
 
@@ -528,11 +550,8 @@ impl ToolBundle {
             tools: self
                 .binaries
                 .iter()
-                .map(|binary| ToolInfo {
-                    tool: binary.tool,
-                    command: binary.tool.command(),
-                    version: binary.version.clone(),
-                })
+                .map(|binary| ToolInfo::tool(binary.tool, binary.version.clone()))
+                .chain(self.python.as_ref().map(ToolInfo::python))
                 .collect(),
         }
     }
@@ -550,6 +569,7 @@ impl ToolBundle {
         struct Identity<'a> {
             target: &'a ToolTarget,
             tools: Vec<(&'a str, &'a semver::Version, &'a [u8; 32])>,
+            python: Option<(&'a semver::Version, &'a [u8; 32])>,
         }
         let identity = Identity {
             target: &self.target,
@@ -558,11 +578,19 @@ impl ToolBundle {
                 .iter()
                 .map(|binary| (binary.tool.command(), &binary.version, &binary.sha256))
                 .collect(),
+            python: self
+                .python
+                .as_ref()
+                .map(|python| (python.version(), python.interpreter_sha256())),
         };
         Ok(hex::encode(digest(&serde_json::to_vec(&identity)?)))
     }
 
     /// Prepares or verifies a content-addressed directory outside agent workspaces.
+    ///
+    /// Beside the content-addressed runtimes, `<root>/uv` is created as the
+    /// shared writable directory of `uv`'s cache and project Python
+    /// installs; it is separate from the read-only managed interpreter.
     ///
     /// # Errors
     /// Returns errors for target mismatch, I/O failure or tampered cached content.
@@ -577,7 +605,14 @@ impl ToolBundle {
         let root = root.to_path_buf();
         blocking::unblock(move || {
             let key = bundle.cache_key()?;
-            bundle.prepare_local_sync(&root, &key)
+            let mut prepared = bundle.prepare_local_sync(&root, &key, None)?;
+            if bundle.python.is_some() {
+                let uv_dir = std::fs::canonicalize(&root)?.join(UV_STATE_DIRECTORY);
+                std::fs::create_dir_all(&uv_dir)?;
+                set_private(&uv_dir)?;
+                prepared.uv_dir = Some(uv_dir);
+            }
+            Ok(prepared)
         })
         .await
     }
@@ -588,10 +623,14 @@ impl ToolBundle {
     /// Verifying a valid runtime takes no lock. Creation and replacement run under an
     /// exclusive lock on `<root>/.<key>.lock`, so concurrent preparers never
     /// discard a runtime another preparer has just activated.
+    ///
+    /// `installer` is the `uv` that installs the interpreter when this bundle's
+    /// own cannot run on the building machine (an image for another platform).
     pub(crate) fn prepare_local_sync(
         &self,
         root: &Path,
         key: &str,
+        installer: Option<&[u8]>,
     ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
         std::fs::create_dir_all(root)?;
         let root = std::fs::canonicalize(root)?;
@@ -612,7 +651,7 @@ impl ToolBundle {
         if let Some(prepared) = self.reusable(&destination)? {
             return Ok(prepared);
         }
-        let stage = self.stage_scratch(&root)?;
+        let stage = self.stage_scratch(&root, installer)?;
         let discarded = if destination.try_exists()? {
             let discarded = tempfile::Builder::new()
                 .prefix(".invalid-")
@@ -626,13 +665,28 @@ impl ToolBundle {
             Ok(()) => {}
             Err(error) if destination.try_exists()? => {
                 tracing::debug!(%error, "another initializer activated the tool bundle");
+                self.unlock_python(stage.path())?;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                self.unlock_python(stage.path())?;
+                return Err(error.into());
+            }
         }
         if let Some(discarded) = discarded {
+            self.unlock_python(&discarded.path().join("runtime"))?;
             discarded.close()?;
         }
         self.verify_prepared(&destination)
+    }
+
+    /// Opens up the read-only managed interpreter tree under `runtime` so the
+    /// runtime can be deleted. A bundle without Python has no such tree, and
+    /// its platform may have no permission modes to change.
+    fn unlock_python(&self, runtime: &Path) -> Result<(), ToolRuntimeError> {
+        if self.python.is_some() {
+            unlock_tree(runtime)?;
+        }
+        Ok(())
     }
 
     /// Verifies an existing runtime; `None` when it is absent or must be replaced.
@@ -646,7 +700,9 @@ impl ToolBundle {
         match self.verify_prepared(destination) {
             Ok(prepared) => Ok(Some(prepared)),
             Err(
-                error @ (ToolRuntimeError::InvalidCache(_) | ToolRuntimeError::Integrity { .. }),
+                error @ (ToolRuntimeError::InvalidCache(_)
+                | ToolRuntimeError::Integrity { .. }
+                | ToolRuntimeError::PythonIntegrity),
             ) => {
                 tracing::warn!(
                     path = %destination.display(),
@@ -660,7 +716,14 @@ impl ToolBundle {
     }
 
     /// Writes every executable into a fresh `.initializing-` directory under `root`.
-    fn stage_scratch(&self, root: &Path) -> Result<tempfile::TempDir, ToolRuntimeError> {
+    ///
+    /// The managed interpreter is installed last, and the finished tree is
+    /// read-only.
+    fn stage_scratch(
+        &self,
+        root: &Path,
+        installer: Option<&[u8]>,
+    ) -> Result<tempfile::TempDir, ToolRuntimeError> {
         let stage = tempfile::Builder::new()
             .prefix(".initializing-")
             .tempdir_in(root)?;
@@ -680,6 +743,23 @@ impl ToolBundle {
                     link_alias(binary.tool, &bin.join(alias))?;
                 }
             }
+        }
+        if let Some(python) = &self.python {
+            let own = || {
+                self.binaries
+                    .iter()
+                    .find(|binary| binary.tool == ManagedTool::Uv)
+                    .map(|binary| binary.bytes.as_ref())
+            };
+            // This bundle's `uv` runs only on its own platform.
+            let installer = match installer {
+                Some(installer) => installer,
+                None if self.target == ToolTarget::native()? => {
+                    own().ok_or(ToolRuntimeError::MissingTool(ManagedTool::Uv))?
+                }
+                None => return Err(ToolRuntimeError::PythonInstallerUnavailable),
+            };
+            python.stage(&self.target, stage.path(), installer)?;
         }
         Ok(stage)
     }
@@ -725,12 +805,20 @@ impl ToolBundle {
                 }
             }
         }
+        if let Some(python) = &self.python {
+            python.verify(&self.target, &bin_dir)?;
+        }
         Ok(PreparedTools {
             bin_dir,
+            uv_dir: None,
             catalog: self.catalog(),
         })
     }
 }
+
+/// Name of the shared, writable directory for `uv`'s cache and project
+/// Python installs, beside the content-addressed runtimes.
+pub const UV_STATE_DIRECTORY: &str = "uv";
 
 /// One baseline command a container image must carry, without its bytes.
 #[derive(Debug, Clone)]
@@ -751,13 +839,22 @@ pub struct ImageTool {
 /// [`ImageTools::container_directory`].
 #[derive(Debug, Clone)]
 pub struct ImageTools {
-    target: ToolTarget,
+    pub(crate) target: ToolTarget,
     pub(crate) tools: Vec<ImageTool>,
+    pub(crate) python: Option<PythonRuntime>,
 }
 
 impl ImageTools {
-    pub(crate) const fn new(target: ToolTarget, tools: Vec<ImageTool>) -> Self {
-        Self { target, tools }
+    pub(crate) const fn new(
+        target: ToolTarget,
+        tools: Vec<ImageTool>,
+        python: Option<PythonRuntime>,
+    ) -> Self {
+        Self {
+            target,
+            tools,
+            python,
+        }
     }
 
     /// Stable identity of the pinned image tools, for directory naming.
@@ -766,6 +863,7 @@ impl ImageTools {
         struct Identity<'a> {
             target: &'a ToolTarget,
             tools: Vec<(&'a str, &'a semver::Version, &'a [u8; 32])>,
+            python: Option<(&'a semver::Version, &'a [u8; 32])>,
         }
         let identity = Identity {
             target: &self.target,
@@ -774,6 +872,10 @@ impl ImageTools {
                 .iter()
                 .map(|tool| (tool.tool.command(), &tool.version, &tool.archive_sha256))
                 .collect(),
+            python: self
+                .python
+                .as_ref()
+                .map(|python| (python.version(), python.interpreter_sha256())),
         };
         Ok(hex::encode(digest(&serde_json::to_vec(&identity)?)))
     }
@@ -800,13 +902,23 @@ impl ImageTools {
             tools: self
                 .tools
                 .iter()
-                .map(|tool| ToolInfo {
-                    tool: tool.tool,
-                    command: tool.tool.command(),
-                    version: tool.version.clone(),
-                })
+                .map(|tool| ToolInfo::tool(tool.tool, tool.version.clone()))
+                .chain(self.python.as_ref().map(ToolInfo::python))
                 .collect(),
         }
+    }
+}
+
+/// Rejects a missing interpreter pin where `target` provides one, and a pin
+/// where it does not.
+pub fn check_python(
+    target: &ToolTarget,
+    python: Option<&PythonRuntime>,
+) -> Result<(), ToolRuntimeError> {
+    match (target.provides_python(), python) {
+        (true, None) => Err(ToolRuntimeError::MissingPython),
+        (false, Some(_)) => Err(ToolRuntimeError::UnexpectedPython),
+        _ => Ok(()),
     }
 }
 
@@ -873,6 +985,20 @@ fn ensure_aliases_provided(tool: ManagedTool, path: &Path) -> Result<(), ToolRun
     Ok(())
 }
 
+/// Makes `path` accessible to its owner only.
+fn set_private(path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 fn set_executable_readonly(path: &Path) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
@@ -895,6 +1021,9 @@ fn set_executable_readonly(path: &Path) -> Result<(), std::io::Error> {
 #[derive(Debug, Clone)]
 pub struct PreparedTools<D> {
     pub(crate) bin_dir: D,
+    /// The shared writable directory of `uv`'s cache and project Python
+    /// installs, when the environment provides one.
+    pub(crate) uv_dir: Option<D>,
     pub(crate) catalog: ToolCatalog,
 }
 
@@ -903,6 +1032,17 @@ impl<D> PreparedTools<D> {
     #[must_use]
     pub const fn bin_dir(&self) -> &D {
         &self.bin_dir
+    }
+
+    /// The writable directory shared by every session for `uv`'s cache
+    /// (`UV_CACHE_DIR`) and project Python installs (`UV_PYTHON_INSTALL_DIR`),
+    /// kept apart from the read-only managed interpreter and from the
+    /// per-session `HOME`. `None` where the environment has no such directory:
+    /// Windows, which has no managed `uv`, and container images, whose
+    /// writable state belongs to the container.
+    #[must_use]
+    pub const fn uv_dir(&self) -> Option<&D> {
+        self.uv_dir.as_ref()
     }
 
     /// Verified commands to describe to the model before its first request.
@@ -1015,7 +1155,28 @@ impl PreparedTools<PathBuf> {
 #[template(path = "tool_path.sh", escape = "none")]
 struct ToolPathTemplate<'a> {
     bin_dir: std::borrow::Cow<'a, str>,
+    uv: Option<UvEnvironmentText<'a>>,
     script: &'a str,
+}
+
+/// The quoted values of the `uv` variables a script exports.
+struct UvEnvironmentText<'a> {
+    cache: std::borrow::Cow<'a, str>,
+    python_installs: std::borrow::Cow<'a, str>,
+    python_preference: &'static str,
+}
+
+/// `UV_PYTHON_PREFERENCE`: a project without its own Python request gets the
+/// managed `python3` from `PATH` rather than whichever interpreter `uv` last
+/// installed for another project. A `.python-version` or `.venv` that no
+/// `PATH` interpreter satisfies is still installed or found by `uv`.
+pub const UV_PYTHON_PREFERENCE: &str = "system";
+
+/// `uv`'s cache and project Python installs, both under the shared
+/// [`PreparedTools::uv_dir`].
+pub struct UvEnvironment {
+    pub(crate) cache: PathBuf,
+    pub(crate) python_installs: PathBuf,
 }
 
 impl PreparedTools<PathBuf> {
@@ -1026,21 +1187,50 @@ impl PreparedTools<PathBuf> {
             .ok_or_else(|| ToolRuntimeError::InvalidCache(self.bin_dir.clone()))
     }
 
+    /// Where `uv` keeps its cache (`UV_CACHE_DIR`) and the Pythons it installs
+    /// for projects (`UV_PYTHON_INSTALL_DIR`), when there is a shared directory.
+    pub(crate) fn uv_environment(&self) -> Option<UvEnvironment> {
+        self.uv_dir.as_ref().map(|dir| UvEnvironment {
+            cache: dir.join("cache"),
+            python_installs: dir.join("python"),
+        })
+    }
+
     pub(crate) fn wrap_script(&self, script: &str) -> Result<String, ToolRuntimeError> {
-        render_tool_path(self.script_bin_dir()?, script)
+        let text = |path: &Path| {
+            path.to_str()
+                .map(|text| shell_words::quote(text).into_owned())
+                .ok_or_else(|| ToolRuntimeError::InvalidCache(path.to_path_buf()))
+        };
+        let uv = self
+            .uv_environment()
+            .map(|environment| {
+                Ok::<_, ToolRuntimeError>(UvEnvironmentText {
+                    cache: text(&environment.cache)?.into(),
+                    python_installs: text(&environment.python_installs)?.into(),
+                    python_preference: UV_PYTHON_PREFERENCE,
+                })
+            })
+            .transpose()?;
+        render_tool_path(self.script_bin_dir()?, uv, script)
     }
 }
 
 impl PreparedTools<ContainerPath> {
     pub(crate) fn wrap_script(&self, script: &str) -> Result<String, ToolRuntimeError> {
-        render_tool_path(self.bin_dir.as_str(), script)
+        render_tool_path(self.bin_dir.as_str(), None, script)
     }
 }
 
 /// Prepends `bin_dir` to a POSIX shell script's `PATH`.
-fn render_tool_path(bin_dir: &str, script: &str) -> Result<String, ToolRuntimeError> {
+fn render_tool_path(
+    bin_dir: &str,
+    uv: Option<UvEnvironmentText<'_>>,
+    script: &str,
+) -> Result<String, ToolRuntimeError> {
     Ok(ToolPathTemplate {
         bin_dir: shell_words::quote(bin_dir),
+        uv,
         script,
     }
     .render()?)
@@ -1054,9 +1244,36 @@ pub struct ToolCatalog {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolInfo {
-    tool: ManagedTool,
+    source: CatalogCommand,
     command: &'static str,
     version: semver::Version,
+}
+
+/// What reports the version of a catalog entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogCommand {
+    /// A managed tool, by its own banner.
+    Tool(ManagedTool),
+    /// The managed `python3`, which `uv` installs.
+    Python,
+}
+
+impl ToolInfo {
+    const fn tool(tool: ManagedTool, version: semver::Version) -> Self {
+        Self {
+            source: CatalogCommand::Tool(tool),
+            command: tool.command(),
+            version,
+        }
+    }
+
+    fn python(python: &PythonRuntime) -> Self {
+        Self {
+            source: CatalogCommand::Python,
+            command: PYTHON_COMMAND,
+            version: python.version().clone(),
+        }
+    }
 }
 
 impl ToolCatalog {
@@ -1074,7 +1291,10 @@ impl ToolCatalog {
 
 impl ToolInfo {
     fn verify_version(&self, output: &str) -> Result<(), ToolRuntimeError> {
-        let reported = self.tool.reported_version(output);
+        let reported = match self.source {
+            CatalogCommand::Tool(tool) => tool.reported_version(output),
+            CatalogCommand::Python => PythonRuntime::reported_version(output),
+        };
         if reported.as_ref() != Some(&self.version) {
             return Err(ToolRuntimeError::VersionMismatch(self.command.into()));
         }
@@ -1210,6 +1430,33 @@ pub enum ToolRuntimeError {
     /// A bundle carries a tool its platform does not provide.
     #[error("tool is not provided on this platform: {0:?}")]
     UnexpectedTool(ManagedTool),
+    /// The platform provides a managed `python3` but nothing pins its interpreter.
+    #[error("the interpreter pin of the managed python3 is missing")]
+    MissingPython,
+    /// The distribution pins several interpreters for one target.
+    #[error("the distribution pins several interpreters for one target")]
+    DuplicatePython,
+    /// An interpreter is pinned for a platform that has no managed `uv`.
+    #[error("python3 is not provided on this platform")]
+    UnexpectedPython,
+    /// `uv python install` failed while preparing the managed interpreter.
+    #[error("installing the managed python3 failed ({status:?}): {stderr}")]
+    PythonInstall {
+        /// Process exit status, if available.
+        status: Option<i32>,
+        /// What `uv` reported.
+        stderr: String,
+    },
+    /// The installed interpreter tree holds an entry that is neither a
+    /// directory, a regular file nor a link inside the tree.
+    #[error("the managed python3 tree holds an unacceptable entry: {0}")]
+    InvalidPythonTree(PathBuf),
+    /// The installed interpreter executable does not have the pinned digest.
+    #[error("the managed python3 interpreter failed SHA-256 verification")]
+    PythonIntegrity,
+    /// A bundle for another platform has no `uv` that runs here to install its interpreter.
+    #[error("the managed python3 of another platform needs an installer that runs on this machine")]
+    PythonInstallerUnavailable,
     /// A multicall tool's `--list` failed.
     #[error("`{0} --list` failed")]
     AliasList(String),
@@ -1300,6 +1547,8 @@ pub enum ImageToolDefect {
     MissingBinary(String),
     /// An alias is absent or is not a symlink to its multicall executable.
     InvalidAlias(String),
+    /// `python3` is absent or is not a link to the interpreter of the pinned tree.
+    InvalidPython,
 }
 
 impl std::fmt::Display for ImageToolDefect {
@@ -1312,6 +1561,7 @@ impl std::fmt::Display for ImageToolDefect {
             Self::InvalidAlias(alias) => {
                 write!(f, "missing or mislinked alias `{alias}`")
             }
+            Self::InvalidPython => write!(f, "missing or mislinked python3"),
         }
     }
 }
@@ -1329,6 +1579,67 @@ pub mod tests {
         );
     }
 
+    /// A temporary directory that can hold prepared runtimes: their managed
+    /// interpreter tree is read-only, which a plain `TempDir` cannot delete.
+    pub struct UnlockingTempDir(tempfile::TempDir);
+
+    impl std::ops::Deref for UnlockingTempDir {
+        type Target = tempfile::TempDir;
+
+        fn deref(&self) -> &tempfile::TempDir {
+            &self.0
+        }
+    }
+
+    impl Drop for UnlockingTempDir {
+        fn drop(&mut self) {
+            let _ = unlock_tree(self.0.path());
+        }
+    }
+
+    pub fn unlocking_tempdir() -> UnlockingTempDir {
+        UnlockingTempDir(tempfile::tempdir().unwrap())
+    }
+
+    /// The `CPython` version the fixture `uv` installs.
+    pub const FIXTURE_PYTHON_VERSION: &str = "3.13.1";
+
+    /// The interpreter the fixture `uv` installs: a script reporting `version`.
+    pub fn fixture_interpreter(version: &str) -> Vec<u8> {
+        format!("#!/bin/sh\nprintf '%s\\n' 'Python {version}'\n").into_bytes()
+    }
+
+    /// The manifest pin matching what the fixture `uv` installs on `target`.
+    pub fn fixture_python_pin(target: &ToolTarget) -> PythonPin {
+        PythonPin {
+            version: FIXTURE_PYTHON_VERSION.into(),
+            target: target.clone(),
+            interpreter_sha256: hex::encode(digest(&fixture_interpreter(FIXTURE_PYTHON_VERSION))),
+        }
+    }
+
+    /// The native target's interpreter pin for an interpreter with `digest`,
+    /// as manifest JSON; empty where the platform has no managed `python3`.
+    pub fn python_pins_for(digest: [u8; 32], version: &str) -> Vec<PythonPin> {
+        let target = ToolTarget::native().unwrap();
+        target
+            .provides_python()
+            .then(|| PythonPin {
+                version: version.into(),
+                target,
+                interpreter_sha256: hex::encode(digest),
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// The interpreter pin matching what the fixture `uv` installs.
+    pub fn fixture_python() -> PythonRuntime {
+        fixture_python_pin(&ToolTarget::native().unwrap())
+            .runtime()
+            .unwrap()
+    }
+
     pub fn bundle() -> ToolBundle {
         bundle_pinned("1.0.0")
     }
@@ -1343,7 +1654,9 @@ pub mod tests {
                 ToolBinary::verify(tool, version, &digest(&bytes), bytes).unwrap()
             })
             .collect();
-        ToolBundle::new(ToolTarget::native().unwrap(), binaries).unwrap()
+        let target = ToolTarget::native().unwrap();
+        let python = target.provides_python().then(fixture_python);
+        ToolBundle::new(target, binaries, python).unwrap()
     }
 
     /// The tools the test host's platform must provide.
@@ -1357,6 +1670,9 @@ pub mod tests {
     /// Invoked through one of its aliases it runs the host's command of that
     /// name, as the real multicall binary would.
     pub fn script_tool(tool: ManagedTool, version: &str) -> Vec<u8> {
+        if tool == ManagedTool::Uv {
+            return fixture_uv(version, "");
+        }
         let multicall = if tool.aliases().is_empty() {
             String::new()
         } else {
@@ -1371,6 +1687,37 @@ pub mod tests {
             "#!/bin/sh\n{multicall}printf '%s\\n' '{} {version}'\n",
             tool.command()
         )
+        .into_bytes()
+    }
+
+    /// A `uv` that reports `uv <version>` and, like the real one, installs
+    /// `python install <request>` as `$UV_PYTHON_INSTALL_DIR/<request>` with
+    /// its housekeeping entries (an absolute minor-version link, `.lock`,
+    /// `.temp`). `extra` is shell run last, with the installed tree in `$dir`.
+    pub fn fixture_uv(version: &str, extra: &str) -> Vec<u8> {
+        let interpreter = String::from_utf8(fixture_interpreter(FIXTURE_PYTHON_VERSION)).unwrap();
+        r#"#!/bin/sh
+PATH=/usr/bin:/bin
+case "$1" in
+--version) printf '%s\n' 'uv @VERSION@'; exit 0;;
+python)
+    for request; do :; done
+    dir="$UV_PYTHON_INSTALL_DIR/$request"
+    mkdir -p "$dir/bin" "$UV_PYTHON_INSTALL_DIR/.temp"
+    cat > "$dir/bin/python3.13" <<'INTERPRETER'
+@INTERPRETER@INTERPRETER
+    chmod 755 "$dir/bin/python3.13"
+    ln -s python3.13 "$dir/bin/python3"
+    ln -s "$dir" "$UV_PYTHON_INSTALL_DIR/cpython-3.13-minor"
+    : > "$UV_PYTHON_INSTALL_DIR/.lock"
+    @EXTRA@
+    exit 0;;
+esac
+printf '%s\n' 'uv @VERSION@'
+"#
+        .replace("@VERSION@", version)
+        .replace("@INTERPRETER@", &interpreter)
+        .replace("@EXTRA@", extra)
         .into_bytes()
     }
 
@@ -1390,13 +1737,16 @@ pub mod tests {
                 archive_sha256: digest(&script_tool(tool, version)),
             })
             .collect();
-        ImageTools::new(ToolTarget::native().unwrap(), tools)
+        let target = ToolTarget::native().unwrap();
+        let python = target.provides_python().then(fixture_python);
+        ImageTools::new(target, tools, python)
     }
 
     /// Tools as a container sees them once baked into its image.
     pub fn container_tools(tools: &ImageTools) -> PreparedTools<ContainerPath> {
         PreparedTools {
             bin_dir: tools.container_bin_dir().unwrap(),
+            uv_dir: None,
             catalog: tools.catalog(),
         }
     }
@@ -1421,12 +1771,40 @@ pub mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrapped_scripts_export_the_shared_uv_directory() {
+        let cache = unlocking_tempdir();
+        let ready = bundle().prepare_local(cache.path()).await.unwrap();
+        let uv = ready.uv_dir().unwrap().clone();
+        let script = ready
+            .wrap_script(
+                r#"printf '%s\n' "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR" "$UV_PYTHON_PREFERENCE""#,
+            )
+            .unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "{}\n{}\nsystem\n",
+                uv.join("cache").display(),
+                uv.join("python").display()
+            )
+        );
+        // A container image has no such directory to export.
+        let container = container_tools(&image_tools()).wrap_script("true").unwrap();
+        assert!(!container.contains("UV_"), "{container}");
+    }
+
     #[test]
     fn missing_baseline_tool_is_an_initialization_error() {
         let mut binaries = bundle().binaries.to_vec();
         let removed = binaries.pop().unwrap().tool;
         assert!(matches!(
-            ToolBundle::new(ToolTarget::native().unwrap(), binaries),
+            ToolBundle::new(ToolTarget::native().unwrap(), binaries, Some(fixture_python())),
             Err(ToolRuntimeError::MissingTool(missing)) if missing == removed
         ));
     }
@@ -1466,11 +1844,42 @@ pub mod tests {
     #[test]
     fn windows_bundle_needs_only_the_portable_tools() {
         let windows = target("Windows_NT");
-        ToolBundle::new(windows.clone(), script_binaries(windows.required_tools())).unwrap();
+        ToolBundle::new(
+            windows.clone(),
+            script_binaries(windows.required_tools()),
+            None,
+        )
+        .unwrap();
         assert!(matches!(
-            ToolBundle::new(windows, script_binaries(&ManagedTool::ALL)),
+            ToolBundle::new(windows.clone(), script_binaries(&ManagedTool::ALL), None),
             Err(ToolRuntimeError::UnexpectedTool(ManagedTool::Coreutils))
         ));
+        // Windows has no managed `uv`, so no interpreter pin either.
+        assert!(matches!(
+            ToolBundle::new(
+                windows.clone(),
+                script_binaries(windows.required_tools()),
+                Some(fixture_python())
+            ),
+            Err(ToolRuntimeError::UnexpectedPython)
+        ));
+        assert!(!windows.provides_python());
+    }
+
+    #[test]
+    fn a_platform_with_uv_needs_its_interpreter_pinned() {
+        let linux = target("Linux");
+        assert!(linux.provides_python());
+        assert!(matches!(
+            ToolBundle::new(linux.clone(), script_binaries(&ManagedTool::ALL), None),
+            Err(ToolRuntimeError::MissingPython)
+        ));
+        ToolBundle::new(
+            linux,
+            script_binaries(&ManagedTool::ALL),
+            Some(fixture_python()),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1481,7 +1890,7 @@ pub mod tests {
             .filter(|tool| *tool != ManagedTool::Coreutils)
             .collect::<Vec<_>>();
         assert!(matches!(
-            ToolBundle::new(linux, script_binaries(&tools)),
+            ToolBundle::new(linux, script_binaries(&tools), Some(fixture_python())),
             Err(ToolRuntimeError::MissingTool(ManagedTool::Coreutils))
         ));
     }
@@ -1504,6 +1913,11 @@ pub mod tests {
                 "15.2.0",
             ),
             (ManagedTool::AstGrep, "ast-grep 0.45.3\n", "0.45.3"),
+            (
+                ManagedTool::Uv,
+                "uv 0.13.7 (316c827e0 2026-11-03 aarch64-apple-darwin)\n",
+                "0.13.7",
+            ),
         ];
         for (tool, output, expected) in cases {
             assert_eq!(
@@ -1516,6 +1930,8 @@ pub mod tests {
         assert_eq!(ManagedTool::Fd.reported_version("fd-10.5.0\n"), None);
         assert_eq!(ManagedTool::Coreutils.reported_version("coreutils\n"), None);
         assert_eq!(ManagedTool::Xargs.reported_version(""), None);
+        assert_eq!(ManagedTool::Uv.reported_version("uv\n"), None);
+        assert_eq!(ManagedTool::Uv.reported_version("uv-0.13.7\n"), None);
     }
 
     #[cfg(unix)]
@@ -1526,7 +1942,7 @@ pub mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn coreutils_aliases_are_relative_links_to_the_multicall_binary() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let bundle = bundle();
         let prepared = bundle.prepare_local(cache.path()).await.unwrap();
         assert_ne!(COREUTILS_ALIASES.len(), 0);
@@ -1547,7 +1963,7 @@ pub mod tests {
     #[tokio::test]
     async fn tampered_aliases_are_rejected_and_repaired() {
         type Tamper = fn(&Path, &Path);
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let bundle = bundle();
         let prepared = bundle.prepare_local(cache.path()).await.unwrap();
         let runtime = prepared.bin_dir().parent().unwrap().to_path_buf();
@@ -1593,7 +2009,7 @@ pub mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn alias_the_binary_does_not_provide_is_a_staging_error() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let mut binaries = script_binaries(&ManagedTool::ALL);
         let limited = b"#!/bin/sh\ncase \"$1\" in --list) printf 'cat\\n'; exit 0;; esac\nprintf '%s\\n' 'coreutils 1.0.0'\n".to_vec();
         let position = binaries
@@ -1603,7 +2019,12 @@ pub mod tests {
         binaries[position] =
             ToolBinary::verify(ManagedTool::Coreutils, "1.0.0", &digest(&limited), limited)
                 .unwrap();
-        let bundle = ToolBundle::new(ToolTarget::native().unwrap(), binaries).unwrap();
+        let bundle = ToolBundle::new(
+            ToolTarget::native().unwrap(),
+            binaries,
+            Some(fixture_python()),
+        )
+        .unwrap();
         assert!(matches!(
             bundle.prepare_local(cache.path()).await,
             Err(ToolRuntimeError::UnprovidedAlias {
@@ -1625,7 +2046,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn initialize_outside_workspace_and_reuse_verified_content() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let bundle = bundle();
         let first = bundle.prepare_local(cache.path()).await.unwrap();
         let second = bundle.prepare_local(cache.path()).await.unwrap();
@@ -1651,7 +2072,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn concurrent_initialization_never_exposes_partial_tools() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let bundle = bundle();
         let (left, right) = futures_lite::future::zip(
             bundle.prepare_local(cache.path()),
@@ -1672,7 +2093,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn managed_tools_cannot_overlap_a_writable_grant() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let workspace = tempfile::tempdir().unwrap();
         let ready = bundle().prepare_local(cache.path()).await.unwrap();
         ready
@@ -1688,7 +2109,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn writable_grant_to_one_managed_executable_is_rejected() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let bundle = bundle();
         let ready = bundle.prepare_local(cache.path()).await.unwrap();
         let executable = ready
@@ -1717,14 +2138,15 @@ pub mod tests {
             .unwrap();
     }
 
-    /// Entries left in the cache root other than the runtime and its lock file.
+    /// Entries left in the cache root other than the runtime, its lock file
+    /// and the shared `uv` directory.
     fn leftovers(root: &Path, bundle: &ToolBundle) -> Vec<OsString> {
         let key = bundle.cache_key().unwrap();
         let lock = format!(".{key}.lock");
         std::fs::read_dir(root)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
-            .filter(|name| *name != *key && *name != *lock)
+            .filter(|name| *name != *key && *name != *lock && *name != *UV_STATE_DIRECTORY)
             .collect()
     }
 
@@ -1742,7 +2164,7 @@ pub mod tests {
 
     #[test]
     fn missing_executable_is_reported_with_its_path() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let bundle = bundle();
         let destination = cache.path().join(bundle.cache_key().unwrap());
         std::fs::create_dir_all(destination.join("bin")).unwrap();
@@ -1757,7 +2179,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn empty_runtime_skeleton_is_replaced() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let bundle = bundle();
         std::fs::create_dir_all(cache.path().join(bundle.cache_key().unwrap()).join("bin"))
             .unwrap();
@@ -1768,7 +2190,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn tampered_executable_is_replaced() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let bundle = bundle();
         let ready = bundle.prepare_local(cache.path()).await.unwrap();
         let path = ready
@@ -1790,7 +2212,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn writable_executable_is_replaced() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let bundle = bundle();
         let ready = bundle.prepare_local(cache.path()).await.unwrap();
         let path = ready
@@ -1807,7 +2229,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn valid_runtime_is_reused_untouched() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let bundle = bundle();
         let ready = bundle.prepare_local(cache.path()).await.unwrap();
         let snapshot = |prepared: &PreparedTools<PathBuf>| {
@@ -1837,7 +2259,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn concurrent_preparers_repair_one_damaged_runtime() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let bundle = bundle();
         std::fs::create_dir_all(cache.path().join(bundle.cache_key().unwrap()).join("bin"))
             .unwrap();
@@ -1849,6 +2271,372 @@ pub mod tests {
         assert_eq!(leftovers(cache.path(), &bundle), Vec::<OsString>::new());
     }
 
+    /// A bundle whose `uv` is `uv`, otherwise the fixture bundle.
+    pub fn bundle_with_uv(uv: Vec<u8>) -> ToolBundle {
+        let mut binaries = bundle().binaries.to_vec();
+        let position = binaries
+            .iter()
+            .position(|binary| binary.tool == ManagedTool::Uv)
+            .unwrap();
+        binaries[position] =
+            ToolBinary::verify(ManagedTool::Uv, "1.0.0", &digest(&uv), uv).unwrap();
+        ToolBundle::new(
+            ToolTarget::native().unwrap(),
+            binaries,
+            Some(fixture_python()),
+        )
+        .unwrap()
+    }
+
+    /// Every entry under `path` that is not a link, with its mode.
+    #[cfg(unix)]
+    fn modes_under(path: &Path) -> Vec<(PathBuf, u32)> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut found = Vec::new();
+        let mut pending = vec![path.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            if metadata.is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+            }
+            found.push((path, metadata.permissions().mode()));
+        }
+        found
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_managed_python_is_installed_read_only_and_linked() {
+        let cache = unlocking_tempdir();
+        let bundle = bundle();
+        let prepared = bundle.prepare_local(cache.path()).await.unwrap();
+        let bin = prepared.bin_dir();
+        let request = bundle
+            .python
+            .as_ref()
+            .unwrap()
+            .request(bundle.target())
+            .unwrap();
+        let link = format!(".python/{request}/bin/python3.13");
+        assert_eq!(
+            std::fs::read_link(bin.join("python3")).unwrap(),
+            Path::new(&link)
+        );
+        // The link reaches the pinned interpreter, which runs.
+        let output = std::process::Command::new(bin.join("python3"))
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("Python {FIXTURE_PYTHON_VERSION}\n")
+        );
+        // Everything uv wrote besides the tree itself is gone.
+        let python_dir = bin.join(".python");
+        let installed = std::fs::read_dir(&python_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(installed, [OsString::from(&request)]);
+        assert!(!bin.parent().unwrap().join(".python-install").exists());
+        assert!(!bin.join(".python-install").exists());
+        // The tree is read-only throughout; only the shared uv directory is writable.
+        let modes = modes_under(&python_dir);
+        assert!(modes.len() > 3);
+        for (path, mode) in modes {
+            assert_eq!(mode & 0o222, 0, "{} is writable", path.display());
+        }
+        let uv = prepared.uv_dir().unwrap();
+        assert!(uv.is_dir() && !uv.starts_with(bin));
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::symlink_metadata(uv).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        let environment = prepared.uv_environment().unwrap();
+        assert_eq!(environment.cache, uv.join("cache"));
+        assert_eq!(environment.python_installs, uv.join("python"));
+        assert!(!environment.python_installs.starts_with(&python_dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_python_version_and_interpreter_enter_the_cache_key() {
+        let base = bundle();
+        let key = base.cache_key().unwrap();
+        let pinned = |version: &str, interpreter: [u8; 32]| {
+            let mut bundle = base.clone();
+            bundle.python = Some(
+                PythonPin {
+                    version: version.into(),
+                    target: ToolTarget::native().unwrap(),
+                    interpreter_sha256: hex::encode(interpreter),
+                }
+                .runtime()
+                .unwrap(),
+            );
+            bundle.cache_key().unwrap()
+        };
+        let digest_of = digest(&fixture_interpreter(FIXTURE_PYTHON_VERSION));
+        assert_eq!(pinned(FIXTURE_PYTHON_VERSION, digest_of), key);
+        assert_ne!(pinned("3.13.2", digest_of), key);
+        assert_ne!(pinned(FIXTURE_PYTHON_VERSION, [7; 32]), key);
+        let image = image_tools();
+        let image_key = image.cache_key().unwrap();
+        let mut other = image;
+        other.python = Some(
+            PythonPin {
+                version: "3.13.2".into(),
+                target: ToolTarget::native().unwrap(),
+                interpreter_sha256: hex::encode(digest_of),
+            }
+            .runtime()
+            .unwrap(),
+        );
+        assert_ne!(other.cache_key().unwrap(), image_key);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tampering_with_the_python_link_or_interpreter_is_rejected_and_repaired() {
+        let cache = unlocking_tempdir();
+        let bundle = bundle();
+        let ready = bundle.prepare_local(cache.path()).await.unwrap();
+        let runtime = ready.bin_dir().parent().unwrap().to_path_buf();
+        let python = ready.bin_dir().join("python3");
+        let target = std::fs::read_link(&python).unwrap();
+        let interpreter = ready.bin_dir().join(&target);
+
+        std::fs::remove_file(&python).unwrap();
+        std::os::unix::fs::symlink("../elsewhere/python3.13", &python).unwrap();
+        assert!(matches!(
+            bundle.verify_prepared(&runtime),
+            Err(ToolRuntimeError::InvalidCache(path)) if path == python
+        ));
+        std::fs::remove_file(&python).unwrap();
+        assert!(matches!(
+            bundle.verify_prepared(&runtime),
+            Err(ToolRuntimeError::InvalidCache(path)) if path == python
+        ));
+        std::os::unix::fs::symlink(&target, &python).unwrap();
+        bundle.verify_prepared(&runtime).unwrap();
+
+        // An interpreter that is not the pinned bytes.
+        let parent = interpreter.parent().unwrap();
+        make_writable(parent);
+        make_writable(&interpreter);
+        std::fs::write(&interpreter, b"#!/bin/sh\necho Python 9.9.9\n").unwrap();
+        set_executable_readonly(&interpreter).unwrap();
+        assert!(matches!(
+            bundle.verify_prepared(&runtime),
+            Err(ToolRuntimeError::PythonIntegrity)
+        ));
+        let repaired = bundle.prepare_local(cache.path()).await.unwrap();
+        assert_prepared(&bundle, &repaired);
+        assert_eq!(
+            std::fs::read(&interpreter).unwrap(),
+            fixture_interpreter(FIXTURE_PYTHON_VERSION)
+        );
+        assert_eq!(leftovers(cache.path(), &bundle), Vec::<OsString>::new());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_writable_interpreter_is_rejected() {
+        let cache = unlocking_tempdir();
+        let bundle = bundle();
+        let ready = bundle.prepare_local(cache.path()).await.unwrap();
+        let interpreter = ready
+            .bin_dir()
+            .join(std::fs::read_link(ready.bin_dir().join("python3")).unwrap());
+        make_writable(interpreter.parent().unwrap());
+        make_writable(&interpreter);
+        assert!(matches!(
+            bundle.verify_prepared(ready.bin_dir().parent().unwrap()),
+            Err(ToolRuntimeError::InvalidCache(path)) if path == interpreter
+        ));
+    }
+
+    /// Prepares a bundle whose `uv` runs `extra` after installing, and
+    /// returns the staging error together with what the cache root kept.
+    #[cfg(unix)]
+    async fn stage_with(extra: &str) -> (ToolRuntimeError, Vec<OsString>) {
+        let cache = unlocking_tempdir();
+        let bundle = bundle_with_uv(fixture_uv("1.0.0", extra));
+        let error = bundle.prepare_local(cache.path()).await.unwrap_err();
+        (error, leftovers(cache.path(), &bundle))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_python_tree_with_an_unacceptable_entry_is_not_staged() {
+        for (name, extra) in [
+            ("absolute link", r#"ln -s /etc/passwd "$dir/bin/escape""#),
+            (
+                "link out of the tree",
+                r#"ln -s ../../../outside "$dir/lib""#,
+            ),
+            ("named pipe", r#"mkfifo "$dir/pipe""#),
+        ] {
+            let (error, kept) = stage_with(extra).await;
+            assert!(
+                matches!(error, ToolRuntimeError::InvalidPythonTree(_)),
+                "{name}: {error:?}"
+            );
+            // The rejected stage was deleted again, read-only or not.
+            assert!(kept.is_empty(), "{name} left {kept:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_installed_interpreter_that_is_not_the_pinned_one_is_not_staged() {
+        let (error, kept) = stage_with(r#"printf 'other' > "$dir/bin/python3.13""#).await;
+        assert!(
+            matches!(error, ToolRuntimeError::PythonIntegrity),
+            "{error:?}"
+        );
+        assert!(kept.is_empty(), "{kept:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_python_install_reports_what_uv_said() {
+        let (error, kept) = stage_with("echo 'no network' >&2; exit 3").await;
+        match error {
+            ToolRuntimeError::PythonInstall { status, stderr } => {
+                assert_eq!(status, Some(3));
+                assert!(stderr.contains("no network"), "{stderr}");
+            }
+            error => panic!("expected PythonInstall, got {error:?}"),
+        }
+        assert!(kept.is_empty(), "{kept:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_python_installer_runs_with_a_cleared_environment() {
+        // `UV_PYTHON_INSTALL_MIRROR` and friends must not redirect the download.
+        let cache = unlocking_tempdir();
+        // SAFETY: the installer inherits only the proxy and certificate
+        // variables, and no other test reads this one.
+        unsafe { std::env::set_var("UV_PYTHON_INSTALL_MIRROR", "https://example.invalid") };
+        let bundle = bundle_with_uv(fixture_uv(
+            "1.0.0",
+            r#"[ -z "${UV_PYTHON_INSTALL_MIRROR+x}" ] || exit 9"#,
+        ));
+        let result = bundle.prepare_local_sync(cache.path(), &bundle.cache_key().unwrap(), None);
+        unsafe { std::env::remove_var("UV_PYTHON_INSTALL_MIRROR") };
+        result.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_platforms_interpreter_needs_an_installer_that_runs_here() {
+        let native = ToolTarget::native().unwrap();
+        let foreign = ToolTarget::from_probe(
+            "Linux",
+            if native.arch() == "aarch64" {
+                "x86_64"
+            } else {
+                "aarch64"
+            },
+        )
+        .unwrap();
+        let binaries = script_binaries(&ManagedTool::ALL);
+        let bundle = ToolBundle::new(foreign.clone(), binaries, Some(fixture_python())).unwrap();
+        let root = unlocking_tempdir();
+        let key = bundle.cache_key().unwrap();
+        assert!(matches!(
+            bundle.prepare_local_sync(root.path(), &key, None),
+            Err(ToolRuntimeError::PythonInstallerUnavailable)
+        ));
+        let installer = script_tool(ManagedTool::Uv, "1.0.0");
+        let prepared = bundle
+            .prepare_local_sync(root.path(), &key, Some(&installer))
+            .unwrap();
+        let request = bundle.python.as_ref().unwrap().request(&foreign).unwrap();
+        assert!(
+            request.ends_with(&format!("linux-{}-gnu", foreign.arch())),
+            "{request}"
+        );
+        assert_eq!(
+            std::fs::read_link(prepared.bin_dir().join("python3")).unwrap(),
+            Path::new(&format!(".python/{request}/bin/python3.13"))
+        );
+    }
+
+    #[test]
+    fn python_requests_pin_the_platform_and_the_libc() {
+        let python = fixture_python();
+        let request =
+            |os: &str, arch: &str| python.request(&ToolTarget::from_probe(os, arch).unwrap());
+        assert_eq!(
+            request("Darwin", "arm64").unwrap(),
+            "cpython-3.13.1-macos-aarch64-none"
+        );
+        assert_eq!(
+            request("Linux", "x86_64").unwrap(),
+            "cpython-3.13.1-linux-x86_64-gnu"
+        );
+        assert!(matches!(
+            request("Windows_NT", "x86_64"),
+            Err(ToolRuntimeError::UnsupportedTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn python_pins_are_validated() {
+        let pin = |version: &str, digest: &str| PythonPin {
+            version: version.into(),
+            target: ToolTarget::native().unwrap(),
+            interpreter_sha256: digest.into(),
+        };
+        let good = "00".repeat(32);
+        pin("3.13.18", &good).runtime().unwrap();
+        assert!(pin("3.13", &good).runtime().is_err());
+        assert!(pin("3.13.18", "abc").runtime().is_err());
+        assert!(pin("3.13.18", &"g".repeat(64)).runtime().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_catalog_entry_checks_its_own_version() {
+        let image = image_tools();
+        let catalog = image.catalog();
+        let banner = |tool: ManagedTool| match tool {
+            ManagedTool::Jq => "jq-1.0.0".to_owned(),
+            tool => format!("{} 1.0.0", tool.command()),
+        };
+        let reports = |python: &str| {
+            let mut output = String::new();
+            for tool in native_tools() {
+                output.push_str(&banner(*tool));
+                output.push('\0');
+            }
+            output.push_str(python);
+            output.push('\0');
+            output
+        };
+        catalog.verify_versions(&reports("Python 3.13.1")).unwrap();
+        for wrong in ["Python 3.12.0", "python 3.13.1", "uv 3.13.1", ""] {
+            assert!(
+                matches!(
+                    catalog.verify_versions(&reports(wrong)),
+                    Err(ToolRuntimeError::VersionMismatch(command)) if command == "python3"
+                ),
+                "{wrong:?}"
+            );
+        }
+    }
+
     #[test]
     fn prompt_catalog_is_operational_and_stable() {
         let catalog = bundle().catalog();
@@ -1856,6 +2644,10 @@ pub mod tests {
         assert_eq!(first, catalog.render().unwrap());
         for command in native_tools() {
             assert!(first.contains(command.command()), "{command:?}");
+        }
+        if ToolTarget::native().unwrap().provides_python() {
+            assert!(first.contains(&format!("python3 {FIXTURE_PYTHON_VERSION}")));
+            assert!(first.contains("`.python-version`"));
         }
         assert!(first.contains("ast-grep run"));
         assert!(first.contains("*** Begin Patch"));
@@ -1885,7 +2677,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn prepared_path_retains_heel_ipc_commands() {
-        let cache = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
         let workspace = tempfile::tempdir().unwrap();
         let ready = bundle().prepare_local(cache.path()).await.unwrap();
         let sandbox_path = heel::default_sandbox_path();

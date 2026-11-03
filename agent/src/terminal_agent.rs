@@ -1561,7 +1561,7 @@ mod tests {
         let source = tempdir().unwrap();
         let binary = compile_baseline_fixture(source.path()).await;
         let distribution = fixture_distribution(&binary, "1.0.0").await;
-        let cache = tempdir().unwrap();
+        let cache = crate::test_support::TempDir::new();
         let (requests, _captured) = async_channel::bounded(4);
         let first_dir = tempdir().unwrap();
         let first =
@@ -1623,7 +1623,7 @@ mod tests {
         // The fixture reports 1.0.0, so the probe rejects a 2.0.0 pin while
         // downloads and integrity checks accept it.
         let distribution = fixture_distribution(&binary, "2.0.0").await;
-        let cache = tempdir().unwrap();
+        let cache = crate::test_support::TempDir::new();
         let (requests, _captured) = async_channel::bounded(4);
 
         let probed_dir = tempdir().unwrap();
@@ -1660,7 +1660,7 @@ mod tests {
         let dir = tempdir().expect("tempdir should exist");
         let terminal_tool = noop_terminal(dir.path()).await;
         let source = tempdir().unwrap();
-        let cache = tempdir().unwrap();
+        let cache = crate::test_support::TempDir::new();
         let binary = compile_baseline_fixture(source.path()).await;
         let distribution = fixture_distribution(&binary, "1.0.0").await;
         let (requests, captured) = async_channel::bounded(4);
@@ -1734,7 +1734,7 @@ mod tests {
         let source = tempdir().unwrap();
         let binary = compile_baseline_fixture(source.path()).await;
         let distribution = fixture_distribution(&binary, "1.0.0").await;
-        let cache = tempdir().unwrap();
+        let cache = crate::test_support::TempDir::new();
         let dir = tempdir().unwrap();
         let (requests, _captured) = async_channel::bounded(4);
         let builder =
@@ -1795,7 +1795,7 @@ mod tests {
         let source = tempdir().unwrap();
         let binary = compile_baseline_fixture(source.path()).await;
         let distribution = fixture_distribution(&binary, "1.0.0").await;
-        let cache = tempdir().unwrap();
+        let cache = crate::test_support::TempDir::new();
         let dir = tempdir().unwrap();
         let terminal_tool = noop_terminal(dir.path()).await;
         let jobs = terminal_tool.job_registry();

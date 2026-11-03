@@ -2388,7 +2388,8 @@ mod tests {
     /// worktree on `subagent/work/main`, the worktree a subagent is granted
     /// commit in.
     struct CommitFixture {
-        _dirs: [tempfile::TempDir; 3],
+        _dirs: [tempfile::TempDir; 2],
+        _cache: crate::test_support::TempDir,
         terminal: aither_sandbox::TerminalTool<
             aither_sandbox::permission::NoopPermissionHandler,
             executor_core::tokio::TokioGlobal,
@@ -2406,7 +2407,7 @@ mod tests {
 
             let work = tempfile::tempdir().unwrap();
             let source = tempfile::tempdir().unwrap();
-            let cache = tempfile::tempdir().unwrap();
+            let cache = crate::test_support::TempDir::new();
             let binary = crate::test_support::compile_baseline_fixture(source.path()).await;
             let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
 
@@ -2436,7 +2437,8 @@ mod tests {
             let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
             let terminal = terminal.with_registry(registry);
             Self {
-                _dirs: [work, source, cache],
+                _dirs: [work, source],
+                _cache: cache,
                 terminal,
                 repository,
                 worktree,
@@ -3684,7 +3686,8 @@ You are a file-defined agent.
     /// A main agent's terminal whose permission requests are recorded.
     struct ForkFixture {
         _hook_tools: crate::test_support::PreparedFixture,
-        _dirs: [tempfile::TempDir; 3],
+        _dirs: [tempfile::TempDir; 2],
+        _cache: crate::test_support::TempDir,
         terminal: aither_sandbox::TerminalTool<
             crate::ReviewedPermission<RecordingPermission>,
             executor_core::tokio::TokioGlobal,
@@ -3705,7 +3708,7 @@ You are a file-defined agent.
 
             let session = tempfile::tempdir().unwrap();
             let source = tempfile::tempdir().unwrap();
-            let cache = tempfile::tempdir().unwrap();
+            let cache = crate::test_support::TempDir::new();
             let binary = crate::test_support::compile_baseline_fixture(source.path()).await;
             let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
             let permission = RecordingPermission::default();
@@ -3734,7 +3737,8 @@ You are a file-defined agent.
                 .expect("tools should prepare");
             let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
             Self {
-                _dirs: [session, source, cache],
+                _dirs: [session, source],
+                _cache: cache,
                 _hook_tools: hook_tools,
                 terminal: terminal.with_registry(registry),
                 asked,
