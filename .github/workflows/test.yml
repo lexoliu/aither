@@ -51,6 +51,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: test-${{ matrix.os }}-${{ inputs.cache-key }}
       - uses: arduino/setup-protoc@v3
         with:
