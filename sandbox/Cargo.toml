@@ -97,6 +97,10 @@ url = { version = "2.5.8", features = ["serde"] }
 fd-lock = "4"
 typed-path = "0.12.3"
 
+# Outage intervals reported to the model; see the `connectivity` feature.
+aither-connectivity = { workspace = true, optional = true }
+jiff = { version = "0.2.39", optional = true, default-features = false, features = ["std", "tz-system"] }
+
 [features]
 default = []
 # Detect source code in command output so it can be folded with tree-sitter.
@@ -104,6 +108,8 @@ default = []
 code-folding = ["dep:magika", "dep:ort", "dep:tree-sitter", "dep:rs-tree-sitter-languages"]
 # Broker a shared GNU make jobserver token pool across commands (unix only).
 jobserver = ["dep:polling", "dep:rustix"]
+# State the sleep and offline intervals a command ran through in its result.
+connectivity = ["dep:aither-connectivity", "dep:jiff"]
 
 [dev-dependencies]
 magika = { version = "1", features = ["_test"] }

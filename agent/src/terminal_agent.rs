@@ -901,12 +901,15 @@ where
     }
 
     /// Ends a provider response stream in flight when the machine wakes from
-    /// sleep or loses its network.
+    /// sleep or loses its network, and has the terminal state the sleep and
+    /// offline intervals each command ran through.
     ///
-    /// See [`AgentBuilder::connectivity`].
+    /// See [`AgentBuilder::connectivity`] and
+    /// [`TerminalTool::with_connectivity`].
     #[cfg(feature = "connectivity")]
     #[must_use]
     pub fn connectivity(mut self, connectivity: aither_connectivity::Connectivity) -> Self {
+        self.terminal_tool = self.terminal_tool.with_connectivity(&connectivity);
         self.inner = self.inner.connectivity(connectivity);
         self
     }
