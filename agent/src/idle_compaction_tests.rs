@@ -85,7 +85,7 @@ async fn agent_after_one_turn(
         .await
         .expect("terminal tool initializes");
     let tools = tempdir().expect("tool dir");
-    let cache = tempdir().expect("cache dir");
+    let cache = crate::test_support::TempDir::new();
     let binary = test_support::compile_baseline_fixture(tools.path()).await;
     let distribution = test_support::fixture_distribution(&binary, "1.0.0").await;
     let mut builder = TerminalAgentBuilder::new(llm, terminal)

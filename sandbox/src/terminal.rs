@@ -3899,6 +3899,13 @@ fn local_path_grants(
             resolved(tools.bin_dir())?,
             Access::EXEC,
         ))))
+        // The shared `uv` cache and project Python installs, which `uv`
+        // writes and the interpreters it installs execute.
+        .chain(
+            tools
+                .uv_dir()
+                .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE | Access::EXEC))),
+        )
         .chain(
             job_fifo
                 .iter()
@@ -4803,6 +4810,8 @@ async fn record_container_exec_outcome(
 struct SshToolExecutionTemplate<'a> {
     binary: Cow<'a, str>,
     tools_dir: Cow<'a, str>,
+    /// Read, write and execute access to the shared `uv` directory, quoted.
+    uv_grant: Option<String>,
     program: Cow<'a, str>,
     arguments: String,
 }
@@ -4816,9 +4825,22 @@ async fn execute_ssh_background(
             let script = context.prepared_tools.wrap_script(context.script)?;
             let (program, args) = shell_launch(&script);
             let directory = context.prepared_tools.script_bin_dir()?;
+            let uv_grant = context
+                .prepared_tools
+                .uv_dir()
+                .map(|dir| {
+                    let dir = dir
+                        .to_str()
+                        .ok_or_else(|| ToolRuntimeError::InvalidCache(dir.clone()))?;
+                    Ok::<_, ToolRuntimeError>(
+                        shell_words::quote(&format!("{dir}=rwx")).into_owned(),
+                    )
+                })
+                .transpose()?;
             SshToolExecutionTemplate {
                 binary: shell_words::quote(binary),
                 tools_dir: shell_words::quote(directory),
+                uv_grant,
                 program: shell_words::quote(&program),
                 arguments: shell_words::join(&args),
             }
@@ -5013,6 +5035,22 @@ async fn prepare_session_runtime_environment(
         ("PLAYWRIGHT_BROWSERS_PATH".to_string(), playwright),
         ("PYTHONPATH".to_string(), python),
     ];
+    // `uv` keeps its cache and the Pythons it installs for projects in one
+    // directory shared by every session, not under the remapped HOME.
+    if let Some(uv) = tools.uv_environment() {
+        env.push((
+            "UV_CACHE_DIR".to_string(),
+            path_environment_value("UV_CACHE_DIR", &uv.cache)?,
+        ));
+        env.push((
+            "UV_PYTHON_INSTALL_DIR".to_string(),
+            path_environment_value("UV_PYTHON_INSTALL_DIR", &uv.python_installs)?,
+        ));
+        env.push((
+            "UV_PYTHON_PREFERENCE".to_string(),
+            crate::tool_runtime::UV_PYTHON_PREFERENCE.to_string(),
+        ));
+    }
     for (name, home) in host_toolchain_homes() {
         env.push((name.to_string(), path_environment_value(name, &home)?));
     }
@@ -5715,8 +5753,11 @@ mod tests {
         }
     }
 
-    async fn prepared_test_registry() -> (tempfile::TempDir, ShellSessionRegistry) {
-        let cache = tempfile::tempdir().unwrap();
+    async fn prepared_test_registry() -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        ShellSessionRegistry,
+    ) {
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
         let tools = crate::tool_runtime::tests::bundle()
             .prepare_local(cache.path())
             .await
@@ -5839,9 +5880,17 @@ mod tests {
         // Invoked through a coreutils alias it runs the host's command of
         // that name, so the scripts of these tests still find `pwd` and `cat`.
         let commands = crate::ManagedTool::ALL.map(crate::ManagedTool::command);
+        // As `uv`, `python install <request>` installs a copy of the script as
+        // the interpreter, which reports the Python version below.
         let script = format!(
-            "#!/bin/sh\ncase \"${{0##*/}}\" in {}) ;; *) PATH=/usr/bin:/bin exec \"${{0##*/}}\" \"$@\";; esac\n\
-             case \"$1\" in --list) printf '%s\\n' {}; exit 0;; esac\nprintf '%s\\n' 'tool 1.0.0'\n",
+            "#!/bin/sh\ncase \"${{0##*/}}\" in python*) printf '%s\\n' 'Python 3.13.1'; exit 0;; esac\n\
+             case \"${{0##*/}}\" in {}) ;; *) PATH=/usr/bin:/bin exec \"${{0##*/}}\" \"$@\";; esac\n\
+             case \"$1\" in --list) printf '%s\\n' {}; exit 0;; esac\n\
+             case \"$1\" in python) PATH=/usr/bin:/bin; for request; do :; done; \
+             dir=\"$UV_PYTHON_INSTALL_DIR/$request\"; mkdir -p \"$dir/bin\"; \
+             cp \"$0\" \"$dir/bin/python3.13\"; chmod 755 \"$dir/bin/python3.13\"; \
+             ln -s python3.13 \"$dir/bin/python3\"; exit 0;; esac\n\
+             printf '%s\\n' 'tool 1.0.0'\n",
             commands.join("|"),
             crate::tool_runtime::COREUTILS_ALIASES.join(" ")
         )
@@ -5862,8 +5911,13 @@ mod tests {
                 encoding: crate::ToolArtifactFormat::Executable,
             })
             .collect::<Vec<_>>();
+        let python = crate::tool_runtime::tests::python_pins_for(
+            crate::tool_runtime::digest(script),
+            "3.13.1",
+        );
         ToolDistribution::from_json(
-            &serde_json::to_vec(&serde_json::json!({ "artifacts": artifacts })).unwrap(),
+            &serde_json::to_vec(&serde_json::json!({ "artifacts": artifacts, "python": python }))
+                .unwrap(),
         )
         .unwrap()
     }
@@ -5878,7 +5932,7 @@ mod tests {
         let artifacts = tempfile::tempdir().unwrap();
         let distribution = script_distribution(artifacts.path()).await;
         let first = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
         let denied = fresh_terminal(first.path())
             .await
             .with_shell_sessions(local_and_ssh_registry(&authorizer))
@@ -5892,7 +5946,7 @@ mod tests {
 
         // Tools pinned to a version their commands do not report: the version
         // probe of full preparation rejects them.
-        let tools_cache = tempfile::tempdir().unwrap();
+        let tools_cache = crate::tool_runtime::tests::unlocking_tempdir();
         let tools = crate::tool_runtime::tests::bundle_pinned("2.0.0")
             .prepare_local(tools_cache.path())
             .await
@@ -5972,7 +6026,7 @@ mod tests {
 
         let artifacts = tempfile::tempdir().unwrap();
         let distribution = script_distribution(artifacts.path()).await;
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
         let host = container
             .host_tools(&distribution, cache.path())
             .await
@@ -5994,7 +6048,7 @@ mod tests {
     #[tokio::test]
     async fn adoption_rejects_a_registry_changed_after_preparation() {
         let authorizer = Arc::new(CountingSshAuthorizer::default());
-        let tools_cache = tempfile::tempdir().unwrap();
+        let tools_cache = crate::tool_runtime::tests::unlocking_tempdir();
         let tools = crate::tool_runtime::tests::bundle()
             .prepare_local(tools_cache.path())
             .await
@@ -6129,7 +6183,7 @@ mod tests {
     #[tokio::test]
     async fn session_runtime_environment_is_prepared_without_wrapping_the_script() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
         let ready = crate::tool_runtime::tests::bundle()
             .prepare_local(cache.path())
             .await
@@ -6155,12 +6209,50 @@ mod tests {
         assert!(dir.path().join(".cache/bun").is_dir());
         assert!(dir.path().join(".cache/ms-playwright").is_dir());
         assert!(dir.path().join(".config").is_dir());
+        // `uv` keeps its state in the shared directory, not in the session's HOME.
+        if let Some(uv) = ready.uv_dir() {
+            assert_eq!(
+                value("UV_CACHE_DIR"),
+                uv.join("cache").to_str().expect("UTF-8 temp path")
+            );
+            assert_eq!(
+                value("UV_PYTHON_INSTALL_DIR"),
+                uv.join("python").to_str().expect("UTF-8 temp path")
+            );
+            assert_eq!(value("UV_PYTHON_PREFERENCE"), "system");
+            assert!(!uv.starts_with(dir.path()));
+        }
+    }
+
+    /// The shared `uv` directory is writable and executable beside the
+    /// read-only tools directory, and nothing else of the cache is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_shared_uv_directory_is_a_writable_grant_apart_from_the_tools() {
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
+        let ready = crate::tool_runtime::tests::bundle()
+            .prepare_local(cache.path())
+            .await
+            .unwrap();
+        let uv = ready.uv_dir().expect("the test host has a managed uv");
+        let grants = local_path_grants(&[], &[], &ready, None).expect("grants build");
+        let access_of = |path: &Path| {
+            let path = std::fs::canonicalize(path).unwrap();
+            grants
+                .iter()
+                .find(|grant| grant.resolved_path().as_path() == path)
+                .map(heel::Grant::access)
+        };
+        assert_eq!(access_of(uv), Some(Access::WRITE | Access::EXEC));
+        assert_eq!(access_of(ready.bin_dir()), Some(Access::EXEC));
+        // Neither grant exposes the other.
+        assert!(!ready.bin_dir().starts_with(uv) && !uv.starts_with(ready.bin_dir()));
     }
 
     #[tokio::test]
     async fn session_runtime_environment_sets_toolchain_homes_and_host_path() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
         let cargo_home = tempfile::tempdir().unwrap();
         let rustup_home = tempfile::tempdir().unwrap();
         unsafe {
@@ -6211,7 +6303,7 @@ mod tests {
     async fn local_path_grants_make_writable_dirs_executable() {
         let workdir = tempfile::tempdir().unwrap();
         let readonly = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
+        let cache = crate::tool_runtime::tests::unlocking_tempdir();
         let tools = crate::tool_runtime::tests::bundle()
             .prepare_local(cache.path())
             .await
@@ -6840,7 +6932,10 @@ mod tests {
     /// it without a grant. The directories live as long as the guards.
     #[cfg(unix)]
     async fn parent_and_child_terminals() -> (
-        [tempfile::TempDir; 2],
+        (
+            tempfile::TempDir,
+            crate::tool_runtime::tests::UnlockingTempDir,
+        ),
         ConfiguredTestTool,
         ConfiguredTestTool,
     ) {
@@ -6868,7 +6963,7 @@ mod tests {
             .subagent_without_grant()
             .await
             .expect("an empty grant is always given");
-        ([dir, cache], parent, child)
+        ((dir, cache), parent, child)
     }
 
     /// A child terminal's `terminal_input` and `terminal_read` reach its own
@@ -7551,7 +7646,7 @@ mod tests {
         timeout_cap: Duration,
         alert_after: Duration,
     ) -> (
-        tempfile::TempDir,
+        crate::tool_runtime::tests::UnlockingTempDir,
         TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
@@ -8187,7 +8282,7 @@ mod tests {
         dir: &Path,
         priority: ProcessPriority,
     ) -> (
-        tempfile::TempDir,
+        crate::tool_runtime::tests::UnlockingTempDir,
         TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
@@ -8707,7 +8802,7 @@ mod tests {
     async fn start_acceptance_container() -> (
         TestDockerContainer,
         crate::tool_runtime::ImageTools,
-        tempfile::TempDir,
+        crate::tool_runtime::tests::UnlockingTempDir,
     ) {
         let docker_ready = std::process::Command::new("docker")
             .arg("info")
@@ -8721,12 +8816,12 @@ mod tests {
             .expect("container acceptance requires a Linux heel binary (set HEEL_BIN)");
         let image = crate::tool_runtime::tests::image_tools();
         let bundle = crate::tool_runtime::tests::bundle();
-        let tools_cache = tempfile::tempdir().expect("tool cache dir should be created");
+        let tools_cache = crate::tool_runtime::tests::unlocking_tempdir();
         // Stage the executables under the image's cache key — exactly what
         // `stage_image_tools` produces — and mount the directory where the
         // image carries it.
         let prepared = bundle
-            .prepare_local_sync(tools_cache.path(), &image.cache_key().unwrap())
+            .prepare_local_sync(tools_cache.path(), &image.cache_key().unwrap(), None)
             .expect("test bundle should stage for the image");
         let staged = prepared
             .bin_dir()
@@ -8995,7 +9090,12 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn authority_terminal(dir: &Path) -> (tempfile::TempDir, ConfiguredTestTool) {
+    async fn authority_terminal(
+        dir: &Path,
+    ) -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        ConfiguredTestTool,
+    ) {
         configured_test_terminal(
             dir,
             Duration::from_secs(30),
@@ -9526,7 +9626,7 @@ mod tests {
         /// The subagent's repository.
         subagent: PathBuf,
         parent: ConfiguredTestTool,
-        _cache: tempfile::TempDir,
+        _cache: crate::tool_runtime::tests::UnlockingTempDir,
     }
 
     #[cfg(unix)]
@@ -10652,7 +10752,7 @@ mod tests {
     async fn kill_guard_tool(
         dir: &Path,
     ) -> (
-        tempfile::TempDir,
+        crate::tool_runtime::tests::UnlockingTempDir,
         TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;

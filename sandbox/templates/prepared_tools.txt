@@ -14,5 +14,6 @@ apply_patch <<'PATCH'
 *** End Patch
 PATCH
 ```
+{% endif %}{% if self.has("uv") %}`python3` is the managed interpreter; a project's own `.venv` and `.python-version` still decide what `uv run` uses.
 {% endif %}Use command `--help` for uncommon options, not to discover these prepared capabilities.
 </prepared_tools>
