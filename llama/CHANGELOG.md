@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/May-Agent/aither/compare/llama-v0.12.0...llama-v0.13.0) - 2026-11-03
+
+### Added
+
+- *(core)* [**breaking**] classify provider failures and carry Retry-After
+
+### Other
+
+- Merge pull request #350 from May-Agent/chore/merge-main-into-dev-0.12
+
 ## [0.12.0](https://github.com/May-Agent/aither/compare/llama-v0.11.0...llama-v0.12.0) - 2026-11-03
 
 ### Other

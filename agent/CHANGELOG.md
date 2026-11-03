@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/May-Agent/aither/compare/agent-v0.12.0...agent-v0.13.0) - 2026-11-03
+
+### Added
+
+- *(sandbox)* command results state the outages they ran through
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into feat/344-connectivity
+- Merge pull request #348 from May-Agent/feat/347-cache-warmth
+- Merge pull request #350 from May-Agent/chore/merge-main-into-dev-0.12
+- Merge remote-tracking branch 'origin/main' into chore/merge-main-into-dev-0.12
+
 ## [0.12.0](https://github.com/May-Agent/aither/compare/agent-v0.11.0...agent-v0.12.0) - 2026-11-03
 
 ### Added
