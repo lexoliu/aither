@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/May-Agent/aither/compare/sandbox-v0.13.0...sandbox-v0.14.0) - 2026-11-03
+
+### Added
+
+- *(sed)* aither-sed prints line ranges for sed in agent scripts
+- *(sandbox)* grep, sed, awk and find fail in agent scripts with their replacement
+- *(sandbox)* managed uv and a pinned python3
+- *(sandbox)* build bash 5.3 in CI and run terminal scripts through it
+- *(sandbox)* managed uutils coreutils, findutils xargs and fd
+- *(sandbox)* fail initialization on macOS without the Command Line Tools
+- *(sandbox)* existing files change only through apply_patch
+
+### Fixed
+
+- *(sandbox)* read hints name head, tail and rg, not the blocked commands
+- *(sandbox)* unlock the Python tree only when the bundle has one; type the outage test's cache
+- *(sandbox)* leave stdbuf out of the coreutils aliases, which the musl builds lack
+- *(sandbox)* keep the apply_patch rule free of `which`
+
+### Other
+
+- Merge origin/dev into feat/387-managed-bash
+- Merge pull request #392 from May-Agent/feat/386-managed-coreutils
+- Merge pull request #391 from May-Agent/feat/390-clt-check
+- Merge pull request #385 from May-Agent/feat/384-apply-patch-only
+
 ## [0.13.0](https://github.com/May-Agent/aither/compare/sandbox-v0.12.0...sandbox-v0.13.0) - 2026-11-03
 
 ### Added
