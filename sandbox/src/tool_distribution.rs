@@ -764,6 +764,19 @@ pub mod tests {
         ToolDistribution::from_json(include_bytes!("../../patch/third-party-tools.json")).unwrap()
     }
 
+    /// Every tool aither builds is named in the release manifest by its
+    /// `patch/built-tools.json` entry, so each name must be a `ManagedTool`.
+    #[test]
+    fn every_built_tool_is_a_managed_tool() {
+        let list: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../patch/built-tools.json")).unwrap();
+        for entry in list["tools"].as_array().unwrap() {
+            let name = entry["tool"].clone();
+            serde_json::from_value::<ManagedTool>(name.clone())
+                .unwrap_or_else(|error| panic!("{name} is not a managed tool: {error}"));
+        }
+    }
+
     #[test]
     fn pinned_tools_cover_the_required_set_of_every_platform() {
         let pinned = pinned_distribution();
