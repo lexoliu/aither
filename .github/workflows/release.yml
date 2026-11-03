@@ -44,6 +44,8 @@ jobs:
       # `cargo publish` verifies each tarball by compiling it; aither-search
       # builds lance/prost, which needs protoc. CI installs it too.
       - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       # Every crate's publish verification shares the ci-ubuntu cache: CI
       # keeps it warm between releases, a release-scoped key would go cold and
       # never hit.
