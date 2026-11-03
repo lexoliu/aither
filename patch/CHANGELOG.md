@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/May-Agent/aither/compare/patch-v0.11.0...patch-v0.12.0) - 2026-11-03
+
+### Added
+
+- *(sandbox)* [**breaking**] prepare a cached host program without re-extracting its archive
+
+### Other
+
+- point repository links at May-Agent/aither
+- drop macos-x86_64 artifacts and float the arm64 lane on latest
+- refresh README with agent, sandbox, MCP/ACP, and provider crates
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/patch-v0.10.1...patch-v0.11.0) - 2026-10-29
 
 ### Added

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/May-Agent/aither/compare/models-v0.11.0...models-v0.12.0) - 2026-11-03
+
+### Fixed
+
+- *(models)* resolve hyphenated v-minor ids and compact MMDD dates
+
+### Other
+
+- refresh README with agent, sandbox, MCP/ACP, and provider crates
+
 ### Fixed
 
 - Lookup strips compact `-MMDD` checkpoint dates and collapses `vMAJOR-MINOR` / `vMAJOR.MINOR` onto the `vMAJOR` record

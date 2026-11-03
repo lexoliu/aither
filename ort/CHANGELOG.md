@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/May-Agent/aither/compare/ort-v0.11.0...ort-v0.12.0) - 2026-11-03
+
+### Other
+
+- refresh README with agent, sandbox, MCP/ACP, and provider crates
+
 ## [0.6.0](https://github.com/lexoliu/aither/compare/ort-v0.5.0...ort-v0.6.0) - 2026-10-10
 
 ### Added

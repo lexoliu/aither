@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/May-Agent/aither/compare/core-v0.11.0...core-v0.12.0) - 2026-11-03
+
+### Fixed
+
+- *(core)* [**breaking**] CommandStream::Inline carries its text in a named field
+
+### Other
+
+- point repository links at May-Agent/aither
+- refresh README with agent, sandbox, MCP/ACP, and provider crates
+- Merge remote-tracking branch 'origin/main' into chore/merge-main-into-dev-0.11
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/core-v0.10.1...core-v0.11.0) - 2026-10-29
 
 ### Fixed
