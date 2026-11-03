@@ -1,0 +1,52 @@
+name: release-plz trial
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release-plz-trial.yml
+
+jobs:
+  update:
+    name: update (${{ matrix.build }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [upstream, fork]
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../release-pr-target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+      - run: git checkout -B dev origin/dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-semver-checks
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - if: matrix.build == 'upstream'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: release-plz@0.4.3
+      - if: matrix.build == 'fork'
+        env:
+          REV: cc554a52e97e0ee359e45c7801d770895247cf27
+        run: |
+          set -euo pipefail
+          asset="release-plz-${REV}-x86_64-unknown-linux-gnu.tar.gz"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/devtools"
+          curl -fsSL "${base}/${asset}" -o "${RUNNER_TEMP}/${asset}"
+          curl -fsSL "${base}/${asset}.sha256" -o "${RUNNER_TEMP}/${asset}.sha256"
+          (cd "${RUNNER_TEMP}" && sha256sum -c "${asset}.sha256")
+          tar -xzf "${RUNNER_TEMP}/${asset}" -C "${CARGO_HOME}/bin"
+      - run: release-plz --version
+      - name: release-plz update
+        run: release-plz update
+      - name: Computed release
+        run: |
+          cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | "\(.name) \(.version)"' | sort
+          git status --short
+          git diff --stat
