@@ -24,6 +24,15 @@ apply_patch <<'PATCH'
 *** End Patch
 PATCH
 rg -q 'new_call' src/main.rs
+# The script itself runs in the managed bash: `bash` on PATH is the shell
+# running this script, and it is the pinned 5.3 series, not the host's.
+banner=$(bash --version)
+banner=${banner%%$'\n'*}
+case $banner in
+    "GNU bash, version $BASH_VERSION "*) ;;
+    *) echo "bash on PATH is not the running managed bash: $banner ($BASH_VERSION)" >&2; exit 1 ;;
+esac
+case $BASH_VERSION in 5.3.*) ;; *) echo "not bash 5.3: $BASH_VERSION" >&2; exit 1 ;; esac
 # Managed uutils tools win over the host's BSD or GNU ones, so GNU options
 # behave identically on macOS and Linux.
 date --version | rg -q 'uutils coreutils'
