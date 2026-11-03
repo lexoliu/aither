@@ -30,7 +30,10 @@ pub enum ManagedTool {
     Xargs,
     /// Fast file finder.
     Fd,
-    /// `aither-sed`, the `sed` of terminal scripts, which only prints line ranges.
+    /// `aither-sed`, the `sed` of terminal scripts, which only prints line
+    /// ranges. Its manifest id is its executable's name, as
+    /// `patch/built-tools.json` names it.
+    #[serde(rename = "aither-sed")]
     Sed,
     /// The `uv` Python package and project manager, which installs the
     /// managed `python3` ([`PythonRuntime`]) when the tools are prepared.
