@@ -11,9 +11,9 @@ use crate::{EXIT_OK, EXIT_UNREADABLE_INPUT};
 #[derive(Debug)]
 pub struct Line {
     pub text: Vec<u8>,
-    /// Whether the line ended its input without a newline and that newline
-    /// stays missing: GNU `sed` keeps it only on the last line of the last
-    /// input.
+    /// Whether the line ended its input without a newline. GNU `sed` prints
+    /// it without one too, and writes the newline only when more output
+    /// follows.
     pub unterminated: bool,
 }
 
@@ -35,8 +35,6 @@ impl<R: Read> Source<R> {
 /// skipped.
 pub struct Input<'a, R, E> {
     names: std::vec::IntoIter<OsString>,
-    /// Operands not yet opened, plus the open one.
-    remaining: usize,
     stdin: Option<R>,
     open: Option<(OsString, Source<R>)>,
     stderr: &'a mut E,
@@ -46,7 +44,6 @@ pub struct Input<'a, R, E> {
 impl<'a, R: Read, E: Write> Input<'a, R, E> {
     pub fn new(names: Vec<OsString>, stdin: R, stderr: &'a mut E) -> Self {
         Self {
-            remaining: names.len(),
             names: names.into_iter(),
             stdin: Some(stdin),
             open: None,
@@ -81,7 +78,7 @@ impl<'a, R: Read, E: Write> Input<'a, R, E> {
                     }
                     return Ok(Some(Line {
                         text,
-                        unterminated: !terminated && self.remaining == 0,
+                        unterminated: !terminated,
                     }));
                 }
                 Err(error) => {
@@ -112,7 +109,6 @@ impl<'a, R: Read, E: Write> Input<'a, R, E> {
     /// Opens the next operand that can be read; `false` when none is left.
     fn open_next(&mut self) -> bool {
         while let Some(name) = self.names.next() {
-            self.remaining -= 1;
             if name == "-" {
                 // A second `-` finds standard input already at its end.
                 if let Some(stdin) = self.stdin.take() {

@@ -80,6 +80,7 @@ fn every_supported_form_matches_gnu_sed() {
         &["-n", "2,3p", "-"],
         &["-n", "2,3p"],
     ];
+    let mut mismatches = Vec::new();
     for args in cases {
         let run = |program: &str| {
             let mut child = Command::new(program)
@@ -101,13 +102,17 @@ fn every_supported_form_matches_gnu_sed() {
         };
         let ours = run(env!("CARGO_BIN_EXE_aither-sed"));
         let gnu = run("sed");
-        assert_eq!(
-            (ours.status.code(), &ours.stdout),
-            (gnu.status.code(), &gnu.stdout),
-            "{args:?}: GNU stderr {}",
-            String::from_utf8_lossy(&gnu.stderr)
-        );
+        if (ours.status.code(), &ours.stdout) != (gnu.status.code(), &gnu.stdout) {
+            mismatches.push(format!(
+                "{args:?}: ours {:?} {:?}, GNU {:?} {:?}",
+                ours.status.code(),
+                String::from_utf8_lossy(&ours.stdout),
+                gnu.status.code(),
+                String::from_utf8_lossy(&gnu.stdout),
+            ));
+        }
     }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 #[test]

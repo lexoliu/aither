@@ -142,7 +142,7 @@ fn standard_input_is_the_default_and_dash() {
 }
 
 #[test]
-fn only_the_last_line_of_the_last_input_may_lack_its_newline() {
+fn a_line_without_its_newline_gets_one_only_when_output_follows() {
     for (args, expected) in [
         (&["-n", "1,2p", "nonl"][..], "n1\nn2"),
         (&["-n", "2p", "nonl"], "n2"),
@@ -150,12 +150,13 @@ fn only_the_last_line_of_the_last_input_may_lack_its_newline() {
         (&["-n", "$p", "nonl"], "n2"),
         (&["-n", "2p;2p", "nonl"], "n2\nn2"),
         (&["-n", "2p;1p", "nonl"], "n1\nn2"),
-        (&["-n", "1,2p", "nonl", "a"], "n1\nn2\n"),
+        (&["-n", "1,2p", "nonl", "a"], "n1\nn2"),
+        (&["-n", "2p", "nonl", "b"], "n2"),
         (&["-n", "$p", "nonl", "a"], "a5\n"),
         (&["-n", "2,3p", "nonl", "a"], "n2\na1\n"),
         (&["-n", "2,3p", "a", "nonl"], "a2\na3\n"),
         (&["-n", "4,$p", "a", "nonl"], "a4\na5\nn1\nn2"),
-        (&["-n", "$p", "nonl", "empty"], "n2\n"),
+        (&["-n", "$p", "nonl", "empty"], "n2"),
         (&["-n", "$p", "empty", "nonl"], "n2"),
         (&["-n", "1,$p", "nonl", "nonl"], "n1\nn2\nn1\nn2"),
     ] {
@@ -210,6 +211,8 @@ fn an_unreadable_file_is_reported_and_the_rest_still_print() {
     );
 }
 
+/// Unix reports reading a directory as such; aither-sed ships only there.
+#[cfg(unix)]
 #[test]
 fn a_directory_is_a_read_error() {
     let directory = fixture();
