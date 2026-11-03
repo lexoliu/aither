@@ -131,6 +131,50 @@ async fn run_command(
     .await
 }
 
+/// Initialization on the coordinator's own machine.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalToolTransport;
+
+impl ToolTransport for LocalToolTransport {
+    async fn run(&self, script: &str, input: Option<Vec<u8>>) -> Result<Output, ToolRuntimeError> {
+        let mut command = async_process::Command::new("sh");
+        command.args(["-c", script]);
+        run_command(command, input).await
+    }
+}
+
+/// Exit status `clt_check.sh` uses for a missing Command Line Tools install.
+const CLT_MISSING_STATUS: i32 = 4;
+
+/// Requires the Command Line Tools on a macOS target.
+///
+/// The check reads `xcode-select -p` and looks for `usr/bin/git` in that
+/// directory; it never runs `/usr/bin/git`, whose shim opens an install dialog.
+/// Other targets pass untouched.
+///
+/// # Errors
+/// Fails with [`ToolRuntimeError::CommandLineToolsMissing`] when the tools are
+/// absent, or with the transport's error when the check cannot run.
+pub async fn ensure_command_line_tools(
+    transport: &impl ToolTransport,
+    target: &ToolTarget,
+) -> Result<(), ToolRuntimeError> {
+    if target.os() != "macos" {
+        return Ok(());
+    }
+    let output = transport
+        .run(include_str!("../templates/clt_check.sh"), None)
+        .await?;
+    match output.status.code() {
+        Some(0) => Ok(()),
+        Some(CLT_MISSING_STATUS) => Err(ToolRuntimeError::CommandLineToolsMissing),
+        status => Err(ToolRuntimeError::InitializationCommand {
+            status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }),
+    }
+}
+
 /// Platform information from the target execution environment.
 #[derive(Debug, Clone)]
 pub struct ToolEnvironmentInfo {
@@ -556,5 +600,93 @@ mod tests {
         )
         .await;
         assert_eq!(first.unwrap().bin_dir(), second.unwrap().bin_dir());
+    }
+
+    /// Answers the probe with fixed stdout, as an SSH host would.
+    struct CannedTransport(&'static str);
+
+    impl ToolTransport for CannedTransport {
+        fn run(
+            &self,
+            _script: &str,
+            _input: Option<Vec<u8>>,
+        ) -> impl Future<Output = Result<Output, ToolRuntimeError>> + Send {
+            use std::os::unix::process::ExitStatusExt;
+            std::future::ready(Ok(Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: self.0.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_parses_a_macos_host() {
+        let info = probe_tool_environment(&CannedTransport("Darwin\narm64\n/Users/dev\n"))
+            .await
+            .unwrap();
+        assert_eq!(info.target.os(), "macos");
+        assert_eq!(info.target.arch(), "aarch64");
+        assert_eq!(
+            info.cache_root,
+            PathBuf::from("/Users/dev/.cache/aither/tools")
+        );
+    }
+
+    #[tokio::test]
+    async fn clt_check_skips_other_targets() {
+        struct Unreachable;
+        impl ToolTransport for Unreachable {
+            async fn run(
+                &self,
+                _script: &str,
+                _input: Option<Vec<u8>>,
+            ) -> Result<Output, ToolRuntimeError> {
+                panic!("the check must not run on a non-macOS target");
+            }
+        }
+        let target = ToolTarget::from_probe("Linux", "x86_64").unwrap();
+        ensure_command_line_tools(&Unreachable, &target)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn clt_check_passes_with_the_installed_tools() {
+        ensure_command_line_tools(&LocalToolTransport, &ToolTarget::native().unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// Runs the check with `DEVELOPER_DIR` set for that child only.
+    #[cfg(target_os = "macos")]
+    struct DeveloperDirTransport(PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl ToolTransport for DeveloperDirTransport {
+        async fn run(
+            &self,
+            script: &str,
+            input: Option<Vec<u8>>,
+        ) -> Result<Output, ToolRuntimeError> {
+            let mut command = async_process::Command::new("sh");
+            command.args(["-c", script]).env("DEVELOPER_DIR", &self.0);
+            run_command(command, input).await
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn clt_check_fails_on_an_empty_developer_dir() {
+        let empty = tempfile::tempdir().unwrap();
+        let error = ensure_command_line_tools(
+            &DeveloperDirTransport(empty.path().to_path_buf()),
+            &ToolTarget::native().unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolRuntimeError::CommandLineToolsMissing));
+        assert!(error.to_string().contains("xcode-select --install"));
     }
 }

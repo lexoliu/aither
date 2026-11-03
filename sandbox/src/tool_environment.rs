@@ -11,7 +11,10 @@ use crate::tool_distribution::ToolDistribution;
 use crate::tool_runtime::{
     PreparedEnvironment, PreparedTools, ToolCatalog, ToolRuntimeError, ToolTarget,
 };
-use crate::tool_transport::{ContainerToolTransport, SshToolTransport, probe_tool_environment};
+use crate::tool_transport::{
+    ContainerToolTransport, LocalToolTransport, SshToolTransport, ensure_command_line_tools,
+    probe_tool_environment,
+};
 
 /// The home backend's tools, typed by where that backend sees them.
 #[derive(Debug, Clone)]
@@ -82,8 +85,10 @@ impl ShellSessionRegistry {
                     tools,
                 }))
             } else if availability.local {
+                let target = ToolTarget::native()?;
+                ensure_command_line_tools(&LocalToolTransport, &target).await?;
                 let bundle = distribution
-                    .load(&ToolTarget::native()?, &cache_root.join("artifacts"))
+                    .load(&target, &cache_root.join("artifacts"))
                     .await?;
                 let tools = bundle.prepare_local(&cache_root.join("runtimes")).await?;
                 Ok(Some(PreparedHome::Local(tools)))
@@ -103,6 +108,7 @@ impl ShellSessionRegistry {
                         let runtime = bootstrap_ssh_runtime(&server.target, &authorizer).await.map_err(|error| ToolRuntimeError::SshBootstrap(error.to_string()))?;
                         let transport = SshToolTransport::new(server.clone());
                         let info = probe_tool_environment(&transport).await?;
+                        ensure_command_line_tools(&transport, &info.target).await?;
                         let bundle = distribution.load(&info.target, &cache_root.join("artifacts")).await?;
                         let tools = bundle.prepare_remote(&transport, &info.cache_root, || async {
                             let authorizer = authorizer.as_ref().ok_or_else(|| ToolRuntimeError::InstallDenied(server.target.clone()))?;
