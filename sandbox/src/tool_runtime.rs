@@ -877,12 +877,19 @@ impl std::fmt::Display for PreparedEnvironment {
     }
 }
 
+#[derive(Template)]
+#[template(path = "command_line_tools_missing.txt", escape = "none")]
+struct CommandLineToolsMissingNotice;
+
 /// Fail-closed errors from tool initialization and shell integration.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolRuntimeError {
     /// Configured container has no execution transport.
     #[error("container runtime is not configured")]
     MissingContainerRuntime,
+    /// A macOS host has no Command Line Tools to provide `git`.
+    #[error("{}", CommandLineToolsMissingNotice)]
+    CommandLineToolsMissing,
     /// Environments resolved different command versions.
     #[error("prepared tool catalogs differ between environments")]
     CatalogMismatch,
