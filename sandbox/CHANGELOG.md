@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/May-Agent/aither/compare/sandbox-v0.12.0...sandbox-v0.13.0) - 2026-11-03
+
+### Added
+
+- *(sandbox)* command results state the outages they ran through
+
+### Other
+
+- *(sandbox)* accept every name the env-cleaned setsid command can be killed under
+- Merge remote-tracking branch 'origin/main' into chore/merge-main-into-dev-0.12
+
 ## [0.12.0](https://github.com/May-Agent/aither/compare/sandbox-v0.11.0...sandbox-v0.12.0) - 2026-11-03
 
 ### Added
