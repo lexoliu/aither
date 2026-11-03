@@ -68,7 +68,7 @@ If multiple skills apply, use the minimal set that fully covers the request.
 
 <output-storage>
 Large outputs and compaction outputs are stored as files.
-Use `head`, `tail`, `grep`, or `ask` to process stored outputs:
+Use `head`, `tail`, `rg`, or `ask` to process stored outputs:
 `cat /path/to/output.txt | ask "summarize"`
 </output-storage>
 

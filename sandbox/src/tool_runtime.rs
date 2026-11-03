@@ -1252,12 +1252,77 @@ impl PreparedTools<ContainerPath> {
     }
 }
 
+/// Host commands a script must not call, each with what to use instead.
+const BLOCKED_COMMANDS: [(&str, &str); 4] = [
+    ("grep", "`rg`"),
+    (
+        "sed",
+        "`apply_patch` to edit files or `python3` to process text",
+    ),
+    ("awk", "`python3` or `jq`"),
+    ("find", "`fd`"),
+];
+
+/// Whether `command` is one the managed shell refuses in a script.
+pub fn is_blocked_command(command: &str) -> bool {
+    BLOCKED_COMMANDS.iter().any(|(name, _)| *name == command)
+}
+
+#[derive(Template)]
+#[template(path = "blocked_command.txt", escape = "none")]
+struct BlockedCommandTemplate<'a> {
+    name: &'a str,
+    replacement: &'a str,
+}
+
+struct BlockedCommandFunction {
+    name: &'static str,
+    message: String,
+}
+
+#[derive(Template)]
+#[template(path = "blocked_commands.sh", escape = "none")]
+struct BlockedCommandsTemplate<'a> {
+    commands: Vec<BlockedCommandFunction>,
+    script: &'a str,
+}
+
+/// `script` behind shell functions that make the blocked commands fail with a
+/// message naming their replacement. They are not exported, so only the
+/// script's own shell sees them: child processes still reach the host
+/// programs.
+fn with_blocked_commands(script: &str) -> String {
+    BlockedCommandsTemplate {
+        script,
+        commands: BLOCKED_COMMANDS
+            .iter()
+            .map(|&(name, replacement)| {
+                let message = BlockedCommandTemplate { name, replacement }
+                    .render()
+                    .expect("the blocked command message is a static template");
+                BlockedCommandFunction {
+                    name,
+                    message: shell_words::quote(&message).into_owned(),
+                }
+            })
+            .collect(),
+    }
+    .render()
+    .expect("the blocked commands preamble is a static template")
+}
+
 /// The arguments with which the managed bash runs `script`: no startup file
-/// is read, so a script behaves the same on every host.
+/// is read, so a script behaves the same on every host, and the blocked
+/// commands are defined ahead of it.
 pub fn shell_arguments(script: &str) -> Vec<String> {
-    ["--noprofile", "--norc", "-c", script]
-        .map(Into::into)
-        .into()
+    [
+        "--noprofile",
+        "--norc",
+        "-c",
+        &with_blocked_commands(script),
+    ]
+    .map(Into::into)
+    .into()
 }
 
 /// Prepends `bin_dir` to a POSIX shell script's `PATH`.
@@ -1608,6 +1673,57 @@ impl std::fmt::Display for ImageToolDefect {
 pub mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[cfg(unix)]
+    fn run_in_shell(script: &str) -> std::process::Output {
+        std::process::Command::new("bash")
+            .args(shell_arguments(script))
+            .output()
+            .expect("bash should run")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_commands_fail_with_their_replacement() {
+        for (name, replacement) in [
+            ("grep", "`rg`"),
+            ("sed", "`apply_patch`"),
+            ("awk", "`jq`"),
+            ("find", "`fd`"),
+        ] {
+            let output = run_in_shell(&format!("{name} x"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{name} should fail");
+            assert!(output.stdout.is_empty(), "{name} should print to stderr");
+            assert!(
+                stderr.contains(&format!("`{name}` is not available")),
+                "{name}: {stderr}"
+            );
+            assert!(stderr.contains(replacement), "{name}: {stderr}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_commands_stay_out_of_child_processes() {
+        let output = run_in_shell("bash -c \"printf 'a\\n' | sed 's/a/b/'\"");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "b\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn make_recipes_reach_the_host_sed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let makefile = directory.path().join("Makefile");
+        std::fs::write(&makefile, "all:\n\t@echo a | sed 's/a/b/'\n").expect("write Makefile");
+        let output = run_in_shell(&format!(
+            "make -f {}",
+            shell_words::quote(&makefile.to_string_lossy())
+        ));
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "b\n");
+    }
 
     #[test]
     fn artifact_digest_matches_known_sha256_vector() {
