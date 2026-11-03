@@ -15,5 +15,6 @@ apply_patch <<'PATCH'
 PATCH
 ```
 {% endif %}{% if self.has("uv") %}`python3` is the managed interpreter; a project's own `.venv` and `.python-version` still decide what `uv run` uses.
+{% endif %}{% if self.has("bash") %}`grep`, `sed`, `awk` and `find` fail in scripts; use `rg`, `apply_patch` or `python3`, `python3` or `jq`, and `fd`.
 {% endif %}Use command `--help` for uncommon options, not to discover these prepared capabilities.
 </prepared_tools>

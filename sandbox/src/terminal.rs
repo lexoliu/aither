@@ -279,7 +279,10 @@ fn direct_command(script: &str) -> Result<Option<(String, Vec<String>)>, Termina
         return Ok(None);
     }
     let (program, args) = parse_direct_command(script)?;
-    if looks_like_env_assignment(&program) || is_shell_builtin(&program) {
+    if looks_like_env_assignment(&program)
+        || is_shell_builtin(&program)
+        || crate::tool_runtime::is_blocked_command(&program)
+    {
         return Ok(None);
     }
     Ok(Some((program, args)))
@@ -6210,11 +6213,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shell_launch_runs_the_managed_bash_without_startup_files() {
-        let script = "printf '%s\\n' hello | sed -n '1p'";
+        let script = "printf '%s\\n' hello | cat";
         let (program, args) = shell_launch("/tools/bin/bash", script);
 
         assert_eq!(program, "/tools/bin/bash");
-        assert_eq!(args, ["--noprofile", "--norc", "-c", script]);
+        assert_eq!(args[..3], ["--noprofile", "--norc", "-c"]);
+        assert!(args[3].ends_with(script));
+        assert_eq!(args.len(), 4);
+    }
+
+    #[test]
+    fn blocked_commands_always_run_in_the_shell() {
+        for name in ["grep", "sed", "awk", "find"] {
+            assert_eq!(direct_command(&format!("{name} x")).unwrap(), None);
+        }
     }
 
     #[test]
