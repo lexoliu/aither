@@ -25,6 +25,14 @@ serde_json = { version = "1.0", default-features = false }
 url = { version = "2.5", default-features = false }
 zenwave = { workspace = true, optional = true, features = ["hyper-backend", "rustls"] }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+async-io = { version = "2.6", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers = { version = "0.4", features = ["futures"], optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+async-channel = { version = "2", optional = true }
+
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread"] }
 tokio-test = "0.4"
@@ -38,6 +46,8 @@ serde = ["serde/derive","url/serde"]
 derive = ["aither-derive"]
 # HTTP failure classification for providers built on zenwave.
 zenwave = ["dep:zenwave", "dep:httpdate"]
+# A runtime-agnostic `time::sleep` that also runs on wasm32.
+timer = ["dep:async-io", "dep:gloo-timers", "dep:wasm-bindgen-futures", "dep:async-channel"]
 
 [lints]
 workspace = true

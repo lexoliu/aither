@@ -12,7 +12,7 @@ keywords = ["ai", "llm", "openai", "chatgpt"]
 categories = ["api-bindings"]
 
 [dependencies]
-aither-core = { workspace = true, features = ["zenwave"] }
+aither-core = { workspace = true, features = ["zenwave", "timer"] }
 aither-models.workspace = true
 aither-attachments.workspace = true
 async-stream = "0.3"
@@ -28,13 +28,7 @@ url = "2"
 zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-async-io = "2"
 async-fs = "2"
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-gloo-timers = { version = "0.4", features = ["futures"] }
-wasm-bindgen-futures = "0.4"
-async-channel = "2"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt"] }

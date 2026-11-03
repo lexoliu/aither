@@ -29,6 +29,11 @@ pub enum ClaudeError {
         /// The API's message.
         message: String,
     },
+    /// The response stream sent nothing for the client's idle timeout.
+    IdleTimeout {
+        /// How long the stream stayed silent.
+        idle: core::time::Duration,
+    },
 }
 
 impl fmt::Display for ClaudeError {
@@ -39,6 +44,9 @@ impl fmt::Display for ClaudeError {
             Self::Stream(err) => write!(f, "SSE error: {err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
             Self::Api(message) | Self::StreamEvent { message, .. } => write!(f, "{message}"),
+            Self::IdleTimeout { idle } => {
+                write!(f, "the response stream was silent for {idle:?}")
+            }
         }
     }
 }
@@ -96,6 +104,7 @@ impl Classify for ClaudeError {
             Self::StreamEvent { error_type, .. } => {
                 Failure::new(kind_of_error_type(error_type).unwrap_or(FailureKind::Permanent))
             }
+            Self::IdleTimeout { .. } => Failure::network(),
             Self::Json(_) | Self::Api(_) => Failure::permanent(),
         }
     }
@@ -223,5 +232,69 @@ mod tests {
             .expect("stream yields")
             .expect_err("connection is refused");
         assert_eq!(error.failure().kind, FailureKind::Network, "{error}");
+    }
+
+    /// A local server that opens an event stream, sends one `ping` and then
+    /// goes silent while keeping the connection open.
+    fn silent_sse_server() -> (u16, std::sync::mpsc::Sender<()>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = connection.read(&mut chunk).unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            connection
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nevent: ping\ndata: {\"type\": \"ping\"}\n\n",
+                )
+                .unwrap();
+            // The connection stays open until the test drops `release`.
+            let _ = held.recv();
+        });
+        (port, release)
+    }
+
+    #[tokio::test]
+    async fn a_silent_stream_ends_with_a_network_failure() {
+        let (port, _release) = silent_sse_server();
+        let client = Claude::builder("key")
+            .base_url(format!("http://127.0.0.1:{port}"))
+            .idle_timeout(Duration::from_millis(300))
+            .build();
+        let stream = client.respond(oneshot("system", "hello"));
+        futures_lite::pin!(stream);
+        let error = stream
+            .next()
+            .await
+            .expect("stream yields")
+            .expect_err("the stream goes silent");
+        assert!(matches!(error, ClaudeError::IdleTimeout { .. }), "{error}");
+        assert_eq!(error.failure().kind, FailureKind::Network);
+        assert!(stream.next().await.is_none(), "the stream ends");
+    }
+
+    #[test]
+    fn the_idle_timeout_defaults_to_ninety_seconds() {
+        assert_eq!(
+            Claude::new("key").config().idle_timeout,
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            Claude::new("key")
+                .with_idle_timeout(Duration::from_secs(5))
+                .config()
+                .idle_timeout,
+            Duration::from_secs(5)
+        );
     }
 }

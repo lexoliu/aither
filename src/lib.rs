@@ -78,6 +78,9 @@ pub use aither_rag as rag;
 #[cfg(feature = "mem0")]
 pub use aither_mem0 as mem0;
 
+#[cfg(feature = "connectivity")]
+pub use aither_connectivity as connectivity;
+
 #[cfg(feature = "skills")]
 pub use aither_skills as skills;
 

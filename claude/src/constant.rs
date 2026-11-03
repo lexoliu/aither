@@ -3,6 +3,14 @@
 /// Base URL for the Anthropic Messages API.
 pub const CLAUDE_BASE_URL: &str = "https://api.anthropic.com";
 
+/// How long a response stream may stay silent before the client gives up on it.
+///
+/// Anthropic interleaves `ping` events with the events of a stream
+/// (<https://docs.anthropic.com/en/docs/build-with-claude/streaming#ping-events>),
+/// but does not document their interval, so this is a conservative bound
+/// rather than a protocol constant.
+pub const DEFAULT_IDLE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(90);
+
 /// Required API version header value.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 

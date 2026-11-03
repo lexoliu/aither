@@ -171,6 +171,8 @@ pub mod embedding;
 /// Contains [`ImageGenerator`] trait for creating images from text.
 pub mod image;
 pub mod llm;
+#[cfg(feature = "timer")]
+pub mod time;
 
 /// Content moderation utilities.
 ///

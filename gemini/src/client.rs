@@ -1,27 +1,7 @@
 use aither_core::llm::Classify;
 use std::time::Duration;
 
-/// Waits out a retry backoff.
-///
-/// wasm32 has no reactor to park on, so the browser timer runs on the JS event
-/// loop and the delay is awaited through a channel — skipping the wait there
-/// would turn exponential backoff into a hot retry loop against a rate-limited
-/// API.
-async fn sleep(duration: Duration) {
-    #[cfg(not(target_arch = "wasm32"))]
-    async_io::Timer::after(duration).await;
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        let millis = u32::try_from(duration.as_millis()).unwrap_or(u32::MAX);
-        let (elapsed_tx, elapsed_rx) = async_channel::bounded::<()>(1);
-        wasm_bindgen_futures::spawn_local(async move {
-            gloo_timers::future::TimeoutFuture::new(millis).await;
-            let _ = elapsed_tx.send(()).await;
-        });
-        let _ = elapsed_rx.recv().await;
-    }
-}
+use aither_core::time::sleep;
 
 use serde::{Deserialize, Serialize};
 use zenwave::{Client, client, header};

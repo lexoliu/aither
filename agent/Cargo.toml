@@ -42,6 +42,7 @@ aither-fs = { workspace = true, optional = true }
 aither-command = { workspace = true, optional = true }
 aither-mcp = { workspace = true, optional = true }
 aither-skills = { workspace = true, optional = true }
+aither-connectivity = { workspace = true, optional = true }
 async-stream = "0.3.6"
 futures = "0.3"
 futures-core = "0.3.34"
@@ -73,6 +74,7 @@ filesystem = ["dep:aither-fs"]
 command = ["dep:aither-command"]
 mcp = ["dep:aither-mcp"]
 skills = ["dep:aither-skills"]
-full = ["websearch", "webfetch", "filesystem", "command", "mcp", "skills"]
+connectivity = ["dep:aither-connectivity"]
+full = ["websearch", "webfetch", "filesystem", "command", "mcp", "skills", "connectivity"]
 [lints]
 workspace = true

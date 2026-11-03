@@ -657,6 +657,10 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// [`Agent::cache_warmth`].
     pub(crate) warmth: crate::CacheWarmth,
 
+    /// Ends a provider stream in flight when the machine wakes or goes
+    /// offline.
+    pub(crate) connectivity: crate::connectivity::Watch,
+
     /// The most recent LLM request issued by this agent, retained so a
     /// prompt-cache keep-alive can re-send it verbatim.
     pub(crate) last_request: Option<LLMRequest>,
@@ -728,6 +732,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             profile: None,
             initialized: false,
             session: SessionPhase::NotStarted,
+            connectivity: crate::connectivity::Watch::default(),
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
@@ -775,9 +780,10 @@ where
         advanced: &'a Arc<Advanced>,
         balanced: &'a Arc<Balanced>,
         fast: &'a Arc<Fast>,
+        connectivity: &crate::connectivity::Watch,
         request: LLMRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<Event, AgentError>> + Send + 'a>> {
-        match tier {
+        let stream: crate::connectivity::EventStream<'a> = match tier {
             ModelTier::Advanced => Box::pin(
                 advanced
                     .respond(request)
@@ -792,7 +798,8 @@ where
                 fast.respond(request)
                     .map(|event| event.map_err(|error| AgentError::from_model_error(&error))),
             ),
-        }
+        };
+        connectivity.guard(stream)
     }
 
     async fn collect_model_turn(
@@ -810,6 +817,7 @@ where
             &self.advanced,
             &self.balanced,
             &self.fast,
+            &self.connectivity,
             request,
         );
         futures_lite::pin!(stream);
@@ -1470,6 +1478,7 @@ where
             &self.advanced,
             &self.balanced,
             &self.fast,
+            &self.connectivity,
             request,
         );
         futures_lite::pin!(stream);

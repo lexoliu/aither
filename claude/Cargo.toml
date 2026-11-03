@@ -12,7 +12,7 @@ keywords = ["ai", "llm", "claude", "anthropic"]
 categories = ["api-bindings"]
 
 [dependencies]
-aither-core = { workspace = true, features = ["zenwave"] }
+aither-core = { workspace = true, features = ["zenwave", "timer"] }
 aither-models.workspace = true
 async-stream = "0.3"
 base64 = "0.23"

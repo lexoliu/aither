@@ -14,6 +14,7 @@ use crate::{
         ResponsesStreamEvent, ResponsesUsage, should_skip_event,
     },
 };
+use aither_core::time::sleep;
 use aither_core::{
     LanguageModel,
     llm::{
@@ -91,18 +92,6 @@ fn get_retry_delay(err: &OpenAIError, attempt: u32, config: &RetryConfig) -> Dur
     config.delay_for_attempt(attempt)
 }
 
-/// Sleep for the given duration (runtime-agnostic).
-async fn sleep(duration: Duration) {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        async_io::Timer::after(duration).await;
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = duration;
-    }
-}
-
 fn map_zenwave_error(error: zenwave::Error) -> OpenAIError {
     if matches!(error, zenwave::Error::Timeout) {
         OpenAIError::Timeout
@@ -115,40 +104,14 @@ async fn request_with_timeout<T>(
     timeout: Duration,
     fut: impl Future<Output = Result<T, zenwave::Error>>,
 ) -> Result<T, OpenAIError> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        futures_lite::future::or(
-            async move { fut.await.map_err(map_zenwave_error) },
-            async move {
-                async_io::Timer::after(timeout).await;
-                Err(OpenAIError::Timeout)
-            },
-        )
-        .await
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        // The browser timer is not `Send`, and `LanguageModel` requires the
-        // futures built on top of this one to be. Run the timer on the JS event
-        // loop where it belongs and wait on a channel, which is `Send`.
-        let millis = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-        let (expired_tx, expired_rx) = async_channel::bounded::<()>(1);
-        wasm_bindgen_futures::spawn_local(async move {
-            gloo_timers::future::TimeoutFuture::new(millis).await;
-            let _ = expired_tx.send(()).await;
-        });
-
-        futures_lite::future::or(
-            async move { fut.await.map_err(map_zenwave_error) },
-            async move {
-                // A closed channel means the timer task was dropped, which can
-                // only happen once the whole request is being torn down.
-                let _ = expired_rx.recv().await;
-                Err(OpenAIError::Timeout)
-            },
-        )
-        .await
-    }
+    futures_lite::future::or(
+        async move { fut.await.map_err(map_zenwave_error) },
+        async move {
+            sleep(timeout).await;
+            Err(OpenAIError::Timeout)
+        },
+    )
+    .await
 }
 
 /// Result of attempting to establish an SSE stream.

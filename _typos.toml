@@ -14,3 +14,5 @@ extend-ignore-re = [
 # the test exists to cover.
 [default.extend-words]
 paht = "paht"
+# `Oif` is netlink-packet-route's output-interface route attribute (RTA_OIF).
+Oif = "Oif"
