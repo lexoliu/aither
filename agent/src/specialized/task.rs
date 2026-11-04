@@ -4020,6 +4020,7 @@ mod tests {
                 )
                 .agent_kind(crate::AgentKind::Chatbot)
                 .dyn_terminal(self.terminal.clone().to_dyn())
+                .compact_tool()
                 .tool(aither_sandbox::builtin::KillTerminalTool::new(jobs.clone()))
                 .tool(aither_sandbox::builtin::InputTerminalTool::new(
                     jobs.clone(),
@@ -4124,6 +4125,82 @@ mod tests {
             first.parameters().cache.openai,
             last_main.parameters().cache.openai,
             "the fork reads the main agent's cache"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fork_calling_compact_compacts_itself_and_leaves_the_main_agent_alone() {
+        use crate::compact_tool::CompactRequest;
+
+        let fixture = ForkFixture::new().await;
+        let (seen_tx, seen_rx) = async_channel::unbounded();
+        let main = ScriptedLlm::new("main", &seen_tx);
+        main.then([vec![Event::Text("main answer".to_string())]]);
+        let tool = fixture.tool(&main, &seen_tx);
+        let mut agent = fixture.main_agent(
+            main.clone(),
+            tool.fork_source(),
+            crate::ContextPolicy {
+                compaction_floor: 0,
+                ..crate::ContextPolicy::default()
+            },
+        );
+        agent.query("look into it").await.expect("main run");
+        drain(&seen_rx);
+
+        main.then([
+            vec![Event::ToolCall(aither_core::llm::ToolCall::new(
+                "call-1",
+                "compact",
+                serde_json::json!({}),
+            ))],
+            vec![Event::ToolCall(aither_core::llm::ToolCall::new(
+                "call-2",
+                "compact",
+                serde_json::json!({}),
+            ))],
+            vec![Event::Text("fork answer".to_string())],
+        ]);
+        let (dir, args) = start_fork("fork-compact");
+        Tool::call(&tool, args, ToolContext::new())
+            .await
+            .expect("fork call");
+
+        let requests = drain(&seen_rx);
+        let turns: Vec<_> = requests
+            .iter()
+            .filter(|(_, request)| !request.parameters().structured_outputs)
+            .collect();
+        let [_, (_, after_first), (_, after_second)] = turns.as_slice() else {
+            panic!("the fork sent three turns, got {}", turns.len());
+        };
+        let results = |request: &LLMRequest| {
+            request
+                .messages()
+                .iter()
+                .map(|message| message.content().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            results(after_first).contains("Compaction started"),
+            "the first call started a compaction, not refused: {}",
+            results(after_first)
+        );
+        assert!(
+            results(after_second).contains("Nothing was started")
+                || results(after_second).contains("nothing was started"),
+            "the second call found the fork's own compaction: {}",
+            results(after_second)
+        );
+
+        let signal = agent.compact_signal.as_ref().expect("main has the tool");
+        assert_eq!(
+            signal.request(),
+            CompactRequest::Started,
+            "the main agent's compaction state is untouched"
         );
 
         let _ = std::fs::remove_dir_all(dir);

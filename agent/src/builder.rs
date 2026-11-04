@@ -403,7 +403,8 @@ where
     ///
     /// The tools run in `terminal`, the fork's own terminal. A tool of the
     /// main agent that `terminal` does not provide stays in the definitions,
-    /// to keep the request identical, and refuses when called.
+    /// to keep the request identical, and refuses when called. The exception
+    /// is `compact`, which compacts the fork through a signal of its own.
     pub fn forked_from(
         mut self,
         fork: &crate::fork::ForkSnapshot,
@@ -424,7 +425,14 @@ where
         // subagent, not the main agent's it inherited the context of.
         self.restore_dir = Some(terminal.working_dir().clone());
         self.sandbox_dir = Some(terminal.working_dir().clone());
-        self.tools = AgentTools::forked(&fork.definitions, terminal);
+        // The inherited `compact` definition runs over the fork's own
+        // signal, so a call compacts the fork, never the main agent.
+        self.compact_signal = fork
+            .definitions
+            .iter()
+            .any(|definition| definition.name() == crate::compact_tool::COMPACT_TOOL_NAME)
+            .then(std::sync::Arc::default);
+        self.tools = AgentTools::forked(&fork.definitions, terminal, self.compact_signal.as_ref());
         self
     }
 
