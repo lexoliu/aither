@@ -92,6 +92,9 @@ struct JobState {
     /// job's own flow reports meanwhile waits in `deferred_end`.
     kills_in_flight: usize,
     deferred_end: Option<Ending>,
+    /// Callers of `get_by_task_id_settled` parked until the last kill in
+    /// flight records its outcome.
+    settled_waiters: Vec<Sender<Option<JobInfo>>>,
     output_redirect: Option<async_fs::File>,
     finished_at: Option<Instant>,
 }
@@ -149,6 +152,10 @@ enum JobRequest {
         reply: Sender<Option<JobInfo>>,
     },
     GetByTaskId {
+        task_id: String,
+        reply: Sender<Option<JobInfo>>,
+    },
+    GetByTaskIdSettled {
         task_id: String,
         reply: Sender<Option<JobInfo>>,
     },
@@ -578,6 +585,20 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
+    /// Gets information about a job by its task ID once no kill of it is in
+    /// flight. A job whose process has exited from a kill's signal still reads
+    /// `Running` until the kill records its outcome; this waits for that
+    /// outcome, so the status it returns is the job's real ending.
+    pub async fn get_by_task_id_settled(&self, task_id: &str) -> Option<JobInfo> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::GetByTaskIdSettled {
+            task_id: task_id.to_string(),
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
     /// Kills a running job by its PID.
     pub async fn kill(&self, pid: u32) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
@@ -791,6 +812,9 @@ async fn handle_job_request(
                 .map(|state| state.info.clone());
             let _ = reply.send(item).await;
         }
+        JobRequest::GetByTaskIdSettled { task_id, reply } => {
+            get_settled_by_task_id(jobs, &task_id, reply).await;
+        }
         JobRequest::BeginKill { pid, reply } => {
             let plan = begin_kill(jobs, pid).await;
             let _ = reply.send(plan).await;
@@ -811,6 +835,7 @@ async fn handle_job_request(
         }
         JobRequest::EndKill { pid, killed, reply } => {
             let result = end_kill(jobs, pid, killed).await;
+            release_settled_waiters(jobs, pid).await;
             let _ = reply.send(result).await;
         }
         JobRequest::InputTerminal {
@@ -921,6 +946,7 @@ impl JobState {
             process_tree: None,
             kills_in_flight: 0,
             deferred_end: None,
+            settled_waiters: Vec::new(),
             output_redirect: None,
             finished_at: None,
         }
@@ -1295,6 +1321,36 @@ async fn end_kill(jobs: &mut HashMap<u32, JobState>, pid: u32, killed: bool) -> 
         None => {}
     }
     false
+}
+
+/// Answers a settled read at once, or parks it while a kill of the job runs.
+async fn get_settled_by_task_id(
+    jobs: &mut HashMap<u32, JobState>,
+    task_id: &str,
+    reply: Sender<Option<JobInfo>>,
+) {
+    match find_pid_by_task_id(jobs, task_id).and_then(|pid| jobs.get_mut(&pid)) {
+        Some(job) if job.kills_in_flight > 0 => job.settled_waiters.push(reply),
+        Some(job) => {
+            let _ = reply.send(Some(job.info.clone())).await;
+        }
+        None => {
+            let _ = reply.send(None).await;
+        }
+    }
+}
+
+/// Answers the callers parked on a job once its last kill in flight ended.
+async fn release_settled_waiters(jobs: &mut HashMap<u32, JobState>, pid: u32) {
+    let Some(job) = jobs.get_mut(&pid) else {
+        return;
+    };
+    if job.kills_in_flight > 0 {
+        return;
+    }
+    for waiter in std::mem::take(&mut job.settled_waiters) {
+        let _ = waiter.send(Some(job.info.clone())).await;
+    }
 }
 
 /// The bytes of a script a running-jobs line shows.
@@ -1720,5 +1776,61 @@ mod tests {
         complete_job(&mut jobs, 8, 0, None).await;
         assert!(end_kill(&mut jobs, 8, true).await);
         assert_eq!(jobs[&8].info.status, JobStatus::Killed);
+    }
+
+    /// A job whose process exited from a kill's signal reads as running until
+    /// the kill records its outcome; the settled read waits for it.
+    #[tokio::test]
+    async fn the_settled_read_waits_for_a_kill_in_flight() {
+        let (registry, service) = job_registry_channel();
+        TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
+        registry
+            .register(
+                557,
+                "task-settled",
+                "exec-settled",
+                "sleep 10",
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        registry
+            .send_command(JobRequest::BeginKill {
+                pid: 557,
+                reply: reply_tx,
+            })
+            .await;
+        let plan = JobRegistry::recv_reply(reply_rx).await;
+        assert!(matches!(plan, KillPlan::Group(557)));
+        // The killed process exits and its flow reports completion while the
+        // kill has not returned.
+        registry.complete(557, 137, None).await;
+        let running = registry.get_by_task_id("task-settled").await;
+        assert!(matches!(
+            running.expect("job should exist").status,
+            JobStatus::Running
+        ));
+
+        let waiting = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.get_by_task_id_settled("task-settled").await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "the kill is still in flight");
+
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        registry
+            .send_command(JobRequest::EndKill {
+                pid: 557,
+                killed: true,
+                reply: reply_tx,
+            })
+            .await;
+        assert!(JobRegistry::recv_reply(reply_rx).await);
+        let job = waiting.await.unwrap().expect("job should exist");
+        assert!(matches!(job.status, JobStatus::Killed));
     }
 }
