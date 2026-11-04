@@ -1,0 +1,1 @@
+Its {{ timeout.as_secs() }}s timeout bound passed; it started at {{ started_utc() }} and was killed at {{ killed_utc() }}.

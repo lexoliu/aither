@@ -286,7 +286,7 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
             format!("{description}\n\n{}", schema_to_help(&schema))
         };
 
-        registry.configure_raw_handler(name, help, move |args| {
+        registry.configure_raw_handler(name, help, move |_call, args| {
             let conn = conn.clone();
             let tool_name = tool_name.clone();
             let schema = schema.clone();
@@ -370,10 +370,6 @@ struct Args {
     /// Path to skills directory. Skills are loaded from SKILL.md files in subdirectories.
     #[arg(long)]
     skills: Option<PathBuf>,
-
-    /// Path to subagents directory. Subagents are markdown files invoked via `subagent start --subagent <path> --prompt-file <file>`.
-    #[arg(long)]
-    subagents: Option<PathBuf>,
 
     /// Run as ACP server (for integration with Zed and other editors).
     #[arg(long)]
@@ -521,22 +517,6 @@ async fn build_agent(
         }
     }
 
-    // Set up subagents directory if path provided
-    if let Some(ref subagents_path) = args.subagents {
-        let expanded = expand_tilde(subagents_path);
-        if path_exists(&expanded).await? {
-            builder = builder.with_subagents(&expanded).await?;
-            if !args.quiet {
-                println!("Subagents directory: {}", expanded.display());
-            }
-        } else if !args.quiet {
-            eprintln!(
-                "Warning: Subagents directory not found: {}",
-                expanded.display()
-            );
-        }
-    }
-
     // Add Context7 MCP server by default (documentation lookup)
     if !args.no_context7 {
         match McpConnection::http("https://mcp.context7.com/mcp").await {
@@ -582,22 +562,21 @@ async fn build_agent(
         }
     }
 
-    // Create SubagentTool and register as a terminal IPC command
-    // Set base_dir to sandbox directory so paths like .subagents/ resolve correctly
-    // Every terminal, a subagent's included, gets its own `subagent` command,
-    // which launches with that terminal's authority.
-    let subagent_tool = SubagentTool::new(cloud)
-        .with_builtins()
-        .with_base_dir(builder.sandbox_dir().to_string());
-    let subagent_desc = format_subagent_description(&subagent_tool);
-    // The agent publishes each request here so a `fork` subagent can start
-    // from it.
-    builder = builder.fork_source(subagent_tool.fork_source());
-    builder = builder.terminal_bound_tool_with_desc(
-        "subagent",
-        move |binding| subagent_tool.for_terminal(binding),
-        subagent_desc,
-    );
+    // The bundled subagents are kept in the global subagents directory,
+    // overwritten so they match this build; only the main agent gets the
+    // `subagent` command.
+    let global_subagents = workdir_parent.join("subagents");
+    aither_agent::install_bundled_subagents(&global_subagents)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to install the bundled subagents into {}",
+                global_subagents.display()
+            )
+        })?;
+    let subagent_tool =
+        SubagentTool::new(cloud, global_subagents).with_base_dir(builder.sandbox_dir().to_string());
+    builder = builder.subagents(subagent_tool, SUBAGENT_DESCRIPTION);
 
     // Add system prompt
     let builder = if let Some(ref system) = args.system {
@@ -609,19 +588,8 @@ async fn build_agent(
     Ok(builder.hook(DebugHook).build())
 }
 
-fn format_subagent_description(subagent_tool: &SubagentTool<CloudProvider>) -> String {
-    let mut subagent_desc = String::from(
-        "Spawn or continue a subagent for complex tasks. The prompt must be a path to a prompt file, not inline text. (types: ",
-    );
-    let subagent_names = subagent_tool
-        .type_descriptions()
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>();
-    subagent_desc.push_str(&subagent_names.join(", "));
-    subagent_desc.push(')');
-    subagent_desc
-}
+/// What the `subagent` command is for, as the main agent reads it.
+const SUBAGENT_DESCRIPTION: &str = "Run a named subagent, fork your context, or continue a finished subagent; `subagent` alone lists the names. The brief is a path to a file you wrote, not inline text.";
 
 /// Run a single prompt and exit (headless mode).
 async fn run_headless(cloud: CloudProvider, args: &Args, prompt: &str) -> Result<()> {

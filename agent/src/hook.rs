@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use aither_core::llm::ToolResult;
+use aither_core::llm::{CallIdentity, ToolResult};
 
 use crate::external_hook::{InjectedContext, LifecyclePayload};
 use crate::{ContextCheckpoint, context_window::ContextWindowSnapshot};
@@ -32,6 +32,8 @@ use crate::{ContextCheckpoint, context_window::ContextWindowSnapshot};
 /// Context provided to hooks before a tool is called.
 #[derive(Debug)]
 pub struct ToolUseContext<'a> {
+    /// The id of this call and the agent making it.
+    pub call: &'a CallIdentity,
     /// Name of the tool being called.
     pub tool_name: &'a str,
     /// JSON-encoded arguments.
@@ -362,10 +364,19 @@ mod tests {
         }
     }
 
+    fn test_call() -> CallIdentity {
+        CallIdentity::new(
+            aither_core::llm::ToolCallId::new("call_1"),
+            aither_core::llm::AgentIdentity::Main,
+        )
+    }
+
     #[tokio::test]
     async fn test_unit_hook() {
         let hook = ();
+        let call = test_call();
         let ctx = ToolUseContext {
+            call: &call,
             tool_name: "test",
             arguments: "{}",
             turn: 0,
@@ -379,7 +390,9 @@ mod tests {
     async fn test_hcons_chain() {
         let chain = HCons::new(CountingHook::new(), HCons::new(CountingHook::new(), ()));
 
+        let call = test_call();
         let ctx = ToolUseContext {
+            call: &call,
             tool_name: "test",
             arguments: "{}",
             turn: 0,
