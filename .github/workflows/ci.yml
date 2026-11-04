@@ -330,6 +330,36 @@ jobs:
           terminal::tests::container_command_runs_with_configured_nice_and_reaches_ipc
           -- --exact --nocapture
 
+  # Runs sandbox/templates/verify_baseline_tools.sh through the real sandboxed
+  # terminal against real managed tools. The manifest is this change's
+  # third-party tools plus the aither-built tools of the latest patch release,
+  # which exist nowhere else.
+  verify-tools:
+    name: Verify Tools (${{ matrix.os }})
+    needs: scope
+    if: needs.scope.outputs.sandbox == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          shared-key: ci-verify-tools
+      - uses: ./.github/actions/install-heel
+      - name: Compose the manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: patch/compose-verify-manifest.sh "${GITHUB_REPOSITORY}" "${RUNNER_TEMP}/manifest.json"
+      - run: >
+          cargo run --locked -p aither-sandbox --example verify_tools --
+          "${RUNNER_TEMP}/manifest.json" "${RUNNER_TEMP}/tool-cache" "${RUNNER_TEMP}/workspace"
+
   # `cargo hack` expands both flags into one `cargo check` per feature
   # combination, and over a 25-crate workspace that list cannot finish inside
   # one job's timeout — every run was being cancelled at 45 minutes.
