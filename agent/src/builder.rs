@@ -86,6 +86,8 @@ pub struct AgentBuilder<
     restore_dir: Option<std::path::PathBuf>,
     /// Where the built agent publishes each request for a fork to start from.
     fork_source: Option<crate::fork::ForkSource>,
+    /// Who the built agent's tool calls are made by.
+    identity: aither_core::llm::AgentIdentity,
     /// The window state a fork inherits, which replaces initialization.
     inherited: Option<Inherited>,
     #[cfg(feature = "skills")]
@@ -136,6 +138,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             blocker_resolver: None,
             restore_dir: None,
             fork_source: None,
+            identity: aither_core::llm::AgentIdentity::Main,
             inherited: None,
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -180,6 +183,7 @@ where
             blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
+            identity: self.identity,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
@@ -215,6 +219,7 @@ where
             blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
+            identity: self.identity,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
@@ -254,6 +259,7 @@ where
             blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
+            identity: self.identity,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
@@ -341,6 +347,14 @@ where
         self
     }
 
+    /// Sets the identity every tool call of the built agent carries as the
+    /// agent making it. An agent is the main agent unless a subagent tool
+    /// builds it as a subagent.
+    pub fn identity(mut self, identity: aither_core::llm::AgentIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
     /// Publishes every request the built agent sends to `source`, which is
     /// where the `fork` subagent kind starts from.
     ///
@@ -423,6 +437,7 @@ where
             blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
+            identity: self.identity,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
@@ -813,6 +828,7 @@ where
             blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
+            identity: self.identity,
             connectivity: self.connectivity,
             last_request: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
