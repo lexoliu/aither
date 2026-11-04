@@ -967,19 +967,19 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         self
     }
 
-    /// The directory of the calling terminal, or the base directory of a
-    /// tool bound to none: grants, prompt paths and `agents/` resolve
-    /// against it.
-    fn caller_dir(&self) -> Option<&Path> {
-        self.binding
-            .as_ref()
-            .map(TerminalBinding::working_dir)
+    /// The directory grants, prompt paths and `agents/` resolve against: the
+    /// directory the calling process was in when it ran the command, else
+    /// the starting directory of the calling terminal, else the base
+    /// directory of a tool bound to none.
+    fn caller_dir<'a>(&'a self, requested: Option<&'a Path>) -> Option<&'a Path> {
+        requested
+            .or_else(|| self.binding.as_ref().map(TerminalBinding::working_dir))
             .or(self.base_dir.as_deref())
     }
 
-    /// Where a subagent name resolves.
-    fn lookup(&self) -> anyhow::Result<SubagentLookup<'_>> {
-        let working_dir = self.caller_dir().ok_or_else(|| {
+    /// Where a subagent name resolves for a call made from `requested`.
+    fn lookup<'a>(&'a self, requested: Option<&'a Path>) -> anyhow::Result<SubagentLookup<'a>> {
+        let working_dir = self.caller_dir(requested).ok_or_else(|| {
             anyhow::anyhow!(
                 "the subagent tool is bound to no terminal and has no base directory, so it has no `{}/` to look subagents up in",
                 crate::LOCAL_SUBAGENTS_DIR
@@ -993,7 +993,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
 
     /// The names a call can run, as a call that does not parse lists them.
     async fn usage_text(&self) -> String {
-        let lookup = match self.lookup() {
+        let lookup = match self.lookup(None) {
             Ok(lookup) => lookup,
             Err(error) => return error.to_string(),
         };
@@ -1011,13 +1011,12 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         .expect("subagent usage template must render")
     }
 
-    fn effective_mounts(&self) -> Vec<SubagentFileMount> {
-        // A relative path names a file in the calling terminal's working
-        // directory first: a subagent writes its prompts in its own space.
-        let caller = self
-            .binding
-            .as_ref()
-            .map(TerminalBinding::working_dir)
+    fn effective_mounts(&self, requested: Option<&Path>) -> Vec<SubagentFileMount> {
+        // A relative path names a file in the directory the calling process
+        // was in first, else in the calling terminal's working directory: a
+        // subagent writes its prompts in its own space.
+        let caller = requested
+            .or_else(|| self.binding.as_ref().map(TerminalBinding::working_dir))
             .filter(|working_dir| self.base_dir.as_deref() != Some(*working_dir))
             .map(|working_dir| SubagentFileMount::new(PathBuf::from("."), working_dir));
         if !self.mounts.is_empty() {
@@ -1200,9 +1199,13 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
     ///
     /// The prompt is always a file: inline text fails path resolution, and a
     /// missing or empty file is an error.
-    async fn read_prompt(&self, prompt_file: &str) -> anyhow::Result<String> {
+    async fn read_prompt(
+        &self,
+        prompt_file: &str,
+        requested: Option<&Path>,
+    ) -> anyhow::Result<String> {
         let resolved = Self::resolve_subagent_path(
-            &self.effective_mounts(),
+            &self.effective_mounts(requested),
             self.base_dir.as_deref(),
             Path::new(prompt_file),
         )
@@ -1233,8 +1236,9 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         &self,
         name: &str,
         grant: Requested<'_>,
+        requested: Option<&Path>,
     ) -> anyhow::Result<Resolved<'_, LLM>> {
-        let definition = self.lookup()?.resolve(name).await?;
+        let definition = self.lookup(requested)?.resolve(name).await?;
         if definition.access == SubagentAccess::ReadOnly && !grant.is_empty() {
             anyhow::bail!(
                 "subagent '{name}' is read-only: it writes only its own working directory and takes no `--worktrees` or `--commit-worktrees`"
@@ -1308,6 +1312,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         &self,
         subagent_id: &str,
         requested: Requested<'_>,
+        caller: Option<&Path>,
     ) -> anyhow::Result<FinishedSubagent<LLM>> {
         let backend = &self
             .externals
@@ -1324,7 +1329,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                 }
             })?
             .backend;
-        let working_dir = self.caller_dir().ok_or_else(|| {
+        let working_dir = self.caller_dir(caller).ok_or_else(|| {
             anyhow::anyhow!(
                 "external agent '{subagent_id}' needs a working directory: the tool is bound to no terminal and has no base directory"
             )
@@ -1484,6 +1489,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         call: Call<'_>,
         prompt: &str,
         started_by: Option<&CallIdentity>,
+        caller: Option<&Path>,
     ) -> anyhow::Result<(FinishedSubagent<LLM>, Option<u64>)> {
         let (resolved, grant) = match call {
             Call::Resume { id } => {
@@ -1492,7 +1498,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                 return Ok((*finished, Some(id)));
             }
             Call::External { agent, grant } => {
-                return Ok((self.start_external(agent, grant).await?, None));
+                return Ok((self.start_external(agent, grant, caller).await?, None));
             }
             Call::Fork { grant } => (
                 Resolved {
@@ -1502,9 +1508,9 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                 },
                 grant,
             ),
-            Call::Named { name, grant } => (self.named_source(name, grant).await?, grant),
+            Call::Named { name, grant } => (self.named_source(name, grant, caller).await?, grant),
         };
-        let grant = grant.grant(self.caller_dir());
+        let grant = grant.grant(self.caller_dir(caller));
         Ok((
             self.start_agent(resolved, grant, prompt, started_by)
                 .await?,
@@ -1660,9 +1666,11 @@ where
     async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
         let call = args.call()?;
         // The task prompt comes from a file; inline prompt text is rejected.
-        let prompt = self.read_prompt(args.prompt_file()).await?;
+        // Relative paths and `agents/` resolve where the calling process was.
+        let caller = cx.working_dir().map(Path::new);
+        let prompt = self.read_prompt(args.prompt_file(), caller).await?;
 
-        let (finished, resumed) = self.acquire(call, &prompt, cx.identity()).await?;
+        let (finished, resumed) = self.acquire(call, &prompt, cx.identity(), caller).await?;
         let (
             FinishedSubagent {
                 subagent: subagent_id,
@@ -2238,7 +2246,7 @@ mod tests {
             SubagentFileMount::new(".skills", skills_root.clone()),
         ]);
         let resolved = SubagentTool::<()>::resolve_subagent_path(
-            &tool.effective_mounts(),
+            &tool.effective_mounts(None),
             tool.base_dir.as_deref(),
             Path::new(".skills/slide/SKILL.md"),
         )
@@ -2256,7 +2264,7 @@ mod tests {
             .with_file_mounts([SubagentFileMount::new("skills", root.join("skills"))]);
 
         let error = SubagentTool::<()>::resolve_subagent_path(
-            &tool.effective_mounts(),
+            &tool.effective_mounts(None),
             tool.base_dir.as_deref(),
             Path::new("../outside.md"),
         )
@@ -2281,7 +2289,7 @@ mod tests {
             .with_file_mounts([SubagentFileMount::new("skills", skills_root.clone())]);
 
         let error = SubagentTool::<()>::resolve_subagent_path(
-            &tool.effective_mounts(),
+            &tool.effective_mounts(None),
             tool.base_dir.as_deref(),
             Path::new(".skills/missing.md"),
         )
@@ -2888,6 +2896,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A script that `cd`s into a skill runs `subagent art_direction
+    /// --prompt-file brief.md`: the request carries that directory, and both
+    /// the skill's `agents/` and its brief resolve there, not in the
+    /// terminal's starting directory.
+    #[tokio::test]
+    async fn subagent_after_cd_resolves_agents_and_brief_in_the_callers_directory() {
+        let bundled = Bundled::new().await;
+        let skill = bundled.root.path().join("work/skills/slide");
+        write_definition(
+            &skill.join("agents"),
+            "art_direction",
+            Some("fast"),
+            "read_only",
+            "direct the art",
+        );
+        std::fs::write(skill.join("brief.md"), "design the deck").unwrap();
+        let tool = tiered_tool(&bundled, r#"{"model":"fast"}"#);
+        let args = |name: &str| named(name, Path::new("brief.md"));
+        let in_skill = || ToolContext::new().with_working_dir(skill.to_string_lossy());
+
+        let result = Tool::call(&tool, args("art_direction"), in_skill())
+            .await
+            .expect("agents/ and the brief resolve in the caller's directory");
+        let ToolResult::Text { text } = result else {
+            panic!("expected text result, got {result:?}");
+        };
+        assert!(
+            text.starts_with("Subagent 'art_direction' completed"),
+            "{text}"
+        );
+
+        // From the terminal's starting directory neither exists.
+        let error = Tool::call(&tool, args("art_direction"), ToolContext::new())
+            .await
+            .expect_err("the starting directory holds neither the brief nor agents/");
+        assert!(error.to_string().contains("brief.md"), "{error}");
+    }
+
     #[tokio::test]
     async fn general_runs_on_and_reports_the_tier_routing_picked() {
         let bundled = Bundled::new().await;
@@ -3423,7 +3469,7 @@ mod tests {
             ]);
 
         let resolved = SubagentTool::<()>::resolve_subagent_path(
-            &tool.effective_mounts(),
+            &tool.effective_mounts(None),
             tool.base_dir.as_deref(),
             &session_skills_file,
         )

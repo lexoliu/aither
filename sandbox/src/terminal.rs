@@ -4840,6 +4840,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         Some(start_container_ipc_bridge(
             context.executor,
             Arc::clone(context.registry),
+            container_runtime.workspace_mount().cloned(),
             container_runtime.ipc_route().bind(),
         )?)
     };
@@ -5429,6 +5430,7 @@ impl ContainerIpcBridge {
 fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
     executor: E,
     registry: Arc<ToolRegistry>,
+    workspace: Option<MountRoot>,
     bind: BridgeAddress,
 ) -> Result<ContainerIpcBridge, TerminalError> {
     // The bridge executes host IPC commands for whoever connects, so it binds
@@ -5459,8 +5461,14 @@ fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
     executor
         .spawn(async move {
             tracing::debug!(bind = %local_addr, "container IPC bridge listening");
-            if let Err(error) =
-                run_container_ipc_bridge(listener, registry, shutdown_rx, bridge_executor).await
+            if let Err(error) = run_container_ipc_bridge(
+                listener,
+                registry,
+                workspace,
+                shutdown_rx,
+                bridge_executor,
+            )
+            .await
             {
                 tracing::debug!(error = %error, "container IPC bridge stopped with error");
             }
@@ -5482,6 +5490,7 @@ enum ContainerIpcBridgeEvent {
 async fn run_container_ipc_bridge<E: Executor + Clone + 'static>(
     listener: Async<StdTcpListener>,
     registry: Arc<ToolRegistry>,
+    workspace: Option<MountRoot>,
     shutdown_rx: Receiver<()>,
     executor: E,
 ) -> Result<(), String> {
@@ -5500,9 +5509,11 @@ async fn run_container_ipc_bridge<E: Executor + Clone + 'static>(
             ContainerIpcBridgeEvent::Accept(Ok((stream, _addr))) => {
                 tracing::debug!("container IPC bridge accepted connection");
                 let registry = registry.clone();
+                let workspace = workspace.clone();
                 executor
                     .spawn(async move {
-                        if let Err(error) = handle_container_ipc_connection(stream, registry).await
+                        if let Err(error) =
+                            handle_container_ipc_connection(stream, registry, workspace).await
                         {
                             tracing::debug!(error = %error, "container IPC connection failed");
                         }
@@ -5522,6 +5533,7 @@ async fn run_container_ipc_bridge<E: Executor + Clone + 'static>(
 async fn handle_container_ipc_connection(
     mut stream: Async<StdTcpStream>,
     registry: Arc<ToolRegistry>,
+    workspace: Option<MountRoot>,
 ) -> Result<(), String> {
     loop {
         let mut length_bytes = [0_u8; 4];
@@ -5541,26 +5553,28 @@ async fn handle_container_ipc_connection(
             .await
             .map_err(|e| format!("failed to read IPC request body: {e}"))?;
 
-        if body.is_empty() {
-            write_container_ipc_error(&mut stream, "empty IPC request body").await?;
-            continue;
-        }
-
-        let method_length = body[0] as usize;
-        if method_length == 0 {
-            write_container_ipc_error(&mut stream, "empty IPC method name").await?;
-            continue;
-        }
-        if body.len() < 1 + method_length {
-            write_container_ipc_error(&mut stream, "invalid IPC request framing").await?;
-            continue;
-        }
-
-        let method = std::str::from_utf8(&body[1..=method_length])
-            .map_err(|e| format!("invalid IPC method name utf8: {e}"))?;
-        let params = &body[1 + method_length..];
-        let cli_args = decode_container_ipc_args(params)?;
-        let envelope = registry.query_tool_handler(method, &cli_args).await;
+        let request = match heel::ipc::IpcRequest::decode(&body) {
+            Ok(request) if !request.method.is_empty() => request,
+            Ok(_) => {
+                write_container_ipc_error(&mut stream, "empty IPC method name").await?;
+                continue;
+            }
+            Err(error) => {
+                write_container_ipc_error(&mut stream, &error.to_string()).await?;
+                continue;
+            }
+        };
+        let cli_args = decode_container_ipc_args(&request.params)?;
+        // The caller reports its directory as the container sees it; the
+        // host resolves relative paths in the directory that is mounted at.
+        // A directory outside the workspace mount has no host spelling.
+        let working_dir = workspace.as_ref().and_then(|workspace| {
+            let container_dir = ContainerPath::new(request.working_dir.to_str()?).ok()?;
+            workspace.host_path(&container_dir).ok()
+        });
+        let envelope = registry
+            .query_tool_handler_from(&request.method, &cli_args, working_dir.as_deref())
+            .await;
         match crate::command::envelope_to_cli(envelope) {
             Ok(rendered) => write_container_ipc_success(&mut stream, &rendered).await?,
             Err(error) => {
@@ -9093,6 +9107,7 @@ mod tests {
         let bridge = start_container_ipc_bridge(
             executor_core::tokio::TokioGlobal,
             registry,
+            None,
             BridgeAddress::try_from(loopback).expect("loopback binds the bridge"),
         )
         .expect("bridge should start on loopback");
@@ -9101,21 +9116,14 @@ mod tests {
             .await
             .expect("client should connect to the bridge");
 
-        let method = b"probe_echo";
         let params = rmp_serde::to_vec_named(&serde_json::json!({ "marker": "pong" }))
             .expect("params should encode");
-        let mut request = vec![u8::try_from(method.len()).expect("method name fits a byte")];
-        request.extend_from_slice(method);
-        request.extend_from_slice(&params);
-        let request_length = u32::try_from(request.len()).expect("request fits the frame");
-        stream
-            .write_all(&request_length.to_be_bytes())
-            .await
-            .expect("request length should be written");
+        let request = heel::ipc::IpcRequest::encode("probe_echo", Path::new("/workspace"), &params)
+            .expect("request should encode");
         stream
             .write_all(&request)
             .await
-            .expect("request body should be written");
+            .expect("request frame should be written");
 
         let mut length_bytes = [0_u8; 4];
         stream
