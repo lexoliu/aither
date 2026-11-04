@@ -438,6 +438,18 @@ where
         self
     }
 
+    /// Enforces the communication and working languages `guard` holds on the
+    /// agent's replies and on `tasks.md`, and states them in the system
+    /// prompt. Give the same guard (a clone) to the tools and harness
+    /// commands that take text from the agent, so their refusals reach it as
+    /// alerts. Nothing happens while the communication language is unset or
+    /// English.
+    #[cfg(feature = "languages")]
+    pub fn languages(mut self, guard: crate::LanguageGuard) -> Self {
+        self.config.languages = Some(guard);
+        self
+    }
+
     /// Sets the maximum number of iterations (turns).
     ///
     /// The agent will stop and return an error if this limit is exceeded.

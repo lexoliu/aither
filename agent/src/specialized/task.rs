@@ -768,6 +768,9 @@ pub struct SubagentTool<LLM> {
     /// The external hooks of the agent this tool serves: told when a
     /// subagent starts and stops, and the parent of each subagent's own scope.
     hooks: Option<ExternalHooks>,
+    /// Holds subagent prompts to the working language.
+    #[cfg(feature = "languages")]
+    languages: Option<crate::LanguageGuard>,
 }
 
 impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
@@ -801,6 +804,8 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             fork_source: ForkSource::default(),
             serves_main: true,
             hooks: None,
+            #[cfg(feature = "languages")]
+            languages: None,
         }
     }
 
@@ -870,7 +875,18 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
                     .clone()
                     .filter(|_| binding.role() == CommandRole::Main)
             }),
+            #[cfg(feature = "languages")]
+            languages: self.languages.clone(),
         }
+    }
+
+    /// Refuses a prompt file whose prose is not in the working language
+    /// `guard` enforces. The user's own words may be quoted in it verbatim.
+    #[cfg(feature = "languages")]
+    #[must_use]
+    pub fn with_languages(mut self, guard: crate::LanguageGuard) -> Self {
+        self.languages = Some(guard);
+        self
     }
 
     /// Tells `hooks` when a subagent starts and stops, and gives each
@@ -1170,6 +1186,10 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         let prompt = content.trim();
         if prompt.is_empty() {
             anyhow::bail!("subagent prompt file '{}' is empty", resolved.display());
+        }
+        #[cfg(feature = "languages")]
+        if let Some(guard) = &self.languages {
+            guard.check_working(prompt, crate::WorkingText::Internal)?;
         }
         Ok(prompt.to_string())
     }
@@ -4473,6 +4493,31 @@ You are a file-defined agent.
             ToolResult::Text { text } => Ok(text),
             other => panic!("expected a text result, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "languages")]
+    #[tokio::test]
+    async fn a_prompt_not_in_the_working_language_is_refused() {
+        let (dir, chinese) =
+            write_prompt_file("language-refused", "请检查数据库迁移脚本是否正确。");
+        let english = dir.join("english.txt");
+        std::fs::write(
+            &english,
+            "Check that the database migration script is correct.",
+        )
+        .expect("write prompt file");
+        let (tool, _runs, _log) = external_tool(&dir);
+        let tool = tool.with_languages(crate::LanguageGuard::new(crate::Languages::new(
+            "Chinese".parse().unwrap(),
+        )));
+
+        let error = call_text(&tool, external_start(&chinese, None))
+            .await
+            .expect_err("a Chinese prompt is refused");
+        assert!(error.to_string().contains("English"), "{error}");
+        call_text(&tool, external_start(&english, None))
+            .await
+            .expect("an English prompt starts");
     }
 
     #[tokio::test]

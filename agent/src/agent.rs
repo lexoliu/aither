@@ -355,6 +355,15 @@ pub struct KnowledgeAndTimeTemplate {
     pub websearch_command: bool,
 }
 
+/// The system prompt's statement of the communication and working languages.
+#[cfg(feature = "languages")]
+#[derive(Template)]
+#[template(path = "language_system.txt", escape = "none")]
+struct LanguagesTemplate {
+    communication: crate::Language,
+    working: crate::Language,
+}
+
 /// The result given to a tool call whose run was cancelled before it finished.
 #[derive(Template)]
 #[template(path = "tool_call_cancelled.txt", escape = "none")]
@@ -876,6 +885,10 @@ where
                 .on_lifecycle(&external_hook::SessionStart {})
                 .await;
         }
+        #[cfg(feature = "languages")]
+        if let Some(guard) = &self.config.languages {
+            guard.record_user_message(&prompt);
+        }
         self.hooks
             .on_lifecycle(&external_hook::UserMessage {
                 message: prompt.clone(),
@@ -1067,6 +1080,8 @@ where
     ) -> Result<TurnControl, AgentError> {
         if !response_text.is_empty() {
             self.context.push(Message::assistant(&response_text));
+            #[cfg(feature = "languages")]
+            self.enforce_reply_language(&response_text, events).await;
         }
         events.emit(AgentEvent::turn_complete(turn, false));
         if self.push_final_turn_alerts().await {
@@ -1076,6 +1091,44 @@ where
             final_text: response_text,
             stop_reason: StopReason::NoToolCalls,
         })
+    }
+
+    /// Holds a reply to the communication language.
+    ///
+    /// A reply in another language raises one alert telling the model to
+    /// return to it, and the user is shown a translation by the fast model,
+    /// marked by [`AgentEvent::ReplyTranslated`]. The history keeps the
+    /// original, so the cached prefix is untouched. A translation that fails
+    /// is logged and leaves the original on display, which the user has
+    /// already been streamed.
+    #[cfg(feature = "languages")]
+    async fn enforce_reply_language(&mut self, reply: &str, events: &EventSink) {
+        let Some(guard) = self.config.languages.clone() else {
+            return;
+        };
+        let Some(language) = guard
+            .languages()
+            .communication()
+            .filter(|_| guard.languages().enforced() && !guard.reply_in_language(reply))
+        else {
+            return;
+        };
+        self.push_system_alert(
+            crate::language::LanguageAlertsTemplate {
+                alerts: &[crate::language::LanguageAlert::Reply { language }],
+            }
+            .render()
+            .expect("language alert template must render"),
+        );
+        match crate::language::translate(self.fast.as_ref(), reply, language).await {
+            Ok(text) => events.emit(AgentEvent::ReplyTranslated {
+                text,
+                language: language.code().to_string(),
+            }),
+            Err(error) => {
+                tracing::warn!(%error, %language, "failed to translate a reply for display");
+            }
+        }
     }
 
     /// Gives every tool call in the context a result.
@@ -1561,6 +1614,16 @@ where
     #[must_use]
     pub const fn cache_lifetime(&self) -> CacheLifetime {
         self.prompt_cache.lifetime()
+    }
+
+    /// The session's communication and working languages, when the agent
+    /// enforces any. An application that writes to the user on the agent's
+    /// behalf, such as a recap or a prompt suggestion, reads the
+    /// communication language here.
+    #[cfg(feature = "languages")]
+    #[must_use]
+    pub const fn languages(&self) -> Option<&crate::LanguageGuard> {
+        self.config.languages.as_ref()
     }
 
     /// Keep-alive bookkeeping for the current run.
@@ -2510,6 +2573,26 @@ where
                 include_str!("prompts/permissions.txt"),
             );
         }
+
+        #[cfg(feature = "languages")]
+        if let Some(languages) = self
+            .config
+            .languages
+            .as_ref()
+            .map(|guard| *guard.languages())
+            && languages.enforced()
+            && let Some(communication) = languages.communication()
+        {
+            instructions.insert_tagged(
+                &InstructionSlot::LANGUAGES,
+                &LanguagesTemplate {
+                    communication,
+                    working: languages.working(),
+                }
+                .render()
+                .expect("language system template must render"),
+            );
+        }
     }
 
     /// Registers the context sources the agent itself owns.
@@ -2517,6 +2600,19 @@ where
     /// A host's own sources are registered through the builder and kept, so
     /// this only adds what the agent has the state for.
     fn register_builtin_context_sources(&mut self) {
+        #[cfg(feature = "languages")]
+        if let Some(guard) = self
+            .config
+            .languages
+            .clone()
+            .filter(|guard| guard.languages().enforced())
+        {
+            self.context_sources
+                .push(AnyContextSource::new(crate::language::LanguageAlerts::new(
+                    guard,
+                    self.sandbox_dir.clone(),
+                )));
+        }
         if let Some(sandbox_dir) = self.sandbox_dir.clone() {
             let mut source = TasksDocument::new(sandbox_dir, self.config.tasks_stale_after_turns);
             if let Some(resolver) = self.blocker_resolver.clone() {
@@ -5305,6 +5401,144 @@ mod tests {
             killed: false,
             result: Err(aither_sandbox::TerminalError::Execution(output.to_string())),
         }
+    }
+
+    #[cfg(feature = "languages")]
+    fn language_agent(
+        languages: crate::Languages,
+        responses: impl IntoIterator<Item = String>,
+    ) -> (
+        Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, ()>,
+        ScriptedLlm,
+    ) {
+        let llm = ScriptedLlm::new(1_000_000, responses);
+        let agent = Agent::with_config(
+            llm.clone(),
+            AgentConfig::default().with_languages(crate::LanguageGuard::new(languages)),
+        );
+        (agent, llm)
+    }
+
+    #[cfg(feature = "languages")]
+    fn chinese() -> crate::Languages {
+        crate::Languages::new("Chinese".parse().unwrap())
+    }
+
+    #[cfg(feature = "languages")]
+    fn language_alerts(agent: &Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, ()>) -> usize {
+        agent
+            .history()
+            .iter()
+            .filter(|message| message.content().contains("was not in Chinese"))
+            .count()
+    }
+
+    #[cfg(feature = "languages")]
+    #[tokio::test]
+    async fn an_english_reply_yields_one_alert_and_a_translated_display_copy() {
+        let original = "I have finished the database migration and every test passes.";
+        let (mut agent, llm) = language_agent(
+            chinese(),
+            [
+                original.to_string(),
+                "数据库迁移已经完成，所有测试都通过了。".to_string(),
+            ],
+        );
+        let events = drain_run(agent.run("请迁移数据库", std::iter::empty())).await;
+
+        let translated: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ReplyTranslated { text, language } => Some((text, language.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            translated,
+            [(&"数据库迁移已经完成，所有测试都通过了。".to_string(), "cmn")]
+        );
+        assert_eq!(language_alerts(&agent), 1, "one alert per lapse");
+        assert!(
+            agent
+                .history()
+                .iter()
+                .any(|message| message.content() == original),
+            "the history keeps the original reply"
+        );
+        assert!(
+            agent
+                .history()
+                .iter()
+                .all(|message| !message.content().contains("数据库迁移已经完成")),
+            "the translation is for display only"
+        );
+        let requests = llm.recorded();
+        assert_eq!(requests.len(), 2, "one turn and one translation");
+    }
+
+    #[cfg(feature = "languages")]
+    #[tokio::test]
+    async fn a_chinese_reply_needs_no_alert_or_translation() {
+        let (mut agent, llm) = language_agent(chinese(), ["数据库迁移已经完成。".to_string()]);
+        let events = drain_run(agent.run("请迁移数据库", std::iter::empty())).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ReplyTranslated { .. }))
+        );
+        assert_eq!(language_alerts(&agent), 0);
+        assert_eq!(llm.recorded().len(), 1);
+    }
+
+    #[cfg(feature = "languages")]
+    #[tokio::test]
+    async fn languages_unset_or_english_change_nothing() {
+        for languages in [
+            crate::Languages::unset(),
+            crate::Languages::new(crate::Language::ENGLISH),
+        ] {
+            let (mut agent, llm) =
+                language_agent(languages, ["All done, the migration passes.".to_string()]);
+            let events = drain_run(agent.run("go", std::iter::empty())).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::ReplyTranslated { .. }))
+            );
+            assert_eq!(llm.recorded().len(), 1);
+            assert!(
+                !agent
+                    .context()
+                    .instructions()
+                    .contains(&InstructionSlot::LANGUAGES),
+                "no language section in the system prompt"
+            );
+        }
+    }
+
+    #[cfg(feature = "languages")]
+    #[tokio::test]
+    async fn the_system_prompt_states_both_languages() {
+        let (mut agent, _llm) =
+            language_agent(chinese().with_working("German".parse().unwrap()), []);
+        agent.ensure_initialized().await.expect("agent initializes");
+        let section = agent
+            .context()
+            .instructions()
+            .get(&InstructionSlot::LANGUAGES)
+            .expect("the languages section is present")
+            .clone();
+        assert!(
+            section.contains("Chinese") && section.contains("German"),
+            "{section}"
+        );
+        assert_eq!(
+            agent
+                .languages()
+                .map(|guard| guard.languages().communication()),
+            Some(Some("Chinese".parse().unwrap())),
+            "an application reads the language from the agent"
+        );
     }
 
     /// Under `Detach` the run ends with the model's turn even while a
