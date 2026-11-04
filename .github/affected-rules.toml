@@ -19,7 +19,7 @@ globs = [
 ]
 mark-changed = "all"
 
-# Lint, format, typo and test-runner configuration applies to every crate's
+# Lint, format and test-runner configuration applies to every crate's
 # gate run. The determinator's defaults mark `clippy.toml` and `rustfmt.toml`
 # as changing nothing, which is wrong for these jobs.
 [[path-rule]]
@@ -28,8 +28,6 @@ globs = [
     "Clippy.toml",
     "rustfmt.toml",
     ".rustfmt.toml",
-    "_typos.toml",
-    ".typos.toml",
     ".config/**",
 ]
 mark-changed = "all"
