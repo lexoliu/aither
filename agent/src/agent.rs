@@ -355,6 +355,14 @@ pub struct KnowledgeAndTimeTemplate {
     pub websearch_command: bool,
 }
 
+/// A user message with the UTC time it was sent at appended.
+#[derive(Template)]
+#[template(path = "user_message_time.txt", escape = "none")]
+struct UserMessageTimeTemplate<'a> {
+    prompt: &'a str,
+    utc: String,
+}
+
 /// The system prompt's statement of the communication and working languages.
 #[cfg(feature = "languages")]
 #[derive(Template)]
@@ -458,7 +466,7 @@ enum BackgroundOutcome<'a> {
     Finished { code: i32 },
     /// The job was killed — its `timeout` bound or `terminal_kill` — and
     /// whatever `code` the harness saw means nothing.
-    Killed,
+    Killed { timeout: Option<&'a str> },
     /// The task could not be run or tracked to completion.
     Failed { error: &'a str },
 }
@@ -904,11 +912,31 @@ where
             events.emit(event);
         }
         self.settle_interrupted_tool_calls();
-        self.context
-            .push(Message::user(&prompt).with_attachments(attachments));
+        self.context.push(
+            self.timestamped_user_message(&prompt)
+                .with_attachments(attachments),
+        );
 
         let outcome = self.run_agent_loop(run_id.as_str(), 0, events).await?;
         self.finish_run(run_id.as_str(), outcome, events).await
+    }
+
+    /// The user message for `prompt` with the current UTC time appended.
+    ///
+    /// The time is part of the message from the moment it joins the context
+    /// and is never rewritten, so the cached prefix a later request replays
+    /// is unchanged.
+    fn timestamped_user_message(&self, prompt: &str) -> Message {
+        let utc = self
+            .warmth
+            .utc_now()
+            .strftime("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        Message::user(
+            UserMessageTimeTemplate { prompt, utc }
+                .render()
+                .expect("failed to render user_message_time template"),
+        )
     }
 
     /// A run without a new user message: the model acts on what
@@ -2939,8 +2967,10 @@ where
         self.ensure_initialized().await?;
         let checkpoint = self.context.checkpoint();
         self.context.extend(extra_messages);
-        self.context
-            .push(Message::user(prompt).with_attachments(attachments));
+        self.context.push(
+            self.timestamped_user_message(prompt)
+                .with_attachments(attachments),
+        );
         let tail = self.render_tail().await;
         let messages = self.context.build_request(&tail);
         self.context.restore(checkpoint);
@@ -2986,9 +3016,15 @@ where
 /// Formats a completed background task result as a system message.
 fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String {
     let error_text;
+    let timeout_notice = task
+        .timeout_kill
+        .as_ref()
+        .map(aither_sandbox::TimeoutKill::notice);
     let (outcome, output, stderr) = match &task.result {
         Ok(command) if task.killed => (
-            BackgroundOutcome::Killed,
+            BackgroundOutcome::Killed {
+                timeout: timeout_notice.as_deref(),
+            },
             output_block(&command.stdout),
             command.stderr.as_ref().and_then(output_block),
         ),
@@ -3135,6 +3171,7 @@ mod tests {
             script: "make test".to_string(),
             result,
             killed: false,
+            timeout_kill: None,
         }
     }
 
@@ -3197,6 +3234,26 @@ mod tests {
         assert_eq!(
             format_background_task_result(&task),
             "Background task 'amber-forest-thunder-pearl' (`make test`) was killed.\npartial output\n"
+        );
+    }
+
+    #[test]
+    fn background_result_killed_at_its_timeout_states_the_utc_times() {
+        let mut task = completed(Ok(CompletedCommand {
+            stdout: inline("partial output"),
+            stderr: None,
+            exit_code: -1,
+            interruptions: Vec::new(),
+        }));
+        task.killed = true;
+        task.timeout_kill = Some(aither_sandbox::TimeoutKill {
+            timeout: Duration::from_secs(90),
+            started: "2026-11-04T12:00:00Z".parse().expect("timestamp"),
+            killed: "2026-11-04T12:01:31Z".parse().expect("timestamp"),
+        });
+        assert_eq!(
+            format_background_task_result(&task),
+            "Background task 'amber-forest-thunder-pearl' (`make test`) was killed. Its 90s timeout bound passed; it started at 2026-11-04 12:00:00 UTC and was killed at 2026-11-04 12:01:31 UTC.\npartial output\n"
         );
     }
 
@@ -3665,6 +3722,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_user_message_carries_its_utc_time_and_the_prefix_stays_put() {
+        let clock = crate::ManualClock::at_utc("2026-11-04T12:00:00Z".parse().expect("timestamp"));
+        let mut agent = Agent::builder(MockLlm {
+            context_length: 1_000_000,
+        })
+        .clock(clock.clone())
+        .build();
+        agent.ensure_initialized().await.expect("agent initializes");
+        let prefix = agent.context().system_prefix().expect("prefix").clone();
+        assert!(!prefix.contains("run `date`"), "{prefix}");
+
+        let first = agent
+            .preview_request_messages_with("hello", [], [])
+            .await
+            .expect("preview");
+        assert_eq!(
+            first.last().expect("user message").content(),
+            "hello\n\nSent at 2026-11-04 12:00:00 UTC."
+        );
+
+        let message = agent.timestamped_user_message("hello");
+        agent.push_message(message);
+        clock.advance(Duration::from_secs(90));
+        let message = agent.timestamped_user_message("again");
+        agent.push_message(message);
+
+        let sent = agent.context().build_messages();
+        let contents: Vec<_> = sent
+            .iter()
+            .map(aither_core::llm::Message::content)
+            .collect();
+        assert!(
+            contents.contains(&"hello\n\nSent at 2026-11-04 12:00:00 UTC."),
+            "{contents:?}"
+        );
+        assert!(
+            contents.contains(&"again\n\nSent at 2026-11-04 12:01:30 UTC."),
+            "{contents:?}"
+        );
+        assert_eq!(agent.context().system_prefix().expect("prefix"), prefix);
+    }
+
+    #[tokio::test]
     async fn the_host_layout_places_and_replaces_built_in_blocks() {
         use crate::context::{ExternalContent, ExternalSlot, SystemLayout};
         const MEMORY: ExternalSlot = ExternalSlot::new("memory");
@@ -4068,6 +4168,7 @@ mod tests {
                                 task_id: "task-test".to_string(),
                                 script: "cat".to_string(),
                                 killed: false,
+                                timeout_kill: None,
                                 result: Err(aither_sandbox::TerminalError::Execution(
                                     "fed and finished".to_string(),
                                 )),
@@ -4204,7 +4305,11 @@ mod tests {
             })
             .expect("extra message must appear in the previewed request");
         assert_eq!(messages[hidden_pos + 1].role(), Role::User);
-        assert_eq!(messages[hidden_pos + 1].content(), "hi");
+        assert!(
+            messages[hidden_pos + 1]
+                .content()
+                .starts_with("hi\n\nSent at ")
+        );
 
         // Post-preview state is exactly what a normal first turn leaves:
         // initialized with the static blocks populated, and neither the
@@ -5350,7 +5455,7 @@ mod tests {
         );
         let prompt = messages
             .iter()
-            .position(|message| message.content() == "again")
+            .position(|message| message.content().starts_with("again\n\nSent at "))
             .expect("the new prompt is sent");
         assert!(result < prompt, "the result precedes the new prompt");
     }
@@ -5410,6 +5515,7 @@ mod tests {
             task_id: task_id.to_string(),
             script: "make".to_string(),
             killed: false,
+            timeout_kill: None,
             result: Err(aither_sandbox::TerminalError::Execution(output.to_string())),
         }
     }
