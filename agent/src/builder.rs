@@ -18,7 +18,10 @@ use askama::Template;
 use crate::{
     agent::Agent,
     config::{AgentConfig, AgentKind},
-    context::{AnyContextSource, Context, ContextPolicy, ContextSource},
+    context::{
+        AnyContextSource, Context, ContextPolicy, ContextSource, ExternalContent, ExternalSlot,
+        InstructionSlot, SystemLayout,
+    },
     hook::{HCons, Hook},
     model_group::ModelTier,
     tools::AgentTools,
@@ -304,8 +307,9 @@ where
     ///
     /// Panics if the `knowledge_and_time` prompt template fails to render.
     pub fn dyn_terminal(mut self, dyn_tool: aither_sandbox::DynTerminalTool) -> Self {
-        self.context.insert_system_text(
-            "prepared_tools",
+        let instructions = self.context.instructions_mut();
+        instructions.insert(
+            &InstructionSlot::PREPARED_TOOLS,
             dyn_tool
                 .prepared_tools()
                 .render()
@@ -314,11 +318,11 @@ where
         // Seed knowledge/time guidance against the shared command registry so
         // subagents are not told to run commands that were never registered
         // (e.g. `websearch` when a provider-hosted search tool is active).
-        if !self.context.has_system_block("knowledge_and_time") {
+        if !instructions.contains(&InstructionSlot::KNOWLEDGE_AND_TIME) {
             let websearch_command = dyn_tool.has_command("websearch");
-            self.context.insert_system_named(
-                "knowledge_and_time",
-                crate::agent::KnowledgeAndTimeTemplate { websearch_command }
+            instructions.insert_tagged(
+                &InstructionSlot::KNOWLEDGE_AND_TIME,
+                &crate::agent::KnowledgeAndTimeTemplate { websearch_command }
                     .render()
                     .expect("failed to render knowledge_and_time template"),
             );
@@ -496,32 +500,62 @@ where
         self
     }
 
-    /// Inserts or replaces a typed persistent system block.
-    pub fn system<T: askama::Template>(mut self, value: T) -> Self {
-        self.context.insert_system(&value);
-        self
-    }
-
-    /// Inserts or replaces a persistent system block with an explicit tag.
-    pub fn system_named(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
-        self.context.insert_system_named(tag, content);
-        self
-    }
-
-    /// Whether a persistent system block with `tag` is already set.
-    pub(crate) fn has_system_named(&self, tag: &str) -> bool {
-        self.context.has_system_block(tag)
-    }
-
-    /// Inserts or replaces a persistent system block with raw text.
+    /// Lays the system prompt out in `layout`'s order.
     ///
-    /// Unlike [`system`](Self::system) and [`system_named`](Self::system_named),
-    /// the `content` is stored verbatim without any XML wrapping. This is the
-    /// preferred entry point for prose system blocks (workspace descriptions,
-    /// runtime metadata, environment hints) where XML structure adds tokens
-    /// without providing semantic value.
-    pub fn system_text(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
-        self.context.insert_system_text(tag, content);
+    /// Every system block, the built-in ones included, renders at its slot's
+    /// position. Set the layout before adding blocks the default layout does
+    /// not place.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a block already added has no slot in `layout`.
+    pub fn system_layout(mut self, layout: SystemLayout) -> Self {
+        self.context.set_layout(layout);
+        self
+    }
+
+    /// Inserts or replaces the instruction block in `slot`, wrapped in a tag
+    /// named after the slot.
+    ///
+    /// A built-in slot set here keeps the host's text: this is how a host
+    /// replaces built-in prose such as [`InstructionSlot::PERMISSIONS`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no such slot.
+    pub fn system_named(mut self, slot: &InstructionSlot, content: &str) -> Self {
+        self.context.instructions_mut().insert_tagged(slot, content);
+        self
+    }
+
+    /// Whether the instruction block in `slot` is already set.
+    pub(crate) fn has_instruction(&self, slot: &InstructionSlot) -> bool {
+        self.context.instructions().contains(slot)
+    }
+
+    /// Inserts or replaces the instruction block in `slot` with raw text.
+    ///
+    /// Unlike [`system_named`](Self::system_named), the `content` is stored
+    /// verbatim without any wrapping, for prose blocks (runtime metadata,
+    /// environment hints) where a tag adds tokens without meaning.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no such slot.
+    pub fn system_text(mut self, slot: &InstructionSlot, content: impl Into<String>) -> Self {
+        self.context.instructions_mut().insert(slot, content);
+        self
+    }
+
+    /// Inserts or replaces the external-content block in `slot`: memory, a
+    /// repository's instructions, a fetched page or a file, rendered after
+    /// every instruction block inside a boundary it cannot close.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no such slot.
+    pub fn external_content(mut self, slot: &ExternalSlot, content: ExternalContent) -> Self {
+        self.context.external_mut().insert(slot, content);
         self
     }
 
@@ -613,8 +647,8 @@ where
         P: aither_sandbox::PermissionHandler + 'static,
         E: executor_core::Executor + Clone + 'static,
     {
-        self.context.insert_system_text(
-            "prepared_tools",
+        self.context.instructions_mut().insert(
+            &InstructionSlot::PREPARED_TOOLS,
             terminal_tool
                 .prepared_tools_context()
                 .expect("terminal tools must be initialized before agent construction"),
