@@ -1262,10 +1262,10 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             .fork_source
             .latest()
             .ok_or_else(|| ForkRefusal::NothingSent.into_error())?;
-        if !snapshot.policy().allows_fork(snapshot.usage()) {
+        if !snapshot.allows_fork() {
             return Err(ForkRefusal::NearCompaction {
                 usage: snapshot.usage() * 100.0,
-                compaction: snapshot.policy().compact_at * 100.0,
+                compaction: snapshot.compaction_usage() * 100.0,
             }
             .into_error());
         }
@@ -4036,6 +4036,9 @@ You are a file-defined agent.
         let compact_at = usage / 0.95;
         let policy = crate::ContextPolicy {
             compact_at,
+            compact_ceiling: usize::MAX,
+            start_distance: 0,
+            safe_buffer: 0,
             restore_budget: compact_at / 4.0,
             ..crate::ContextPolicy::default()
         };
