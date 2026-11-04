@@ -134,7 +134,7 @@ mod tests {
                 outputs_spilled: 1
             }
         );
-        let spilled = dir.path().join("outputs/compaction-call_1.txt");
+        let spilled = dir.path().join("outputs").join("compaction-call_1.txt");
         assert_eq!(
             std::fs::read_to_string(&spilled).expect("spill file"),
             "é".repeat(200)
