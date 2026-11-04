@@ -44,7 +44,8 @@ pub struct SpillLimits {
     pub head: usize,
 }
 
-/// Removes the alerts and reminders from `context`, and moves the tool
+/// Removes the alerts and reminders numbered below `fork_point` (the fork
+/// point of the compaction about to run) from `context`, and moves the tool
 /// outputs over `limits.threshold` into `working_dir`.
 ///
 /// With no working directory there is nowhere the agent could read a file
@@ -56,10 +57,11 @@ pub struct SpillLimits {
 /// output it held is left in the window.
 pub async fn clean_for_recovery(
     context: &mut Context,
+    fork_point: u64,
     working_dir: Option<&Path>,
     limits: SpillLimits,
 ) -> std::io::Result<RecoveryReport> {
-    let alerts_removed = context.prune_recent_system_messages();
+    let alerts_removed = context.prune_system_messages_below(fork_point);
     let mut outputs_spilled = 0;
     if let Some(working_dir) = working_dir {
         let dir = working_dir.join(SPILL_DIR);
@@ -123,7 +125,7 @@ mod tests {
         context.push(Message::tool("call/1", "é".repeat(200)));
         context.push(Message::tool("call-2", "short"));
 
-        let report = clean_for_recovery(&mut context, Some(dir.path()), limits())
+        let report = clean_for_recovery(&mut context, u64::MAX, Some(dir.path()), limits())
             .await
             .expect("recovery");
 
@@ -149,12 +151,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_alerts_below_the_fork_point_go() {
+        let mut context = Context::new();
+        context.push(Message::system("old alert"));
+        let fork_point = context.fork_point();
+        context.push(Message::system("new alert"));
+
+        let report = clean_for_recovery(&mut context, fork_point, None, limits())
+            .await
+            .expect("recovery");
+
+        assert_eq!(report.alerts_removed, 1);
+        let kept: Vec<_> = context.recent().iter().map(|m| m.content()).collect();
+        assert_eq!(kept, ["new alert"]);
+    }
+
+    #[tokio::test]
     async fn without_a_working_directory_only_the_alerts_go() {
         let mut context = Context::new();
         context.push(Message::system("alert"));
         context.push(Message::tool("call-1", "x".repeat(500)));
 
-        let report = clean_for_recovery(&mut context, None, limits())
+        let report = clean_for_recovery(&mut context, u64::MAX, None, limits())
             .await
             .expect("recovery");
 

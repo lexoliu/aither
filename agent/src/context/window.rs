@@ -519,6 +519,16 @@ impl Context {
     /// Reassembly invalidates the cacheable prefix, so it runs as part of
     /// applying a compaction, which rewrites the prefix anyway.
     pub fn reassemble(&mut self) -> ReassemblyReport {
+        self.reassemble_below(u64::MAX)
+    }
+
+    /// [`reassemble`](Self::reassemble) that removes only the durable system
+    /// alerts numbered below `fork_point`.
+    ///
+    /// Applying a compaction handoff uses it: alerts at or after the fork
+    /// arrived while the handoff was written, are not described by it and
+    /// must reach the model.
+    pub fn reassemble_below(&mut self, fork_point: u64) -> ReassemblyReport {
         let mut report = ReassemblyReport::default();
 
         for (applied, freed) in [
@@ -532,7 +542,7 @@ impl Context {
         let mut system_messages_pruned = 0usize;
         let mut removed_bytes = 0usize;
         self.items.retain(|item| {
-            if item.message.role() == Role::System {
+            if item.message.role() == Role::System && item.seq < fork_point {
                 system_messages_pruned += 1;
                 removed_bytes += item.message.content().len();
                 false
@@ -564,11 +574,12 @@ impl Context {
         alerts + dedupe_bytes
     }
 
-    /// Removes durable system alerts and returns how many were pruned.
-    pub fn prune_recent_system_messages(&mut self) -> usize {
+    /// Removes the durable system alerts numbered below `fork_point` and
+    /// returns how many were pruned.
+    pub fn prune_system_messages_below(&mut self, fork_point: u64) -> usize {
         let before = self.items.len();
         self.items
-            .retain(|item| item.message.role() != Role::System);
+            .retain(|item| item.message.role() != Role::System || item.seq >= fork_point);
         before - self.items.len()
     }
 
@@ -1199,6 +1210,20 @@ mod tests {
                 .handoff()
                 .is_some_and(|handoff| handoff.render().contains("task"))
         );
+    }
+
+    #[test]
+    fn reassembling_below_a_fork_keeps_the_later_alerts() {
+        let mut context = Context::new();
+        context.push(Message::system("old"));
+        let fork_point = context.fork_point();
+        context.push(Message::system("new"));
+
+        let report = context.reassemble_below(fork_point);
+
+        assert_eq!(report.system_messages_pruned, 1);
+        let kept: Vec<_> = context.recent().iter().map(|m| m.content()).collect();
+        assert_eq!(kept, ["new"]);
     }
 
     #[test]
