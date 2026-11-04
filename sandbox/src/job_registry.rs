@@ -81,6 +81,11 @@ enum TerminalStream {
 struct JobState {
     info: JobInfo,
     terminal_buffer: Vec<u8>,
+    /// Complete lines only, each from one stream, in the order they
+    /// completed: what the `monitor` pump reads.
+    line_buffer: Vec<u8>,
+    stdout_partial: Vec<u8>,
+    stderr_partial: Vec<u8>,
     stdout_buffer: Vec<u8>,
     stderr_buffer: Vec<u8>,
     stdout_closed: bool,
@@ -187,8 +192,9 @@ enum JobRequest {
         task_id: String,
         cursor: usize,
         max_bytes: usize,
-        /// Whether this read is a model read tracked by the
-        /// unchanged-read refusal; a monitor pump's reads are not.
+        /// Whether this read is a model read of the merged terminal buffer,
+        /// tracked by the unchanged-read refusal; a monitor pump's reads are
+        /// not, and read the complete-line buffer instead.
         tracked: bool,
         reply: Sender<Result<TerminalDelta, String>>,
     },
@@ -839,7 +845,7 @@ async fn handle_job_request(
             tracked,
             reply,
         } => {
-            let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes)
+            let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes, !tracked)
                 .and_then(|delta| tracked_delta(reads, &task_id, delta, tracked));
             let _ = reply.send(result).await;
         }
@@ -912,6 +918,9 @@ impl JobState {
         Self {
             info,
             terminal_buffer: Vec::new(),
+            line_buffer: Vec::new(),
+            stdout_partial: Vec::new(),
+            stderr_partial: Vec::new(),
             stdout_buffer: Vec::new(),
             stderr_buffer: Vec::new(),
             stdout_closed: false,
@@ -954,9 +963,16 @@ async fn append_terminal_output(
                 "failed to append redirected output"
             );
         }
-        match stream {
-            TerminalStream::Stdout => job.stdout_buffer.extend_from_slice(&chunk),
-            TerminalStream::Stderr => job.stderr_buffer.extend_from_slice(&chunk),
+        let (buffer, partial) = match stream {
+            TerminalStream::Stdout => (&mut job.stdout_buffer, &mut job.stdout_partial),
+            TerminalStream::Stderr => (&mut job.stderr_buffer, &mut job.stderr_partial),
+        };
+        buffer.extend_from_slice(&chunk);
+        partial.extend_from_slice(&chunk);
+        // Each stream completes its own lines; a line reaches the line
+        // buffer whole, so one stream never interrupts the other's.
+        if let Some(last_newline) = partial.iter().rposition(|byte| *byte == b'\n') {
+            job.line_buffer.extend(partial.drain(..=last_newline));
         }
     }
 }
@@ -1132,13 +1148,14 @@ fn read_terminal_delta(
     task_id: &str,
     cursor: usize,
     max_bytes: usize,
+    lines: bool,
 ) -> Result<TerminalDelta, String> {
     find_pid_by_task_id(jobs, task_id).map_or_else(
         || Err(format!("unknown task_id: {task_id}")),
         |pid| {
             jobs.get(&pid).map_or_else(
                 || Err(format!("unknown task_id: {task_id}")),
-                |job| terminal_read(job, cursor, max_bytes),
+                |job| terminal_read(job, cursor, max_bytes, lines),
             )
         },
     )
@@ -1343,8 +1360,18 @@ fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
     output
 }
 
-fn terminal_read(job: &JobState, cursor: usize, max_bytes: usize) -> Result<TerminalDelta, String> {
-    let total_bytes = job.terminal_buffer.len();
+fn terminal_read(
+    job: &JobState,
+    cursor: usize,
+    max_bytes: usize,
+    lines: bool,
+) -> Result<TerminalDelta, String> {
+    let buffer = if lines {
+        &job.line_buffer
+    } else {
+        &job.terminal_buffer
+    };
+    let total_bytes = buffer.len();
     if cursor > total_bytes {
         return Err(format!(
             "cursor {cursor} exceeds terminal buffer size {total_bytes} for task {}",
@@ -1356,7 +1383,7 @@ fn terminal_read(job: &JobState, cursor: usize, max_bytes: usize) -> Result<Term
         task_id: job.info.task_id.clone(),
         cursor: end,
         total_bytes,
-        bytes: job.terminal_buffer[cursor..end].to_vec(),
+        bytes: buffer[cursor..end].to_vec(),
         status: job.info.status.clone(),
     })
 }
@@ -1561,6 +1588,51 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&second.bytes), "world");
         assert_eq!(second.cursor, 11);
         assert_eq!(second.total_bytes, 11);
+    }
+
+    /// The rotation case: tail writes `tail: ` on stderr, the new file's line
+    /// arrives on stdout, then the rest of the notice on stderr. The monitor
+    /// reads whole lines, while the merged terminal buffer stays in arrival
+    /// order.
+    #[tokio::test]
+    async fn monitor_reads_whole_lines_when_partial_writes_interleave() {
+        let (registry, service) = job_registry_channel();
+        TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
+        registry
+            .register(
+                203,
+                "task-lines",
+                "exec-lines",
+                "tail -F f",
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+        registry.append_stderr(203, b"tail: ".to_vec()).await;
+        registry.append_stdout(203, b"rotated\n".to_vec()).await;
+        registry
+            .append_stderr(203, b"'f' has been replaced\n".to_vec())
+            .await;
+        registry.append_stdout(203, b"unfinished".to_vec()).await;
+
+        let lines = registry
+            .monitor_read("task-lines", 0, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&lines.bytes),
+            "rotated\ntail: 'f' has been replaced\n"
+        );
+        let merged = registry
+            .terminal_read("task-lines", 0, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&merged.bytes),
+            "tail: rotated\n'f' has been replaced\nunfinished"
+        );
     }
 
     #[tokio::test]
