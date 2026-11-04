@@ -1560,6 +1560,10 @@ impl ToolRegistry {
     /// request carried none.
     ///
     /// Large outputs (> 4000 chars) are automatically saved to file.
+    ///
+    /// # Panics
+    /// Panics if the registry's own kept-exchange channel is closed, which
+    /// it never is while the registry exists.
     pub async fn query_tool_handler_from(
         &self,
         tool_name: &str,
