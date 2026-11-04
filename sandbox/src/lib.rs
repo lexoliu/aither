@@ -55,6 +55,7 @@
 mod bollard_exec;
 mod command;
 mod container;
+mod foreground_wait;
 mod grants;
 mod kill_guard;
 pub mod monitor;
@@ -102,6 +103,7 @@ pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
     MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,
 };
+pub use foreground_wait::ForegroundWait;
 pub use grants::{GrantSet, TerminalGrants};
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
 pub use heel::NetworkAuditLog;

@@ -55,8 +55,16 @@ jiff = { version = "0.2", default-features = false, features = ["std", "serde"] 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", default-features = false, features = ["std", "time"] }
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = { version = "0.2", default-features = false }
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", default-features = false, features = ["Win32_System_WindowsProgramming"] }
+windows-sys = { version = "0.61", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
 
 [dev-dependencies]
 hex = "0.4"

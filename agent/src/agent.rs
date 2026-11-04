@@ -630,6 +630,8 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
     /// Receiver for permission wait/resume events emitted by terminal execution.
     pub(crate) permission_receiver: Option<PermissionEventReceiver>,
+    /// Receiver for the host memory pressure and machine load events.
+    pub(crate) host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
     /// Registry for running background terminal tasks.
     pub(crate) job_registry: Option<JobRegistry>,
 
@@ -736,6 +738,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             connectivity: crate::connectivity::Watch::default(),
             background_receiver: None,
             permission_receiver: None,
+            host_load_events: None,
             job_registry: None,
             detached_task_ids: HashSet::new(),
             sandbox_dir: None,
@@ -1565,6 +1568,7 @@ where
     /// whose stdin watch failed. Returns whether any of them is a job blocked
     /// on stdin, which the model must act on.
     fn push_job_alerts(&mut self) -> bool {
+        self.push_host_load_alerts();
         let Some(receiver) = self.background_receiver.clone() else {
             return false;
         };
@@ -1573,6 +1577,18 @@ where
             wake |= self.push_job_alert(alert);
         }
         wake
+    }
+
+    /// Pushes one durable alert per host load event raised since the last
+    /// call: a condition starting or ending. An event leaves the channel as
+    /// it is pushed, so the model sees it once.
+    fn push_host_load_alerts(&mut self) {
+        let Some(receiver) = self.host_load_events.clone() else {
+            return;
+        };
+        while let Ok(event) = receiver.try_recv() {
+            self.push_system_alert(event.alert_text());
+        }
     }
 
     /// Pushes one durable alert for a background job alert; returns whether
@@ -2258,6 +2274,7 @@ where
     /// time, which is when their earlier alerts stopped being in it.
     async fn push_request_alerts(&mut self) {
         self.push_injected_context();
+        self.push_host_load_alerts();
         let reassembled = std::mem::take(&mut self.reassembled);
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_request(reassembled).await {
@@ -3653,6 +3670,58 @@ mod tests {
             }),
             "ad-hoc alerts must reach the next request"
         );
+    }
+
+    /// A host load event is injected once, at the next request, and nothing
+    /// restates it on the requests that follow.
+    #[tokio::test]
+    async fn host_load_events_are_injected_once() {
+        use aither_core::llm::Role;
+
+        async fn mentions(agent: &mut Agent<MockLlm, MockLlm, MockLlm, ()>, text: &str) -> usize {
+            let request = agent
+                .prepare_request()
+                .await
+                .expect("request boundary")
+                .expect("a fresh window must accept a request");
+            request
+                .messages()
+                .iter()
+                .filter(|message| {
+                    message.role() == Role::System && message.content().contains(text)
+                })
+                .count()
+        }
+
+        let (events, receiver) = async_channel::unbounded();
+        let mut agent = Agent::new(MockLlm {
+            context_length: 1_000,
+        });
+        agent.host_load_events = Some(receiver);
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        assert_eq!(mentions(&mut agent, "load is high").await, 0);
+        events
+            .send(crate::HostLoadEvent::LoadHigh {
+                load: crate::MachineLoad(1.8),
+                foreground_wait: Duration::from_secs(90),
+            })
+            .await
+            .expect("agent listens");
+        assert_eq!(mentions(&mut agent, "load is high").await, 1);
+        assert_eq!(mentions(&mut agent, "load is high").await, 1);
+        assert_eq!(mentions(&mut agent, "load is high").await, 1);
+
+        events
+            .send(crate::HostLoadEvent::LoadEnded {
+                load: crate::MachineLoad(0.2),
+                foreground_wait: Duration::from_secs(10),
+            })
+            .await
+            .expect("agent listens");
+        assert_eq!(mentions(&mut agent, "load has ended").await, 1);
+        assert_eq!(mentions(&mut agent, "load has ended").await, 1);
+        assert_eq!(mentions(&mut agent, "load is high").await, 1);
     }
 
     /// A job blocked on stdin can never complete, so its alert must end the
