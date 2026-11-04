@@ -3055,6 +3055,7 @@ You are a file-defined agent.
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
                 killed: false,
+                timeout_kill: None,
                 result: Ok(aither_sandbox::CompletedCommand {
                     stdout: aither_core::llm::CommandStream::Inline {
                         text: String::new(),
@@ -3139,6 +3140,7 @@ You are a file-defined agent.
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
                 killed: false,
+                timeout_kill: None,
                 result: Ok(aither_sandbox::CompletedCommand {
                     stdout: aither_core::llm::CommandStream::Inline {
                         text: String::new(),
@@ -3874,10 +3876,14 @@ You are a file-defined agent.
             shared,
             "the fork's request starts with the main agent's, unchanged"
         );
-        assert_eq!(
-            &first.messages()[shared.len()..],
-            [aither_core::llm::Message::user("carry on from here")],
-            "and continues with the fork prompt alone"
+        let tail = &first.messages()[shared.len()..];
+        assert_eq!(tail.len(), 1, "and continues with the fork prompt alone");
+        assert!(
+            tail[0]
+                .content()
+                .starts_with("carry on from here\n\nSent at "),
+            "the fork prompt carries its time: {}",
+            tail[0].content()
         );
         assert_eq!(first.tool_definitions(), last_main.tool_definitions());
         assert_eq!(
