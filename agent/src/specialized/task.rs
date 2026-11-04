@@ -1,12 +1,12 @@
-//! Subagent tool for spawning specialized subagents.
+//! The `subagent` command: runs a named subagent, forks the calling agent or
+//! continues a finished subagent, each in a context window of its own.
 //!
-//! Allows the main agent to delegate complex tasks to specialized subagents
-//! that run autonomously and return results.
-//!
-//! Subagents can be defined in files or registered programmatically.
+//! A named subagent is a TOML definition (see [`SubagentDefinition`]) looked
+//! up first in the global subagents directory the host configures, then in
+//! `agents/` under the calling terminal's working directory.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -14,14 +14,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use aither_core::llm::ToolContext;
+use aither_core::llm::{AgentIdentity, CallIdentity, SubagentIdentity, ToolContext};
 use aither_core::{
     LanguageModel,
     llm::{Tool, ToolResult, oneshot},
 };
 use aither_sandbox::{
-    CommandRole, CommitLedger, CommitLedgerError, CommitMark, DynTerminalTool, SubagentCommit,
-    SubagentGrant, TerminalBinding,
+    CommandRole, CommandUsage, CommitLedger, CommitLedgerError, CommitMark, DynTerminalTool,
+    SubagentCommit, SubagentGrant, TerminalBinding,
 };
 use askama::Template;
 use schemars::JsonSchema;
@@ -34,7 +34,7 @@ use crate::external_hook::{self, ExternalHooks};
 use crate::fork::{ForkSnapshot, ForkSource};
 use crate::fs_util::path_exists;
 use crate::model_group::ModelTier;
-use crate::subagent_file::SubagentDefinition;
+use crate::subagent_file::{Listed, SubagentAccess, SubagentDefinition, SubagentLookup};
 
 async fn checked_path_exists(path: &Path) -> anyhow::Result<bool> {
     path_exists(path)
@@ -46,39 +46,23 @@ async fn checked_path_exists(path: &Path) -> anyhow::Result<bool> {
 /// hooks, which holds none when the host configured none.
 pub type SubagentHooks = crate::HCons<ExternalHooks, ()>;
 
-/// Builder function type for configuring a subagent.
-/// Returns an `AgentBuilder` so we can add hooks before building.
-/// The builder returns a single-model agent (all tiers use the same LLM).
-pub type SubagentBuilder<LLM> = Arc<dyn Fn(LLM) -> AgentBuilder<LLM, LLM, LLM, ()> + Send + Sync>;
+/// Adds to the agent a named subagent's definition makes, before its
+/// terminal, cache keep-alive and hooks are attached.
+///
+/// See [`SubagentTool::with_agent_setup`]. The agent is single-model: all
+/// tiers use the model the subagent runs on.
+pub type SubagentSetup<LLM> =
+    Arc<dyn Fn(AgentBuilder<LLM, LLM, LLM, ()>) -> AgentBuilder<LLM, LLM, LLM, ()> + Send + Sync>;
 
-/// Configuration for a subagent type.
-pub struct SubagentType<LLM> {
-    /// Description shown to the main agent.
-    pub description: String,
-    /// Model tier this subagent runs on when the caller does not choose one.
-    pub model: Option<ModelTier>,
-    /// How the subagent's agent is made.
-    origin: Origin<LLM>,
-}
+/// What a `fork` subagent is for, as the main agent reads it.
+pub const FORK_DESCRIPTION: &str = "Continues your own context on your model; use it for work that depends on what you have read and decided";
 
-/// How a subagent type makes its agent.
-enum Origin<LLM> {
-    /// A fresh agent from a configured builder.
-    Builder(SubagentBuilder<LLM>),
-    /// A copy of the main agent's request and model.
-    Fork,
-    /// An agent that runs outside aither.
-    External(Arc<AnyExternalSubagent>),
-}
-
-impl<LLM> Clone for Origin<LLM> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Builder(builder) => Self::Builder(Arc::clone(builder)),
-            Self::Fork => Self::Fork,
-            Self::External(backend) => Self::External(Arc::clone(backend)),
-        }
-    }
+/// A connected agent that runs outside aither, started with
+/// `subagent external --agent <name>`.
+#[derive(Clone)]
+struct External {
+    description: String,
+    backend: Arc<AnyExternalSubagent>,
 }
 
 /// Maps a path the subagent sees onto the host directory it really refers to.
@@ -104,165 +88,78 @@ impl SubagentFileMount {
     }
 }
 
-impl<LLM> Clone for SubagentType<LLM> {
-    fn clone(&self) -> Self {
-        Self {
-            description: self.description.clone(),
-            model: self.model,
-            origin: self.origin.clone(),
-        }
-    }
-}
-
-impl<LLM> std::fmt::Debug for SubagentType<LLM> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SubagentType")
-            .field("description", &self.description)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<LLM: Clone> SubagentType<LLM> {
-    /// Create a new subagent type with a builder function.
-    ///
-    /// The builder function should return an `AgentBuilder` (not a built `Agent`)
-    /// so that hooks can be added before building.
-    pub fn new<F>(description: impl Into<String>, builder: F) -> Self
-    where
-        F: Fn(LLM) -> AgentBuilder<LLM, LLM, LLM, ()> + Send + Sync + 'static,
-    {
-        Self {
-            description: description.into(),
-            model: None,
-            origin: Origin::Builder(Arc::new(builder)),
-        }
-    }
-
-    /// A subagent that continues the main agent's own context.
-    ///
-    /// It runs on exactly the main agent's model and its first request is the
-    /// main agent's request followed by the prompt, so it reads the main
-    /// agent's warm prompt cache. It runs with the authority of any other
-    /// subagent: its own space, and what it cannot do there goes to the main
-    /// agent. The main agent must publish its requests to the tool's
-    /// [`fork_source`](SubagentTool::fork_source), and a start is refused
-    /// while the main agent's context is within 10% of its compaction point.
-    pub fn fork(description: impl Into<String>) -> Self {
-        Self {
-            description: description.into(),
-            model: None,
-            origin: Origin::Fork,
-        }
-    }
-
-    /// A subagent whose turns run outside aither, on `backend`.
-    ///
-    /// The tool opens one [`ExternalSession`](super::ExternalSession) per
-    /// `start` call and prompts it again on `resume`; a turn's final message
-    /// is the result. The external agent picks its own model, so a `start`
-    /// call that names one is refused, and its sessions never expire.
-    pub fn external(description: impl Into<String>, backend: impl ExternalSubagent) -> Self {
-        Self {
-            description: description.into(),
-            model: None,
-            origin: Origin::External(Arc::new(AnyExternalSubagent::new(backend))),
-        }
-    }
-
-    /// Declare the model tier this subagent runs on unless the caller
-    /// overrides it with the `model` argument of a `start` call.
-    #[must_use]
-    pub const fn with_model(mut self, model: ModelTier) -> Self {
-        self.model = Some(model);
-        self
-    }
-}
-
-/// Launch a specialized subagent for complex tasks.
+/// Run a subagent: an autonomous agent with a context window of its own that
+/// returns only its final result.
 ///
-/// Subagents are autonomous agents that run in their own context window.
-/// Their work does not consume your context, and they return only their
-/// final results. This enables:
+/// `subagent <name> --prompt-file <path>` runs the subagent `<name>` names;
+/// run `subagent` alone to list the names that resolve. Its definition fixes
+/// its role prompt, its model and what it may write: every subagent reads the
+/// whole workspace and writes its own working directory, and one whose
+/// definition allows it also writes the worktrees you grant. Three names are
+/// reserved: `fork` continues your own context, `resume` continues a
+/// finished subagent, and `external` runs a connected agent.
 ///
-/// - Context isolation for research-heavy tasks
-/// - Parallel execution of independent investigations
-/// - Specialized capabilities per subagent type
-///
-/// Each subagent type has focused tools and prompts optimized for its purpose.
-/// Choose the subagent type that best matches the task requirements.
-///
-/// The task prompt is always read from a file: write the full prompt to a
-/// file first, then pass its path in `prompt_file`. Inline prompt text is
-/// not a file path and is rejected.
+/// The brief is always read from a file: write it to a file first, then pass
+/// its path. Inline prompt text is not a file path and is rejected.
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SubagentArgs {
-    /// Start a new subagent.
-    Start {
-        /// Subagent type name (e.g., "explore", "plan") or path to a
-        /// subagent file. If the value contains '/' or ends with '.md',
-        /// it's treated as a file path, so custom subagents can be loaded
-        /// from files like `./custom-agent.md` or `subagents/researcher.md`.
-        subagent: String,
-        /// Path to a file containing the detailed task prompt for the
-        /// subagent. The file must exist and be non-empty.
-        prompt_file: String,
-        /// Model tier to run the subagent on. When omitted and the subagent
-        /// definition declares none, the fast model reads the prompt and
-        /// routes it to one of the configured tiers.
-        model: Option<ModelTier>,
-        /// Directories, usually linked git worktrees you created, the
-        /// subagent may write in addition to its own space. Each must be
-        /// inside what you can write. Everything else you can write is
-        /// read-only to the subagent, and it cannot commit in these.
-        #[serde(default)]
-        worktrees: Vec<String>,
-        /// Linked git worktrees the subagent may write and commit in. Each
-        /// must be on a branch `subagent/<id>/<name>` whose namespace
-        /// `subagent/<id>/` holds no other branch. Every commit it makes is
-        /// listed in its result.
-        #[serde(default)]
-        commit_worktrees: Vec<String>,
-    },
-    /// Continue a finished subagent in its own context.
-    ///
-    /// Its earlier conversation stays its context and `prompt_file` is the
-    /// follow-up prompt; the result comes back under the same id. Ids
-    /// expire with the provider's prompt cache: continuing an expired or
-    /// unknown id is an error.
-    Resume {
-        /// Id from a finished subagent's result.
-        id: u64,
-        /// Path to a file containing the follow-up prompt. The file must
-        /// exist and be non-empty.
-        prompt_file: String,
-    },
+#[serde(deny_unknown_fields)]
+pub struct SubagentArgs {
+    /// The subagent to run, or `fork`, `resume` or `external`.
+    pub name: String,
+    /// Path to a file holding the brief, or for `resume` the follow-up. The
+    /// file must exist and be non-empty.
+    pub prompt_file: String,
+    /// `resume` only: the id from a finished subagent's result. Ids expire
+    /// with the provider's prompt cache.
+    #[serde(default)]
+    pub id: Option<u64>,
+    /// `external` only: the connected agent to run.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Directories, usually linked git worktrees you created, the subagent
+    /// may write besides its own space, when its definition lets it write
+    /// worktrees. Each must be inside what you can write. It cannot commit
+    /// in these.
+    #[serde(default)]
+    pub worktrees: Vec<String>,
+    /// Linked git worktrees the subagent may write and commit in, when its
+    /// definition lets it write worktrees. Each must be on a branch
+    /// `subagent/<id>/<name>` whose namespace `subagent/<id>/` holds no other
+    /// branch. Every commit it makes is listed in its result.
+    #[serde(default)]
+    pub commit_worktrees: Vec<String>,
 }
 
-impl SubagentArgs {
-    /// What a start call grants beyond the subagent's own space, with
-    /// relative paths resolved against the caller's working directory.
-    fn grant(&self, working_dir: Option<&Path>) -> SubagentGrant {
-        let (worktrees, commit_worktrees) = self.granted_paths(working_dir);
-        let grant = worktrees
-            .into_iter()
-            .fold(SubagentGrant::new(), SubagentGrant::with_worktree);
-        commit_worktrees
-            .into_iter()
-            .fold(grant, SubagentGrant::with_committing_worktree)
+/// What a call asks for, checked against the reserved names.
+enum Call<'a> {
+    /// Runs the subagent a name resolves to.
+    Named { name: &'a str, grant: Requested<'a> },
+    /// Continues the calling agent's context.
+    Fork { grant: Requested<'a> },
+    /// Runs a connected agent.
+    External {
+        agent: &'a str,
+        grant: Requested<'a>,
+    },
+    /// Continues a finished subagent.
+    Resume { id: u64 },
+}
+
+/// The directories a call asks to grant, as written.
+#[derive(Clone, Copy)]
+struct Requested<'a> {
+    worktrees: &'a [String],
+    commit_worktrees: &'a [String],
+}
+
+impl Requested<'_> {
+    const fn is_empty(&self) -> bool {
+        self.worktrees.is_empty() && self.commit_worktrees.is_empty()
     }
 
-    /// The writable and the committing directories a start call grants, with
-    /// relative paths resolved against the caller's working directory.
-    fn granted_paths(&self, working_dir: Option<&Path>) -> (Vec<PathBuf>, Vec<PathBuf>) {
-        let Self::Start {
-            worktrees,
-            commit_worktrees,
-            ..
-        } = self
-        else {
-            return (Vec::new(), Vec::new());
-        };
+    /// The writable and the committing directories, with relative paths
+    /// resolved against the caller's working directory.
+    fn paths(&self, working_dir: Option<&Path>) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let resolve = |path: &String| {
             let path = Path::new(path);
             match working_dir {
@@ -271,16 +168,77 @@ impl SubagentArgs {
             }
         };
         (
-            worktrees.iter().map(resolve).collect(),
-            commit_worktrees.iter().map(resolve).collect(),
+            self.worktrees.iter().map(resolve).collect(),
+            self.commit_worktrees.iter().map(resolve).collect(),
         )
     }
 
-    /// The prompt file either call shape carries.
-    fn prompt_file(&self) -> &str {
-        match self {
-            Self::Start { prompt_file, .. } | Self::Resume { prompt_file, .. } => prompt_file,
+    /// The grant beyond the subagent's own space.
+    fn grant(&self, working_dir: Option<&Path>) -> SubagentGrant {
+        let (worktrees, commit_worktrees) = self.paths(working_dir);
+        let grant = worktrees
+            .into_iter()
+            .fold(SubagentGrant::new(), SubagentGrant::with_worktree);
+        commit_worktrees
+            .into_iter()
+            .fold(grant, SubagentGrant::with_committing_worktree)
+    }
+}
+
+impl SubagentArgs {
+    /// The subagent a call runs, by the name its result reports: the named
+    /// subagent's, `fork` or the external agent's; `None` for `resume`.
+    #[must_use]
+    pub fn subagent(&self) -> Option<&str> {
+        match self.name.as_str() {
+            "resume" => None,
+            "external" => self.agent.as_deref(),
+            name => Some(name),
         }
+    }
+
+    /// The prompt file every call carries.
+    #[must_use]
+    pub fn prompt_file(&self) -> &str {
+        &self.prompt_file
+    }
+
+    /// What the call asks for, refusing an option its name does not take.
+    fn call(&self) -> anyhow::Result<Call<'_>> {
+        let grant = Requested {
+            worktrees: &self.worktrees,
+            commit_worktrees: &self.commit_worktrees,
+        };
+        let name = self.name.as_str();
+        if name != "resume" && self.id.is_some() {
+            anyhow::bail!("`--id` continues a finished subagent: use it with `subagent resume`");
+        }
+        if name != "external" && self.agent.is_some() {
+            anyhow::bail!("`--agent` names a connected agent: use it with `subagent external`");
+        }
+        Ok(match name {
+            "resume" => {
+                let Some(id) = self.id else {
+                    anyhow::bail!(
+                        "`subagent resume` takes the `--id` of the finished subagent to continue"
+                    );
+                };
+                if !grant.is_empty() {
+                    anyhow::bail!(
+                        "a continued subagent keeps what it was granted: `subagent resume` takes no `--worktrees` or `--commit-worktrees`"
+                    );
+                }
+                Call::Resume { id }
+            }
+            "fork" => Call::Fork { grant },
+            "external" => {
+                let Some(agent) = self.agent.as_deref() else {
+                    anyhow::bail!("`subagent external` takes the `--agent` to run");
+                };
+                Call::External { agent, grant }
+            }
+            name => Call::Named { name, grant },
+        })
     }
 }
 
@@ -326,6 +284,8 @@ enum SubagentReport<'a> {
     Cancelled,
     /// The run produced a result.
     Completed {
+        /// The tier the subagent ran on; `None` for an external agent.
+        tier: Option<&'static str>,
         model: Option<&'a str>,
         result: &'a str,
         /// Id to continue this subagent with.
@@ -365,10 +325,6 @@ struct ForkRefusedTemplate<'a> {
 
 /// Why a fork was not started.
 enum ForkRefusal {
-    /// The caller chose a model; a fork has the main agent's.
-    ModelGiven,
-    /// The caller is a subagent.
-    NotMain,
     /// The tool is not bound to a terminal to launch from.
     NoTerminal,
     /// The main agent has published no request.
@@ -429,12 +385,24 @@ const fn tier_label(tier: ModelTier) -> &'static str {
     }
 }
 
-/// Where a subagent request gets its definition and builder from.
+/// How a start call makes its subagent's agent.
 enum Source<'a, LLM> {
-    /// A `SubagentDefinition` loaded from a file.
-    File(SubagentDefinition),
-    /// A registered `SubagentType` on the tool.
-    Registered(&'a SubagentType<LLM>),
+    /// From a named subagent's definition, with the setup the host added for
+    /// that name.
+    Definition {
+        definition: SubagentDefinition,
+        setup: Option<&'a SubagentSetup<LLM>>,
+    },
+    /// From the main agent's request and model.
+    Fork,
+}
+
+/// The subagent a start call runs: its name, the tier it declares (`None`
+/// leaves the tier to routing) and how its agent is made.
+struct Resolved<'a, LLM> {
+    name: String,
+    tier: Option<ModelTier>,
+    source: Source<'a, LLM>,
 }
 
 /// Snapshot of one in-flight subagent run.
@@ -569,6 +537,8 @@ where
 /// A finished subagent kept so the parent can continue it.
 struct FinishedSubagent<LLM> {
     subagent: String,
+    /// The tier it runs on; `None` for an external agent.
+    tier: Option<ModelTier>,
     model: Option<String>,
     /// Lists the commits the subagent makes; set when it was launched with a
     /// commit grant.
@@ -706,31 +676,24 @@ impl<LLM: LanguageModel + 'static> FinishedSubagents<LLM> {
     }
 }
 
-/// A tool that spawns specialized subagents to handle complex tasks.
+/// The `subagent` command, which runs named subagents, forks the main agent
+/// and continues finished subagents.
 ///
-/// Allows the main agent to delegate work to specialized subagents
-/// that have different capabilities and run in isolated context windows.
+/// Only the main agent has it: register it with
+/// [`TerminalAgentBuilder::subagents`](crate::TerminalAgentBuilder::subagents),
+/// or with [`ToolRegistryBuilder::main_exclusive`](aither_sandbox::ToolRegistryBuilder::main_exclusive)
+/// and [`configure_terminal_bound_usage_tool`](aither_sandbox::ToolRegistryBuilder::configure_terminal_bound_usage_tool),
+/// so a subagent's terminal has no `subagent` command.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use aither_agent::specialized::task::{SubagentTool, SubagentType};
+/// use aither_agent::{install_bundled_subagents, specialized::SubagentTool};
 ///
-/// // Create subagent tool
-/// let mut subagent_tool = SubagentTool::new(llm.clone());
-///
-/// // Register an "explore" subagent type
-/// subagent_tool.register("explore", SubagentType::new(
-///     "Codebase explorer for finding files and searching code",
-///     |llm| Agent::builder(llm)
-///         .system_prompt("You are a codebase explorer...")
-///         .tool(FsTool::new())
-///         .max_iterations(15)
-///         .build()
-/// ));
-///
-/// let agent = Agent::builder(llm)
-///     .tool(subagent_tool)
+/// install_bundled_subagents(&global_subagents).await?;
+/// let subagents = SubagentTool::new(llm.clone(), &global_subagents);
+/// let agent = TerminalAgentBuilder::new(llm, terminal)
+///     .subagents(subagents, "Run a subagent")
 ///     .build();
 /// ```
 pub struct SubagentTool<LLM> {
@@ -739,9 +702,15 @@ pub struct SubagentTool<LLM> {
     /// Model a subagent runs on when the balanced tier is selected.
     balanced: LLM,
     /// Model a subagent runs on when the fast tier is selected; also routes
-    /// prompts that carry no model selector.
+    /// the briefs of subagents that declare no tier.
     fast: LLM,
-    types: HashMap<String, SubagentType<LLM>>,
+    /// The global subagents directory, looked in before the calling
+    /// terminal's `agents/`.
+    global_dir: PathBuf,
+    /// What the host adds to the agent of a named subagent, by name.
+    setups: HashMap<String, SubagentSetup<LLM>>,
+    /// Connected external agents, by name.
+    externals: BTreeMap<String, External>,
     /// Base directory for resolving relative paths (e.g., sandbox directory).
     base_dir: Option<PathBuf>,
     /// Ordered mount map used to resolve virtual sandbox paths into host paths.
@@ -762,9 +731,6 @@ pub struct SubagentTool<LLM> {
     finished: FinishedSubagents<LLM>,
     /// The main agent's latest request, which a fork starts from.
     fork_source: ForkSource,
-    /// Whether this tool serves the main agent's terminal, the only one a
-    /// fork can continue the context of.
-    serves_main: bool,
     /// The external hooks of the agent this tool serves: told when a
     /// subagent starts and stops, and the parent of each subagent's own scope.
     hooks: Option<ExternalHooks>,
@@ -775,26 +741,34 @@ pub struct SubagentTool<LLM> {
 
 impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let type_names: Vec<_> = self.types.keys().cloned().collect();
+        let setups: Vec<_> = self.setups.keys().collect();
+        let externals: Vec<_> = self.externals.keys().collect();
         f.debug_struct("SubagentTool")
-            .field("type_names", &type_names)
+            .field("global_dir", &self.global_dir)
+            .field("setups", &setups)
+            .field("externals", &externals)
             .field("base_dir", &self.base_dir)
             .finish_non_exhaustive()
     }
 }
 
 impl<LLM: Clone + Sync> SubagentTool<LLM> {
-    /// Creates a new `TaskTool` with the given LLM.
+    /// Creates a subagent tool that runs subagents on `llm`, looking their
+    /// names up in the global subagents directory `global_dir` first.
     ///
-    /// All three model tiers (advanced/balanced/fast) use the same model;
-    /// configure distinct ones with [`with_balanced_model`](Self::with_balanced_model)
-    /// and [`with_fast_model`](Self::with_fast_model).
-    pub fn new(llm: LLM) -> Self {
+    /// The host keeps the bundled subagents there with
+    /// [`install_bundled_subagents`](crate::install_bundled_subagents). All
+    /// three model tiers use `llm`; configure distinct ones with
+    /// [`with_balanced_model`](Self::with_balanced_model) and
+    /// [`with_fast_model`](Self::with_fast_model).
+    pub fn new(llm: LLM, global_dir: impl Into<PathBuf>) -> Self {
         Self {
             advanced: llm.clone(),
             balanced: llm.clone(),
             fast: llm,
-            types: HashMap::new(),
+            global_dir: global_dir.into(),
+            setups: HashMap::new(),
+            externals: BTreeMap::new(),
             base_dir: None,
             mounts: Vec::new(),
             binding: None,
@@ -802,17 +776,15 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             cache_keep_alive: None,
             finished: FinishedSubagents::new(),
             fork_source: ForkSource::default(),
-            serves_main: true,
             hooks: None,
             #[cfg(feature = "languages")]
             languages: None,
         }
     }
 
-    /// Sets the base directory for resolving relative paths.
-    ///
-    /// Paths like `subagents/...` and `skills/...` will be resolved
-    /// relative to this directory.
+    /// Sets the directory relative prompt paths resolve against, and whose
+    /// `agents/` holds the local subagents, when the tool is bound to no
+    /// terminal.
     #[must_use]
     pub fn with_base_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.base_dir = Some(dir.into());
@@ -846,22 +818,32 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         self
     }
 
-    /// This tool as the terminal `binding` describes serves it: subagents
-    /// launch from that terminal, with at most its authority, and relative
-    /// paths resolve against its working directory first.
+    /// This tool as the main agent's terminal `binding` describes serves it:
+    /// subagents launch from that terminal, with at most its authority, and
+    /// relative paths and `agents/` resolve against its working directory.
     ///
-    /// Register the tool with
-    /// [`ToolRegistryBuilder::configure_terminal_bound_tool`](aither_sandbox::ToolRegistryBuilder::configure_terminal_bound_tool)
-    /// so every terminal, a subagent's included, gets its own instance. The
-    /// instance shares the run registry; the subagents it can continue are
-    /// its own.
+    /// Register the tool so only the main agent's terminal binds it (see
+    /// [`SubagentTool`]). The instance shares the run registry; the
+    /// subagents it can continue are its own.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `binding` is a subagent's terminal: a subagent has no
+    /// `subagent` command, so the tool was registered for it by mistake.
     #[must_use]
     pub fn for_terminal(&self, binding: &TerminalBinding) -> Self {
+        assert_eq!(
+            binding.role(),
+            CommandRole::Main,
+            "a subagent's terminal has no `subagent` command: register it with `main_exclusive`"
+        );
         Self {
             advanced: self.advanced.clone(),
             balanced: self.balanced.clone(),
             fast: self.fast.clone(),
-            types: self.types.clone(),
+            global_dir: self.global_dir.clone(),
+            setups: self.setups.clone(),
+            externals: self.externals.clone(),
             base_dir: self.base_dir.clone(),
             mounts: self.mounts.clone(),
             binding: Some(binding.clone()),
@@ -869,12 +851,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             cache_keep_alive: self.cache_keep_alive.clone(),
             finished: FinishedSubagents::new(),
             fork_source: self.fork_source.clone(),
-            serves_main: binding.role() == CommandRole::Main,
-            hooks: ExternalHooks::of_observer(binding.observer()).or_else(|| {
-                self.hooks
-                    .clone()
-                    .filter(|_| binding.role() == CommandRole::Main)
-            }),
+            hooks: ExternalHooks::of_observer(binding.observer()).or_else(|| self.hooks.clone()),
             #[cfg(feature = "languages")]
             languages: self.languages.clone(),
         }
@@ -950,37 +927,96 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         self.runs.clone()
     }
 
-    /// Register a subagent type.
-    pub fn register(&mut self, name: impl Into<String>, subagent: SubagentType<LLM>) {
-        let name = name.into();
-        self.types.insert(name, subagent);
-    }
-
-    /// Register a subagent type (builder pattern).
+    /// Adds `setup` to the agent of the subagent `name` resolves to, on top
+    /// of what its definition makes: its role prompt, the tier it runs on and
+    /// what it may write stay the definition's.
     #[must_use]
-    pub fn with_type(mut self, name: impl Into<String>, subagent: SubagentType<LLM>) -> Self {
-        self.register(name, subagent);
+    pub fn with_agent_setup<F>(mut self, name: impl Into<String>, setup: F) -> Self
+    where
+        F: Fn(AgentBuilder<LLM, LLM, LLM, ()>) -> AgentBuilder<LLM, LLM, LLM, ()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.setups.insert(name.into(), Arc::new(setup));
         self
     }
 
-    /// Returns a list of registered subagent types with their descriptions.
+    /// Connects an agent whose turns run outside aither, on `backend`, as
+    /// `subagent external --agent <name>`; a later one under the same name
+    /// replaces it.
     ///
-    /// Useful for injecting into system prompts so the main agent knows
-    /// what subagents are available.
-    pub fn type_descriptions(&self) -> Vec<(&str, &str)> {
-        self.types
-            .iter()
-            .map(|(name, t)| (name.as_str(), t.description.as_str()))
-            .collect()
+    /// The tool opens one [`ExternalSession`](super::ExternalSession) per
+    /// start call and prompts it again on `resume`; a turn's final message is
+    /// the result. The external agent picks its own model, and its sessions
+    /// never expire.
+    #[must_use]
+    pub fn with_external(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        backend: impl ExternalSubagent,
+    ) -> Self {
+        self.externals.insert(
+            name.into(),
+            External {
+                description: description.into(),
+                backend: Arc::new(AnyExternalSubagent::new(backend)),
+            },
+        );
+        self
     }
 
-    fn effective_mounts(&self) -> Vec<SubagentFileMount> {
-        // A relative path names a file in the calling terminal's working
-        // directory first: a subagent writes its prompts in its own space.
-        let caller = self
-            .binding
-            .as_ref()
-            .map(TerminalBinding::working_dir)
+    /// The directory grants, prompt paths and `agents/` resolve against: the
+    /// directory the calling process was in when it ran the command, else
+    /// the starting directory of the calling terminal, else the base
+    /// directory of a tool bound to none.
+    fn caller_dir<'a>(&'a self, requested: Option<&'a Path>) -> Option<&'a Path> {
+        requested
+            .or_else(|| self.binding.as_ref().map(TerminalBinding::working_dir))
+            .or(self.base_dir.as_deref())
+    }
+
+    /// Where a subagent name resolves for a call made from `requested`.
+    fn lookup<'a>(&'a self, requested: Option<&'a Path>) -> anyhow::Result<SubagentLookup<'a>> {
+        let working_dir = self.caller_dir(requested).ok_or_else(|| {
+            anyhow::anyhow!(
+                "the subagent tool is bound to no terminal and has no base directory, so it has no `{}/` to look subagents up in",
+                crate::LOCAL_SUBAGENTS_DIR
+            )
+        })?;
+        Ok(SubagentLookup {
+            global: &self.global_dir,
+            working_dir,
+        })
+    }
+
+    /// The names a call can run, as a call that does not parse lists them.
+    async fn usage_text(&self) -> String {
+        let lookup = match self.lookup(None) {
+            Ok(lookup) => lookup,
+            Err(error) => return error.to_string(),
+        };
+        let subagents = lookup.resolvable().await;
+        SubagentUsageTemplate {
+            subagents: &subagents,
+            fork: FORK_DESCRIPTION,
+            externals: self
+                .externals
+                .iter()
+                .map(|(name, external)| (name.as_str(), external.description.as_str()))
+                .collect(),
+        }
+        .render()
+        .expect("subagent usage template must render")
+    }
+
+    fn effective_mounts(&self, requested: Option<&Path>) -> Vec<SubagentFileMount> {
+        // A relative path names a file in the directory the calling process
+        // was in first, else in the calling terminal's working directory: a
+        // subagent writes its prompts in its own space.
+        let caller = requested
+            .or_else(|| self.binding.as_ref().map(TerminalBinding::working_dir))
             .filter(|working_dir| self.base_dir.as_deref() != Some(*working_dir))
             .map(|working_dir| SubagentFileMount::new(PathBuf::from("."), working_dir));
         if !self.mounts.is_empty() {
@@ -993,11 +1029,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             .unwrap_or_else(|| PathBuf::from(Path::new(".")));
         caller
             .into_iter()
-            .chain([
-                SubagentFileMount::new(PathBuf::from("."), base.clone()),
-                SubagentFileMount::new(PathBuf::from("subagents"), base.join("subagents")),
-                SubagentFileMount::new(PathBuf::from("skills"), base.join("skills")),
-            ])
+            .chain([SubagentFileMount::new(PathBuf::from("."), base)])
             .collect()
     }
 
@@ -1167,9 +1199,13 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
     ///
     /// The prompt is always a file: inline text fails path resolution, and a
     /// missing or empty file is an error.
-    async fn read_prompt(&self, prompt_file: &str) -> anyhow::Result<String> {
+    async fn read_prompt(
+        &self,
+        prompt_file: &str,
+        requested: Option<&Path>,
+    ) -> anyhow::Result<String> {
         let resolved = Self::resolve_subagent_path(
-            &self.effective_mounts(),
+            &self.effective_mounts(requested),
             self.base_dir.as_deref(),
             Path::new(prompt_file),
         )
@@ -1194,87 +1230,40 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         Ok(prompt.to_string())
     }
 
-    /// Resolves a `start` call's `subagent` into the source it builds its
-    /// agent from.
-    ///
-    /// Returns the subagent id, the model the definition declares (if any),
-    /// and the source. Values containing '/' or ending in '.md' load a
-    /// `SubagentDefinition` from a file; anything else must name a
-    /// registered subagent type.
-    async fn resolve_source(
+    /// The subagent `name` resolves to, refusing a grant its definition does
+    /// not let it take.
+    async fn named_source(
         &self,
-        subagent: &str,
-    ) -> anyhow::Result<(String, Option<ModelTier>, Source<'_, LLM>)> {
-        let is_file_path = subagent.contains('/')
-            || Path::new(subagent)
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
-
-        if is_file_path {
-            // Resolve file paths using explicit search roots.
-            let resolved_path = Self::resolve_subagent_path(
-                &self.effective_mounts(),
-                self.base_dir.as_deref(),
-                &PathBuf::from(subagent),
-            )
-            .await?;
-            let def = SubagentDefinition::from_file_async(&resolved_path)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to read subagent file '{}': {e}",
-                        resolved_path.display()
-                    )
-                })?;
-            return Ok((def.id.clone(), def.model, Source::File(def)));
+        name: &str,
+        grant: Requested<'_>,
+        requested: Option<&Path>,
+    ) -> anyhow::Result<Resolved<'_, LLM>> {
+        let definition = self.lookup(requested)?.resolve(name).await?;
+        if definition.access == SubagentAccess::ReadOnly && !grant.is_empty() {
+            anyhow::bail!(
+                "subagent '{name}' is read-only: it writes only its own working directory and takes no `--worktrees` or `--commit-worktrees`"
+            );
         }
-
-        let subagent_type = self.types.get(subagent).ok_or_else(|| {
-            let available: Vec<&str> = self.types.keys().map(std::string::String::as_str).collect();
-            anyhow::anyhow!(
-                "Unknown subagent type '{subagent}'. Available: {}",
-                available.join(", ")
-            )
-        })?;
-        Ok((
-            subagent.to_string(),
-            subagent_type.model,
-            Source::Registered(subagent_type),
-        ))
+        Ok(Resolved {
+            name: definition.name.clone(),
+            tier: definition.tier,
+            source: Source::Definition {
+                definition,
+                setup: self.setups.get(name),
+            },
+        })
     }
 }
 
 impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
-    /// Register a subagent from a definition (builder pattern).
-    ///
-    /// Creates a subagent type from a `SubagentDefinition` loaded from a file.
-    /// The subagent will use the definition's system prompt and max iterations.
-    #[must_use]
-    pub fn with_definition(self, def: SubagentDefinition) -> Self {
-        let mut subagent = SubagentType::new(def.description.clone(), move |llm| {
-            crate::AgentBuilder::new(llm)
-                .agent_kind(crate::AgentKind::Chatbot)
-                .system_prompt(&def.system_prompt)
-                .max_iterations(def.max_iterations)
-        });
-        subagent.model = def.model;
-        self.with_type(def.id, subagent)
-    }
-
     /// The main agent's request a fork starts from.
     ///
     /// # Errors
     ///
-    /// Refuses, starting nothing, when the caller is not the main agent or
-    /// chose a model, when no request was published, and when the main
-    /// agent's context is within 10% of its compaction point.
-    fn fork_snapshot(&self, chosen: Option<ModelTier>) -> anyhow::Result<Arc<ForkSnapshot>> {
-        if chosen.is_some() {
-            return Err(ForkRefusal::ModelGiven.into_error());
-        }
-        if !self.serves_main {
-            return Err(ForkRefusal::NotMain.into_error());
-        }
+    /// Refuses, starting nothing, when the tool is bound to no terminal,
+    /// when no request was published, and when the main agent's context is
+    /// within 10% of its compaction point.
+    fn fork_snapshot(&self) -> anyhow::Result<Arc<ForkSnapshot>> {
         if self.binding.is_none() {
             return Err(ForkRefusal::NoTerminal.into_error());
         }
@@ -1321,30 +1310,32 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
     /// gives the commit ledger; the session works in the directories granted.
     async fn start_external(
         &self,
-        subagent_id: String,
-        backend: &AnyExternalSubagent,
-        args: &SubagentArgs,
+        subagent_id: &str,
+        requested: Requested<'_>,
+        caller: Option<&Path>,
     ) -> anyhow::Result<FinishedSubagent<LLM>> {
-        let SubagentArgs::Start { model, .. } = args else {
-            unreachable!("only a start call opens a session");
-        };
-        if model.is_some() {
-            anyhow::bail!(
-                "subagent type '{subagent_id}' runs an external agent that picks its own model; start it without `model`"
-            );
-        }
-        let working_dir = self
-            .binding
-            .as_ref()
-            .map(TerminalBinding::working_dir)
-            .or(self.base_dir.as_deref())
+        let backend = &self
+            .externals
+            .get(subagent_id)
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "subagent type '{subagent_id}' needs a working directory: the tool is bound to no terminal and has no base directory"
-                )
-            })?;
-        let grant = args.grant(Some(working_dir));
-        let (worktrees, commit_worktrees) = args.granted_paths(Some(working_dir));
+                let connected: Vec<&str> = self.externals.keys().map(String::as_str).collect();
+                if connected.is_empty() {
+                    anyhow::anyhow!("no external agent is connected, so '{subagent_id}' cannot run")
+                } else {
+                    anyhow::anyhow!(
+                        "no external agent '{subagent_id}' is connected; connected: {}",
+                        connected.join(", ")
+                    )
+                }
+            })?
+            .backend;
+        let working_dir = self.caller_dir(caller).ok_or_else(|| {
+            anyhow::anyhow!(
+                "external agent '{subagent_id}' needs a working directory: the tool is bound to no terminal and has no base directory"
+            )
+        })?;
+        let grant = requested.grant(Some(working_dir));
+        let (worktrees, commit_worktrees) = requested.paths(Some(working_dir));
         let terminal = self.launch_terminal(grant, None, None).await?.map(Box::new);
         let commit_ledger = terminal
             .as_ref()
@@ -1361,7 +1352,8 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             })?;
         tracing::info!(subagent = %subagent_id, "Starting external subagent");
         Ok(FinishedSubagent {
-            subagent: subagent_id,
+            subagent: subagent_id.to_string(),
+            tier: None,
             model: session.model(),
             commit_ledger,
             body: SubagentBody::External {
@@ -1371,33 +1363,28 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         })
     }
 
-    /// Builds a fresh agent for `subagent`, selecting its model from `chosen`
-    /// or by routing `prompt`.
+    /// Builds a fresh agent for the resolved subagent, on the tier it
+    /// declares or the one the fast model routes `prompt` to.
     async fn start_agent(
         &self,
-        (subagent_id, declared_model, source): (String, Option<ModelTier>, Source<'_, LLM>),
-        chosen: Option<ModelTier>,
+        Resolved {
+            name: subagent_id,
+            tier: declared,
+            source,
+        }: Resolved<'_, LLM>,
         grant: SubagentGrant,
         prompt: &str,
-    ) -> anyhow::Result<(
-        crate::Agent<LLM, LLM, LLM, SubagentHooks>,
-        String,
-        String,
-        Option<aither_sandbox::JobRegistry>,
-        Option<CommitLedger>,
-    )> {
+        started_by: Option<&CallIdentity>,
+    ) -> anyhow::Result<FinishedSubagent<LLM>> {
         // A fork is checked before anything is started, and runs on the
         // main agent's model.
         let fork = match &source {
-            Source::Registered(SubagentType {
-                origin: Origin::Fork,
-                ..
-            }) => Some(self.fork_snapshot(chosen)?),
-            _ => None,
+            Source::Fork => Some(self.fork_snapshot()?),
+            Source::Definition { .. } => None,
         };
 
-        // A model given by the caller or the definition runs as given;
-        // otherwise the fast model routes the prompt to a configured tier.
+        // A declared tier runs as given; otherwise the fast model routes the
+        // prompt to a configured tier.
         let (tier, model) = match &fork {
             Some(fork) => {
                 let resolved = self.select_model(prompt, Some(fork.tier())).await?;
@@ -1410,27 +1397,21 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                 }
                 resolved
             }
-            None => self.select_model(prompt, chosen.or(declared_model)).await?,
+            None => self.select_model(prompt, declared).await?,
         };
         let selected = self.model_for(tier).clone();
 
         let agent_builder = match source {
-            Source::File(def) => crate::AgentBuilder::new(selected)
-                .agent_kind(crate::AgentKind::Chatbot)
-                .system_prompt(&def.system_prompt)
-                .max_iterations(def.max_iterations),
-            Source::Registered(SubagentType {
-                origin: Origin::Builder(builder),
-                ..
-            }) => builder(selected),
-            Source::Registered(SubagentType {
-                origin: Origin::Fork,
-                ..
-            }) => crate::AgentBuilder::new(selected),
-            Source::Registered(SubagentType {
-                origin: Origin::External(_),
-                ..
-            }) => unreachable!("an external type starts through `start_external`"),
+            Source::Definition { definition, setup } => {
+                let builder = crate::AgentBuilder::new(selected)
+                    .agent_kind(crate::AgentKind::Chatbot)
+                    .system_prompt(&definition.prompt);
+                match setup {
+                    Some(setup) => setup(builder),
+                    None => builder,
+                }
+            }
+            Source::Fork => crate::AgentBuilder::new(selected),
         };
         tracing::info!(subagent = %subagent_id, model = %model, "Starting subagent");
         let child_hooks = self
@@ -1457,92 +1438,90 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             None => (agent_builder, None, None),
         };
 
-        // Keep-alive is configured only for the Claude client, whose
-        // subagents run on the five-minute cache: in-run waits are covered
-        // by the keep-alive and a finished subagent is continuable until
-        // that entry expires. A fork applies it last, over the cache it
-        // inherits from the main agent.
-        let agent_builder = match &self.cache_keep_alive {
+        let identity = AgentIdentity::Subagent(SubagentIdentity::new(
+            subagent_id.clone(),
+            started_by.cloned(),
+        ));
+        let agent = self
+            .subagent_harness(agent_builder)
+            .identity(identity)
+            .hook(child_hooks)
+            .build();
+        let lifetime = agent.cache_lifetime();
+        Ok(FinishedSubagent {
+            subagent: subagent_id,
+            tier: Some(tier),
+            model: Some(model),
+            commit_ledger,
+            body: SubagentBody::Agent {
+                agent: Box::new(agent),
+                child_job_registry,
+                lifetime,
+            },
+        })
+    }
+
+    /// The harness mechanisms every subagent's agent carries, a named
+    /// subagent's and a fork's alike, applied last over what its source and
+    /// terminal set.
+    ///
+    /// Keep-alive is configured only for the Claude client, whose subagents
+    /// run on the five-minute cache: in-run waits are covered by the
+    /// keep-alive and a finished subagent is continuable until that entry
+    /// expires. A fork gets it over the cache it inherits from the main agent.
+    fn subagent_harness(
+        &self,
+        agent_builder: AgentBuilder<LLM, LLM, LLM, ()>,
+    ) -> AgentBuilder<LLM, LLM, LLM, ()> {
+        match &self.cache_keep_alive {
             Some(keep_alive) => agent_builder
                 .cache_keep_alive(keep_alive.clone())
                 .claude_cache_ttl(aither_core::llm::model::ClaudePromptCacheTtl::FiveMinutes),
             None => agent_builder,
-        };
-
-        Ok((
-            agent_builder.hook(child_hooks).build(),
-            subagent_id,
-            model,
-            child_job_registry,
-            commit_ledger,
-        ))
+        }
     }
 
-    /// Returns the subagent a call runs: a fresh agent for
-    /// [`SubagentArgs::Start`], or the finished one
-    /// [`SubagentArgs::Resume`] names; the second value is the continued
+    /// Returns the subagent a call runs: a fresh one for a start call, or
+    /// the finished one `resume` names; the second value is the continued
     /// id.
     async fn acquire(
         &self,
-        args: SubagentArgs,
+        call: Call<'_>,
         prompt: &str,
+        started_by: Option<&CallIdentity>,
+        caller: Option<&Path>,
     ) -> anyhow::Result<(FinishedSubagent<LLM>, Option<u64>)> {
-        match args {
-            SubagentArgs::Start {
-                ref subagent,
-                model,
-                ..
-            } => {
-                let resolved = self.resolve_source(subagent).await?;
-                if let (
-                    subagent_id,
-                    _,
-                    Source::Registered(SubagentType {
-                        origin: Origin::External(backend),
-                        ..
-                    }),
-                ) = &resolved
-                {
-                    let finished = self
-                        .start_external(subagent_id.clone(), backend, &args)
-                        .await?;
-                    return Ok((finished, None));
-                }
-                let grant = args.grant(
-                    self.binding
-                        .as_ref()
-                        .map(TerminalBinding::working_dir)
-                        .or(self.base_dir.as_deref()),
-                );
-                let (agent, subagent, model, child_job_registry, commit_ledger) =
-                    self.start_agent(resolved, model, grant, prompt).await?;
-                let lifetime = agent.cache_lifetime();
-                Ok((
-                    FinishedSubagent {
-                        subagent,
-                        model: Some(model),
-                        commit_ledger,
-                        body: SubagentBody::Agent {
-                            agent: Box::new(agent),
-                            child_job_registry,
-                            lifetime,
-                        },
-                    },
-                    None,
-                ))
-            }
-            SubagentArgs::Resume { id, .. } => {
+        let (resolved, grant) = match call {
+            Call::Resume { id } => {
                 let finished = self.finished.checkout(id)?;
                 tracing::info!(subagent = %finished.subagent, id, "Continuing subagent");
-                Ok((*finished, Some(id)))
+                return Ok((*finished, Some(id)));
             }
-        }
+            Call::External { agent, grant } => {
+                return Ok((self.start_external(agent, grant, caller).await?, None));
+            }
+            Call::Fork { grant } => (
+                Resolved {
+                    name: "fork".to_string(),
+                    tier: None,
+                    source: Source::Fork,
+                },
+                grant,
+            ),
+            Call::Named { name, grant } => (self.named_source(name, grant, caller).await?, grant),
+        };
+        let grant = grant.grant(self.caller_dir(caller));
+        Ok((
+            self.start_agent(resolved, grant, prompt, started_by)
+                .await?,
+            None,
+        ))
     }
 
     /// Picks the model a subagent call runs on.
     ///
-    /// A `chosen` tier — from a `start` call's `model` or the definition —
-    /// is used as given. Without one, [`route_model`](Self::route_model)
+    /// A `chosen` tier — the definition's or the main
+    /// agent's for a fork — is used as given. Without one, [`route_model`](Self::route_model)
     /// asks the fast model which configured tier fits the prompt.
     async fn select_model(
         &self,
@@ -1624,22 +1603,6 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         };
         Ok((routing.model, name))
     }
-
-    /// Register all builtin subagents.
-    ///
-    /// Loads subagents from embedded definition files (explore, plan, etc.).
-    #[must_use]
-    pub fn with_builtins(mut self) -> Self {
-        for def in crate::builtin_subagents() {
-            self = self.with_definition(def);
-        }
-        self.with_type(
-            "fork",
-            SubagentType::fork(
-                "Continues your own context on your model; use it for work that depends on what you have read and decided",
-            ),
-        )
-    }
 }
 
 impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
@@ -1700,18 +1663,18 @@ where
     type Arguments = SubagentArgs;
     type Res = ToolResult;
 
-    async fn call(
-        &self,
-        args: Self::Arguments,
-        _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
+        let call = args.call()?;
         // The task prompt comes from a file; inline prompt text is rejected.
-        let prompt = self.read_prompt(args.prompt_file()).await?;
+        // Relative paths and `agents/` resolve where the calling process was.
+        let caller = cx.working_dir().map(Path::new);
+        let prompt = self.read_prompt(args.prompt_file(), caller).await?;
 
-        let (finished, resumed) = self.acquire(args, &prompt).await?;
+        let (finished, resumed) = self.acquire(call, &prompt, cx.identity(), caller).await?;
         let (
             FinishedSubagent {
                 subagent: subagent_id,
+                tier,
                 model,
                 commit_ledger,
                 mut body,
@@ -1790,6 +1753,7 @@ where
             resumed,
             FinishedSubagent {
                 subagent: subagent_id.clone(),
+                tier,
                 model: model.clone(),
                 commit_ledger,
                 body,
@@ -1800,6 +1764,7 @@ where
             SubagentResultTemplate {
                 subagent: &subagent_id,
                 outcome: SubagentReport::Completed {
+                    tier: tier.map(tier_label),
                     model: model.as_deref(),
                     result: &result,
                     id,
@@ -1812,6 +1777,27 @@ where
             .expect("subagent result template must render"),
         ))
     }
+}
+
+impl<LLM> CommandUsage for SubagentTool<LLM>
+where
+    LLM: LanguageModel + Clone + Sync + 'static,
+{
+    /// The names a call can run at the moment of the call.
+    fn usage(&self) -> impl std::future::Future<Output = String> + Send {
+        self.usage_text()
+    }
+}
+
+/// What a call that does not parse is told it can run.
+#[derive(Template)]
+#[template(path = "subagent_usage.txt", escape = "none")]
+struct SubagentUsageTemplate<'a> {
+    /// The names that resolve, global ones shadowing local ones.
+    subagents: &'a [Listed],
+    fork: &'a str,
+    /// The connected external agents, by name, with their descriptions.
+    externals: Vec<(&'a str, &'a str)>,
 }
 
 /// The error text for a failed run, with the tail of its history.
@@ -1939,46 +1925,92 @@ mod tests {
 
     use super::*;
 
+    /// The argument schema, as the terminal's command parser reads it.
+    fn args_schema() -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(SubagentArgs)).expect("schema serializes")
+    }
+
+    /// Parses `words` the way the `subagent` terminal command does.
+    fn parse_cli(words: &[&str]) -> anyhow::Result<SubagentArgs> {
+        let words: Vec<String> = words.iter().map(ToString::to_string).collect();
+        let json = aither_sandbox::cli_to_json(&args_schema(), &words)?;
+        Ok(serde_json::from_value(json)?)
+    }
+
     #[test]
-    fn subagent_args_schema() {
-        let schema = schemars::schema_for!(SubagentArgs);
-        let value = schema.to_value();
-        let variants = value
-            .get("oneOf")
-            .and_then(serde_json::Value::as_array)
-            .expect("start and resume are tagged-enum variants");
-        assert_eq!(variants.len(), 2);
+    fn the_name_and_the_brief_are_the_positional_arguments() {
+        let args = parse_cli(&["explore", "p.md"]).expect("a name and a brief parse");
+        assert_eq!(args.subagent(), Some("explore"));
+        assert_eq!(args.prompt_file(), "p.md");
+        assert!(matches!(
+            args.call().unwrap(),
+            Call::Named {
+                name: "explore",
+                ..
+            }
+        ));
 
-        let requires = |variant: &serde_json::Value, field: &str| {
-            variant
-                .get("required")
-                .and_then(serde_json::Value::as_array)
-                .expect("a variant lists its required fields")
-                .contains(&serde_json::json!(field))
+        let error = parse_cli(&[]).expect_err("a bare `subagent` names no subagent");
+        assert_eq!(error.to_string(), "missing required argument: name");
+        let schema = args_schema();
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["name", "prompt_file"]),
+            "only the name and the brief are positional"
+        );
+        assert!(
+            !schema["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("model"),
+            "no call takes a model"
+        );
+    }
+
+    #[test]
+    fn fork_resume_and_external_are_reserved_names_with_their_own_options() {
+        let fork = parse_cli(&["fork", "p.md", "--worktrees", "wt"]).expect("fork parses");
+        assert_eq!(fork.subagent(), Some("fork"));
+        let Call::Fork { grant } = fork.call().unwrap() else {
+            panic!("`fork` forks");
         };
-        let start = variants
-            .iter()
-            .find(|variant| requires(variant, "subagent"))
-            .expect("one variant starts a subagent");
-        let resume = variants
-            .iter()
-            .find(|variant| requires(variant, "id"))
-            .expect("one variant continues a subagent");
+        assert_eq!(
+            grant.paths(Some(Path::new("/base"))),
+            (vec![PathBuf::from("/base/wt")], vec![]),
+            "a fork keeps its worktree grants"
+        );
 
-        assert!(requires(start, "prompt_file"));
-        assert!(
-            !requires(start, "model"),
-            "`model` stays optional; the caller may leave routing to the tool"
-        );
-        assert!(requires(resume, "prompt_file"));
-        let resume_props = resume
-            .get("properties")
-            .and_then(serde_json::Value::as_object)
-            .expect("resume has properties");
-        assert!(
-            !resume_props.contains_key("model") && !resume_props.contains_key("subagent"),
-            "a continuation keeps its model and its subagent type"
-        );
+        let resume =
+            parse_cli(&["resume", "--id", "3", "--prompt-file", "p.md"]).expect("resume parses");
+        assert_eq!(resume.subagent(), None);
+        assert!(matches!(resume.call().unwrap(), Call::Resume { id: 3 }));
+
+        let external = parse_cli(&["external", "p.md", "--agent", "codex"]).expect("parses");
+        assert_eq!(external.subagent(), Some("codex"));
+        assert!(matches!(
+            external.call().unwrap(),
+            Call::External { agent: "codex", .. }
+        ));
+
+        for (words, refused) in [
+            (&["resume", "p.md"][..], "takes the `--id`"),
+            (
+                &["resume", "p.md", "--id", "3", "--worktrees", "wt"],
+                "keeps what it was granted",
+            ),
+            (
+                &["explore", "p.md", "--id", "3"],
+                "use it with `subagent resume`",
+            ),
+            (
+                &["fork", "p.md", "--agent", "codex"],
+                "use it with `subagent external`",
+            ),
+            (&["external", "p.md"], "takes the `--agent`"),
+        ] {
+            let error = parse_cli(words).unwrap().call().map(|_| ()).unwrap_err();
+            assert!(error.to_string().contains(refused), "{words:?}: {error}");
+        }
     }
 
     #[test]
@@ -2014,6 +2046,7 @@ mod tests {
         let completed = SubagentResultTemplate {
             subagent: "research",
             outcome: SubagentReport::Completed {
+                tier: Some("fast"),
                 model: Some("test-model"),
                 result: "done",
                 id: 7,
@@ -2026,12 +2059,32 @@ mod tests {
         .expect("subagent result should render");
         assert_eq!(
             completed,
-            "Subagent 'research' completed (model: test-model).\n\ndone\n\nContinue this subagent with `subagent resume --id 7` while its prompt cache is still warm."
+            "Subagent 'research' completed (fast tier, model: test-model).\n\ndone\n\nContinue this subagent with `subagent resume --id 7` while its prompt cache is still warm."
+        );
+
+        let external = SubagentResultTemplate {
+            subagent: "codex",
+            outcome: SubagentReport::Completed {
+                tier: None,
+                model: Some("its-model"),
+                result: "done",
+                id: 7,
+                cache_bound: false,
+                alert: None,
+            },
+            commits: None,
+        }
+        .render()
+        .expect("subagent result should render");
+        assert_eq!(
+            external,
+            "Subagent 'codex' completed (model: its-model).\n\ndone\n\nContinue this subagent with `subagent resume --id 7`."
         );
 
         let without_model = SubagentResultTemplate {
             subagent: "research",
             outcome: SubagentReport::Completed {
+                tier: None,
                 model: None,
                 result: "done",
                 id: 7,
@@ -2070,6 +2123,7 @@ mod tests {
         let completed = SubagentResultTemplate {
             subagent: "worker",
             outcome: SubagentReport::Completed {
+                tier: None,
                 model: None,
                 result: "done",
                 id: 3,
@@ -2135,6 +2189,49 @@ mod tests {
         dir
     }
 
+    /// A global subagents directory holding the bundled subagents, beside a
+    /// working directory whose `agents/` a test may fill.
+    struct Bundled {
+        root: tempfile::TempDir,
+    }
+
+    impl Bundled {
+        async fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            crate::install_bundled_subagents(&root.path().join("global"))
+                .await
+                .unwrap();
+            std::fs::create_dir_all(root.path().join("work")).unwrap();
+            Self { root }
+        }
+
+        fn global(&self) -> PathBuf {
+            self.root.path().join("global")
+        }
+
+        fn work(&self) -> PathBuf {
+            self.root.path().join("work")
+        }
+
+        /// A tool on `llm` resolving names in these directories.
+        fn tool<LLM: Clone + Sync>(&self, llm: LLM) -> SubagentTool<LLM> {
+            SubagentTool::new(llm, self.global()).with_base_dir(self.work())
+        }
+    }
+
+    /// Writes a definition of `name` into `dir`.
+    fn write_definition(dir: &Path, name: &str, tier: Option<&str>, access: &str, prompt: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let tier = tier.map_or_else(String::new, |tier| format!("tier = \"{tier}\"\n"));
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\ndescription = \"the {name} subagent\"\n{tier}access = \"{access}\"\nprompt = '''\n{prompt}\n'''\n"
+            ),
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn resolves_file_through_mount_prefix() {
         let root = unique_temp_dir("mount-resolve");
@@ -2144,12 +2241,12 @@ mod tests {
             .expect("create skill parent");
         std::fs::write(&skill_file, "# slide").expect("write skill file");
 
-        let tool = SubagentTool::new(()).with_file_mounts([
+        let tool = SubagentTool::new((), root.join("global")).with_file_mounts([
             SubagentFileMount::new(".", root.join("workspace")),
             SubagentFileMount::new(".skills", skills_root.clone()),
         ]);
         let resolved = SubagentTool::<()>::resolve_subagent_path(
-            &tool.effective_mounts(),
+            &tool.effective_mounts(None),
             tool.base_dir.as_deref(),
             Path::new(".skills/slide/SKILL.md"),
         )
@@ -2163,11 +2260,11 @@ mod tests {
     #[tokio::test]
     async fn rejects_parent_traversal_paths() {
         let root = unique_temp_dir("mount-traversal");
-        let tool = SubagentTool::new(())
+        let tool = SubagentTool::new((), root.join("global"))
             .with_file_mounts([SubagentFileMount::new("skills", root.join("skills"))]);
 
         let error = SubagentTool::<()>::resolve_subagent_path(
-            &tool.effective_mounts(),
+            &tool.effective_mounts(None),
             tool.base_dir.as_deref(),
             Path::new("../outside.md"),
         )
@@ -2188,11 +2285,11 @@ mod tests {
         let root = unique_temp_dir("mount-errors");
         let skills_root = root.join("skills");
         std::fs::create_dir_all(&skills_root).expect("create skills root");
-        let tool = SubagentTool::new(())
+        let tool = SubagentTool::new((), root.join("global"))
             .with_file_mounts([SubagentFileMount::new("skills", skills_root.clone())]);
 
         let error = SubagentTool::<()>::resolve_subagent_path(
-            &tool.effective_mounts(),
+            &tool.effective_mounts(None),
             tool.base_dir.as_deref(),
             Path::new(".skills/missing.md"),
         )
@@ -2228,8 +2325,12 @@ mod tests {
         }
     }
 
+    /// Routes a structured-output request to the fast tier.
+    const ROUTE_FAST: &str = r#"{"model":"fast"}"#;
+
     /// A model whose `respond` stream never yields, so the child query
-    /// stays in flight until the run is cancelled.
+    /// stays in flight until the run is cancelled. It routes every prompt
+    /// to the fast tier.
     #[derive(Clone)]
     struct PendingLlm;
 
@@ -2238,9 +2339,15 @@ mod tests {
 
         fn respond(
             &self,
-            _request: LLMRequest,
+            request: LLMRequest,
         ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
-            futures_lite::stream::pending()
+            if request.parameters().structured_outputs {
+                futures::future::Either::Left(futures_lite::stream::iter([Ok(Event::Text(
+                    ROUTE_FAST.to_string(),
+                ))]))
+            } else {
+                futures::future::Either::Right(futures_lite::stream::pending())
+            }
         }
 
         fn profile(
@@ -2316,48 +2423,32 @@ mod tests {
         (dir, prompt_file)
     }
 
-    fn worker_tool<LLM: LanguageModel + Clone + Sync>(
-        tool: SubagentTool<LLM>,
-    ) -> SubagentTool<LLM> {
-        tool.with_type(
-            "worker",
-            SubagentType::new("worker for tests", |llm| {
-                crate::AgentBuilder::new(llm)
-                    .agent_kind(crate::AgentKind::Chatbot)
-                    .max_iterations(2)
-            }),
-        )
+    /// A call of the subagent `name` reading its brief from `prompt_file`.
+    fn named(name: &str, prompt_file: &Path) -> SubagentArgs {
+        SubagentArgs {
+            name: name.to_string(),
+            prompt_file: prompt_file.to_string_lossy().into_owned(),
+            id: None,
+            agent: None,
+            worktrees: Vec::new(),
+            commit_worktrees: Vec::new(),
+        }
+    }
+
+    /// An `explore` call reading its prompt from `prompt_file`.
+    fn explore(prompt_file: &Path) -> SubagentArgs {
+        named("explore", prompt_file)
     }
 
     #[tokio::test]
     async fn cancelled_run_returns_cancelled_result() {
         let runs = SubagentRuns::default();
-        let tool = SubagentTool::new(PendingLlm)
-            .with_runs(runs.clone())
-            .with_type(
-                "explore",
-                SubagentType::new("explorer", |llm| {
-                    crate::AgentBuilder::new(llm)
-                        .agent_kind(crate::AgentKind::Chatbot)
-                        .max_iterations(5)
-                }),
-            );
+        let bundled = Bundled::new().await;
+        let tool = bundled.tool(PendingLlm).with_runs(runs.clone());
         let (dir, prompt_file) = write_prompt_file("cancelled-run", "survey the codebase");
 
-        let prompt_path = prompt_file.to_string_lossy().into_owned();
         let call = tokio::spawn(async move {
-            Tool::call(
-                &tool,
-                SubagentArgs::Start {
-                    worktrees: Vec::new(),
-                    commit_worktrees: Vec::new(),
-                    subagent: "explore".to_string(),
-                    prompt_file: prompt_path,
-                    model: Some(ModelTier::Fast),
-                },
-                ToolContext::new(),
-            )
-            .await
+            Tool::call(&tool, explore(&prompt_file), ToolContext::new()).await
         });
 
         // Wait for the run to register before cancelling it.
@@ -2410,6 +2501,7 @@ mod tests {
     struct CommitFixture {
         _dirs: [tempfile::TempDir; 2],
         _cache: crate::test_support::TempDir,
+        bundled: Bundled,
         terminal: aither_sandbox::TerminalTool<
             aither_sandbox::permission::NoopPermissionHandler,
             executor_core::tokio::TokioGlobal,
@@ -2459,6 +2551,7 @@ mod tests {
             Self {
                 _dirs: [work, source],
                 _cache: cache,
+                bundled: Bundled::new().await,
                 terminal,
                 repository,
                 worktree,
@@ -2471,30 +2564,21 @@ mod tests {
             llm: LLM,
             runs: &SubagentRuns,
         ) -> SubagentTool<LLM> {
-            SubagentTool::new(llm)
+            SubagentTool::new(llm, self.bundled.global())
                 .with_runs(runs.clone())
-                .with_type(
-                    "worker",
-                    SubagentType::new("worker", |llm| {
-                        crate::AgentBuilder::new(llm)
-                            .agent_kind(crate::AgentKind::Chatbot)
-                            .max_iterations(5)
-                    }),
-                )
+                .with_agent_setup("general", |builder| builder.max_iterations(5))
                 .for_terminal(self.terminal.binding())
         }
 
-        /// Starts a subagent granted commit in the fixture's worktree.
+        /// Starts a `general` subagent granted commit in the fixture's
+        /// worktree.
         fn start(&self, tag: &str) -> (PathBuf, SubagentArgs) {
             let (dir, prompt_file) = write_prompt_file(tag, "work in the worktree");
             (
                 dir,
-                SubagentArgs::Start {
-                    worktrees: Vec::new(),
+                SubagentArgs {
                     commit_worktrees: vec![self.worktree.to_string_lossy().into_owned()],
-                    subagent: "worker".to_string(),
-                    prompt_file: prompt_file.to_string_lossy().into_owned(),
-                    model: Some(ModelTier::Fast),
+                    ..named("general", &prompt_file)
                 },
             )
         }
@@ -2526,8 +2610,11 @@ mod tests {
 
         fn respond(
             &self,
-            _request: LLMRequest,
+            request: LLMRequest,
         ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            if request.parameters().structured_outputs {
+                return futures_lite::stream::iter([Ok(Event::Text(ROUTE_FAST.to_string()))]);
+            }
             let answer = match self.step {
                 CommitStep::Commit => {
                     git(
@@ -2607,7 +2694,7 @@ mod tests {
             .await
             .expect("the run completes");
         let text = result.render_for_model();
-        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
+        assert!(text.starts_with("Subagent 'general' completed"), "{text}");
         assert_eq!(listed_subjects(&text), ["made by the subagent"], "{text}");
 
         let _ = std::fs::remove_dir_all(dir);
@@ -2626,7 +2713,7 @@ mod tests {
             .expect_err("the run fails");
         let failure = error.to_string();
         assert!(
-            failure.starts_with("Subagent 'worker' error: "),
+            failure.starts_with("Subagent 'general' error: "),
             "{failure}"
         );
         assert!(failure.contains("never resolves"), "{failure}");
@@ -2652,7 +2739,7 @@ mod tests {
             .await
             .expect("the run's outcome survives the listing failure");
         let text = result.render_for_model();
-        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
+        assert!(text.starts_with("Subagent 'general' completed"), "{text}");
         assert!(text.contains("\n\ndone\n\n"), "{text}");
         assert_eq!(
             continuation_id(&text),
@@ -2696,7 +2783,7 @@ mod tests {
             .expect("subagent call failed");
         let text = result.render_for_model();
         assert!(
-            text.starts_with("Subagent 'worker' was cancelled by the user."),
+            text.starts_with("Subagent 'general' was cancelled by the user."),
             "{text}"
         );
         assert_eq!(listed_subjects(&text), ["made during the run"], "{text}");
@@ -2706,16 +2793,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_grant_without_a_terminal_is_refused() {
-        let tool = worker_tool(SubagentTool::new(TextLlm::new("only-model")));
+        let bundled = Bundled::new().await;
+        let tool = bundled.tool(TextLlm::routing("only-model", ROUTE_FAST));
         let (dir, prompt_file) = write_prompt_file("grant-without-terminal", "do it");
         let error = Tool::call(
             &tool,
-            SubagentArgs::Start {
+            SubagentArgs {
                 worktrees: vec!["somewhere".to_string()],
-                commit_worktrees: Vec::new(),
-                subagent: "worker".to_string(),
-                prompt_file: prompt_file.to_string_lossy().into_owned(),
-                model: Some(ModelTier::Fast),
+                ..named("general", &prompt_file)
             },
             ToolContext::new(),
         )
@@ -2730,17 +2815,12 @@ mod tests {
 
     #[tokio::test]
     async fn inline_prompt_text_is_rejected() {
-        let tool = worker_tool(SubagentTool::new(TextLlm::new("only-model")));
+        let bundled = Bundled::new().await;
+        let tool = bundled.tool(TextLlm::new("only-model"));
 
         let error = Tool::call(
             &tool,
-            SubagentArgs::Start {
-                worktrees: Vec::new(),
-                commit_worktrees: Vec::new(),
-                subagent: "worker".to_string(),
-                prompt_file: "summarize the repository layout".to_string(),
-                model: Some(ModelTier::Fast),
-            },
+            explore(Path::new("summarize the repository layout")),
             ToolContext::new(),
         )
         .await
@@ -2753,22 +2833,13 @@ mod tests {
 
     #[tokio::test]
     async fn empty_prompt_file_is_rejected() {
-        let tool = worker_tool(SubagentTool::new(TextLlm::new("only-model")));
+        let bundled = Bundled::new().await;
+        let tool = bundled.tool(TextLlm::new("only-model"));
         let (dir, prompt_file) = write_prompt_file("empty-prompt", "   \n");
 
-        let error = Tool::call(
-            &tool,
-            SubagentArgs::Start {
-                worktrees: Vec::new(),
-                commit_worktrees: Vec::new(),
-                subagent: "worker".to_string(),
-                prompt_file: prompt_file.to_string_lossy().into_owned(),
-                model: Some(ModelTier::Fast),
-            },
-            ToolContext::new(),
-        )
-        .await
-        .expect_err("empty prompt file must be rejected");
+        let error = Tool::call(&tool, explore(&prompt_file), ToolContext::new())
+            .await
+            .expect_err("empty prompt file must be rejected");
         assert!(
             error.to_string().contains("is empty"),
             "error should report the empty file: {error}"
@@ -2777,118 +2848,300 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[tokio::test]
-    async fn explicit_model_runs_as_given() {
-        let tool = worker_tool(
-            SubagentTool::new(TextLlm::new("advanced-model"))
-                .with_balanced_model(TextLlm::new("balanced-model"))
-                .with_fast_model(TextLlm::new("fast-model")),
-        );
-        let (dir, prompt_file) = write_prompt_file("explicit-model", "do the task");
-
-        let result = Tool::call(
-            &tool,
-            SubagentArgs::Start {
-                worktrees: Vec::new(),
-                commit_worktrees: Vec::new(),
-                subagent: "worker".to_string(),
-                prompt_file: prompt_file.to_string_lossy().into_owned(),
-                model: Some(ModelTier::Fast),
-            },
-            ToolContext::new(),
-        )
-        .await
-        .expect("subagent call failed");
-        let ToolResult::Text { text } = result else {
-            panic!("expected text result, got {result:?}");
-        };
-        assert_eq!(
-            text,
-            "Subagent 'worker' completed (model: fast-model).\n\nfast-model\n\nContinue this subagent with `subagent resume --id 1` while its prompt cache is still warm."
-        );
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn missing_model_is_routed_by_fast_model() {
-        let tool = worker_tool(
-            SubagentTool::new(TextLlm::new("advanced-model"))
-                .with_balanced_model(TextLlm::new("balanced-model"))
-                .with_fast_model(TextLlm::routing("fast-model", r#"{"model":"balanced"}"#)),
-        );
-        let (dir, prompt_file) = write_prompt_file("routed-model", "do the task");
-
-        let result = Tool::call(
-            &tool,
-            SubagentArgs::Start {
-                worktrees: Vec::new(),
-                commit_worktrees: Vec::new(),
-                subagent: "worker".to_string(),
-                prompt_file: prompt_file.to_string_lossy().into_owned(),
-                model: None,
-            },
-            ToolContext::new(),
-        )
-        .await
-        .expect("subagent call failed");
-        let ToolResult::Text { text } = result else {
-            panic!("expected text result, got {result:?}");
-        };
-        assert_eq!(
-            text,
-            "Subagent 'worker' completed (model: balanced-model).\n\nbalanced-model\n\nContinue this subagent with `subagent resume --id 1` while its prompt cache is still warm."
-        );
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn definition_model_is_used_when_caller_gives_none() {
-        let root = unique_temp_dir("definition-model");
-        let def_path = root.join("file-agent.md");
-        std::fs::write(
-            &def_path,
-            r"---
-version: 1
-name: file-agent
-description: agent loaded from a file
-model: fast
----
-
-You are a file-defined agent.
-",
-        )
-        .expect("write subagent definition");
-        let (dir, prompt_file) = write_prompt_file("definition-model-prompt", "do the task");
-
-        let tool = SubagentTool::new(TextLlm::new("advanced-model"))
+    /// A tool whose tiers answer under their own names; the fast model
+    /// routes every prompt to `routed`.
+    fn tiered_tool(bundled: &Bundled, routed: &'static str) -> SubagentTool<TextLlm> {
+        bundled
+            .tool(TextLlm::new("advanced-model"))
             .with_balanced_model(TextLlm::new("balanced-model"))
-            .with_fast_model(TextLlm::new("fast-model"));
+            .with_fast_model(TextLlm::routing("fast-model", routed))
+    }
 
-        let result = Tool::call(
+    /// Runs `args` and returns its result text.
+    async fn completed_text<LLM: LanguageModel + Clone + Sync + 'static>(
+        tool: &SubagentTool<LLM>,
+        args: SubagentArgs,
+    ) -> String {
+        let result = Tool::call(tool, args, ToolContext::new())
+            .await
+            .expect("subagent call failed");
+        let ToolResult::Text { text } = result else {
+            panic!("expected text result, got {result:?}");
+        };
+        text
+    }
+
+    #[tokio::test]
+    async fn each_bundled_subagent_runs_on_its_stated_tier() {
+        // The router would pick balanced, which no bundled subagent states.
+        let bundled = Bundled::new().await;
+        let tool = tiered_tool(&bundled, r#"{"model":"balanced"}"#);
+        let (dir, prompt_file) = write_prompt_file("stated-tier", "do the task");
+        let calls = [
+            ("explore", "fast"),
+            ("research", "fast"),
+            ("audit", "advanced"),
+            ("review", "advanced"),
+            ("plan", "advanced"),
+        ];
+        for (id, (subagent, tier)) in (1..).zip(calls) {
+            assert_eq!(
+                completed_text(&tool, named(subagent, &prompt_file)).await,
+                format!(
+                    "Subagent '{subagent}' completed ({tier} tier, model: {tier}-model).\n\n{tier}-model\n\nContinue this subagent with `subagent resume --id {id}` while its prompt cache is still warm."
+                )
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A script that `cd`s into a skill runs `subagent art_direction
+    /// --prompt-file brief.md`: the request carries that directory, and both
+    /// the skill's `agents/` and its brief resolve there, not in the
+    /// terminal's starting directory.
+    #[tokio::test]
+    async fn subagent_after_cd_resolves_agents_and_brief_in_the_callers_directory() {
+        let bundled = Bundled::new().await;
+        let skill = bundled.root.path().join("work/skills/slide");
+        write_definition(
+            &skill.join("agents"),
+            "art_direction",
+            Some("fast"),
+            "read_only",
+            "direct the art",
+        );
+        std::fs::write(skill.join("brief.md"), "design the deck").unwrap();
+        let tool = tiered_tool(&bundled, r#"{"model":"fast"}"#);
+        let args = |name: &str| named(name, Path::new("brief.md"));
+        let in_skill = || ToolContext::new().with_working_dir(skill.to_string_lossy());
+
+        let result = Tool::call(&tool, args("art_direction"), in_skill())
+            .await
+            .expect("agents/ and the brief resolve in the caller's directory");
+        let ToolResult::Text { text } = result else {
+            panic!("expected text result, got {result:?}");
+        };
+        assert!(
+            text.starts_with("Subagent 'art_direction' completed"),
+            "{text}"
+        );
+
+        // From the terminal's starting directory neither exists.
+        let error = Tool::call(&tool, args("art_direction"), ToolContext::new())
+            .await
+            .expect_err("the starting directory holds neither the brief nor agents/");
+        assert!(error.to_string().contains("brief.md"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn general_runs_on_and_reports_the_tier_routing_picked() {
+        let bundled = Bundled::new().await;
+        let (dir, prompt_file) = write_prompt_file("routed-tier", "do the task");
+        for (routed, tier) in [
+            (r#"{"model":"balanced"}"#, "balanced"),
+            (r#"{"model":"advanced"}"#, "advanced"),
+        ] {
+            let text = completed_text(
+                &tiered_tool(&bundled, routed),
+                named("general", &prompt_file),
+            )
+            .await;
+            assert_eq!(
+                text,
+                format!(
+                    "Subagent 'general' completed ({tier} tier, model: {tier}-model).\n\n{tier}-model\n\nContinue this subagent with `subagent resume --id 1` while its prompt cache is still warm."
+                )
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A model that answers with its own name and the role marker its
+    /// request carries, so a result shows which tier ran which role prompt.
+    /// Structured-output requests get `structured` back, which lets the fast
+    /// model play router.
+    #[derive(Clone)]
+    struct RoleLlm {
+        name: &'static str,
+        structured: &'static str,
+    }
+
+    /// The role prompts [`RoleLlm`] tells apart.
+    const ROLE_MARKERS: [&str; 3] = ["GLOBAL-ROLE", "LOCAL-ROLE", "ONLY-LOCAL-ROLE"];
+
+    impl LanguageModel for RoleLlm {
+        type Error = NeverError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let text = if request.parameters().structured_outputs {
+                self.structured.to_string()
+            } else {
+                let sent = serde_json::to_string(request.messages()).unwrap();
+                let role = ROLE_MARKERS
+                    .iter()
+                    .rev()
+                    .find(|marker| sent.contains(*marker))
+                    .unwrap_or(&"no role");
+                format!("{} ran {role}", self.name)
+            };
+            futures_lite::stream::iter([Ok(Event::Text(text))])
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                self.name,
+                "test",
+                self.name,
+                "role mock",
+                128_000,
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn global_and_local_definitions_run_as_declared_and_a_global_name_wins() {
+        let bundled = Bundled::new().await;
+        let local = bundled.work().join(crate::LOCAL_SUBAGENTS_DIR);
+        write_definition(
+            &bundled.global(),
+            "shared",
+            Some("fast"),
+            "read_only",
+            "GLOBAL-ROLE",
+        );
+        write_definition(
+            &local,
+            "shared",
+            Some("advanced"),
+            "worktrees",
+            "LOCAL-ROLE",
+        );
+        write_definition(&local, "only_local", None, "worktrees", "ONLY-LOCAL-ROLE");
+        let role = |name| RoleLlm {
+            name,
+            structured: r#"{"model":"balanced"}"#,
+        };
+        let tool = bundled
+            .tool(role("advanced-model"))
+            .with_balanced_model(role("balanced-model"))
+            .with_fast_model(role("fast-model"));
+        let (dir, prompt_file) = write_prompt_file("definitions", "do the task");
+
+        let shared = completed_text(&tool, named("shared", &prompt_file)).await;
+        assert!(
+            shared.starts_with(
+                "Subagent 'shared' completed (fast tier, model: fast-model).\n\nfast-model ran GLOBAL-ROLE\n"
+            ),
+            "the global definition shadows the local one: {shared}"
+        );
+        let only_local = completed_text(&tool, named("only_local", &prompt_file)).await;
+        assert!(
+            only_local.starts_with(
+                "Subagent 'only_local' completed (balanced tier, model: balanced-model).\n\nbalanced-model ran ONLY-LOCAL-ROLE\n"
+            ),
+            "a local definition without a tier is routed: {only_local}"
+        );
+
+        // The global definition's access applies: it takes no grant, while
+        // the local one it shadows would.
+        let error = Tool::call(
             &tool,
-            SubagentArgs::Start {
-                worktrees: Vec::new(),
-                commit_worktrees: Vec::new(),
-                subagent: def_path.to_string_lossy().into_owned(),
-                prompt_file: prompt_file.to_string_lossy().into_owned(),
-                model: None,
+            SubagentArgs {
+                worktrees: vec!["wt".to_string()],
+                ..named("shared", &prompt_file)
             },
             ToolContext::new(),
         )
         .await
-        .expect("subagent call failed");
-        let ToolResult::Text { text } = result else {
-            panic!("expected text result, got {result:?}");
-        };
-        assert_eq!(
-            text,
-            "Subagent 'file-agent' completed (model: fast-model).\n\nfast-model\n\nContinue this subagent with `subagent resume --id 1` while its prompt cache is still warm."
+        .expect_err("a read-only subagent takes no grant");
+        assert!(
+            error.to_string().contains("subagent 'shared' is read-only"),
+            "{error}"
         );
 
         let _ = std::fs::remove_dir_all(dir);
-        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_name_names_both_places_it_was_looked_for() {
+        let bundled = Bundled::new().await;
+        let tool = bundled.tool(TextLlm::new("only-model"));
+        let (dir, prompt_file) = write_prompt_file("unknown-name", "do the task");
+        let error = Tool::call(&tool, named("nowhere", &prompt_file), ToolContext::new())
+            .await
+            .expect_err("an unknown name is refused");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "no subagent 'nowhere': neither the global subagents directory {} nor {} holds nowhere.toml",
+                bundled.global().display(),
+                bundled.work().join("agents").display()
+            )
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_usage_lists_every_name_that_resolves() {
+        let bundled = Bundled::new().await;
+        let local = bundled.work().join(crate::LOCAL_SUBAGENTS_DIR);
+        write_definition(&local, "only_local", None, "read_only", "ONLY-LOCAL-ROLE");
+        write_definition(&local, "explore", None, "read_only", "LOCAL-ROLE");
+        std::fs::write(local.join("broken.toml"), "name = ").unwrap();
+        let tool = bundled.tool(PendingLlm).with_external(
+            "outside",
+            "runs outside aither",
+            TestBackend {
+                log: EventLog::default(),
+                opened: Arc::default(),
+            },
+        );
+
+        let usage = tool.usage().await;
+        let listed: Vec<&str> = usage
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .filter_map(|line| line.split_once(':').map(|(name, _)| name))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "audit",
+                "broken",
+                "explore",
+                "general",
+                "only_local",
+                "plan",
+                "research",
+                "review",
+                "fork",
+                "outside"
+            ],
+            "{usage}"
+        );
+        assert!(
+            usage.contains(&format!(
+                "- explore: {}\n",
+                crate::BUNDLED_SUBAGENTS[0].definition().description
+            )),
+            "the global explore shadows the local one: {usage}"
+        );
+        assert!(
+            usage.contains("- broken: the subagent definition "),
+            "an invalid definition is listed with why: {usage}"
+        );
+        assert!(usage.contains("`subagent resume --id <id>"), "{usage}");
+        assert!(
+            usage.contains("`subagent external --agent <agent>"),
+            "{usage}"
+        );
     }
 
     /// A model that records every request and answers with a scripted
@@ -2959,6 +3212,7 @@ You are a file-defined agent.
     /// tool plus the sender halves and the child's job registry, so the
     /// test can park the run and register the command it waits on.
     fn keep_alive_tool(
+        bundled: &Bundled,
         author: &'static str,
         requests: async_channel::Sender<LLMRequest>,
         keep_alive: Option<crate::config::CacheKeepAlive>,
@@ -2971,7 +3225,7 @@ You are a file-defined agent.
         let (sender, receiver) = aither_sandbox::background_task_channel();
         let (job_registry, job_service) = aither_sandbox::job_registry_channel();
         let child_jobs = job_registry.clone();
-        let tool = SubagentTool::new(KeepAliveMockLlm {
+        let tool = bundled.tool(KeepAliveMockLlm {
             author,
             requests,
             turns: Arc::default(),
@@ -2980,15 +3234,11 @@ You are a file-defined agent.
             Some(keep_alive) => tool.with_cache_keep_alive(keep_alive),
             None => tool,
         }
-        .with_type(
-            "worker",
-            SubagentType::new("worker for keep-alive tests", move |llm| {
-                crate::AgentBuilder::new(llm)
-                    .agent_kind(crate::AgentKind::Chatbot)
-                    .max_iterations(4)
-                    .background_channels(receiver.clone(), child_jobs.clone())
-            }),
-        );
+        .with_agent_setup("explore", move |builder| {
+            builder
+                .max_iterations(4)
+                .background_channels(receiver.clone(), child_jobs.clone())
+        });
         (tool, sender, job_registry, job_service)
     }
 
@@ -3026,7 +3276,9 @@ You are a file-defined agent.
     async fn anthropic_subagent_waiting_on_background_command_gets_keep_alives() {
         let (dir, prompt_file) = write_prompt_file("keep-alive-warm-prompt", "hold a job");
         let (request_tx, request_rx) = async_channel::unbounded();
+        let bundled = Bundled::new().await;
         let (tool, sender, job_registry, job_service) = keep_alive_tool(
+            &bundled,
             "Anthropic",
             request_tx,
             Some(crate::config::CacheKeepAlive {
@@ -3042,18 +3294,7 @@ You are a file-defined agent.
         sender.task_started();
 
         let call = tokio::spawn(async move {
-            Tool::call(
-                &tool,
-                SubagentArgs::Start {
-                    worktrees: Vec::new(),
-                    commit_worktrees: Vec::new(),
-                    subagent: "worker".to_string(),
-                    prompt_file: prompt_file.to_string_lossy().into_owned(),
-                    model: Some(ModelTier::Fast),
-                },
-                ToolContext::new(),
-            )
-            .await
+            Tool::call(&tool, explore(&prompt_file), ToolContext::new()).await
         });
 
         // Hold the job open until two keep-alives have gone out, then
@@ -3075,6 +3316,7 @@ You are a file-defined agent.
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
                 killed: false,
+                timeout_kill: None,
                 result: Ok(aither_sandbox::CompletedCommand {
                     stdout: aither_core::llm::CommandStream::Inline {
                         text: String::new(),
@@ -3091,7 +3333,7 @@ You are a file-defined agent.
             .expect("call task panicked")
             .expect("subagent call failed");
         let text = result.render_for_model();
-        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
+        assert!(text.starts_with("Subagent 'explore' completed"), "{text}");
 
         keep_alives.extend(keep_alive_requests(&request_rx));
         for request in &keep_alives {
@@ -3115,7 +3357,7 @@ You are a file-defined agent.
         // Two keep-alives crossed the configured threshold: the parent gets
         // one alert naming the subagent and the command it waited on.
         assert!(
-            text.contains("Subagent 'worker' needed"),
+            text.contains("Subagent 'explore' needed"),
             "alert names the subagent: {text}"
         );
         assert!(
@@ -3131,25 +3373,15 @@ You are a file-defined agent.
     async fn subagent_without_keep_alive_config_gets_no_keep_alives() {
         let (dir, prompt_file) = write_prompt_file("keep-alive-other-prompt", "hold a job");
         let (request_tx, request_rx) = async_channel::unbounded();
+        let bundled = Bundled::new().await;
         let (tool, sender, job_registry, job_service) =
-            keep_alive_tool("Anthropic", request_tx, None);
+            keep_alive_tool(&bundled, "Anthropic", request_tx, None);
         tokio::spawn(job_service.serve());
         register_running_job(&job_registry, 4243, "sleep 2").await;
         sender.task_started();
 
         let call = tokio::spawn(async move {
-            Tool::call(
-                &tool,
-                SubagentArgs::Start {
-                    worktrees: Vec::new(),
-                    commit_worktrees: Vec::new(),
-                    subagent: "worker".to_string(),
-                    prompt_file: prompt_file.to_string_lossy().into_owned(),
-                    model: Some(ModelTier::Fast),
-                },
-                ToolContext::new(),
-            )
-            .await
+            Tool::call(&tool, explore(&prompt_file), ToolContext::new()).await
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
@@ -3159,6 +3391,7 @@ You are a file-defined agent.
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
                 killed: false,
+                timeout_kill: None,
                 result: Ok(aither_sandbox::CompletedCommand {
                     stdout: aither_core::llm::CommandStream::Inline {
                         text: String::new(),
@@ -3175,7 +3408,7 @@ You are a file-defined agent.
             .expect("call task panicked")
             .expect("subagent call failed");
         let text = result.render_for_model();
-        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
+        assert!(text.starts_with("Subagent 'explore' completed"), "{text}");
         assert!(
             keep_alive_requests(&request_rx).is_empty(),
             "no keep-alive config means no keep-alives"
@@ -3196,31 +3429,17 @@ You are a file-defined agent.
             requests: request_tx,
             turns: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         };
-        let tool = SubagentTool::new(llm).with_type(
-            "worker",
-            SubagentType::new("worker", |llm| {
-                crate::AgentBuilder::new(llm)
-                    .agent_kind(crate::AgentKind::Chatbot)
-                    .max_iterations(2)
-            }),
-        );
+        let bundled = Bundled::new().await;
+        let tool = bundled
+            .tool(llm)
+            .with_agent_setup("explore", |builder| builder.max_iterations(2));
         let (dir, prompt_file) = write_prompt_file("keep-alive-idle", "answer directly");
 
-        let result = Tool::call(
-            &tool,
-            SubagentArgs::Start {
-                worktrees: Vec::new(),
-                commit_worktrees: Vec::new(),
-                subagent: "worker".to_string(),
-                prompt_file: prompt_file.to_string_lossy().into_owned(),
-                model: Some(ModelTier::Fast),
-            },
-            ToolContext::new(),
-        )
-        .await
-        .expect("subagent call failed");
+        let result = Tool::call(&tool, explore(&prompt_file), ToolContext::new())
+            .await
+            .expect("subagent call failed");
         let text = result.render_for_model();
-        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
+        assert!(text.starts_with("Subagent 'explore' completed"), "{text}");
         assert!(
             keep_alive_requests(&request_rx).is_empty(),
             "a run that never waits on a background job gets no keep-alive"
@@ -3234,15 +3453,15 @@ You are a file-defined agent.
         let root = unique_temp_dir("absolute-workspace-skills");
         let workspace_root = root.join("workspace");
         let skills_root = root.join("skills");
-        let session_skills_file = workspace_root.join("skills/slide/subagents/art_direction.md");
-        let mounted_skill_file = skills_root.join("slide/subagents/art_direction.md");
+        let session_skills_file = workspace_root.join("skills/slide/references/layouts.md");
+        let mounted_skill_file = skills_root.join("slide/references/layouts.md");
         std::fs::create_dir_all(session_skills_file.parent().expect("session skill parent"))
             .expect("create session skill parent");
         std::fs::create_dir_all(mounted_skill_file.parent().expect("mounted skill parent"))
             .expect("create mounted skill parent");
-        std::fs::write(&mounted_skill_file, "# art direction").expect("write mounted skill file");
+        std::fs::write(&mounted_skill_file, "# layouts").expect("write mounted skill file");
 
-        let tool = SubagentTool::new(())
+        let tool = SubagentTool::new((), root.join("global"))
             .with_base_dir(workspace_root.clone())
             .with_file_mounts([
                 SubagentFileMount::new(".", workspace_root.clone()),
@@ -3250,7 +3469,7 @@ You are a file-defined agent.
             ]);
 
         let resolved = SubagentTool::<()>::resolve_subagent_path(
-            &tool.effective_mounts(),
+            &tool.effective_mounts(None),
             tool.base_dir.as_deref(),
             &session_skills_file,
         )
@@ -3301,12 +3520,17 @@ You are a file-defined agent.
     /// `keep_alive` marks the tool as serving the Claude client; `lifetime`
     /// overrides the cache lifetime the subagent runs with, and `None`
     /// leaves the one `SubagentTool` itself assigns.
-    fn resume_tool(
+    async fn resume_tool(
         lifetime: Option<CacheLifetime>,
         keep_alive: Option<crate::config::CacheKeepAlive>,
-    ) -> (SubagentTool<EchoLlm>, async_channel::Receiver<LLMRequest>) {
+    ) -> (
+        SubagentTool<EchoLlm>,
+        async_channel::Receiver<LLMRequest>,
+        Bundled,
+    ) {
         let (request_tx, request_rx) = async_channel::unbounded();
-        let tool = SubagentTool::new(EchoLlm {
+        let bundled = Bundled::new().await;
+        let tool = bundled.tool(EchoLlm {
             requests: request_tx,
             replies: Arc::default(),
         });
@@ -3314,27 +3538,22 @@ You are a file-defined agent.
             Some(keep_alive) => tool.with_cache_keep_alive(keep_alive),
             None => tool,
         }
-        .with_type(
-            "worker",
-            SubagentType::new("worker for resume tests", move |llm| {
-                let builder = crate::AgentBuilder::new(llm)
-                    .agent_kind(crate::AgentKind::Chatbot)
-                    .max_iterations(2);
-                match lifetime {
-                    Some(lifetime) => builder.prompt_cache(
-                        crate::context::PromptCache::new("resume-test").with_lifetime(lifetime),
-                    ),
-                    None => builder,
-                }
-            }),
-        );
-        (tool, request_rx)
+        .with_agent_setup("explore", move |builder| {
+            let builder = builder.max_iterations(2);
+            match lifetime {
+                Some(lifetime) => builder.prompt_cache(
+                    crate::context::PromptCache::new("resume-test").with_lifetime(lifetime),
+                ),
+                None => builder,
+            }
+        });
+        (tool, request_rx, bundled)
     }
 
     fn resume_args(prompt_file: &Path, resume: u64) -> SubagentArgs {
-        SubagentArgs::Resume {
-            id: resume,
-            prompt_file: prompt_file.to_string_lossy().into_owned(),
+        SubagentArgs {
+            id: Some(resume),
+            ..named("resume", prompt_file)
         }
     }
 
@@ -3353,19 +3572,9 @@ You are a file-defined agent.
 
     /// Runs the first call and returns its result text and continuation id.
     async fn first_run(tool: &SubagentTool<EchoLlm>, prompt_file: &Path) -> (String, u64) {
-        let result = Tool::call(
-            tool,
-            SubagentArgs::Start {
-                worktrees: Vec::new(),
-                commit_worktrees: Vec::new(),
-                subagent: "worker".to_string(),
-                prompt_file: prompt_file.to_string_lossy().into_owned(),
-                model: Some(ModelTier::Fast),
-            },
-            ToolContext::new(),
-        )
-        .await
-        .expect("subagent call failed");
+        let result = Tool::call(tool, explore(prompt_file), ToolContext::new())
+            .await
+            .expect("subagent call failed");
         let text = result.render_for_model();
         let id = continuation_id(&text);
         (text, id)
@@ -3373,16 +3582,17 @@ You are a file-defined agent.
 
     #[tokio::test]
     async fn finished_subagent_continues_with_its_earlier_conversation() {
-        let (tool, requests) = resume_tool(
+        let (tool, requests, _bundled) = resume_tool(
             None,
             Some(crate::config::CacheKeepAlive {
                 send_before_expiry: std::time::Duration::ZERO,
                 frequent_idle_threshold: 3,
             }),
-        );
+        )
+        .await;
         let (dir, first_prompt) = write_prompt_file("resume-first", "first question marker");
         let (first, id) = first_run(&tool, &first_prompt).await;
-        assert!(first.starts_with("Subagent 'worker' completed"), "{first}");
+        assert!(first.starts_with("Subagent 'explore' completed"), "{first}");
         assert!(first.contains("\n\nreply-0\n\n"), "{first}");
         while requests.try_recv().is_ok() {}
 
@@ -3392,7 +3602,7 @@ You are a file-defined agent.
             .await
             .expect("continuing failed");
         let text = result.render_for_model();
-        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
+        assert!(text.starts_with("Subagent 'explore' completed"), "{text}");
         assert!(text.contains("\n\nreply-1\n\n"), "{text}");
         assert_eq!(
             continuation_id(&text),
@@ -3411,7 +3621,7 @@ You are a file-defined agent.
 
     #[tokio::test]
     async fn continuing_an_unknown_id_is_an_error() {
-        let (tool, _requests) = resume_tool(None, None);
+        let (tool, _requests, _bundled) = resume_tool(None, None).await;
         let (dir, prompt_file) = write_prompt_file("resume-unknown", "follow-up");
         let error = Tool::call(&tool, resume_args(&prompt_file, 99), ToolContext::new())
             .await
@@ -3443,7 +3653,8 @@ You are a file-defined agent.
 
     #[tokio::test]
     async fn claude_subagent_expires_after_its_five_minute_lifetime() {
-        let (tool, _requests) = resume_tool(None, Some(crate::config::CacheKeepAlive::default()));
+        let (tool, _requests, _bundled) =
+            resume_tool(None, Some(crate::config::CacheKeepAlive::default())).await;
         let (dir, prompt_file) = write_prompt_file("resume-expired", "first");
         let (_, id) = first_run(&tool, &prompt_file).await;
 
@@ -3462,7 +3673,8 @@ You are a file-defined agent.
 
     #[tokio::test]
     async fn claude_subagent_continues_just_inside_its_five_minute_lifetime() {
-        let (tool, _requests) = resume_tool(None, Some(crate::config::CacheKeepAlive::default()));
+        let (tool, _requests, _bundled) =
+            resume_tool(None, Some(crate::config::CacheKeepAlive::default())).await;
         let (dir, prompt_file) = write_prompt_file("resume-inside", "first");
         let (_, id) = first_run(&tool, &prompt_file).await;
 
@@ -3477,7 +3689,7 @@ You are a file-defined agent.
     /// the Claude five minutes.
     #[tokio::test]
     async fn non_claude_subagent_keeps_the_default_lifetime() {
-        let (tool, _requests) = resume_tool(None, None);
+        let (tool, _requests, _bundled) = resume_tool(None, None).await;
         let (dir, prompt_file) = write_prompt_file("resume-default-lifetime", "first");
         let (_, id) = first_run(&tool, &prompt_file).await;
 
@@ -3511,8 +3723,8 @@ You are a file-defined agent.
                 .ttl
         };
 
-        let (tool, subagent_requests) =
-            resume_tool(None, Some(crate::config::CacheKeepAlive::default()));
+        let (tool, subagent_requests, _bundled) =
+            resume_tool(None, Some(crate::config::CacheKeepAlive::default())).await;
         let (dir, prompt_file) = write_prompt_file("cache-ttl-claude", "first");
         first_run(&tool, &prompt_file).await;
         let subagent_request = subagent_requests.try_recv().expect("subagent request");
@@ -3521,7 +3733,7 @@ You are a file-defined agent.
             ClaudePromptCacheTtl::FiveMinutes
         );
 
-        let (other, other_requests) = resume_tool(None, None);
+        let (other, other_requests, _other_bundled) = resume_tool(None, None).await;
         first_run(&other, &prompt_file).await;
         let other_request = other_requests.try_recv().expect("other subagent request");
         assert_eq!(claude_ttl(&other_request), ClaudePromptCacheTtl::OneHour);
@@ -3543,15 +3755,15 @@ You are a file-defined agent.
     /// The `resume` shape carries no model or subagent selector at all, so
     /// an argument object that names one fails to deserialize.
     #[test]
-    fn resume_args_carry_no_model_or_subagent() {
-        for extra in ["model", "subagent"] {
+    fn no_call_carries_a_model_or_another_subagent_selector() {
+        for extra in ["model", "subagent", "command"] {
             let error = serde_json::from_value::<SubagentArgs>(serde_json::json!({
-                "command": "resume",
+                "name": "resume",
                 "id": 7,
                 "prompt_file": "prompt.txt",
                 extra: "fast",
             }))
-            .expect_err("a resume call cannot name a model or subagent");
+            .expect_err("a call cannot name a model or another selector");
             assert!(
                 error.to_string().contains("unknown field"),
                 "{extra} must be rejected as unknown: {error}"
@@ -3564,10 +3776,10 @@ You are a file-defined agent.
     /// prompt-cache lifetime it ran with passes.
     #[tokio::test]
     async fn finished_subagent_without_keep_alive_still_continues() {
-        let (tool, requests) = resume_tool(None, None);
+        let (tool, requests, _bundled) = resume_tool(None, None).await;
         let (dir, first_prompt) = write_prompt_file("resume-no-keepalive", "first marker");
         let (first, id) = first_run(&tool, &first_prompt).await;
-        assert!(first.starts_with("Subagent 'worker' completed"), "{first}");
+        assert!(first.starts_with("Subagent 'explore' completed"), "{first}");
         while requests.try_recv().is_ok() {}
 
         let follow_up = dir.join("follow-up.txt");
@@ -3576,7 +3788,7 @@ You are a file-defined agent.
             .await
             .expect("continuing failed");
         let text = result.render_for_model();
-        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
+        assert!(text.starts_with("Subagent 'explore' completed"), "{text}");
         assert!(text.contains("\n\nreply-1\n\n"), "{text}");
         assert_eq!(continuation_id(&text), id);
 
@@ -3586,7 +3798,7 @@ You are a file-defined agent.
     /// A permanent prompt-cache lifetime never expires its continuation id.
     #[tokio::test]
     async fn permanent_cache_lifetime_never_expires() {
-        let (tool, _requests) = resume_tool(Some(CacheLifetime::Permanent), None);
+        let (tool, _requests, _bundled) = resume_tool(Some(CacheLifetime::Permanent), None).await;
         let (dir, first_prompt) = write_prompt_file("resume-permanent", "first");
         let (_, id) = first_run(&tool, &first_prompt).await;
 
@@ -3599,7 +3811,7 @@ You are a file-defined agent.
             .await
             .expect("a permanent lifetime never expires");
         let text = result.render_for_model();
-        assert!(text.starts_with("Subagent 'worker' completed"), "{text}");
+        assert!(text.starts_with("Subagent 'explore' completed"), "{text}");
         assert_eq!(continuation_id(&text), id);
 
         let _ = std::fs::remove_dir_all(dir);
@@ -3708,6 +3920,7 @@ You are a file-defined agent.
         _hook_tools: crate::test_support::PreparedFixture,
         _dirs: [tempfile::TempDir; 2],
         _cache: crate::test_support::TempDir,
+        bundled: Bundled,
         terminal: aither_sandbox::TerminalTool<
             crate::ReviewedPermission<RecordingPermission>,
             executor_core::tokio::TokioGlobal,
@@ -3723,6 +3936,16 @@ You are a file-defined agent.
 
         /// A fixture whose permission requests go through `chain` first.
         async fn reviewed(reviewers: Vec<crate::external_hook::ReviewerConfig>) -> Self {
+            Self::build(reviewers, Bundled::new().await, |_| {}).await
+        }
+
+        /// A fixture whose terminal serves the commands `commands` registers,
+        /// with `bundled` as its subagents' global directory.
+        async fn build(
+            reviewers: Vec<crate::external_hook::ReviewerConfig>,
+            bundled: Bundled,
+            commands: impl FnOnce(&mut aither_sandbox::ToolRegistryBuilder),
+        ) -> Self {
             use aither_sandbox::{TerminalTool, ToolRegistryBuilder};
             use executor_core::tokio::TokioGlobal;
 
@@ -3755,11 +3978,14 @@ You are a file-defined agent.
                 .initialize_tools(&distribution, cache.path())
                 .await
                 .expect("tools should prepare");
-            let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+            let mut registry = ToolRegistryBuilder::new();
+            commands(&mut registry);
+            let registry = Arc::new(registry.build(terminal.outputs_dir()));
             Self {
                 _dirs: [session, source],
                 _cache: cache,
                 _hook_tools: hook_tools,
+                bundled,
                 terminal: terminal.with_registry(registry),
                 asked,
             }
@@ -3772,28 +3998,19 @@ You are a file-defined agent.
             main: &ScriptedLlm,
             seen: &async_channel::Sender<(&'static str, LLMRequest)>,
         ) -> SubagentTool<ScriptedLlm> {
-            SubagentTool::new(main.clone())
+            SubagentTool::new(main.clone(), self.bundled.global())
                 .with_balanced_model(ScriptedLlm::new("balanced", seen))
                 .with_fast_model(ScriptedLlm::new("fast", seen))
-                .with_builtins()
-                .with_type(
-                    "worker",
-                    SubagentType::new("worker", |llm| {
-                        crate::AgentBuilder::new(llm)
-                            .agent_kind(crate::AgentKind::Chatbot)
-                            .max_iterations(5)
-                    }),
-                )
                 .for_terminal(self.terminal.binding())
         }
 
         /// A main agent on `llm` with this terminal, publishing to `source`.
-        fn main_agent(
+        fn main_agent<LLM: LanguageModel + Clone + 'static>(
             &self,
-            llm: ScriptedLlm,
+            llm: LLM,
             source: ForkSource,
             policy: crate::ContextPolicy,
-        ) -> crate::Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, ()> {
+        ) -> crate::Agent<LLM, LLM, LLM, ()> {
             let jobs = self.terminal.job_registry();
             crate::AgentBuilder::new(llm)
                 .config(
@@ -3813,18 +4030,17 @@ You are a file-defined agent.
         }
     }
 
-    fn start_fork(tag: &str, subagent: &str, model: Option<ModelTier>) -> (PathBuf, SubagentArgs) {
+    /// A `fork` call, with the directory holding its prompt file.
+    fn start_fork(tag: &str) -> (PathBuf, SubagentArgs) {
         let (dir, prompt_file) = write_prompt_file(tag, "carry on from here");
-        (
-            dir,
-            SubagentArgs::Start {
-                worktrees: Vec::new(),
-                commit_worktrees: Vec::new(),
-                subagent: subagent.to_string(),
-                prompt_file: prompt_file.to_string_lossy().into_owned(),
-                model,
-            },
-        )
+        (dir, named("fork", &prompt_file))
+    }
+
+    /// An `audit` call, which runs on the advanced tier as the main agent
+    /// does, with the directory holding its prompt file.
+    fn start_audit(tag: &str) -> (PathBuf, SubagentArgs) {
+        let (dir, prompt_file) = write_prompt_file(tag, "carry on from here");
+        (dir, named("audit", &prompt_file))
     }
 
     fn unsafe_terminal_call(id: &str) -> Event {
@@ -3870,7 +4086,7 @@ You are a file-defined agent.
         let (_, last_main) = main_requests.last().expect("the main agent sent requests");
         assert_eq!(main_requests.len(), 2, "one tool round, then the answer");
 
-        let (dir, args) = start_fork("fork-first-request", "fork", None);
+        let (dir, args) = start_fork("fork-first-request");
         let result = Tool::call(&tool, args, ToolContext::new())
             .await
             .expect("fork call");
@@ -3894,10 +4110,14 @@ You are a file-defined agent.
             shared,
             "the fork's request starts with the main agent's, unchanged"
         );
-        assert_eq!(
-            &first.messages()[shared.len()..],
-            [aither_core::llm::Message::user("carry on from here")],
-            "and continues with the fork prompt alone"
+        let tail = &first.messages()[shared.len()..];
+        assert_eq!(tail.len(), 1, "and continues with the fork prompt alone");
+        assert!(
+            tail[0]
+                .content()
+                .starts_with("carry on from here\n\nSent at "),
+            "the fork prompt carries its time: {}",
+            tail[0].content()
         );
         assert_eq!(first.tool_definitions(), last_main.tool_definitions());
         assert_eq!(
@@ -3931,15 +4151,14 @@ You are a file-defined agent.
             ]
         };
         main.then(probe());
-        let (fork_dir, fork) = start_fork("fork-permission", "fork", None);
+        let (fork_dir, fork) = start_fork("fork-permission");
         Tool::call(&tool, fork, ToolContext::new())
             .await
             .expect("fork call");
         let asked_by_fork = std::mem::take(&mut *fixture.asked.lock().unwrap());
 
         main.then(probe());
-        let (worker_dir, worker) =
-            start_fork("worker-permission", "worker", Some(ModelTier::Advanced));
+        let (worker_dir, worker) = start_audit("worker-permission");
         Tool::call(&tool, worker, ToolContext::new())
             .await
             .expect("worker call");
@@ -3979,8 +4198,7 @@ You are a file-defined agent.
             vec![unsafe_terminal_call("call-1")],
             vec![Event::Text("finished".to_string())],
         ]);
-        let (worker_dir, worker) =
-            start_fork("worker-reviewed", "worker", Some(ModelTier::Advanced));
+        let (worker_dir, worker) = start_audit("worker-reviewed");
         Tool::call(&tool, worker, ToolContext::new())
             .await
             .expect("worker call");
@@ -4081,7 +4299,7 @@ You are a file-defined agent.
                 .count()
         };
         let before = spaces();
-        let (dir, args) = start_fork("fork-refused", "fork", None);
+        let (dir, args) = start_fork("fork-refused");
         let error = Tool::call(&tool, args.clone(), ToolContext::new())
             .await
             .expect_err("a fork this close to compaction is refused");
@@ -4113,21 +4331,15 @@ You are a file-defined agent.
     async fn a_fork_is_refused_where_there_is_no_main_request_to_continue() {
         let (seen_tx, _seen_rx) = async_channel::unbounded();
         let main = ScriptedLlm::new("main", &seen_tx);
-        let tool = SubagentTool::new(main).with_builtins();
-        let (dir, args) = start_fork("fork-unbound", "fork", None);
+        let bundled = Bundled::new().await;
+        let tool = bundled.tool(main);
+        let (dir, args) = start_fork("fork-unbound");
         let error = Tool::call(&tool, args, ToolContext::new())
             .await
             .expect_err("a tool bound to no terminal cannot fork");
         assert!(error.to_string().contains("needs the terminal"), "{error}");
 
-        let (dir_model, with_model) = start_fork("fork-model", "fork", Some(ModelTier::Fast));
-        let error = Tool::call(&tool, with_model, ToolContext::new())
-            .await
-            .expect_err("a fork cannot choose a model");
-        assert!(error.to_string().contains("main agent's model"), "{error}");
-
         let _ = std::fs::remove_dir_all(dir);
-        let _ = std::fs::remove_dir_all(dir_model);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4153,7 +4365,7 @@ You are a file-defined agent.
                 .count()
         };
         let before = spaces();
-        let (dir, args) = start_fork("fork-other-model", "fork", None);
+        let (dir, args) = start_fork("fork-other-model");
         let error = Tool::call(&tool, args, ToolContext::new())
             .await
             .expect_err("a fork on another model is refused");
@@ -4254,7 +4466,7 @@ You are a file-defined agent.
         main.then([vec![control_call("kill-2", "terminal_kill", "main-job")]]);
         main.then([vec![Event::Text("finished".to_string())]]);
 
-        let (dir, args) = start_fork("fork-controls", "fork", None);
+        let (dir, args) = start_fork("fork-controls");
         Tool::call(&tool, args, ToolContext::new())
             .await
             .expect("fork call");
@@ -4321,23 +4533,15 @@ You are a file-defined agent.
             &tools,
         )
         .await;
-        let tool =
-            worker_tool(SubagentTool::new(TextLlm::new("only-model"))).with_hooks(main.clone());
+        let bundled = Bundled::new().await;
+        let tool = bundled
+            .tool(TextLlm::new("only-model"))
+            .with_hooks(main.clone());
         let (dir, prompt_file) = write_prompt_file("subagent-hooks", "do it");
 
         tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            Tool::call(
-                &tool,
-                SubagentArgs::Start {
-                    worktrees: Vec::new(),
-                    commit_worktrees: Vec::new(),
-                    subagent: "worker".to_string(),
-                    prompt_file: prompt_file.to_string_lossy().into_owned(),
-                    model: Some(ModelTier::Fast),
-                },
-                ToolContext::new(),
-            ),
+            Tool::call(&tool, explore(&prompt_file), ToolContext::new()),
         )
         .await
         .expect("the subagent finishes within its bound")
@@ -4362,7 +4566,7 @@ You are a file-defined agent.
         .map(|(event, role)| (event.to_string(), role.to_string()));
         assert_eq!(seen, expected);
         let inputs = logged(&log);
-        assert_eq!(inputs[0]["subagent"], "worker");
+        assert_eq!(inputs[0]["subagent"], "explore");
         assert_eq!(inputs[0]["prompt"], "do it");
         assert_eq!(inputs[4]["end"], "completed");
         assert_eq!(inputs[4]["result"], "only-model");
@@ -4455,29 +4659,24 @@ You are a file-defined agent.
     fn external_tool(dir: &Path) -> (SubagentTool<PendingLlm>, SubagentRuns, EventLog) {
         let log = EventLog::default();
         let runs = SubagentRuns::default();
-        let tool = SubagentTool::new(PendingLlm)
+        let tool = SubagentTool::new(PendingLlm, dir.join("global"))
             .with_base_dir(dir)
             .with_runs(runs.clone())
-            .with_type(
+            .with_external(
                 "outside",
-                SubagentType::external(
-                    "runs outside aither",
-                    TestBackend {
-                        log: log.clone(),
-                        opened: Arc::default(),
-                    },
-                ),
+                "runs outside aither",
+                TestBackend {
+                    log: log.clone(),
+                    opened: Arc::default(),
+                },
             );
         (tool, runs, log)
     }
 
-    fn external_start(prompt_file: &Path, model: Option<ModelTier>) -> SubagentArgs {
-        SubagentArgs::Start {
-            worktrees: Vec::new(),
-            commit_worktrees: Vec::new(),
-            subagent: "outside".to_string(),
-            prompt_file: prompt_file.to_string_lossy().into_owned(),
-            model,
+    fn external_start(agent: &str, prompt_file: &Path) -> SubagentArgs {
+        SubagentArgs {
+            agent: Some(agent.to_string()),
+            ..named("external", prompt_file)
         }
     }
 
@@ -4511,11 +4710,11 @@ You are a file-defined agent.
             "Chinese".parse().unwrap(),
         )));
 
-        let error = call_text(&tool, external_start(&chinese, None))
+        let error = call_text(&tool, external_start("outside", &chinese))
             .await
             .expect_err("a Chinese prompt is refused");
         assert!(error.to_string().contains("English"), "{error}");
-        call_text(&tool, external_start(&english, None))
+        call_text(&tool, external_start("outside", &english))
             .await
             .expect("an English prompt starts");
     }
@@ -4527,7 +4726,7 @@ You are a file-defined agent.
         std::fs::write(&second, "second").expect("write prompt file");
         let (tool, runs, log) = external_tool(&dir);
 
-        let text = call_text(&tool, external_start(&first, None))
+        let text = call_text(&tool, external_start("outside", &first))
             .await
             .expect("start succeeds");
         assert!(text.contains("turn 1 of session 0: first"), "{text}");
@@ -4551,25 +4750,41 @@ You are a file-defined agent.
             ]
         );
         assert!(
-            tool.type_descriptions()
-                .contains(&("outside", "runs outside aither"))
+            tool.usage()
+                .await
+                .ends_with("--prompt-file <path>`:\n- outside: runs outside aither"),
+            "the usage lists the connected agent"
         );
 
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn external_subagent_refuses_an_explicit_model() {
-        let (dir, prompt_file) = write_prompt_file("external-model", "first");
+    async fn an_agent_that_is_not_connected_is_refused_with_the_connected_ones() {
+        let (dir, prompt_file) = write_prompt_file("external-unknown", "first");
         let (tool, _runs, log) = external_tool(&dir);
 
-        let error = call_text(&tool, external_start(&prompt_file, Some(ModelTier::Fast)))
+        let error = call_text(&tool, external_start("elsewhere", &prompt_file))
             .await
-            .expect_err("a model tier is refused");
-        let message = error.to_string();
-        assert!(message.contains("outside"), "{message}");
-        assert!(message.contains("model"), "{message}");
+            .expect_err("an unknown agent is refused");
+        assert_eq!(
+            error.to_string(),
+            "no external agent 'elsewhere' is connected; connected: outside"
+        );
         assert!(events(&log).is_empty(), "no session was opened");
+
+        let error = call_text(
+            &SubagentTool::new(PendingLlm, dir.join("global")).with_base_dir(&dir),
+            external_start("outside", &prompt_file),
+        )
+        .await
+        .expect_err("no agent is connected");
+        assert!(
+            error
+                .to_string()
+                .starts_with("no external agent is connected"),
+            "{error}"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -4580,7 +4795,9 @@ You are a file-defined agent.
         let (tool, runs, log) = external_tool(&dir);
 
         let call =
-            tokio::spawn(async move { call_text(&tool, external_start(&prompt_file, None)).await });
+            tokio::spawn(
+                async move { call_text(&tool, external_start("outside", &prompt_file)).await },
+            );
         let run = loop {
             match runs.list().as_slice() {
                 [run] => break run.clone(),
@@ -4615,7 +4832,7 @@ You are a file-defined agent.
         let (dir, prompt_file) = write_prompt_file("external-error", "fail");
         let (tool, runs, log) = external_tool(&dir);
 
-        let error = call_text(&tool, external_start(&prompt_file, None))
+        let error = call_text(&tool, external_start("outside", &prompt_file))
             .await
             .expect_err("a failed turn is an error");
         assert!(
@@ -4638,21 +4855,379 @@ You are a file-defined agent.
     #[tokio::test]
     async fn external_subagent_needs_a_working_directory() {
         let (dir, prompt_file) = write_prompt_file("external-no-dir", "first");
-        let tool = SubagentTool::new(PendingLlm).with_type(
+        let tool = SubagentTool::new(PendingLlm, dir.join("global")).with_external(
             "outside",
-            SubagentType::external(
-                "runs outside aither",
-                TestBackend {
-                    log: EventLog::default(),
-                    opened: Arc::default(),
-                },
-            ),
+            "runs outside aither",
+            TestBackend {
+                log: EventLog::default(),
+                opened: Arc::default(),
+            },
         );
 
-        let error = call_text(&tool, external_start(&prompt_file, None))
+        let error = call_text(&tool, external_start("outside", &prompt_file))
             .await
             .expect_err("no working directory is an error");
         assert!(error.to_string().contains("working directory"), "{error}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The prompt that makes [`WritingLlm`] write.
+    const WRITE_PROBE: &str = "write probe";
+
+    /// A model that, given the [`WRITE_PROBE`] prompt, runs one command
+    /// writing its own working directory, the workspace and a directory in
+    /// it, then answers. Any other prompt it answers at once, and it routes
+    /// every prompt to the fast tier.
+    #[derive(Clone)]
+    struct WritingLlm {
+        workspace: PathBuf,
+    }
+
+    impl WritingLlm {
+        fn script(&self) -> String {
+            [
+                "touch scratch.txt && echo scratch-written".to_string(),
+                format!(
+                    "touch '{}' || echo workspace-refused",
+                    self.workspace.join("probe.txt").display()
+                ),
+                format!(
+                    "touch '{}' || echo granted-refused",
+                    self.workspace.join("granted").join("probe.txt").display()
+                ),
+            ]
+            .join("; ")
+        }
+    }
+
+    impl LanguageModel for WritingLlm {
+        type Error = NeverError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let event = if request.parameters().structured_outputs {
+                Event::Text(ROUTE_FAST.to_string())
+            } else {
+                match request.messages().last() {
+                    Some(aither_core::llm::Message::Tool { content, .. }) => {
+                        Event::Text(content.clone())
+                    }
+                    Some(message) if message.content().contains(WRITE_PROBE) => {
+                        Event::ToolCall(aither_core::llm::ToolCall::new(
+                            "write-1",
+                            "terminal",
+                            serde_json::json!({
+                                "description": "write probe",
+                                "script": self.script(),
+                                "timeout": 30,
+                            }),
+                        ))
+                    }
+                    _ => Event::Text("ok".to_string()),
+                }
+            };
+            futures_lite::stream::iter([Ok(event)])
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "writing",
+                "test",
+                "writing-model",
+                "writes the workspace",
+                1_000_000,
+            )))
+        }
+    }
+
+    /// The spaces, under the main terminal's working directory, whose
+    /// subagent wrote `scratch.txt` there.
+    fn spaces_written(workspace: &Path) -> usize {
+        std::fs::read_dir(workspace.join("subagent-spaces"))
+            .expect("a subagent ran, so the spaces directory exists")
+            .map(|entry| entry.expect("a space entry reads").path())
+            .filter(|space| space.join("scratch.txt").is_file())
+            .count()
+    }
+
+    // Sandboxed writes are confined only where heel's per-command sandbox
+    // runs, as in the sandbox crate's own confinement tests.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_only_subagents_write_only_their_scratch_directory_and_writers_their_grants() {
+        let fixture = ForkFixture::new().await;
+        let workspace = std::fs::canonicalize(fixture.terminal.working_dir()).unwrap();
+        let granted = workspace.join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        let local = workspace.join(crate::LOCAL_SUBAGENTS_DIR);
+        write_definition(&local, "helper", Some("fast"), "read_only", "You help.");
+        write_definition(&local, "writer", Some("fast"), "worktrees", "You write.");
+        let llm = WritingLlm {
+            workspace: workspace.clone(),
+        };
+        let tool = SubagentTool::new(llm.clone(), fixture.bundled.global())
+            .for_terminal(fixture.terminal.binding());
+        let mut main = fixture.main_agent(llm, tool.fork_source(), crate::ContextPolicy::default());
+        main.query("look around").await.expect("main run");
+        let (dir, prompt_file) = write_prompt_file("read-only-writes", WRITE_PROBE);
+
+        let read_only = [
+            "explore", "research", "audit", "review", "plan", "helper", "fork",
+        ];
+        let mut runs = 0;
+        for subagent in read_only {
+            runs += 1;
+            let text = completed_text(&tool, named(subagent, &prompt_file)).await;
+            assert!(text.contains("scratch-written"), "{subagent}: {text}");
+            assert!(text.contains("workspace-refused"), "{subagent}: {text}");
+            assert!(text.contains("granted-refused"), "{subagent}: {text}");
+            assert!(
+                !workspace.join("probe.txt").exists(),
+                "{subagent} wrote the workspace"
+            );
+            assert!(
+                !granted.join("probe.txt").exists(),
+                "{subagent} wrote the workspace"
+            );
+            assert_eq!(
+                spaces_written(&workspace),
+                runs,
+                "{subagent} wrote its scratch directory"
+            );
+        }
+
+        for subagent in ["general", "writer", "fork"] {
+            runs += 1;
+            let text = completed_text(
+                &tool,
+                SubagentArgs {
+                    worktrees: vec![granted.to_string_lossy().into_owned()],
+                    ..named(subagent, &prompt_file)
+                },
+            )
+            .await;
+            assert!(text.contains("workspace-refused"), "{subagent}: {text}");
+            assert!(!text.contains("granted-refused"), "{subagent}: {text}");
+            assert!(
+                !workspace.join("probe.txt").exists(),
+                "{subagent} wrote ungranted workspace"
+            );
+            assert!(
+                granted.join("probe.txt").exists(),
+                "{subagent} writes its grant"
+            );
+            std::fs::remove_file(granted.join("probe.txt")).unwrap();
+            assert_eq!(spaces_written(&workspace), runs);
+        }
+        assert!(
+            fixture.asked.lock().unwrap().is_empty(),
+            "nothing asked to escalate"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The brief that makes [`ProbingLlm`] run its probe.
+    const PROBE: &str = "run the probe";
+
+    /// A model that, given the [`PROBE`] brief, runs `script` in its
+    /// terminal and answers with what it printed; it routes every brief to
+    /// the fast tier and records each request's messages.
+    #[derive(Clone)]
+    struct ProbingLlm {
+        script: &'static str,
+        seen: async_channel::Sender<String>,
+    }
+
+    impl LanguageModel for ProbingLlm {
+        type Error = NeverError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let event = if request.parameters().structured_outputs {
+                Event::Text(ROUTE_FAST.to_string())
+            } else {
+                self.seen
+                    .try_send(serde_json::to_string(request.messages()).unwrap())
+                    .unwrap();
+                // The latest tool result since the brief: a fork's inherited
+                // context holds its parent's earlier results.
+                let probe_result = request
+                    .messages()
+                    .iter()
+                    .rev()
+                    .take_while(|message| {
+                        !matches!(message, aither_core::llm::Message::User { .. })
+                    })
+                    .find_map(|message| match message {
+                        aither_core::llm::Message::Tool { content, .. } => Some(content.clone()),
+                        _ => None,
+                    });
+                match (probe_result, request.messages().last()) {
+                    // The harness may follow a failed command's result with a
+                    // notice, so the probe's result need not be the last message.
+                    (Some(content), _) => Event::Text(content),
+                    (None, Some(message)) if message.content().contains(PROBE) => {
+                        Event::ToolCall(aither_core::llm::ToolCall::new(
+                            "probe-1",
+                            "terminal",
+                            serde_json::json!({
+                                "description": "probe",
+                                "script": self.script,
+                                "timeout": 30,
+                            }),
+                        ))
+                    }
+                    _ => Event::Text("ok".to_string()),
+                }
+            };
+            futures_lite::stream::iter([Ok(event)])
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "probing",
+                "test",
+                "probing-model",
+                "runs a probe",
+                1_000_000,
+            )))
+        }
+    }
+
+    /// Reports whether the terminal has a `subagent` command, then calls it
+    /// bare.
+    const COMMAND_PROBE: &str = "if command -v subagent >/dev/null 2>&1; then echo has-subagent; else echo no-subagent; fi; subagent 2>&1; true";
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_has_no_subagent_command_and_a_bare_call_lists_the_names() {
+        let (seen_tx, _seen_rx) = async_channel::unbounded();
+        let llm = ProbingLlm {
+            script: COMMAND_PROBE,
+            seen: seen_tx,
+        };
+        let bundled = Bundled::new().await;
+        let shared = Arc::new(SubagentTool::new(llm.clone(), bundled.global()));
+        let bound = shared.clone();
+        let fixture = ForkFixture::build(Vec::new(), bundled, move |registry| {
+            registry.main_exclusive(|main| {
+                main.configure_terminal_bound_usage_tool("subagent", move |binding| {
+                    bound.for_terminal(binding)
+                });
+            });
+        })
+        .await;
+        let tool = shared.for_terminal(fixture.terminal.binding());
+
+        let mut main = fixture.main_agent(llm, tool.fork_source(), crate::ContextPolicy::default());
+        let answer = main.query(PROBE).await.expect("main run");
+        assert!(
+            answer.contains("has-subagent"),
+            "the main agent has the command: {answer}"
+        );
+        assert!(
+            answer.contains("missing required argument: name\n\nName the subagent to run"),
+            "a bare `subagent` lists the names: {answer}"
+        );
+        for name in ["explore", "general", "fork"] {
+            assert!(answer.contains(&format!("\n- {name}: ")), "{answer}");
+        }
+
+        let (dir, prompt_file) = write_prompt_file("nesting", PROBE);
+        for subagent in ["explore", "fork"] {
+            let text = completed_text(&tool, named(subagent, &prompt_file)).await;
+            assert!(
+                text.contains("no-subagent"),
+                "{subagent} has no `subagent` command: {text}"
+            );
+            assert!(
+                !text.contains("Name the subagent to run"),
+                "{subagent} reached no `subagent` command: {text}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Writes a finished item: an unchecked one would rightly hold the
+    /// probe's final turn open.
+    const TASKS_PROBE: &str = "printf '%s\\n' '- [x] SUBAGENT-TASK' > tasks.md && echo written";
+
+    /// The `tasks.md` the subagents under `workspace` wrote in their spaces.
+    fn subagent_tasks(workspace: &Path) -> Vec<String> {
+        std::fs::read_dir(workspace.join("subagent-spaces"))
+            .unwrap()
+            .filter_map(|entry| {
+                std::fs::read_to_string(entry.unwrap().path().join("tasks.md")).ok()
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_keeps_its_own_tasks_md_and_never_touches_its_parents() {
+        let fixture = ForkFixture::new().await;
+        let workspace = std::fs::canonicalize(fixture.terminal.working_dir()).unwrap();
+        let parent_tasks = workspace.join("tasks.md");
+        std::fs::write(&parent_tasks, "- [x] PARENT-TASK\n").unwrap();
+        let (seen_tx, seen_rx) = async_channel::unbounded();
+        let llm = ProbingLlm {
+            script: TASKS_PROBE,
+            seen: seen_tx,
+        };
+        let tool = SubagentTool::new(llm.clone(), fixture.bundled.global())
+            .for_terminal(fixture.terminal.binding());
+        let mut main = fixture.main_agent(llm, tool.fork_source(), crate::ContextPolicy::default());
+        main.query("look around").await.expect("main run");
+        let main_requests: Vec<String> = std::iter::from_fn(|| seen_rx.try_recv().ok()).collect();
+        let parent_marks = main_requests
+            .last()
+            .expect("the main agent sent a request")
+            .matches("PARENT-TASK")
+            .count();
+        assert!(parent_marks > 0, "the main agent sees its own tasks.md");
+        let (dir, prompt_file) = write_prompt_file("subagent-tasks", PROBE);
+
+        for (run, subagent) in (1..).zip(["explore", "fork"]) {
+            let text = completed_text(&tool, named(subagent, &prompt_file)).await;
+            assert!(text.contains("written"), "{subagent}: {text}");
+            let requests: Vec<String> = std::iter::from_fn(|| seen_rx.try_recv().ok()).collect();
+            let [first, after_write] = requests.as_slice() else {
+                panic!("{subagent} sent two requests, got {}", requests.len());
+            };
+            // A fork's context is the main agent's, which already carries the
+            // main agent's tasks.md; its own source adds nothing of it.
+            let inherited = if subagent == "fork" { parent_marks } else { 0 };
+            assert_eq!(
+                first.matches("PARENT-TASK").count(),
+                inherited,
+                "{subagent} does not read its parent's tasks.md"
+            );
+            assert!(
+                after_write.contains("SUBAGENT-TASK"),
+                "{subagent}'s own tasks.md reaches its context: {after_write}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&parent_tasks).unwrap(),
+                "- [x] PARENT-TASK\n",
+                "{subagent} left its parent's tasks.md alone"
+            );
+            assert_eq!(
+                subagent_tasks(&workspace),
+                vec!["- [x] SUBAGENT-TASK\n".to_string(); run],
+                "{subagent} wrote tasks.md in its own space"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(dir);
     }

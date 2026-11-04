@@ -74,6 +74,11 @@ impl CacheWarmth {
         Self::new(lifetime, self.inner.clock.clone())
     }
 
+    /// The wall-clock time on the entry's clock.
+    pub(crate) fn utc_now(&self) -> jiff::Timestamp {
+        self.inner.clock.utc_now()
+    }
+
     /// Records that a request or keep-alive started the entry just now.
     pub(crate) fn start_entry_now(&self) {
         self.start_entry(self.inner.clock.now());

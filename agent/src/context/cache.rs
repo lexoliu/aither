@@ -101,6 +101,18 @@ impl PromptCache {
         self.lifetime
     }
 
+    /// Resumes a session's key at `epoch`, as read back from
+    /// [`PromptCache::epoch`] on the agent being replaced.
+    ///
+    /// A rebuilt agent keyed by the same session identity and epoch asks the
+    /// provider for the same cache shard its predecessor warmed, instead of
+    /// restarting at epoch zero.
+    #[must_use]
+    pub const fn with_epoch(mut self, epoch: u32) -> Self {
+        self.epoch = epoch;
+        self
+    }
+
     /// The current cache key, which changes only when the prefix is rewritten.
     #[must_use]
     pub fn key(&self) -> String {
@@ -230,6 +242,17 @@ mod tests {
         assert!(cache.observe_prefix(9));
         assert_ne!(cache.key(), first);
         assert_eq!(cache.epoch(), 1);
+    }
+
+    #[test]
+    fn a_rebuilt_agent_keeps_the_sessions_key_and_rotates_with_the_epoch() {
+        let mut first = PromptCache::new("session-1");
+        first.observe_prefix(1);
+        first.observe_prefix(2);
+        let rebuilt = PromptCache::new("session-1").with_epoch(first.epoch());
+        assert_eq!(rebuilt.key(), first.key());
+        assert_eq!(rebuilt.key(), "session-1:1");
+        assert_ne!(PromptCache::new("session-1").key(), rebuilt.key());
     }
 
     #[test]
