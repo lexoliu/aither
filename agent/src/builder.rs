@@ -88,6 +88,8 @@ pub struct AgentBuilder<
     fork_source: Option<crate::fork::ForkSource>,
     /// What the `compact` tool shares with the built agent, once registered.
     compact_signal: Option<std::sync::Arc<crate::compact_tool::CompactSignal>>,
+    /// Who the built agent's tool calls are made by.
+    identity: aither_core::llm::AgentIdentity,
     /// The window state a fork inherits, which replaces initialization.
     inherited: Option<Inherited>,
     #[cfg(feature = "skills")]
@@ -139,6 +141,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             restore_dir: None,
             fork_source: None,
             compact_signal: None,
+            identity: aither_core::llm::AgentIdentity::Main,
             inherited: None,
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -184,6 +187,7 @@ where
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             compact_signal: self.compact_signal,
+            identity: self.identity,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
@@ -220,6 +224,7 @@ where
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             compact_signal: self.compact_signal,
+            identity: self.identity,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
@@ -260,6 +265,7 @@ where
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             compact_signal: self.compact_signal,
+            identity: self.identity,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
@@ -365,6 +371,14 @@ where
         self.tool(crate::compact_tool::CompactTool::new(signal))
     }
 
+    /// Sets the identity every tool call of the built agent carries as the
+    /// agent making it. An agent is the main agent unless a subagent tool
+    /// builds it as a subagent.
+    pub fn identity(mut self, identity: aither_core::llm::AgentIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
     /// Publishes every request the built agent sends to `source`, which is
     /// where the `fork` subagent kind starts from.
     ///
@@ -448,6 +462,7 @@ where
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
             compact_signal: self.compact_signal,
+            identity: self.identity,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
@@ -839,6 +854,7 @@ where
             fork_source: self.fork_source,
             compact_signal: self.compact_signal,
             compaction_warning: crate::agent::CompactionWarning::Armed,
+            identity: self.identity,
             connectivity: self.connectivity,
             last_request: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),

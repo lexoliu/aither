@@ -35,6 +35,8 @@ pub mod ask_user;
 mod browser_backend;
 mod builder;
 mod cache_stats;
+#[cfg(test)]
+mod call_identity_tests;
 mod checkpoint;
 mod clock;
 mod compact_tool;

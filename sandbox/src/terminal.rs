@@ -25,7 +25,7 @@ use std::{
     time::Duration,
 };
 
-use aither_core::llm::ToolContext;
+use aither_core::llm::{CallIdentity, ToolContext};
 use aither_core::llm::{
     CommandOutcome, CommandResult, CommandStream, Interruption, IntoToolResult, StoredFile, Tool,
     ToolResult,
@@ -2393,7 +2393,15 @@ where
             background,
             timeout,
             carry,
+            call,
         } = request;
+        // Every IPC channel this execution opens, local router or container
+        // bridge, is served from this one registry, so each command its script
+        // runs, a detached job's included, is told the id of this call.
+        let registry = call.map_or_else(
+            || self.registry().clone(),
+            |call| Arc::new(self.registry().for_call(call)),
+        );
         let ExecutionTarget { mode, backend } = target;
         let (result_tx, result_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
@@ -2429,7 +2437,7 @@ where
                 readable_paths: self.grants.snapshot().readable.clone(),
                 env_source: self.env_source.clone(),
                 executor: self.executor.clone(),
-                registry: self.registry().clone(),
+                registry,
                 permission_handler: self.permission_handler.clone(),
                 job_registry: self.job_registry.clone(),
                 task_id,
@@ -2480,7 +2488,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
     async fn call(
         &self,
         arguments: Self::Arguments,
-        _cx: ToolContext,
+        cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
         let cap = self.limits.timeout_cap;
         let timeout = Duration::from_secs(arguments.timeout);
@@ -2510,6 +2518,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             background: arguments.background,
             timeout,
             carry: carry.clone(),
+            call: cx.identity().cloned(),
         });
         // Registration precedes `report_ready` on every backend, so once
         // startup returns the job is killable through the registry and the
@@ -3207,6 +3216,8 @@ struct TerminalSpawnRequest {
     background: bool,
     timeout: Duration,
     carry: Option<CwdCarry>,
+    /// The `terminal` call this execution belongs to.
+    call: Option<CallIdentity>,
 }
 
 struct SpawnedTerminal {
@@ -10595,6 +10606,228 @@ mod tests {
         let child = child.to_dyn();
         assert!(!child.has_command("probe_echo"));
         assert_eq!(child.role(), crate::CommandRole::Subagent);
+    }
+
+    // ---- call identity ------------------------------------------------------
+
+    use aither_core::llm::{AgentIdentity, SubagentIdentity, ToolCallId};
+
+    /// Answers with the identity its call carries, and reports it to the test
+    /// the moment it arrives. With `hold` set it then waits for the test's go
+    /// signal, so two calls can be made to overlap inside their handlers.
+    struct IdentityProbe {
+        entered: async_channel::Sender<CallIdentity>,
+        hold: Option<Receiver<()>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct IdentityProbeArgs {}
+
+    impl Tool for IdentityProbe {
+        fn name(&self) -> Cow<'static, str> {
+            "identity_probe".into()
+        }
+
+        type Arguments = IdentityProbeArgs;
+        type Res = ToolResult;
+
+        async fn call(
+            &self,
+            _arguments: Self::Arguments,
+            cx: ToolContext,
+        ) -> aither_core::Result<Self::Res> {
+            let identity = cx.identity().expect("a terminal call identifies itself");
+            self.entered.send(identity.clone()).await.unwrap();
+            if let Some(hold) = &self.hold {
+                hold.recv().await.unwrap();
+            }
+            Ok(ToolResult::text(format!("seen={}", identity.call())))
+        }
+    }
+
+    /// Reports the identity of every command call the registry serves.
+    struct IdentityObserver(async_channel::Sender<(String, Option<CallIdentity>)>);
+
+    impl crate::CommandObserver for IdentityObserver {
+        async fn command_called(&self, call: &crate::CommandCall<'_>) {
+            self.0
+                .send((call.name.to_string(), call.call.cloned()))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn call_identity(id: &str, agent: AgentIdentity) -> CallIdentity {
+        CallIdentity::new(ToolCallId::new(id), agent)
+    }
+
+    /// Fails the test instead of hanging it when `future` does not finish.
+    async fn within_deadline<T>(future: impl std::future::Future<Output = T>) -> T {
+        futures_lite::future::or(async { Some(future.await) }, async {
+            async_io::Timer::after(Duration::from_secs(60)).await;
+            None
+        })
+        .await
+        .expect("the probe should finish within its deadline")
+    }
+
+    #[cfg(unix)]
+    async fn identity_terminal(
+        dir: &Path,
+        probe: IdentityProbe,
+        observer: async_channel::Sender<(String, Option<CallIdentity>)>,
+    ) -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        ConfiguredTestTool,
+    ) {
+        let (cache, shell_sessions) = prepared_test_registry().await;
+        let tool = TerminalTool::new_exact(
+            dir,
+            TestPermissionHandler::default(),
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(probe);
+        builder.observe_commands(crate::AnyCommandObserver::new(IdentityObserver(observer)));
+        (
+            cache,
+            tool.with_registry(Arc::new(builder.build(dir.join("outputs")))),
+        )
+    }
+
+    /// A command a `terminal` call's script runs is handed that call's id and
+    /// agent, and so is the registry's observer.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ipc_command_receives_the_identity_of_its_terminal_call() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (entered, entered_rx) = async_channel::unbounded();
+        let (observed, observed_rx) = async_channel::unbounded();
+        let (_cache, tool) = identity_terminal(
+            dir.path(),
+            IdentityProbe {
+                entered,
+                hold: None,
+            },
+            observed,
+        )
+        .await;
+        let subagent = AgentIdentity::Subagent(SubagentIdentity::new(
+            "explore",
+            Some(call_identity("call_parent", AgentIdentity::Main)),
+        ));
+        let identity = call_identity("call_a", subagent);
+
+        let result = within_deadline(tool.call(
+            terminal_args("identity probe", "identity_probe"),
+            ToolContext::new().with_identity(identity.clone()),
+        ))
+        .await
+        .expect("terminal call should succeed");
+
+        assert!(
+            render_terminal_result(&result).contains("seen=call_a"),
+            "{}",
+            render_terminal_result(&result)
+        );
+        assert_eq!(entered_rx.recv().await.unwrap(), identity);
+        assert_eq!(
+            observed_rx.recv().await.unwrap(),
+            ("identity_probe".to_string(), Some(identity))
+        );
+    }
+
+    /// Two overlapping `terminal` calls each get their own id in the command
+    /// their script runs, even though both commands are in flight at once.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_terminal_calls_deliver_their_own_ids() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (entered, entered_rx) = async_channel::unbounded();
+        let (hold_tx, hold) = async_channel::unbounded();
+        let (observed, _observed_rx) = async_channel::unbounded();
+        let (_cache, tool) = identity_terminal(
+            dir.path(),
+            IdentityProbe {
+                entered,
+                hold: Some(hold),
+            },
+            observed,
+        )
+        .await;
+
+        let run = |id: &'static str| {
+            let tool = &tool;
+            async move {
+                let result = tool
+                    .call(
+                        terminal_args("identity probe", "identity_probe"),
+                        ToolContext::new().with_identity(call_identity(id, AgentIdentity::Main)),
+                    )
+                    .await
+                    .expect("terminal call should succeed");
+                render_terminal_result(&result)
+            }
+        };
+        let release = async {
+            // Both handlers are inside their command before either answers.
+            let mut inside = [
+                entered_rx.recv().await.unwrap(),
+                entered_rx.recv().await.unwrap(),
+            ];
+            inside.sort_by(|a, b| a.call().as_str().cmp(b.call().as_str()));
+            assert_eq!(
+                inside
+                    .iter()
+                    .map(|identity| identity.call().as_str())
+                    .collect::<Vec<_>>(),
+                ["call_a", "call_b"]
+            );
+            hold_tx.send(()).await.unwrap();
+            hold_tx.send(()).await.unwrap();
+        };
+        let (a, b, ()) =
+            within_deadline(async { futures::join!(run("call_a"), run("call_b"), release) }).await;
+
+        assert!(a.contains("seen=call_a") && !a.contains("call_b"), "{a}");
+        assert!(b.contains("seen=call_b") && !b.contains("call_a"), "{b}");
+    }
+
+    /// A command run by a backgrounded job is told the id of the call that
+    /// started the job, long after that call returned.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_backgrounded_job_keeps_the_id_of_the_call_that_started_it() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (entered, entered_rx) = async_channel::unbounded();
+        let (observed, observed_rx) = async_channel::unbounded();
+        let (_cache, tool) = identity_terminal(
+            dir.path(),
+            IdentityProbe {
+                entered,
+                hold: None,
+            },
+            observed,
+        )
+        .await;
+        let identity = call_identity("call_bg", AgentIdentity::Main);
+
+        let mut args = terminal_args("identity probe", "identity_probe");
+        args.background = true;
+        within_deadline(tool.call(args, ToolContext::new().with_identity(identity.clone())))
+            .await
+            .expect("terminal call should succeed");
+
+        assert_eq!(within_deadline(entered_rx.recv()).await.unwrap(), identity);
+        assert_eq!(
+            within_deadline(observed_rx.recv()).await.unwrap().1,
+            Some(identity)
+        );
     }
 
     /// Records the script every container exec runs.
