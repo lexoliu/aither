@@ -976,11 +976,47 @@ fn link_alias(tool: ManagedTool, alias: &Path) -> Result<(), std::io::Error> {
     }
 }
 
+/// Waits between the attempts to run a freshly written executable; the whole
+/// schedule totals 315 ms, long past the instant a child forked during the
+/// write needs to exec and drop its inherited write descriptor.
+const BUSY_BACKOFF: [std::time::Duration; 6] = [
+    std::time::Duration::from_millis(5),
+    std::time::Duration::from_millis(10),
+    std::time::Duration::from_millis(20),
+    std::time::Duration::from_millis(40),
+    std::time::Duration::from_millis(80),
+    std::time::Duration::from_millis(160),
+];
+
+/// Runs `command`, an executable this process just wrote, to completion.
+///
+/// A child forked by another thread while the file was open for writing holds
+/// the write descriptor until it execs, and executing the file meanwhile fails
+/// with `ETXTBSY`. That failure is retried with a short bounded backoff; any
+/// other error, or a file still busy afterwards, is returned unchanged.
+pub fn run_installed(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Output> {
+    retry_busy(|| command.output())
+}
+
+fn retry_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    for delay in BUSY_BACKOFF {
+        match attempt() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(delay);
+            }
+            result => return result,
+        }
+    }
+    attempt()
+}
+
 /// Fails unless every alias of `tool` is a command its executable at `path`
 /// reports in `--list`, so the managed directory never shadows a command the
 /// pinned binary lacks.
 fn ensure_aliases_provided(tool: ManagedTool, path: &Path) -> Result<(), ToolRuntimeError> {
-    let output = std::process::Command::new(path).arg("--list").output()?;
+    let output = run_installed(std::process::Command::new(path).arg("--list"))?;
     if !output.status.success() {
         return Err(ToolRuntimeError::AliasList(tool.command().into()));
     }
@@ -2939,5 +2975,62 @@ printf '%s\n' 'uv @VERSION@'
             ToolTarget::from_probe("FreeBSD", "riscv64"),
             Err(ToolRuntimeError::UnsupportedTarget { .. })
         ));
+    }
+
+    #[test]
+    fn busy_retry_returns_other_errors_after_one_attempt() {
+        let mut attempts = 0;
+        let error = retry_busy(|| -> std::io::Result<()> {
+            attempts += 1;
+            Err(std::io::ErrorKind::NotFound.into())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn busy_retry_gives_up_after_the_bound() {
+        let mut attempts = 0;
+        let error = retry_busy(|| -> std::io::Result<()> {
+            attempts += 1;
+            Err(std::io::ErrorKind::ExecutableFileBusy.into())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ExecutableFileBusy);
+        assert_eq!(attempts, BUSY_BACKOFF.len() + 1);
+    }
+
+    /// Linux refuses to exec a file while any descriptor open for writing
+    /// refers to it, which is the state a forked child leaves behind until it
+    /// execs; macOS does not, so this reproduction only runs on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_an_executable_waits_for_its_write_descriptor_to_close() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tool");
+        let mut writer = std::fs::File::create(&path).unwrap();
+        writer.write_all(b"#!/bin/sh\necho ready\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Without the retry the exec fails while the descriptor is open.
+        assert_eq!(
+            std::process::Command::new(&path)
+                .output()
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::ExecutableFileBusy
+        );
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(writer);
+        });
+        let output = run_installed(&mut std::process::Command::new(&path)).unwrap();
+        release.join().unwrap();
+        assert_eq!(output.stdout, b"ready\n");
     }
 }
