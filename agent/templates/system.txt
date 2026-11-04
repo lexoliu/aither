@@ -49,12 +49,6 @@ If multiple skills apply, use the minimal set that fully covers the request.
 </skill-semantics>
 </skills>
 {% endif %}
-{% if has_subagents %}
-<subagents>
-<invoke>Use `subagent <subcommand> --prompt-file "<path>"` to spawn one (`subagent --help` lists the subcommands), or `subagent resume --id "<id>" --prompt-file "<path>"` to continue a finished one. Write the prompt to a file first; inline prompt text is rejected.</invoke>
-{{ subagents }}
-</subagents>
-{% endif %}
 
 <principles>
 - Act first, explain after. Avoid "Let me...", "I'll...", "First...".

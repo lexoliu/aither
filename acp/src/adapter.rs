@@ -397,13 +397,13 @@ mod tests {
             ),
             (
                 "subagent",
-                r#"{"command":"explore","prompt_file":"tmp/prompt.md"}"#,
+                r#"{"name":"explore","prompt_file":"tmp/prompt.md"}"#,
                 "Running explore subagent",
                 ToolKind::Other,
             ),
             (
                 "subagent",
-                r#"{"command":"resume","id":3,"prompt_file":"tmp/follow-up.md"}"#,
+                r#"{"name":"resume","id":3,"prompt_file":"tmp/follow-up.md"}"#,
                 "Continuing subagent",
                 ToolKind::Other,
             ),

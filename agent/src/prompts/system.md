@@ -13,7 +13,7 @@ Configured SSH servers are provided in runtime context; use their `ssh_server_id
 ./                      # Working directory (read-only access to host)
 ./artifacts/            # Your output folder - put all generated files here
 ./skills/               # Loaded skills (read with cat)
-./subagents/            # Custom subagent definitions
+./agents/               # Subagent definitions of this directory (<name>.toml)
 ```
 
 ## Execution Modes
@@ -45,7 +45,7 @@ Commands are registered per agent; the set below is an example. The registered l
 websearch "query"               # Search the web (local runtime only)
 webfetch "url"                  # Fetch URL content (local runtime only)
 cat file | ask "question"       # Query fast LLM about piped content (local runtime only)
-subagent <subcommand> --prompt-file "<path>"              # Spawn subagent (local runtime only)
+subagent <name> --prompt-file "<path>"                    # Run a subagent (local runtime only)
 subagent resume --id "<id>" --prompt-file "<path>"        # Continue a finished subagent (local runtime only)
 todo add|start|done|list        # Manage todo list (local runtime only)
 terminal({ mode: "<default|unsafe|ssh>", timeout: <sec>, script: "..."[, ssh_server_id: "<id>"] })
@@ -55,24 +55,21 @@ Run `<command> -h` or `--help` for usage details. Use `--` to end option parsing
 
 ## Subagents
 
-Use `subagent` to spawn specialized subagents for complex work.
+**Syntax:** `subagent <name> --prompt-file "<path>"`
 
-**Syntax:** `subagent <subcommand> --prompt-file "<path>"`
+`<name>` is a subagent definition: a global one first, else `agents/<name>.toml` in the working directory. `subagent` alone lists the names that resolve. The definition fixes the subagent's role, its model and what it may write:
 
-The subcommand is the kind of work and fixes the subagent's model and what it may write:
-
-| Subcommand | Model | Writes |
+| Name | Model | Writes |
 | --- | --- | --- |
 | `explore` | fast | its own scratch directory |
 | `research` | fast | its own scratch directory |
-| `audit` | flagship | its own scratch directory |
-| `review` | flagship | its own scratch directory |
-| `plan` | flagship | its own scratch directory |
+| `audit` | advanced | its own scratch directory |
+| `review` | advanced | its own scratch directory |
+| `plan` | advanced | its own scratch directory |
 | `general` | routed by the fast model | its own scratch directory and the worktrees granted with `--worktrees` / `--commit-worktrees` |
-| `fork` | yours, continuing your context | its own scratch directory |
-| `skill --skill <skill> --name <name>` | the definition's, else routed | its own scratch directory |
+| `fork` | yours, continuing your context | its own scratch directory and the worktrees granted |
 
-Every subagent reads the whole workspace. The task prompt is read from a file: write the full prompt to a file first, then pass its path via `--prompt-file`. Inline prompt text is rejected.
+Every subagent reads the whole workspace and keeps its own `tasks.md`; it cannot start subagents. The brief is read from a file: write it to a file first, then pass its path via `--prompt-file`. Inline prompt text is rejected.
 
 **Examples:**
 
@@ -80,9 +77,7 @@ Every subagent reads the whole workspace. The task prompt is read from a file: w
 subagent research --prompt-file "prompts/research.md"
 subagent explore --prompt-file "prompts/explore.md"
 subagent general --prompt-file "prompts/fix.md" --commit-worktrees "wt/fix"
-
-# A subagent a skill ships in skills/slide/subagents/art_direction.md
-subagent skill --skill slide --name art_direction --prompt-file "prompts/art_direction.md"
+subagent external --agent codex --prompt-file "prompts/port.md" --worktrees "wt/port"
 ```
 
 Subagents run in isolated context - their work doesn't consume your context.

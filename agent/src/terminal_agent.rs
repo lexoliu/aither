@@ -27,13 +27,8 @@
 //! let agent = TerminalAgentBuilder::new(llm, terminal_tool)
 //!     .tool(WebSearchTool::default())  // Becomes `websearch` terminal command
 //!     .tool(WebFetchTool::new())       // Becomes `webfetch` terminal command
-//!     // Becomes the `subagent` terminal command, launching from whichever
-//!     // terminal runs it.
-//!     .terminal_bound_tool_with_desc(
-//!         "subagent",
-//!         move |binding| subagents.for_terminal(binding),
-//!         "Spawn or continue a subagent",
-//!     )
+//!     // Becomes the main agent's `subagent` terminal command.
+//!     .subagents(subagents, "Run or continue a subagent")
 //!     .build();
 //! ```
 
@@ -51,6 +46,7 @@ use aither_mcp::McpConnection;
 #[cfg(feature = "skills")]
 use aither_skills::SkillRegistry;
 use askama::Template;
+#[cfg(feature = "skills")]
 use async_fs as fs;
 use executor_core::Executor;
 use schemars::JsonSchema;
@@ -82,8 +78,6 @@ struct SystemPrompt {
     host_runtime_context: String,
     skills: String,
     has_skills: bool,
-    subagents: String,
-    has_subagents: bool,
     is_macos: bool,
     has_websearch_command: bool,
 }
@@ -96,6 +90,7 @@ struct ShellRuntimeContextTemplate {
     runtime: &'static str,
 }
 
+#[cfg(feature = "skills")]
 fn join_text(parts: &[&str]) -> String {
     let capacity = parts.iter().map(|part| part.len()).sum();
     let mut output = String::with_capacity(capacity);
@@ -105,12 +100,14 @@ fn join_text(parts: &[&str]) -> String {
     output
 }
 
+#[cfg(feature = "skills")]
 fn path_error_text(prefix: &str, path: &std::path::Path, error: &impl std::fmt::Display) -> String {
     let path_text = path.display().to_string();
     let error_text = error.to_string();
     join_text(&[prefix, path_text.as_str(), "': ", error_text.as_str()])
 }
 
+#[cfg(feature = "skills")]
 fn quoted_path_error_text(
     prefix: &str,
     first_path: &std::path::Path,
@@ -138,17 +135,6 @@ pub struct SkillInfo {
     pub name: String,
     /// Short description.
     pub description: String,
-}
-
-/// Loaded subagent metadata for system prompt.
-#[derive(Debug, Clone)]
-pub struct SubagentInfo {
-    /// Name/ID of the subagent.
-    pub name: String,
-    /// Short description.
-    pub description: String,
-    /// Relative path within the `subagents` folder.
-    pub path: String,
 }
 
 /// [`TerminalAgentBuilder`] state while its shell backends are still being
@@ -184,7 +170,6 @@ where
     registry_builder: ToolRegistryBuilder,
     tool_descriptions: Vec<(String, String)>,
     skills: Vec<SkillInfo>,
-    subagents: Vec<SubagentInfo>,
     #[cfg(feature = "skills")]
     skill_registry: Option<SkillRegistry>,
     state: PhantomData<S>,
@@ -200,7 +185,6 @@ where
         f.debug_struct("TerminalAgentBuilder")
             .field("tool_count", &self.tool_descriptions.len())
             .field("skill_count", &self.skills.len())
-            .field("subagent_count", &self.subagents.len())
             .finish_non_exhaustive()
     }
 }
@@ -244,7 +228,6 @@ where
             registry_builder,
             tool_descriptions,
             skills: Vec::new(),
-            subagents: Vec::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
             state: PhantomData,
@@ -270,13 +253,13 @@ where
             registry_builder: self.registry_builder,
             tool_descriptions: self.tool_descriptions,
             skills: self.skills,
-            subagents: self.subagents,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
             state: PhantomData,
         }
     }
 
+    #[cfg(feature = "skills")]
     async fn resolve_absolute_dir(
         path: &std::path::Path,
         kind: &str,
@@ -297,6 +280,7 @@ where
             })
     }
 
+    #[cfg(feature = "skills")]
     async fn register_readable_dir(
         mut self,
         source_path: &std::path::Path,
@@ -307,6 +291,7 @@ where
         Ok(self)
     }
 
+    #[cfg(feature = "skills")]
     async fn attach_readable_symlink(
         mut self,
         source_path: &std::path::Path,
@@ -486,6 +471,32 @@ where
         self
     }
 
+    /// Gives the main agent the `subagent` command `subagents` serves, with
+    /// `description`, and publishes the agent's requests for its `fork`.
+    ///
+    /// A subagent's terminal has no `subagent` command, so a subagent, a
+    /// fork included, starts none. A bare `subagent` lists the names that
+    /// resolve.
+    #[must_use]
+    pub fn subagents(
+        mut self,
+        subagents: crate::specialized::SubagentTool<LLM>,
+        description: impl Into<String>,
+    ) -> Self
+    where
+        LLM: Sync + 'static,
+    {
+        self.inner = self.inner.fork_source(subagents.fork_source());
+        self.tool_descriptions
+            .push(("subagent".to_string(), description.into()));
+        self.registry_builder.main_exclusive(|main| {
+            main.configure_terminal_bound_usage_tool("subagent", move |binding| {
+                subagents.for_terminal(binding)
+            });
+        });
+        self
+    }
+
     /// Adds a pre-configured tool description (for tools registered elsewhere).
     ///
     /// Use this when the tool was already registered on the registry builder.
@@ -645,10 +656,6 @@ where
         let has_skills = !self.skills.is_empty();
         let skills = render_skill_descriptions(&self.skills);
 
-        // Build subagents description
-        let has_subagents = !self.subagents.is_empty();
-        let subagents = render_subagent_descriptions(&self.subagents);
-
         // Get directory paths
         let sandbox_dir = self.terminal_tool.working_dir().display().to_string();
         let user_cwd =
@@ -670,8 +677,6 @@ where
             host_runtime_context,
             skills,
             has_skills,
-            subagents,
-            has_subagents,
             is_macos,
             has_websearch_command: self.has_command("websearch"),
         };
@@ -776,83 +781,6 @@ where
             description: description.into(),
         });
         self
-    }
-
-    /// Sets up the subagents directory and creates a symlink in the sandbox.
-    ///
-    /// Subagents are markdown files with YAML frontmatter (name, description).
-    /// A symlink `subagents` is created in the sandbox working directory.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// builder.with_subagents("/path/to/subagents").await?
-    /// ```
-    async fn load_subagents(
-        mut self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, crate::AgentError> {
-        use crate::subagent_file::SubagentDefinition;
-
-        let path = path.as_ref().to_path_buf();
-        let abs_path = Self::resolve_absolute_dir(&path, "subagents").await?;
-
-        let defs = SubagentDefinition::load_from_dir_async(&abs_path)
-            .await
-            .map_err(|error| {
-                crate::AgentError::Config(path_error_text(
-                    "failed to load subagents from '",
-                    &abs_path,
-                    &error,
-                ))
-            })?;
-
-        for def in defs {
-            let mut filename = def.id.clone();
-            filename.push_str(".md");
-            self.subagents.push(SubagentInfo {
-                name: def.id,
-                description: def.description,
-                path: filename,
-            });
-        }
-
-        Ok(self)
-    }
-
-    /// Loads subagents and exposes the subagent directory inside the sandbox.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when loading subagents or creating the sandbox symlink fails.
-    pub async fn with_subagents(
-        self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, crate::AgentError> {
-        let path = path.as_ref().to_path_buf();
-        self.load_subagents(&path)
-            .await?
-            .attach_readable_symlink(&path, "subagents", "subagents")
-            .await
-    }
-
-    /// Loads subagent metadata and grants read-only access to the source
-    /// directory without creating a `subagents` symlink in the sandbox.
-    ///
-    /// Use this when the runtime already mounts `subagents` inside the sandbox.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when loading subagents or registering the readable directory fails.
-    pub async fn with_subagents_readable_only(
-        self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, crate::AgentError> {
-        let path = path.as_ref().to_path_buf();
-        self.load_subagents(&path)
-            .await?
-            .register_readable_dir(&path, "subagents")
-            .await
     }
 
     /// Sets the model compaction runs on, instead of the session's own.
@@ -1193,22 +1121,6 @@ fn render_skill_descriptions(entries: &[SkillInfo]) -> String {
     output
 }
 
-fn render_subagent_descriptions(entries: &[SubagentInfo]) -> String {
-    let mut output = String::new();
-    for subagent in entries {
-        let mut line = String::with_capacity(
-            subagent.name.len() + subagent.path.len() + subagent.description.len() + 5,
-        );
-        line.push_str(subagent.name.as_str());
-        line.push_str(" (");
-        line.push_str(subagent.path.as_str());
-        line.push_str("): ");
-        line.push_str(subagent.description.as_str());
-        push_bullet_line(&mut output, line.as_str());
-    }
-    output
-}
-
 fn describe_host_runtime_context(
     host_profile: &str,
     availability: &ShellRuntimeAvailability,
@@ -1360,8 +1272,6 @@ mod tests {
             host_runtime_context: String::new(),
             skills: String::new(),
             has_skills: false,
-            subagents: String::new(),
-            has_subagents: false,
             is_macos: false,
             has_websearch_command: false,
         }
@@ -1484,8 +1394,6 @@ mod tests {
             host_runtime_context: "runtime=linux_container".to_string(),
             skills: String::new(),
             has_skills: false,
-            subagents: String::new(),
-            has_subagents: false,
             is_macos: true,
             has_websearch_command: true,
         }
@@ -1511,8 +1419,6 @@ mod tests {
             host_runtime_context: "runtime=user_local_machine".to_string(),
             skills: String::new(),
             has_skills: false,
-            subagents: String::new(),
-            has_subagents: false,
             is_macos: true,
             has_websearch_command: true,
         }
