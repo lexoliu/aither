@@ -2881,6 +2881,7 @@ printf '%s\n' 'uv @VERSION@'
         fn handle(
             &self,
             _args: RuntimeProbeArgs,
+            _context: heel::IpcContext,
         ) -> impl Future<Output = Result<String, heel::IpcError>> {
             std::future::ready(Ok("runtime_probe_ok".into()))
         }

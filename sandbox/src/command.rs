@@ -38,7 +38,7 @@ use aither_core::llm::tool::ToolResultPart;
 use aither_core::llm::{CallIdentity, IntoToolResult, Tool, ToolContext, ToolResult};
 use askama::Template;
 use heel::IpcCommand;
-use heel::ipc::IpcError;
+use heel::ipc::{IpcContext, IpcError};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -253,14 +253,37 @@ impl CommandEnvelope {
     }
 }
 
-/// Type-erased tool handler function: the identity of the `terminal` call
-/// whose script invoked the command (`None` outside a terminal call), and the
+/// Who invoked a command and from where.
+#[derive(Debug, Clone, Default)]
+struct Caller {
+    /// The `terminal` call whose script invoked the command; `None` outside
+    /// a terminal call.
+    call: Option<CallIdentity>,
+    /// The working directory of the process that made the request, on the
+    /// host; `None` when the request carried none.
+    working_dir: Option<String>,
+}
+
+impl Caller {
+    /// The context a tool runs with when this caller invoked it. A shell
+    /// invocation has nowhere to show progress, but the call whose script ran
+    /// it and the directory the script was in are known.
+    fn into_context(self) -> ToolContext {
+        let mut cx = ToolContext::new();
+        if let Some(identity) = self.call {
+            cx = cx.with_identity(identity);
+        }
+        if let Some(working_dir) = self.working_dir {
+            cx = cx.with_working_dir(working_dir);
+        }
+        cx
+    }
+}
+
+/// Type-erased tool handler function: who invoked the command, and the
 /// command's arguments.
 type ToolHandlerFn = Box<
-    dyn Fn(
-            Option<CallIdentity>,
-            Vec<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
+    dyn Fn(Caller, Vec<String>) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -1056,7 +1079,7 @@ impl ToolRegistryBuilder {
         self.insert_entry(
             name.into(),
             RoleEntries::shared(Arc::new(ToolEntry {
-                handler: Box::new(handler),
+                handler: Box::new(move |caller: Caller, args| handler(caller.call, args)),
                 help: help.into(),
                 stdin_arg: None,
             })),
@@ -1130,7 +1153,7 @@ where
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
     let name_for_errors = tool.name().to_string();
-    Box::new(move |identity: Option<CallIdentity>, args: Vec<String>| {
+    Box::new(move |caller: Caller, args: Vec<String>| {
         let tool = tool.clone();
         let schema = schema.clone();
         let name = name_for_errors.clone();
@@ -1161,13 +1184,8 @@ where
                     return Err(tool_usage_error(message.as_str(), name.as_str()));
                 }
             };
-            // A shell invocation has nowhere to show progress, but the call
-            // whose script ran it is known.
-            let cx = identity.map_or_else(ToolContext::new, |identity| {
-                ToolContext::new().with_identity(identity)
-            });
             let output = tool
-                .call(parsed, cx)
+                .call(parsed, caller.into_context())
                 .await
                 .map_err(|error| error.to_string())?;
             output
@@ -1226,22 +1244,21 @@ where
     let schema_for_handler = schema;
     let name_for_handler = name.clone();
     let handler = Arc::new(handler);
-    let raw_handler: ToolHandlerFn =
-        Box::new(move |identity: Option<CallIdentity>, args: Vec<String>| {
-            let schema = schema_for_handler.clone();
-            let name = name_for_handler.clone();
-            let handler = handler.clone();
-            Box::pin(async move {
-                let json_args = match cli_to_json(&schema, &args) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let message = error.to_string();
-                        return Err(tool_usage_error(message.as_str(), name.as_str()));
-                    }
-                };
-                handler(identity, json_args).await
-            })
-        });
+    let raw_handler: ToolHandlerFn = Box::new(move |caller: Caller, args: Vec<String>| {
+        let schema = schema_for_handler.clone();
+        let name = name_for_handler.clone();
+        let handler = handler.clone();
+        Box::pin(async move {
+            let json_args = match cli_to_json(&schema, &args) {
+                Ok(value) => value,
+                Err(error) => {
+                    let message = error.to_string();
+                    return Err(tool_usage_error(message.as_str(), name.as_str()));
+                }
+            };
+            handler(caller.call, json_args).await
+        })
+    });
 
     (
         name,
@@ -1446,12 +1463,33 @@ impl ToolRegistry {
     ///
     /// Large outputs (> 4000 chars) are automatically saved to file.
     pub async fn query_tool_handler(&self, tool_name: &str, args: &[String]) -> CommandEnvelope {
+        self.query_tool_handler_from(tool_name, args, None).await
+    }
+
+    /// Queries a tool handler by name on behalf of a process whose working
+    /// directory was `working_dir` when it made the request.
+    ///
+    /// The command sees the directory through [`ToolContext::working_dir`],
+    /// so the relative paths in `args` resolve against it. `None` when the
+    /// request carried none.
+    ///
+    /// Large outputs (> 4000 chars) are automatically saved to file.
+    pub async fn query_tool_handler_from(
+        &self,
+        tool_name: &str,
+        args: &[String],
+        working_dir: Option<&Path>,
+    ) -> CommandEnvelope {
         match self.resolve(tool_name) {
             Some(Resolved {
                 handler: Some(handler),
                 ..
             }) => {
-                let outcome = match handler(self.call.clone(), args.to_vec()).await {
+                let caller = Caller {
+                    call: self.call.clone(),
+                    working_dir: working_dir.map(|dir| dir.to_string_lossy().into_owned()),
+                };
+                let outcome = match handler(caller, args.to_vec()).await {
                     Ok(output) => handle_large_output(output, &self.output_dir).await,
                     Err(error) => CommandEnvelope::failure(error),
                 };
@@ -1693,7 +1731,7 @@ impl IpcCommand for ToolCallCommand {
             .map(Cow::Owned)
     }
 
-    async fn handle(&self, args: Self::Args) -> Result<String, IpcError> {
+    async fn handle(&self, args: Self::Args, context: IpcContext) -> Result<String, IpcError> {
         let cli_args = flatten_args_to_cli(&args);
         tracing::info!(tool = %self.tool_name, args = ?cli_args, "ToolCallCommand::handle invoked");
 
@@ -1710,7 +1748,7 @@ impl IpcCommand for ToolCallCommand {
         tracing::info!(tool = %self.tool_name, "Calling registry.query_tool_handler");
         envelope_to_cli(
             self.registry
-                .query_tool_handler(&self.tool_name, &cli_args)
+                .query_tool_handler_from(&self.tool_name, &cli_args, Some(context.working_dir()))
                 .await,
         )
     }
@@ -1763,7 +1801,7 @@ impl IpcCommand for IpcGatewayCommand {
         true
     }
 
-    async fn handle(&self, args: Self::Args) -> Result<String, IpcError> {
+    async fn handle(&self, args: Self::Args, context: IpcContext) -> Result<String, IpcError> {
         let cli_args = flatten_args_to_cli(&args);
         if cli_args.is_empty() {
             return Err(IpcError::remote("usage: ipc <tool> [args ...]"));
@@ -1784,7 +1822,7 @@ impl IpcCommand for IpcGatewayCommand {
         let tool_args = cli_args[1..].to_vec();
         envelope_to_cli(
             self.registry
-                .query_tool_handler(tool_name, &tool_args)
+                .query_tool_handler_from(tool_name, &tool_args, Some(context.working_dir()))
                 .await,
         )
     }
@@ -1948,7 +1986,7 @@ where
         self.stdin_arg.clone().map(Cow::Owned)
     }
 
-    async fn handle(&self, args: Self::Args) -> Result<String, IpcError> {
+    async fn handle(&self, args: Self::Args, context: IpcContext) -> Result<String, IpcError> {
         let cli_args = flatten_args_to_cli(&args);
 
         // Handle help flags
@@ -1980,8 +2018,10 @@ where
             }
         };
 
-        // A shell invocation has nowhere to show progress.
-        match self.tool.call(parsed, ToolContext::new()).await {
+        // A shell invocation has nowhere to show progress, but the directory
+        // it ran in is known.
+        let cx = ToolContext::new().with_working_dir(context.working_dir().to_string_lossy());
+        match self.tool.call(parsed, cx).await {
             Ok(output) => tool_output_to_payload(output, &self.output_dir)
                 .await
                 .map(|payload| payload.map_or_else(String::new, |payload| payload.render_for_cli()))
@@ -3539,7 +3579,10 @@ mod tests {
         }))
         .unwrap();
 
-        let rendered = cmd.handle(args).await.expect("command should succeed");
+        let rendered = cmd
+            .handle(args, IpcContext::new("/"))
+            .await
+            .expect("command should succeed");
         tracing::debug!("result: {rendered}");
         assert!(
             rendered.contains("option=[\"原味\", \"番茄味\", \"芝士味\"]"),
@@ -3596,6 +3639,7 @@ mod tests {
                     "args": ["read", "input.txt"]
                 }))
                 .unwrap(),
+                IpcContext::new("/"),
             )
             .await
             .expect("read parses and runs");
@@ -3607,6 +3651,7 @@ mod tests {
                     "args": ["write", "out.txt", "hello"]
                 }))
                 .unwrap(),
+                IpcContext::new("/"),
             )
             .await
             .expect("write parses and runs");
@@ -3620,6 +3665,7 @@ mod tests {
                     "args": ["explode"]
                 }))
                 .unwrap(),
+                IpcContext::new("/"),
             )
             .await
             .expect_err("unknown subcommand must fail");
@@ -3627,6 +3673,51 @@ mod tests {
             error.to_string().contains("unknown subcommand 'explode'"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Reports the directory its caller was in.
+    #[derive(Debug, Clone)]
+    struct WhereTool;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct WhereArgs {}
+
+    impl Tool for WhereTool {
+        fn name(&self) -> Cow<'static, str> {
+            "where_am_i".into()
+        }
+        type Arguments = WhereArgs;
+        type Res = ToolResult;
+
+        fn call(
+            &self,
+            _args: Self::Arguments,
+            cx: aither_core::llm::ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            let text = cx.working_dir().unwrap_or("none").to_string();
+            std::future::ready(Ok(ToolResult::Text { text }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_sees_the_directory_its_request_came_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(WhereTool);
+        let registry = std::sync::Arc::new(builder.build(tmp.path()));
+
+        let none = registry.query_tool_handler("where_am_i", &[]).await;
+        assert_eq!(envelope_to_cli(none).unwrap(), "none");
+
+        let cmd = ToolCallCommand::new("where_am_i", registry);
+        let rendered = cmd
+            .handle(
+                serde_json::from_value(serde_json::json!({ "args": [] })).unwrap(),
+                IpcContext::new("/skills/slide"),
+            )
+            .await
+            .expect("the command runs");
+        assert_eq!(rendered, "/skills/slide");
     }
 
     /// Echoes which role's handler ran.
