@@ -39,6 +39,7 @@ mod cache_stats;
 mod call_identity_tests;
 mod checkpoint;
 mod clock;
+mod compaction_state;
 mod config;
 mod connectivity;
 pub mod context;
