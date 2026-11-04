@@ -12,6 +12,8 @@ use core::fmt::{self, Debug, Display};
 use core::future::Future;
 use core::pin::Pin;
 
+use super::CallIdentity;
+
 /// How far a running tool call has got.
 ///
 /// `progress` is the amount of work done so far and `total`, when known, the
@@ -142,6 +144,7 @@ impl core::error::Error for ProgressError {}
 pub struct ToolContext {
     sink: Option<Box<dyn ProgressSinkImpl>>,
     last_progress: Option<f64>,
+    identity: Option<CallIdentity>,
 }
 
 impl ToolContext {
@@ -154,6 +157,7 @@ impl ToolContext {
         Self {
             sink: None,
             last_progress: None,
+            identity: None,
         }
     }
 
@@ -163,7 +167,24 @@ impl ToolContext {
         Self {
             sink: Some(Box::new(sink)),
             last_progress: None,
+            identity: None,
         }
+    }
+
+    /// Attaches the identity of the call this context belongs to.
+    #[must_use]
+    pub fn with_identity(mut self, identity: CallIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    /// The id of this call and the agent making it.
+    ///
+    /// `None` when the dispatcher does not identify its calls, such as an MCP
+    /// server or a direct call from a test; the agent loop always does.
+    #[must_use]
+    pub const fn identity(&self) -> Option<&CallIdentity> {
+        self.identity.as_ref()
     }
 
     /// Whether the caller listens for progress.
@@ -220,6 +241,7 @@ impl Debug for ToolContext {
         f.debug_struct("ToolContext")
             .field("listening", &self.sink.is_some())
             .field("last_progress", &self.last_progress)
+            .field("identity", &self.identity)
             .finish()
     }
 }
@@ -250,6 +272,17 @@ mod tests {
     fn reports_whether_the_caller_listens() {
         assert!(!ToolContext::new().is_listening());
         assert!(listening().0.is_listening());
+    }
+
+    #[test]
+    fn carries_the_identity_it_was_given() {
+        use super::super::{AgentIdentity, ToolCallId};
+
+        assert_eq!(ToolContext::new().identity(), None);
+        let identity = CallIdentity::new(ToolCallId::new("call_1"), AgentIdentity::Main);
+        let cx = ToolContext::new().with_identity(identity.clone());
+        assert_eq!(cx.identity(), Some(&identity));
+        assert_eq!(identity.call().as_str(), "call_1");
     }
 
     #[tokio::test]

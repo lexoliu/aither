@@ -17,7 +17,9 @@ use crate::{
     context::{
         AnyContextSource, BackgroundJobs, Block, CacheLifetime, CompactionFork,
         CompletedCompaction, Context, ContextBudget, HandoffDocument, InstructionSlot,
-        PendingCompaction, PromptCache, TasksDocument, restore_context,
+        PendingCompaction, PromptCache, TasksDocument,
+        recovery::{SpillLimits, clean_for_recovery},
+        restore_context,
     },
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
@@ -353,6 +355,15 @@ pub struct KnowledgeAndTimeTemplate {
     pub websearch_command: bool,
 }
 
+/// The system prompt's statement of the communication and working languages.
+#[cfg(feature = "languages")]
+#[derive(Template)]
+#[template(path = "language_system.txt", escape = "none")]
+struct LanguagesTemplate {
+    communication: crate::Language,
+    working: crate::Language,
+}
+
 /// The result given to a tool call whose run was cancelled before it finished.
 #[derive(Template)]
 #[template(path = "tool_call_cancelled.txt", escape = "none")]
@@ -613,6 +624,10 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Compaction that finished and is waiting for a request boundary.
     pub(crate) completed_compaction: Option<CompletedCompaction>,
 
+    /// Why the compaction forked alongside the run failed, until one lands:
+    /// the next compaction the window forces recovers first.
+    pub(crate) compaction_failure: Option<crate::context::CompactionError>,
+
     /// Results of the tool calls of the turn in flight, in completion order,
     /// until they are moved into the context.
     pub(crate) tool_results: VecDeque<ToolExecutionResult>,
@@ -673,6 +688,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// subagent kind to start from; `None` when no fork reads this agent.
     pub(crate) fork_source: Option<crate::fork::ForkSource>,
 
+    /// The agent every tool call of this loop is made by.
+    pub(crate) identity: aither_core::llm::AgentIdentity,
+
     /// Rolling KV-cache statistics accumulated from emitted `Usage` events.
     ///
     /// Hosts can read [`Agent::cache_stats`] at any time to observe the
@@ -729,6 +747,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             reassembled: false,
             pending_compaction: None,
             completed_compaction: None,
+            compaction_failure: None,
             tool_results: VecDeque::new(),
             profile: None,
             initialized: false,
@@ -744,6 +763,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
             fork_source: None,
+            identity: aither_core::llm::AgentIdentity::Main,
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -868,6 +888,10 @@ where
             self.hooks
                 .on_lifecycle(&external_hook::SessionStart {})
                 .await;
+        }
+        #[cfg(feature = "languages")]
+        if let Some(guard) = &self.config.languages {
+            guard.record_user_message(&prompt);
         }
         self.hooks
             .on_lifecycle(&external_hook::UserMessage {
@@ -1044,6 +1068,7 @@ where
             }
             (Some(Err(error)), _) => {
                 tracing::warn!(%error, "forked compaction failed");
+                self.compaction_failure = Some(error);
             }
             (Some(Ok(_)), None) | (None, _) => {}
         }
@@ -1059,6 +1084,8 @@ where
     ) -> Result<TurnControl, AgentError> {
         if !response_text.is_empty() {
             self.context.push(Message::assistant(&response_text));
+            #[cfg(feature = "languages")]
+            self.enforce_reply_language(&response_text, events).await;
         }
         events.emit(AgentEvent::turn_complete(turn, false));
         if self.push_final_turn_alerts().await {
@@ -1068,6 +1095,44 @@ where
             final_text: response_text,
             stop_reason: StopReason::NoToolCalls,
         })
+    }
+
+    /// Holds a reply to the communication language.
+    ///
+    /// A reply in another language raises one alert telling the model to
+    /// return to it, and the user is shown a translation by the fast model,
+    /// marked by [`AgentEvent::ReplyTranslated`]. The history keeps the
+    /// original, so the cached prefix is untouched. A translation that fails
+    /// is logged and leaves the original on display, which the user has
+    /// already been streamed.
+    #[cfg(feature = "languages")]
+    async fn enforce_reply_language(&mut self, reply: &str, events: &EventSink) {
+        let Some(guard) = self.config.languages.clone() else {
+            return;
+        };
+        let Some(language) = guard
+            .languages()
+            .communication()
+            .filter(|_| guard.languages().enforced() && !guard.reply_in_language(reply))
+        else {
+            return;
+        };
+        self.push_system_alert(
+            crate::language::LanguageAlertsTemplate {
+                alerts: &[crate::language::LanguageAlert::Reply { language }],
+            }
+            .render()
+            .expect("language alert template must render"),
+        );
+        match crate::language::translate(self.fast.as_ref(), reply, language).await {
+            Ok(text) => events.emit(AgentEvent::ReplyTranslated {
+                text,
+                language: language.code().to_string(),
+            }),
+            Err(error) => {
+                tracing::warn!(%error, %language, "failed to translate a reply for display");
+            }
+        }
     }
 
     /// Gives every tool call in the context a result.
@@ -1132,12 +1197,17 @@ where
         let permission_receiver = self.permission_receiver.clone();
         let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(tool_calls);
         let message_count = self.context.len_recent();
-        let (hooks, tools) = (&self.hooks, &self.tools);
+        let (hooks, tools, agent) = (&self.hooks, &self.tools, &self.identity);
         let results = &mut self.tool_results;
         let tool_futures = tool_calls.iter().map(|call| {
             let args_json = call.arguments.to_string();
+            let identity = aither_core::llm::CallIdentity::new(
+                aither_core::llm::ToolCallId::new(call.id.clone()),
+                agent.clone(),
+            );
             async move {
                 let tool_ctx = ToolUseContext {
+                    call: &identity,
                     tool_name: &call.name,
                     arguments: &args_json,
                     turn,
@@ -1203,9 +1273,11 @@ where
             }
             PreToolAction::Allow => {
                 let start = Instant::now();
-                // The agent loop has nowhere to show a tool's progress.
+                // The agent loop has nowhere to show a tool's progress, but
+                // the tool learns which call, of which agent, it serves.
+                let cx = aither_core::llm::ToolContext::new().with_identity(tool_ctx.call.clone());
                 let result = tools
-                    .call(&call.name, args_json, aither_core::llm::ToolContext::new())
+                    .call(&call.name, args_json, cx)
                     .await
                     .unwrap_or_else(|error| {
                         let mut message = String::from("Error: ");
@@ -1553,6 +1625,16 @@ where
     #[must_use]
     pub const fn cache_lifetime(&self) -> CacheLifetime {
         self.prompt_cache.lifetime()
+    }
+
+    /// The session's communication and working languages, when the agent
+    /// enforces any. An application that writes to the user on the agent's
+    /// behalf, such as a recap or a prompt suggestion, reads the
+    /// communication language here.
+    #[cfg(feature = "languages")]
+    #[must_use]
+    pub const fn languages(&self) -> Option<&crate::LanguageGuard> {
+        self.config.languages.as_ref()
     }
 
     /// Keep-alive bookkeeping for the current run.
@@ -2141,6 +2223,7 @@ where
         self.context.reassemble();
         self.context.apply_handoff(&handoff, fork_point);
         self.reassembled = true;
+        self.compaction_failure = None;
         tracing::info!(
             fork_point,
             kept = self.context.len_recent(),
@@ -2169,30 +2252,67 @@ where
         }
     }
 
-    /// Waits for a forked compaction to land, then applies it.
+    /// Makes room at the pause point: waits for the compaction in flight and
+    /// applies it, or runs one now when none is.
     ///
-    /// Returns `false` when there is nothing to wait for or the compaction
-    /// failed — in both cases the window is still over the pause threshold
-    /// and the run cannot issue another request.
-    async fn await_pending_compaction(&mut self) -> bool {
-        let Some(mut pending) = self.pending_compaction.take() else {
-            return false;
-        };
-        let fork_point = pending.fork_point();
-        match pending.wait().await {
-            Ok(handoff) => {
-                self.completed_compaction = Some(CompletedCompaction {
-                    fork_point,
-                    handoff,
-                });
-                self.apply_completed_compaction().await;
-                true
-            }
-            Err(error) => {
-                tracing::error!(%error, "compaction failed with the window exhausted");
-                false
+    /// A compaction that fails — the one in flight, one that failed earlier
+    /// alongside the run, or the one run here — sends the context through
+    /// recovery: alerts and reminders are removed, long tool outputs move to
+    /// files, and the compaction reruns synchronously.
+    ///
+    /// Returns `false` when there was nothing to compact, so the window is
+    /// still over the pause point and the run cannot issue another request.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the rerun when it fails too, or of the file
+    /// write recovery needed.
+    async fn make_room(&mut self) -> Result<bool, AgentError> {
+        let mut failed = self.compaction_failure.is_some();
+        if let Some(mut pending) = self.pending_compaction.take() {
+            let fork_point = pending.fork_point();
+            match pending.wait().await {
+                Ok(handoff) => {
+                    self.completed_compaction = Some(CompletedCompaction {
+                        fork_point,
+                        handoff,
+                    });
+                    self.apply_completed_compaction().await;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "compaction failed with the window exhausted");
+                    failed = true;
+                }
             }
         }
+        if !failed {
+            match Box::pin(self.compact(None)).await {
+                Ok(result) => return Ok(result.is_some()),
+                Err(error) => tracing::warn!(%error, "compaction failed with the window exhausted"),
+            }
+        }
+
+        let policy = self.config.context_policy;
+        let limits = SpillLimits {
+            threshold: self.budget.chars_for_tokens(policy.spill_threshold),
+            head: self.budget.chars_for_tokens(policy.spill_head),
+        };
+        let report = clean_for_recovery(&mut self.context, self.restore_dir.as_deref(), limits)
+            .await
+            .map_err(|error| {
+                AgentError::llm_local(format!(
+                    "compaction recovery could not move a long tool output to a file: {error}"
+                ))
+            })?;
+        tracing::warn!(
+            alerts_removed = report.alerts_removed,
+            outputs_spilled = report.outputs_spilled,
+            "rerunning the failed compaction on the cleaned context"
+        );
+        self.reassembled = true;
+        let result = Box::pin(self.compact(None)).await?;
+        Ok(result.is_some())
     }
 
     /// Renders every context source into the volatile tail of a request.
@@ -2397,6 +2517,16 @@ where
                 .await
                 .map_err(|e| AgentError::from_model_error(&e)),
         }?;
+        let policy = self.config.context_policy;
+        if !policy.admits(profile.context_length) {
+            return Err(AgentError::Config(format!(
+                "the {}-token context window leaves no room below its {}-token auto-compact point \
+                 once the {}-token safe buffer is kept; lower `ContextPolicy::safe_buffer`",
+                profile.context_length,
+                policy.compact_point(profile.context_length),
+                policy.safe_buffer,
+            )));
+        }
         self.budget.set_window(profile.context_length);
         self.profile = Some(profile);
 
@@ -2454,6 +2584,26 @@ where
                 include_str!("prompts/permissions.txt"),
             );
         }
+
+        #[cfg(feature = "languages")]
+        if let Some(languages) = self
+            .config
+            .languages
+            .as_ref()
+            .map(|guard| *guard.languages())
+            && languages.enforced()
+            && let Some(communication) = languages.communication()
+        {
+            instructions.insert_tagged(
+                &InstructionSlot::LANGUAGES,
+                &LanguagesTemplate {
+                    communication,
+                    working: languages.working(),
+                }
+                .render()
+                .expect("language system template must render"),
+            );
+        }
     }
 
     /// Registers the context sources the agent itself owns.
@@ -2461,6 +2611,19 @@ where
     /// A host's own sources are registered through the builder and kept, so
     /// this only adds what the agent has the state for.
     fn register_builtin_context_sources(&mut self) {
+        #[cfg(feature = "languages")]
+        if let Some(guard) = self
+            .config
+            .languages
+            .clone()
+            .filter(|guard| guard.languages().enforced())
+        {
+            self.context_sources
+                .push(AnyContextSource::new(crate::language::LanguageAlerts::new(
+                    guard,
+                    self.sandbox_dir.clone(),
+                )));
+        }
         if let Some(sandbox_dir) = self.sandbox_dir.clone() {
             let mut source = TasksDocument::new(sandbox_dir, self.config.tasks_stale_after_turns);
             if let Some(resolver) = self.blocker_resolver.clone() {
@@ -2480,8 +2643,9 @@ where
     /// not happen mid-turn happens here, in order: a landed handoff is
     /// folded in, the window is measured against the provider's own token
     /// counts, a compaction is forked if usage crossed
-    /// [`ContextPolicy::compact_at`], and one that was already running is
-    /// awaited if usage reached [`ContextPolicy::pause_at`].
+    /// [`ContextPolicy::start_point`], and the compaction is awaited (or run,
+    /// with recovery when it fails) once the room left before the
+    /// auto-compact point is down to [`ContextPolicy::safe_buffer`].
     ///
     /// With a compaction model set, a cache that went cold since the last
     /// request is rebuilt first (`rebuild_if_cache_is_cold`).
@@ -2495,8 +2659,8 @@ where
     /// Returns the compaction failure when the cold-cache compaction fails;
     /// nothing is sent on an uncompacted context.
     ///
-    /// [`ContextPolicy::compact_at`]: crate::ContextPolicy::compact_at
-    /// [`ContextPolicy::pause_at`]: crate::ContextPolicy::pause_at
+    /// [`ContextPolicy::start_point`]: crate::ContextPolicy::start_point
+    /// [`ContextPolicy::safe_buffer`]: crate::ContextPolicy::safe_buffer
     async fn prepare_request(&mut self) -> Result<Option<LLMRequest>, AgentError> {
         self.apply_completed_compaction().await;
         self.rebuild_if_cache_is_cold().await?;
@@ -2508,8 +2672,10 @@ where
         self.budget
             .observe_assembled(request_chars(&messages, &definitions));
 
-        let usage = self.budget.usage();
-        if self.config.context_policy.should_compact(usage)
+        if self
+            .config
+            .context_policy
+            .should_compact(self.budget.estimated_tokens(), self.budget.window())
             && self.pending_compaction.is_none()
             && self.completed_compaction.is_none()
         {
@@ -2529,9 +2695,16 @@ where
             self.start_compaction(&fork_request, None);
         }
 
-        if self.config.context_policy.should_pause(usage) {
-            tracing::warn!(usage, "context window exhausted; waiting for compaction");
-            if !self.await_pending_compaction().await {
+        if self
+            .config
+            .context_policy
+            .should_pause(self.budget.estimated_tokens(), self.budget.window())
+        {
+            tracing::warn!(
+                tokens = self.budget.estimated_tokens(),
+                "context window at the safe buffer; waiting for compaction"
+            );
+            if !self.make_room().await? {
                 return Ok(None);
             }
             self.push_request_alerts().await;
@@ -2541,7 +2714,11 @@ where
                 .observe_assembled(request_chars(&messages, &definitions));
             // A landed compaction is still no guarantee the rebuilt request
             // fits; an unshrinkable request is paused rather than sent.
-            if self.config.context_policy.should_pause(self.budget.usage()) {
+            if self
+                .config
+                .context_policy
+                .should_pause(self.budget.estimated_tokens(), self.budget.window())
+            {
                 return Ok(None);
             }
         }
@@ -2705,7 +2882,7 @@ where
 
     fn classify_context_window_phase(&self, metrics: &ContextWindowMetrics) -> ContextWindowPhase {
         let policy = &self.config.context_policy;
-        if policy.should_pause(metrics.usage_fraction) {
+        if policy.should_pause(metrics.estimated_tokens, metrics.context_window) {
             return ContextWindowPhase::Exhausted;
         }
         if self.pending_compaction.is_some() || self.completed_compaction.is_some() {
@@ -3180,7 +3357,7 @@ mod tests {
 
         let mut agent = Agent::with_config(
             MockLlm {
-                context_length: 1000,
+                context_length: 200_000,
             },
             AgentConfig::default(),
         );
@@ -3238,9 +3415,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_window_with_no_room_below_the_safe_buffer_is_refused() {
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 4_096,
+            },
+            AgentConfig::default(),
+        );
+        let error = agent
+            .ensure_initialized()
+            .await
+            .expect_err("a 4k window under the 5k buffer cannot hold a request");
+        assert!(
+            matches!(&error, AgentError::Config(message) if message.contains("safe_buffer")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_phase_tracks_usage_against_the_policy() {
+        // A buffer small enough for the 100-token window to admit requests.
         let config = AgentConfig {
             system_prompt: Some("x".repeat(400)),
+            context_policy: crate::ContextPolicy {
+                safe_buffer: 10,
+                ..crate::ContextPolicy::default()
+            },
             ..AgentConfig::default()
         };
 
@@ -3259,7 +3459,13 @@ mod tests {
 
         assert_eq!(snapshot.phase, ContextWindowPhase::Exhausted);
         assert!(snapshot.metrics.system_block_count > 0);
-        assert!(snapshot.metrics.usage_fraction >= agent.config.context_policy.pause_at);
+        assert!(
+            snapshot.metrics.estimated_tokens
+                >= agent
+                    .config
+                    .context_policy
+                    .pause_point(snapshot.metrics.context_window)
+        );
         assert_eq!(snapshot.metrics.recent_message_count, 1);
         assert_eq!(snapshot.metrics.context_window, 100);
     }
@@ -3281,29 +3487,159 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_window_pauses_the_run_instead_of_requesting() {
+    async fn a_second_compaction_failure_stops_the_run_with_the_error() {
         let config = AgentConfig {
             system_prompt: Some("x".repeat(4_000)),
+            context_policy: crate::ContextPolicy {
+                safe_buffer: 10,
+                ..crate::ContextPolicy::default()
+            },
             ..AgentConfig::default()
         };
-        let mut agent = Agent::with_config(
-            MockLlm {
-                context_length: 100,
-            },
-            config,
-        );
+        // The window is far over the pause point. The model never answers
+        // with a handoff: the forked compaction fails, and so does the
+        // rerun on the cleaned context.
+        let llm = ScriptedLlm::new(100, []);
+        let mut agent = Agent::with_config(llm.clone(), config);
         agent.push_message(Message::user("hello"));
         agent.ensure_initialized().await.expect("agent initializes");
 
-        // The conversation is non-empty, so a compaction is forked; the mock
-        // model answers with an empty stream, so it cannot land, and the
-        // request must not be sent on a window this far over the threshold.
+        let error = agent
+            .prepare_request()
+            .await
+            .expect_err("no request is sent on a window this far over the pause point");
+
+        assert!(
+            error.to_string().contains("compaction"),
+            "the compaction's own error stops the run: {error}"
+        );
+        // The forked attempt and the rerun each get a request and a
+        // corrective retry.
+        assert_eq!(llm.recorded().len(), 4);
+    }
+
+    /// Fills the window to `tokens` with one long tool output, behind an
+    /// alert, and aims the agent's cleanup at a temporary working directory.
+    async fn agent_with_long_output(
+        llm: &ScriptedLlm,
+        tokens: usize,
+        dir: &std::path::Path,
+    ) -> Agent<ScriptedLlm> {
+        let mut agent = Agent::new(llm.clone());
+        agent.restore_dir = Some(dir.to_path_buf());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("run it"));
+        agent.push_message(Message::assistant_with_tool_calls(
+            "",
+            vec![aither_core::llm::ToolCall::new(
+                "call_1",
+                "terminal",
+                serde_json::json!({"description": "build"}),
+            )],
+        ));
+        agent.push_message(Message::tool("call_1", "o".repeat(tokens * 4)));
+        agent.push_message(Message::system(
+            "<system-reminder>stale alert</system-reminder>",
+        ));
+        agent
+    }
+
+    /// A 1M window starts compacting 50k tokens before 400k, and the turn's
+    /// request still goes out.
+    #[tokio::test]
+    async fn crossing_the_start_distance_forks_without_blocking() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = agent_with_long_output(&llm, 360_000, dir.path()).await;
+
+        let request = agent.prepare_request().await.expect("request boundary");
+
+        assert!(request.is_some(), "the turn is not held back");
+        assert!(agent.pending_compaction.is_some(), "the fork started");
+        assert!(llm.recorded().is_empty(), "nothing waited for it");
+        assert!(agent.context().handoff().is_none());
+    }
+
+    /// Below the start point nothing forks, on a 200k window as on a 1M one.
+    #[tokio::test]
+    async fn below_the_start_distance_nothing_forks() {
+        let llm = ScriptedLlm::new(200_000, [HANDOFF_JSON.to_string()]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = agent_with_long_output(&llm, 100_000, dir.path()).await;
+
         assert!(
             agent
                 .prepare_request()
                 .await
                 .expect("request boundary")
-                .is_none()
+                .is_some()
+        );
+        assert!(agent.pending_compaction.is_none());
+    }
+
+    /// Down to the safe buffer with no compaction in flight, the loop runs
+    /// one synchronously before the request goes out.
+    #[tokio::test]
+    async fn reaching_the_buffer_runs_a_compaction_before_the_request() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
+        // The fork the boundary starts is the compaction it then waits for.
+        let request = agent.prepare_request().await.expect("request boundary");
+
+        assert!(request.is_some());
+        assert!(agent.pending_compaction.is_none());
+        assert!(
+            agent.context().handoff().is_some(),
+            "the request waited for the handoff and went out on the compacted window"
+        );
+        assert_eq!(llm.recorded().len(), 1);
+    }
+
+    /// A failed compaction strips the alerts and reminders, moves the long
+    /// tool output to a file, and the synchronous rerun succeeds.
+    #[tokio::test]
+    async fn a_failed_compaction_recovers_on_the_cleaned_context() {
+        let llm = ScriptedLlm::new(
+            1_000_000,
+            [
+                "bad".to_string(),
+                "bad".to_string(),
+                HANDOFF_JSON.to_string(),
+            ],
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
+
+        let request = agent.prepare_request().await.expect("recovery succeeds");
+
+        assert!(request.is_some());
+        assert!(agent.context().handoff().is_some());
+        let recorded = llm.recorded();
+        assert_eq!(
+            recorded.len(),
+            3,
+            "the failed attempt, its retry, the rerun"
+        );
+        let holds = |request: &LLMRequest, needle: &str| {
+            request
+                .messages()
+                .iter()
+                .any(|message| message.content().contains(needle))
+        };
+        assert!(holds(&recorded[0], "stale alert"));
+        assert!(holds(&recorded[0], &"o".repeat(1_000)));
+        let rerun = &recorded[2];
+        assert!(!holds(rerun, "stale alert"), "alerts are stripped");
+        assert!(
+            !holds(rerun, &"o".repeat(10_000)),
+            "the long output is gone from the window"
+        );
+        assert!(holds(rerun, "outputs/compaction-call_1.txt"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("outputs/compaction-call_1.txt"))
+                .expect("the spilled output is readable"),
+            "o".repeat(396_000 * 4)
         );
     }
 
@@ -3558,7 +3894,7 @@ mod tests {
 
         let mut agent = Agent::with_config(
             MockLlm {
-                context_length: 1000,
+                context_length: 200_000,
             },
             AgentConfig::default(),
         );
@@ -3662,7 +3998,7 @@ mod tests {
     async fn stdin_blocked_alert_wakes_the_parked_background_wait() {
         let (sender, receiver) = aither_sandbox::background_task_channel();
         let mut agent = Agent::new(MockLlm {
-            context_length: 1_000,
+            context_length: 1_000_000,
         });
         agent.background_receiver = Some(receiver);
         agent.ensure_initialized().await.expect("agent initializes");
@@ -3752,7 +4088,7 @@ mod tests {
                 "test",
                 "mock-model",
                 "mock model",
-                1_000,
+                1_000_000,
             )))
         }
     }
@@ -3836,11 +4172,11 @@ mod tests {
         use aither_core::llm::Role;
 
         let mut previewed = Agent::builder(MockLlm {
-            context_length: 1_000,
+            context_length: 200_000,
         })
         .build();
         let mut control = Agent::builder(MockLlm {
-            context_length: 1_000,
+            context_length: 200_000,
         })
         .build();
         // A normal first assembly initializes the agent and populates the
@@ -3938,10 +4274,25 @@ mod tests {
 
     const HANDOFF_JSON: &str = r#"{"current_task":"keep going","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["continue"],"recovery_hints":[],"skills":[]}"#;
 
+    /// A config whose compaction distances fit the few-hundred-token windows
+    /// [`window_for_usage`] sizes: the fork starts 50 tokens before the
+    /// auto-compact point (80% of the window) and the pause one token before.
+    fn scaled_config() -> AgentConfig {
+        AgentConfig {
+            system_prompt: Some("x".repeat(400)),
+            context_policy: crate::ContextPolicy {
+                start_distance: 50,
+                safe_buffer: 1,
+                ..crate::ContextPolicy::default()
+            },
+            ..AgentConfig::default()
+        }
+    }
+
     /// Sizes a mock's context window so the agent's next request lands at
     /// `usage_percent` percent of it — the only honest way to aim between the
-    /// `compact_at` and `pause_at` thresholds, since tool definitions and
-    /// system blocks weigh as much as the conversation does.
+    /// start and pause points, since tool definitions and system blocks
+    /// weigh as much as the conversation does.
     async fn window_for_usage(
         config: &AgentConfig,
         messages: &[Message],
@@ -3980,10 +4331,7 @@ mod tests {
     /// compaction must fork, not rest on the previous one.
     #[tokio::test]
     async fn a_landed_handoff_compacts_again_when_the_window_grows() {
-        let config = AgentConfig {
-            system_prompt: Some("x".repeat(400)),
-            ..AgentConfig::default()
-        };
+        let config = scaled_config();
         let (mut agent, _window) = window_for_usage(&config, &[Message::user("hello")], 75).await;
         agent.ensure_initialized().await.expect("agent initializes");
         agent.context_mut().set_handoff("resume here");
@@ -4005,10 +4353,7 @@ mod tests {
     /// still lets that turn's request out: forking must not block the turn.
     #[tokio::test]
     async fn a_tool_round_crossing_compact_at_forks_without_blocking() {
-        let config = AgentConfig {
-            system_prompt: Some("x".repeat(400)),
-            ..AgentConfig::default()
-        };
+        let config = scaled_config();
         let messages = vec![
             Message::user("run it"),
             Message::assistant_with_tool_calls(
@@ -4043,10 +4388,7 @@ mod tests {
     /// proceeds with the rebuilt request once it lands.
     #[tokio::test]
     async fn the_pause_waits_for_an_in_flight_compaction() {
-        let config = AgentConfig {
-            system_prompt: Some("x".repeat(400)),
-            ..AgentConfig::default()
-        };
+        let config = scaled_config();
         // Aim at 95% of the window: a handoff a fraction of the conversation
         // size lands the rebuilt request back under compact_at.
         let probe_window = {
@@ -4183,7 +4525,7 @@ mod tests {
         let fork =
             CompactionFork::new(&main, agent.context.fork_point(), &[], None, &[]).expect("fork");
         agent.pending_compaction = Some(PendingCompaction::start(fork, llm.clone()));
-        assert!(agent.await_pending_compaction().await);
+        assert!(agent.make_room().await.expect("compaction lands"));
 
         let recorded = llm.recorded();
         let compaction = &recorded[0];
@@ -4438,7 +4780,7 @@ mod tests {
         let tail = agent.render_tail().await;
         let request = LLMRequest::new(agent.context.build_request(&tail));
         agent.start_compaction(&request, None);
-        assert!(agent.await_pending_compaction().await);
+        assert!(agent.make_room().await.expect("compaction lands"));
         assert_eq!(compactor.recorded().len(), 1);
     }
 
@@ -5070,6 +5412,144 @@ mod tests {
             killed: false,
             result: Err(aither_sandbox::TerminalError::Execution(output.to_string())),
         }
+    }
+
+    #[cfg(feature = "languages")]
+    fn language_agent(
+        languages: crate::Languages,
+        responses: impl IntoIterator<Item = String>,
+    ) -> (
+        Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, ()>,
+        ScriptedLlm,
+    ) {
+        let llm = ScriptedLlm::new(1_000_000, responses);
+        let agent = Agent::with_config(
+            llm.clone(),
+            AgentConfig::default().with_languages(crate::LanguageGuard::new(languages)),
+        );
+        (agent, llm)
+    }
+
+    #[cfg(feature = "languages")]
+    fn chinese() -> crate::Languages {
+        crate::Languages::new("Chinese".parse().unwrap())
+    }
+
+    #[cfg(feature = "languages")]
+    fn language_alerts(agent: &Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, ()>) -> usize {
+        agent
+            .history()
+            .iter()
+            .filter(|message| message.content().contains("was not in Chinese"))
+            .count()
+    }
+
+    #[cfg(feature = "languages")]
+    #[tokio::test]
+    async fn an_english_reply_yields_one_alert_and_a_translated_display_copy() {
+        let original = "I have finished the database migration and every test passes.";
+        let (mut agent, llm) = language_agent(
+            chinese(),
+            [
+                original.to_string(),
+                "数据库迁移已经完成，所有测试都通过了。".to_string(),
+            ],
+        );
+        let events = drain_run(agent.run("请迁移数据库", std::iter::empty())).await;
+
+        let translated: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ReplyTranslated { text, language } => Some((text, language.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            translated,
+            [(&"数据库迁移已经完成，所有测试都通过了。".to_string(), "cmn")]
+        );
+        assert_eq!(language_alerts(&agent), 1, "one alert per lapse");
+        assert!(
+            agent
+                .history()
+                .iter()
+                .any(|message| message.content() == original),
+            "the history keeps the original reply"
+        );
+        assert!(
+            agent
+                .history()
+                .iter()
+                .all(|message| !message.content().contains("数据库迁移已经完成")),
+            "the translation is for display only"
+        );
+        let requests = llm.recorded();
+        assert_eq!(requests.len(), 2, "one turn and one translation");
+    }
+
+    #[cfg(feature = "languages")]
+    #[tokio::test]
+    async fn a_chinese_reply_needs_no_alert_or_translation() {
+        let (mut agent, llm) = language_agent(chinese(), ["数据库迁移已经完成。".to_string()]);
+        let events = drain_run(agent.run("请迁移数据库", std::iter::empty())).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ReplyTranslated { .. }))
+        );
+        assert_eq!(language_alerts(&agent), 0);
+        assert_eq!(llm.recorded().len(), 1);
+    }
+
+    #[cfg(feature = "languages")]
+    #[tokio::test]
+    async fn languages_unset_or_english_change_nothing() {
+        for languages in [
+            crate::Languages::unset(),
+            crate::Languages::new(crate::Language::ENGLISH),
+        ] {
+            let (mut agent, llm) =
+                language_agent(languages, ["All done, the migration passes.".to_string()]);
+            let events = drain_run(agent.run("go", std::iter::empty())).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::ReplyTranslated { .. }))
+            );
+            assert_eq!(llm.recorded().len(), 1);
+            assert!(
+                !agent
+                    .context()
+                    .instructions()
+                    .contains(&InstructionSlot::LANGUAGES),
+                "no language section in the system prompt"
+            );
+        }
+    }
+
+    #[cfg(feature = "languages")]
+    #[tokio::test]
+    async fn the_system_prompt_states_both_languages() {
+        let (mut agent, _llm) =
+            language_agent(chinese().with_working("German".parse().unwrap()), []);
+        agent.ensure_initialized().await.expect("agent initializes");
+        let section = agent
+            .context()
+            .instructions()
+            .get(&InstructionSlot::LANGUAGES)
+            .expect("the languages section is present")
+            .clone();
+        assert!(
+            section.contains("Chinese") && section.contains("German"),
+            "{section}"
+        );
+        assert_eq!(
+            agent
+                .languages()
+                .map(|guard| guard.languages().communication()),
+            Some(Some("Chinese".parse().unwrap())),
+            "an application reads the language from the agent"
+        );
     }
 
     /// Under `Detach` the run ends with the model's turn even while a

@@ -120,7 +120,8 @@ impl SessionUpdateMapper {
             | AgentEvent::TurnComplete { .. }
             | AgentEvent::Complete { .. }
             | AgentEvent::Error(_)
-            | AgentEvent::Usage(_) => None,
+            | AgentEvent::Usage(_)
+            | AgentEvent::ReplyTranslated { .. } => None,
         }
     }
 }

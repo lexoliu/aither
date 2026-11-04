@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use aither_core::llm::ToolContext;
+use aither_core::llm::{AgentIdentity, CallIdentity, SubagentIdentity, ToolContext};
 use aither_core::{
     LanguageModel,
     llm::{Tool, ToolResult, oneshot},
@@ -734,6 +734,9 @@ pub struct SubagentTool<LLM> {
     /// The external hooks of the agent this tool serves: told when a
     /// subagent starts and stops, and the parent of each subagent's own scope.
     hooks: Option<ExternalHooks>,
+    /// Holds subagent prompts to the working language.
+    #[cfg(feature = "languages")]
+    languages: Option<crate::LanguageGuard>,
 }
 
 impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
@@ -774,6 +777,8 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             finished: FinishedSubagents::new(),
             fork_source: ForkSource::default(),
             hooks: None,
+            #[cfg(feature = "languages")]
+            languages: None,
         }
     }
 
@@ -847,7 +852,18 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             finished: FinishedSubagents::new(),
             fork_source: self.fork_source.clone(),
             hooks: ExternalHooks::of_observer(binding.observer()).or_else(|| self.hooks.clone()),
+            #[cfg(feature = "languages")]
+            languages: self.languages.clone(),
         }
+    }
+
+    /// Refuses a prompt file whose prose is not in the working language
+    /// `guard` enforces. The user's own words may be quoted in it verbatim.
+    #[cfg(feature = "languages")]
+    #[must_use]
+    pub fn with_languages(mut self, guard: crate::LanguageGuard) -> Self {
+        self.languages = Some(guard);
+        self
     }
 
     /// Tells `hooks` when a subagent starts and stops, and gives each
@@ -1204,6 +1220,10 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         if prompt.is_empty() {
             anyhow::bail!("subagent prompt file '{}' is empty", resolved.display());
         }
+        #[cfg(feature = "languages")]
+        if let Some(guard) = &self.languages {
+            guard.check_working(prompt, crate::WorkingText::Internal)?;
+        }
         Ok(prompt.to_string())
     }
 
@@ -1247,10 +1267,10 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             .fork_source
             .latest()
             .ok_or_else(|| ForkRefusal::NothingSent.into_error())?;
-        if !snapshot.policy().allows_fork(snapshot.usage()) {
+        if !snapshot.allows_fork() {
             return Err(ForkRefusal::NearCompaction {
                 usage: snapshot.usage() * 100.0,
-                compaction: snapshot.policy().compact_at * 100.0,
+                compaction: snapshot.compaction_usage() * 100.0,
             }
             .into_error());
         }
@@ -1349,6 +1369,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         }: Resolved<'_, LLM>,
         grant: SubagentGrant,
         prompt: &str,
+        started_by: Option<&CallIdentity>,
     ) -> anyhow::Result<FinishedSubagent<LLM>> {
         // A fork is checked before anything is started, and runs on the
         // main agent's model.
@@ -1412,8 +1433,13 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             None => (agent_builder, None, None),
         };
 
+        let identity = AgentIdentity::Subagent(SubagentIdentity::new(
+            subagent_id.clone(),
+            started_by.cloned(),
+        ));
         let agent = self
             .subagent_harness(agent_builder)
+            .identity(identity)
             .hook(child_hooks)
             .build();
         let lifetime = agent.cache_lifetime();
@@ -1457,6 +1483,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         &self,
         call: Call<'_>,
         prompt: &str,
+        started_by: Option<&CallIdentity>,
     ) -> anyhow::Result<(FinishedSubagent<LLM>, Option<u64>)> {
         let (resolved, grant) = match call {
             Call::Resume { id } => {
@@ -1478,7 +1505,11 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             Call::Named { name, grant } => (self.named_source(name, grant).await?, grant),
         };
         let grant = grant.grant(self.caller_dir());
-        Ok((self.start_agent(resolved, grant, prompt).await?, None))
+        Ok((
+            self.start_agent(resolved, grant, prompt, started_by)
+                .await?,
+            None,
+        ))
     }
 
     /// Picks the model a subagent call runs on.
@@ -1626,16 +1657,12 @@ where
     type Arguments = SubagentArgs;
     type Res = ToolResult;
 
-    async fn call(
-        &self,
-        args: Self::Arguments,
-        _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
         let call = args.call()?;
         // The task prompt comes from a file; inline prompt text is rejected.
         let prompt = self.read_prompt(args.prompt_file()).await?;
 
-        let (finished, resumed) = self.acquire(call, &prompt).await?;
+        let (finished, resumed) = self.acquire(call, &prompt, cx.identity()).await?;
         let (
             FinishedSubagent {
                 subagent: subagent_id,
@@ -4195,6 +4222,9 @@ mod tests {
         let compact_at = usage / 0.95;
         let policy = crate::ContextPolicy {
             compact_at,
+            compact_ceiling: usize::MAX,
+            start_distance: 0,
+            safe_buffer: 0,
             restore_budget: compact_at / 4.0,
             ..crate::ContextPolicy::default()
         };
@@ -4610,6 +4640,31 @@ mod tests {
             ToolResult::Text { text } => Ok(text),
             other => panic!("expected a text result, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "languages")]
+    #[tokio::test]
+    async fn a_prompt_not_in_the_working_language_is_refused() {
+        let (dir, chinese) =
+            write_prompt_file("language-refused", "请检查数据库迁移脚本是否正确。");
+        let english = dir.join("english.txt");
+        std::fs::write(
+            &english,
+            "Check that the database migration script is correct.",
+        )
+        .expect("write prompt file");
+        let (tool, _runs, _log) = external_tool(&dir);
+        let tool = tool.with_languages(crate::LanguageGuard::new(crate::Languages::new(
+            "Chinese".parse().unwrap(),
+        )));
+
+        let error = call_text(&tool, external_start("outside", &chinese))
+            .await
+            .expect_err("a Chinese prompt is refused");
+        assert!(error.to_string().contains("English"), "{error}");
+        call_text(&tool, external_start("outside", &english))
+            .await
+            .expect("an English prompt starts");
     }
 
     #[tokio::test]

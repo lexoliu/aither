@@ -400,6 +400,7 @@ where
     pub fn definition_handler<F>(mut self, definition: &ToolDefinition, handler: F) -> Self
     where
         F: Fn(
+                Option<aither_core::llm::CallIdentity>,
                 serde_json::Value,
             ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
             + Send

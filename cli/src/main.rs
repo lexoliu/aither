@@ -286,7 +286,7 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
             format!("{description}\n\n{}", schema_to_help(&schema))
         };
 
-        registry.configure_raw_handler(name, help, move |args| {
+        registry.configure_raw_handler(name, help, move |_call, args| {
             let conn = conn.clone();
             let tool_name = tool_name.clone();
             let schema = schema.clone();

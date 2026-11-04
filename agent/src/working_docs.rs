@@ -128,6 +128,28 @@ pub fn tasks_md_diff(
     Some(lines.join("\n"))
 }
 
+/// The lines a change added to `tasks.md`, or `None` when it added none.
+#[cfg(feature = "languages")]
+#[must_use]
+pub fn tasks_md_added(
+    previous: &WorkingDocsSnapshot,
+    current: &WorkingDocsSnapshot,
+) -> Option<String> {
+    if previous.tasks_md == current.tasks_md {
+        return None;
+    }
+    let diff = TextDiff::from_lines(
+        previous.tasks_md.as_deref().unwrap_or_default(),
+        current.tasks_md.as_deref().unwrap_or_default(),
+    );
+    let added: String = diff
+        .iter_all_changes()
+        .filter(|change| change.tag() == ChangeTag::Insert)
+        .map(|change| change.value())
+        .collect();
+    (!added.trim().is_empty()).then_some(added)
+}
+
 /// Detects unchecked markdown checklist items (`- [ ]`) a run can still
 /// progress on.
 ///

@@ -26,6 +26,7 @@ pub mod cache;
 pub mod compaction;
 pub mod policy;
 pub mod reassembly;
+pub(crate) mod recovery;
 pub mod source;
 pub mod sources;
 pub mod system;
