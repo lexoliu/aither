@@ -223,12 +223,14 @@ use serde::de::DeserializeOwned;
 
 mod command;
 mod context;
+mod identity;
 
 pub use command::{
     CommandOutcome, CommandResult, CommandStream, Interruption, InterruptionCause, StoredFile,
     render_interruptions,
 };
 pub use context::{Progress, ProgressError, ProgressSink, ToolContext};
+pub use identity::{AgentIdentity, CallIdentity, SubagentIdentity, ToolCallId};
 
 /// Final structured result from a tool execution.
 ///
