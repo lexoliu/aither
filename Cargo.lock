@@ -112,6 +112,7 @@ dependencies = [
  "async-io",
  "async-process",
  "async-stream",
+ "basic-toml",
  "blocking",
  "dunce",
  "event-listener",
@@ -122,13 +123,13 @@ dependencies = [
  "hex",
  "indexmap 2.14.2",
  "jiff",
+ "libc",
  "notify",
  "num-traits",
  "rustix",
  "schemars 1.2.3",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.11.1",
  "similar",
  "sync_wrapper",
@@ -4059,9 +4060,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.7.4"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d483b82223401ff6c169a2bfa3ea348837cefeb3ada4e1feb2edf27d9a03861"
+checksum = "783190e84edad24743d7e1136be79240e9556cf4b078f91b896b4619d260a4c9"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
@@ -8178,19 +8179,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap 2.14.2",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
 ]
 
 [[package]]

@@ -20,7 +20,7 @@ arc-swap.workspace = true
 aither-core.workspace = true
 
 # Sandboxing
-heel = "0.7.4"
+heel = "0.8.0"
 rmp-serde = "1"
 
 # Executor for tokio integration
@@ -99,7 +99,7 @@ typed-path = "0.12.3"
 
 # Outage intervals reported to the model; see the `connectivity` feature.
 aither-connectivity = { workspace = true, optional = true }
-jiff = { version = "0.2.39", optional = true, default-features = false, features = ["std", "tz-system"] }
+jiff = { version = "0.2.39", default-features = false, features = ["std"] }
 
 [features]
 default = []
@@ -109,7 +109,7 @@ code-folding = ["dep:magika", "dep:ort", "dep:tree-sitter", "dep:rs-tree-sitter-
 # Broker a shared GNU make jobserver token pool across commands (unix only).
 jobserver = ["dep:polling", "dep:rustix"]
 # State the sleep and offline intervals a command ran through in its result.
-connectivity = ["dep:aither-connectivity", "dep:jiff"]
+connectivity = ["dep:aither-connectivity", "jiff/tz-system"]
 
 [dev-dependencies]
 magika = { version = "1", features = ["_test"] }

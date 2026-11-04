@@ -80,13 +80,6 @@ impl LanguageModel for Copilot {
         let tool_defs = filter_tool_definitions(tool_defs, &parameters.tool_choice);
 
         async_stream::stream! {
-            if parameters.cache.claude.is_some() || parameters.cache.gemini.is_some() {
-                yield Err(CopilotError::Api(
-                    "Copilot provider only accepts cache.openai settings".to_string(),
-                ));
-                return;
-            }
-
             let payload_messages = match to_chat_messages(&messages).await {
                 Ok(messages) => messages,
                 Err(error) => {
