@@ -170,21 +170,98 @@ impl SubagentDefinition {
     }
 }
 
-/// Default subagent definitions embedded in the binary.
+/// A bundled subagent, started by the `subagent` subcommand of its name.
+///
+/// Its prompt, the model tier it runs on and what it may write are fixed:
+/// every one but [`General`](Self::General) writes only its own scratch
+/// directory, and only `General` leaves its tier to routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuiltinSubagent {
+    /// Investigates a codebase; fast tier, read-only.
+    Explore,
+    /// Researches a topic on the web; fast tier, read-only.
+    Research,
+    /// Audits code for defects; advanced tier, read-only.
+    Audit,
+    /// Reviews a change; advanced tier, read-only.
+    Review,
+    /// Plans an implementation; advanced tier, read-only.
+    Plan,
+    /// Carries out a task, code changes included, in the worktrees it is
+    /// granted; the fast model routes its prompt to a tier.
+    General,
+}
+
+impl BuiltinSubagent {
+    /// Every bundled subagent.
+    pub const ALL: [Self; 6] = [
+        Self::Explore,
+        Self::Research,
+        Self::Audit,
+        Self::Review,
+        Self::Plan,
+        Self::General,
+    ];
+
+    /// The subcommand that starts it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Explore => "explore",
+            Self::Research => "research",
+            Self::Audit => "audit",
+            Self::Review => "review",
+            Self::Plan => "plan",
+            Self::General => "general",
+        }
+    }
+
+    /// The tier it runs on; `None` for [`General`](Self::General), whose
+    /// prompt the fast model routes to a tier.
+    #[must_use]
+    pub const fn tier(self) -> Option<ModelTier> {
+        match self {
+            Self::Explore | Self::Research => Some(ModelTier::Fast),
+            Self::Audit | Self::Review | Self::Plan => Some(ModelTier::Advanced),
+            Self::General => None,
+        }
+    }
+
+    const fn source(self) -> &'static str {
+        match self {
+            Self::Explore => include_str!("prompts/subagents/explore.md"),
+            Self::Research => include_str!("prompts/subagents/research.md"),
+            Self::Audit => include_str!("prompts/subagents/audit.md"),
+            Self::Review => include_str!("prompts/subagents/review.md"),
+            Self::Plan => include_str!("prompts/subagents/plan.md"),
+            Self::General => include_str!("prompts/subagents/general.md"),
+        }
+    }
+
+    /// Its bundled definition.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bundled definition is invalid.
+    #[must_use]
+    pub fn definition(self) -> SubagentDefinition {
+        SubagentDefinition::parse(self.source())
+            .unwrap_or_else(|error| panic!("bundled subagent '{}': {error}", self.name()))
+    }
+}
+
+/// The definitions of every bundled subagent, in [`BuiltinSubagent::ALL`]
+/// order.
 ///
 /// # Panics
 ///
-/// Panics if an embedded subagent definition is invalid.
+/// Panics if a bundled subagent definition is invalid.
 #[must_use]
 pub fn builtin_subagents() -> Vec<SubagentDefinition> {
-    vec![
-        SubagentDefinition::parse(include_str!("prompts/subagents/explore.md"))
-            .expect("builtin explore subagent must parse"),
-        SubagentDefinition::parse(include_str!("prompts/subagents/plan.md"))
-            .expect("builtin plan subagent must parse"),
-        SubagentDefinition::parse(include_str!("prompts/subagents/research.md"))
-            .expect("builtin research subagent must parse"),
-    ]
+    BuiltinSubagent::ALL
+        .into_iter()
+        .map(BuiltinSubagent::definition)
+        .collect()
 }
 
 #[cfg(test)]
@@ -222,19 +299,19 @@ You are a test agent. Do test things.
     }
 
     #[test]
-    fn builtin_subagents_load() {
-        let defs = builtin_subagents();
-        assert!(!defs.is_empty(), "should have builtin subagents");
-
-        // Check that explore is present
-        let explore = defs.iter().find(|d| d.id == "explore");
-        assert!(explore.is_some(), "should have explore subagent");
-        let explore = explore.unwrap();
-        assert_ne!(explore.description, "");
-        assert_ne!(explore.system_prompt, "");
-
-        // Check that plan is present
-        let plan = defs.iter().find(|d| d.id == "plan");
-        assert!(plan.is_some(), "should have plan subagent");
+    fn every_bundled_subagent_loads_under_its_subcommand_name() {
+        for subagent in BuiltinSubagent::ALL {
+            let def = subagent.definition();
+            assert_eq!(def.id, subagent.name());
+            assert_ne!(def.description, "");
+            assert_ne!(def.system_prompt, "");
+            assert_eq!(
+                def.model,
+                None,
+                "'{}' takes its tier from `BuiltinSubagent::tier`",
+                subagent.name()
+            );
+        }
+        assert_eq!(builtin_subagents().len(), BuiltinSubagent::ALL.len());
     }
 }

@@ -66,7 +66,7 @@ pub mod workspace_request;
 pub mod specialized;
 
 // File-based subagent definitions
-pub use subagent_file::{SubagentDefinition, builtin_subagents};
+pub use subagent_file::{BuiltinSubagent, SubagentDefinition, builtin_subagents};
 
 // Re-export tool crates
 #[cfg(feature = "command")]
