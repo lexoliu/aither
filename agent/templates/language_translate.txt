@@ -1,0 +1,1 @@
+Translate the message you are given into {{ language }}. Keep markdown structure, code blocks, code spans, URLs, paths and identifiers unchanged. Reply with the translation only.

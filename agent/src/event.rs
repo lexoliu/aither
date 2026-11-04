@@ -51,6 +51,17 @@ pub enum AgentEvent {
     /// Text chunk from the LLM response.
     Text(String),
 
+    /// The reply just streamed was not in the communication language: show
+    /// this translation of it instead, marked as translated.
+    ///
+    /// The model's history keeps the original reply.
+    ReplyTranslated {
+        /// The reply translated into `language` by the fast model.
+        text: String,
+        /// The communication language's ISO 639-3 code.
+        language: String,
+    },
+
     /// Reasoning step (for models with extended thinking).
     Reasoning(String),
 

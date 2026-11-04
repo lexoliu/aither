@@ -10,6 +10,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::external_hook::{self, ExternalHooks};
+#[cfg(feature = "languages")]
+use crate::language::LanguageGuard;
 use crate::tool_request::{
     ToolRequest, ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
@@ -153,6 +155,8 @@ pub struct AskUserTool {
     broker: AskUserBroker,
     session_id: String,
     hooks: Option<ExternalHooks>,
+    #[cfg(feature = "languages")]
+    languages: Option<LanguageGuard>,
 }
 
 impl AskUserTool {
@@ -163,7 +167,20 @@ impl AskUserTool {
             broker,
             session_id: session_id.into(),
             hooks: None,
+            #[cfg(feature = "languages")]
+            languages: None,
         }
+    }
+
+    /// Refuses a question, or options, not in the communication language
+    /// `guard` enforces, and raises the alert that tells the agent to ask
+    /// again. The user's custom answers are recorded as theirs, so the agent
+    /// may quote them verbatim in its records.
+    #[cfg(feature = "languages")]
+    #[must_use]
+    pub fn with_languages(mut self, guard: LanguageGuard) -> Self {
+        self.languages = Some(guard);
+        self
     }
 
     /// Tells `hooks` which questions were asked and how the user answered.
@@ -187,6 +204,16 @@ impl Tool for AskUserTool {
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
+        #[cfg(feature = "languages")]
+        if let Some(guard) = &self.languages {
+            for question in args.clone().into_questions() {
+                let parts = std::iter::once(question.question.as_str())
+                    .chain(question.option.iter().map(String::as_str));
+                if let Err(refusal) = guard.check_question(parts) {
+                    return Ok(ToolResult::error(refusal.to_string()));
+                }
+            }
+        }
         let questions = if self.hooks.is_some() {
             args.clone().into_questions()
         } else {
@@ -199,6 +226,14 @@ impl Tool for AskUserTool {
                 request: args,
             })
             .await?;
+        #[cfg(feature = "languages")]
+        if let Some(guard) = &self.languages {
+            for answer in &response {
+                if let AnswerValue::Custom(text) = &answer.answer {
+                    guard.record_user_message(text);
+                }
+            }
+        }
         if let Some(hooks) = &self.hooks {
             hooks
                 .fire(&external_hook::AskUser {
@@ -218,6 +253,71 @@ impl Tool for AskUserTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "languages")]
+    fn chinese_tool() -> (AskUserTool, AskUserQueue, LanguageGuard) {
+        let guard = LanguageGuard::new(crate::Languages::new("Chinese".parse().unwrap()));
+        let (broker, queue) = channel();
+        (
+            AskUserTool::new("session", broker).with_languages(guard.clone()),
+            queue,
+            guard,
+        )
+    }
+
+    #[cfg(feature = "languages")]
+    fn ask(question: &str, options: &[&str]) -> AskUserArgs {
+        AskUserArgs {
+            question: Some(question.to_string()),
+            option: options.iter().map(ToString::to_string).collect(),
+            multi_select: false,
+            questions: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "languages")]
+    #[tokio::test]
+    async fn an_english_question_is_refused_and_raises_an_alert() {
+        let (tool, queue, guard) = chinese_tool();
+        let result = tool
+            .call(
+                ask("Which database should we use?", &["PostgreSQL", "MySQL"]),
+                ToolContext::new(),
+            )
+            .await
+            .expect("a refusal is a tool result");
+        assert!(result.is_error(), "{result:?}");
+        assert!(
+            queue.is_empty(),
+            "a refused question never reaches the user"
+        );
+        assert_eq!(guard.take_alerts().len(), 1);
+    }
+
+    #[cfg(feature = "languages")]
+    #[tokio::test]
+    async fn a_chinese_question_with_english_code_reaches_the_user() {
+        let (tool, queue, guard) = chinese_tool();
+        let asked = tool.call(
+            ask(
+                "应该用 `tokio::spawn` 还是 spawn_blocking 运行 parse_config？",
+                &["`tokio::spawn`", "spawn_blocking", "PostgreSQL"],
+            ),
+            ToolContext::new(),
+        );
+        let answered = async {
+            let request = queue.next().await.expect("the question arrives");
+            request
+                .respond(vec![QuestionAnswer {
+                    section: String::new(),
+                    answer: AnswerValue::Custom("两个都不用".to_string()),
+                }])
+                .expect("the tool is waiting");
+        };
+        let (result, ()) = futures_lite::future::zip(asked, answered).await;
+        assert!(!result.expect("the call succeeds").is_error());
+        assert_eq!(guard.take_alerts().len(), 0);
+    }
 
     #[test]
     fn test_deser_option_array() {
