@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/May-Agent/aither/compare/claude-v0.14.1...claude-v0.15.0) - 2026-11-04
+
+### Fixed
+
+- *(agent)* providers ignore other providers' cache sections
+
 ## [0.13.0](https://github.com/May-Agent/aither/compare/claude-v0.12.0...claude-v0.13.0) - 2026-11-03
 
 ### Added

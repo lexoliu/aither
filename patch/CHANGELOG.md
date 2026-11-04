@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/May-Agent/aither/compare/patch-v0.14.1...patch-v0.15.0) - 2026-11-04
+
+### Other
+
+- verify the baseline tools on macOS and Linux
+- Merge pull request #407 from May-Agent/fix/342-wrapper-leftover
+
 ## [0.14.0](https://github.com/May-Agent/aither/compare/patch-v0.13.0...patch-v0.14.0) - 2026-11-03
 
 ### Added
