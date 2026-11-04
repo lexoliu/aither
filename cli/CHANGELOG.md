@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/May-Agent/aither/compare/cli-v0.14.1...cli-v0.15.0) - 2026-11-04
+
+### Added
+
+- *(agent)* [**breaking**] named subagents defined in TOML
+- *(sandbox)* hand IPC commands and observers the identity of the terminal call that ran them
+- *(agent)* [**breaking**] the subagent type is the subcommand, with a fixed tier and workspace
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into feat/415-subagent-subcommands
+
 ## [0.13.0](https://github.com/May-Agent/aither/compare/cli-v0.12.0...cli-v0.13.0) - 2026-11-03
 
 ### Other

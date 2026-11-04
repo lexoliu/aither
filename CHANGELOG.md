@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/May-Agent/aither/compare/v0.14.1...v0.15.0) - 2026-11-04
+
+### Added
+
+- *(agent)* alert the agent when host memory pressure or machine load becomes high and when it ends
+- *(agent)* [**breaking**] communication and working languages enforced on questions, replies and records
+- *(agent)* [**breaking**] named subagents defined in TOML
+- *(agent)* [**breaking**] the subagent type is the subcommand, with a fixed tier and workspace
+- *(agent)* [**breaking**] host-ordered system layout with bounded external content
+
+### Fixed
+
+- *(sandbox)* resolve IPC command paths against the caller's working directory
+
+### Other
+
+- Merge pull request #440 from May-Agent/fix/428-caller-cwd
+- Merge remote-tracking branch 'origin/dev' into feat/210-load-alerts
+- Merge remote-tracking branch 'origin/dev' into feat/415-subagent-subcommands
+- Merge remote-tracking branch 'origin/dev' into feat/210-load-alerts
+
 ## [0.14.0](https://github.com/May-Agent/aither/compare/v0.13.0...v0.14.0) - 2026-11-03
 
 ### Added

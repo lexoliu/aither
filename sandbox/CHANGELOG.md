@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/May-Agent/aither/compare/sandbox-v0.14.1...sandbox-v0.15.0) - 2026-11-04
+
+### Added
+
+- *(agent)* alert the agent when host memory pressure or machine load becomes high and when it ends
+- *(agent)* [**breaking**] stamp user messages with UTC time and report timeout kill times
+- *(sandbox)* main-exclusive commands and usage on a parse failure
+- *(sandbox)* hand IPC commands and observers the identity of the terminal call that ran them
+- *(agent)* [**breaking**] the subagent type is the subcommand, with a fixed tier and workspace
+
+### Fixed
+
+- *(sandbox)* retry transient tool artifact download failures
+- *(sandbox)* never splice one stream's bytes into another's line
+- *(sandbox)* report a timeout-killed job as killed
+- *(sandbox)* resolve IPC command paths against the caller's working directory
+- *(sandbox)* retry running a freshly installed tool while its file is busy
+- *(agent)* keep terminal-run ask_user exchanges through compaction
+- *(sandbox)* a process in an exec no longer escapes its container job
+
+### Other
+
+- *(sandbox)* note when query_tool_handler_from panics
+- Merge remote-tracking branch 'origin/dev' into fix/430-verbatim-user-messages
+- Merge pull request #442 from May-Agent/fix/441-timeout-kill-report
+- Merge pull request #443 from May-Agent/fix/371-monitor-stream-splice
+- Merge pull request #439 from May-Agent/fix/438-etxtbsy
+- Merge pull request #440 from May-Agent/fix/428-caller-cwd
+- *(sandbox)* format the busy-retry call
+- Merge remote-tracking branch 'origin/dev' into feat/210-load-alerts
+- Merge pull request #427 from May-Agent/feat/415-subagent-subcommands
+- Merge pull request #431 from May-Agent/feat/417-utc-times
+- Merge remote-tracking branch 'origin/dev' into feat/415-subagent-subcommands
+- Merge remote-tracking branch 'origin/dev' into feat/210-load-alerts
+- Merge pull request #410 from May-Agent/main
+- Merge pull request #407 from May-Agent/fix/342-wrapper-leftover
+- *(sandbox)* spell the non-ASCII environment value without a flagged word
+
 ## [0.14.1](https://github.com/May-Agent/aither/compare/sandbox-v0.14.0...sandbox-v0.14.1) - 2026-11-03
 
 ### Fixed

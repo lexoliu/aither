@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/May-Agent/aither/compare/mcp-v0.14.1...mcp-v0.15.0) - 2026-11-04
+
+### Added
+
+- *(sandbox)* hand IPC commands and observers the identity of the terminal call that ran them
+
 ## [0.12.0](https://github.com/May-Agent/aither/compare/mcp-v0.11.0...mcp-v0.12.0) - 2026-11-03
 
 ### Other

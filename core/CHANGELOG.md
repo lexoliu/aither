@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/May-Agent/aither/compare/core-v0.14.1...core-v0.15.0) - 2026-11-04
+
+### Added
+
+- *(core)* carry the tool call id and calling agent in ToolContext
+
+### Fixed
+
+- *(sandbox)* resolve IPC command paths against the caller's working directory
+
+### Other
+
+- Merge pull request #407 from May-Agent/fix/342-wrapper-leftover
+
 ## [0.14.0](https://github.com/May-Agent/aither/compare/core-v0.13.0...core-v0.14.0) - 2026-11-03
 
 ### Fixed
