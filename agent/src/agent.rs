@@ -2443,6 +2443,16 @@ where
                 .await
                 .map_err(|e| AgentError::from_model_error(&e)),
         }?;
+        let policy = self.config.context_policy;
+        if !policy.admits(profile.context_length) {
+            return Err(AgentError::Config(format!(
+                "the {}-token context window leaves no room below its {}-token auto-compact point \
+                 once the {}-token safe buffer is kept; lower `ContextPolicy::safe_buffer`",
+                profile.context_length,
+                policy.compact_point(profile.context_length),
+                policy.safe_buffer,
+            )));
+        }
         self.budget.set_window(profile.context_length);
         self.profile = Some(profile);
 
@@ -3240,7 +3250,7 @@ mod tests {
 
         let mut agent = Agent::with_config(
             MockLlm {
-                context_length: 1000,
+                context_length: 200_000,
             },
             AgentConfig::default(),
         );
@@ -3298,9 +3308,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_window_with_no_room_below_the_safe_buffer_is_refused() {
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 4_096,
+            },
+            AgentConfig::default(),
+        );
+        let error = agent
+            .ensure_initialized()
+            .await
+            .expect_err("a 4k window under the 5k buffer cannot hold a request");
+        assert!(
+            matches!(&error, AgentError::Config(message) if message.contains("safe_buffer")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_phase_tracks_usage_against_the_policy() {
+        // A buffer small enough for the 100-token window to admit requests.
         let config = AgentConfig {
             system_prompt: Some("x".repeat(400)),
+            context_policy: crate::ContextPolicy {
+                safe_buffer: 10,
+                ..crate::ContextPolicy::default()
+            },
             ..AgentConfig::default()
         };
 
@@ -3350,6 +3383,10 @@ mod tests {
     async fn a_second_compaction_failure_stops_the_run_with_the_error() {
         let config = AgentConfig {
             system_prompt: Some("x".repeat(4_000)),
+            context_policy: crate::ContextPolicy {
+                safe_buffer: 10,
+                ..crate::ContextPolicy::default()
+            },
             ..AgentConfig::default()
         };
         // The window is far over the pause point. The model never answers
@@ -3750,7 +3787,7 @@ mod tests {
 
         let mut agent = Agent::with_config(
             MockLlm {
-                context_length: 1000,
+                context_length: 200_000,
             },
             AgentConfig::default(),
         );
@@ -4028,11 +4065,11 @@ mod tests {
         use aither_core::llm::Role;
 
         let mut previewed = Agent::builder(MockLlm {
-            context_length: 1_000,
+            context_length: 200_000,
         })
         .build();
         let mut control = Agent::builder(MockLlm {
-            context_length: 1_000,
+            context_length: 200_000,
         })
         .build();
         // A normal first assembly initializes the agent and populates the

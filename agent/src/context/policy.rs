@@ -137,6 +137,13 @@ impl ContextPolicy {
         self.compact_point(window).saturating_sub(self.safe_buffer)
     }
 
+    /// Whether a window of `window` tokens leaves any room below the pause
+    /// point. One that does not would pause before its first request.
+    #[must_use]
+    pub fn admits(&self, window: u32) -> bool {
+        self.pause_point(window) > 0
+    }
+
     /// Whether the window holds enough to fork a background compaction.
     ///
     /// A budget with no window yet never reports it: thresholds must not fire
