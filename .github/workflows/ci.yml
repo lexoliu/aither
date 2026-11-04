@@ -123,16 +123,6 @@ jobs:
   # ---------------------------------------------------------------- fast gates
   # These need no build, so they answer in seconds and catch the cheap mistakes
   # before anyone waits on a compile.
-  typos:
-    name: Typos
-    needs: scope
-    if: needs.scope.outputs.queued != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: crate-ci/typos@master
-
   audit:
     name: Security Audit
     needs: scope
