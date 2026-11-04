@@ -4968,6 +4968,10 @@ mod tests {
     /// Dropping the apply while it reads the files to restore commits
     /// nothing: the compaction stays landed and the next boundary applies it
     /// in full, restored files included.
+    ///
+    /// The read runs on the blocking pool, which may finish it within the
+    /// first poll; the apply must then have committed in full. Either way
+    /// the apply is never seen half done.
     #[tokio::test]
     async fn dropping_the_apply_during_restoration_leaves_the_compaction_pending() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4992,10 +4996,14 @@ mod tests {
             },
         );
 
-        let dropped = futures_lite::future::poll_once(agent.apply_completed_compaction()).await;
-        assert!(dropped.is_none(), "the apply was waiting on the file read");
-        assert!(agent.context().handoff().is_none(), "nothing was committed");
-        assert!(agent.compaction.landed().is_some(), "still pending");
+        let first_poll = futures_lite::future::poll_once(agent.apply_completed_compaction()).await;
+        if first_poll.is_none() {
+            assert!(agent.context().handoff().is_none(), "nothing was committed");
+            assert!(agent.compaction.landed().is_some(), "still pending");
+        } else {
+            assert!(agent.context().handoff().is_some(), "committed in full");
+            assert!(agent.compaction.landed().is_none(), "nothing left pending");
+        }
 
         let request = agent
             .prepare_request()
