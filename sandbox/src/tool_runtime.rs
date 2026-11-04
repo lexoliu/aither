@@ -994,9 +994,7 @@ const BUSY_BACKOFF: [std::time::Duration; 6] = [
 /// the write descriptor until it execs, and executing the file meanwhile fails
 /// with `ETXTBSY`. That failure is retried with a short bounded backoff; any
 /// other error, or a file still busy afterwards, is returned unchanged.
-pub fn run_installed(
-    command: &mut std::process::Command,
-) -> std::io::Result<std::process::Output> {
+pub fn run_installed(command: &mut std::process::Command) -> std::io::Result<std::process::Output> {
     retry_busy(|| command.output())
 }
 
