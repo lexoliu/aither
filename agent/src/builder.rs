@@ -687,10 +687,12 @@ where
 
     /// Overrides the session's prompt-cache controller.
     ///
-    /// The default derives a fresh session key per agent and retains Claude
-    /// breakpoints for one hour; a host with its own session identity or a
-    /// provider that retains prompts differently supplies the
-    /// [`PromptCache`](crate::context::PromptCache) it wants here.
+    /// The default derives a fresh session key per agent, so every rebuild
+    /// asks for a new cache shard; a host that rebuilds its agent supplies
+    /// the session's identity (and the replaced agent's epoch, through
+    /// [`PromptCache::with_epoch`](crate::context::PromptCache::with_epoch))
+    /// so the key stays the same across rebuilds. The same value sets the
+    /// Claude breakpoint retention, which is one hour by default.
     pub fn prompt_cache(mut self, cache: crate::context::PromptCache) -> Self {
         self.prompt_cache = cache;
         self
