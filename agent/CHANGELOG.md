@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/May-Agent/aither/compare/agent-v0.14.1...agent-v0.15.0) - 2026-11-04
+
+### Added
+
+- *(agent)* alert the agent when host memory pressure or machine load becomes high and when it ends
+- *(agent)* [**breaking**] stamp user messages with UTC time and report timeout kill times
+- *(agent)* [**breaking**] communication and working languages enforced on questions, replies and records
+- *(agent)* [**breaking**] named subagents defined in TOML
+- *(agent)* dispatch every tool call with its id and the agent making it
+- *(sandbox)* hand IPC commands and observers the identity of the terminal call that ran them
+- *(agent)* native compact tool and a one-shot pre-compaction alert
+- *(agent)* [**breaking**] compaction points in tokens, a safe buffer and recovery from failed compaction
+- *(agent)* [**breaking**] the subagent type is the subcommand, with a fixed tier and workspace
+- *(agent)* bundle audit, review and general subagents with fixed tiers
+- *(agent)* [**breaking**] host-ordered system layout with bounded external content
+
+### Fixed
+
+- *(agent)* a fork's inherited compact tool compacts the fork
+- *(sandbox)* resolve IPC command paths against the caller's working directory
+- *(agent)* keep terminal-run ask_user exchanges through compaction
+- *(agent)* keep ask_user exchanges and user messages verbatim through compaction
+- *(agent)* commit a compaction apply in one step
+- *(agent)* keep post-fork alerts when a compaction handoff applies
+- *(agent)* providers ignore other providers' cache sections
+- *(agent)* route every compaction through one state
+- *(agent)* add a compaction floor to the context policy
+- *(agent)* keep a final answer's reasoning in the conversation
+- *(context)* expose a checkpoint's sequence boundary
+- *(agent)* refuse a context window with no room below the safe buffer
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into fix/430-verbatim-user-messages
+- Merge remote-tracking branch 'origin/dev' into fix/422-apply-cancel-safety
+- Merge pull request #450 from May-Agent/fix/420-post-fork-alerts
+- Merge remote-tracking branch 'origin/dev' into fix/420-post-fork-alerts
+- Merge remote-tracking branch 'origin/dev' into feat/188-compact-tool
+- Merge remote-tracking branch 'origin/dev' into fix/424-one-compaction-state
+- Merge pull request #440 from May-Agent/fix/428-caller-cwd
+- Merge pull request #437 from May-Agent/fix/426-compaction-floor
+- Merge pull request #432 from May-Agent/feat/210-load-alerts
+- Merge pull request #436 from May-Agent/fix/423-provider-cache-sections
+- Merge remote-tracking branch 'origin/dev' into feat/210-load-alerts
+- Merge pull request #427 from May-Agent/feat/415-subagent-subcommands
+- merge dev into fix/430-verbatim-user-messages
+- Merge pull request #435 from May-Agent/fix/421-final-answer-reasoning
+- Merge pull request #431 from May-Agent/feat/417-utc-times
+- Merge branch 'fix/424-one-compaction-state' into feat/188-compact-tool
+- Merge remote-tracking branch 'origin/dev' into feat/415-subagent-subcommands
+- Merge remote-tracking branch 'origin/dev' into feat/210-load-alerts
+- Merge remote-tracking branch 'origin/dev' into feat/417-utc-times
+- Merge pull request #434 from May-Agent/fix/433-checkpoint-boundary
+- Merge remote-tracking branch 'origin/dev' into feat/188-compact-tool
+- Merge pull request #425 from May-Agent/feat/418-call-identity
+- Merge pull request #429 from May-Agent/feat/211-languages
+- *(agent)* build the expected spill path with native separators
+- Merge origin/dev into feat/415-subagent-subcommands
+
 ## [0.14.0](https://github.com/May-Agent/aither/compare/agent-v0.13.0...agent-v0.14.0) - 2026-11-03
 
 ### Added
