@@ -593,7 +593,7 @@ mod tests {
             file_index: build_file_index(context.handoff_file_index(), &context.build_request(&[])),
             ..HandoffDocument::default()
         };
-        context.apply_handoff(&handoff, u64::MAX);
+        context.apply_handoff(&handoff, u64::MAX, 0);
         handoff
     }
 
@@ -726,5 +726,100 @@ mod tests {
             .content();
         assert!(instruction.contains("Focus the handoff on: the failing test"));
         assert!(instruction.contains("pdf"), "the skill catalog is offered");
+    }
+
+    #[derive(Debug)]
+    struct NoError;
+
+    impl std::fmt::Display for NoError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("never fails")
+        }
+    }
+
+    impl std::error::Error for NoError {}
+
+    impl aither_core::llm::Classify for NoError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
+
+    /// Answers every request with a handoff and records it.
+    struct CapturingModel {
+        seen: std::sync::Mutex<Vec<LLMRequest>>,
+    }
+
+    impl LanguageModel for CapturingModel {
+        type Error = NoError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl futures_lite::Stream<Item = Result<Event, Self::Error>> + Send {
+            self.seen.lock().unwrap().push(request);
+            futures_lite::stream::iter([Ok(Event::Text(
+                r#"{"current_task":"keep going","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["continue"],"recovery_hints":[],"skills":[]}"#
+                    .to_string(),
+            ))])
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<
+            Output = Result<aither_core::llm::model::Profile, Self::Error>,
+        > + Send {
+            std::future::ready(Ok(aither_core::llm::model::Profile::new(
+                "capture",
+                "test",
+                "capture",
+                "capturing model",
+                1_000_000,
+            )))
+        }
+    }
+
+    /// The compaction request must reach the provider with the session's
+    /// cache controls and the structured-output flag `generate` sets.
+    #[tokio::test]
+    async fn the_compaction_request_keeps_the_cache_controls_beside_structured_outputs() {
+        use aither_core::llm::model::{
+            ClaudeCacheBreakpointTarget, ClaudePromptCacheStrategy, OpenAIPromptCacheRetention,
+            Parameters,
+        };
+
+        let messages = vec![
+            Message::system("prefix"),
+            Message::user("hello"),
+            Message::assistant("hi"),
+            Message::system("live tail"),
+        ];
+        let parameters = crate::context::PromptCache::new("session-1").apply(
+            Parameters::default(),
+            &messages,
+            false,
+        );
+        let main = LLMRequest::new(messages).with_parameters(parameters);
+        let fork = CompactionFork::new(&main, 0, &[], None, &[]).expect("fork");
+        let model = CapturingModel {
+            seen: std::sync::Mutex::default(),
+        };
+        fork.run(&model).await.expect("compaction");
+
+        let request = model.seen.lock().unwrap().remove(0);
+        let parameters = request.parameters();
+        assert!(parameters.structured_outputs);
+        let openai = parameters.cache.openai.as_ref().expect("openai cache");
+        assert_eq!(openai.key.as_deref(), Some("session-1:0"));
+        assert_eq!(openai.retention, Some(OpenAIPromptCacheRetention::Hours24));
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) =
+            parameters.cache.claude.expect("claude cache").strategy
+        else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.first.target,
+            ClaudeCacheBreakpointTarget::LastSystem
+        );
     }
 }

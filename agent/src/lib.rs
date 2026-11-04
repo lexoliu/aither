@@ -35,8 +35,12 @@ pub mod ask_user;
 mod browser_backend;
 mod builder;
 mod cache_stats;
+#[cfg(test)]
+mod call_identity_tests;
 mod checkpoint;
 mod clock;
+mod compact_tool;
+mod compaction_state;
 mod config;
 mod connectivity;
 pub mod context;
@@ -47,8 +51,11 @@ pub mod external_hook;
 mod fork;
 mod fs_util;
 mod hook;
+mod host_load;
 #[cfg(test)]
 mod idle_compaction_tests;
+#[cfg(feature = "languages")]
+pub mod language;
 mod model_group;
 mod output_urls;
 mod stream;
@@ -65,8 +72,12 @@ pub mod workspace_request;
 // Specialized agents
 pub mod specialized;
 
-// File-based subagent definitions
-pub use subagent_file::{SubagentDefinition, builtin_subagents};
+// Subagent definitions
+pub use subagent_file::{
+    BUNDLED_SUBAGENTS, BundledSubagent, DefinitionError, LOCAL_SUBAGENTS_DIR,
+    RESERVED_SUBAGENT_NAMES, ResolveError, SubagentAccess, SubagentDefinition,
+    install_bundled_subagents, validate_subagent_name,
+};
 
 // Re-export tool crates
 #[cfg(feature = "command")]
@@ -88,13 +99,15 @@ pub use builder::AgentBuilder;
 pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
 pub use clock::{AnyClock, Clock, Instant, ManualClock, SystemClock};
+pub use compact_tool::{CompactArgs, CompactSignal, CompactTool};
 pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy};
 #[cfg(feature = "skills")]
 pub use context::ActiveSkills;
 pub use context::{
     AnyContextSource, BackgroundJobs, Block, CompactionError, CompletedCompaction, Context,
-    ContextBudget, ContextCheckpoint, ContextItem, ContextPolicy, ContextSource, Handoff,
-    HandoffDocument, PromptCache, ReassemblyReport, TasksDocument,
+    ContextBudget, ContextCheckpoint, ContextItem, ContextPolicy, ContextSource, ExternalContent,
+    ExternalSlot, Handoff, HandoffDocument, InstructionSlot, PromptCache, ReassemblyReport,
+    SystemLayout, TasksDocument,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;
@@ -108,6 +121,12 @@ pub use hook::{
     CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction, StopContext,
     StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
 };
+pub use host_load::{
+    AnyHostReader, HostLoadConfig, HostLoadEvent, HostLoadMonitor, HostReader, HostSample,
+    MachineLoad, MemoryPressure, ReadError, SystemReader,
+};
+#[cfg(feature = "languages")]
+pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
 pub use stream::AgentStream;
 pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};

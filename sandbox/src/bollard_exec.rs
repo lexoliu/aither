@@ -857,6 +857,138 @@ mod tests {
         );
     }
 
+    /// Leaves `$HOPPERS` processes running, each re-executing itself `$HOPS`
+    /// times before it execs `$THEN`, with two thousand variables in its
+    /// environment so that every exec spends long laying it out — the time
+    /// during which `/proc` reads that environment as empty — and records
+    /// their pids in `hoppers`.
+    #[cfg(target_os = "linux")]
+    const EXEC_HOPPERS: &str = r#"i=0; while [ $i -lt 2000 ]; do export "BULK_$i=$i"; i=$((i + 1)); done; hop='if [ "$1" -gt 0 ]; then exec sh -c "$0" "$0" $(($1 - 1)) "$2"; fi; exec $2'; : > hoppers; n=0; while [ $n -lt "$HOPPERS" ]; do sh -c "$hop" "$hop" "$HOPS" "$THEN" > /dev/null 2>&1 & echo $! >> hoppers; n=$((n + 1)); done"#;
+
+    /// Runs the wrapper over [`EXEC_HOPPERS`] and returns its output and the
+    /// hoppers' pids.
+    #[cfg(target_os = "linux")]
+    fn run_hoppers(
+        lifetime: &str,
+        hoppers: usize,
+        hops: u32,
+        then: &str,
+        dir: &std::path::Path,
+    ) -> (std::process::Output, Vec<String>) {
+        let pid_file = dir.join("exec.pid");
+        let run = Command::new("sh")
+            .args(["-c", CONTAINER_EXEC_WRAPPER, "sh"])
+            .arg(&pid_file)
+            .arg(EXEC_HOPPERS)
+            .arg(lifetime)
+            .arg(CONTAINER_JOB_SCRIPT)
+            .current_dir(dir)
+            .env("HOPPERS", hoppers.to_string())
+            .env("HOPS", hops.to_string())
+            .env("THEN", then)
+            .output()
+            .expect("run the exec wrapper");
+        let pids = std::fs::read_to_string(dir.join("hoppers")).expect("the hoppers' pids");
+        let pids: Vec<String> = pids.lines().map(str::to_string).collect();
+        assert_eq!(pids.len(), hoppers, "every hopper started");
+        (run, pids)
+    }
+
+    /// Kills the processes of `pids` that are still alive and returns them.
+    #[cfg(target_os = "linux")]
+    fn kill_survivors(pids: &[String], wait: std::time::Duration) -> Vec<String> {
+        let survivors: Vec<String> = pids
+            .iter()
+            .filter(|pid| !dead_within(pid, wait))
+            .cloned()
+            .collect();
+        for pid in &survivors {
+            Command::new("kill")
+                .args(["-KILL", pid.as_str()])
+                .status()
+                .expect("kill a survivor");
+        }
+        survivors
+    }
+
+    /// The foreground kill finds every leftover process, also those that are
+    /// in an exec while it looks: a process whose new image's environment is
+    /// not laid out yet still belongs to the job.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreground_wrapper_kills_leftover_processes_in_an_exec() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (run, pids) = run_hoppers("foreground", 16, 2000, "sleep 300", dir.path());
+        let survivors = kill_survivors(&pids, std::time::Duration::from_secs(5));
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            survivors.is_empty(),
+            "the wrapper missed {survivors:?}: {stderr}"
+        );
+        assert!(run.status.success(), "{stderr}");
+        let report = format!("{} killed ", dir.path().join("exec.pid").display());
+        for pid in &pids {
+            assert!(
+                stderr
+                    .lines()
+                    .filter_map(|line| line.strip_prefix(&report))
+                    .any(|killed| killed
+                        .split_once(' ')
+                        .is_some_and(|(id, _)| id == pid.as_str())),
+                "{pid} is not reported killed: {stderr}"
+            );
+        }
+    }
+
+    /// A background wrapper outlives a leftover process that execs again and
+    /// again: no look at it during an exec ends the wait early.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_wrapper_outlives_a_leftover_process_in_an_exec() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (run, pids) = run_hoppers("background", 1, 1500, "true", dir.path());
+        let survivors = kill_survivors(&pids, std::time::Duration::ZERO);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            survivors.is_empty(),
+            "the wrapper ended before {survivors:?}: {stderr}"
+        );
+        assert!(run.status.success(), "{stderr}");
+        assert!(run.stderr.is_empty(), "{stderr}");
+    }
+
+    /// A process that dropped the marker from its environment, or runs with
+    /// none at all, escapes the job: the background wrapper does not wait for
+    /// it, and reading an environment of any bytes is no error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_wrapper_ignores_a_process_without_the_marker() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("exec.pid");
+        let started = std::time::Instant::now();
+        let run = run_wrapper_as(
+            &pid_file,
+            r#"(unset AITHER_JOB; export ODD="$(printf '\303\251t\303\251\nx\001\177')"; exec sleep 30) > /dev/null 2>&1 & echo $! > escaped; env -i sleep 30 > /dev/null 2>&1 & echo $! >> escaped"#,
+            "background",
+            dir.path(),
+        );
+        let elapsed = started.elapsed();
+        let pids: Vec<String> = std::fs::read_to_string(dir.path().join("escaped"))
+            .expect("the escaped pids")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let survivors = kill_survivors(&pids, std::time::Duration::ZERO);
+        assert_eq!(survivors.len(), 2, "both processes ran: {pids:?}");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "{stderr}");
+        assert!(run.stderr.is_empty(), "{stderr}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the wrapper waited for processes outside the job"
+        );
+    }
+
     /// A helper that fails ends the wait with an error line the exec turns
     /// into a failure, in the background wait and in the foreground kill: it
     /// is not read as "still alive". Runs anywhere `sh` does.

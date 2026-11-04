@@ -1,0 +1,1 @@
+A compaction is already in flight; nothing was started. Keep working: its summary replaces the older conversation at a later step.

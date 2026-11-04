@@ -27,13 +27,8 @@
 //! let agent = TerminalAgentBuilder::new(llm, terminal_tool)
 //!     .tool(WebSearchTool::default())  // Becomes `websearch` terminal command
 //!     .tool(WebFetchTool::new())       // Becomes `webfetch` terminal command
-//!     // Becomes the `subagent` terminal command, launching from whichever
-//!     // terminal runs it.
-//!     .terminal_bound_tool_with_desc(
-//!         "subagent",
-//!         move |binding| subagents.for_terminal(binding),
-//!         "Spawn or continue a subagent",
-//!     )
+//!     // Becomes the main agent's `subagent` terminal command.
+//!     .subagents(subagents, "Run or continue a subagent")
 //!     .build();
 //! ```
 
@@ -51,11 +46,13 @@ use aither_mcp::McpConnection;
 #[cfg(feature = "skills")]
 use aither_skills::SkillRegistry;
 use askama::Template;
+#[cfg(feature = "skills")]
 use async_fs as fs;
 use executor_core::Executor;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
+use crate::context::{ExternalContent, ExternalSlot, InstructionSlot, SystemLayout};
 use crate::hook::Hook;
 use crate::{Agent, AgentBuilder, config::AgentKind};
 use aither_core::llm::ToolResult;
@@ -81,8 +78,6 @@ struct SystemPrompt {
     host_runtime_context: String,
     skills: String,
     has_skills: bool,
-    subagents: String,
-    has_subagents: bool,
     is_macos: bool,
     has_websearch_command: bool,
 }
@@ -95,6 +90,7 @@ struct ShellRuntimeContextTemplate {
     runtime: &'static str,
 }
 
+#[cfg(feature = "skills")]
 fn join_text(parts: &[&str]) -> String {
     let capacity = parts.iter().map(|part| part.len()).sum();
     let mut output = String::with_capacity(capacity);
@@ -104,12 +100,14 @@ fn join_text(parts: &[&str]) -> String {
     output
 }
 
+#[cfg(feature = "skills")]
 fn path_error_text(prefix: &str, path: &std::path::Path, error: &impl std::fmt::Display) -> String {
     let path_text = path.display().to_string();
     let error_text = error.to_string();
     join_text(&[prefix, path_text.as_str(), "': ", error_text.as_str()])
 }
 
+#[cfg(feature = "skills")]
 fn quoted_path_error_text(
     prefix: &str,
     first_path: &std::path::Path,
@@ -137,17 +135,6 @@ pub struct SkillInfo {
     pub name: String,
     /// Short description.
     pub description: String,
-}
-
-/// Loaded subagent metadata for system prompt.
-#[derive(Debug, Clone)]
-pub struct SubagentInfo {
-    /// Name/ID of the subagent.
-    pub name: String,
-    /// Short description.
-    pub description: String,
-    /// Relative path within the `subagents` folder.
-    pub path: String,
 }
 
 /// [`TerminalAgentBuilder`] state while its shell backends are still being
@@ -183,10 +170,28 @@ where
     registry_builder: ToolRegistryBuilder,
     tool_descriptions: Vec<(String, String)>,
     skills: Vec<SkillInfo>,
-    subagents: Vec<SubagentInfo>,
+    host_load: HostLoadSetup,
     #[cfg(feature = "skills")]
     skill_registry: Option<SkillRegistry>,
     state: PhantomData<S>,
+}
+
+/// How the built agent watches the host's memory pressure and load.
+struct HostLoadSetup {
+    enabled: bool,
+    config: crate::HostLoadConfig,
+    /// The reader to watch; the host's own when unset.
+    reader: Option<crate::AnyHostReader>,
+}
+
+impl Default for HostLoadSetup {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            config: crate::HostLoadConfig::default(),
+            reader: None,
+        }
+    }
 }
 
 impl<LLM, P, E, H, S> std::fmt::Debug for TerminalAgentBuilder<LLM, P, E, H, S>
@@ -199,7 +204,6 @@ where
         f.debug_struct("TerminalAgentBuilder")
             .field("tool_count", &self.tool_descriptions.len())
             .field("skill_count", &self.skills.len())
-            .field("subagent_count", &self.subagents.len())
             .finish_non_exhaustive()
     }
 }
@@ -212,8 +216,9 @@ where
 {
     /// Creates a new terminal-first agent builder.
     ///
-    /// Creates the agent with native tools (`terminal`, `terminal_kill`,
-    /// `terminal_input`, `terminal_read`) and IPC commands accessible through
+    /// Creates the agent with native tools (`terminal`, `monitor`,
+    /// `terminal_kill`, `terminal_input`, `terminal_read`, `compact`) and IPC
+    /// commands accessible through
     /// `terminal` (registered via `.tool()`). The native control tools address
     /// the same background jobs as `terminal` and are not advertised as commands.
     pub fn new(llm: LLM, mut terminal_tool: TerminalTool<P, E, Unconfigured>) -> Self {
@@ -235,7 +240,8 @@ where
         let inner = AgentBuilder::new(llm)
             .tool(kill_terminal_tool)
             .tool(input_terminal_tool)
-            .tool(read_terminal_delta_tool);
+            .tool(read_terminal_delta_tool)
+            .compact_tool();
 
         Self {
             inner,
@@ -243,7 +249,7 @@ where
             registry_builder,
             tool_descriptions,
             skills: Vec::new(),
-            subagents: Vec::new(),
+            host_load: HostLoadSetup::default(),
             #[cfg(feature = "skills")]
             skill_registry: None,
             state: PhantomData,
@@ -269,13 +275,14 @@ where
             registry_builder: self.registry_builder,
             tool_descriptions: self.tool_descriptions,
             skills: self.skills,
-            subagents: self.subagents,
+            host_load: self.host_load,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
             state: PhantomData,
         }
     }
 
+    #[cfg(feature = "skills")]
     async fn resolve_absolute_dir(
         path: &std::path::Path,
         kind: &str,
@@ -296,6 +303,7 @@ where
             })
     }
 
+    #[cfg(feature = "skills")]
     async fn register_readable_dir(
         mut self,
         source_path: &std::path::Path,
@@ -306,6 +314,7 @@ where
         Ok(self)
     }
 
+    #[cfg(feature = "skills")]
     async fn attach_readable_symlink(
         mut self,
         source_path: &std::path::Path,
@@ -414,6 +423,7 @@ where
     pub fn definition_handler<F>(mut self, definition: &ToolDefinition, handler: F) -> Self
     where
         F: Fn(
+                Option<aither_core::llm::CallIdentity>,
                 serde_json::Value,
             ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
             + Send
@@ -485,6 +495,32 @@ where
         self
     }
 
+    /// Gives the main agent the `subagent` command `subagents` serves, with
+    /// `description`, and publishes the agent's requests for its `fork`.
+    ///
+    /// A subagent's terminal has no `subagent` command, so a subagent, a
+    /// fork included, starts none. A bare `subagent` lists the names that
+    /// resolve.
+    #[must_use]
+    pub fn subagents(
+        mut self,
+        subagents: crate::specialized::SubagentTool<LLM>,
+        description: impl Into<String>,
+    ) -> Self
+    where
+        LLM: Sync + 'static,
+    {
+        self.inner = self.inner.fork_source(subagents.fork_source());
+        self.tool_descriptions
+            .push(("subagent".to_string(), description.into()));
+        self.registry_builder.main_exclusive(|main| {
+            main.configure_terminal_bound_usage_tool("subagent", move |binding| {
+                subagents.for_terminal(binding)
+            });
+        });
+        self
+    }
+
     /// Adds a pre-configured tool description (for tools registered elsewhere).
     ///
     /// Use this when the tool was already registered on the registry builder.
@@ -548,30 +584,51 @@ where
         self
     }
 
-    /// Inserts or replaces a typed persistent system block.
-    #[must_use]
-    pub fn system<T: Template>(mut self, value: T) -> Self {
-        self.inner = self.inner.system(value);
-        self
-    }
-
-    /// Inserts or replaces a persistent system block with an explicit tag.
-    #[must_use]
-    pub fn system_named(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
-        self.inner = self.inner.system_named(tag, content);
-        self
-    }
-
-    /// Inserts or replaces a persistent system block with raw text.
+    /// Lays the system prompt out in `layout`'s order; see
+    /// [`AgentBuilder::system_layout`].
     ///
-    /// Unlike [`system`](Self::system) and [`system_named`](Self::system_named),
-    /// the `content` is stored verbatim without any XML wrapping. This is the
-    /// preferred entry point for prose system blocks (workspace descriptions,
-    /// runtime metadata, environment hints) where XML structure adds tokens
-    /// without providing semantic value.
+    /// # Panics
+    ///
+    /// Panics if a block already added has no slot in `layout`.
     #[must_use]
-    pub fn system_text(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
-        self.inner = self.inner.system_text(tag, content);
+    pub fn system_layout(mut self, layout: SystemLayout) -> Self {
+        self.inner = self.inner.system_layout(layout);
+        self
+    }
+
+    /// Inserts or replaces the instruction block in `slot`, wrapped in a tag
+    /// named after the slot; see [`AgentBuilder::system_named`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no such slot.
+    #[must_use]
+    pub fn system_named(mut self, slot: &InstructionSlot, content: &str) -> Self {
+        self.inner = self.inner.system_named(slot, content);
+        self
+    }
+
+    /// Inserts or replaces the instruction block in `slot` with raw text; see
+    /// [`AgentBuilder::system_text`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no such slot.
+    #[must_use]
+    pub fn system_text(mut self, slot: &InstructionSlot, content: impl Into<String>) -> Self {
+        self.inner = self.inner.system_text(slot, content);
+        self
+    }
+
+    /// Inserts or replaces the external-content block in `slot`; see
+    /// [`AgentBuilder::external_content`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no such slot.
+    #[must_use]
+    pub fn external_content(mut self, slot: &ExternalSlot, content: ExternalContent) -> Self {
+        self.inner = self.inner.external_content(slot, content);
         self
     }
 
@@ -607,7 +664,9 @@ where
         }
         .render()
         .expect("shell runtime context template must render");
-        self.inner = self.inner.system_text("shell_runtime", shell_context);
+        self.inner = self
+            .inner
+            .system_text(&InstructionSlot::SHELL_RUNTIME, shell_context);
 
         let ssh_context =
             describe_ssh_servers(&self.terminal_tool.shell_sessions().list_ssh_servers());
@@ -620,10 +679,6 @@ where
         // Build skills description
         let has_skills = !self.skills.is_empty();
         let skills = render_skill_descriptions(&self.skills);
-
-        // Build subagents description
-        let has_subagents = !self.subagents.is_empty();
-        let subagents = render_subagent_descriptions(&self.subagents);
 
         // Get directory paths
         let sandbox_dir = self.terminal_tool.working_dir().display().to_string();
@@ -646,8 +701,6 @@ where
             host_runtime_context,
             skills,
             has_skills,
-            subagents,
-            has_subagents,
             is_macos,
             has_websearch_command: self.has_command("websearch"),
         };
@@ -754,85 +807,6 @@ where
         self
     }
 
-    /// Sets up the subagents directory and creates a symlink in the sandbox.
-    ///
-    /// Subagents are markdown files with YAML frontmatter (name, description).
-    /// They can be invoked via: `subagent start --subagent <path> --prompt-file "..."`
-    ///
-    /// A symlink `subagents` is created in the sandbox working directory.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// builder.with_subagents("/path/to/subagents").await?
-    /// ```
-    async fn load_subagents(
-        mut self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, crate::AgentError> {
-        use crate::subagent_file::SubagentDefinition;
-
-        let path = path.as_ref().to_path_buf();
-        let abs_path = Self::resolve_absolute_dir(&path, "subagents").await?;
-
-        let defs = SubagentDefinition::load_from_dir_async(&abs_path)
-            .await
-            .map_err(|error| {
-                crate::AgentError::Config(path_error_text(
-                    "failed to load subagents from '",
-                    &abs_path,
-                    &error,
-                ))
-            })?;
-
-        for def in defs {
-            let mut filename = def.id.clone();
-            filename.push_str(".md");
-            self.subagents.push(SubagentInfo {
-                name: def.id,
-                description: def.description,
-                path: filename,
-            });
-        }
-
-        Ok(self)
-    }
-
-    /// Loads subagents and exposes the subagent directory inside the sandbox.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when loading subagents or creating the sandbox symlink fails.
-    pub async fn with_subagents(
-        self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, crate::AgentError> {
-        let path = path.as_ref().to_path_buf();
-        self.load_subagents(&path)
-            .await?
-            .attach_readable_symlink(&path, "subagents", "subagents")
-            .await
-    }
-
-    /// Loads subagent metadata and grants read-only access to the source
-    /// directory without creating a `subagents` symlink in the sandbox.
-    ///
-    /// Use this when the runtime already mounts `subagents` inside the sandbox.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when loading subagents or registering the readable directory fails.
-    pub async fn with_subagents_readable_only(
-        self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, crate::AgentError> {
-        let path = path.as_ref().to_path_buf();
-        self.load_subagents(&path)
-            .await?
-            .register_readable_dir(&path, "subagents")
-            .await
-    }
-
     /// Sets the model compaction runs on, instead of the session's own.
     ///
     /// See [`AgentBuilder::compaction_model`].
@@ -897,6 +871,32 @@ where
     #[must_use]
     pub fn clock(mut self, clock: impl crate::Clock) -> Self {
         self.inner = self.inner.clock(clock);
+        self
+    }
+
+    /// Sets when host memory pressure and machine load count as high, how
+    /// long they must hold to start and to end, how often the host is read,
+    /// and the terminal's foreground window while high load lasts.
+    ///
+    /// The built agent is told once when each condition starts and once when
+    /// it ends; see [`HostLoadMonitor`](crate::HostLoadMonitor).
+    #[must_use]
+    pub const fn host_load(mut self, config: crate::HostLoadConfig) -> Self {
+        self.host_load.config = config;
+        self
+    }
+
+    /// Reads the host through `reader` instead of the platform's own.
+    #[must_use]
+    pub fn host_reader(mut self, reader: impl crate::HostReader) -> Self {
+        self.host_load.reader = Some(crate::AnyHostReader::new(reader));
+        self
+    }
+
+    /// Does not watch the host's memory pressure or machine load.
+    #[must_use]
+    pub const fn without_host_load(mut self) -> Self {
+        self.host_load.enabled = false;
         self
     }
 
@@ -994,15 +994,40 @@ where
         // Configure terminal tool
         let terminal_tool = self.terminal_tool.with_registry(registry);
 
-        let inner = if self.inner.has_system_named("knowledge_and_time") {
+        let inner = if self
+            .inner
+            .has_instruction(&InstructionSlot::KNOWLEDGE_AND_TIME)
+        {
             self.inner
         } else {
             self.inner.system_named(
-                "knowledge_and_time",
-                crate::agent::KnowledgeAndTimeTemplate { websearch_command }
+                &InstructionSlot::KNOWLEDGE_AND_TIME,
+                &crate::agent::KnowledgeAndTimeTemplate { websearch_command }
                     .render()
                     .expect("failed to render knowledge_and_time template"),
             )
+        };
+        let host_load = self.host_load;
+        let reader = host_load
+            .enabled
+            .then_some(host_load.reader)
+            .flatten()
+            .or_else(|| {
+                host_load.enabled.then(|| {
+                    crate::SystemReader::new()
+                        .inspect_err(|error| tracing::warn!(%error, "host load is not watched"))
+                        .ok()
+                        .map(crate::AnyHostReader::new)
+                })?
+            });
+        let inner = match reader {
+            Some(reader) => inner.host_load(
+                terminal_tool.executor(),
+                reader,
+                host_load.config,
+                terminal_tool.foreground_wait(),
+            ),
+            None => inner,
         };
         let inner = inner
             .terminal(terminal_tool.clone())
@@ -1168,22 +1193,6 @@ fn render_skill_descriptions(entries: &[SkillInfo]) -> String {
     output
 }
 
-fn render_subagent_descriptions(entries: &[SubagentInfo]) -> String {
-    let mut output = String::new();
-    for subagent in entries {
-        let mut line = String::with_capacity(
-            subagent.name.len() + subagent.path.len() + subagent.description.len() + 5,
-        );
-        line.push_str(subagent.name.as_str());
-        line.push_str(" (");
-        line.push_str(subagent.path.as_str());
-        line.push_str("): ");
-        line.push_str(subagent.description.as_str());
-        push_bullet_line(&mut output, line.as_str());
-    }
-    output
-}
-
 fn describe_host_runtime_context(
     host_profile: &str,
     availability: &ShellRuntimeAvailability,
@@ -1335,8 +1344,6 @@ mod tests {
             host_runtime_context: String::new(),
             skills: String::new(),
             has_skills: false,
-            subagents: String::new(),
-            has_subagents: false,
             is_macos: false,
             has_websearch_command: false,
         }
@@ -1459,8 +1466,6 @@ mod tests {
             host_runtime_context: "runtime=linux_container".to_string(),
             skills: String::new(),
             has_skills: false,
-            subagents: String::new(),
-            has_subagents: false,
             is_macos: true,
             has_websearch_command: true,
         }
@@ -1486,8 +1491,6 @@ mod tests {
             host_runtime_context: "runtime=user_local_machine".to_string(),
             skills: String::new(),
             has_skills: false,
-            subagents: String::new(),
-            has_subagents: false,
             is_macos: true,
             has_websearch_command: true,
         }
@@ -1691,6 +1694,7 @@ mod tests {
         assert_eq!(
             tool_names,
             [
+                "compact",
                 "monitor",
                 "terminal",
                 "terminal_input",
@@ -1711,6 +1715,7 @@ mod tests {
                 .map(ToolDefinition::name)
                 .collect::<Vec<_>>(),
             vec![
+                "compact",
                 "monitor",
                 "terminal",
                 "terminal_input",

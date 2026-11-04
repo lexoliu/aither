@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use jiff::{SignedDuration, Timestamp};
+
 /// A point on a [`Clock`]'s timeline.
 ///
 /// Opaque and only meaningful against other instants of the same clock. Unlike
@@ -65,6 +67,10 @@ impl Instant {
 pub trait Clock: Send + Sync + 'static {
     /// The current instant.
     fn now(&self) -> Instant;
+
+    /// The current wall-clock time, stamped on the user messages the model
+    /// reads.
+    fn utc_now(&self) -> Timestamp;
 }
 
 /// The operating system's monotonic clock that keeps counting while the
@@ -80,6 +86,10 @@ pub struct SystemClock;
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
         Instant::from_nanos(system_nanos())
+    }
+
+    fn utc_now(&self) -> Timestamp {
+        Timestamp::now()
     }
 }
 
@@ -117,14 +127,23 @@ fn system_nanos() -> u64 {
 #[derive(Debug, Clone)]
 pub struct ManualClock {
     advanced_nanos: Arc<AtomicU64>,
+    origin_utc: Timestamp,
 }
 
 impl ManualClock {
     /// Creates a clock standing at its origin.
     #[must_use]
     pub fn new() -> Self {
+        Self::at_utc(Timestamp::UNIX_EPOCH)
+    }
+
+    /// Creates a clock standing at its origin, whose wall-clock time there is
+    /// `origin_utc`.
+    #[must_use]
+    pub fn at_utc(origin_utc: Timestamp) -> Self {
         Self {
             advanced_nanos: Arc::new(AtomicU64::new(0)),
+            origin_utc,
         }
     }
 
@@ -149,6 +168,14 @@ impl Clock for ManualClock {
     fn now(&self) -> Instant {
         Instant::from_nanos(self.advanced_nanos.load(Ordering::Relaxed))
     }
+
+    fn utc_now(&self) -> Timestamp {
+        let advanced = i64::try_from(self.advanced_nanos.load(Ordering::Relaxed))
+            .expect("a manual clock stays within i64 nanoseconds");
+        self.origin_utc
+            .checked_add(SignedDuration::from_nanos(advanced))
+            .expect("a manual clock stays within the timestamp range")
+    }
 }
 
 /// A type-erased [`Clock`], what the agent stores.
@@ -169,6 +196,12 @@ impl AnyClock {
     #[must_use]
     pub fn now(&self) -> Instant {
         self.0.now()
+    }
+
+    /// The current wall-clock time on the wrapped clock.
+    #[must_use]
+    pub fn utc_now(&self) -> Timestamp {
+        self.0.utc_now()
     }
 
     /// Time elapsed since `earlier`, zero when `earlier` is in the future.

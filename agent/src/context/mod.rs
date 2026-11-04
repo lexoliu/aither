@@ -6,6 +6,8 @@
 //!
 //! - [`window`] owns the layout, and guarantees it grows only at the end so a
 //!   provider's prefix cache survives the conversation growing;
+//! - [`system`] orders the system prompt as the host lays it out and keeps
+//!   external content inside boundaries it cannot close;
 //! - [`budget`] turns the provider's own token counts into a usage figure,
 //!   instead of trusting a character heuristic that is wrong by a different
 //!   factor for prose, code and tool arguments;
@@ -24,8 +26,10 @@ pub mod cache;
 pub mod compaction;
 pub mod policy;
 pub mod reassembly;
+pub(crate) mod recovery;
 pub mod source;
 pub mod sources;
+pub mod system;
 pub mod window;
 
 pub use budget::ContextBudget;
@@ -40,4 +44,8 @@ pub use source::{AnyContextSource, Block, ContextSource};
 #[cfg(feature = "skills")]
 pub use sources::ActiveSkills;
 pub use sources::{BackgroundJobs, TasksDocument};
+pub use system::{
+    BlockKind, External, ExternalContent, ExternalSlot, Instruction, InstructionSlot, Slot,
+    SystemLayout, SystemRegion,
+};
 pub use window::{Context, ContextCheckpoint, ContextItem, ReassemblyReport};

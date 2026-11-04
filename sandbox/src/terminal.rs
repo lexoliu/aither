@@ -10,6 +10,7 @@
 //! (e.g., `amber-forest-thunder-pearl/`). All terminal executions share this
 //! directory, but each execution gets a fresh sandbox (new TTY/process).
 
+use crate::foreground_wait::ForegroundWait;
 use crate::grants::{GrantSet, TerminalGrants};
 use crate::outage::Outages;
 use std::{
@@ -25,7 +26,7 @@ use std::{
     time::Duration,
 };
 
-use aither_core::llm::ToolContext;
+use aither_core::llm::{CallIdentity, ToolContext};
 use aither_core::llm::{
     CommandOutcome, CommandResult, CommandStream, Interruption, IntoToolResult, StoredFile, Tool,
     ToolResult,
@@ -294,6 +295,72 @@ fn runs_in_shell(script: &str) -> bool {
     matches!(direct_command(script.trim()), Ok(None))
 }
 
+/// A command killed because its `timeout` bound passed, with the UTC times it
+/// started and was killed at.
+#[derive(Debug, Clone, PartialEq, Eq, Template)]
+#[template(path = "command_timed_out.txt", escape = "none")]
+pub struct TimeoutKill {
+    /// The `timeout` the command was bounded by.
+    pub timeout: Duration,
+    /// When the command started.
+    pub started: jiff::Timestamp,
+    /// When the kill was issued.
+    pub killed: jiff::Timestamp,
+}
+
+impl TimeoutKill {
+    fn started_utc(&self) -> String {
+        Self::utc(self.started)
+    }
+
+    fn killed_utc(&self) -> String {
+        Self::utc(self.killed)
+    }
+
+    fn utc(at: jiff::Timestamp) -> String {
+        at.strftime("%Y-%m-%d %H:%M:%S UTC").to_string()
+    }
+
+    /// The sentence stating the timeout and both times, as the model reads it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the template fails to render, which is a bug in the template.
+    #[must_use]
+    pub fn notice(&self) -> String {
+        self.render()
+            .expect("failed to render command_timed_out template")
+    }
+}
+
+/// What the kill watchdog of one job records: when the job started, and when
+/// the watchdog issued the kill, if it did.
+#[derive(Debug)]
+struct TimeoutWatch {
+    timeout: Duration,
+    started: jiff::Timestamp,
+    killed: std::sync::OnceLock<jiff::Timestamp>,
+}
+
+impl TimeoutWatch {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            started: jiff::Timestamp::now(),
+            killed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The kill, once the watchdog has issued one.
+    fn kill(&self) -> Option<TimeoutKill> {
+        self.killed.get().map(|killed| TimeoutKill {
+            timeout: self.timeout,
+            started: self.started,
+            killed: *killed,
+        })
+    }
+}
+
 #[derive(Template)]
 #[template(path = "carry_cwd.sh", escape = "none")]
 struct CarryCwdTemplate<'a> {
@@ -510,7 +577,7 @@ pub const DEFAULT_LONG_JOB_ALERT_AFTER: Duration = Duration::from_secs(40 * 60);
 struct TerminalLimits {
     /// Foreground wait before a `terminal` call promotes to a background
     /// task.
-    foreground_wait: Duration,
+    foreground_wait: ForegroundWait,
     /// Maximum accepted `timeout` for a command.
     timeout_cap: Duration,
     /// Runtime after which a background job produces a long-running alert.
@@ -524,7 +591,7 @@ struct TerminalLimits {
 impl Default for TerminalLimits {
     fn default() -> Self {
         Self {
-            foreground_wait: DEFAULT_FOREGROUND_WAIT,
+            foreground_wait: ForegroundWait::new(DEFAULT_FOREGROUND_WAIT),
             timeout_cap: DEFAULT_TIMEOUT_CAP,
             long_job_alert: DEFAULT_LONG_JOB_ALERT_AFTER,
             subagent_import: ImportBudget::new(DEFAULT_SUBAGENT_IMPORT_LIMIT),
@@ -743,6 +810,8 @@ pub struct CompletedTask {
     /// Whether the job was killed — its `timeout` bound or `terminal_kill`
     /// — rather than exiting on its own.
     pub killed: bool,
+    /// Set when the kill was the `timeout` bound passing.
+    pub timeout_kill: Option<TimeoutKill>,
 }
 
 /// Stage of a permission-lifecycle event for `terminal`.
@@ -1773,9 +1842,17 @@ where
     /// still-running command promotes to a background task. Defaults to
     /// [`DEFAULT_FOREGROUND_WAIT`].
     #[must_use]
-    pub const fn with_foreground_wait(mut self, wait: Duration) -> Self {
-        self.limits.foreground_wait = wait;
+    pub fn with_foreground_wait(self, wait: Duration) -> Self {
+        self.limits.foreground_wait.set_normal(wait);
         self
+    }
+
+    /// A handle on the foreground window, shared with every terminal derived
+    /// from this one: a longer window put in force through it applies to the
+    /// next foreground wait of each of them.
+    #[must_use]
+    pub fn foreground_wait(&self) -> ForegroundWait {
+        self.limits.foreground_wait.clone()
     }
 
     /// Sets the largest `timeout` a command accepts.
@@ -1940,7 +2017,7 @@ where
     }
 
     /// The executor backing this terminal, for spawning watch tasks.
-    pub(crate) const fn executor(&self) -> &E {
+    pub const fn executor(&self) -> &E {
         &self.executor
     }
 
@@ -2192,6 +2269,15 @@ where
         &self.registry.registry
     }
 
+    /// Returns a receiver for the `terminal` calls in which a command
+    /// registered with
+    /// [`ToolRegistryBuilder::kept_through_compaction`](crate::ToolRegistryBuilder::kept_through_compaction)
+    /// succeeded.
+    #[must_use]
+    pub fn kept_receiver(&self) -> crate::command::KeptExchangeReceiver {
+        self.registry().kept_receiver()
+    }
+
     /// What this terminal hands the commands bound to it: its working
     /// directory and the launcher for the subagents it starts.
     #[must_use]
@@ -2208,7 +2294,7 @@ where
                 subagent.git.clone(),
                 ImportLimits {
                     bytes: self.limits.subagent_import.clone(),
-                    time: self.limits.foreground_wait,
+                    time: self.limits.foreground_wait.get(),
                 },
             )
         })
@@ -2226,6 +2312,7 @@ where
 
         let background_receiver = self.background_receiver();
         let permission_receiver = self.permission_receiver();
+        let kept_receiver = self.kept_receiver();
         let job_registry = self.job_registry();
         let working_dir = self.working_dir().clone();
         let command_names = self.registry().available_tool_names();
@@ -2242,6 +2329,7 @@ where
             entries,
             background_receiver,
             permission_receiver,
+            kept_receiver,
             job_registry,
             working_dir,
             command_names,
@@ -2393,7 +2481,15 @@ where
             background,
             timeout,
             carry,
+            call,
         } = request;
+        // Every IPC channel this execution opens, local router or container
+        // bridge, is served from this one registry, so each command its script
+        // runs, a detached job's included, is told the id of this call.
+        let registry = call.map_or_else(
+            || self.registry().clone(),
+            |call| Arc::new(self.registry().for_call(call)),
+        );
         let ExecutionTarget { mode, backend } = target;
         let (result_tx, result_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
@@ -2405,7 +2501,7 @@ where
             task_id: task_id.clone(),
             script: script.clone(),
         });
-        self.spawn_kill_watchdog(&task_id, timeout);
+        let timeout_watch = self.spawn_kill_watchdog(&task_id, timeout);
         self.spawn_long_job_alert(&task_id);
 
         let lifetime = if background {
@@ -2429,12 +2525,13 @@ where
                 readable_paths: self.grants.snapshot().readable.clone(),
                 env_source: self.env_source.clone(),
                 executor: self.executor.clone(),
-                registry: self.registry().clone(),
+                registry,
                 permission_handler: self.permission_handler.clone(),
                 job_registry: self.job_registry.clone(),
                 task_id,
                 execution_id,
                 background,
+                timeout_watch: timeout_watch.clone(),
                 carry,
                 carried_dir: self.carried_dir.clone(),
                 alert_tx: self.alert_tx.clone(),
@@ -2463,6 +2560,7 @@ where
         SpawnedTerminal {
             result: result_rx,
             startup: startup_rx,
+            timeout_watch,
         }
     }
 }
@@ -2480,7 +2578,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
     async fn call(
         &self,
         arguments: Self::Arguments,
-        _cx: ToolContext,
+        cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
         let cap = self.limits.timeout_cap;
         let timeout = Duration::from_secs(arguments.timeout);
@@ -2510,6 +2608,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             background: arguments.background,
             timeout,
             carry: carry.clone(),
+            call: cx.identity().cloned(),
         });
         // Registration precedes `report_ready` on every backend, so once
         // startup returns the job is killable through the registry and the
@@ -2526,7 +2625,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             .await;
         }
         let outcome =
-            wait_for_foreground_result(&spawned.result, self.limits.foreground_wait).await;
+            wait_for_foreground_result(&spawned.result, self.limits.foreground_wait.get()).await;
         // A result that raced in at the window's edge counts as a
         // foreground finish.
         let outcome = outcome.or_else(|| spawned.result.try_recv().ok());
@@ -2544,9 +2643,9 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                         interruptions: result.interruptions,
                         outcome: CommandOutcome::Killed {
                             task_id: prepared.task_id.clone(),
-                            notice: format!(
-                                "Killed when its {}s timeout bound passed.",
-                                arguments.timeout
+                            notice: spawned.timeout_watch.kill().map_or_else(
+                                || "Killed before its timeout bound passed.".to_string(),
+                                |kill| kill.notice(),
                             ),
                         },
                     }
@@ -2891,19 +2990,28 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
     }
 
     /// Kills the job through the registry once its timeout passes.
-    fn spawn_kill_watchdog(&self, task_id: &str, timeout: Duration) {
+    ///
+    /// The returned watch holds the job's start time and, once the watchdog
+    /// issues the kill, the time it did.
+    fn spawn_kill_watchdog(&self, task_id: &str, timeout: Duration) -> Arc<TimeoutWatch> {
+        let watch = Arc::new(TimeoutWatch::new(timeout));
         let job_registry = self.job_registry.clone();
         let task_id = task_id.to_string();
+        let recorded = watch.clone();
         self.executor
             .spawn(async move {
                 async_io::Timer::after(timeout).await;
                 if let Some(job) = job_registry.get_by_task_id(&task_id).await
                     && matches!(job.status, JobStatus::Running)
                 {
+                    // Recorded before the kill, so a result that races the
+                    // kill's return already finds it.
+                    let _ = recorded.killed.set(jiff::Timestamp::now());
                     job_registry.kill(job.pid).await;
                 }
             })
             .detach();
+        watch
     }
 
     /// Emits one [`LongRunningJob`] when the job crosses the configured
@@ -3207,11 +3315,14 @@ struct TerminalSpawnRequest {
     background: bool,
     timeout: Duration,
     carry: Option<CwdCarry>,
+    /// The `terminal` call this execution belongs to.
+    call: Option<CallIdentity>,
 }
 
 struct SpawnedTerminal {
     result: Receiver<Result<CompletedCommand, String>>,
     startup: Receiver<Result<(), String>>,
+    timeout_watch: Arc<TimeoutWatch>,
 }
 
 struct SpawnedTerminalTask<P, E> {
@@ -3225,6 +3336,7 @@ struct SpawnedTerminalTask<P, E> {
     task_id: String,
     execution_id: String,
     background: bool,
+    timeout_watch: Arc<TimeoutWatch>,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     alert_tx: Sender<JobAlert>,
@@ -3267,6 +3379,7 @@ where
         task_id,
         execution_id,
         background,
+        timeout_watch,
         carry,
         carried_dir,
         alert_tx,
@@ -3334,8 +3447,10 @@ where
         Err(err) => Err(err.to_string()),
     };
     let _ = result_tx.send(quick_result).await;
+    // A kill's signal can end the process before the kill records its
+    // outcome, so the read waits for any kill still in flight.
     let killed = status_registry
-        .get_by_task_id(&task_id)
+        .get_by_task_id_settled(&task_id)
         .await
         .is_some_and(|job| matches!(job.status, JobStatus::Killed));
     // Every job reports completion; the agent reinjects the result only for
@@ -3347,6 +3462,7 @@ where
             script,
             result,
             killed,
+            timeout_kill: timeout_watch.kill().filter(|_| killed),
         })
         .await;
     running_tasks.fetch_sub(1, Ordering::AcqRel);
@@ -4737,6 +4853,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         Some(start_container_ipc_bridge(
             context.executor,
             Arc::clone(context.registry),
+            container_runtime.workspace_mount().cloned(),
             container_runtime.ipc_route().bind(),
         )?)
     };
@@ -5326,6 +5443,7 @@ impl ContainerIpcBridge {
 fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
     executor: E,
     registry: Arc<ToolRegistry>,
+    workspace: Option<MountRoot>,
     bind: BridgeAddress,
 ) -> Result<ContainerIpcBridge, TerminalError> {
     // The bridge executes host IPC commands for whoever connects, so it binds
@@ -5356,8 +5474,14 @@ fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
     executor
         .spawn(async move {
             tracing::debug!(bind = %local_addr, "container IPC bridge listening");
-            if let Err(error) =
-                run_container_ipc_bridge(listener, registry, shutdown_rx, bridge_executor).await
+            if let Err(error) = run_container_ipc_bridge(
+                listener,
+                registry,
+                workspace,
+                shutdown_rx,
+                bridge_executor,
+            )
+            .await
             {
                 tracing::debug!(error = %error, "container IPC bridge stopped with error");
             }
@@ -5379,6 +5503,7 @@ enum ContainerIpcBridgeEvent {
 async fn run_container_ipc_bridge<E: Executor + Clone + 'static>(
     listener: Async<StdTcpListener>,
     registry: Arc<ToolRegistry>,
+    workspace: Option<MountRoot>,
     shutdown_rx: Receiver<()>,
     executor: E,
 ) -> Result<(), String> {
@@ -5397,9 +5522,11 @@ async fn run_container_ipc_bridge<E: Executor + Clone + 'static>(
             ContainerIpcBridgeEvent::Accept(Ok((stream, _addr))) => {
                 tracing::debug!("container IPC bridge accepted connection");
                 let registry = registry.clone();
+                let workspace = workspace.clone();
                 executor
                     .spawn(async move {
-                        if let Err(error) = handle_container_ipc_connection(stream, registry).await
+                        if let Err(error) =
+                            handle_container_ipc_connection(stream, registry, workspace).await
                         {
                             tracing::debug!(error = %error, "container IPC connection failed");
                         }
@@ -5419,6 +5546,7 @@ async fn run_container_ipc_bridge<E: Executor + Clone + 'static>(
 async fn handle_container_ipc_connection(
     mut stream: Async<StdTcpStream>,
     registry: Arc<ToolRegistry>,
+    workspace: Option<MountRoot>,
 ) -> Result<(), String> {
     loop {
         let mut length_bytes = [0_u8; 4];
@@ -5438,26 +5566,28 @@ async fn handle_container_ipc_connection(
             .await
             .map_err(|e| format!("failed to read IPC request body: {e}"))?;
 
-        if body.is_empty() {
-            write_container_ipc_error(&mut stream, "empty IPC request body").await?;
-            continue;
-        }
-
-        let method_length = body[0] as usize;
-        if method_length == 0 {
-            write_container_ipc_error(&mut stream, "empty IPC method name").await?;
-            continue;
-        }
-        if body.len() < 1 + method_length {
-            write_container_ipc_error(&mut stream, "invalid IPC request framing").await?;
-            continue;
-        }
-
-        let method = std::str::from_utf8(&body[1..=method_length])
-            .map_err(|e| format!("invalid IPC method name utf8: {e}"))?;
-        let params = &body[1 + method_length..];
-        let cli_args = decode_container_ipc_args(params)?;
-        let envelope = registry.query_tool_handler(method, &cli_args).await;
+        let request = match heel::ipc::IpcRequest::decode(&body) {
+            Ok(request) if !request.method.is_empty() => request,
+            Ok(_) => {
+                write_container_ipc_error(&mut stream, "empty IPC method name").await?;
+                continue;
+            }
+            Err(error) => {
+                write_container_ipc_error(&mut stream, &error.to_string()).await?;
+                continue;
+            }
+        };
+        let cli_args = decode_container_ipc_args(&request.params)?;
+        // The caller reports its directory as the container sees it; the
+        // host resolves relative paths in the directory that is mounted at.
+        // A directory outside the workspace mount has no host spelling.
+        let working_dir = workspace.as_ref().and_then(|workspace| {
+            let container_dir = ContainerPath::new(request.working_dir.to_str()?).ok()?;
+            workspace.host_path(&container_dir).ok()
+        });
+        let envelope = registry
+            .query_tool_handler_from(&request.method, &cli_args, working_dir.as_deref())
+            .await;
         match crate::command::envelope_to_cli(envelope) {
             Ok(rendered) => write_container_ipc_success(&mut stream, &rendered).await?,
             Err(error) => {
@@ -6620,7 +6750,7 @@ mod tests {
 
     #[test]
     fn wrap_container_script_preserves_user_script_semantics() {
-        let script = "echo '$5,040' && subagent start --subagent .skills/slide/subagents/art_direction.md --prompt-file tmp/prompt.md";
+        let script = "echo '$5,040' && subagent art_direction --prompt-file tmp/prompt.md";
         let wrapped = wrap_container_script(
             script,
             &[String::from("subagent")],
@@ -6973,6 +7103,109 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["terminal"]);
+    }
+
+    /// Picks one of the entries of its terminal's working directory, and
+    /// names those entries when a call does not parse.
+    struct PickTool {
+        dir: PathBuf,
+    }
+
+    /// Pick an entry.
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct PickArgs {
+        /// The entry.
+        entry: String,
+    }
+
+    impl aither_core::llm::Tool for PickTool {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "pick".into()
+        }
+        type Arguments = PickArgs;
+        type Res = aither_core::llm::ToolResult;
+
+        fn call(
+            &self,
+            args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(aither_core::llm::ToolResult::text(args.entry)))
+        }
+    }
+
+    impl crate::CommandUsage for PickTool {
+        async fn usage(&self) -> String {
+            use futures_lite::StreamExt as _;
+            let mut entries: Vec<String> = async_fs::read_dir(&self.dir)
+                .await
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("entry-"))
+                .collect()
+                .await;
+            entries.sort();
+            format!("entries: {}", entries.join(", "))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_main_exclusive_command_names_its_choices_and_does_not_exist_for_a_subagent() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
+        let mut builder = ToolRegistryBuilder::new();
+        builder.main_exclusive(|main| {
+            main.configure_terminal_bound_usage_tool("pick", |binding| PickTool {
+                dir: binding.working_dir().to_path_buf(),
+            });
+        });
+        let parent = tool.with_registry(Arc::new(builder.build(dir.path().join("outputs"))));
+
+        // What the usage names is read when the call fails, not when the
+        // terminal bound the command.
+        std::fs::write(dir.path().join("entry-b"), "").unwrap();
+        std::fs::write(dir.path().join("entry-a"), "").unwrap();
+        let bare = parent.registry().query_tool_handler("pick", &[]).await;
+        assert!(!bare.ok);
+        assert_eq!(
+            bare.error.as_deref(),
+            Some(
+                "missing required argument: entry\n\nentries: entry-a, entry-b\n\nRun `pick --help` for usage information."
+            )
+        );
+        let picked = parent
+            .registry()
+            .query_tool_handler("pick", &["entry-a".to_string()])
+            .await;
+        assert_eq!(picked.payload.unwrap().render_for_cli(), "entry-a");
+
+        let child = parent
+            .subagent_without_grant()
+            .await
+            .expect("an empty grant is always given");
+        let registry = child.registry();
+        assert!(!registry.is_tool_configured("pick"));
+        assert!(!registry.registered_tool_names().contains(&"pick".into()));
+        assert!(registry.tool_help("pick").is_none());
+        let refused = registry
+            .query_tool_handler("pick", &["entry-a".to_string()])
+            .await;
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("unknown command 'pick'. Run 'help' to see available commands.")
+        );
+        assert!(!child.to_dyn().has_command("pick"));
     }
 
     async fn query_control(
@@ -7815,6 +8048,58 @@ mod tests {
         );
     }
 
+    /// A longer foreground window put in force through the shared handle
+    /// keeps a command that outlasts the normal window in the foreground, and
+    /// the normal window applies again once it is restored.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_longer_foreground_window_holds_until_restored() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let wait = tool.foreground_wait();
+        let run = || async {
+            let result = tool
+                .call(
+                    TerminalArgs {
+                        description: "outlast the normal window".to_string(),
+                        script: "sleep 2 & wait; echo finished".to_string(),
+                        mode: TerminalExecutionMode::Sandboxed,
+                        ssh_server_id: None,
+                        expect: OutputFormat::Text,
+                        resolution: MediaResolution::Auto,
+                        max_lines: 50,
+                        raw: false,
+                        timeout: 30,
+                        background: false,
+                    },
+                    ToolContext::new(),
+                )
+                .await
+                .expect("terminal call should succeed");
+            render_terminal_result(&result)
+        };
+
+        wait.extend(Duration::from_secs(20));
+        let during = run().await;
+        assert!(
+            during.contains("finished") && !during.contains("Started in background"),
+            "the longer window keeps the command in the foreground: {during}"
+        );
+
+        wait.restore();
+        let after = run().await;
+        assert!(
+            after.contains("Started in background as task '"),
+            "the normal window applies again: {after}"
+        );
+    }
+
     /// What a test leaves running after its shell exits.
     ///
     /// `Plain` is a `sleep` in the shell's process group. `Setsid` is a helper
@@ -8290,6 +8575,142 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_timeout_notice_states_both_utc_times() {
+        let kill = TimeoutKill {
+            timeout: Duration::from_secs(90),
+            started: "2026-11-04T12:00:00Z".parse().expect("valid timestamp"),
+            killed: "2026-11-04T12:01:31Z".parse().expect("valid timestamp"),
+        };
+        assert_eq!(
+            kill.notice(),
+            "Its 90s timeout bound passed; it started at 2026-11-04 12:00:00 UTC \
+             and was killed at 2026-11-04 12:01:31 UTC."
+        );
+    }
+
+    #[cfg(unix)]
+    fn spinning_args(timeout: u64, background: bool) -> TerminalArgs {
+        TerminalArgs {
+            description: "spin past the timeout".to_string(),
+            script: if background {
+                "while :; do sleep 0.1; done"
+            } else {
+                // A foreground `sleep` is refused; a niced spin leaves the
+                // other tests their CPU.
+                "nice -n 19 sh -c 'while :; do :; done'"
+            }
+            .to_string(),
+            mode: TerminalExecutionMode::Sandboxed,
+            ssh_server_id: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            max_lines: 50,
+            raw: false,
+            timeout,
+            background,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_background_job_killed_at_its_timeout_reports_its_utc_times() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let background_receiver = tool.background_receiver();
+        tool.call(spinning_args(1, true), ToolContext::new())
+            .await
+            .expect("the job starts");
+        let task_id = started_task_id(&background_receiver);
+        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+
+        assert!(completed.killed);
+        let kill = completed
+            .timeout_kill
+            .expect("a job killed at its timeout carries the times");
+        assert_eq!(kill.timeout, Duration::from_secs(1));
+        assert!(
+            kill.killed.duration_since(kill.started).as_secs_f64() >= 1.0,
+            "{kill:?}"
+        );
+        assert!(
+            kill.killed.duration_since(kill.started).as_secs() < 10,
+            "{kill:?}"
+        );
+        assert!(
+            kill.notice()
+                .starts_with("Its 1s timeout bound passed; it started at ")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_killed_by_hand_is_not_a_timeout_kill() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let background_receiver = tool.background_receiver();
+        tool.call(spinning_args(30, true), ToolContext::new())
+            .await
+            .expect("the job starts");
+        let task_id = started_task_id(&background_receiver);
+        assert!(tool.job_registry().kill_by_task_id(&task_id).await);
+        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        assert!(completed.killed);
+        assert_eq!(completed.timeout_kill, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_foreground_command_killed_at_its_timeout_reports_its_utc_times() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(20),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let before = jiff::Timestamp::now();
+        let result = tool
+            .call(spinning_args(1, false), ToolContext::new())
+            .await
+            .expect("a killed command still returns a result");
+        let rendered = render_terminal_result(&result);
+        let utc = |marker: &str| {
+            let text = rendered
+                .split(marker)
+                .nth(1)
+                .and_then(|rest| rest.split(" UTC").next())
+                .unwrap_or_else(|| panic!("{marker:?} missing: {rendered}"));
+            jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", text)
+                .expect("a UTC date and time")
+                .to_zoned(jiff::tz::TimeZone::UTC)
+                .expect("UTC has no gaps")
+                .timestamp()
+        };
+        assert!(
+            rendered.contains("Its 1s timeout bound passed; it started at "),
+            "{rendered}"
+        );
+        let started = utc("it started at ");
+        let killed = utc("was killed at ");
+        assert!(started.as_second() >= before.as_second(), "{rendered}");
+        assert!(killed.as_second() - started.as_second() >= 1, "{rendered}");
+        assert!(killed.as_second() - started.as_second() < 10, "{rendered}");
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn background_job_past_the_alert_threshold_yields_one_alert() {
@@ -8699,6 +9120,7 @@ mod tests {
         let bridge = start_container_ipc_bridge(
             executor_core::tokio::TokioGlobal,
             registry,
+            None,
             BridgeAddress::try_from(loopback).expect("loopback binds the bridge"),
         )
         .expect("bridge should start on loopback");
@@ -8707,21 +9129,14 @@ mod tests {
             .await
             .expect("client should connect to the bridge");
 
-        let method = b"probe_echo";
         let params = rmp_serde::to_vec_named(&serde_json::json!({ "marker": "pong" }))
             .expect("params should encode");
-        let mut request = vec![u8::try_from(method.len()).expect("method name fits a byte")];
-        request.extend_from_slice(method);
-        request.extend_from_slice(&params);
-        let request_length = u32::try_from(request.len()).expect("request fits the frame");
-        stream
-            .write_all(&request_length.to_be_bytes())
-            .await
-            .expect("request length should be written");
+        let request = heel::ipc::IpcRequest::encode("probe_echo", Path::new("/workspace"), &params)
+            .expect("request should encode");
         stream
             .write_all(&request)
             .await
-            .expect("request body should be written");
+            .expect("request frame should be written");
 
         let mut length_bytes = [0_u8; 4];
         stream
@@ -10595,6 +11010,228 @@ mod tests {
         let child = child.to_dyn();
         assert!(!child.has_command("probe_echo"));
         assert_eq!(child.role(), crate::CommandRole::Subagent);
+    }
+
+    // ---- call identity ------------------------------------------------------
+
+    use aither_core::llm::{AgentIdentity, SubagentIdentity, ToolCallId};
+
+    /// Answers with the identity its call carries, and reports it to the test
+    /// the moment it arrives. With `hold` set it then waits for the test's go
+    /// signal, so two calls can be made to overlap inside their handlers.
+    struct IdentityProbe {
+        entered: async_channel::Sender<CallIdentity>,
+        hold: Option<Receiver<()>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct IdentityProbeArgs {}
+
+    impl Tool for IdentityProbe {
+        fn name(&self) -> Cow<'static, str> {
+            "identity_probe".into()
+        }
+
+        type Arguments = IdentityProbeArgs;
+        type Res = ToolResult;
+
+        async fn call(
+            &self,
+            _arguments: Self::Arguments,
+            cx: ToolContext,
+        ) -> aither_core::Result<Self::Res> {
+            let identity = cx.identity().expect("a terminal call identifies itself");
+            self.entered.send(identity.clone()).await.unwrap();
+            if let Some(hold) = &self.hold {
+                hold.recv().await.unwrap();
+            }
+            Ok(ToolResult::text(format!("seen={}", identity.call())))
+        }
+    }
+
+    /// Reports the identity of every command call the registry serves.
+    struct IdentityObserver(async_channel::Sender<(String, Option<CallIdentity>)>);
+
+    impl crate::CommandObserver for IdentityObserver {
+        async fn command_called(&self, call: &crate::CommandCall<'_>) {
+            self.0
+                .send((call.name.to_string(), call.call.cloned()))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn call_identity(id: &str, agent: AgentIdentity) -> CallIdentity {
+        CallIdentity::new(ToolCallId::new(id), agent)
+    }
+
+    /// Fails the test instead of hanging it when `future` does not finish.
+    async fn within_deadline<T>(future: impl std::future::Future<Output = T>) -> T {
+        futures_lite::future::or(async { Some(future.await) }, async {
+            async_io::Timer::after(Duration::from_secs(60)).await;
+            None
+        })
+        .await
+        .expect("the probe should finish within its deadline")
+    }
+
+    #[cfg(unix)]
+    async fn identity_terminal(
+        dir: &Path,
+        probe: IdentityProbe,
+        observer: async_channel::Sender<(String, Option<CallIdentity>)>,
+    ) -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        ConfiguredTestTool,
+    ) {
+        let (cache, shell_sessions) = prepared_test_registry().await;
+        let tool = TerminalTool::new_exact(
+            dir,
+            TestPermissionHandler::default(),
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(probe);
+        builder.observe_commands(crate::AnyCommandObserver::new(IdentityObserver(observer)));
+        (
+            cache,
+            tool.with_registry(Arc::new(builder.build(dir.join("outputs")))),
+        )
+    }
+
+    /// A command a `terminal` call's script runs is handed that call's id and
+    /// agent, and so is the registry's observer.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ipc_command_receives_the_identity_of_its_terminal_call() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (entered, entered_rx) = async_channel::unbounded();
+        let (observed, observed_rx) = async_channel::unbounded();
+        let (_cache, tool) = identity_terminal(
+            dir.path(),
+            IdentityProbe {
+                entered,
+                hold: None,
+            },
+            observed,
+        )
+        .await;
+        let subagent = AgentIdentity::Subagent(SubagentIdentity::new(
+            "explore",
+            Some(call_identity("call_parent", AgentIdentity::Main)),
+        ));
+        let identity = call_identity("call_a", subagent);
+
+        let result = within_deadline(tool.call(
+            terminal_args("identity probe", "identity_probe"),
+            ToolContext::new().with_identity(identity.clone()),
+        ))
+        .await
+        .expect("terminal call should succeed");
+
+        assert!(
+            render_terminal_result(&result).contains("seen=call_a"),
+            "{}",
+            render_terminal_result(&result)
+        );
+        assert_eq!(entered_rx.recv().await.unwrap(), identity);
+        assert_eq!(
+            observed_rx.recv().await.unwrap(),
+            ("identity_probe".to_string(), Some(identity))
+        );
+    }
+
+    /// Two overlapping `terminal` calls each get their own id in the command
+    /// their script runs, even though both commands are in flight at once.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_terminal_calls_deliver_their_own_ids() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (entered, entered_rx) = async_channel::unbounded();
+        let (hold_tx, hold) = async_channel::unbounded();
+        let (observed, _observed_rx) = async_channel::unbounded();
+        let (_cache, tool) = identity_terminal(
+            dir.path(),
+            IdentityProbe {
+                entered,
+                hold: Some(hold),
+            },
+            observed,
+        )
+        .await;
+
+        let run = |id: &'static str| {
+            let tool = &tool;
+            async move {
+                let result = tool
+                    .call(
+                        terminal_args("identity probe", "identity_probe"),
+                        ToolContext::new().with_identity(call_identity(id, AgentIdentity::Main)),
+                    )
+                    .await
+                    .expect("terminal call should succeed");
+                render_terminal_result(&result)
+            }
+        };
+        let release = async {
+            // Both handlers are inside their command before either answers.
+            let mut inside = [
+                entered_rx.recv().await.unwrap(),
+                entered_rx.recv().await.unwrap(),
+            ];
+            inside.sort_by(|a, b| a.call().as_str().cmp(b.call().as_str()));
+            assert_eq!(
+                inside
+                    .iter()
+                    .map(|identity| identity.call().as_str())
+                    .collect::<Vec<_>>(),
+                ["call_a", "call_b"]
+            );
+            hold_tx.send(()).await.unwrap();
+            hold_tx.send(()).await.unwrap();
+        };
+        let (a, b, ()) =
+            within_deadline(async { futures::join!(run("call_a"), run("call_b"), release) }).await;
+
+        assert!(a.contains("seen=call_a") && !a.contains("call_b"), "{a}");
+        assert!(b.contains("seen=call_b") && !b.contains("call_a"), "{b}");
+    }
+
+    /// A command run by a backgrounded job is told the id of the call that
+    /// started the job, long after that call returned.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_backgrounded_job_keeps_the_id_of_the_call_that_started_it() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (entered, entered_rx) = async_channel::unbounded();
+        let (observed, observed_rx) = async_channel::unbounded();
+        let (_cache, tool) = identity_terminal(
+            dir.path(),
+            IdentityProbe {
+                entered,
+                hold: None,
+            },
+            observed,
+        )
+        .await;
+        let identity = call_identity("call_bg", AgentIdentity::Main);
+
+        let mut args = terminal_args("identity probe", "identity_probe");
+        args.background = true;
+        within_deadline(tool.call(args, ToolContext::new().with_identity(identity.clone())))
+            .await
+            .expect("terminal call should succeed");
+
+        assert_eq!(within_deadline(entered_rx.recv()).await.unwrap(), identity);
+        assert_eq!(
+            within_deadline(observed_rx.recv()).await.unwrap().1,
+            Some(identity)
+        );
     }
 
     /// Records the script every container exec runs.
