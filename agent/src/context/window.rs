@@ -42,8 +42,6 @@ use serde::{Deserialize, Serialize};
 
 use aither_core::llm::{Message, Role, ToolCall};
 
-use crate::ask_user;
-
 use super::compaction::{Handoff, HandoffDocument};
 use super::source::Block;
 use super::system::{
@@ -68,9 +66,22 @@ pub struct ContextItem {
     /// When the item was committed to the window. Bookkeeping only: it is
     /// never rendered into a request.
     committed_at: Timestamp,
+    /// Whether this tool result closes an exchange the user's own words
+    /// make up, such as an `ask_user` question and its answer. A kept
+    /// exchange survives a compaction handoff verbatim and its result is
+    /// never tombstoned or spilled.
+    #[serde(default)]
+    kept: bool,
 }
 
 impl ContextItem {
+    /// Whether this tool result is part of an exchange kept verbatim
+    /// through compaction.
+    #[must_use]
+    pub const fn kept(&self) -> bool {
+        self.kept
+    }
+
     /// The item's monotonic sequence number.
     #[must_use]
     pub const fn seq(&self) -> u64 {
@@ -266,12 +277,23 @@ impl Context {
 
     /// Appends a message to the window and returns its sequence number.
     pub fn push(&mut self, message: Message) -> u64 {
+        self.push_item(message, false)
+    }
+
+    /// Appends a tool result that closes an exchange kept verbatim through
+    /// compaction, and returns its sequence number.
+    pub fn push_kept(&mut self, message: Message) -> u64 {
+        self.push_item(message, true)
+    }
+
+    fn push_item(&mut self, message: Message, kept: bool) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.items.push(ContextItem {
             seq,
             message,
             committed_at: Timestamp::now(),
+            kept,
         });
         seq
     }
@@ -529,25 +551,20 @@ impl Context {
     fn verbatim_below(&self, fork_point: u64, user_message_chars: usize) -> Vec<ContextItem> {
         let below = || self.items.iter().filter(|item| item.seq < fork_point);
 
-        let answered: HashSet<&str> = below()
-            .filter_map(|item| match &item.message {
-                Message::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
-                _ => None,
-            })
+        let asks: HashSet<&str> = below()
+            .filter(|item| item.kept)
+            .filter_map(|item| item.message.tool_call_id())
             .collect();
-        let asks = self.ask_user_call_ids();
         let mut kept: Vec<ContextItem> = Vec::new();
         for item in below() {
             match &item.message {
-                // The call keeps only its `ask_user` calls: the turn's other
+                // The call keeps only its kept calls: the turn's other
                 // calls and reasoning are compacted, and a result must not
                 // outlive the call it answers.
                 Message::Assistant { tool_calls, .. } => {
                     let calls: Vec<ToolCall> = tool_calls
                         .iter()
-                        .filter(|call| {
-                            call.name == ask_user::TOOL_NAME && answered.contains(call.id.as_str())
-                        })
+                        .filter(|call| asks.contains(call.id.as_str()))
                         .cloned()
                         .collect();
                     if !calls.is_empty() {
@@ -557,9 +574,7 @@ impl Context {
                         });
                     }
                 }
-                Message::Tool { tool_call_id, .. } if asks.contains(tool_call_id.as_str()) => {
-                    kept.push(item.clone());
-                }
+                Message::Tool { .. } if item.kept => kept.push(item.clone()),
                 _ => {}
             }
         }
@@ -579,13 +594,12 @@ impl Context {
         kept
     }
 
-    /// The ids of the `ask_user` calls in the window.
-    fn ask_user_call_ids(&self) -> HashSet<&str> {
+    /// The ids of the calls whose exchanges are kept verbatim.
+    fn kept_call_ids(&self) -> HashSet<&str> {
         self.items
             .iter()
-            .flat_map(|item| item.message.tool_calls())
-            .filter(|call| call.name == ask_user::TOOL_NAME)
-            .map(|call| call.id.as_str())
+            .filter(|item| item.kept)
+            .filter_map(|item| item.message.tool_call_id())
             .collect()
     }
 
@@ -668,7 +682,7 @@ impl Context {
 
     /// The tool results holding more than `min_bytes` bytes.
     pub(crate) fn long_tool_outputs(&self, min_bytes: usize) -> Vec<LongToolOutput> {
-        let asks = self.ask_user_call_ids();
+        let asks = self.kept_call_ids();
         self.items
             .iter()
             .filter_map(|item| match &item.message {
@@ -732,7 +746,7 @@ impl Context {
         }
 
         // An answer is the user's word, not a re-readable resource.
-        let asks = self.ask_user_call_ids();
+        let asks = self.kept_call_ids();
         let mut indices = Vec::new();
         let mut bytes = 0usize;
         for (index, item) in self.items.iter().enumerate() {
@@ -1331,10 +1345,70 @@ mod tests {
             ],
         ));
         context.push(Message::tool(format!("{id}-x"), "terminal output"));
-        context.push(Message::tool(
+        context.push_kept(Message::tool(
             id,
             format!("The user answered:\n- {answer}\n"),
         ));
+    }
+
+    /// Pushes one `terminal` call running `command`, with its result, kept
+    /// through compaction or not.
+    fn push_terminal_call(context: &mut Context, id: &str, command: &str, kept: bool) {
+        context.push(Message::assistant_with_tool_calls(
+            "running it",
+            vec![tool_call(
+                id,
+                "terminal",
+                serde_json::json!({"command": command}),
+            )],
+        ));
+        let result = Message::tool(id, format!("{command} output"));
+        if kept {
+            context.push_kept(result);
+        } else {
+            context.push(result);
+        }
+    }
+
+    #[test]
+    fn a_kept_terminal_exchange_survives_a_handoff_and_an_ordinary_one_does_not() {
+        let mut context = Context::new();
+        push_terminal_call(&mut context, "kept", "ask_user q", true);
+        push_terminal_call(&mut context, "plain", "ls", false);
+        let fork = context.fork_point();
+
+        context.apply_handoff(&handoff(), fork, 0);
+
+        let recent = context.recent();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].tool_calls().len(), 1);
+        assert_eq!(recent[0].tool_calls()[0].id, "kept");
+        assert_eq!(recent[0].tool_calls()[0].name, "terminal");
+        assert_eq!(recent[0].content(), "");
+        assert_eq!(recent[1].content(), "ask_user q output");
+    }
+
+    #[test]
+    fn the_kept_tag_round_trips_through_a_checkpoint() {
+        let mut context = Context::new();
+        push_terminal_call(&mut context, "kept", "ask_user q", true);
+        push_terminal_call(&mut context, "plain", "ls", false);
+
+        let json = serde_json::to_string(&context.checkpoint()).unwrap();
+        let checkpoint: ContextCheckpoint = serde_json::from_str(&json).unwrap();
+        let mut restored = Context::new();
+        restored.restore(checkpoint);
+
+        let tags: Vec<bool> = restored
+            .checkpoint()
+            .items()
+            .iter()
+            .map(ContextItem::kept)
+            .collect();
+        assert_eq!(tags, [false, true, false, false]);
+        let fork = restored.fork_point();
+        restored.apply_handoff(&handoff(), fork, 0);
+        assert_eq!(restored.len_recent(), 2);
     }
 
     fn texts(context: &Context) -> Vec<String> {
@@ -1460,7 +1534,7 @@ mod tests {
                     serde_json::json!({"question": "q"}),
                 )],
             ));
-            context.push(Message::tool(id, answer.clone()));
+            context.push_kept(Message::tool(id, answer.clone()));
         }
 
         let report = context.reassemble();

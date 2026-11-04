@@ -35,8 +35,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_core::llm::tool::ToolResultPart;
-use aither_core::llm::{CallIdentity, IntoToolResult, Tool, ToolContext, ToolResult};
+use aither_core::llm::{CallIdentity, IntoToolResult, Tool, ToolCallId, ToolContext, ToolResult};
 use askama::Template;
+use async_channel::{Receiver, Sender};
 use heel::IpcCommand;
 use heel::ipc::IpcError;
 use schemars::JsonSchema;
@@ -694,6 +695,7 @@ pub struct DynTerminalTool {
     pub(crate) entries: Vec<DynTerminalToolEntry>,
     pub(crate) background_receiver: crate::terminal::BackgroundTaskReceiver,
     pub(crate) permission_receiver: crate::terminal::PermissionEventReceiver,
+    pub(crate) kept_receiver: KeptExchangeReceiver,
     pub(crate) job_registry: crate::job_registry::JobRegistry,
     pub(crate) working_dir: PathBuf,
     pub(crate) command_names: Vec<String>,
@@ -713,6 +715,13 @@ impl DynTerminalTool {
     #[must_use]
     pub fn permission_receiver(&self) -> crate::terminal::PermissionEventReceiver {
         self.permission_receiver.clone()
+    }
+
+    /// Returns the receiver for the terminal calls whose kept commands
+    /// succeeded.
+    #[must_use]
+    pub fn kept_receiver(&self) -> KeptExchangeReceiver {
+        self.kept_receiver.clone()
     }
 
     /// Operational catalog inherited from the initialized parent environment.
@@ -803,6 +812,7 @@ pub struct ToolRegistryBuilder {
     bound: HashMap<String, RoleEntries<Arc<BoundEntry>>>,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
+    kept: HashSet<String>,
 }
 
 impl ToolRegistryBuilder {
@@ -881,6 +891,7 @@ impl ToolRegistryBuilder {
     pub fn main_only(&mut self, configure: impl FnOnce(&mut Self)) {
         let mut reserved = Self::new();
         configure(&mut reserved);
+        self.kept.extend(reserved.kept);
         for (name, entries) in reserved.entries {
             self.insert_entry(
                 name,
@@ -898,6 +909,25 @@ impl ToolRegistryBuilder {
                     subagent: None,
                 },
             );
+        }
+    }
+
+    /// Marks every command `configure` registers as one whose exchanges
+    /// are kept verbatim through compaction: when such a command succeeds
+    /// inside a `terminal` call, the registry reports that call on the
+    /// channel behind [`ToolRegistry::kept_receiver`], and the agent keeps
+    /// the call and its result in the context across a handoff.
+    pub fn kept_through_compaction(&mut self, configure: impl FnOnce(&mut Self)) {
+        let mut registered = Self::new();
+        configure(&mut registered);
+        self.kept.extend(registered.kept);
+        self.kept.extend(registered.entries.keys().cloned());
+        self.kept.extend(registered.bound.keys().cloned());
+        for (name, entries) in registered.entries {
+            self.insert_entry(name, entries);
+        }
+        for (name, entries) in registered.bound {
+            self.insert_bound(name, entries);
         }
     }
 
@@ -996,7 +1026,11 @@ impl ToolRegistryBuilder {
     /// Terminal-bound commands are built when a terminal serves it.
     #[must_use]
     pub fn build(self, output_dir: impl Into<PathBuf>) -> ToolRegistry {
+        let (kept_tx, kept_rx) = async_channel::unbounded();
         ToolRegistry {
+            kept: Arc::new(self.kept),
+            kept_tx,
+            kept_rx,
             entries: self.entries,
             bound: self.bound,
             instances: HashMap::new(),
@@ -1135,6 +1169,33 @@ where
     )
 }
 
+/// Receiver for the `terminal` calls in which a command registered with
+/// [`ToolRegistryBuilder::kept_through_compaction`] succeeded.
+#[derive(Clone)]
+pub struct KeptExchangeReceiver {
+    rx: Receiver<ToolCallId>,
+}
+
+impl KeptExchangeReceiver {
+    /// Takes the pending call ids without blocking.
+    #[must_use]
+    pub fn take_pending(&self) -> Vec<ToolCallId> {
+        let mut calls = Vec::new();
+        while let Ok(call) = self.rx.try_recv() {
+            calls.push(call);
+        }
+        calls
+    }
+}
+
+impl std::fmt::Debug for KeptExchangeReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeptExchangeReceiver")
+            .field("pending", &self.rx.len())
+            .finish()
+    }
+}
+
 /// Immutable registry of tool handlers, as one [`CommandRole`] sees them.
 #[derive(Debug, Clone)]
 pub struct ToolRegistry {
@@ -1150,6 +1211,12 @@ pub struct ToolRegistry {
     /// The `terminal` call this registry serves, once [`Self::for_call`] has
     /// bound it to one.
     call: Option<CallIdentity>,
+    /// The commands whose exchanges are kept through compaction.
+    kept: Arc<HashSet<String>>,
+    /// Reports each `terminal` call a kept command succeeded in.
+    kept_tx: Sender<ToolCallId>,
+    /// Held so the channel stays open for as long as the registry serves.
+    kept_rx: Receiver<ToolCallId>,
     /// The worktrees this registry's terminals have granted commit to so
     /// far, in grant order: the git map the terminal's `git` shim reads.
     /// Shared across every bind and role of the session's registries.
@@ -1248,7 +1315,13 @@ impl ToolRegistry {
         observer: Option<AnyCommandObserver>,
         gate: Option<AnyCommandGate>,
     ) -> Self {
+        // The subagent's agent keeps its own context, so it reads its own
+        // channel.
+        let (kept_tx, kept_rx) = async_channel::unbounded();
         Self {
+            kept: self.kept.clone(),
+            kept_tx,
+            kept_rx,
             entries: self.entries.clone(),
             bound: self.bound.clone(),
             instances: HashMap::new(),
@@ -1272,6 +1345,15 @@ impl ToolRegistry {
         Self {
             call: Some(call),
             ..self.clone()
+        }
+    }
+
+    /// The receiver of the `terminal` calls in which a kept command
+    /// succeeded; see [`ToolRegistryBuilder::kept_through_compaction`].
+    #[must_use]
+    pub fn kept_receiver(&self) -> KeptExchangeReceiver {
+        KeptExchangeReceiver {
+            rx: self.kept_rx.clone(),
         }
     }
 
@@ -1321,6 +1403,10 @@ impl ToolRegistry {
     /// Queries a tool handler by name.
     ///
     /// Large outputs (> 4000 chars) are automatically saved to file.
+    ///
+    /// # Panics
+    /// Panics if the registry's own kept-exchange channel is closed, which
+    /// it never is while the registry exists.
     pub async fn query_tool_handler(&self, tool_name: &str, args: &[String]) -> CommandEnvelope {
         match self.resolve(tool_name) {
             Some(Resolved {
@@ -1331,6 +1417,14 @@ impl ToolRegistry {
                     Ok(output) => handle_large_output(output, &self.output_dir).await,
                     Err(error) => CommandEnvelope::failure(error),
                 };
+                if outcome.ok
+                    && self.kept.contains(tool_name)
+                    && let Some(call) = &self.call
+                {
+                    self.kept_tx
+                        .try_send(call.call().clone())
+                        .expect("the registry holds its kept channel open and unbounded");
+                }
                 if let Some(observer) = &self.observer {
                     observer
                         .command_called(&CommandCall {
@@ -3517,6 +3611,55 @@ mod tests {
 
     async fn run_command(registry: &ToolRegistry, name: &str) -> CommandEnvelope {
         registry.query_tool_handler(name, &[]).await
+    }
+
+    #[tokio::test]
+    async fn a_kept_command_reports_the_terminal_call_it_succeeded_in() {
+        use aither_core::llm::{AgentIdentity, ToolCallId};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = ToolRegistryBuilder::new();
+        builder.main_only(|reserved| {
+            reserved.kept_through_compaction(|kept| {
+                kept.configure_tool(RoleTool {
+                    name: "kept",
+                    answer: "asked",
+                });
+            });
+        });
+        builder.configure_tool(RoleTool {
+            name: "ordinary",
+            answer: "ran",
+        });
+        let registry = builder.build(tmp.path());
+        let receiver = registry.kept_receiver();
+        let call = |id: &str| {
+            registry.for_call(CallIdentity::new(ToolCallId::new(id), AgentIdentity::Main))
+        };
+
+        assert!(run_command(&call("call_1"), "ordinary").await.ok);
+        assert!(
+            run_command(&call("call_2"), "missing")
+                .await
+                .error
+                .is_some()
+        );
+        assert!(
+            receiver.take_pending().is_empty(),
+            "an ordinary or failed command keeps nothing"
+        );
+        assert!(run_command(&registry, "kept").await.ok);
+        assert!(
+            receiver.take_pending().is_empty(),
+            "a command outside a terminal call names no call"
+        );
+
+        assert!(run_command(&call("call_3"), "kept").await.ok);
+        let pending = receiver.take_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].as_str(), "call_3");
+        let subagent = registry.for_subagent(None, None).kept_receiver();
+        assert_eq!(subagent.take_pending(), []);
     }
 
     #[tokio::test]

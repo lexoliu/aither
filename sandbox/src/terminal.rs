@@ -2192,6 +2192,15 @@ where
         &self.registry.registry
     }
 
+    /// Returns a receiver for the `terminal` calls in which a command
+    /// registered with
+    /// [`ToolRegistryBuilder::kept_through_compaction`](crate::ToolRegistryBuilder::kept_through_compaction)
+    /// succeeded.
+    #[must_use]
+    pub fn kept_receiver(&self) -> crate::command::KeptExchangeReceiver {
+        self.registry().kept_receiver()
+    }
+
     /// What this terminal hands the commands bound to it: its working
     /// directory and the launcher for the subagents it starts.
     #[must_use]
@@ -2226,6 +2235,7 @@ where
 
         let background_receiver = self.background_receiver();
         let permission_receiver = self.permission_receiver();
+        let kept_receiver = self.kept_receiver();
         let job_registry = self.job_registry();
         let working_dir = self.working_dir().clone();
         let command_names = self.registry().available_tool_names();
@@ -2242,6 +2252,7 @@ where
             entries,
             background_receiver,
             permission_receiver,
+            kept_receiver,
             job_registry,
             working_dir,
             command_names,
