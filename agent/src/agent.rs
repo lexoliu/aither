@@ -2091,6 +2091,8 @@ where
     /// - a compaction model is set, which cannot read that cache;
     /// - the lifetime is [`CacheLifetime::Permanent`];
     /// - nothing has been sent yet, or the conversation is empty;
+    /// - the context holds fewer tokens than the policy's
+    ///   [`compaction_floor`](crate::ContextPolicy::compaction_floor);
     /// - it already ran since the last request;
     /// - the cache has expired already, when compacting would only pay to
     ///   write the whole context again.
@@ -2106,6 +2108,10 @@ where
             || self.pending_compaction.is_some()
             || self.completed_compaction.is_some()
             || self.context.is_conversation_empty()
+            || self
+                .config
+                .context_policy
+                .below_floor(self.budget.estimated_tokens())
         {
             return None;
         }
@@ -4652,15 +4658,71 @@ mod tests {
     async fn agent_after_one_request(
         llm: ScriptedLlm,
     ) -> Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, (), ScriptedLlm> {
-        let mut agent = Agent::new(llm);
+        agent_after_one_message(
+            llm,
+            "hello",
+            crate::ContextPolicy {
+                compaction_floor: 0,
+                ..crate::ContextPolicy::default()
+            },
+        )
+        .await
+    }
+
+    /// An agent under `policy` that has sent one request carrying `text`.
+    async fn agent_after_one_message(
+        llm: ScriptedLlm,
+        text: &str,
+        policy: crate::ContextPolicy,
+    ) -> Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, (), ScriptedLlm> {
+        let mut agent = Agent::with_config(llm, AgentConfig::default().with_context_policy(policy));
         agent.ensure_initialized().await.expect("agent initializes");
-        agent.push_message(Message::user("hello"));
+        agent.push_message(Message::user(text));
         agent
             .prepare_request()
             .await
             .expect("request boundary")
             .expect("the first request goes out");
         agent
+    }
+
+    /// A message of roughly `tokens` tokens at the uncalibrated ratio.
+    fn text_of_tokens(tokens: usize) -> String {
+        "word ".repeat(tokens)
+    }
+
+    /// Idle compaction leaves a context under the floor alone, and runs on
+    /// one over it, reading the floor from the agent's own policy.
+    #[tokio::test]
+    async fn idle_compaction_respects_the_policy_floor() {
+        let policy = crate::ContextPolicy::default();
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut small = agent_after_one_message(llm.clone(), "hello", policy).await;
+        small.backdate_cache_entry(Duration::from_secs(3240));
+        assert_eq!(small.idle_compaction_due_in(), None);
+        assert!(small.compact_when_idle().await.expect("no-op").is_none());
+        assert!(llm.recorded().is_empty());
+
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let big_text = text_of_tokens(2 * policy.compaction_floor);
+        let mut big = agent_after_one_message(llm.clone(), &big_text, policy).await;
+        big.backdate_cache_entry(Duration::from_secs(3240));
+        assert_eq!(big.idle_compaction_due_in(), Some(Duration::ZERO));
+        big.compact_when_idle()
+            .await
+            .expect("the compaction succeeds")
+            .expect("the compaction ran");
+        assert_eq!(llm.recorded().len(), 1);
+
+        // A lowered floor in the given policy admits the small context.
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let lowered = crate::ContextPolicy {
+            compaction_floor: 1,
+            ..policy
+        };
+        let mut lowered = agent_after_one_message(llm, "hello", lowered).await;
+        lowered.backdate_cache_entry(Duration::from_secs(3240));
+        assert_eq!(lowered.idle_compaction_due_in(), Some(Duration::ZERO));
     }
 
     /// The idle compaction fires once, shortly before the cache lifetime ends,
