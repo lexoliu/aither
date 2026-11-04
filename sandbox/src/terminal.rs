@@ -3436,8 +3436,10 @@ where
         Err(err) => Err(err.to_string()),
     };
     let _ = result_tx.send(quick_result).await;
+    // A kill's signal can end the process before the kill records its
+    // outcome, so the read waits for any kill still in flight.
     let killed = status_registry
-        .get_by_task_id(&task_id)
+        .get_by_task_id_settled(&task_id)
         .await
         .is_some_and(|job| matches!(job.status, JobStatus::Killed));
     // Every job reports completion; the agent reinjects the result only for
