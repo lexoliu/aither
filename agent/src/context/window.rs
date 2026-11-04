@@ -750,6 +750,15 @@ impl ContextCheckpoint {
         &self.items
     }
 
+    /// Returns the sequence number the next item will receive, as
+    /// [`Context::fork_point`] does. Every item numbered below it is covered
+    /// by this checkpoint, which an empty post-compaction window still
+    /// records.
+    #[must_use]
+    pub const fn fork_point(&self) -> u64 {
+        self.next_seq
+    }
+
     /// Returns whether this checkpoint has no handoff and no items.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
@@ -1247,6 +1256,20 @@ mod tests {
         assert_eq!(restored.fork_point(), context.fork_point());
         assert_eq!(restored.items_since(fork).len(), 1);
         assert_eq!(restored.push(Message::user("three")), 2);
+    }
+
+    #[test]
+    fn a_checkpoint_of_an_empty_compacted_window_keeps_its_boundary() {
+        let mut context = Context::new();
+        context.push(Message::user("one"));
+        context.push(Message::user("two"));
+        let fork = context.fork_point();
+        context.apply_handoff(&HandoffDocument::default(), fork);
+
+        let checkpoint = context.checkpoint();
+
+        assert_eq!(checkpoint.items(), []);
+        assert_eq!(checkpoint.fork_point(), 2);
     }
 
     #[test]

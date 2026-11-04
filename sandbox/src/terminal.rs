@@ -295,6 +295,72 @@ fn runs_in_shell(script: &str) -> bool {
     matches!(direct_command(script.trim()), Ok(None))
 }
 
+/// A command killed because its `timeout` bound passed, with the UTC times it
+/// started and was killed at.
+#[derive(Debug, Clone, PartialEq, Eq, Template)]
+#[template(path = "command_timed_out.txt", escape = "none")]
+pub struct TimeoutKill {
+    /// The `timeout` the command was bounded by.
+    pub timeout: Duration,
+    /// When the command started.
+    pub started: jiff::Timestamp,
+    /// When the kill was issued.
+    pub killed: jiff::Timestamp,
+}
+
+impl TimeoutKill {
+    fn started_utc(&self) -> String {
+        Self::utc(self.started)
+    }
+
+    fn killed_utc(&self) -> String {
+        Self::utc(self.killed)
+    }
+
+    fn utc(at: jiff::Timestamp) -> String {
+        at.strftime("%Y-%m-%d %H:%M:%S UTC").to_string()
+    }
+
+    /// The sentence stating the timeout and both times, as the model reads it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the template fails to render, which is a bug in the template.
+    #[must_use]
+    pub fn notice(&self) -> String {
+        self.render()
+            .expect("failed to render command_timed_out template")
+    }
+}
+
+/// What the kill watchdog of one job records: when the job started, and when
+/// the watchdog issued the kill, if it did.
+#[derive(Debug)]
+struct TimeoutWatch {
+    timeout: Duration,
+    started: jiff::Timestamp,
+    killed: std::sync::OnceLock<jiff::Timestamp>,
+}
+
+impl TimeoutWatch {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            started: jiff::Timestamp::now(),
+            killed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The kill, once the watchdog has issued one.
+    fn kill(&self) -> Option<TimeoutKill> {
+        self.killed.get().map(|killed| TimeoutKill {
+            timeout: self.timeout,
+            started: self.started,
+            killed: *killed,
+        })
+    }
+}
+
 #[derive(Template)]
 #[template(path = "carry_cwd.sh", escape = "none")]
 struct CarryCwdTemplate<'a> {
@@ -744,6 +810,8 @@ pub struct CompletedTask {
     /// Whether the job was killed — its `timeout` bound or `terminal_kill`
     /// — rather than exiting on its own.
     pub killed: bool,
+    /// Set when the kill was the `timeout` bound passing.
+    pub timeout_kill: Option<TimeoutKill>,
 }
 
 /// Stage of a permission-lifecycle event for `terminal`.
@@ -2422,7 +2490,7 @@ where
             task_id: task_id.clone(),
             script: script.clone(),
         });
-        self.spawn_kill_watchdog(&task_id, timeout);
+        let timeout_watch = self.spawn_kill_watchdog(&task_id, timeout);
         self.spawn_long_job_alert(&task_id);
 
         let lifetime = if background {
@@ -2452,6 +2520,7 @@ where
                 task_id,
                 execution_id,
                 background,
+                timeout_watch: timeout_watch.clone(),
                 carry,
                 carried_dir: self.carried_dir.clone(),
                 alert_tx: self.alert_tx.clone(),
@@ -2480,6 +2549,7 @@ where
         SpawnedTerminal {
             result: result_rx,
             startup: startup_rx,
+            timeout_watch,
         }
     }
 }
@@ -2562,9 +2632,9 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                         interruptions: result.interruptions,
                         outcome: CommandOutcome::Killed {
                             task_id: prepared.task_id.clone(),
-                            notice: format!(
-                                "Killed when its {}s timeout bound passed.",
-                                arguments.timeout
+                            notice: spawned.timeout_watch.kill().map_or_else(
+                                || "Killed before its timeout bound passed.".to_string(),
+                                |kill| kill.notice(),
                             ),
                         },
                     }
@@ -2909,19 +2979,28 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
     }
 
     /// Kills the job through the registry once its timeout passes.
-    fn spawn_kill_watchdog(&self, task_id: &str, timeout: Duration) {
+    ///
+    /// The returned watch holds the job's start time and, once the watchdog
+    /// issues the kill, the time it did.
+    fn spawn_kill_watchdog(&self, task_id: &str, timeout: Duration) -> Arc<TimeoutWatch> {
+        let watch = Arc::new(TimeoutWatch::new(timeout));
         let job_registry = self.job_registry.clone();
         let task_id = task_id.to_string();
+        let recorded = watch.clone();
         self.executor
             .spawn(async move {
                 async_io::Timer::after(timeout).await;
                 if let Some(job) = job_registry.get_by_task_id(&task_id).await
                     && matches!(job.status, JobStatus::Running)
                 {
+                    // Recorded before the kill, so a result that races the
+                    // kill's return already finds it.
+                    let _ = recorded.killed.set(jiff::Timestamp::now());
                     job_registry.kill(job.pid).await;
                 }
             })
             .detach();
+        watch
     }
 
     /// Emits one [`LongRunningJob`] when the job crosses the configured
@@ -3232,6 +3311,7 @@ struct TerminalSpawnRequest {
 struct SpawnedTerminal {
     result: Receiver<Result<CompletedCommand, String>>,
     startup: Receiver<Result<(), String>>,
+    timeout_watch: Arc<TimeoutWatch>,
 }
 
 struct SpawnedTerminalTask<P, E> {
@@ -3245,6 +3325,7 @@ struct SpawnedTerminalTask<P, E> {
     task_id: String,
     execution_id: String,
     background: bool,
+    timeout_watch: Arc<TimeoutWatch>,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     alert_tx: Sender<JobAlert>,
@@ -3287,6 +3368,7 @@ where
         task_id,
         execution_id,
         background,
+        timeout_watch,
         carry,
         carried_dir,
         alert_tx,
@@ -3367,6 +3449,7 @@ where
             script,
             result,
             killed,
+            timeout_kill: timeout_watch.kill().filter(|_| killed),
         })
         .await;
     running_tasks.fetch_sub(1, Ordering::AcqRel);
@@ -6640,7 +6723,7 @@ mod tests {
 
     #[test]
     fn wrap_container_script_preserves_user_script_semantics() {
-        let script = "echo '$5,040' && subagent start --subagent .skills/slide/subagents/art_direction.md --prompt-file tmp/prompt.md";
+        let script = "echo '$5,040' && subagent art_direction --prompt-file tmp/prompt.md";
         let wrapped = wrap_container_script(
             script,
             &[String::from("subagent")],
@@ -6993,6 +7076,109 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["terminal"]);
+    }
+
+    /// Picks one of the entries of its terminal's working directory, and
+    /// names those entries when a call does not parse.
+    struct PickTool {
+        dir: PathBuf,
+    }
+
+    /// Pick an entry.
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct PickArgs {
+        /// The entry.
+        entry: String,
+    }
+
+    impl aither_core::llm::Tool for PickTool {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "pick".into()
+        }
+        type Arguments = PickArgs;
+        type Res = aither_core::llm::ToolResult;
+
+        fn call(
+            &self,
+            args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(aither_core::llm::ToolResult::text(args.entry)))
+        }
+    }
+
+    impl crate::CommandUsage for PickTool {
+        async fn usage(&self) -> String {
+            use futures_lite::StreamExt as _;
+            let mut entries: Vec<String> = async_fs::read_dir(&self.dir)
+                .await
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("entry-"))
+                .collect()
+                .await;
+            entries.sort();
+            format!("entries: {}", entries.join(", "))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_main_exclusive_command_names_its_choices_and_does_not_exist_for_a_subagent() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
+        let mut builder = ToolRegistryBuilder::new();
+        builder.main_exclusive(|main| {
+            main.configure_terminal_bound_usage_tool("pick", |binding| PickTool {
+                dir: binding.working_dir().to_path_buf(),
+            });
+        });
+        let parent = tool.with_registry(Arc::new(builder.build(dir.path().join("outputs"))));
+
+        // What the usage names is read when the call fails, not when the
+        // terminal bound the command.
+        std::fs::write(dir.path().join("entry-b"), "").unwrap();
+        std::fs::write(dir.path().join("entry-a"), "").unwrap();
+        let bare = parent.registry().query_tool_handler("pick", &[]).await;
+        assert!(!bare.ok);
+        assert_eq!(
+            bare.error.as_deref(),
+            Some(
+                "missing required argument: entry\n\nentries: entry-a, entry-b\n\nRun `pick --help` for usage information."
+            )
+        );
+        let picked = parent
+            .registry()
+            .query_tool_handler("pick", &["entry-a".to_string()])
+            .await;
+        assert_eq!(picked.payload.unwrap().render_for_cli(), "entry-a");
+
+        let child = parent
+            .subagent_without_grant()
+            .await
+            .expect("an empty grant is always given");
+        let registry = child.registry();
+        assert!(!registry.is_tool_configured("pick"));
+        assert!(!registry.registered_tool_names().contains(&"pick".into()));
+        assert!(registry.tool_help("pick").is_none());
+        let refused = registry
+            .query_tool_handler("pick", &["entry-a".to_string()])
+            .await;
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("unknown command 'pick'. Run 'help' to see available commands.")
+        );
+        assert!(!child.to_dyn().has_command("pick"));
     }
 
     async fn query_control(
@@ -8360,6 +8546,142 @@ mod tests {
             JobStatus::Killed,
             "the job should have been killed at its timeout: {completed:?}"
         );
+    }
+
+    #[test]
+    fn the_timeout_notice_states_both_utc_times() {
+        let kill = TimeoutKill {
+            timeout: Duration::from_secs(90),
+            started: "2026-11-04T12:00:00Z".parse().expect("valid timestamp"),
+            killed: "2026-11-04T12:01:31Z".parse().expect("valid timestamp"),
+        };
+        assert_eq!(
+            kill.notice(),
+            "Its 90s timeout bound passed; it started at 2026-11-04 12:00:00 UTC \
+             and was killed at 2026-11-04 12:01:31 UTC."
+        );
+    }
+
+    #[cfg(unix)]
+    fn spinning_args(timeout: u64, background: bool) -> TerminalArgs {
+        TerminalArgs {
+            description: "spin past the timeout".to_string(),
+            script: if background {
+                "while :; do sleep 0.1; done"
+            } else {
+                // A foreground `sleep` is refused; a niced spin leaves the
+                // other tests their CPU.
+                "nice -n 19 sh -c 'while :; do :; done'"
+            }
+            .to_string(),
+            mode: TerminalExecutionMode::Sandboxed,
+            ssh_server_id: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            max_lines: 50,
+            raw: false,
+            timeout,
+            background,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_background_job_killed_at_its_timeout_reports_its_utc_times() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let background_receiver = tool.background_receiver();
+        tool.call(spinning_args(1, true), ToolContext::new())
+            .await
+            .expect("the job starts");
+        let task_id = started_task_id(&background_receiver);
+        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+
+        assert!(completed.killed);
+        let kill = completed
+            .timeout_kill
+            .expect("a job killed at its timeout carries the times");
+        assert_eq!(kill.timeout, Duration::from_secs(1));
+        assert!(
+            kill.killed.duration_since(kill.started).as_secs_f64() >= 1.0,
+            "{kill:?}"
+        );
+        assert!(
+            kill.killed.duration_since(kill.started).as_secs() < 10,
+            "{kill:?}"
+        );
+        assert!(
+            kill.notice()
+                .starts_with("Its 1s timeout bound passed; it started at ")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_killed_by_hand_is_not_a_timeout_kill() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let background_receiver = tool.background_receiver();
+        tool.call(spinning_args(30, true), ToolContext::new())
+            .await
+            .expect("the job starts");
+        let task_id = started_task_id(&background_receiver);
+        assert!(tool.job_registry().kill_by_task_id(&task_id).await);
+        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        assert!(completed.killed);
+        assert_eq!(completed.timeout_kill, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_foreground_command_killed_at_its_timeout_reports_its_utc_times() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(20),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let before = jiff::Timestamp::now();
+        let result = tool
+            .call(spinning_args(1, false), ToolContext::new())
+            .await
+            .expect("a killed command still returns a result");
+        let rendered = render_terminal_result(&result);
+        let utc = |marker: &str| {
+            let text = rendered
+                .split(marker)
+                .nth(1)
+                .and_then(|rest| rest.split(" UTC").next())
+                .unwrap_or_else(|| panic!("{marker:?} missing: {rendered}"));
+            jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", text)
+                .expect("a UTC date and time")
+                .to_zoned(jiff::tz::TimeZone::UTC)
+                .expect("UTC has no gaps")
+                .timestamp()
+        };
+        assert!(
+            rendered.contains("Its 1s timeout bound passed; it started at "),
+            "{rendered}"
+        );
+        let started = utc("it started at ");
+        let killed = utc("was killed at ");
+        assert!(started.as_second() >= before.as_second(), "{rendered}");
+        assert!(killed.as_second() - started.as_second() >= 1, "{rendered}");
+        assert!(killed.as_second() - started.as_second() < 10, "{rendered}");
     }
 
     #[cfg(unix)]

@@ -341,13 +341,11 @@ where
         self.background_receiver = Some(dyn_tool.background_receiver());
         self.permission_receiver = Some(dyn_tool.permission_receiver());
         self.job_registry = Some(dyn_tool.job_registry());
-        // Files are restored after compaction from wherever the terminal
-        // works; working-document supervision (`tasks.md`) belongs to the
-        // main agent's terminal alone.
+        // Files are restored after compaction, and `tasks.md` is kept, in
+        // wherever the terminal works: a subagent's are in its own space,
+        // never its parent's.
         self.restore_dir = Some(dyn_tool.working_dir().clone());
-        if dyn_tool.role() == aither_sandbox::CommandRole::Main {
-            self.sandbox_dir = Some(dyn_tool.working_dir().clone());
-        }
+        self.sandbox_dir = Some(dyn_tool.working_dir().clone());
         self.tools.register_dyn_terminal(dyn_tool);
         self
     }
@@ -398,7 +396,10 @@ where
         self.background_receiver = Some(terminal.background_receiver());
         self.permission_receiver = Some(terminal.permission_receiver());
         self.job_registry = Some(terminal.job_registry());
+        // A fork keeps its own `tasks.md` in its own space, like any
+        // subagent, not the main agent's it inherited the context of.
         self.restore_dir = Some(terminal.working_dir().clone());
+        self.sandbox_dir = Some(terminal.working_dir().clone());
         self.tools = AgentTools::forked(&fork.definitions, terminal);
         self
     }
@@ -1067,7 +1068,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_subagent_gets_no_working_document_supervision_but_keeps_file_restore() {
+    async fn a_subagent_keeps_its_working_documents_and_files_in_its_own_space() {
         use aither_sandbox::permission::NoopPermissionHandler;
         use aither_sandbox::{SubagentGrant, TerminalTool, ToolRegistryBuilder};
         use executor_core::tokio::TokioGlobal;
@@ -1094,17 +1095,21 @@ mod tests {
             .unwrap();
         let space = subagent.working_dir().clone();
 
+        let main_dir = terminal.working_dir().clone();
         let main = AgentBuilder::new(MockLlm).dyn_terminal(terminal.clone().to_dyn());
-        assert!(
-            main.sandbox_dir.is_some(),
-            "the main agent supervises its working documents"
+        assert_eq!(
+            main.sandbox_dir.as_ref(),
+            Some(&main_dir),
+            "the main agent keeps its working documents in its sandbox"
         );
         let main = AgentBuilder::new(MockLlm).terminal(terminal);
-        assert!(main.sandbox_dir.is_some());
+        assert_eq!(main.sandbox_dir.as_ref(), Some(&main_dir));
         let child = AgentBuilder::new(MockLlm).dyn_terminal(subagent);
-        assert!(
-            child.sandbox_dir.is_none(),
-            "a subagent's space is not supervised like the main agent's"
+        assert_ne!(space, main_dir);
+        assert_eq!(
+            child.sandbox_dir.as_ref(),
+            Some(&space),
+            "a subagent's tasks.md is in its own space, not its parent's"
         );
         assert_eq!(
             child.restore_dir,
