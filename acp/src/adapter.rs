@@ -255,12 +255,10 @@ fn format_tool_title(name: &str, arguments: &str) -> String {
         "subagent" => {
             use aither_agent::specialized::SubagentArgs;
             if let Ok(args) = serde_json::from_str::<SubagentArgs>(arguments) {
-                return match args {
-                    SubagentArgs::Start { subagent, .. } => {
-                        format!("Running {} subagent", truncate_title(&subagent))
-                    }
-                    SubagentArgs::Resume { .. } => "Continuing subagent".to_string(),
-                };
+                return args.subagent().map_or_else(
+                    || "Continuing subagent".to_string(),
+                    |subagent| format!("Running {} subagent", truncate_title(subagent)),
+                );
             }
             "Running subagent".to_string()
         }
@@ -399,7 +397,7 @@ mod tests {
             ),
             (
                 "subagent",
-                r#"{"command":"start","subagent":"explore","prompt_file":"tmp/prompt.md"}"#,
+                r#"{"command":"explore","prompt_file":"tmp/prompt.md"}"#,
                 "Running explore subagent",
                 ToolKind::Other,
             ),

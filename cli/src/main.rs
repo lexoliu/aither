@@ -371,7 +371,7 @@ struct Args {
     #[arg(long)]
     skills: Option<PathBuf>,
 
-    /// Path to subagents directory. Subagents are markdown files invoked via `subagent start --subagent <path> --prompt-file <file>`.
+    /// Path to subagents directory. Subagents are markdown files with YAML frontmatter, listed in the system prompt.
     #[arg(long)]
     subagents: Option<PathBuf>,
 
@@ -586,9 +586,7 @@ async fn build_agent(
     // Set base_dir to sandbox directory so paths like .subagents/ resolve correctly
     // Every terminal, a subagent's included, gets its own `subagent` command,
     // which launches with that terminal's authority.
-    let subagent_tool = SubagentTool::new(cloud)
-        .with_builtins()
-        .with_base_dir(builder.sandbox_dir().to_string());
+    let subagent_tool = SubagentTool::new(cloud).with_base_dir(builder.sandbox_dir().to_string());
     let subagent_desc = format_subagent_description(&subagent_tool);
     // The agent publishes each request here so a `fork` subagent can start
     // from it.
@@ -611,12 +609,12 @@ async fn build_agent(
 
 fn format_subagent_description(subagent_tool: &SubagentTool<CloudProvider>) -> String {
     let mut subagent_desc = String::from(
-        "Spawn or continue a subagent for complex tasks. The prompt must be a path to a prompt file, not inline text. (types: ",
+        "Spawn or continue a subagent for complex tasks. The prompt must be a path to a prompt file, not inline text. (subagents: ",
     );
     let subagent_names = subagent_tool
-        .type_descriptions()
-        .iter()
-        .map(|(name, _)| *name)
+        .descriptions()
+        .into_iter()
+        .map(|(name, _)| name)
         .collect::<Vec<_>>();
     subagent_desc.push_str(&subagent_names.join(", "));
     subagent_desc.push(')');

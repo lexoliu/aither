@@ -757,8 +757,6 @@ where
     /// Sets up the subagents directory and creates a symlink in the sandbox.
     ///
     /// Subagents are markdown files with YAML frontmatter (name, description).
-    /// They can be invoked via: `subagent start --subagent <path> --prompt-file "..."`
-    ///
     /// A symlink `subagents` is created in the sandbox working directory.
     ///
     /// # Example
