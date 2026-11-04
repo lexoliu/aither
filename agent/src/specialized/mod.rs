@@ -10,5 +10,6 @@ pub mod task;
 pub use external::{ExternalSession, ExternalStart, ExternalSubagent};
 pub use subagent::{IntoSubAgent, SubAgentQuery, SubAgentTool};
 pub use task::{
-    SubagentArgs, SubagentFileMount, SubagentRunInfo, SubagentRuns, SubagentTool, SubagentType,
+    FORK_DESCRIPTION, SubagentArgs, SubagentFileMount, SubagentRunInfo, SubagentRuns,
+    SubagentSetup, SubagentTool,
 };

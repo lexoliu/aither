@@ -375,6 +375,14 @@ pub struct KnowledgeAndTimeTemplate {
     pub websearch_command: bool,
 }
 
+/// A user message with the UTC time it was sent at appended.
+#[derive(Template)]
+#[template(path = "user_message_time.txt", escape = "none")]
+struct UserMessageTimeTemplate<'a> {
+    prompt: &'a str,
+    utc: String,
+}
+
 /// The system prompt's statement of the communication and working languages.
 #[cfg(feature = "languages")]
 #[derive(Template)]
@@ -478,7 +486,7 @@ enum BackgroundOutcome<'a> {
     Finished { code: i32 },
     /// The job was killed — its `timeout` bound or `terminal_kill` — and
     /// whatever `code` the harness saw means nothing.
-    Killed,
+    Killed { timeout: Option<&'a str> },
     /// The task could not be run or tracked to completion.
     Failed { error: &'a str },
 }
@@ -667,6 +675,8 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     pub(crate) kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
     /// Calls reported by `kept_receiver` whose results are not committed yet.
     pub(crate) kept_exchanges: HashSet<String>,
+    /// Receiver for the host memory pressure and machine load events.
+    pub(crate) host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
     /// Registry for running background terminal tasks.
     pub(crate) job_registry: Option<JobRegistry>,
 
@@ -786,6 +796,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             permission_receiver: None,
             kept_receiver: None,
             kept_exchanges: HashSet::new(),
+            host_load_events: None,
             job_registry: None,
             detached_task_ids: HashSet::new(),
             sandbox_dir: None,
@@ -937,11 +948,31 @@ where
             events.emit(event);
         }
         self.settle_interrupted_tool_calls();
-        self.context
-            .push(Message::user(&prompt).with_attachments(attachments));
+        self.context.push(
+            self.timestamped_user_message(&prompt)
+                .with_attachments(attachments),
+        );
 
         let outcome = self.run_agent_loop(run_id.as_str(), 0, events).await?;
         self.finish_run(run_id.as_str(), outcome, events).await
+    }
+
+    /// The user message for `prompt` with the current UTC time appended.
+    ///
+    /// The time is part of the message from the moment it joins the context
+    /// and is never rewritten, so the cached prefix a later request replays
+    /// is unchanged.
+    fn timestamped_user_message(&self, prompt: &str) -> Message {
+        let utc = self
+            .warmth
+            .utc_now()
+            .strftime("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        Message::user(
+            UserMessageTimeTemplate { prompt, utc }
+                .render()
+                .expect("failed to render user_message_time template"),
+        )
     }
 
     /// A run without a new user message: the model acts on what
@@ -1033,17 +1064,11 @@ where
         let tool_calls = model_turn.tool_calls;
         ensure_non_empty_tool_call_ids(&tool_calls, &response_text)?;
 
+        self.commit_assistant_turn(&response_text, &tool_calls, model_turn.reasoning);
         if tool_calls.is_empty() {
             return self.finish_no_tool_turn(response_text, turn, events).await;
         }
 
-        // The reasoning has to travel with the turn that produced these calls,
-        // or the model receives their results without the thinking behind them.
-        self.context.push(Message::assistant_with_reasoning(
-            &response_text,
-            tool_calls.clone(),
-            model_turn.reasoning,
-        ));
         Self::push_tool_start_events(&tool_calls, events);
         self.execute_tool_calls(&tool_calls, turn, events).await;
         self.apply_tool_results(events)?;
@@ -1104,6 +1129,27 @@ where
         turn
     }
 
+    /// Stores what the model produced this turn: its text, calls and reasoning.
+    ///
+    /// The reasoning travels with the turn that produced it, or later requests
+    /// carry the calls and the answer without the thinking behind them. A turn
+    /// that produced nothing at all stores nothing.
+    fn commit_assistant_turn(
+        &mut self,
+        response_text: &str,
+        tool_calls: &[ToolCall],
+        reasoning: Vec<ReasoningState>,
+    ) {
+        if response_text.is_empty() && tool_calls.is_empty() && reasoning.is_empty() {
+            return;
+        }
+        self.context.push(Message::assistant_with_reasoning(
+            response_text,
+            tool_calls.to_vec(),
+            reasoning,
+        ));
+    }
+
     async fn finish_no_tool_turn(
         &mut self,
         response_text: String,
@@ -1111,7 +1157,6 @@ where
         events: &EventSink,
     ) -> Result<TurnControl, AgentError> {
         if !response_text.is_empty() {
-            self.context.push(Message::assistant(&response_text));
             #[cfg(feature = "languages")]
             self.enforce_reply_language(&response_text, events).await;
         }
@@ -1695,6 +1740,7 @@ where
     /// whose stdin watch failed. Returns whether any of them is a job blocked
     /// on stdin, which the model must act on.
     fn push_job_alerts(&mut self) -> bool {
+        self.push_host_load_alerts();
         let Some(receiver) = self.background_receiver.clone() else {
             return false;
         };
@@ -1703,6 +1749,18 @@ where
             wake |= self.push_job_alert(alert);
         }
         wake
+    }
+
+    /// Pushes one durable alert per host load event raised since the last
+    /// call: a condition starting or ending. An event leaves the channel as
+    /// it is pushed, so the model sees it once.
+    fn push_host_load_alerts(&mut self) {
+        let Some(receiver) = self.host_load_events.clone() else {
+            return;
+        };
+        while let Ok(event) = receiver.try_recv() {
+            self.push_system_alert(event.alert_text());
+        }
     }
 
     /// Pushes one durable alert for a background job alert; returns whether
@@ -2448,6 +2506,7 @@ where
     /// time, which is when their earlier alerts stopped being in it.
     async fn push_request_alerts(&mut self) {
         self.push_injected_context();
+        self.push_host_load_alerts();
         let reassembled = std::mem::take(&mut self.reassembled);
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_request(reassembled).await {
@@ -3077,8 +3136,10 @@ where
         self.ensure_initialized().await?;
         let checkpoint = self.context.checkpoint();
         self.context.extend(extra_messages);
-        self.context
-            .push(Message::user(prompt).with_attachments(attachments));
+        self.context.push(
+            self.timestamped_user_message(prompt)
+                .with_attachments(attachments),
+        );
         let tail = self.render_tail().await;
         let messages = self.context.build_request(&tail);
         self.context.restore(checkpoint);
@@ -3124,9 +3185,15 @@ where
 /// Formats a completed background task result as a system message.
 fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String {
     let error_text;
+    let timeout_notice = task
+        .timeout_kill
+        .as_ref()
+        .map(aither_sandbox::TimeoutKill::notice);
     let (outcome, output, stderr) = match &task.result {
         Ok(command) if task.killed => (
-            BackgroundOutcome::Killed,
+            BackgroundOutcome::Killed {
+                timeout: timeout_notice.as_deref(),
+            },
             output_block(&command.stdout),
             command.stderr.as_ref().and_then(output_block),
         ),
@@ -3274,6 +3341,7 @@ mod tests {
             script: "make test".to_string(),
             result,
             killed: false,
+            timeout_kill: None,
         }
     }
 
@@ -3336,6 +3404,26 @@ mod tests {
         assert_eq!(
             format_background_task_result(&task),
             "Background task 'amber-forest-thunder-pearl' (`make test`) was killed.\npartial output\n"
+        );
+    }
+
+    #[test]
+    fn background_result_killed_at_its_timeout_states_the_utc_times() {
+        let mut task = completed(Ok(CompletedCommand {
+            stdout: inline("partial output"),
+            stderr: None,
+            exit_code: -1,
+            interruptions: Vec::new(),
+        }));
+        task.killed = true;
+        task.timeout_kill = Some(aither_sandbox::TimeoutKill {
+            timeout: Duration::from_secs(90),
+            started: "2026-11-04T12:00:00Z".parse().expect("timestamp"),
+            killed: "2026-11-04T12:01:31Z".parse().expect("timestamp"),
+        });
+        assert_eq!(
+            format_background_task_result(&task),
+            "Background task 'amber-forest-thunder-pearl' (`make test`) was killed. Its 90s timeout bound passed; it started at 2026-11-04 12:00:00 UTC and was killed at 2026-11-04 12:01:31 UTC.\npartial output\n"
         );
     }
 
@@ -3804,6 +3892,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_user_message_carries_its_utc_time_and_the_prefix_stays_put() {
+        let clock = crate::ManualClock::at_utc("2026-11-04T12:00:00Z".parse().expect("timestamp"));
+        let mut agent = Agent::builder(MockLlm {
+            context_length: 1_000_000,
+        })
+        .clock(clock.clone())
+        .build();
+        agent.ensure_initialized().await.expect("agent initializes");
+        let prefix = agent.context().system_prefix().expect("prefix").clone();
+        assert!(!prefix.contains("run `date`"), "{prefix}");
+
+        let first = agent
+            .preview_request_messages_with("hello", [], [])
+            .await
+            .expect("preview");
+        assert_eq!(
+            first.last().expect("user message").content(),
+            "hello\n\nSent at 2026-11-04 12:00:00 UTC."
+        );
+
+        let message = agent.timestamped_user_message("hello");
+        agent.push_message(message);
+        clock.advance(Duration::from_secs(90));
+        let message = agent.timestamped_user_message("again");
+        agent.push_message(message);
+
+        let sent = agent.context().build_messages();
+        let contents: Vec<_> = sent
+            .iter()
+            .map(aither_core::llm::Message::content)
+            .collect();
+        assert!(
+            contents.contains(&"hello\n\nSent at 2026-11-04 12:00:00 UTC."),
+            "{contents:?}"
+        );
+        assert!(
+            contents.contains(&"again\n\nSent at 2026-11-04 12:01:30 UTC."),
+            "{contents:?}"
+        );
+        assert_eq!(agent.context().system_prefix().expect("prefix"), prefix);
+    }
+
+    #[tokio::test]
     async fn the_host_layout_places_and_replaces_built_in_blocks() {
         use crate::context::{ExternalContent, ExternalSlot, SystemLayout};
         const MEMORY: ExternalSlot = ExternalSlot::new("memory");
@@ -4213,6 +4344,58 @@ mod tests {
         );
     }
 
+    /// A host load event is injected once, at the next request, and nothing
+    /// restates it on the requests that follow.
+    #[tokio::test]
+    async fn host_load_events_are_injected_once() {
+        use aither_core::llm::Role;
+
+        async fn mentions(agent: &mut Agent<MockLlm, MockLlm, MockLlm, ()>, text: &str) -> usize {
+            let request = agent
+                .prepare_request()
+                .await
+                .expect("request boundary")
+                .expect("a fresh window must accept a request");
+            request
+                .messages()
+                .iter()
+                .filter(|message| {
+                    message.role() == Role::System && message.content().contains(text)
+                })
+                .count()
+        }
+
+        let (events, receiver) = async_channel::unbounded();
+        let mut agent = Agent::new(MockLlm {
+            context_length: 200_000,
+        });
+        agent.host_load_events = Some(receiver);
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        assert_eq!(mentions(&mut agent, "load is high").await, 0);
+        events
+            .send(crate::HostLoadEvent::LoadHigh {
+                load: crate::MachineLoad(1.8),
+                foreground_wait: Duration::from_secs(90),
+            })
+            .await
+            .expect("agent listens");
+        assert_eq!(mentions(&mut agent, "load is high").await, 1);
+        assert_eq!(mentions(&mut agent, "load is high").await, 1);
+        assert_eq!(mentions(&mut agent, "load is high").await, 1);
+
+        events
+            .send(crate::HostLoadEvent::LoadEnded {
+                load: crate::MachineLoad(0.2),
+                foreground_wait: Duration::from_secs(10),
+            })
+            .await
+            .expect("agent listens");
+        assert_eq!(mentions(&mut agent, "load has ended").await, 1);
+        assert_eq!(mentions(&mut agent, "load has ended").await, 1);
+        assert_eq!(mentions(&mut agent, "load is high").await, 1);
+    }
+
     /// A job blocked on stdin can never complete, so its alert must end the
     /// post-turn wait and resume the loop — otherwise the model never sees
     /// it until the job's own timeout kills it.
@@ -4290,6 +4473,7 @@ mod tests {
                                 task_id: "task-test".to_string(),
                                 script: "cat".to_string(),
                                 killed: false,
+                                timeout_kill: None,
                                 result: Err(aither_sandbox::TerminalError::Execution(
                                     "fed and finished".to_string(),
                                 )),
@@ -4426,7 +4610,11 @@ mod tests {
             })
             .expect("extra message must appear in the previewed request");
         assert_eq!(messages[hidden_pos + 1].role(), Role::User);
-        assert_eq!(messages[hidden_pos + 1].content(), "hi");
+        assert!(
+            messages[hidden_pos + 1]
+                .content()
+                .starts_with("hi\n\nSent at ")
+        );
 
         // Post-preview state is exactly what a normal first turn leaves:
         // initialized with the static blocks populated, and neither the
@@ -5798,7 +5986,7 @@ mod tests {
         );
         let prompt = messages
             .iter()
-            .position(|message| message.content() == "again")
+            .position(|message| message.content().starts_with("again\n\nSent at "))
             .expect("the new prompt is sent");
         assert!(result < prompt, "the result precedes the new prompt");
     }
@@ -5858,6 +6046,7 @@ mod tests {
             task_id: task_id.to_string(),
             script: "make".to_string(),
             killed: false,
+            timeout_kill: None,
             result: Err(aither_sandbox::TerminalError::Execution(output.to_string())),
         }
     }
@@ -6392,5 +6581,105 @@ mod tests {
                 .iter()
                 .all(|message| !message.content().contains("`compact`"))
         );
+    }
+
+    /// A model that replays one scripted event list per request and records
+    /// the requests it receives.
+    #[derive(Clone)]
+    struct EventScriptLlm {
+        requests: Arc<std::sync::Mutex<Vec<LLMRequest>>>,
+        turns: Arc<std::sync::Mutex<std::collections::VecDeque<Vec<Event>>>>,
+    }
+
+    impl EventScriptLlm {
+        fn new(turns: impl IntoIterator<Item = Vec<Event>>) -> Self {
+            Self {
+                requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+                turns: Arc::new(std::sync::Mutex::new(turns.into_iter().collect())),
+            }
+        }
+    }
+
+    impl LanguageModel for EventScriptLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.requests.lock().expect("requests lock").push(request);
+            let events = self
+                .turns
+                .lock()
+                .expect("turns lock")
+                .pop_front()
+                .unwrap_or_default();
+            futures_lite::stream::iter(events.into_iter().map(Ok))
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                1_000_000,
+            )))
+        }
+    }
+
+    /// The assistant messages of the last request the model received.
+    fn replayed_assistants(llm: &EventScriptLlm) -> Vec<Message> {
+        llm.requests
+            .lock()
+            .expect("requests lock")
+            .last()
+            .expect("a request was sent")
+            .messages()
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant { .. }))
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_final_answer_keeps_its_reasoning_in_the_next_request() {
+        let thinking = ReasoningState::new("claude", "signed-thinking");
+        let llm = EventScriptLlm::new([
+            vec![
+                Event::ReasoningState(thinking.clone()),
+                Event::Text("the answer".to_string()),
+            ],
+            vec![Event::Text("done".to_string())],
+        ]);
+        let mut agent = Agent::new(llm.clone());
+
+        agent.query("first").await.expect("first run");
+        agent.query("second").await.expect("second run");
+
+        let assistants = replayed_assistants(&llm);
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0].content(), "the answer");
+        assert_eq!(assistants[0].reasoning(), [thinking]);
+    }
+
+    #[tokio::test]
+    async fn a_reasoning_only_turn_is_kept() {
+        let thinking = ReasoningState::new("openai", "encrypted-reasoning");
+        let llm = EventScriptLlm::new([
+            vec![Event::ReasoningState(thinking.clone())],
+            vec![Event::Text("done".to_string())],
+        ]);
+        let mut agent = Agent::new(llm.clone());
+
+        agent.query("first").await.expect("first run");
+        agent.query("second").await.expect("second run");
+
+        let assistants = replayed_assistants(&llm);
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0].content(), "");
+        assert_eq!(assistants[0].reasoning(), [thinking]);
     }
 }

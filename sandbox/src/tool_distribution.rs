@@ -588,36 +588,105 @@ async fn download_artifact(
                 .map_err(|()| ToolRuntimeError::ArtifactSource(tool))?;
             read_artifact_file(&path, tool).await?
         }
-        "https" => {
-            futures_lite::future::or(
-                async {
-                    let mut client = zenwave::client();
-                    let response = client.get(url.as_str())?.await?;
-                    if !response.status().is_success() {
-                        return Err(ToolRuntimeError::DownloadStatus(response.status().as_u16()));
-                    }
-                    let mut bytes = Vec::new();
-                    response
-                        .into_body()
-                        .into_reader()
-                        .take(64 * 1024 * 1024 + 1)
-                        .read_to_end(&mut bytes)
-                        .await?;
-                    Ok(bytes)
-                },
-                async {
-                    async_io::Timer::after(Duration::from_secs(60)).await;
-                    Err(ToolRuntimeError::Download(zenwave::Error::Timeout))
-                },
-            )
-            .await?
-        }
+        "https" => download_with_retry(url.as_str(), DOWNLOAD_RETRY).await?,
         _ => return Err(ToolRuntimeError::ArtifactSource(tool)),
     };
     if encoded.len() > 64 * 1024 * 1024 {
         return Err(ToolRuntimeError::ArtifactTooLarge(tool));
     }
     Ok(encoded)
+}
+
+/// Retry schedule for transient artifact download failures.
+#[derive(Clone, Copy, Debug)]
+struct DownloadRetry {
+    /// Total attempts, the first included.
+    attempts: u32,
+    /// Wait before the second attempt; each later wait doubles.
+    initial_backoff: Duration,
+    /// Deadline of a single attempt.
+    attempt_timeout: Duration,
+}
+
+/// Four attempts with 1 s, 2 s and 4 s between them and 60 s per attempt: the
+/// worst case is 4 * 60 s + 7 s = 247 s, and the common CI failure (a dropped
+/// or timed-out connection setup) recovers within seconds.
+const DOWNLOAD_RETRY: DownloadRetry = DownloadRetry {
+    attempts: 4,
+    initial_backoff: Duration::from_secs(1),
+    attempt_timeout: Duration::from_secs(60),
+};
+
+/// Fetches `url` once, bounded by the attempt deadline.
+async fn download_once(url: &str, timeout: Duration) -> Result<Vec<u8>, ToolRuntimeError> {
+    futures_lite::future::or(
+        async {
+            let mut client = zenwave::client();
+            let response = client.get(url)?.await?;
+            if !response.status().is_success() {
+                return Err(ToolRuntimeError::DownloadStatus(response.status().as_u16()));
+            }
+            let mut bytes = Vec::new();
+            response
+                .into_body()
+                .into_reader()
+                .take(64 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            Ok(bytes)
+        },
+        async {
+            async_io::Timer::after(timeout).await;
+            Err(ToolRuntimeError::Download(zenwave::Error::Timeout))
+        },
+    )
+    .await
+}
+
+/// Whether an HTTP status is worth another attempt: a server fault or throttling.
+fn is_transient_status(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+/// Whether a failed download attempt may succeed when repeated. Only the
+/// attempt's own failures reach this: connection setup, the deadline, a body
+/// read cut off mid-transfer, and the HTTP status. A TLS, redirect, request or
+/// proxy error is permanent.
+fn is_transient(error: &ToolRuntimeError) -> bool {
+    match error {
+        ToolRuntimeError::DownloadStatus(status) => is_transient_status(*status),
+        ToolRuntimeError::Io(_) => true,
+        ToolRuntimeError::Download(error) => match error {
+            zenwave::Error::Transport(_) | zenwave::Error::Timeout => true,
+            zenwave::Error::Http { status, .. } => is_transient_status(status.as_u16()),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Downloads `url`, retrying transient failures with exponential backoff and
+/// failing with the last error once the attempts are spent.
+async fn download_with_retry(url: &str, retry: DownloadRetry) -> Result<Vec<u8>, ToolRuntimeError> {
+    let mut backoff = retry.initial_backoff;
+    let mut attempt = 1;
+    loop {
+        match download_once(url, retry.attempt_timeout).await {
+            Err(error) if attempt < retry.attempts && is_transient(&error) => {
+                tracing::warn!(
+                    %error,
+                    attempt,
+                    attempts = retry.attempts,
+                    retry_in = ?backoff,
+                    "tool artifact download failed; retrying"
+                );
+                async_io::Timer::after(backoff).await;
+                backoff *= 2;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
 }
 
 fn read_executable(reader: impl Read) -> Result<Vec<u8>, ToolRuntimeError> {
@@ -1487,5 +1556,80 @@ pub mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(prepared.path()).unwrap(), fixture.executable);
+    }
+
+    type Scripted = Vec<Option<(u16, &'static [u8])>>;
+
+    /// Answers one scripted response per connection, in order (`None` drops the
+    /// connection), and resolves to the number of connections served.
+    async fn serve(responses: Scripted) -> (String, tokio::task::JoinHandle<usize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/artifact", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let mut served = 0;
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                served += 1;
+                let Some((status, body)) = response else {
+                    drop(socket);
+                    continue;
+                };
+                let mut request = [0; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+            served
+        });
+        (url, handle)
+    }
+
+    const FAST_RETRY: DownloadRetry = DownloadRetry {
+        attempts: 4,
+        initial_backoff: Duration::from_millis(5),
+        attempt_timeout: Duration::from_secs(10),
+    };
+
+    #[tokio::test]
+    async fn dropped_connections_and_server_faults_are_retried_until_the_bytes_arrive() {
+        let (url, server) = serve(vec![
+            None,
+            Some((503, b"busy")),
+            Some((429, b"")),
+            Some((200, b"payload")),
+        ])
+        .await;
+        let bytes = download_with_retry(&url, FAST_RETRY).await.unwrap();
+        assert_eq!(bytes, b"payload");
+        assert_eq!(server.await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_permanent_status_is_tried_exactly_once() {
+        let (url, server) = serve(vec![Some((404, b"missing"))]).await;
+        let error = download_with_retry(&url, FAST_RETRY).await.unwrap_err();
+        assert!(error.to_string().contains("404"), "{error}");
+        assert!(!is_transient(&error));
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_failures_end_after_the_last_attempt_with_the_last_error() {
+        let (url, server) = serve(vec![
+            None,
+            Some((503, b"")),
+            Some((503, b"")),
+            Some((502, b"")),
+        ])
+        .await;
+        let error = download_with_retry(&url, FAST_RETRY).await.unwrap_err();
+        assert!(error.to_string().contains("502"), "{error}");
+        assert_eq!(server.await.unwrap(), 4);
     }
 }

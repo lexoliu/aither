@@ -55,6 +55,7 @@
 mod bollard_exec;
 mod command;
 mod container;
+mod foreground_wait;
 mod grants;
 mod kill_guard;
 pub mod monitor;
@@ -93,15 +94,16 @@ pub mod permission;
 pub use bollard_exec::BollardContainerExec;
 pub use command::{
     AnyCommandGate, AnyCommandObserver, CommandCall, CommandEnvelope, CommandGate, CommandObserver,
-    CommandPayload, CommandRole, DynTerminalTool, DynToolHandler, GateDecision, IpcToolCommand,
-    KeptExchangeReceiver, ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder,
-    cli_to_json, register_ipc_gateway_command, register_tool_command, register_tool_direct,
-    schema_to_help, tool_output_to_payload,
+    CommandPayload, CommandRole, CommandUsage, DynTerminalTool, DynToolHandler, GateDecision,
+    IpcToolCommand, KeptExchangeReceiver, ToolCallCommand, ToolCommand, ToolRegistry,
+    ToolRegistryBuilder, cli_to_json, register_ipc_gateway_command, register_tool_command,
+    register_tool_direct, schema_to_help, tool_output_to_payload,
 };
 pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
     MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,
 };
+pub use foreground_wait::ForegroundWait;
 pub use grants::{GrantSet, TerminalGrants};
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
 pub use heel::NetworkAuditLog;
@@ -145,7 +147,7 @@ pub use terminal::{
     DirectoryResetReason, JobAlert, LongRunningJob, PermissionEvent, PermissionEventReceiver,
     PermissionEventStage, StartedBackgroundTask, StdinBlockedJob, StdinProbeFailedJob,
     TerminalArgs, TerminalBinding, TerminalEnvSource, TerminalError, TerminalExecutionMode,
-    TerminalTool, TerminalToolFactory, TerminalToolFactoryError, Unconfigured,
+    TerminalTool, TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
     background_task_channel, open_network_audit_log,
 };
 pub use tool_distribution::{

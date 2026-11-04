@@ -103,10 +103,13 @@ impl AgentTools {
     /// carried them, run by the entries and terminal controls of `terminal`
     /// of the same name, so a control acts on the fork's own jobs. A
     /// definition `terminal` has no entry for belongs to the main agent and
-    /// refuses when called.
+    /// refuses when called. The native `compact` definition is the exception:
+    /// it runs the real tool over `compact`, the fork's own signal, so a call
+    /// compacts the fork.
     pub(crate) fn forked(
         definitions: &[ToolDefinition],
         terminal: aither_sandbox::DynTerminalTool,
+        compact: Option<&std::sync::Arc<crate::compact_tool::CompactSignal>>,
     ) -> Self {
         use futures_core::Future;
         use std::pin::Pin;
@@ -122,6 +125,9 @@ impl AgentTools {
         for definition in definitions {
             let name = definition.name().to_string();
             let handler = handlers.remove(&name);
+            let compact = compact
+                .filter(|_| name == crate::compact_tool::COMPACT_TOOL_NAME)
+                .map(|signal| crate::compact_tool::CompactTool::new(std::sync::Arc::clone(signal)));
             tools
                 .eager
                 .register_dyn(
@@ -131,6 +137,15 @@ impl AgentTools {
                           -> Pin<
                         Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send>,
                     > {
+                        if let Some(tool) = compact.clone() {
+                            let args = args.to_string();
+                            return Box::pin(async move {
+                                let args = serde_json::from_str(&args).map_err(|error| {
+                                    anyhow::anyhow!("Invalid arguments: {error}")
+                                })?;
+                                Tool::call(&tool, args, cx).await?.into_tool_result()
+                            });
+                        }
                         let Some(handler) = handler.clone() else {
                             let refusal = ForkToolRefused { name: &name }
                                 .render()

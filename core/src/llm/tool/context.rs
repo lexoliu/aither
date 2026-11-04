@@ -145,6 +145,7 @@ pub struct ToolContext {
     sink: Option<Box<dyn ProgressSinkImpl>>,
     last_progress: Option<f64>,
     identity: Option<CallIdentity>,
+    working_dir: Option<String>,
 }
 
 impl ToolContext {
@@ -158,6 +159,7 @@ impl ToolContext {
             sink: None,
             last_progress: None,
             identity: None,
+            working_dir: None,
         }
     }
 
@@ -168,7 +170,26 @@ impl ToolContext {
             sink: Some(Box::new(sink)),
             last_progress: None,
             identity: None,
+            working_dir: None,
         }
+    }
+
+    /// Attaches the working directory of the process that made the call.
+    #[must_use]
+    pub fn with_working_dir(mut self, working_dir: impl Into<String>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
+
+    /// The working directory of the process that made the call, when the
+    /// dispatcher knows it.
+    ///
+    /// A command a shell script runs after `cd` sees the directory the script
+    /// changed to; a relative path argument resolves against it. `None` for
+    /// dispatchers that have no calling process, such as the agent loop.
+    #[must_use]
+    pub fn working_dir(&self) -> Option<&str> {
+        self.working_dir.as_deref()
     }
 
     /// Attaches the identity of the call this context belongs to.
@@ -242,6 +263,7 @@ impl Debug for ToolContext {
             .field("listening", &self.sink.is_some())
             .field("last_progress", &self.last_progress)
             .field("identity", &self.identity)
+            .field("working_dir", &self.working_dir)
             .finish()
     }
 }

@@ -1,4 +1,4 @@
-{% match outcome %}{% when SubagentReport::Cancelled %}Subagent '{{ subagent }}' was cancelled by the user.{% when SubagentReport::Completed { model, result, id, cache_bound, alert } %}Subagent '{{ subagent }}' completed{% if let Some(model) = model %} (model: {{ model }}){% endif %}.
+{% match outcome %}{% when SubagentReport::Cancelled %}Subagent '{{ subagent }}' was cancelled by the user.{% when SubagentReport::Completed { tier, model, result, id, cache_bound, alert } %}Subagent '{{ subagent }}' completed{% if let Some(model) = model %} ({% if let Some(tier) = tier %}{{ tier }} tier, {% endif %}model: {{ model }}){% endif %}.
 
 {{ result }}
 

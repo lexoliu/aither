@@ -81,6 +81,11 @@ enum TerminalStream {
 struct JobState {
     info: JobInfo,
     terminal_buffer: Vec<u8>,
+    /// Complete lines only, each from one stream, in the order they
+    /// completed: what the `monitor` pump reads.
+    line_buffer: Vec<u8>,
+    stdout_partial: Vec<u8>,
+    stderr_partial: Vec<u8>,
     stdout_buffer: Vec<u8>,
     stderr_buffer: Vec<u8>,
     stdout_closed: bool,
@@ -92,6 +97,9 @@ struct JobState {
     /// job's own flow reports meanwhile waits in `deferred_end`.
     kills_in_flight: usize,
     deferred_end: Option<Ending>,
+    /// Callers of `get_by_task_id_settled` parked until the last kill in
+    /// flight records its outcome.
+    settled_waiters: Vec<Sender<Option<JobInfo>>>,
     output_redirect: Option<async_fs::File>,
     finished_at: Option<Instant>,
 }
@@ -152,6 +160,10 @@ enum JobRequest {
         task_id: String,
         reply: Sender<Option<JobInfo>>,
     },
+    GetByTaskIdSettled {
+        task_id: String,
+        reply: Sender<Option<JobInfo>>,
+    },
     BeginKill {
         pid: u32,
         reply: Sender<KillPlan>,
@@ -187,8 +199,9 @@ enum JobRequest {
         task_id: String,
         cursor: usize,
         max_bytes: usize,
-        /// Whether this read is a model read tracked by the
-        /// unchanged-read refusal; a monitor pump's reads are not.
+        /// Whether this read is a model read of the merged terminal buffer,
+        /// tracked by the unchanged-read refusal; a monitor pump's reads are
+        /// not, and read the complete-line buffer instead.
         tracked: bool,
         reply: Sender<Result<TerminalDelta, String>>,
     },
@@ -578,6 +591,20 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
+    /// Gets information about a job by its task ID once no kill of it is in
+    /// flight. A job whose process has exited from a kill's signal still reads
+    /// `Running` until the kill records its outcome; this waits for that
+    /// outcome, so the status it returns is the job's real ending.
+    pub async fn get_by_task_id_settled(&self, task_id: &str) -> Option<JobInfo> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::GetByTaskIdSettled {
+            task_id: task_id.to_string(),
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
     /// Kills a running job by its PID.
     pub async fn kill(&self, pid: u32) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
@@ -791,6 +818,9 @@ async fn handle_job_request(
                 .map(|state| state.info.clone());
             let _ = reply.send(item).await;
         }
+        JobRequest::GetByTaskIdSettled { task_id, reply } => {
+            get_settled_by_task_id(jobs, &task_id, reply).await;
+        }
         JobRequest::BeginKill { pid, reply } => {
             let plan = begin_kill(jobs, pid).await;
             let _ = reply.send(plan).await;
@@ -811,6 +841,7 @@ async fn handle_job_request(
         }
         JobRequest::EndKill { pid, killed, reply } => {
             let result = end_kill(jobs, pid, killed).await;
+            release_settled_waiters(jobs, pid).await;
             let _ = reply.send(result).await;
         }
         JobRequest::InputTerminal {
@@ -839,7 +870,7 @@ async fn handle_job_request(
             tracked,
             reply,
         } => {
-            let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes)
+            let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes, !tracked)
                 .and_then(|delta| tracked_delta(reads, &task_id, delta, tracked));
             let _ = reply.send(result).await;
         }
@@ -912,6 +943,9 @@ impl JobState {
         Self {
             info,
             terminal_buffer: Vec::new(),
+            line_buffer: Vec::new(),
+            stdout_partial: Vec::new(),
+            stderr_partial: Vec::new(),
             stdout_buffer: Vec::new(),
             stderr_buffer: Vec::new(),
             stdout_closed: false,
@@ -921,6 +955,7 @@ impl JobState {
             process_tree: None,
             kills_in_flight: 0,
             deferred_end: None,
+            settled_waiters: Vec::new(),
             output_redirect: None,
             finished_at: None,
         }
@@ -954,9 +989,16 @@ async fn append_terminal_output(
                 "failed to append redirected output"
             );
         }
-        match stream {
-            TerminalStream::Stdout => job.stdout_buffer.extend_from_slice(&chunk),
-            TerminalStream::Stderr => job.stderr_buffer.extend_from_slice(&chunk),
+        let (buffer, partial) = match stream {
+            TerminalStream::Stdout => (&mut job.stdout_buffer, &mut job.stdout_partial),
+            TerminalStream::Stderr => (&mut job.stderr_buffer, &mut job.stderr_partial),
+        };
+        buffer.extend_from_slice(&chunk);
+        partial.extend_from_slice(&chunk);
+        // Each stream completes its own lines; a line reaches the line
+        // buffer whole, so one stream never interrupts the other's.
+        if let Some(last_newline) = partial.iter().rposition(|byte| *byte == b'\n') {
+            job.line_buffer.extend(partial.drain(..=last_newline));
         }
     }
 }
@@ -1132,13 +1174,14 @@ fn read_terminal_delta(
     task_id: &str,
     cursor: usize,
     max_bytes: usize,
+    lines: bool,
 ) -> Result<TerminalDelta, String> {
     find_pid_by_task_id(jobs, task_id).map_or_else(
         || Err(format!("unknown task_id: {task_id}")),
         |pid| {
             jobs.get(&pid).map_or_else(
                 || Err(format!("unknown task_id: {task_id}")),
-                |job| terminal_read(job, cursor, max_bytes),
+                |job| terminal_read(job, cursor, max_bytes, lines),
             )
         },
     )
@@ -1297,6 +1340,36 @@ async fn end_kill(jobs: &mut HashMap<u32, JobState>, pid: u32, killed: bool) -> 
     false
 }
 
+/// Answers a settled read at once, or parks it while a kill of the job runs.
+async fn get_settled_by_task_id(
+    jobs: &mut HashMap<u32, JobState>,
+    task_id: &str,
+    reply: Sender<Option<JobInfo>>,
+) {
+    match find_pid_by_task_id(jobs, task_id).and_then(|pid| jobs.get_mut(&pid)) {
+        Some(job) if job.kills_in_flight > 0 => job.settled_waiters.push(reply),
+        Some(job) => {
+            let _ = reply.send(Some(job.info.clone())).await;
+        }
+        None => {
+            let _ = reply.send(None).await;
+        }
+    }
+}
+
+/// Answers the callers parked on a job once its last kill in flight ended.
+async fn release_settled_waiters(jobs: &mut HashMap<u32, JobState>, pid: u32) {
+    let Some(job) = jobs.get_mut(&pid) else {
+        return;
+    };
+    if job.kills_in_flight > 0 {
+        return;
+    }
+    for waiter in std::mem::take(&mut job.settled_waiters) {
+        let _ = waiter.send(Some(job.info.clone())).await;
+    }
+}
+
 /// The bytes of a script a running-jobs line shows.
 const SCRIPT_PREVIEW_BYTES: usize = 50;
 
@@ -1343,8 +1416,18 @@ fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
     output
 }
 
-fn terminal_read(job: &JobState, cursor: usize, max_bytes: usize) -> Result<TerminalDelta, String> {
-    let total_bytes = job.terminal_buffer.len();
+fn terminal_read(
+    job: &JobState,
+    cursor: usize,
+    max_bytes: usize,
+    lines: bool,
+) -> Result<TerminalDelta, String> {
+    let buffer = if lines {
+        &job.line_buffer
+    } else {
+        &job.terminal_buffer
+    };
+    let total_bytes = buffer.len();
     if cursor > total_bytes {
         return Err(format!(
             "cursor {cursor} exceeds terminal buffer size {total_bytes} for task {}",
@@ -1356,7 +1439,7 @@ fn terminal_read(job: &JobState, cursor: usize, max_bytes: usize) -> Result<Term
         task_id: job.info.task_id.clone(),
         cursor: end,
         total_bytes,
-        bytes: job.terminal_buffer[cursor..end].to_vec(),
+        bytes: buffer[cursor..end].to_vec(),
         status: job.info.status.clone(),
     })
 }
@@ -1563,6 +1646,51 @@ mod tests {
         assert_eq!(second.total_bytes, 11);
     }
 
+    /// The rotation case: tail writes `tail: ` on stderr, the new file's line
+    /// arrives on stdout, then the rest of the notice on stderr. The monitor
+    /// reads whole lines, while the merged terminal buffer stays in arrival
+    /// order.
+    #[tokio::test]
+    async fn monitor_reads_whole_lines_when_partial_writes_interleave() {
+        let (registry, service) = job_registry_channel();
+        TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
+        registry
+            .register(
+                203,
+                "task-lines",
+                "exec-lines",
+                "tail -F f",
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+        registry.append_stderr(203, b"tail: ".to_vec()).await;
+        registry.append_stdout(203, b"rotated\n".to_vec()).await;
+        registry
+            .append_stderr(203, b"'f' has been replaced\n".to_vec())
+            .await;
+        registry.append_stdout(203, b"unfinished".to_vec()).await;
+
+        let lines = registry
+            .monitor_read("task-lines", 0, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&lines.bytes),
+            "rotated\ntail: 'f' has been replaced\n"
+        );
+        let merged = registry
+            .terminal_read("task-lines", 0, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&merged.bytes),
+            "tail: rotated\n'f' has been replaced\nunfinished"
+        );
+    }
+
     #[tokio::test]
     async fn test_kill_by_execution_key_no_match() {
         let (registry, service) = job_registry_channel();
@@ -1720,5 +1848,61 @@ mod tests {
         complete_job(&mut jobs, 8, 0, None).await;
         assert!(end_kill(&mut jobs, 8, true).await);
         assert_eq!(jobs[&8].info.status, JobStatus::Killed);
+    }
+
+    /// A job whose process exited from a kill's signal reads as running until
+    /// the kill records its outcome; the settled read waits for it.
+    #[tokio::test]
+    async fn the_settled_read_waits_for_a_kill_in_flight() {
+        let (registry, service) = job_registry_channel();
+        TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
+        registry
+            .register(
+                557,
+                "task-settled",
+                "exec-settled",
+                "sleep 10",
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        registry
+            .send_command(JobRequest::BeginKill {
+                pid: 557,
+                reply: reply_tx,
+            })
+            .await;
+        let plan = JobRegistry::recv_reply(reply_rx).await;
+        assert!(matches!(plan, KillPlan::Group(557)));
+        // The killed process exits and its flow reports completion while the
+        // kill has not returned.
+        registry.complete(557, 137, None).await;
+        let running = registry.get_by_task_id("task-settled").await;
+        assert!(matches!(
+            running.expect("job should exist").status,
+            JobStatus::Running
+        ));
+
+        let waiting = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.get_by_task_id_settled("task-settled").await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "the kill is still in flight");
+
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        registry
+            .send_command(JobRequest::EndKill {
+                pid: 557,
+                killed: true,
+                reply: reply_tx,
+            })
+            .await;
+        assert!(JobRegistry::recv_reply(reply_rx).await);
+        let job = waiting.await.unwrap().expect("job should exist");
+        assert!(matches!(job.status, JobStatus::Killed));
     }
 }

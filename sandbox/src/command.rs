@@ -39,7 +39,7 @@ use aither_core::llm::{CallIdentity, IntoToolResult, Tool, ToolCallId, ToolConte
 use askama::Template;
 use async_channel::{Receiver, Sender};
 use heel::IpcCommand;
-use heel::ipc::IpcError;
+use heel::ipc::{IpcContext, IpcError};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,9 @@ struct CommandOutputSavedTemplate<'a> {
 #[template(path = "tool_usage_error.txt", escape = "none")]
 struct ToolUsageErrorTemplate<'a> {
     message: &'a str,
+    /// What the command's arguments can be at the moment of the call, for a
+    /// command that says so.
+    usage: Option<&'a str>,
     tool_name: &'a str,
 }
 
@@ -103,9 +106,13 @@ fn prefix_error(prefix: &str, error: &impl std::fmt::Display) -> String {
 }
 
 fn tool_usage_error(message: &str, tool_name: &str) -> String {
-    ToolUsageErrorTemplate { message, tool_name }
-        .render()
-        .expect("tool usage error template must render")
+    ToolUsageErrorTemplate {
+        message,
+        usage: None,
+        tool_name,
+    }
+    .render()
+    .expect("tool usage error template must render")
 }
 
 fn output_saved_text(
@@ -247,14 +254,37 @@ impl CommandEnvelope {
     }
 }
 
-/// Type-erased tool handler function: the identity of the `terminal` call
-/// whose script invoked the command (`None` outside a terminal call), and the
+/// Who invoked a command and from where.
+#[derive(Debug, Clone, Default)]
+struct Caller {
+    /// The `terminal` call whose script invoked the command; `None` outside
+    /// a terminal call.
+    call: Option<CallIdentity>,
+    /// The working directory of the process that made the request, on the
+    /// host; `None` when the request carried none.
+    working_dir: Option<String>,
+}
+
+impl Caller {
+    /// The context a tool runs with when this caller invoked it. A shell
+    /// invocation has nowhere to show progress, but the call whose script ran
+    /// it and the directory the script was in are known.
+    fn into_context(self) -> ToolContext {
+        let mut cx = ToolContext::new();
+        if let Some(identity) = self.call {
+            cx = cx.with_identity(identity);
+        }
+        if let Some(working_dir) = self.working_dir {
+            cx = cx.with_working_dir(working_dir);
+        }
+        cx
+    }
+}
+
+/// Type-erased tool handler function: who invoked the command, and the
 /// command's arguments.
 type ToolHandlerFn = Box<
-    dyn Fn(
-            Option<CallIdentity>,
-            Vec<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
+    dyn Fn(Caller, Vec<String>) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -288,19 +318,50 @@ pub enum CommandRole {
     Subagent,
 }
 
-/// What a command resolves to in each role; a subagent role without an entry
-/// gets the refusal naming the command as reserved for the main agent.
+/// What a command resolves to in each role.
 #[derive(Debug)]
 struct RoleEntries<T> {
     main: T,
-    subagent: Option<T>,
+    subagent: SubagentSide<T>,
+}
+
+/// What the subagent role has of a command.
+#[derive(Debug)]
+enum SubagentSide<T> {
+    /// The handler a subagent's call runs.
+    Serves(T),
+    /// The command is reserved for the main agent: a subagent's call gets the
+    /// refusal naming it so.
+    Reserved,
+    /// A subagent has no such command: it is neither listed nor callable.
+    Absent,
+}
+
+/// What a restricted registration leaves the subagent role.
+#[derive(Debug, Clone, Copy)]
+enum Restriction {
+    Reserved,
+    Absent,
+}
+
+impl Restriction {
+    const fn side<T>(self) -> SubagentSide<T> {
+        match self {
+            Self::Reserved => SubagentSide::Reserved,
+            Self::Absent => SubagentSide::Absent,
+        }
+    }
 }
 
 impl<T: Clone> Clone for RoleEntries<T> {
     fn clone(&self) -> Self {
         Self {
             main: self.main.clone(),
-            subagent: self.subagent.clone(),
+            subagent: match &self.subagent {
+                SubagentSide::Serves(entry) => SubagentSide::Serves(entry.clone()),
+                SubagentSide::Reserved => SubagentSide::Reserved,
+                SubagentSide::Absent => SubagentSide::Absent,
+            },
         }
     }
 }
@@ -313,17 +374,27 @@ impl<T> RoleEntries<T> {
     {
         Self {
             main: entry.clone(),
-            subagent: Some(entry),
+            subagent: SubagentSide::Serves(entry),
         }
     }
 
     /// The entry `role` reaches; `None` when the command is reserved for the
-    /// main agent.
+    /// main agent or absent from `role`.
     const fn for_role(&self, role: CommandRole) -> Option<&T> {
-        match role {
-            CommandRole::Main => Some(&self.main),
-            CommandRole::Subagent => self.subagent.as_ref(),
+        match (role, &self.subagent) {
+            (CommandRole::Main, _) => Some(&self.main),
+            (CommandRole::Subagent, SubagentSide::Serves(entry)) => Some(entry),
+            (CommandRole::Subagent, SubagentSide::Reserved | SubagentSide::Absent) => None,
         }
+    }
+
+    /// Whether `role` has the command at all, reserved or not: a command
+    /// absent from it is neither listed nor callable there.
+    const fn exists_for(&self, role: CommandRole) -> bool {
+        !matches!(
+            (role, &self.subagent),
+            (CommandRole::Subagent, SubagentSide::Absent)
+        )
     }
 }
 
@@ -863,7 +934,32 @@ impl ToolRegistryBuilder {
         T: Tool + Send + Sync + 'static,
         T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
     {
-        let name = name.into();
+        self.insert_bound_tool(name.into(), bind, None);
+    }
+
+    /// Configures a terminal-bound tool like
+    /// [`configure_terminal_bound_tool`](Self::configure_terminal_bound_tool)
+    /// whose call that does not parse is answered with the parse error and
+    /// the tool's [`CommandUsage::usage`], read at the moment of the call.
+    ///
+    /// # Panics
+    /// Panics if the tool argument schema cannot be serialized, and, when a
+    /// terminal binds the registry, if the built tool is not named `name`.
+    pub fn configure_terminal_bound_usage_tool<T, F>(&mut self, name: impl Into<String>, bind: F)
+    where
+        F: Fn(&TerminalBinding) -> T + Send + Sync + 'static,
+        T: CommandUsage + Send + Sync + 'static,
+        T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+    {
+        self.insert_bound_tool(name.into(), bind, Some(command_usage::<T>));
+    }
+
+    fn insert_bound_tool<T, F>(&mut self, name: String, bind: F, usage: Option<UsageFn<T>>)
+    where
+        F: Fn(&TerminalBinding) -> T + Send + Sync + 'static,
+        T: Tool + Send + Sync + 'static,
+        T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+    {
         let schema = tool_schema::<T::Arguments>();
         let help = schema_to_help(&schema);
         let stdin_arg = detect_stdin_arg(&schema);
@@ -876,7 +972,7 @@ impl ToolRegistryBuilder {
                     bound_name,
                     "a terminal-bound command keeps the name it was registered under"
                 );
-                tool_handler(Arc::new(tool), schema.clone())
+                tool_handler(Arc::new(tool), schema.clone(), usage)
             }),
             help,
             stdin_arg,
@@ -889,24 +985,37 @@ impl ToolRegistryBuilder {
     /// reserved for the main agent, while help and stdin handling stay those
     /// of the real command.
     pub fn main_only(&mut self, configure: impl FnOnce(&mut Self)) {
-        let mut reserved = Self::new();
-        configure(&mut reserved);
-        self.kept.extend(reserved.kept);
-        for (name, entries) in reserved.entries {
+        self.restrict(configure, Restriction::Reserved);
+    }
+
+    /// Registers every command `configure` registers for the main agent
+    /// alone: a subagent's terminal has no such command, neither listed nor
+    /// callable.
+    pub fn main_exclusive(&mut self, configure: impl FnOnce(&mut Self)) {
+        self.restrict(configure, Restriction::Absent);
+    }
+
+    /// Registers what `configure` registers with the subagent side
+    /// `restriction` gives.
+    fn restrict(&mut self, configure: impl FnOnce(&mut Self), restriction: Restriction) {
+        let mut restricted = Self::new();
+        configure(&mut restricted);
+        self.kept.extend(restricted.kept);
+        for (name, entries) in restricted.entries {
             self.insert_entry(
                 name,
                 RoleEntries {
                     main: entries.main,
-                    subagent: None,
+                    subagent: restriction.side(),
                 },
             );
         }
-        for (name, entries) in reserved.bound {
+        for (name, entries) in restricted.bound {
             self.insert_bound(
                 name,
                 RoleEntries {
                     main: entries.main,
-                    subagent: None,
+                    subagent: restriction.side(),
                 },
             );
         }
@@ -953,7 +1062,7 @@ impl ToolRegistryBuilder {
             name,
             RoleEntries {
                 main: Arc::new(main),
-                subagent: Some(Arc::new(subagent)),
+                subagent: SubagentSide::Serves(Arc::new(subagent)),
             },
         );
     }
@@ -1000,7 +1109,7 @@ impl ToolRegistryBuilder {
         self.insert_entry(
             name.into(),
             RoleEntries::shared(Arc::new(ToolEntry {
-                handler: Box::new(handler),
+                handler: Box::new(move |caller: Caller, args| handler(caller.call, args)),
                 help: help.into(),
                 stdin_arg: None,
             })),
@@ -1049,14 +1158,36 @@ fn tool_schema<A: JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(A)).expect("failed to serialize tool schema")
 }
 
-/// The handler running `tool` with arguments parsed against `schema`.
-fn tool_handler<T>(tool: Arc<T>, schema: Value) -> ToolHandlerFn
+/// A terminal command whose valid arguments depend on what exists when it is
+/// called, such as the names a lookup can resolve.
+///
+/// Registered with
+/// [`ToolRegistryBuilder::configure_terminal_bound_usage_tool`], a call that
+/// does not parse is answered with the parse error followed by
+/// [`usage`](Self::usage), read at the moment of that call.
+pub trait CommandUsage: Tool {
+    /// What the command's arguments can be right now.
+    fn usage(&self) -> impl Future<Output = String> + Send;
+}
+
+/// Reads a tool's [`CommandUsage::usage`] for a call that did not parse.
+type UsageFn<T> = fn(Arc<T>) -> Pin<Box<dyn Future<Output = String> + Send>>;
+
+fn command_usage<T: CommandUsage + 'static>(
+    tool: Arc<T>,
+) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(async move { tool.usage().await })
+}
+
+/// The handler running `tool` with arguments parsed against `schema`; a call
+/// that does not parse also names what `usage` reads, when it is given.
+fn tool_handler<T>(tool: Arc<T>, schema: Value, usage: Option<UsageFn<T>>) -> ToolHandlerFn
 where
     T: Tool + Send + Sync + 'static,
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
     let name_for_errors = tool.name().to_string();
-    Box::new(move |identity: Option<CallIdentity>, args: Vec<String>| {
+    Box::new(move |caller: Caller, args: Vec<String>| {
         let tool = tool.clone();
         let schema = schema.clone();
         let name = name_for_errors.clone();
@@ -1066,7 +1197,17 @@ where
                 Ok(v) => v,
                 Err(e) => {
                     let message = e.to_string();
-                    return Err(tool_usage_error(message.as_str(), name.as_str()));
+                    let usage = match usage {
+                        Some(usage) => Some(usage(tool.clone()).await),
+                        None => None,
+                    };
+                    return Err(ToolUsageErrorTemplate {
+                        message: message.as_str(),
+                        usage: usage.as_deref(),
+                        tool_name: name.as_str(),
+                    }
+                    .render()
+                    .expect("tool usage error template must render"));
                 }
             };
             tracing::debug!(tool = %name, json = %json_args, "configure_tool handler: parsed JSON");
@@ -1077,13 +1218,8 @@ where
                     return Err(tool_usage_error(message.as_str(), name.as_str()));
                 }
             };
-            // A shell invocation has nowhere to show progress, but the call
-            // whose script ran it is known.
-            let cx = identity.map_or_else(ToolContext::new, |identity| {
-                ToolContext::new().with_identity(identity)
-            });
             let output = tool
-                .call(parsed, cx)
+                .call(parsed, caller.into_context())
                 .await
                 .map_err(|error| error.to_string())?;
             output
@@ -1107,7 +1243,7 @@ where
     (
         name,
         ToolEntry {
-            handler: tool_handler(Arc::new(tool), schema),
+            handler: tool_handler(Arc::new(tool), schema, None),
             help,
             stdin_arg,
         },
@@ -1142,22 +1278,21 @@ where
     let schema_for_handler = schema;
     let name_for_handler = name.clone();
     let handler = Arc::new(handler);
-    let raw_handler: ToolHandlerFn =
-        Box::new(move |identity: Option<CallIdentity>, args: Vec<String>| {
-            let schema = schema_for_handler.clone();
-            let name = name_for_handler.clone();
-            let handler = handler.clone();
-            Box::pin(async move {
-                let json_args = match cli_to_json(&schema, &args) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let message = error.to_string();
-                        return Err(tool_usage_error(message.as_str(), name.as_str()));
-                    }
-                };
-                handler(identity, json_args).await
-            })
-        });
+    let raw_handler: ToolHandlerFn = Box::new(move |caller: Caller, args: Vec<String>| {
+        let schema = schema_for_handler.clone();
+        let name = name_for_handler.clone();
+        let handler = handler.clone();
+        Box::pin(async move {
+            let json_args = match cli_to_json(&schema, &args) {
+                Ok(value) => value,
+                Err(error) => {
+                    let message = error.to_string();
+                    return Err(tool_usage_error(message.as_str(), name.as_str()));
+                }
+            };
+            handler(caller.call, json_args).await
+        })
+    });
 
     (
         name,
@@ -1377,6 +1512,9 @@ impl ToolRegistry {
     /// has bound this registry; a terminal binds the registry it serves.
     fn resolve(&self, tool_name: &str) -> Option<Resolved<'_>> {
         if let Some(bound) = self.bound.get(tool_name) {
+            if !bound.exists_for(self.role) {
+                return None;
+            }
             let entry = bound.for_role(self.role);
             let shown = entry.unwrap_or(&bound.main);
             return Some(Resolved {
@@ -1391,7 +1529,10 @@ impl ToolRegistry {
                 stdin_arg: shown.stdin_arg.as_deref(),
             });
         }
-        let entries = self.entries.get(tool_name)?;
+        let entries = self
+            .entries
+            .get(tool_name)
+            .filter(|entries| entries.exists_for(self.role))?;
         let shown = entries.for_role(self.role).unwrap_or(&entries.main);
         Some(Resolved {
             handler: entries.for_role(self.role).map(|entry| &entry.handler),
@@ -1408,12 +1549,33 @@ impl ToolRegistry {
     /// Panics if the registry's own kept-exchange channel is closed, which
     /// it never is while the registry exists.
     pub async fn query_tool_handler(&self, tool_name: &str, args: &[String]) -> CommandEnvelope {
+        self.query_tool_handler_from(tool_name, args, None).await
+    }
+
+    /// Queries a tool handler by name on behalf of a process whose working
+    /// directory was `working_dir` when it made the request.
+    ///
+    /// The command sees the directory through [`ToolContext::working_dir`],
+    /// so the relative paths in `args` resolve against it. `None` when the
+    /// request carried none.
+    ///
+    /// Large outputs (> 4000 chars) are automatically saved to file.
+    pub async fn query_tool_handler_from(
+        &self,
+        tool_name: &str,
+        args: &[String],
+        working_dir: Option<&Path>,
+    ) -> CommandEnvelope {
         match self.resolve(tool_name) {
             Some(Resolved {
                 handler: Some(handler),
                 ..
             }) => {
-                let outcome = match handler(self.call.clone(), args.to_vec()).await {
+                let caller = Caller {
+                    call: self.call.clone(),
+                    working_dir: working_dir.map(|dir| dir.to_string_lossy().into_owned()),
+                };
+                let outcome = match handler(caller, args.to_vec()).await {
                     Ok(output) => handle_large_output(output, &self.output_dir).await,
                     Err(error) => CommandEnvelope::failure(error),
                 };
@@ -1445,10 +1607,19 @@ impl ToolRegistry {
         }
     }
 
-    /// Returns whether a tool is registered.
+    /// Returns whether a tool is registered for this registry's role; a
+    /// command registered for the main agent alone is not registered for a
+    /// subagent.
     #[must_use]
     pub fn is_tool_configured(&self, tool_name: &str) -> bool {
-        self.entries.contains_key(tool_name) || self.bound.contains_key(tool_name)
+        self.bound.get(tool_name).map_or_else(
+            || {
+                self.entries
+                    .get(tool_name)
+                    .is_some_and(|entries| entries.exists_for(self.role))
+            },
+            |bound| bound.exists_for(self.role),
+        )
     }
 
     /// Returns whether a tool is reserved for the main agent in this
@@ -1479,12 +1650,20 @@ impl ToolRegistry {
             .and_then(|resolved| resolved.stdin_arg.map(str::to_string))
     }
 
-    /// Returns list of registered tool names.
+    /// Returns the names of the tools registered for this registry's role,
+    /// those reserved for the main agent included.
     #[must_use]
     pub fn registered_tool_names(&self) -> Vec<String> {
         self.entries
-            .keys()
-            .chain(self.bound.keys())
+            .iter()
+            .filter(|(_, entries)| entries.exists_for(self.role))
+            .map(|(name, _)| name)
+            .chain(
+                self.bound
+                    .iter()
+                    .filter(|(_, entries)| entries.exists_for(self.role))
+                    .map(|(name, _)| name),
+            )
             .cloned()
             .collect()
     }
@@ -1646,7 +1825,7 @@ impl IpcCommand for ToolCallCommand {
             .map(Cow::Owned)
     }
 
-    async fn handle(&self, args: Self::Args) -> Result<String, IpcError> {
+    async fn handle(&self, args: Self::Args, context: IpcContext) -> Result<String, IpcError> {
         let cli_args = flatten_args_to_cli(&args);
         tracing::info!(tool = %self.tool_name, args = ?cli_args, "ToolCallCommand::handle invoked");
 
@@ -1663,7 +1842,7 @@ impl IpcCommand for ToolCallCommand {
         tracing::info!(tool = %self.tool_name, "Calling registry.query_tool_handler");
         envelope_to_cli(
             self.registry
-                .query_tool_handler(&self.tool_name, &cli_args)
+                .query_tool_handler_from(&self.tool_name, &cli_args, Some(context.working_dir()))
                 .await,
         )
     }
@@ -1716,7 +1895,7 @@ impl IpcCommand for IpcGatewayCommand {
         true
     }
 
-    async fn handle(&self, args: Self::Args) -> Result<String, IpcError> {
+    async fn handle(&self, args: Self::Args, context: IpcContext) -> Result<String, IpcError> {
         let cli_args = flatten_args_to_cli(&args);
         if cli_args.is_empty() {
             return Err(IpcError::remote("usage: ipc <tool> [args ...]"));
@@ -1737,7 +1916,7 @@ impl IpcCommand for IpcGatewayCommand {
         let tool_args = cli_args[1..].to_vec();
         envelope_to_cli(
             self.registry
-                .query_tool_handler(tool_name, &tool_args)
+                .query_tool_handler_from(tool_name, &tool_args, Some(context.working_dir()))
                 .await,
         )
     }
@@ -1901,7 +2080,7 @@ where
         self.stdin_arg.clone().map(Cow::Owned)
     }
 
-    async fn handle(&self, args: Self::Args) -> Result<String, IpcError> {
+    async fn handle(&self, args: Self::Args, context: IpcContext) -> Result<String, IpcError> {
         let cli_args = flatten_args_to_cli(&args);
 
         // Handle help flags
@@ -1933,8 +2112,10 @@ where
             }
         };
 
-        // A shell invocation has nowhere to show progress.
-        match self.tool.call(parsed, ToolContext::new()).await {
+        // A shell invocation has nowhere to show progress, but the directory
+        // it ran in is known.
+        let cx = ToolContext::new().with_working_dir(context.working_dir().to_string_lossy());
+        match self.tool.call(parsed, cx).await {
             Ok(output) => tool_output_to_payload(output, &self.output_dir)
                 .await
                 .map(|payload| payload.map_or_else(String::new, |payload| payload.render_for_cli()))
@@ -3492,7 +3673,10 @@ mod tests {
         }))
         .unwrap();
 
-        let rendered = cmd.handle(args).await.expect("command should succeed");
+        let rendered = cmd
+            .handle(args, IpcContext::new("/"))
+            .await
+            .expect("command should succeed");
         tracing::debug!("result: {rendered}");
         assert!(
             rendered.contains("option=[\"原味\", \"番茄味\", \"芝士味\"]"),
@@ -3549,6 +3733,7 @@ mod tests {
                     "args": ["read", "input.txt"]
                 }))
                 .unwrap(),
+                IpcContext::new("/"),
             )
             .await
             .expect("read parses and runs");
@@ -3560,6 +3745,7 @@ mod tests {
                     "args": ["write", "out.txt", "hello"]
                 }))
                 .unwrap(),
+                IpcContext::new("/"),
             )
             .await
             .expect("write parses and runs");
@@ -3573,6 +3759,7 @@ mod tests {
                     "args": ["explode"]
                 }))
                 .unwrap(),
+                IpcContext::new("/"),
             )
             .await
             .expect_err("unknown subcommand must fail");
@@ -3580,6 +3767,51 @@ mod tests {
             error.to_string().contains("unknown subcommand 'explode'"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Reports the directory its caller was in.
+    #[derive(Debug, Clone)]
+    struct WhereTool;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct WhereArgs {}
+
+    impl Tool for WhereTool {
+        fn name(&self) -> Cow<'static, str> {
+            "where_am_i".into()
+        }
+        type Arguments = WhereArgs;
+        type Res = ToolResult;
+
+        fn call(
+            &self,
+            _args: Self::Arguments,
+            cx: aither_core::llm::ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            let text = cx.working_dir().unwrap_or("none").to_string();
+            std::future::ready(Ok(ToolResult::Text { text }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_sees_the_directory_its_request_came_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(WhereTool);
+        let registry = std::sync::Arc::new(builder.build(tmp.path()));
+
+        let none = registry.query_tool_handler("where_am_i", &[]).await;
+        assert_eq!(envelope_to_cli(none).unwrap(), "none");
+
+        let cmd = ToolCallCommand::new("where_am_i", registry);
+        let rendered = cmd
+            .handle(
+                serde_json::from_value(serde_json::json!({ "args": [] })).unwrap(),
+                IpcContext::new("/skills/slide"),
+            )
+            .await
+            .expect("the command runs");
+        assert_eq!(rendered, "/skills/slide");
     }
 
     /// Echoes which role's handler ran.

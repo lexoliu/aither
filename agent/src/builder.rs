@@ -75,6 +75,7 @@ pub struct AgentBuilder<
     permission_receiver: Option<PermissionEventReceiver>,
     /// The terminal calls in which a kept command succeeded.
     kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
+    host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
     job_registry: Option<JobRegistry>,
     context_sources: Vec<AnyContextSource>,
     /// Directory whose working documents (`tasks.md`) the agent supervises:
@@ -137,6 +138,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             background_receiver: None,
             permission_receiver: None,
             kept_receiver: None,
+            host_load_events: None,
             job_registry: None,
             context_sources: Vec::new(),
             sandbox_dir: None,
@@ -184,6 +186,7 @@ where
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             kept_receiver: self.kept_receiver,
+            host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
@@ -222,6 +225,7 @@ where
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             kept_receiver: self.kept_receiver,
+            host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
@@ -264,6 +268,7 @@ where
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             kept_receiver: self.kept_receiver,
+            host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
@@ -349,13 +354,11 @@ where
         self.permission_receiver = Some(dyn_tool.permission_receiver());
         self.kept_receiver = Some(dyn_tool.kept_receiver());
         self.job_registry = Some(dyn_tool.job_registry());
-        // Files are restored after compaction from wherever the terminal
-        // works; working-document supervision (`tasks.md`) belongs to the
-        // main agent's terminal alone.
+        // Files are restored after compaction, and `tasks.md` is kept, in
+        // wherever the terminal works: a subagent's are in its own space,
+        // never its parent's.
         self.restore_dir = Some(dyn_tool.working_dir().clone());
-        if dyn_tool.role() == aither_sandbox::CommandRole::Main {
-            self.sandbox_dir = Some(dyn_tool.working_dir().clone());
-        }
+        self.sandbox_dir = Some(dyn_tool.working_dir().clone());
         self.tools.register_dyn_terminal(dyn_tool);
         self
     }
@@ -407,7 +410,8 @@ where
     ///
     /// The tools run in `terminal`, the fork's own terminal. A tool of the
     /// main agent that `terminal` does not provide stays in the definitions,
-    /// to keep the request identical, and refuses when called.
+    /// to keep the request identical, and refuses when called. The exception
+    /// is `compact`, which compacts the fork through a signal of its own.
     pub fn forked_from(
         mut self,
         fork: &crate::fork::ForkSnapshot,
@@ -425,8 +429,18 @@ where
         self.permission_receiver = Some(terminal.permission_receiver());
         self.kept_receiver = Some(terminal.kept_receiver());
         self.job_registry = Some(terminal.job_registry());
+        // A fork keeps its own `tasks.md` in its own space, like any
+        // subagent, not the main agent's it inherited the context of.
         self.restore_dir = Some(terminal.working_dir().clone());
-        self.tools = AgentTools::forked(&fork.definitions, terminal);
+        self.sandbox_dir = Some(terminal.working_dir().clone());
+        // The inherited `compact` definition runs over the fork's own
+        // signal, so a call compacts the fork, never the main agent.
+        self.compact_signal = fork
+            .definitions
+            .iter()
+            .any(|definition| definition.name() == crate::compact_tool::COMPACT_TOOL_NAME)
+            .then(std::sync::Arc::default);
+        self.tools = AgentTools::forked(&fork.definitions, terminal, self.compact_signal.as_ref());
         self
     }
 
@@ -464,6 +478,7 @@ where
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             kept_receiver: self.kept_receiver,
+            host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
@@ -738,10 +753,12 @@ where
 
     /// Overrides the session's prompt-cache controller.
     ///
-    /// The default derives a fresh session key per agent and retains Claude
-    /// breakpoints for one hour; a host with its own session identity or a
-    /// provider that retains prompts differently supplies the
-    /// [`PromptCache`](crate::context::PromptCache) it wants here.
+    /// The default derives a fresh session key per agent, so every rebuild
+    /// asks for a new cache shard; a host that rebuilds its agent supplies
+    /// the session's identity (and the replaced agent's epoch, through
+    /// [`PromptCache::with_epoch`](crate::context::PromptCache::with_epoch))
+    /// so the key stays the same across rebuilds. The same value sets the
+    /// Claude breakpoint retention, which is one hour by default.
     pub fn prompt_cache(mut self, cache: crate::context::PromptCache) -> Self {
         self.prompt_cache = cache;
         self
@@ -798,6 +815,33 @@ where
     /// [`BackgroundJobPolicy::Await`]: crate::BackgroundJobPolicy::Await
     pub const fn background_jobs(mut self, policy: crate::BackgroundJobPolicy) -> Self {
         self.config.background_jobs = policy;
+        self
+    }
+
+    /// Starts a [`HostLoadMonitor`](crate::HostLoadMonitor) on `executor` and
+    /// tells the agent, once per event, when host memory pressure or machine
+    /// load becomes high and when it ends.
+    ///
+    /// The monitor lengthens `foreground_wait` while high load lasts and runs
+    /// until the agent is dropped. It reads the builder's [`clock`](Self::clock),
+    /// so set the clock first.
+    pub fn host_load<R, E>(
+        mut self,
+        executor: &E,
+        reader: R,
+        config: crate::HostLoadConfig,
+        foreground_wait: aither_sandbox::ForegroundWait,
+    ) -> Self
+    where
+        R: crate::HostReader,
+        E: executor_core::Executor,
+    {
+        let monitor = crate::HostLoadMonitor::new(reader, config, foreground_wait);
+        self.host_load_events = Some(crate::host_load::spawn(
+            executor,
+            monitor,
+            self.clock.clone(),
+        ));
         self
     }
 
@@ -858,6 +902,7 @@ where
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             kept_receiver: self.kept_receiver,
+            host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             detached_task_ids: std::collections::HashSet::new(),
             sandbox_dir: self.sandbox_dir,
@@ -1072,7 +1117,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_subagent_gets_no_working_document_supervision_but_keeps_file_restore() {
+    async fn a_subagent_keeps_its_working_documents_and_files_in_its_own_space() {
         use aither_sandbox::permission::NoopPermissionHandler;
         use aither_sandbox::{SubagentGrant, TerminalTool, ToolRegistryBuilder};
         use executor_core::tokio::TokioGlobal;
@@ -1099,17 +1144,21 @@ mod tests {
             .unwrap();
         let space = subagent.working_dir().clone();
 
+        let main_dir = terminal.working_dir().clone();
         let main = AgentBuilder::new(MockLlm).dyn_terminal(terminal.clone().to_dyn());
-        assert!(
-            main.sandbox_dir.is_some(),
-            "the main agent supervises its working documents"
+        assert_eq!(
+            main.sandbox_dir.as_ref(),
+            Some(&main_dir),
+            "the main agent keeps its working documents in its sandbox"
         );
         let main = AgentBuilder::new(MockLlm).terminal(terminal);
-        assert!(main.sandbox_dir.is_some());
+        assert_eq!(main.sandbox_dir.as_ref(), Some(&main_dir));
         let child = AgentBuilder::new(MockLlm).dyn_terminal(subagent);
-        assert!(
-            child.sandbox_dir.is_none(),
-            "a subagent's space is not supervised like the main agent's"
+        assert_ne!(space, main_dir);
+        assert_eq!(
+            child.sandbox_dir.as_ref(),
+            Some(&space),
+            "a subagent's tasks.md is in its own space, not its parent's"
         );
         assert_eq!(
             child.restore_dir,
