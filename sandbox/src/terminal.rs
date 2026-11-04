@@ -10,6 +10,7 @@
 //! (e.g., `amber-forest-thunder-pearl/`). All terminal executions share this
 //! directory, but each execution gets a fresh sandbox (new TTY/process).
 
+use crate::foreground_wait::ForegroundWait;
 use crate::grants::{GrantSet, TerminalGrants};
 use crate::outage::Outages;
 use std::{
@@ -576,7 +577,7 @@ pub const DEFAULT_LONG_JOB_ALERT_AFTER: Duration = Duration::from_secs(40 * 60);
 struct TerminalLimits {
     /// Foreground wait before a `terminal` call promotes to a background
     /// task.
-    foreground_wait: Duration,
+    foreground_wait: ForegroundWait,
     /// Maximum accepted `timeout` for a command.
     timeout_cap: Duration,
     /// Runtime after which a background job produces a long-running alert.
@@ -590,7 +591,7 @@ struct TerminalLimits {
 impl Default for TerminalLimits {
     fn default() -> Self {
         Self {
-            foreground_wait: DEFAULT_FOREGROUND_WAIT,
+            foreground_wait: ForegroundWait::new(DEFAULT_FOREGROUND_WAIT),
             timeout_cap: DEFAULT_TIMEOUT_CAP,
             long_job_alert: DEFAULT_LONG_JOB_ALERT_AFTER,
             subagent_import: ImportBudget::new(DEFAULT_SUBAGENT_IMPORT_LIMIT),
@@ -1841,9 +1842,17 @@ where
     /// still-running command promotes to a background task. Defaults to
     /// [`DEFAULT_FOREGROUND_WAIT`].
     #[must_use]
-    pub const fn with_foreground_wait(mut self, wait: Duration) -> Self {
-        self.limits.foreground_wait = wait;
+    pub fn with_foreground_wait(self, wait: Duration) -> Self {
+        self.limits.foreground_wait.set_normal(wait);
         self
+    }
+
+    /// A handle on the foreground window, shared with every terminal derived
+    /// from this one: a longer window put in force through it applies to the
+    /// next foreground wait of each of them.
+    #[must_use]
+    pub fn foreground_wait(&self) -> ForegroundWait {
+        self.limits.foreground_wait.clone()
     }
 
     /// Sets the largest `timeout` a command accepts.
@@ -2008,7 +2017,7 @@ where
     }
 
     /// The executor backing this terminal, for spawning watch tasks.
-    pub(crate) const fn executor(&self) -> &E {
+    pub const fn executor(&self) -> &E {
         &self.executor
     }
 
@@ -2276,7 +2285,7 @@ where
                 subagent.git.clone(),
                 ImportLimits {
                     bytes: self.limits.subagent_import.clone(),
-                    time: self.limits.foreground_wait,
+                    time: self.limits.foreground_wait.get(),
                 },
             )
         })
@@ -2605,7 +2614,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             .await;
         }
         let outcome =
-            wait_for_foreground_result(&spawned.result, self.limits.foreground_wait).await;
+            wait_for_foreground_result(&spawned.result, self.limits.foreground_wait.get()).await;
         // A result that raced in at the window's edge counts as a
         // foreground finish.
         let outcome = outcome.or_else(|| spawned.result.try_recv().ok());
@@ -8009,6 +8018,58 @@ mod tests {
             info.status,
             JobStatus::Killed,
             "the promoted job should be killed at its timeout: {completed:?}"
+        );
+    }
+
+    /// A longer foreground window put in force through the shared handle
+    /// keeps a command that outlasts the normal window in the foreground, and
+    /// the normal window applies again once it is restored.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_longer_foreground_window_holds_until_restored() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let wait = tool.foreground_wait();
+        let run = || async {
+            let result = tool
+                .call(
+                    TerminalArgs {
+                        description: "outlast the normal window".to_string(),
+                        script: "sleep 2 & wait; echo finished".to_string(),
+                        mode: TerminalExecutionMode::Sandboxed,
+                        ssh_server_id: None,
+                        expect: OutputFormat::Text,
+                        resolution: MediaResolution::Auto,
+                        max_lines: 50,
+                        raw: false,
+                        timeout: 30,
+                        background: false,
+                    },
+                    ToolContext::new(),
+                )
+                .await
+                .expect("terminal call should succeed");
+            render_terminal_result(&result)
+        };
+
+        wait.extend(Duration::from_secs(20));
+        let during = run().await;
+        assert!(
+            during.contains("finished") && !during.contains("Started in background"),
+            "the longer window keeps the command in the foreground: {during}"
+        );
+
+        wait.restore();
+        let after = run().await;
+        assert!(
+            after.contains("Started in background as task '"),
+            "the normal window applies again: {after}"
         );
     }
 

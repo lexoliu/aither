@@ -49,6 +49,7 @@ pub mod external_hook;
 mod fork;
 mod fs_util;
 mod hook;
+mod host_load;
 #[cfg(test)]
 mod idle_compaction_tests;
 #[cfg(feature = "languages")]
@@ -116,6 +117,10 @@ pub use fork::{ForkSnapshot, ForkSource};
 pub use hook::{
     CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction, StopContext,
     StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
+};
+pub use host_load::{
+    AnyHostReader, HostLoadConfig, HostLoadEvent, HostLoadMonitor, HostReader, HostSample,
+    MachineLoad, MemoryPressure, ReadError, SystemReader,
 };
 #[cfg(feature = "languages")]
 pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};

@@ -73,6 +73,7 @@ pub struct AgentBuilder<
     connectivity: crate::connectivity::Watch,
     background_receiver: Option<BackgroundTaskReceiver>,
     permission_receiver: Option<PermissionEventReceiver>,
+    host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
     job_registry: Option<JobRegistry>,
     context_sources: Vec<AnyContextSource>,
     /// Directory whose working documents (`tasks.md`) the agent supervises:
@@ -132,6 +133,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             connectivity: crate::connectivity::Watch::default(),
             background_receiver: None,
             permission_receiver: None,
+            host_load_events: None,
             job_registry: None,
             context_sources: Vec::new(),
             sandbox_dir: None,
@@ -177,6 +179,7 @@ where
             connectivity: self.connectivity,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
+            host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
@@ -213,6 +216,7 @@ where
             connectivity: self.connectivity,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
+            host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
@@ -253,6 +257,7 @@ where
             connectivity: self.connectivity,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
+            host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
@@ -432,6 +437,7 @@ where
             connectivity: self.connectivity,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
+            host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
             sandbox_dir: self.sandbox_dir,
@@ -768,6 +774,33 @@ where
         self
     }
 
+    /// Starts a [`HostLoadMonitor`](crate::HostLoadMonitor) on `executor` and
+    /// tells the agent, once per event, when host memory pressure or machine
+    /// load becomes high and when it ends.
+    ///
+    /// The monitor lengthens `foreground_wait` while high load lasts and runs
+    /// until the agent is dropped. It reads the builder's [`clock`](Self::clock),
+    /// so set the clock first.
+    pub fn host_load<R, E>(
+        mut self,
+        executor: &E,
+        reader: R,
+        config: crate::HostLoadConfig,
+        foreground_wait: aither_sandbox::ForegroundWait,
+    ) -> Self
+    where
+        R: crate::HostReader,
+        E: executor_core::Executor,
+    {
+        let monitor = crate::HostLoadMonitor::new(reader, config, foreground_wait);
+        self.host_load_events = Some(crate::host_load::spawn(
+            executor,
+            monitor,
+            self.clock.clone(),
+        ));
+        self
+    }
+
     /// Connects the agent to an external background-task channel pair.
     ///
     /// [`terminal`](Self::terminal) and [`dyn_terminal`](Self::dyn_terminal)
@@ -825,6 +858,7 @@ where
             profile: self.inherited.and_then(|inherited| inherited.profile),
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
+            host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             detached_task_ids: std::collections::HashSet::new(),
             sandbox_dir: self.sandbox_dir,

@@ -170,9 +170,28 @@ where
     registry_builder: ToolRegistryBuilder,
     tool_descriptions: Vec<(String, String)>,
     skills: Vec<SkillInfo>,
+    host_load: HostLoadSetup,
     #[cfg(feature = "skills")]
     skill_registry: Option<SkillRegistry>,
     state: PhantomData<S>,
+}
+
+/// How the built agent watches the host's memory pressure and load.
+struct HostLoadSetup {
+    enabled: bool,
+    config: crate::HostLoadConfig,
+    /// The reader to watch; the host's own when unset.
+    reader: Option<crate::AnyHostReader>,
+}
+
+impl Default for HostLoadSetup {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            config: crate::HostLoadConfig::default(),
+            reader: None,
+        }
+    }
 }
 
 impl<LLM, P, E, H, S> std::fmt::Debug for TerminalAgentBuilder<LLM, P, E, H, S>
@@ -228,6 +247,7 @@ where
             registry_builder,
             tool_descriptions,
             skills: Vec::new(),
+            host_load: HostLoadSetup::default(),
             #[cfg(feature = "skills")]
             skill_registry: None,
             state: PhantomData,
@@ -253,6 +273,7 @@ where
             registry_builder: self.registry_builder,
             tool_descriptions: self.tool_descriptions,
             skills: self.skills,
+            host_load: self.host_load,
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
             state: PhantomData,
@@ -851,6 +872,32 @@ where
         self
     }
 
+    /// Sets when host memory pressure and machine load count as high, how
+    /// long they must hold to start and to end, how often the host is read,
+    /// and the terminal's foreground window while high load lasts.
+    ///
+    /// The built agent is told once when each condition starts and once when
+    /// it ends; see [`HostLoadMonitor`](crate::HostLoadMonitor).
+    #[must_use]
+    pub const fn host_load(mut self, config: crate::HostLoadConfig) -> Self {
+        self.host_load.config = config;
+        self
+    }
+
+    /// Reads the host through `reader` instead of the platform's own.
+    #[must_use]
+    pub fn host_reader(mut self, reader: impl crate::HostReader) -> Self {
+        self.host_load.reader = Some(crate::AnyHostReader::new(reader));
+        self
+    }
+
+    /// Does not watch the host's memory pressure or machine load.
+    #[must_use]
+    pub const fn without_host_load(mut self) -> Self {
+        self.host_load.enabled = false;
+        self
+    }
+
     /// Ends a provider response stream in flight when the machine wakes from
     /// sleep or loses its network, and has the terminal state the sleep and
     /// offline intervals each command ran through.
@@ -957,6 +1004,28 @@ where
                     .render()
                     .expect("failed to render knowledge_and_time template"),
             )
+        };
+        let host_load = self.host_load;
+        let reader = host_load
+            .enabled
+            .then_some(host_load.reader)
+            .flatten()
+            .or_else(|| {
+                host_load.enabled.then(|| {
+                    crate::SystemReader::new()
+                        .inspect_err(|error| tracing::warn!(%error, "host load is not watched"))
+                        .ok()
+                        .map(crate::AnyHostReader::new)
+                })?
+            });
+        let inner = match reader {
+            Some(reader) => inner.host_load(
+                terminal_tool.executor(),
+                reader,
+                host_load.config,
+                terminal_tool.foreground_wait(),
+            ),
+            None => inner,
         };
         let inner = inner
             .terminal(terminal_tool.clone())
