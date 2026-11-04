@@ -88,6 +88,11 @@ pub struct AgentConfig {
     /// What a run does with background commands still running when the
     /// model ends its turn.
     pub background_jobs: BackgroundJobPolicy,
+
+    /// The communication and working languages, enforced on questions,
+    /// replies and records. `None` enforces nothing.
+    #[cfg(feature = "languages")]
+    pub languages: Option<crate::LanguageGuard>,
 }
 
 impl Default for AgentConfig {
@@ -102,6 +107,8 @@ impl Default for AgentConfig {
             request_parameters: Parameters::default(),
             cache_keep_alive: None,
             background_jobs: BackgroundJobPolicy::default(),
+            #[cfg(feature = "languages")]
+            languages: None,
         }
     }
 }
@@ -172,6 +179,14 @@ impl AgentConfig {
     #[must_use]
     pub fn with_request_parameters(mut self, parameters: Parameters) -> Self {
         self.request_parameters = parameters;
+        self
+    }
+
+    /// Enforces the languages `guard` holds.
+    #[cfg(feature = "languages")]
+    #[must_use]
+    pub fn with_languages(mut self, guard: crate::LanguageGuard) -> Self {
+        self.languages = Some(guard);
         self
     }
 

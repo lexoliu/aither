@@ -1,0 +1,2 @@
+{{ head }}
+[output cut: {{ bytes }} bytes in all, moved to {{ path }} (absolute path: {{ absolute_path }}); read the file for the rest]
