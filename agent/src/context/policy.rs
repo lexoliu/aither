@@ -76,6 +76,15 @@ pub struct ContextPolicy {
     /// and the handoff it produces.
     pub safe_buffer: usize,
 
+    /// Tokens before the auto-compact point at which the model is told once
+    /// to save its work and call `compact` itself.
+    ///
+    /// Larger than [`start_distance`](Self::start_distance), so the model has
+    /// the turns in between to reach a clean point before the harness forks a
+    /// compaction of its own. Only an agent with the `compact` tool raises
+    /// the alert.
+    pub warn_distance: usize,
+
     /// Fraction of the window a restored-context block may occupy.
     ///
     /// After compaction the agent re-reads the files and documents the
@@ -116,6 +125,7 @@ impl Default for ContextPolicy {
             compact_ceiling: 400_000,
             start_distance: 50_000,
             safe_buffer: 5_000,
+            warn_distance: 80_000,
             restore_budget: 0.15,
             idle_compact_before_expiry: Duration::from_secs(6 * 60),
             compaction_floor: 20_000,
@@ -146,6 +156,21 @@ impl ContextPolicy {
     pub fn start_point(&self, window: u32) -> usize {
         self.compact_point(window)
             .saturating_sub(self.start_distance)
+    }
+
+    /// The token count at which the model is told to save its work and call
+    /// `compact`.
+    #[must_use]
+    pub fn warn_point(&self, window: u32) -> usize {
+        self.compact_point(window)
+            .saturating_sub(self.warn_distance)
+    }
+
+    /// Whether the window holds enough to warn the model of the coming
+    /// compaction. A window of unknown size never warns.
+    #[must_use]
+    pub fn should_warn(&self, tokens: usize, window: u32) -> bool {
+        window > 0 && tokens >= self.warn_point(window)
     }
 
     /// The token count at which the loop waits for compaction.
@@ -225,6 +250,7 @@ mod tests {
     fn default_points_are_ordered() {
         let policy = ContextPolicy::default();
         for window in [100_000, 200_000, 1_000_000] {
+            assert!(policy.warn_point(window) < policy.start_point(window));
             assert!(policy.start_point(window) < policy.pause_point(window));
             assert!(policy.pause_point(window) < policy.compact_point(window));
         }

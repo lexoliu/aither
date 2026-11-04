@@ -304,6 +304,19 @@ pub struct CompactResult {
     pub summary: String,
 }
 
+/// Whether the pre-compaction alert may still be raised.
+///
+/// The alert is one-shot per approach: it is raised when usage crosses the
+/// warning point and not again until usage has fallen back below it, which
+/// only a compaction does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionWarning {
+    /// Usage has not crossed the warning point since it last fell below it.
+    Armed,
+    /// The crossing already happened; nothing raises the alert again.
+    Raised,
+}
+
 /// Prompt-cache keep-alive bookkeeping for one run.
 ///
 /// The entry's lifetime is the conversation's [`CacheLifetime`], counted
@@ -337,6 +350,12 @@ impl CacheKeepAliveState {
 struct EmittedCheckpoint {
     phase: ContextWindowPhase,
     message_count: usize,
+}
+
+#[derive(Template)]
+#[template(path = "precompaction_alert.txt", escape = "none")]
+struct PreCompactionAlertTemplate {
+    remaining_tokens: usize,
 }
 
 #[derive(Template)]
@@ -697,6 +716,14 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// subagent kind to start from; `None` when no fork reads this agent.
     pub(crate) fork_source: Option<crate::fork::ForkSource>,
 
+    /// What the `compact` tool shares with this agent; `None` without the
+    /// tool, which also means no pre-compaction alert is worth raising.
+    pub(crate) compact_signal: Option<Arc<crate::compact_tool::CompactSignal>>,
+
+    /// Whether the pre-compaction alert has been raised for the current
+    /// approach to the auto-compact point.
+    pub(crate) compaction_warning: CompactionWarning,
+
     /// The agent every tool call of this loop is made by.
     pub(crate) identity: aither_core::llm::AgentIdentity,
 
@@ -772,6 +799,8 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
             fork_source: None,
+            compact_signal: None,
+            compaction_warning: CompactionWarning::Armed,
             identity: aither_core::llm::AgentIdentity::Main,
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
@@ -1232,6 +1261,13 @@ where
         turn: usize,
         events: &EventSink,
     ) {
+        if let Some(signal) = &self.compact_signal
+            && tool_calls
+                .iter()
+                .any(|call| call.name != crate::compact_tool::COMPACT_TOOL_NAME)
+        {
+            signal.acted();
+        }
         let permission_receiver = self.permission_receiver.clone();
         let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(tool_calls);
         let message_count = self.context.len_recent();
@@ -2281,6 +2317,9 @@ where
         self.context.apply_handoff(&handoff, fork_point);
         self.reassembled = true;
         self.compaction_failure = None;
+        if let Some(signal) = &self.compact_signal {
+            signal.landed();
+        }
         tracing::info!(
             fork_point,
             kept = self.context.len_recent(),
@@ -2727,10 +2766,21 @@ where
         self.budget
             .observe_assembled(request_chars(&messages, &definitions));
 
-        if self
-            .config
-            .context_policy
-            .should_compact(self.budget.estimated_tokens(), self.budget.window())
+        self.sync_compact_signal();
+        if self.raise_precompaction_alert() {
+            messages = self.context.build_request(&tail);
+            self.budget
+                .observe_assembled(request_chars(&messages, &definitions));
+        }
+        let requested = self
+            .compact_signal
+            .as_ref()
+            .is_some_and(|signal| signal.take_request());
+        if (requested
+            || self
+                .config
+                .context_policy
+                .should_compact(self.budget.estimated_tokens(), self.budget.window()))
             && !self.compaction.is_active()
         {
             let fork_request = LLMRequest::new(messages.clone())
@@ -2777,6 +2827,7 @@ where
             }
         }
 
+        self.sync_compact_signal();
         self.commit_tail(&tail).await;
         self.warmth.start_entry_now();
         self.idle_compacted = false;
@@ -2793,6 +2844,63 @@ where
             .with_tool_definitions(definitions);
         self.last_request = Some(request.clone());
         Ok(Some(request))
+    }
+
+    /// Whether a compaction is running or waiting to be applied.
+    const fn compaction_in_flight(&self) -> bool {
+        self.compaction.is_active()
+    }
+
+    /// Tells the `compact` tool whether a compaction is in flight and how
+    /// much the context holds against the policy's floor, so a call that is
+    /// not worth a compaction starts nothing.
+    fn sync_compact_signal(&self) {
+        if let Some(signal) = &self.compact_signal {
+            signal.sync(
+                self.compaction_in_flight(),
+                self.budget.estimated_tokens(),
+                self.config.context_policy.compaction_floor,
+            );
+        }
+    }
+
+    /// Pushes the pre-compaction alert when usage first comes within
+    /// [`ContextPolicy::warn_distance`] of the auto-compact point, and
+    /// returns whether it did.
+    ///
+    /// The alert is one-shot: it is raised on the crossing and not again
+    /// until usage has fallen back below the warning point, which only a
+    /// compaction does. It is a durable alert appended to the conversation,
+    /// so the cached prefix is untouched, and it is not raised when a
+    /// compaction is already in flight or the agent has no `compact` tool to
+    /// point the model at.
+    ///
+    /// [`ContextPolicy::warn_distance`]: crate::ContextPolicy::warn_distance
+    fn raise_precompaction_alert(&mut self) -> bool {
+        if self.compact_signal.is_none() {
+            return false;
+        }
+        let policy = self.config.context_policy;
+        let tokens = self.budget.estimated_tokens();
+        let window = self.budget.window();
+        if !policy.should_warn(tokens, window) {
+            self.compaction_warning = CompactionWarning::Armed;
+            return false;
+        }
+        if self.compaction_warning == CompactionWarning::Raised {
+            return false;
+        }
+        self.compaction_warning = CompactionWarning::Raised;
+        if self.compaction_in_flight() {
+            return false;
+        }
+        let alert = PreCompactionAlertTemplate {
+            remaining_tokens: policy.compact_point(window).saturating_sub(tokens),
+        }
+        .render()
+        .expect("pre-compaction alert template must render");
+        self.push_system_alert(alert);
+        true
     }
 
     /// Publishes the request about to be sent for a fork to start from.
@@ -5992,6 +6100,279 @@ mod tests {
             .await
             .expect("the completion is still there for the next wait");
         assert!(wake.needs_model);
+    }
+
+    /// An agent with the `compact` tool on a 1M window, and the tool itself.
+    fn agent_with_compact_tool(
+        llm: &ScriptedLlm,
+    ) -> (Agent<ScriptedLlm>, crate::compact_tool::CompactTool) {
+        agent_with_compact_tool_under(
+            llm,
+            crate::ContextPolicy {
+                compaction_floor: 0,
+                ..crate::ContextPolicy::default()
+            },
+        )
+    }
+
+    /// The same under `policy`.
+    fn agent_with_compact_tool_under(
+        llm: &ScriptedLlm,
+        policy: crate::ContextPolicy,
+    ) -> (Agent<ScriptedLlm>, crate::compact_tool::CompactTool) {
+        let agent = Agent::builder(llm.clone())
+            .context_policy(policy)
+            .compact_tool()
+            .build();
+        let signal = Arc::clone(
+            agent
+                .compact_signal
+                .as_ref()
+                .expect("compact_tool arms the signal"),
+        );
+        (agent, crate::compact_tool::CompactTool::new(signal))
+    }
+
+    async fn call_compact(tool: &crate::compact_tool::CompactTool) -> String {
+        let result = aither_core::llm::Tool::call(
+            tool,
+            crate::CompactArgs::default(),
+            aither_core::llm::ToolContext::new(),
+        )
+        .await
+        .expect("compact returns at once");
+        let aither_core::llm::ToolResult::Text { text } = result else {
+            panic!("compact answers in text: {result:?}");
+        };
+        text
+    }
+
+    /// Calling `compact` starts the compaction at the next request boundary
+    /// without blocking the turn, and the handoff applies at a later one.
+    #[tokio::test]
+    async fn the_compact_tool_starts_a_compaction_and_it_applies_at_a_later_boundary() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let (mut agent, tool) = agent_with_compact_tool(&llm);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("work on it"));
+
+        let answer = call_compact(&tool).await;
+        assert!(answer.contains("Compaction started"), "{answer}");
+        assert!(
+            !agent.compaction.is_active(),
+            "the tool itself starts nothing"
+        );
+
+        let request = agent.prepare_request().await.expect("request boundary");
+        assert!(request.is_some(), "the turn is not held back");
+        assert!(agent.compaction.is_running(), "the fork started");
+        assert!(llm.recorded().is_empty(), "nothing waited for it");
+
+        // The compaction lands while turns run; the next boundary applies it.
+        let mut pending = agent.compaction.take_running().expect("in flight");
+        let fork_point = pending.fork_point();
+        let handoff = pending.wait().await.expect("handoff");
+        agent.compaction.land(fork_point, handoff);
+        assert!(agent.context().handoff().is_none());
+        agent.prepare_request().await.expect("later boundary");
+        assert!(agent.context().handoff().is_some());
+    }
+
+    /// A call after a compaction completed with no new action since starts
+    /// nothing and says so; any other tool call re-opens the valve.
+    #[tokio::test]
+    async fn a_compact_call_after_a_completed_compaction_with_no_action_starts_nothing() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let (mut agent, tool) = agent_with_compact_tool(&llm);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("work on it"));
+        assert!(call_compact(&tool).await.contains("Compaction started"));
+        agent.prepare_request().await.expect("request boundary");
+        let mut pending = agent.compaction.take_running().expect("in flight");
+        let fork_point = pending.fork_point();
+        let handoff = pending.wait().await.expect("handoff");
+        agent.compaction.land(fork_point, handoff);
+        agent.prepare_request().await.expect("later boundary");
+        assert!(agent.context().handoff().is_some(), "the compaction landed");
+
+        let answer = call_compact(&tool).await;
+        assert!(answer.contains("nothing has been done since"), "{answer}");
+        agent.prepare_request().await.expect("next boundary");
+        assert!(!agent.compaction.is_active(), "nothing was started");
+
+        // The model acts: the valve opens again.
+        let (sender, _events) = async_channel::unbounded();
+        let sink = EventSink { sender };
+        let call = ToolCall::new("call-1", "terminal", serde_json::json!({}));
+        agent.execute_tool_calls(&[call], 1, &sink).await;
+        assert!(call_compact(&tool).await.contains("Compaction started"));
+    }
+
+    /// A context under the policy floor starts nothing and names the floor;
+    /// one at the floor starts a compaction. The floor is the agent's own.
+    #[tokio::test]
+    async fn a_compact_call_under_the_floor_starts_nothing() {
+        let policy = crate::ContextPolicy {
+            compaction_floor: 30_000,
+            ..crate::ContextPolicy::default()
+        };
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let (mut agent, tool) = agent_with_compact_tool_under(&llm, policy);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("work on it"));
+        agent.prepare_request().await.expect("request boundary");
+
+        let answer = call_compact(&tool).await;
+        assert!(answer.contains("fewer than 30000 tokens"), "{answer}");
+        agent.prepare_request().await.expect("next boundary");
+        assert!(!agent.compaction.is_active(), "nothing was started");
+
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let (mut agent, tool) = agent_with_compact_tool_under(&llm, policy);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("u".repeat(4 * 60_000)));
+        agent.prepare_request().await.expect("request boundary");
+        assert!(call_compact(&tool).await.contains("Compaction started"));
+        agent.prepare_request().await.expect("next boundary");
+        assert!(agent.compaction.is_running(), "the fork started");
+    }
+
+    /// A second call while a compaction is requested or running starts
+    /// nothing.
+    #[tokio::test]
+    async fn a_second_compact_call_starts_nothing() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let (mut agent, tool) = agent_with_compact_tool(&llm);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("work on it"));
+
+        assert!(call_compact(&tool).await.contains("Compaction started"));
+        assert!(
+            call_compact(&tool).await.contains("already in flight"),
+            "requested twice before the boundary"
+        );
+        agent.prepare_request().await.expect("request boundary");
+        let fork_point = agent
+            .compaction
+            .take_running()
+            .map(|pending| {
+                let fork_point = pending.fork_point();
+                agent.compaction.resume(Some(pending));
+                fork_point
+            })
+            .expect("one compaction");
+
+        agent.push_message(Message::user("more work"));
+        assert!(call_compact(&tool).await.contains("already in flight"));
+        agent.prepare_request().await.expect("next boundary");
+        let still = agent.compaction.take_running().expect("still the first");
+        assert_eq!(
+            still.fork_point(),
+            fork_point,
+            "no second compaction replaced it"
+        );
+    }
+
+    /// A compaction the harness forked on its own counts as in flight too.
+    #[tokio::test]
+    async fn a_compact_call_during_an_automatic_compaction_starts_nothing() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let (mut agent, tool) = agent_with_compact_tool(&llm);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("u".repeat(4 * 360_000)));
+        agent.prepare_request().await.expect("request boundary");
+        assert!(agent.compaction.is_running());
+
+        assert!(call_compact(&tool).await.contains("already in flight"));
+    }
+
+    fn count_alerts(agent: &Agent<ScriptedLlm>) -> usize {
+        agent
+            .context()
+            .recent()
+            .iter()
+            .filter(|message| {
+                message.role() == aither_core::llm::Role::System
+                    && message.content().contains("`compact`")
+                    && message.content().contains("`tasks.md`")
+                    && message.content().contains("notes")
+            })
+            .count()
+    }
+
+    /// Crossing the warning distance yields exactly one alert naming
+    /// `compact` and `tasks.md`; crossing again after a compaction brought
+    /// usage back down yields one more.
+    #[tokio::test]
+    async fn crossing_the_warning_distance_raises_one_alert() {
+        let llm = ScriptedLlm::new(1_000_000, []);
+        let (mut agent, _tool) = agent_with_compact_tool(&llm);
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        // 330k tokens: past the warning point (320k), short of the fork (350k).
+        agent.push_message(Message::user("u".repeat(4 * 330_000)));
+        agent.prepare_request().await.expect("request boundary");
+        assert_eq!(count_alerts(&agent), 1);
+        assert!(!agent.compaction.is_active(), "the alert only asks");
+
+        agent.push_message(Message::user("more"));
+        agent.prepare_request().await.expect("next boundary");
+        agent.prepare_request().await.expect("and again");
+        assert_eq!(count_alerts(&agent), 1, "one-shot");
+
+        // A compaction shrinks the window; the next approach warns again.
+        agent.context.clear_history();
+        agent.prepare_request().await.expect("below the point");
+        assert_eq!(count_alerts(&agent), 0);
+        agent.push_message(Message::user("u".repeat(4 * 330_000)));
+        agent.prepare_request().await.expect("second approach");
+        assert_eq!(count_alerts(&agent), 1);
+    }
+
+    /// The alert is raised before the request is built, so it is part of the
+    /// request that crossed the point, and it appends to the window.
+    #[tokio::test]
+    async fn the_alert_reaches_the_request_that_crossed_the_point() {
+        let llm = ScriptedLlm::new(1_000_000, []);
+        let (mut agent, _tool) = agent_with_compact_tool(&llm);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("u".repeat(4 * 330_000)));
+
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request");
+
+        assert!(
+            request
+                .messages()
+                .last()
+                .expect("messages")
+                .content()
+                .contains("`compact`")
+                || request
+                    .messages()
+                    .iter()
+                    .any(|message| message.content().contains("`compact`")),
+        );
+    }
+
+    /// Without the tool there is nothing to point the model at.
+    #[tokio::test]
+    async fn no_alert_without_the_compact_tool() {
+        let llm = ScriptedLlm::new(1_000_000, []);
+        let mut agent = Agent::new(llm.clone());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("u".repeat(4 * 330_000)));
+        agent.prepare_request().await.expect("request boundary");
+        assert!(
+            agent
+                .context()
+                .recent()
+                .iter()
+                .all(|message| !message.content().contains("`compact`"))
+        );
     }
 
     /// A model that replays one scripted event list per request and records

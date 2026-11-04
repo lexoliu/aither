@@ -87,6 +87,8 @@ pub struct AgentBuilder<
     restore_dir: Option<std::path::PathBuf>,
     /// Where the built agent publishes each request for a fork to start from.
     fork_source: Option<crate::fork::ForkSource>,
+    /// What the `compact` tool shares with the built agent, once registered.
+    compact_signal: Option<std::sync::Arc<crate::compact_tool::CompactSignal>>,
     /// Who the built agent's tool calls are made by.
     identity: aither_core::llm::AgentIdentity,
     /// The window state a fork inherits, which replaces initialization.
@@ -140,6 +142,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             blocker_resolver: None,
             restore_dir: None,
             fork_source: None,
+            compact_signal: None,
             identity: aither_core::llm::AgentIdentity::Main,
             inherited: None,
             #[cfg(feature = "skills")]
@@ -186,6 +189,7 @@ where
             blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
+            compact_signal: self.compact_signal,
             identity: self.identity,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
@@ -223,6 +227,7 @@ where
             blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
+            compact_signal: self.compact_signal,
             identity: self.identity,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
@@ -264,6 +269,7 @@ where
             blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
+            compact_signal: self.compact_signal,
             identity: self.identity,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
@@ -348,6 +354,24 @@ where
         self.sandbox_dir = Some(dyn_tool.working_dir().clone());
         self.tools.register_dyn_terminal(dyn_tool);
         self
+    }
+
+    /// Registers the native `compact` tool and arms the pre-compaction alert.
+    ///
+    /// The model calls `compact` to start an asynchronous compaction at the
+    /// next request boundary, through the same fork and apply path as
+    /// automatic compaction; the call returns at once. When usage comes
+    /// within [`ContextPolicy::warn_distance`](crate::ContextPolicy::warn_distance)
+    /// of the auto-compact point, one alert tells the model to save its work,
+    /// bring its `tasks.md` up to date and call `compact` itself.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a tool named `compact` is already registered.
+    pub fn compact_tool(mut self) -> Self {
+        let signal = std::sync::Arc::new(crate::compact_tool::CompactSignal::default());
+        self.compact_signal = Some(std::sync::Arc::clone(&signal));
+        self.tool(crate::compact_tool::CompactTool::new(signal))
     }
 
     /// Sets the identity every tool call of the built agent carries as the
@@ -444,6 +468,7 @@ where
             blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
+            compact_signal: self.compact_signal,
             identity: self.identity,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
@@ -864,6 +889,8 @@ where
             blocker_resolver: self.blocker_resolver.clone(),
             restore_dir: self.restore_dir,
             fork_source: self.fork_source,
+            compact_signal: self.compact_signal,
+            compaction_warning: crate::agent::CompactionWarning::Armed,
             identity: self.identity,
             connectivity: self.connectivity,
             last_request: None,

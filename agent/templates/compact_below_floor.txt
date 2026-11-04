@@ -1,0 +1,1 @@
+Nothing was started: the context holds fewer than {{ floor }} tokens, too little for compaction to pay off. Carry on with the work.

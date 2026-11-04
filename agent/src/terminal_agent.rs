@@ -216,8 +216,9 @@ where
 {
     /// Creates a new terminal-first agent builder.
     ///
-    /// Creates the agent with native tools (`terminal`, `terminal_kill`,
-    /// `terminal_input`, `terminal_read`) and IPC commands accessible through
+    /// Creates the agent with native tools (`terminal`, `monitor`,
+    /// `terminal_kill`, `terminal_input`, `terminal_read`, `compact`) and IPC
+    /// commands accessible through
     /// `terminal` (registered via `.tool()`). The native control tools address
     /// the same background jobs as `terminal` and are not advertised as commands.
     pub fn new(llm: LLM, mut terminal_tool: TerminalTool<P, E, Unconfigured>) -> Self {
@@ -239,7 +240,8 @@ where
         let inner = AgentBuilder::new(llm)
             .tool(kill_terminal_tool)
             .tool(input_terminal_tool)
-            .tool(read_terminal_delta_tool);
+            .tool(read_terminal_delta_tool)
+            .compact_tool();
 
         Self {
             inner,
@@ -1692,6 +1694,7 @@ mod tests {
         assert_eq!(
             tool_names,
             [
+                "compact",
                 "monitor",
                 "terminal",
                 "terminal_input",
@@ -1712,6 +1715,7 @@ mod tests {
                 .map(ToolDefinition::name)
                 .collect::<Vec<_>>(),
             vec![
+                "compact",
                 "monitor",
                 "terminal",
                 "terminal_input",

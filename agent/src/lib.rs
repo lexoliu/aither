@@ -39,6 +39,7 @@ mod cache_stats;
 mod call_identity_tests;
 mod checkpoint;
 mod clock;
+mod compact_tool;
 mod compaction_state;
 mod config;
 mod connectivity;
@@ -98,6 +99,7 @@ pub use builder::AgentBuilder;
 pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
 pub use clock::{AnyClock, Clock, Instant, ManualClock, SystemClock};
+pub use compact_tool::{CompactArgs, CompactSignal, CompactTool};
 pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy};
 #[cfg(feature = "skills")]
 pub use context::ActiveSkills;
