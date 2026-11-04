@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::tool_runtime::{ToolRuntimeError, ToolTarget, digest};
+use crate::tool_runtime::{ToolRuntimeError, ToolTarget, digest, run_installed};
 
 /// Name of the command that runs the managed interpreter.
 pub const PYTHON_COMMAND: &str = "python3";
@@ -173,17 +173,18 @@ impl PythonRuntime {
         set_mode(&uv, 0o500)?;
         let install_dir = scratch.join("python");
         std::fs::create_dir(&install_dir)?;
-        let output = std::process::Command::new(&uv)
-            .args(["python", "install", "--no-bin", "--no-config", "--no-cache"])
-            .arg(&request)
-            .env_clear()
-            .envs(
-                INSTALLER_NETWORK_ENVIRONMENT
-                    .iter()
-                    .filter_map(|name| Some((*name, std::env::var_os(name)?))),
-            )
-            .env("UV_PYTHON_INSTALL_DIR", &install_dir)
-            .output()?;
+        let output = run_installed(
+            std::process::Command::new(&uv)
+                .args(["python", "install", "--no-bin", "--no-config", "--no-cache"])
+                .arg(&request)
+                .env_clear()
+                .envs(
+                    INSTALLER_NETWORK_ENVIRONMENT
+                        .iter()
+                        .filter_map(|name| Some((*name, std::env::var_os(name)?))),
+                )
+                .env("UV_PYTHON_INSTALL_DIR", &install_dir),
+        )?;
         if !output.status.success() {
             return Err(ToolRuntimeError::PythonInstall {
                 status: output.status.code(),
