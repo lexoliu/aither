@@ -572,6 +572,33 @@ impl Context {
         before - self.items.len()
     }
 
+    /// The tool results holding more than `min_bytes` bytes.
+    pub(crate) fn long_tool_outputs(&self, min_bytes: usize) -> Vec<LongToolOutput> {
+        self.items
+            .iter()
+            .filter_map(|item| match &item.message {
+                Message::Tool {
+                    content,
+                    tool_call_id,
+                } if content.len() > min_bytes => Some(LongToolOutput {
+                    seq: item.seq,
+                    tool_call_id: tool_call_id.clone(),
+                    content: content.clone(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Replaces the content of the tool result numbered `seq`.
+    pub(crate) fn replace_tool_output(&mut self, seq: u64, replacement: String) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.seq == seq)
+            && let Message::Tool { content, .. } = &mut item.message
+        {
+            *content = replacement;
+        }
+    }
+
     /// Identifies tool results superseded by a later identical call (same
     /// tool name and arguments) or an identical later result.
     ///
@@ -647,6 +674,17 @@ impl Context {
         }
         (indices.len(), bytes)
     }
+}
+
+/// A tool result long enough to be moved out of the window.
+#[derive(Debug, Clone)]
+pub(crate) struct LongToolOutput {
+    /// The result's sequence number in the window.
+    pub(crate) seq: u64,
+    /// The call the result answers.
+    pub(crate) tool_call_id: String,
+    /// The full output.
+    pub(crate) content: String,
 }
 
 /// Outcome of a [`Context::reassemble`] pass.

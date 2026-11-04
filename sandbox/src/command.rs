@@ -35,7 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_core::llm::tool::ToolResultPart;
-use aither_core::llm::{IntoToolResult, Tool, ToolContext, ToolResult};
+use aither_core::llm::{CallIdentity, IntoToolResult, Tool, ToolContext, ToolResult};
 use askama::Template;
 use heel::IpcCommand;
 use heel::ipc::IpcError;
@@ -246,9 +246,14 @@ impl CommandEnvelope {
     }
 }
 
-/// Type-erased tool handler function.
+/// Type-erased tool handler function: the identity of the `terminal` call
+/// whose script invoked the command (`None` outside a terminal call), and the
+/// command's arguments.
 type ToolHandlerFn = Box<
-    dyn Fn(Vec<String>) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
+    dyn Fn(
+            Option<CallIdentity>,
+            Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -329,6 +334,9 @@ pub struct CommandCall<'a> {
     pub role: CommandRole,
     /// The resolved command name.
     pub name: &'a str,
+    /// The `terminal` call whose script invoked the command and the agent
+    /// that made it; `None` when the registry serves no terminal call.
+    pub call: Option<&'a CallIdentity>,
     /// The arguments the command was called with.
     pub args: &'a [String],
     /// What the call answered.
@@ -930,7 +938,10 @@ impl ToolRegistryBuilder {
     /// `Tool` implementations.
     pub fn configure_definition_handler<F>(&mut self, definition: &ToolDefinition, handler: F)
     where
-        F: Fn(Value) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
+        F: Fn(
+                Option<CallIdentity>,
+                Value,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
             + Send
             + Sync
             + 'static,
@@ -948,7 +959,10 @@ impl ToolRegistryBuilder {
         help: impl Into<String>,
         handler: F,
     ) where
-        F: Fn(Vec<String>) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
+        F: Fn(
+                Option<CallIdentity>,
+                Vec<String>,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
             + Send
             + Sync
             + 'static,
@@ -990,6 +1004,7 @@ impl ToolRegistryBuilder {
             role: CommandRole::Main,
             observer: self.observer,
             gate: self.gate,
+            call: None,
             committed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -1007,7 +1022,7 @@ where
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
     let name_for_errors = tool.name().to_string();
-    Box::new(move |args: Vec<String>| {
+    Box::new(move |identity: Option<CallIdentity>, args: Vec<String>| {
         let tool = tool.clone();
         let schema = schema.clone();
         let name = name_for_errors.clone();
@@ -1028,9 +1043,13 @@ where
                     return Err(tool_usage_error(message.as_str(), name.as_str()));
                 }
             };
-            // A shell invocation has nowhere to show progress.
+            // A shell invocation has nowhere to show progress, but the call
+            // whose script ran it is known.
+            let cx = identity.map_or_else(ToolContext::new, |identity| {
+                ToolContext::new().with_identity(identity)
+            });
             let output = tool
-                .call(parsed, ToolContext::new())
+                .call(parsed, cx)
                 .await
                 .map_err(|error| error.to_string())?;
             output
@@ -1064,7 +1083,10 @@ where
 /// Builds the registry entry for a schema-defined handler.
 fn definition_entry<F>(definition: &ToolDefinition, handler: F) -> (String, ToolEntry)
 where
-    F: Fn(Value) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
+    F: Fn(
+            Option<CallIdentity>,
+            Value,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -1086,21 +1108,22 @@ where
     let schema_for_handler = schema;
     let name_for_handler = name.clone();
     let handler = Arc::new(handler);
-    let raw_handler: ToolHandlerFn = Box::new(move |args: Vec<String>| {
-        let schema = schema_for_handler.clone();
-        let name = name_for_handler.clone();
-        let handler = handler.clone();
-        Box::pin(async move {
-            let json_args = match cli_to_json(&schema, &args) {
-                Ok(value) => value,
-                Err(error) => {
-                    let message = error.to_string();
-                    return Err(tool_usage_error(message.as_str(), name.as_str()));
-                }
-            };
-            handler(json_args).await
-        })
-    });
+    let raw_handler: ToolHandlerFn =
+        Box::new(move |identity: Option<CallIdentity>, args: Vec<String>| {
+            let schema = schema_for_handler.clone();
+            let name = name_for_handler.clone();
+            let handler = handler.clone();
+            Box::pin(async move {
+                let json_args = match cli_to_json(&schema, &args) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let message = error.to_string();
+                        return Err(tool_usage_error(message.as_str(), name.as_str()));
+                    }
+                };
+                handler(identity, json_args).await
+            })
+        });
 
     (
         name,
@@ -1124,6 +1147,9 @@ pub struct ToolRegistry {
     role: CommandRole,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
+    /// The `terminal` call this registry serves, once [`Self::for_call`] has
+    /// bound it to one.
+    call: Option<CallIdentity>,
     /// The worktrees this registry's terminals have granted commit to so
     /// far, in grant order: the git map the terminal's `git` shim reads.
     /// Shared across every bind and role of the session's registries.
@@ -1230,7 +1256,22 @@ impl ToolRegistry {
             role: CommandRole::Subagent,
             observer,
             gate,
+            call: None,
             committed: self.committed.clone(),
+        }
+    }
+
+    /// The registry that serves one `terminal` call: this registry's commands,
+    /// each handed `call` as the identity of the call whose script invoked it.
+    ///
+    /// The terminal builds one per call and serves its IPC channel from it, so
+    /// the identity a command sees is the one its channel was created for,
+    /// never one a script can name, and parallel calls stay distinct.
+    #[must_use]
+    pub fn for_call(&self, call: CallIdentity) -> Self {
+        Self {
+            call: Some(call),
+            ..self.clone()
         }
     }
 
@@ -1286,7 +1327,7 @@ impl ToolRegistry {
                 handler: Some(handler),
                 ..
             }) => {
-                let outcome = match handler(args.to_vec()).await {
+                let outcome = match handler(self.call.clone(), args.to_vec()).await {
                     Ok(output) => handle_large_output(output, &self.output_dir).await,
                     Err(error) => CommandEnvelope::failure(error),
                 };
@@ -1295,6 +1336,7 @@ impl ToolRegistry {
                         .command_called(&CommandCall {
                             role: self.role,
                             name: tool_name,
+                            call: self.call.as_ref(),
                             args,
                             outcome: &outcome,
                         })

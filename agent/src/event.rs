@@ -29,11 +29,12 @@ pub enum RunPauseReason {
     WorkspaceRequest,
     /// The context window is full and the run cannot continue.
     ///
-    /// Emitted when usage reaches
-    /// [`ContextPolicy::pause_at`](crate::ContextPolicy::pause_at) and no
-    /// compaction can relieve it: either none was in flight, or the one that
-    /// was failed. Sending the request anyway would have the provider reject
-    /// it for length, so the run stops with the reason named instead.
+    /// Emitted when usage reaches the
+    /// [pause point](crate::ContextPolicy::pause_point) and no compaction can
+    /// relieve it: there was nothing to compact, or the compaction landed and
+    /// the window is still full. Sending the request anyway would have the
+    /// provider reject it for length, so the run stops with the reason named
+    /// instead. A compaction that fails twice is an error, not this pause.
     ContextExhausted,
 }
 
@@ -50,6 +51,17 @@ pub enum AgentEvent {
 
     /// Text chunk from the LLM response.
     Text(String),
+
+    /// The reply just streamed was not in the communication language: show
+    /// this translation of it instead, marked as translated.
+    ///
+    /// The model's history keeps the original reply.
+    ReplyTranslated {
+        /// The reply translated into `language` by the fast model.
+        text: String,
+        /// The communication language's ISO 639-3 code.
+        language: String,
+    },
 
     /// Reasoning step (for models with extended thinking).
     Reasoning(String),

@@ -483,7 +483,7 @@ pub fn register_terminal_commands(
     for definition in &definitions {
         let tool_name = definition.name().to_string();
         let conn = conn.clone();
-        registry.configure_definition_handler(definition, move |arguments| {
+        registry.configure_definition_handler(definition, move |_call, arguments| {
             let conn = conn.clone();
             let tool_name = tool_name.clone();
             Box::pin(async move {

@@ -35,6 +35,8 @@ pub mod ask_user;
 mod browser_backend;
 mod builder;
 mod cache_stats;
+#[cfg(test)]
+mod call_identity_tests;
 mod checkpoint;
 mod clock;
 mod config;
@@ -50,6 +52,8 @@ mod hook;
 mod host_load;
 #[cfg(test)]
 mod idle_compaction_tests;
+#[cfg(feature = "languages")]
+pub mod language;
 mod model_group;
 mod output_urls;
 mod stream;
@@ -114,6 +118,8 @@ pub use host_load::{
     AnyHostReader, HostLoadConfig, HostLoadEvent, HostLoadMonitor, HostReader, HostSample,
     MachineLoad, MemoryPressure, ReadError, SystemReader,
 };
+#[cfg(feature = "languages")]
+pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
 pub use stream::AgentStream;
 pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};

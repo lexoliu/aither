@@ -439,7 +439,7 @@ fn render_fragment(path: &str, why: Option<&str>, content: &str, truncated: bool
 }
 
 /// Truncates to at most `limit` bytes without splitting a character.
-fn truncate_on_char_boundary(content: &str, limit: usize) -> String {
+pub(crate) fn truncate_on_char_boundary(content: &str, limit: usize) -> String {
     if content.len() <= limit {
         return content.to_string();
     }

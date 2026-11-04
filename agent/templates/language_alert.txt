@@ -1,0 +1,2 @@
+{% for alert in alerts %}{% if !loop.first %}
+{% endif %}{% match alert %}{% when LanguageAlert::AskAgain { language } %}Your question to the user was refused because it was not in {{ language }}. Ask it again in {{ language }}.{% when LanguageAlert::Reply { language } %}Your last reply to the user was not in {{ language }}. Return to {{ language }} at once, without restating what you said.{% when LanguageAlert::Record { language, document } %}Your change to {{ document }} is not in {{ language }}. Correct it at once.{% endmatch %}{% endfor %}
