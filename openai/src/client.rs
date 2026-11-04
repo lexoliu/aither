@@ -325,13 +325,6 @@ impl LanguageModel for OpenAI {
         };
 
         async_stream::stream! {
-            if parameters.cache.claude.is_some() || parameters.cache.gemini.is_some() {
-                yield Err(OpenAIError::Api(
-                    "OpenAI provider only accepts cache.openai settings".to_string(),
-                ));
-                return;
-            }
-
             if effective_api_kind == ApiKind::ChatCompletions
                 && messages.iter().flat_map(aither_core::llm::Message::attachments).any(|attachment| {
                     let media_type = attachment.media_type().as_ref();

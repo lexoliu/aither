@@ -1693,6 +1693,27 @@ mod tests {
     }
 
     #[test]
+    fn other_providers_cache_sections_do_not_hide_the_claude_breakpoints() {
+        let breakpoints = ClaudeExplicitCacheBreakpoints::new(ClaudeExplicitCacheBreakpoint::new(
+            ClaudeCacheBreakpointTarget::LastSystem,
+        ));
+        let mut params = Parameters::default()
+            .prompt_cache_key("session:alpha")
+            .prompt_cache_retention(aither_core::llm::model::OpenAIPromptCacheRetention::Hours24)
+            .gemini_cached_content("cachedContents/abc")
+            .claude_prompt_cache_explicit(ClaudePromptCacheTtl::OneHour, breakpoints);
+        params.structured_outputs = true;
+        let snapshot = ParameterSnapshot::from(&params);
+        assert_eq!(
+            snapshot.cache,
+            Some(ClaudePromptCache::explicit(
+                ClaudePromptCacheTtl::OneHour,
+                breakpoints
+            ))
+        );
+    }
+
+    #[test]
     fn cache_control_payload_serializes_expected_shape() {
         let one_hour =
             CacheControlPayload::from(ClaudePromptCache::new(ClaudePromptCacheTtl::OneHour));

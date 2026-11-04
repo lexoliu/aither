@@ -112,20 +112,14 @@ fn respond_stream(
 ///
 /// # Errors
 ///
-/// Returns [`GeminiError`] if the request carries another provider's cache
-/// settings, names an exact tool that was not supplied, or an attachment cannot
-/// be resolved.
+/// Returns [`GeminiError`] if the request names an exact tool that was not
+/// supplied, or an attachment cannot be resolved. Cache settings of other
+/// providers are ignored.
 async fn build_generate_request(
     cfg: &crate::config::GeminiConfig,
     request: LLMRequest,
 ) -> Result<GenerateContentRequest, GeminiError> {
     let (messages, parameters, tool_defs) = request.into_parts();
-
-    if parameters.cache.openai.is_some() || parameters.cache.claude.is_some() {
-        return Err(GeminiError::Api(
-            "Gemini provider only accepts cache.gemini settings".to_string(),
-        ));
-    }
 
     #[cfg(not(target_arch = "wasm32"))]
     let messages = crate::attachments::resolve_messages(cfg, messages).await?;

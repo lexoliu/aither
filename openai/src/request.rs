@@ -1598,6 +1598,22 @@ mod tests {
     }
 
     #[test]
+    fn other_providers_cache_sections_do_not_hide_the_openai_cache() {
+        let mut params = Parameters::default()
+            .prompt_cache_key("session:gamma")
+            .prompt_cache_retention(OpenAIPromptCacheRetention::Hours24)
+            .claude_prompt_cache_automatic(aither_core::llm::model::ClaudePromptCacheTtl::OneHour)
+            .gemini_cached_content("cachedContents/abc");
+        params.structured_outputs = true;
+        let snapshot = ParameterSnapshot::from(&params);
+        assert!(snapshot.structured_outputs);
+        let req = ChatCompletionRequest::new("gpt-5".into(), Vec::new(), &snapshot, None, false);
+        let value = serde_json::to_value(&req).expect("serialize chat request");
+        assert_eq!(value["prompt_cache_key"], "session:gamma");
+        assert_eq!(value["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
     fn chat_request_serializes_prompt_cache_fields() {
         let params = Parameters::default()
             .prompt_cache_key("session:beta")

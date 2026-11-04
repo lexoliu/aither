@@ -141,13 +141,6 @@ impl LanguageModel for Claude {
                     }
                 };
 
-            if parameters.cache.openai.is_some() || parameters.cache.gemini.is_some() {
-                yield Err(ClaudeError::Api(
-                    "Claude provider only accepts cache.claude settings".to_string(),
-                ));
-                return;
-            }
-
             if let Some(tool_name) = &missing_exact_tool {
                 yield Err(ClaudeError::Api(format!(
                     "Exact tool choice '{tool_name}' is not present in tool definitions"
