@@ -1028,17 +1028,11 @@ where
         let tool_calls = model_turn.tool_calls;
         ensure_non_empty_tool_call_ids(&tool_calls, &response_text)?;
 
+        self.commit_assistant_turn(&response_text, &tool_calls, model_turn.reasoning);
         if tool_calls.is_empty() {
             return self.finish_no_tool_turn(response_text, turn, events).await;
         }
 
-        // The reasoning has to travel with the turn that produced these calls,
-        // or the model receives their results without the thinking behind them.
-        self.context.push(Message::assistant_with_reasoning(
-            &response_text,
-            tool_calls.clone(),
-            model_turn.reasoning,
-        ));
         Self::push_tool_start_events(&tool_calls, events);
         self.execute_tool_calls(&tool_calls, turn, events).await;
         self.apply_tool_results(events)?;
@@ -1104,6 +1098,27 @@ where
         turn
     }
 
+    /// Stores what the model produced this turn: its text, calls and reasoning.
+    ///
+    /// The reasoning travels with the turn that produced it, or later requests
+    /// carry the calls and the answer without the thinking behind them. A turn
+    /// that produced nothing at all stores nothing.
+    fn commit_assistant_turn(
+        &mut self,
+        response_text: &str,
+        tool_calls: &[ToolCall],
+        reasoning: Vec<ReasoningState>,
+    ) {
+        if response_text.is_empty() && tool_calls.is_empty() && reasoning.is_empty() {
+            return;
+        }
+        self.context.push(Message::assistant_with_reasoning(
+            response_text,
+            tool_calls.to_vec(),
+            reasoning,
+        ));
+    }
+
     async fn finish_no_tool_turn(
         &mut self,
         response_text: String,
@@ -1111,7 +1126,6 @@ where
         events: &EventSink,
     ) -> Result<TurnControl, AgentError> {
         if !response_text.is_empty() {
-            self.context.push(Message::assistant(&response_text));
             #[cfg(feature = "languages")]
             self.enforce_reply_language(&response_text, events).await;
         }
@@ -5777,5 +5791,105 @@ mod tests {
             .await
             .expect("the completion is still there for the next wait");
         assert!(wake.needs_model);
+    }
+
+    /// A model that replays one scripted event list per request and records
+    /// the requests it receives.
+    #[derive(Clone)]
+    struct EventScriptLlm {
+        requests: Arc<std::sync::Mutex<Vec<LLMRequest>>>,
+        turns: Arc<std::sync::Mutex<std::collections::VecDeque<Vec<Event>>>>,
+    }
+
+    impl EventScriptLlm {
+        fn new(turns: impl IntoIterator<Item = Vec<Event>>) -> Self {
+            Self {
+                requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+                turns: Arc::new(std::sync::Mutex::new(turns.into_iter().collect())),
+            }
+        }
+    }
+
+    impl LanguageModel for EventScriptLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.requests.lock().expect("requests lock").push(request);
+            let events = self
+                .turns
+                .lock()
+                .expect("turns lock")
+                .pop_front()
+                .unwrap_or_default();
+            futures_lite::stream::iter(events.into_iter().map(Ok))
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                1_000_000,
+            )))
+        }
+    }
+
+    /// The assistant messages of the last request the model received.
+    fn replayed_assistants(llm: &EventScriptLlm) -> Vec<Message> {
+        llm.requests
+            .lock()
+            .expect("requests lock")
+            .last()
+            .expect("a request was sent")
+            .messages()
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant { .. }))
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_final_answer_keeps_its_reasoning_in_the_next_request() {
+        let thinking = ReasoningState::new("claude", "signed-thinking");
+        let llm = EventScriptLlm::new([
+            vec![
+                Event::ReasoningState(thinking.clone()),
+                Event::Text("the answer".to_string()),
+            ],
+            vec![Event::Text("done".to_string())],
+        ]);
+        let mut agent = Agent::new(llm.clone());
+
+        agent.query("first").await.expect("first run");
+        agent.query("second").await.expect("second run");
+
+        let assistants = replayed_assistants(&llm);
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0].content(), "the answer");
+        assert_eq!(assistants[0].reasoning(), [thinking]);
+    }
+
+    #[tokio::test]
+    async fn a_reasoning_only_turn_is_kept() {
+        let thinking = ReasoningState::new("openai", "encrypted-reasoning");
+        let llm = EventScriptLlm::new([
+            vec![Event::ReasoningState(thinking.clone())],
+            vec![Event::Text("done".to_string())],
+        ]);
+        let mut agent = Agent::new(llm.clone());
+
+        agent.query("first").await.expect("first run");
+        agent.query("second").await.expect("second run");
+
+        let assistants = replayed_assistants(&llm);
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0].content(), "");
+        assert_eq!(assistants[0].reasoning(), [thinking]);
     }
 }
