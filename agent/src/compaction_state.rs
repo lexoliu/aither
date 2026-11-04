@@ -64,6 +64,14 @@ impl CompactionState {
         });
     }
 
+    /// The finished compaction, if one waits, left in place.
+    pub const fn landed(&self) -> Option<&CompletedCompaction> {
+        match self {
+            Self::Landed(completed) => Some(completed),
+            _ => None,
+        }
+    }
+
     /// Takes the finished compaction, if one waits.
     pub fn take_landed(&mut self) -> Option<CompletedCompaction> {
         match std::mem::take(self) {

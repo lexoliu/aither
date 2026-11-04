@@ -2234,18 +2234,40 @@ where
     /// replacing everything below the fork point cannot strand a tool call
     /// from its result.
     async fn apply_completed_compaction(&mut self) {
-        let Some(CompletedCompaction {
-            fork_point,
-            handoff,
-        }) = self.compaction.take_landed()
-        else {
+        // The files are read while the completed compaction is still stored:
+        // a caller that drops this future during the read leaves it pending
+        // for the next boundary, with nothing half applied.
+        let Some(completed) = self.compaction.landed() else {
             return;
         };
+        let handoff = completed.handoff.clone();
+        let restored = match self.restore_dir.clone() {
+            Some(restore_dir) => {
+                let tokens = self
+                    .budget
+                    .fraction_tokens(self.config.context_policy.restore_budget);
+                let budget_chars = self.budget.chars_for_tokens(tokens);
+                #[cfg(feature = "skills")]
+                let skills = self.skill_catalog();
+                #[cfg(not(feature = "skills"))]
+                let skills = Vec::new();
+                restore_context(&handoff, &[restore_dir], &skills, budget_chars).await
+            }
+            None => None,
+        };
 
+        // From here to the hook there is no await: the handoff, the cleanup
+        // and the restored block commit together.
+        let Some(CompletedCompaction { fork_point, .. }) = self.compaction.take_landed() else {
+            return;
+        };
         // Compaction rewrites the cacheable prefix anyway, so this is where
         // staged system-block updates and superseded tool results fold in.
         self.context.reassemble_below(fork_point);
         self.context.apply_handoff(&handoff, fork_point);
+        if let Some(block) = restored {
+            self.context.push_block_alert(&block);
+        }
         self.reassembled = true;
         self.compaction_failure = None;
         if let Some(signal) = &self.compact_signal {
@@ -2261,22 +2283,6 @@ where
                 messages_remaining: self.context.len_recent(),
             })
             .await;
-
-        if let Some(restore_dir) = self.restore_dir.clone() {
-            let tokens = self
-                .budget
-                .fraction_tokens(self.config.context_policy.restore_budget);
-            let budget_chars = self.budget.chars_for_tokens(tokens);
-            #[cfg(feature = "skills")]
-            let skills = self.skill_catalog();
-            #[cfg(not(feature = "skills"))]
-            let skills = Vec::new();
-            if let Some(block) =
-                restore_context(&handoff, &[restore_dir], &skills, budget_chars).await
-            {
-                self.context.push_block_alert(&block);
-            }
-        }
     }
 
     /// Makes room at the pause point: waits for the compaction in flight and
@@ -4646,6 +4652,53 @@ mod tests {
         assert!(seen("hook context injected mid-turn"), "{text:?}");
         assert!(!seen("stale alert before the fork"), "{text:?}");
         assert!(!seen("before the fork"), "{text:?}");
+    }
+
+    /// Dropping the apply while it reads the files to restore commits
+    /// nothing: the compaction stays landed and the next boundary applies it
+    /// in full, restored files included.
+    #[tokio::test]
+    async fn dropping_the_apply_during_restoration_leaves_the_compaction_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "restored marker text").expect("write");
+        let mut agent = Agent::new(MockLlm {
+            context_length: 1_000_000,
+        });
+        agent.restore_dir = Some(dir.path().to_path_buf());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("before the fork"));
+        let fork_point = agent.context.fork_point();
+        agent.compaction.land(
+            fork_point,
+            HandoffDocument {
+                current_task: "keep going".to_string(),
+                context_files: vec![crate::context::ContextFile {
+                    path: "notes.txt".to_string(),
+                    lines: None,
+                    why: "needed".to_string(),
+                }],
+                ..HandoffDocument::default()
+            },
+        );
+
+        let dropped = futures_lite::future::poll_once(agent.apply_completed_compaction()).await;
+        assert!(dropped.is_none(), "the apply was waiting on the file read");
+        assert!(agent.context().handoff().is_none(), "nothing was committed");
+        assert!(agent.compaction.landed().is_some(), "still pending");
+
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after apply");
+        assert!(agent.context().handoff().is_some());
+        assert!(
+            request
+                .messages()
+                .iter()
+                .any(|m| m.content().contains("restored marker text")),
+            "the restored file reached the request"
+        );
     }
 
     /// The compaction request must be the main request's prefix verbatim,
