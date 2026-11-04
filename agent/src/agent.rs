@@ -673,6 +673,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// subagent kind to start from; `None` when no fork reads this agent.
     pub(crate) fork_source: Option<crate::fork::ForkSource>,
 
+    /// The agent every tool call of this loop is made by.
+    pub(crate) identity: aither_core::llm::AgentIdentity,
+
     /// Rolling KV-cache statistics accumulated from emitted `Usage` events.
     ///
     /// Hosts can read [`Agent::cache_stats`] at any time to observe the
@@ -744,6 +747,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
             fork_source: None,
+            identity: aither_core::llm::AgentIdentity::Main,
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -1132,12 +1136,17 @@ where
         let permission_receiver = self.permission_receiver.clone();
         let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(tool_calls);
         let message_count = self.context.len_recent();
-        let (hooks, tools) = (&self.hooks, &self.tools);
+        let (hooks, tools, agent) = (&self.hooks, &self.tools, &self.identity);
         let results = &mut self.tool_results;
         let tool_futures = tool_calls.iter().map(|call| {
             let args_json = call.arguments.to_string();
+            let identity = aither_core::llm::CallIdentity::new(
+                aither_core::llm::ToolCallId::new(call.id.clone()),
+                agent.clone(),
+            );
             async move {
                 let tool_ctx = ToolUseContext {
+                    call: &identity,
                     tool_name: &call.name,
                     arguments: &args_json,
                     turn,
@@ -1203,9 +1212,11 @@ where
             }
             PreToolAction::Allow => {
                 let start = Instant::now();
-                // The agent loop has nowhere to show a tool's progress.
+                // The agent loop has nowhere to show a tool's progress, but
+                // the tool learns which call, of which agent, it serves.
+                let cx = aither_core::llm::ToolContext::new().with_identity(tool_ctx.call.clone());
                 let result = tools
-                    .call(&call.name, args_json, aither_core::llm::ToolContext::new())
+                    .call(&call.name, args_json, cx)
                     .await
                     .unwrap_or_else(|error| {
                         let mut message = String::from("Error: ");

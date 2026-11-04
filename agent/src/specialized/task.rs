@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use aither_core::llm::ToolContext;
+use aither_core::llm::{AgentIdentity, CallIdentity, SubagentIdentity, ToolContext};
 use aither_core::{
     LanguageModel,
     llm::{Tool, ToolResult, oneshot},
@@ -1359,6 +1359,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         chosen: Option<ModelTier>,
         grant: SubagentGrant,
         prompt: &str,
+        started_by: Option<&CallIdentity>,
     ) -> anyhow::Result<(
         crate::Agent<LLM, LLM, LLM, SubagentHooks>,
         String,
@@ -1449,8 +1450,12 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             None => agent_builder,
         };
 
+        let identity = AgentIdentity::Subagent(SubagentIdentity::new(
+            subagent_id.clone(),
+            started_by.cloned(),
+        ));
         Ok((
-            agent_builder.hook(child_hooks).build(),
+            agent_builder.identity(identity).hook(child_hooks).build(),
             subagent_id,
             model,
             child_job_registry,
@@ -1466,6 +1471,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         &self,
         args: SubagentArgs,
         prompt: &str,
+        started_by: Option<&CallIdentity>,
     ) -> anyhow::Result<(FinishedSubagent<LLM>, Option<u64>)> {
         match args {
             SubagentArgs::Start {
@@ -1494,8 +1500,9 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                         .map(TerminalBinding::working_dir)
                         .or(self.base_dir.as_deref()),
                 );
-                let (agent, subagent, model, child_job_registry, commit_ledger) =
-                    self.start_agent(resolved, model, grant, prompt).await?;
+                let (agent, subagent, model, child_job_registry, commit_ledger) = self
+                    .start_agent(resolved, model, grant, prompt, started_by)
+                    .await?;
                 let lifetime = agent.cache_lifetime();
                 Ok((
                     FinishedSubagent {
@@ -1680,15 +1687,11 @@ where
     type Arguments = SubagentArgs;
     type Res = ToolResult;
 
-    async fn call(
-        &self,
-        args: Self::Arguments,
-        _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
         // The task prompt comes from a file; inline prompt text is rejected.
         let prompt = self.read_prompt(args.prompt_file()).await?;
 
-        let (finished, resumed) = self.acquire(args, &prompt).await?;
+        let (finished, resumed) = self.acquire(args, &prompt, cx.identity()).await?;
         let (
             FinishedSubagent {
                 subagent: subagent_id,
