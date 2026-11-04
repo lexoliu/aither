@@ -2313,7 +2313,7 @@ where
 
         // Compaction rewrites the cacheable prefix anyway, so this is where
         // staged system-block updates and superseded tool results fold in.
-        self.context.reassemble();
+        self.context.reassemble_below(fork_point);
         self.context.apply_handoff(&handoff, fork_point);
         self.reassembled = true;
         self.compaction_failure = None;
@@ -2391,13 +2391,19 @@ where
             threshold: self.budget.chars_for_tokens(policy.spill_threshold),
             head: self.budget.chars_for_tokens(policy.spill_head),
         };
-        let report = clean_for_recovery(&mut self.context, self.restore_dir.as_deref(), limits)
-            .await
-            .map_err(|error| {
-                AgentError::llm_local(format!(
-                    "compaction recovery could not move a long tool output to a file: {error}"
-                ))
-            })?;
+        let fork_point = self.context.fork_point();
+        let report = clean_for_recovery(
+            &mut self.context,
+            fork_point,
+            self.restore_dir.as_deref(),
+            limits,
+        )
+        .await
+        .map_err(|error| {
+            AgentError::llm_local(format!(
+                "compaction recovery could not move a long tool output to a file: {error}"
+            ))
+        })?;
         tracing::warn!(
             alerts_removed = report.alerts_removed,
             outputs_spilled = report.outputs_spilled,
@@ -4802,6 +4808,43 @@ mod tests {
             .map(|m| m.content().to_string())
             .collect();
         assert_eq!(conversation, ["during one", "during two"]);
+    }
+
+    /// Alerts that arrive after the fork — a background job's completion, a
+    /// hook's injected context — are not described by the handoff and must
+    /// reach the model; alerts from before the fork go with the rest.
+    #[tokio::test]
+    async fn alerts_after_the_fork_survive_the_apply() {
+        let mut agent = Agent::new(MockLlm {
+            context_length: 1_000_000,
+        });
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("before the fork"));
+        agent.push_system_alert("stale alert before the fork");
+        let fork_point = agent.context.fork_point();
+        agent.push_system_alert("background job 7 completed");
+        agent.push_message(Message::user("during"));
+        agent.push_system_alert("hook context injected mid-turn");
+        agent.compaction.land(
+            fork_point,
+            HandoffDocument {
+                current_task: "keep going".to_string(),
+                ..HandoffDocument::default()
+            },
+        );
+
+        let request = agent
+            .prepare_request()
+            .await
+            .expect("request boundary")
+            .expect("request after apply");
+
+        let text: Vec<&str> = request.messages().iter().map(Message::content).collect();
+        let seen = |needle: &str| text.iter().any(|content| content.contains(needle));
+        assert!(seen("background job 7 completed"), "{text:?}");
+        assert!(seen("hook context injected mid-turn"), "{text:?}");
+        assert!(!seen("stale alert before the fork"), "{text:?}");
+        assert!(!seen("before the fork"), "{text:?}");
     }
 
     /// The compaction request must be the main request's prefix verbatim,
