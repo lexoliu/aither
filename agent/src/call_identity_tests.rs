@@ -14,7 +14,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::AgentBuilder;
-use crate::specialized::{SubagentArgs, SubagentTool, SubagentType};
+use crate::specialized::{SubagentArgs, SubagentTool};
 
 #[derive(Debug)]
 struct NeverError;
@@ -144,27 +144,32 @@ async fn a_subagent_dispatches_its_calls_as_that_subagent_started_by_the_calling
     ]);
     let recorder = IdentityRecorder::default();
     let child_recorder = recorder.clone();
-    let tool = SubagentTool::new(llm).with_type(
-        "worker",
-        SubagentType::new("worker for identity tests", move |llm| {
-            AgentBuilder::new(llm)
-                .agent_kind(crate::AgentKind::Chatbot)
-                .tool(child_recorder.clone())
-        }),
-    );
     let dir = tempfile::tempdir().expect("temp dir");
+    let global = dir.path().join("global");
+    std::fs::create_dir_all(&global).expect("create global subagents dir");
+    std::fs::write(
+        global.join("worker.toml"),
+        "name = \"worker\"\ndescription = \"worker for identity tests\"\ntier = \"fast\"\naccess = \"read_only\"\nprompt = '''\nProbe.\n'''\n",
+    )
+    .expect("write definition");
+    let tool = SubagentTool::new(llm, global)
+        .with_base_dir(dir.path())
+        .with_agent_setup("worker", move |builder| {
+            builder.tool(child_recorder.clone())
+        });
     let prompt_file = dir.path().join("prompt.txt");
     std::fs::write(&prompt_file, "probe once").expect("write prompt file");
     let parent = CallIdentity::new(ToolCallId::new("parent_call"), AgentIdentity::Main);
 
     Tool::call(
         &tool,
-        SubagentArgs::Start {
+        SubagentArgs {
+            name: "worker".to_string(),
+            prompt_file: prompt_file.to_string_lossy().into_owned(),
+            id: None,
+            agent: None,
             worktrees: Vec::new(),
             commit_worktrees: Vec::new(),
-            subagent: "worker".to_string(),
-            prompt_file: prompt_file.to_string_lossy().into_owned(),
-            model: Some(crate::model_group::ModelTier::Fast),
         },
         ToolContext::new().with_identity(parent.clone()),
     )

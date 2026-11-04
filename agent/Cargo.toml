@@ -24,7 +24,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2"
 sync_wrapper = "1"
 serde_json = "1.0"
-serde_yaml = "0.9"
+basic-toml = { version = "0.1.10", default-features = false }
 indexmap = { version = "2", features = ["serde"] }
 tracing = "0.1"
 async-fs = "2"
