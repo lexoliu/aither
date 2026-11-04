@@ -671,6 +671,10 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
     /// Receiver for permission wait/resume events emitted by terminal execution.
     pub(crate) permission_receiver: Option<PermissionEventReceiver>,
+    /// The terminal calls in which a kept command succeeded.
+    pub(crate) kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
+    /// Calls reported by `kept_receiver` whose results are not committed yet.
+    pub(crate) kept_exchanges: HashSet<String>,
     /// Receiver for the host memory pressure and machine load events.
     pub(crate) host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
     /// Registry for running background terminal tasks.
@@ -790,6 +794,8 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             connectivity: crate::connectivity::Watch::default(),
             background_receiver: None,
             permission_receiver: None,
+            kept_receiver: None,
+            kept_exchanges: HashSet::new(),
             host_load_events: None,
             job_registry: None,
             detached_task_ids: HashSet::new(),
@@ -1383,6 +1389,14 @@ where
     /// Results not reached because one failed stay parked for
     /// [`Self::settle_interrupted_tool_calls`].
     fn apply_tool_results(&mut self, events: &EventSink) -> Result<(), AgentError> {
+        if let Some(receiver) = &self.kept_receiver {
+            self.kept_exchanges.extend(
+                receiver
+                    .take_pending()
+                    .into_iter()
+                    .map(|call| call.as_str().to_owned()),
+            );
+        }
         let mut has_tool_error = false;
         let mut unknown_tools: Vec<String> = Vec::new();
         let known_tools: Vec<String> = self
@@ -1408,7 +1422,12 @@ where
             let content = tool_result.render_for_model();
             has_tool_error |= tool_result_is_error(&tool_result, &content);
             self.push_terminal_followup_events(is_terminal_call, &tool_result, events);
-            self.context.push(Message::tool(&call_id, content));
+            let message = Message::tool(&call_id, content);
+            if call_name == crate::ask_user::TOOL_NAME || self.kept_exchanges.remove(&call_id) {
+                self.context.push_kept(message);
+            } else {
+                self.context.push(message);
+            }
         }
         let has_terminal_tool = known_tools.iter().any(|name| name == "terminal");
         if has_terminal_tool && !unknown_tools.is_empty() {
@@ -2333,7 +2352,11 @@ where
         // Compaction rewrites the cacheable prefix anyway, so this is where
         // staged system-block updates and superseded tool results fold in.
         self.context.reassemble_below(fork_point);
-        self.context.apply_handoff(&handoff, fork_point);
+        let user_message_chars = self
+            .budget
+            .chars_for_tokens(self.config.context_policy.user_message_budget);
+        self.context
+            .apply_handoff(&handoff, fork_point, user_message_chars);
         if let Some(block) = restored {
             self.context.push_block_alert(&block);
         }
@@ -4164,6 +4187,89 @@ mod tests {
         );
     }
 
+    /// A `terminal` call that ran the kept IPC command `ask_user` survives a
+    /// handoff with its result; one that ran an ordinary command does not,
+    /// and the native `ask_user` tool survives by its name at commit.
+    #[tokio::test]
+    async fn exchanges_of_kept_commands_and_native_ask_user_survive_a_handoff() {
+        use aither_core::llm::{AgentIdentity, CallIdentity, ToolCallId, ToolResult};
+        use aither_sandbox::ToolRegistryBuilder;
+
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct NoArgs {}
+        struct Command(&'static str);
+        impl aither_core::llm::Tool for Command {
+            fn name(&self) -> std::borrow::Cow<'static, str> {
+                self.0.into()
+            }
+            type Arguments = NoArgs;
+            type Res = ToolResult;
+            fn call(
+                &self,
+                _: Self::Arguments,
+                _: aither_core::llm::ToolContext,
+            ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send
+            {
+                std::future::ready(Ok(ToolResult::text("done")))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut builder = ToolRegistryBuilder::new();
+        builder.kept_through_compaction(|kept| kept.configure_tool(Command("ask_user")));
+        builder.configure_tool(Command("ls"));
+        let registry = builder.build(dir.path());
+        let in_call = |id: &str| {
+            registry.for_call(CallIdentity::new(ToolCallId::new(id), AgentIdentity::Main))
+        };
+        assert!(in_call("kept").query_tool_handler("ask_user", &[]).await.ok);
+        assert!(in_call("plain").query_tool_handler("ls", &[]).await.ok);
+
+        let mut agent = Agent::new(MockLlm {
+            context_length: 1_000_000,
+        });
+        agent.kept_receiver = Some(registry.kept_receiver());
+        let call = |id: &str, name: &str| ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: serde_json::json!({}),
+            reasoning_state: None,
+        };
+        agent.push_message(Message::assistant_with_tool_calls(
+            "",
+            vec![
+                call("kept", "terminal"),
+                call("plain", "terminal"),
+                call("native", "ask_user"),
+            ],
+        ));
+        for id in ["kept", "plain"] {
+            agent
+                .tool_results
+                .push_back(Ok((id.into(), "terminal".into(), ToolResult::text(id))));
+        }
+        agent.tool_results.push_back(Ok((
+            "native".into(),
+            "ask_user".into(),
+            ToolResult::text("native"),
+        )));
+        let (sender, _events) = async_channel::unbounded();
+        agent
+            .apply_tool_results(&EventSink { sender })
+            .expect("results apply");
+
+        let fork = agent.context.fork_point();
+        agent
+            .context
+            .apply_handoff(&crate::context::HandoffDocument::default(), fork, 0);
+
+        let kept = agent.context.recent();
+        let ids: Vec<&str> = kept[0].tool_calls().iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["kept", "native"]);
+        let results: Vec<&str> = kept[1..].iter().map(|m| m.content()).collect();
+        assert_eq!(results, ["kept", "native"]);
+    }
+
     fn tasks_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
         Agent::builder(MockLlm {
             context_length: 1_000_000,
@@ -4587,6 +4693,9 @@ mod tests {
             context_policy: crate::ContextPolicy {
                 start_distance: 50,
                 safe_buffer: 1,
+                // These windows are a few hundred tokens: the conversation
+                // must shrink to the handoff for a compaction to relieve them.
+                user_message_budget: 0,
                 ..crate::ContextPolicy::default()
             },
             ..AgentConfig::default()
@@ -4813,7 +4922,11 @@ mod tests {
             .iter()
             .map(|m| m.content().to_string())
             .collect();
-        assert_eq!(conversation, ["during one", "during two"]);
+        // The user's own message outlives the handoff beside the suffix.
+        assert_eq!(
+            conversation,
+            ["before the fork", "during one", "during two"]
+        );
     }
 
     /// Alerts that arrive after the fork — a background job's completion, a
@@ -4850,7 +4963,6 @@ mod tests {
         assert!(seen("background job 7 completed"), "{text:?}");
         assert!(seen("hook context injected mid-turn"), "{text:?}");
         assert!(!seen("stale alert before the fork"), "{text:?}");
-        assert!(!seen("before the fork"), "{text:?}");
     }
 
     /// Dropping the apply while it reads the files to restore commits

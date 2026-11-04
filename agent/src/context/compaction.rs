@@ -593,7 +593,7 @@ mod tests {
             file_index: build_file_index(context.handoff_file_index(), &context.build_request(&[])),
             ..HandoffDocument::default()
         };
-        context.apply_handoff(&handoff, u64::MAX);
+        context.apply_handoff(&handoff, u64::MAX, 0);
         handoff
     }
 

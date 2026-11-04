@@ -16,6 +16,9 @@ use crate::tool_request::{
     ToolRequest, ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
 
+/// The name the `ask_user` tool is called by.
+pub(crate) const TOOL_NAME: &str = "ask_user";
+
 /// A single question within an `ask_user` request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Question {
@@ -193,7 +196,7 @@ impl AskUserTool {
 
 impl Tool for AskUserTool {
     fn name(&self) -> Cow<'static, str> {
-        "ask_user".into()
+        TOOL_NAME.into()
     }
 
     type Arguments = AskUserArgs;

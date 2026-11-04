@@ -73,6 +73,8 @@ pub struct AgentBuilder<
     connectivity: crate::connectivity::Watch,
     background_receiver: Option<BackgroundTaskReceiver>,
     permission_receiver: Option<PermissionEventReceiver>,
+    /// The terminal calls in which a kept command succeeded.
+    kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
     host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
     job_registry: Option<JobRegistry>,
     context_sources: Vec<AnyContextSource>,
@@ -135,6 +137,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             connectivity: crate::connectivity::Watch::default(),
             background_receiver: None,
             permission_receiver: None,
+            kept_receiver: None,
             host_load_events: None,
             job_registry: None,
             context_sources: Vec::new(),
@@ -182,6 +185,7 @@ where
             connectivity: self.connectivity,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
+            kept_receiver: self.kept_receiver,
             host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
@@ -220,6 +224,7 @@ where
             connectivity: self.connectivity,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
+            kept_receiver: self.kept_receiver,
             host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
@@ -262,6 +267,7 @@ where
             connectivity: self.connectivity,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
+            kept_receiver: self.kept_receiver,
             host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
@@ -346,6 +352,7 @@ where
         }
         self.background_receiver = Some(dyn_tool.background_receiver());
         self.permission_receiver = Some(dyn_tool.permission_receiver());
+        self.kept_receiver = Some(dyn_tool.kept_receiver());
         self.job_registry = Some(dyn_tool.job_registry());
         // Files are restored after compaction, and `tasks.md` is kept, in
         // wherever the terminal works: a subagent's are in its own space,
@@ -420,6 +427,7 @@ where
         });
         self.background_receiver = Some(terminal.background_receiver());
         self.permission_receiver = Some(terminal.permission_receiver());
+        self.kept_receiver = Some(terminal.kept_receiver());
         self.job_registry = Some(terminal.job_registry());
         // A fork keeps its own `tasks.md` in its own space, like any
         // subagent, not the main agent's it inherited the context of.
@@ -469,6 +477,7 @@ where
             connectivity: self.connectivity,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
+            kept_receiver: self.kept_receiver,
             host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             context_sources: self.context_sources,
@@ -722,6 +731,7 @@ where
         );
         let background_receiver = terminal_tool.background_receiver();
         let permission_receiver = terminal_tool.permission_receiver();
+        let kept_receiver = terminal_tool.kept_receiver();
         let job_registry = terminal_tool.job_registry();
         self.sandbox_dir = Some(terminal_tool.working_dir().clone());
         self.restore_dir = Some(terminal_tool.working_dir().clone());
@@ -730,6 +740,7 @@ where
             .expect("tool registration must succeed: duplicate name or missing description");
         self.background_receiver = Some(background_receiver);
         self.permission_receiver = Some(permission_receiver);
+        self.kept_receiver = Some(kept_receiver);
         self.job_registry = Some(job_registry);
         self
     }
@@ -890,6 +901,7 @@ where
             profile: self.inherited.and_then(|inherited| inherited.profile),
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
+            kept_receiver: self.kept_receiver,
             host_load_events: self.host_load_events,
             job_registry: self.job_registry,
             detached_task_ids: std::collections::HashSet::new(),
@@ -899,6 +911,7 @@ where
             fork_source: self.fork_source,
             compact_signal: self.compact_signal,
             compaction_warning: crate::agent::CompactionWarning::Armed,
+            kept_exchanges: std::collections::HashSet::new(),
             identity: self.identity,
             connectivity: self.connectivity,
             last_request: None,
