@@ -1,0 +1,1 @@
+The context is about {{ remaining_tokens }} tokens from automatic compaction, which will replace the conversation so far with a summary. Save your work now: bring your `tasks.md` up to date, notes included, so it carries everything the summary cannot, and call the `compact` tool yourself at a clean point.
