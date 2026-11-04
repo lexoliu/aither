@@ -50,6 +50,8 @@ mod fs_util;
 mod hook;
 #[cfg(test)]
 mod idle_compaction_tests;
+#[cfg(feature = "languages")]
+pub mod language;
 mod model_group;
 mod output_urls;
 mod stream;
@@ -111,6 +113,8 @@ pub use hook::{
     CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction, StopContext,
     StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
 };
+#[cfg(feature = "languages")]
+pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
 pub use stream::AgentStream;
 pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};

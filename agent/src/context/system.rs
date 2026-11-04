@@ -138,8 +138,13 @@ impl InstructionSlot {
     pub const KNOWLEDGE_AND_TIME: Self = Self::new("knowledge_and_time");
     /// The filesystem permission model.
     pub const PERMISSIONS: Self = Self::new("permissions");
+    /// The communication and working languages, present only while a
+    /// communication language is enforced.
+    #[cfg(feature = "languages")]
+    pub const LANGUAGES: Self = Self::new("languages");
 
     /// Every built-in instruction slot, in the default layout's order.
+    #[cfg(not(feature = "languages"))]
     pub const BUILTIN: [Self; 7] = [
         Self::BASE_SYSTEM,
         Self::PERSONA,
@@ -148,6 +153,19 @@ impl InstructionSlot {
         Self::WORKSPACE_FACTS,
         Self::KNOWLEDGE_AND_TIME,
         Self::PERMISSIONS,
+    ];
+
+    /// Every built-in instruction slot, in the default layout's order.
+    #[cfg(feature = "languages")]
+    pub const BUILTIN: [Self; 8] = [
+        Self::BASE_SYSTEM,
+        Self::PERSONA,
+        Self::PREPARED_TOOLS,
+        Self::SHELL_RUNTIME,
+        Self::WORKSPACE_FACTS,
+        Self::KNOWLEDGE_AND_TIME,
+        Self::PERMISSIONS,
+        Self::LANGUAGES,
     ];
 }
 

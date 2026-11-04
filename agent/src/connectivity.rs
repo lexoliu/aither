@@ -142,7 +142,7 @@ mod tests {
             &self,
         ) -> impl core::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
             core::future::ready(Ok(ModelProfile::new(
-                "mock", "test", "stall", "stall", 1000,
+                "mock", "test", "stall", "stall", 200_000,
             )))
         }
     }
