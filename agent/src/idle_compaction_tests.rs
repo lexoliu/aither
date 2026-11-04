@@ -98,7 +98,8 @@ async fn agent_after_one_turn(
     }
     let mut agent = builder.build();
     {
-        let events = agent.run("hello", []);
+        // Over the default compaction floor, which leaves short contexts alone.
+        let events = agent.run(&"word ".repeat(40_000), []);
         futures_lite::pin!(events);
         while futures_lite::StreamExt::next(&mut events).await.is_some() {}
     }

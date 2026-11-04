@@ -101,6 +101,15 @@ pub struct ContextPolicy {
     /// compacts at 54 minutes under a one-hour lifetime.
     pub idle_compact_before_expiry: Duration,
 
+    /// Tokens below which a context is not worth compacting on request.
+    ///
+    /// Re-reading a short context cold costs little, while the handoff
+    /// replaces the verbatim conversation and loses its detail, so idle
+    /// compaction and the model's own `compact` call leave a context under
+    /// this floor alone. Automatic compaction near the window's limit is not
+    /// governed by it.
+    pub compaction_floor: usize,
+
     /// Tokens a tool output may hold before failure recovery moves it to a
     /// file, leaving the path and a short head in its place.
     pub spill_threshold: usize,
@@ -119,6 +128,7 @@ impl Default for ContextPolicy {
             warn_distance: 80_000,
             restore_budget: 0.15,
             idle_compact_before_expiry: Duration::from_secs(6 * 60),
+            compaction_floor: 20_000,
             spill_threshold: 4_000,
             spill_head: 200,
         }
@@ -126,6 +136,13 @@ impl Default for ContextPolicy {
 }
 
 impl ContextPolicy {
+    /// Whether a context holding `tokens` is under the
+    /// [`compaction_floor`](Self::compaction_floor).
+    #[must_use]
+    pub const fn below_floor(&self, tokens: usize) -> bool {
+        tokens < self.compaction_floor
+    }
+
     /// The auto-compact point for a window of `window` tokens:
     /// `min(window * compact_at, compact_ceiling)`.
     #[must_use]
@@ -263,6 +280,13 @@ mod tests {
         let policy = ContextPolicy::default();
         assert!(!policy.should_compact(1_000_000, 0));
         assert!(!policy.should_pause(1_000_000, 0));
+    }
+
+    #[test]
+    fn the_floor_defaults_to_twenty_thousand_tokens_and_is_exclusive_below() {
+        let policy = ContextPolicy::default();
+        assert!(policy.below_floor(19_999));
+        assert!(!policy.below_floor(20_000));
     }
 
     #[test]

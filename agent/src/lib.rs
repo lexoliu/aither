@@ -38,6 +38,7 @@ mod cache_stats;
 mod checkpoint;
 mod clock;
 mod compact_tool;
+mod compaction_state;
 mod config;
 mod connectivity;
 pub mod context;
