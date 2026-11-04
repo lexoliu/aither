@@ -33,13 +33,16 @@
 //! lets its result be applied to a window that has moved on: everything newer
 //! than the fork point is kept verbatim.
 
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 use askama::Template;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use aither_core::llm::{Message, Role};
+use aither_core::llm::{Message, Role, ToolCall};
+
+use crate::ask_user;
 
 use super::compaction::{Handoff, HandoffDocument};
 use super::source::Block;
@@ -501,9 +504,89 @@ impl Context {
     /// `handoff` becomes the new anchor and only the items numbered at or
     /// above `fork_point` are kept: they arrived while the handoff was being
     /// written and are not described by it.
-    pub fn apply_handoff(&mut self, handoff: &HandoffDocument, fork_point: u64) {
+    ///
+    /// The user's own words outlive the handoff beside it, verbatim and in
+    /// order: every `ask_user` exchange from below the fork, whatever its
+    /// size, and the newest user messages that fit `user_message_chars`
+    /// characters. An exchange is the question and its answer together, so it
+    /// is kept or dropped whole, and it is dropped never.
+    pub fn apply_handoff(
+        &mut self,
+        handoff: &HandoffDocument,
+        fork_point: u64,
+        user_message_chars: usize,
+    ) {
+        let mut kept = self.verbatim_below(fork_point, user_message_chars);
         self.items.retain(|item| item.seq >= fork_point);
+        kept.append(&mut self.items);
+        self.items = kept;
         self.set_handoff_document(handoff);
+    }
+
+    /// The items below `fork_point` that survive a handoff: answered
+    /// `ask_user` exchanges, and the newest user messages within
+    /// `user_message_chars`, oldest first.
+    fn verbatim_below(&self, fork_point: u64, user_message_chars: usize) -> Vec<ContextItem> {
+        let below = || self.items.iter().filter(|item| item.seq < fork_point);
+
+        let answered: HashSet<&str> = below()
+            .filter_map(|item| match &item.message {
+                Message::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let asks = self.ask_user_call_ids();
+        let mut kept: Vec<ContextItem> = Vec::new();
+        for item in below() {
+            match &item.message {
+                // The call keeps only its `ask_user` calls: the turn's other
+                // calls and reasoning are compacted, and a result must not
+                // outlive the call it answers.
+                Message::Assistant { tool_calls, .. } => {
+                    let calls: Vec<ToolCall> = tool_calls
+                        .iter()
+                        .filter(|call| {
+                            call.name == ask_user::TOOL_NAME && answered.contains(call.id.as_str())
+                        })
+                        .cloned()
+                        .collect();
+                    if !calls.is_empty() {
+                        kept.push(ContextItem {
+                            message: Message::assistant_with_tool_calls("", calls),
+                            ..item.clone()
+                        });
+                    }
+                }
+                Message::Tool { tool_call_id, .. } if asks.contains(tool_call_id.as_str()) => {
+                    kept.push(item.clone());
+                }
+                _ => {}
+            }
+        }
+
+        let mut remaining = user_message_chars;
+        for item in below().rev() {
+            if !matches!(item.message, Message::User { .. }) {
+                continue;
+            }
+            let Some(left) = remaining.checked_sub(item.message.content().len()) else {
+                break;
+            };
+            remaining = left;
+            kept.push(item.clone());
+        }
+        kept.sort_by_key(|item| item.seq);
+        kept
+    }
+
+    /// The ids of the `ask_user` calls in the window.
+    fn ask_user_call_ids(&self) -> HashSet<&str> {
+        self.items
+            .iter()
+            .flat_map(|item| item.message.tool_calls())
+            .filter(|call| call.name == ask_user::TOOL_NAME)
+            .map(|call| call.id.as_str())
+            .collect()
     }
 
     // ── Reassembly ────────────────────────────────────────────────────
@@ -585,17 +668,20 @@ impl Context {
 
     /// The tool results holding more than `min_bytes` bytes.
     pub(crate) fn long_tool_outputs(&self, min_bytes: usize) -> Vec<LongToolOutput> {
+        let asks = self.ask_user_call_ids();
         self.items
             .iter()
             .filter_map(|item| match &item.message {
                 Message::Tool {
                     content,
                     tool_call_id,
-                } if content.len() > min_bytes => Some(LongToolOutput {
-                    seq: item.seq,
-                    tool_call_id: tool_call_id.clone(),
-                    content: content.clone(),
-                }),
+                } if content.len() > min_bytes && !asks.contains(tool_call_id.as_str()) => {
+                    Some(LongToolOutput {
+                        seq: item.seq,
+                        tool_call_id: tool_call_id.clone(),
+                        content: content.clone(),
+                    })
+                }
                 _ => None,
             })
             .collect()
@@ -645,6 +731,8 @@ impl Context {
             last_by_content.insert(content.as_str(), index);
         }
 
+        // An answer is the user's word, not a re-readable resource.
+        let asks = self.ask_user_call_ids();
         let mut indices = Vec::new();
         let mut bytes = 0usize;
         for (index, item) in self.items.iter().enumerate() {
@@ -655,7 +743,8 @@ impl Context {
             else {
                 continue;
             };
-            if content.len() <= SUPERSEDED_TOOL_RESULT.len() {
+            if content.len() <= SUPERSEDED_TOOL_RESULT.len() || asks.contains(tool_call_id.as_str())
+            {
                 continue;
             }
             let superseded_by_call = call_identity
@@ -1201,7 +1290,7 @@ mod tests {
             current_task: "task".into(),
             ..HandoffDocument::default()
         };
-        context.apply_handoff(&handoff, fork);
+        context.apply_handoff(&handoff, fork, 0);
 
         assert_eq!(context.len_recent(), 1);
         assert_eq!(context.recent()[0].content(), "new request");
@@ -1210,6 +1299,166 @@ mod tests {
                 .handoff()
                 .is_some_and(|handoff| handoff.render().contains("task"))
         );
+    }
+
+    fn handoff() -> HandoffDocument {
+        HandoffDocument {
+            current_task: "task".into(),
+            ..HandoffDocument::default()
+        }
+    }
+
+    /// Pushes one answered `ask_user` exchange and returns its question.
+    fn push_exchange(context: &mut Context, id: &str, question: &str, answer: &str) {
+        context.push(Message::assistant_with_tool_calls(
+            "thinking out loud",
+            vec![
+                tool_call(
+                    id,
+                    "ask_user",
+                    serde_json::json!({"question": question, "option": ["yes", "no"]}),
+                ),
+                tool_call(&format!("{id}-x"), "terminal", serde_json::json!({})),
+            ],
+        ));
+        context.push(Message::tool(format!("{id}-x"), "terminal output"));
+        context.push(Message::tool(
+            id,
+            format!("The user answered:\n- {answer}\n"),
+        ));
+    }
+
+    fn texts(context: &Context) -> Vec<String> {
+        context
+            .recent()
+            .iter()
+            .map(|message| match message {
+                Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                    format!("call {}", tool_calls[0].arguments)
+                }
+                other => other.content().to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_ask_user_exchange_survives_the_handoff_whatever_its_size() {
+        let mut context = Context::new();
+        context.push(Message::user("start"));
+        let long_answer = "a long considered answer ".repeat(2_000);
+        for index in 0..5 {
+            let answer = if index == 2 { &long_answer } else { "short" };
+            push_exchange(
+                &mut context,
+                &format!("ask-{index}"),
+                &format!("q{index}"),
+                answer,
+            );
+        }
+        let fork = context.fork_point();
+        context.push(Message::user("after the fork"));
+
+        context.apply_handoff(&handoff(), fork, 0);
+
+        let kept = context.recent();
+        // Five exchanges (call and answer each) and the suffix; the turn's
+        // other call and its result were compacted.
+        assert_eq!(kept.len(), 5 * 2 + 1);
+        for index in 0..5 {
+            let call = &kept[index * 2];
+            assert_eq!(call.tool_calls().len(), 1);
+            assert_eq!(call.tool_calls()[0].id, format!("ask-{index}"));
+            assert_eq!(call.content(), "");
+            let Message::Tool {
+                tool_call_id,
+                content,
+            } = &kept[index * 2 + 1]
+            else {
+                panic!("the answer follows its question");
+            };
+            assert_eq!(tool_call_id, &format!("ask-{index}"));
+            assert!(content.contains(if index == 2 { &long_answer } else { "short" }));
+        }
+        assert_eq!(kept[10].content(), "after the fork");
+    }
+
+    #[test]
+    fn user_messages_past_the_budget_lose_the_oldest_first() {
+        let mut context = Context::new();
+        context.push(Message::user("oldest"));
+        context.push(Message::assistant("reply"));
+        push_exchange(
+            &mut context,
+            "ask-0",
+            "q0",
+            "an answer far longer than the budget",
+        );
+        context.push(Message::user("middle"));
+        context.push(Message::user("newest"));
+        let fork = context.fork_point();
+
+        // "middle" + "newest" fit; "oldest" does not.
+        context.apply_handoff(&handoff(), fork, "middle".len() + "newest".len());
+
+        let kept = texts(&context);
+        assert_eq!(kept.len(), 4, "{kept:?}");
+        assert!(kept[0].starts_with("call "), "{kept:?}");
+        assert!(kept[1].contains("far longer than the budget"), "{kept:?}");
+        assert_eq!(kept[2], "middle");
+        assert_eq!(kept[3], "newest");
+    }
+
+    #[test]
+    fn a_message_holding_an_offloaded_paste_keeps_its_file_reference() {
+        let mut context = Context::new();
+        let message = "see the log at pastes/build-1.txt (12000 bytes) for the failure";
+        context.push(Message::user(message));
+        let fork = context.fork_point();
+
+        context.apply_handoff(&handoff(), fork, 1_000);
+
+        assert_eq!(context.recent()[0].content(), message);
+    }
+
+    #[test]
+    fn an_unanswered_ask_user_call_is_not_kept() {
+        let mut context = Context::new();
+        context.push(Message::assistant_with_tool_calls(
+            "",
+            vec![tool_call(
+                "ask-0",
+                "ask_user",
+                serde_json::json!({"question": "q"}),
+            )],
+        ));
+        let fork = context.fork_point();
+
+        context.apply_handoff(&handoff(), fork, 0);
+
+        assert_eq!(context.len_recent(), 0);
+    }
+
+    #[test]
+    fn ask_user_answers_are_neither_tombstoned_nor_spilled() {
+        let mut context = Context::new();
+        let answer = "the same long answer ".repeat(64);
+        for id in ["ask-0", "ask-1"] {
+            context.push(Message::assistant_with_tool_calls(
+                "",
+                vec![tool_call(
+                    id,
+                    "ask_user",
+                    serde_json::json!({"question": "q"}),
+                )],
+            ));
+            context.push(Message::tool(id, answer.clone()));
+        }
+
+        let report = context.reassemble();
+
+        assert_eq!(report.tool_results_deduped, 0);
+        assert!(context.long_tool_outputs(10).is_empty());
+        assert_eq!(context.recent()[1].content(), answer);
     }
 
     #[test]

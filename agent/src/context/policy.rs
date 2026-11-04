@@ -116,6 +116,15 @@ pub struct ContextPolicy {
 
     /// Tokens of a spilled tool output that stay in place as its head.
     pub spill_head: usize,
+
+    /// Tokens of the user's own messages that survive a compaction verbatim.
+    ///
+    /// The user's words are the authoritative record of what was asked,
+    /// decided and ruled out, and a retelling drifts from them. The newest
+    /// messages are kept up to this budget; the handoff covers the rest.
+    /// `ask_user` exchanges are kept whole whatever their size and do not
+    /// count against it.
+    pub user_message_budget: usize,
 }
 
 impl Default for ContextPolicy {
@@ -131,6 +140,7 @@ impl Default for ContextPolicy {
             compaction_floor: 20_000,
             spill_threshold: 4_000,
             spill_head: 200,
+            user_message_budget: 20_000,
         }
     }
 }

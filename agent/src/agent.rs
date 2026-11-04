@@ -2264,7 +2264,11 @@ where
         // Compaction rewrites the cacheable prefix anyway, so this is where
         // staged system-block updates and superseded tool results fold in.
         self.context.reassemble_below(fork_point);
-        self.context.apply_handoff(&handoff, fork_point);
+        let user_message_chars = self
+            .budget
+            .chars_for_tokens(self.config.context_policy.user_message_budget);
+        self.context
+            .apply_handoff(&handoff, fork_point, user_message_chars);
         if let Some(block) = restored {
             self.context.push_block_alert(&block);
         }
@@ -4388,6 +4392,9 @@ mod tests {
             context_policy: crate::ContextPolicy {
                 start_distance: 50,
                 safe_buffer: 1,
+                // These windows are a few hundred tokens: the conversation
+                // must shrink to the handoff for a compaction to relieve them.
+                user_message_budget: 0,
                 ..crate::ContextPolicy::default()
             },
             ..AgentConfig::default()
@@ -4614,7 +4621,11 @@ mod tests {
             .iter()
             .map(|m| m.content().to_string())
             .collect();
-        assert_eq!(conversation, ["during one", "during two"]);
+        // The user's own message outlives the handoff beside the suffix.
+        assert_eq!(
+            conversation,
+            ["before the fork", "during one", "during two"]
+        );
     }
 
     /// Alerts that arrive after the fork — a background job's completion, a
@@ -4651,7 +4662,6 @@ mod tests {
         assert!(seen("background job 7 completed"), "{text:?}");
         assert!(seen("hook context injected mid-turn"), "{text:?}");
         assert!(!seen("stale alert before the fork"), "{text:?}");
-        assert!(!seen("before the fork"), "{text:?}");
     }
 
     /// Dropping the apply while it reads the files to restore commits
