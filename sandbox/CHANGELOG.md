@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1](https://github.com/May-Agent/aither/compare/sandbox-v0.14.0...sandbox-v0.14.1) - 2026-11-03
+
+### Fixed
+
+- *(sandbox)* ManagedTool parses aither-sed, the id the release manifest uses
+
+### Other
+
+- Merge pull request #404 from May-Agent/main
+
 ## [0.14.0](https://github.com/May-Agent/aither/compare/sandbox-v0.13.0...sandbox-v0.14.0) - 2026-11-03
 
 ### Added
