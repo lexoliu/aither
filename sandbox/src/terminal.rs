@@ -6620,7 +6620,7 @@ mod tests {
 
     #[test]
     fn wrap_container_script_preserves_user_script_semantics() {
-        let script = "echo '$5,040' && subagent skill --skill slide --name art_direction --prompt-file tmp/prompt.md";
+        let script = "echo '$5,040' && subagent art_direction --prompt-file tmp/prompt.md";
         let wrapped = wrap_container_script(
             script,
             &[String::from("subagent")],
@@ -6973,6 +6973,109 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["terminal"]);
+    }
+
+    /// Picks one of the entries of its terminal's working directory, and
+    /// names those entries when a call does not parse.
+    struct PickTool {
+        dir: PathBuf,
+    }
+
+    /// Pick an entry.
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct PickArgs {
+        /// The entry.
+        entry: String,
+    }
+
+    impl aither_core::llm::Tool for PickTool {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "pick".into()
+        }
+        type Arguments = PickArgs;
+        type Res = aither_core::llm::ToolResult;
+
+        fn call(
+            &self,
+            args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(aither_core::llm::ToolResult::text(args.entry)))
+        }
+    }
+
+    impl crate::CommandUsage for PickTool {
+        async fn usage(&self) -> String {
+            use futures_lite::StreamExt as _;
+            let mut entries: Vec<String> = async_fs::read_dir(&self.dir)
+                .await
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("entry-"))
+                .collect()
+                .await;
+            entries.sort();
+            format!("entries: {}", entries.join(", "))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_main_exclusive_command_names_its_choices_and_does_not_exist_for_a_subagent() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
+        let mut builder = ToolRegistryBuilder::new();
+        builder.main_exclusive(|main| {
+            main.configure_terminal_bound_usage_tool("pick", |binding| PickTool {
+                dir: binding.working_dir().to_path_buf(),
+            });
+        });
+        let parent = tool.with_registry(Arc::new(builder.build(dir.path().join("outputs"))));
+
+        // What the usage names is read when the call fails, not when the
+        // terminal bound the command.
+        std::fs::write(dir.path().join("entry-b"), "").unwrap();
+        std::fs::write(dir.path().join("entry-a"), "").unwrap();
+        let bare = parent.registry().query_tool_handler("pick", &[]).await;
+        assert!(!bare.ok);
+        assert_eq!(
+            bare.error.as_deref(),
+            Some(
+                "missing required argument: entry\n\nentries: entry-a, entry-b\n\nRun `pick --help` for usage information."
+            )
+        );
+        let picked = parent
+            .registry()
+            .query_tool_handler("pick", &["entry-a".to_string()])
+            .await;
+        assert_eq!(picked.payload.unwrap().render_for_cli(), "entry-a");
+
+        let child = parent
+            .subagent_without_grant()
+            .await
+            .expect("an empty grant is always given");
+        let registry = child.registry();
+        assert!(!registry.is_tool_configured("pick"));
+        assert!(!registry.registered_tool_names().contains(&"pick".into()));
+        assert!(registry.tool_help("pick").is_none());
+        let refused = registry
+            .query_tool_handler("pick", &["entry-a".to_string()])
+            .await;
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("unknown command 'pick'. Run 'help' to see available commands.")
+        );
+        assert!(!child.to_dyn().has_command("pick"));
     }
 
     async fn query_control(

@@ -84,6 +84,9 @@ struct CommandOutputSavedTemplate<'a> {
 #[template(path = "tool_usage_error.txt", escape = "none")]
 struct ToolUsageErrorTemplate<'a> {
     message: &'a str,
+    /// What the command's arguments can be at the moment of the call, for a
+    /// command that says so.
+    usage: Option<&'a str>,
     tool_name: &'a str,
 }
 
@@ -102,9 +105,13 @@ fn prefix_error(prefix: &str, error: &impl std::fmt::Display) -> String {
 }
 
 fn tool_usage_error(message: &str, tool_name: &str) -> String {
-    ToolUsageErrorTemplate { message, tool_name }
-        .render()
-        .expect("tool usage error template must render")
+    ToolUsageErrorTemplate {
+        message,
+        usage: None,
+        tool_name,
+    }
+    .render()
+    .expect("tool usage error template must render")
 }
 
 fn output_saved_text(
@@ -282,19 +289,50 @@ pub enum CommandRole {
     Subagent,
 }
 
-/// What a command resolves to in each role; a subagent role without an entry
-/// gets the refusal naming the command as reserved for the main agent.
+/// What a command resolves to in each role.
 #[derive(Debug)]
 struct RoleEntries<T> {
     main: T,
-    subagent: Option<T>,
+    subagent: SubagentSide<T>,
+}
+
+/// What the subagent role has of a command.
+#[derive(Debug)]
+enum SubagentSide<T> {
+    /// The handler a subagent's call runs.
+    Serves(T),
+    /// The command is reserved for the main agent: a subagent's call gets the
+    /// refusal naming it so.
+    Reserved,
+    /// A subagent has no such command: it is neither listed nor callable.
+    Absent,
+}
+
+/// What a restricted registration leaves the subagent role.
+#[derive(Debug, Clone, Copy)]
+enum Restriction {
+    Reserved,
+    Absent,
+}
+
+impl Restriction {
+    const fn side<T>(self) -> SubagentSide<T> {
+        match self {
+            Self::Reserved => SubagentSide::Reserved,
+            Self::Absent => SubagentSide::Absent,
+        }
+    }
 }
 
 impl<T: Clone> Clone for RoleEntries<T> {
     fn clone(&self) -> Self {
         Self {
             main: self.main.clone(),
-            subagent: self.subagent.clone(),
+            subagent: match &self.subagent {
+                SubagentSide::Serves(entry) => SubagentSide::Serves(entry.clone()),
+                SubagentSide::Reserved => SubagentSide::Reserved,
+                SubagentSide::Absent => SubagentSide::Absent,
+            },
         }
     }
 }
@@ -307,17 +345,27 @@ impl<T> RoleEntries<T> {
     {
         Self {
             main: entry.clone(),
-            subagent: Some(entry),
+            subagent: SubagentSide::Serves(entry),
         }
     }
 
     /// The entry `role` reaches; `None` when the command is reserved for the
-    /// main agent.
+    /// main agent or absent from `role`.
     const fn for_role(&self, role: CommandRole) -> Option<&T> {
-        match role {
-            CommandRole::Main => Some(&self.main),
-            CommandRole::Subagent => self.subagent.as_ref(),
+        match (role, &self.subagent) {
+            (CommandRole::Main, _) => Some(&self.main),
+            (CommandRole::Subagent, SubagentSide::Serves(entry)) => Some(entry),
+            (CommandRole::Subagent, SubagentSide::Reserved | SubagentSide::Absent) => None,
         }
+    }
+
+    /// Whether `role` has the command at all, reserved or not: a command
+    /// absent from it is neither listed nor callable there.
+    const fn exists_for(&self, role: CommandRole) -> bool {
+        !matches!(
+            (role, &self.subagent),
+            (CommandRole::Subagent, SubagentSide::Absent)
+        )
     }
 }
 
@@ -845,7 +893,32 @@ impl ToolRegistryBuilder {
         T: Tool + Send + Sync + 'static,
         T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
     {
-        let name = name.into();
+        self.insert_bound_tool(name.into(), bind, None);
+    }
+
+    /// Configures a terminal-bound tool like
+    /// [`configure_terminal_bound_tool`](Self::configure_terminal_bound_tool)
+    /// whose call that does not parse is answered with the parse error and
+    /// the tool's [`CommandUsage::usage`], read at the moment of the call.
+    ///
+    /// # Panics
+    /// Panics if the tool argument schema cannot be serialized, and, when a
+    /// terminal binds the registry, if the built tool is not named `name`.
+    pub fn configure_terminal_bound_usage_tool<T, F>(&mut self, name: impl Into<String>, bind: F)
+    where
+        F: Fn(&TerminalBinding) -> T + Send + Sync + 'static,
+        T: CommandUsage + Send + Sync + 'static,
+        T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+    {
+        self.insert_bound_tool(name.into(), bind, Some(command_usage::<T>));
+    }
+
+    fn insert_bound_tool<T, F>(&mut self, name: String, bind: F, usage: Option<UsageFn<T>>)
+    where
+        F: Fn(&TerminalBinding) -> T + Send + Sync + 'static,
+        T: Tool + Send + Sync + 'static,
+        T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
+    {
         let schema = tool_schema::<T::Arguments>();
         let help = schema_to_help(&schema);
         let stdin_arg = detect_stdin_arg(&schema);
@@ -858,7 +931,7 @@ impl ToolRegistryBuilder {
                     bound_name,
                     "a terminal-bound command keeps the name it was registered under"
                 );
-                tool_handler(Arc::new(tool), schema.clone())
+                tool_handler(Arc::new(tool), schema.clone(), usage)
             }),
             help,
             stdin_arg,
@@ -871,23 +944,36 @@ impl ToolRegistryBuilder {
     /// reserved for the main agent, while help and stdin handling stay those
     /// of the real command.
     pub fn main_only(&mut self, configure: impl FnOnce(&mut Self)) {
-        let mut reserved = Self::new();
-        configure(&mut reserved);
-        for (name, entries) in reserved.entries {
+        self.restrict(configure, Restriction::Reserved);
+    }
+
+    /// Registers every command `configure` registers for the main agent
+    /// alone: a subagent's terminal has no such command, neither listed nor
+    /// callable.
+    pub fn main_exclusive(&mut self, configure: impl FnOnce(&mut Self)) {
+        self.restrict(configure, Restriction::Absent);
+    }
+
+    /// Registers what `configure` registers with the subagent side
+    /// `restriction` gives.
+    fn restrict(&mut self, configure: impl FnOnce(&mut Self), restriction: Restriction) {
+        let mut restricted = Self::new();
+        configure(&mut restricted);
+        for (name, entries) in restricted.entries {
             self.insert_entry(
                 name,
                 RoleEntries {
                     main: entries.main,
-                    subagent: None,
+                    subagent: restriction.side(),
                 },
             );
         }
-        for (name, entries) in reserved.bound {
+        for (name, entries) in restricted.bound {
             self.insert_bound(
                 name,
                 RoleEntries {
                     main: entries.main,
-                    subagent: None,
+                    subagent: restriction.side(),
                 },
             );
         }
@@ -915,7 +1001,7 @@ impl ToolRegistryBuilder {
             name,
             RoleEntries {
                 main: Arc::new(main),
-                subagent: Some(Arc::new(subagent)),
+                subagent: SubagentSide::Serves(Arc::new(subagent)),
             },
         );
     }
@@ -1000,8 +1086,30 @@ fn tool_schema<A: JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(A)).expect("failed to serialize tool schema")
 }
 
-/// The handler running `tool` with arguments parsed against `schema`.
-fn tool_handler<T>(tool: Arc<T>, schema: Value) -> ToolHandlerFn
+/// A terminal command whose valid arguments depend on what exists when it is
+/// called, such as the names a lookup can resolve.
+///
+/// Registered with
+/// [`ToolRegistryBuilder::configure_terminal_bound_usage_tool`], a call that
+/// does not parse is answered with the parse error followed by
+/// [`usage`](Self::usage), read at the moment of that call.
+pub trait CommandUsage: Tool {
+    /// What the command's arguments can be right now.
+    fn usage(&self) -> impl Future<Output = String> + Send;
+}
+
+/// Reads a tool's [`CommandUsage::usage`] for a call that did not parse.
+type UsageFn<T> = fn(Arc<T>) -> Pin<Box<dyn Future<Output = String> + Send>>;
+
+fn command_usage<T: CommandUsage + 'static>(
+    tool: Arc<T>,
+) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(async move { tool.usage().await })
+}
+
+/// The handler running `tool` with arguments parsed against `schema`; a call
+/// that does not parse also names what `usage` reads, when it is given.
+fn tool_handler<T>(tool: Arc<T>, schema: Value, usage: Option<UsageFn<T>>) -> ToolHandlerFn
 where
     T: Tool + Send + Sync + 'static,
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
@@ -1017,7 +1125,17 @@ where
                 Ok(v) => v,
                 Err(e) => {
                     let message = e.to_string();
-                    return Err(tool_usage_error(message.as_str(), name.as_str()));
+                    let usage = match usage {
+                        Some(usage) => Some(usage(tool.clone()).await),
+                        None => None,
+                    };
+                    return Err(ToolUsageErrorTemplate {
+                        message: message.as_str(),
+                        usage: usage.as_deref(),
+                        tool_name: name.as_str(),
+                    }
+                    .render()
+                    .expect("tool usage error template must render"));
                 }
             };
             tracing::debug!(tool = %name, json = %json_args, "configure_tool handler: parsed JSON");
@@ -1054,7 +1172,7 @@ where
     (
         name,
         ToolEntry {
-            handler: tool_handler(Arc::new(tool), schema),
+            handler: tool_handler(Arc::new(tool), schema, None),
             help,
             stdin_arg,
         },
@@ -1254,6 +1372,9 @@ impl ToolRegistry {
     /// has bound this registry; a terminal binds the registry it serves.
     fn resolve(&self, tool_name: &str) -> Option<Resolved<'_>> {
         if let Some(bound) = self.bound.get(tool_name) {
+            if !bound.exists_for(self.role) {
+                return None;
+            }
             let entry = bound.for_role(self.role);
             let shown = entry.unwrap_or(&bound.main);
             return Some(Resolved {
@@ -1268,7 +1389,10 @@ impl ToolRegistry {
                 stdin_arg: shown.stdin_arg.as_deref(),
             });
         }
-        let entries = self.entries.get(tool_name)?;
+        let entries = self
+            .entries
+            .get(tool_name)
+            .filter(|entries| entries.exists_for(self.role))?;
         let shown = entries.for_role(self.role).unwrap_or(&entries.main);
         Some(Resolved {
             handler: entries.for_role(self.role).map(|entry| &entry.handler),
@@ -1309,10 +1433,19 @@ impl ToolRegistry {
         }
     }
 
-    /// Returns whether a tool is registered.
+    /// Returns whether a tool is registered for this registry's role; a
+    /// command registered for the main agent alone is not registered for a
+    /// subagent.
     #[must_use]
     pub fn is_tool_configured(&self, tool_name: &str) -> bool {
-        self.entries.contains_key(tool_name) || self.bound.contains_key(tool_name)
+        self.bound.get(tool_name).map_or_else(
+            || {
+                self.entries
+                    .get(tool_name)
+                    .is_some_and(|entries| entries.exists_for(self.role))
+            },
+            |bound| bound.exists_for(self.role),
+        )
     }
 
     /// Returns whether a tool is reserved for the main agent in this
@@ -1343,12 +1476,20 @@ impl ToolRegistry {
             .and_then(|resolved| resolved.stdin_arg.map(str::to_string))
     }
 
-    /// Returns list of registered tool names.
+    /// Returns the names of the tools registered for this registry's role,
+    /// those reserved for the main agent included.
     #[must_use]
     pub fn registered_tool_names(&self) -> Vec<String> {
         self.entries
-            .keys()
-            .chain(self.bound.keys())
+            .iter()
+            .filter(|(_, entries)| entries.exists_for(self.role))
+            .map(|(name, _)| name)
+            .chain(
+                self.bound
+                    .iter()
+                    .filter(|(_, entries)| entries.exists_for(self.role))
+                    .map(|(name, _)| name),
+            )
             .cloned()
             .collect()
     }
