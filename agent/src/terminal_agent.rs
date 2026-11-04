@@ -56,6 +56,7 @@ use executor_core::Executor;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
+use crate::context::{ExternalContent, ExternalSlot, InstructionSlot, SystemLayout};
 use crate::hook::Hook;
 use crate::{Agent, AgentBuilder, config::AgentKind};
 use aither_core::llm::ToolResult;
@@ -548,30 +549,51 @@ where
         self
     }
 
-    /// Inserts or replaces a typed persistent system block.
-    #[must_use]
-    pub fn system<T: Template>(mut self, value: T) -> Self {
-        self.inner = self.inner.system(value);
-        self
-    }
-
-    /// Inserts or replaces a persistent system block with an explicit tag.
-    #[must_use]
-    pub fn system_named(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
-        self.inner = self.inner.system_named(tag, content);
-        self
-    }
-
-    /// Inserts or replaces a persistent system block with raw text.
+    /// Lays the system prompt out in `layout`'s order; see
+    /// [`AgentBuilder::system_layout`].
     ///
-    /// Unlike [`system`](Self::system) and [`system_named`](Self::system_named),
-    /// the `content` is stored verbatim without any XML wrapping. This is the
-    /// preferred entry point for prose system blocks (workspace descriptions,
-    /// runtime metadata, environment hints) where XML structure adds tokens
-    /// without providing semantic value.
+    /// # Panics
+    ///
+    /// Panics if a block already added has no slot in `layout`.
     #[must_use]
-    pub fn system_text(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
-        self.inner = self.inner.system_text(tag, content);
+    pub fn system_layout(mut self, layout: SystemLayout) -> Self {
+        self.inner = self.inner.system_layout(layout);
+        self
+    }
+
+    /// Inserts or replaces the instruction block in `slot`, wrapped in a tag
+    /// named after the slot; see [`AgentBuilder::system_named`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no such slot.
+    #[must_use]
+    pub fn system_named(mut self, slot: &InstructionSlot, content: &str) -> Self {
+        self.inner = self.inner.system_named(slot, content);
+        self
+    }
+
+    /// Inserts or replaces the instruction block in `slot` with raw text; see
+    /// [`AgentBuilder::system_text`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no such slot.
+    #[must_use]
+    pub fn system_text(mut self, slot: &InstructionSlot, content: impl Into<String>) -> Self {
+        self.inner = self.inner.system_text(slot, content);
+        self
+    }
+
+    /// Inserts or replaces the external-content block in `slot`; see
+    /// [`AgentBuilder::external_content`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no such slot.
+    #[must_use]
+    pub fn external_content(mut self, slot: &ExternalSlot, content: ExternalContent) -> Self {
+        self.inner = self.inner.external_content(slot, content);
         self
     }
 
@@ -607,7 +629,9 @@ where
         }
         .render()
         .expect("shell runtime context template must render");
-        self.inner = self.inner.system_text("shell_runtime", shell_context);
+        self.inner = self
+            .inner
+            .system_text(&InstructionSlot::SHELL_RUNTIME, shell_context);
 
         let ssh_context =
             describe_ssh_servers(&self.terminal_tool.shell_sessions().list_ssh_servers());
@@ -994,12 +1018,15 @@ where
         // Configure terminal tool
         let terminal_tool = self.terminal_tool.with_registry(registry);
 
-        let inner = if self.inner.has_system_named("knowledge_and_time") {
+        let inner = if self
+            .inner
+            .has_instruction(&InstructionSlot::KNOWLEDGE_AND_TIME)
+        {
             self.inner
         } else {
             self.inner.system_named(
-                "knowledge_and_time",
-                crate::agent::KnowledgeAndTimeTemplate { websearch_command }
+                &InstructionSlot::KNOWLEDGE_AND_TIME,
+                &crate::agent::KnowledgeAndTimeTemplate { websearch_command }
                     .render()
                     .expect("failed to render knowledge_and_time template"),
             )

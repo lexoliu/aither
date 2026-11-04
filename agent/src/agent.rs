@@ -16,8 +16,8 @@ use crate::{
     config::{AgentConfig, AgentKind, BackgroundJobPolicy},
     context::{
         AnyContextSource, BackgroundJobs, Block, CacheLifetime, CompactionFork,
-        CompletedCompaction, Context, ContextBudget, HandoffDocument, PendingCompaction,
-        PromptCache, TasksDocument, restore_context,
+        CompletedCompaction, Context, ContextBudget, HandoffDocument, InstructionSlot,
+        PendingCompaction, PromptCache, TasksDocument, restore_context,
     },
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
@@ -2413,30 +2413,34 @@ where
     /// Populates the Context's system blocks from `AgentConfig`.
     ///
     /// Called once during initialization. These blocks form the stable
-    /// cacheable prefix of the system message.
+    /// cacheable prefix of the system message; each renders at its slot in
+    /// the host's layout. A built-in block the host already set keeps the
+    /// host's text.
     fn populate_system_blocks(&mut self) {
+        let instructions = self.context.instructions_mut();
         if let Some(ref system_prompt) = self.config.system_prompt {
-            self.context
-                .insert_system_named("base_system", system_prompt);
+            instructions.insert_tagged(&InstructionSlot::BASE_SYSTEM, system_prompt);
         }
 
         if let Some(ref persona_prompt) = self.config.persona_prompt {
-            self.context.insert_system_named("persona", persona_prompt);
+            instructions.insert_tagged(&InstructionSlot::PERSONA, persona_prompt);
         }
 
-        if self.config.agent_kind == AgentKind::Coding {
-            self.context.insert_system_named(
-                "workspace_facts",
-                "When discovering workspace guidance, load AGENT.md first. If AGENT.md is missing, load CLAUDE.md. Treat these files as repository policy for coding tasks; this behavior is not required for chatbot-style sessions.",
+        if self.config.agent_kind == AgentKind::Coding
+            && !instructions.contains(&InstructionSlot::WORKSPACE_FACTS)
+        {
+            instructions.insert_tagged(
+                &InstructionSlot::WORKSPACE_FACTS,
+                include_str!("prompts/workspace_facts.txt"),
             );
         }
 
         // TerminalAgentBuilder pre-seeds this block rendered against the
         // command registry; keep that version when present.
-        if !self.context.has_system_block("knowledge_and_time") {
-            self.context.insert_system_named(
-                "knowledge_and_time",
-                KnowledgeAndTimeTemplate {
+        if !instructions.contains(&InstructionSlot::KNOWLEDGE_AND_TIME) {
+            instructions.insert_tagged(
+                &InstructionSlot::KNOWLEDGE_AND_TIME,
+                &KnowledgeAndTimeTemplate {
                     websearch_command: true,
                 }
                 .render()
@@ -2444,8 +2448,12 @@ where
             );
         }
 
-        self.context
-            .insert_system_named("permissions", include_str!("prompts/permissions.txt"));
+        if !instructions.contains(&InstructionSlot::PERMISSIONS) {
+            instructions.insert_tagged(
+                &InstructionSlot::PERMISSIONS,
+                include_str!("prompts/permissions.txt"),
+            );
+        }
     }
 
     /// Registers the context sources the agent itself owns.
@@ -2911,7 +2919,7 @@ fn tool_result_is_error(tool_result: &aither_core::llm::ToolResult, content: &st
         || content.contains("Invalid arguments")
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -3318,6 +3326,41 @@ mod tests {
 
         assert_eq!(agent.context().stable_prefix_fingerprint(), first);
         assert_eq!(agent.context().build_messages()[0].content(), before);
+    }
+
+    #[tokio::test]
+    async fn the_host_layout_places_and_replaces_built_in_blocks() {
+        use crate::context::{ExternalContent, ExternalSlot, SystemLayout};
+        const MEMORY: ExternalSlot = ExternalSlot::new("memory");
+
+        let mut agent = Agent::builder(MockLlm {
+            context_length: 1_000_000,
+        })
+        .system_layout(SystemLayout::new(
+            [
+                InstructionSlot::PERMISSIONS,
+                InstructionSlot::KNOWLEDGE_AND_TIME,
+                InstructionSlot::WORKSPACE_FACTS,
+                InstructionSlot::BASE_SYSTEM,
+            ],
+            [MEMORY],
+        ))
+        .external_content(&MEMORY, ExternalContent::data("memory", "remembered"))
+        .system_named(&InstructionSlot::PERMISSIONS, "host permissions")
+        .system_prompt("base")
+        .build();
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        let prefix = agent.context().system_prefix().expect("prefix");
+        assert!(
+            prefix.starts_with("<permissions>host permissions</permissions>\n<knowledge_and_time>")
+        );
+        let base = prefix
+            .find("<base_system>base</base_system>")
+            .expect("base");
+        assert!(prefix.find("<workspace_facts>").expect("workspace facts") < base);
+        assert!(base < prefix.find("<external-content-notice>").expect("notice"));
+        assert!(!prefix.contains(include_str!("prompts/permissions.txt")));
     }
 
     #[test]
@@ -3832,9 +3875,10 @@ mod tests {
         // prompt nor the extra message persisted.
         assert!(previewed.initialized);
         assert_eq!(
-            previewed.context().system_blocks(),
-            control.context().system_blocks()
+            previewed.context().instructions(),
+            control.context().instructions()
         );
+        assert_eq!(previewed.context().external(), control.context().external());
         assert!(previewed.context().is_conversation_empty());
     }
 
