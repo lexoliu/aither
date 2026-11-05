@@ -147,6 +147,11 @@ pub struct BackgroundWake {
     /// the background completed, or one is blocked on stdin. The host then
     /// calls [`Agent::resume`].
     pub needs_model: bool,
+    /// The completions this wake recorded. Each job reads
+    /// [`Delivery::Pending`](aither_sandbox::Delivery) in its registry until
+    /// this is dropped, so a host that drops the wake only once the turn it
+    /// starts is visible never reads a finished job with nothing owed.
+    pub pending: Vec<aither_sandbox::PendingCompletion>,
 }
 
 /// One run of an [`Agent`], from [`Agent::run`] or [`Agent::resume`].
@@ -1696,7 +1701,9 @@ where
         receiver: &BackgroundTaskReceiver,
         events: &EventSink,
     ) -> Result<bool, AgentError> {
-        let mut needs_model = self.drain_background_receiver(receiver, events);
+        let (mut needs_model, taken) = self.drain_background_receiver(receiver, events);
+        // The run itself recorded them: the agent has taken them.
+        drop(taken);
         loop {
             // A job blocked on stdin can never complete, so parking on it
             // would hide its alert from the model for the whole wait. Other
@@ -1972,17 +1979,22 @@ where
         }
     }
 
+    /// Records every queued completion; returns whether any was announced,
+    /// with the completions still pending in their registries. Dropping
+    /// those is the agent taking them.
     fn drain_background_receiver(
         &mut self,
         receiver: &BackgroundTaskReceiver,
         events: &EventSink,
-    ) -> bool {
+    ) -> (bool, Vec<aither_sandbox::PendingCompletion>) {
         let mut announced = false;
-        for task in receiver.take_completed() {
+        let mut pending = Vec::new();
+        for mut task in receiver.take_completed() {
             tracing::info!(task_id = %task.task_id, "background task completed (final check)");
+            pending.extend(task.pending.take());
             announced |= self.push_completed_task_event(task, events);
         }
-        announced
+        (announced, pending)
     }
 
     /// Records a completed job in the context; returns whether it was
@@ -2132,6 +2144,11 @@ where
     /// [`BackgroundWake::needs_model`] is set, the host continues with
     /// [`resume`](Self::resume). The wait is cancel-safe: nothing is taken
     /// until it completes. Without a terminal it never completes.
+    ///
+    /// The completions it recorded stay pending in their job registries
+    /// until the host drops the wake's [`BackgroundWake::pending`]: the host
+    /// takes them on the agent's behalf, once its own state shows the turn
+    /// they start.
     pub async fn wait_background(&mut self) -> BackgroundWake {
         let Some(receiver) = self.background_receiver.clone() else {
             return std::future::pending().await;
@@ -2139,14 +2156,18 @@ where
         let event = receiver.recv_event().await;
         let (sender, emitted) = async_channel::unbounded();
         let sink = EventSink { sender };
+        let mut pending = Vec::new();
         let mut needs_model = match event {
-            BackgroundTaskEvent::Completed(task) => {
+            BackgroundTaskEvent::Completed(mut task) => {
                 tracing::info!(task_id = %task.task_id, "background task completed (idle)");
+                pending.extend(task.pending.take());
                 self.push_completed_task_event(*task, &sink)
             }
             BackgroundTaskEvent::Alert(alert) => self.push_job_alert(alert),
         };
-        needs_model |= self.drain_background_receiver(&receiver, &sink);
+        let (announced, drained) = self.drain_background_receiver(&receiver, &sink);
+        needs_model |= announced;
+        pending.extend(drained);
         needs_model |= self.push_job_alerts();
         drop(sink);
         let mut events = Vec::new();
@@ -2156,6 +2177,7 @@ where
         BackgroundWake {
             events,
             needs_model,
+            pending,
         }
     }
 
@@ -3505,6 +3527,7 @@ mod tests {
             result,
             killed: false,
             timeout_kill: None,
+            pending: None,
         }
     }
 
@@ -4977,6 +5000,7 @@ mod tests {
                                 script: "cat".to_string(),
                                 killed: false,
                                 timeout_kill: None,
+                                pending: None,
                                 result: Err(aither_sandbox::TerminalError::Execution(
                                     "fed and finished".to_string(),
                                 )),
@@ -6669,6 +6693,7 @@ mod tests {
             killed: false,
             timeout_kill: None,
             result: Err(aither_sandbox::TerminalError::Execution(output.to_string())),
+            pending: None,
         }
     }
 
@@ -6908,6 +6933,45 @@ mod tests {
             .expect("the queued completion ends the wait");
         assert!(!wake.needs_model);
         assert!(wake.events.is_empty(), "{:?}", wake.events);
+    }
+
+    /// The idle agent's wake keeps a finished job's completion pending in
+    /// its registry until the host drops it: a host reading the registry in
+    /// between always sees a turn owed.
+    #[tokio::test]
+    async fn a_wake_keeps_its_completions_pending_until_the_host_drops_it() {
+        let (mut agent, sender, _llm) = detached_agent(Vec::new());
+        agent.detached_task_ids.insert("task-build".to_string());
+        let (jobs, service) = aither_sandbox::job_registry_channel();
+        tokio::spawn(service.serve());
+        jobs.register(
+            41,
+            "task-build",
+            "exec",
+            "make",
+            aither_sandbox::TerminalMode::Sandboxed,
+            None,
+        )
+        .await;
+        let owed = jobs
+            .owe_completion("task-build", Err("linker error".to_string()))
+            .await
+            .expect("the job is registered");
+        let mut task = finished("task-build", "linker error");
+        task.pending = Some(owed.pending);
+        sender.send_completed(task).await;
+
+        let wake = tokio::time::timeout(Duration::from_secs(5), agent.wait_background())
+            .await
+            .expect("the queued completion ends the wait");
+        assert!(wake.needs_model);
+        assert_eq!(wake.pending.len(), 1);
+        let status = jobs.get(41).await.expect("job should exist").status;
+        assert!(status.completion_pending(), "{status:?}");
+
+        drop(wake);
+        let status = jobs.get(41).await.expect("job should exist").status;
+        assert_eq!(status.delivery(), Some(aither_sandbox::Delivery::Taken));
     }
 
     /// The idle wait gives the event up when it is dropped before anything

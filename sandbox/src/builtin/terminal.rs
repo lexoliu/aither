@@ -156,9 +156,9 @@ const fn default_max_bytes() -> usize {
 fn job_status_text(status: &JobStatus) -> String {
     match status {
         JobStatus::Running => "is running".to_string(),
-        JobStatus::Completed { exit_code } => format!("completed with exit code {exit_code}"),
-        JobStatus::Failed { error } => format!("failed: {error}"),
-        JobStatus::Killed => "was killed".to_string(),
+        JobStatus::Completed { exit_code, .. } => format!("completed with exit code {exit_code}"),
+        JobStatus::Failed { error, .. } => format!("failed: {error}"),
+        JobStatus::Killed { .. } => "was killed".to_string(),
     }
 }
 
@@ -268,7 +268,10 @@ mod tests {
                 "hello",
                 5,
                 1005,
-                JobStatus::Completed { exit_code: 0 }
+                JobStatus::Completed {
+                    exit_code: 0,
+                    delivery: crate::Delivery::Pending,
+                }
             )),
             "hello\nTask 'amber-forest-thunder-pearl' completed with exit code 0; read 5 new bytes (1005 buffered in total); next cursor is 5.\nMore output is buffered: call terminal_read with cursor=5.\n"
         );

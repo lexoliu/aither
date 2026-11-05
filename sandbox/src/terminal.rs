@@ -61,7 +61,7 @@ use crate::{
     command::{
         AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandRole, GateDecision, ToolRegistry,
     },
-    job_registry::{JobRegistry, JobStatus, job_registry_channel},
+    job_registry::{JobRegistry, JobStatus, PendingCompletion, job_registry_channel},
     output::{
         INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, save_raw_to_file,
         stored_path,
@@ -814,6 +814,10 @@ pub struct CompletedTask {
     pub killed: bool,
     /// Set when the kill was the `timeout` bound passing.
     pub timeout_kill: Option<TimeoutKill>,
+    /// Keeps the job reading [`Delivery::Pending`](crate::Delivery) in its
+    /// registry until the agent takes the completion by dropping it; `None`
+    /// for a command the registry never registered.
+    pub pending: Option<PendingCompletion>,
 }
 
 /// Stage of a permission-lifecycle event for `terminal`.
@@ -2824,7 +2828,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                     .job_registry
                     .get_by_task_id(&prepared.task_id)
                     .await
-                    .is_some_and(|job| matches!(job.status, JobStatus::Killed));
+                    .is_some_and(|job| matches!(job.status, JobStatus::Killed { .. }));
                 let command = if killed {
                     CommandResult {
                         stdout: result.stdout,
@@ -3237,7 +3241,7 @@ where
             .job_registry
             .get_by_task_id_settled(&prepared.task_id)
             .await
-            .is_some_and(|job| matches!(job.status, JobStatus::Killed));
+            .is_some_and(|job| matches!(job.status, JobStatus::Killed { .. }));
         if !killed {
             return Ok(CommandResult::from(result));
         }
@@ -3764,11 +3768,14 @@ where
     };
     let _ = result_tx.send(quick_result).await;
     // A kill's signal can end the process before the kill records its
-    // outcome, so the read waits for any kill still in flight.
-    let killed = status_registry
-        .get_by_task_id_settled(&task_id)
-        .await
-        .is_some_and(|job| matches!(job.status, JobStatus::Killed));
+    // outcome, so the registry settles the ending once no kill is in flight;
+    // the job reads its completion pending from the moment it ended.
+    let ending = match &result {
+        Ok(command) => Ok(command.exit_code),
+        Err(error) => Err(error.to_string()),
+    };
+    let owed = status_registry.owe_completion(&task_id, ending).await;
+    let killed = owed.as_ref().is_some_and(|owed| owed.killed);
     // Every job reports completion; the agent reinjects the result only for
     // tasks it saw promoted or detached (`take_started`), so a plain
     // foreground result is not delivered twice.
@@ -3779,6 +3786,7 @@ where
             result,
             killed,
             timeout_kill: timeout_watch.kill().filter(|_| killed),
+            pending: owed.map(|owed| owed.pending),
         })
         .await;
     running_tasks.fetch_sub(1, Ordering::AcqRel);
@@ -7829,6 +7837,86 @@ mod tests {
         );
     }
 
+    /// What a host reading the registry can tell: whether the session still
+    /// owes its agent a turn.
+    fn host_sees_owed_turn(jobs: &[crate::JobInfo]) -> bool {
+        jobs.iter()
+            .any(|job| job.status == JobStatus::Running || job.status.completion_pending())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_detached_job_reads_pending_until_its_completion_is_taken() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
+            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                local: true,
+                container: false,
+                ssh: false,
+            });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let tool = tool.with_registry(registry);
+        let receiver = tool.background_receiver();
+        let jobs = tool.job_registry();
+
+        tool.run_background(TerminalArgs {
+            description: "finish at once".to_string(),
+            script: "exit 3".to_string(),
+            mode: TerminalExecutionMode::Sandboxed,
+            ssh_server_id: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            max_lines: 50,
+            raw: false,
+            timeout: 30,
+            background: true,
+        })
+        .await
+        .expect("terminal call should succeed");
+        let task_id = started_task_id(&receiver);
+
+        // The agent's receiver is the gate: the completion it receives is
+        // held, not yet taken, while the host reads the registry.
+        let completed = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
+            .await
+            .expect("the job should deliver its completion")
+            .expect("the completion channel stays open");
+        assert_eq!(completed.task_id, task_id);
+        let held = jobs.list().await;
+        assert!(
+            held.iter().all(|job| job.status != JobStatus::Running),
+            "the job has finished: {held:?}"
+        );
+        assert!(
+            host_sees_owed_turn(&held),
+            "a finished job whose completion the agent has not taken reads as done: {held:?}"
+        );
+
+        // The agent takes the completion; the registry serves the take
+        // before the list that follows it.
+        drop(completed);
+        let taken = jobs.list().await;
+        assert_eq!(
+            taken[0].status,
+            JobStatus::Completed {
+                exit_code: 3,
+                delivery: crate::Delivery::Taken
+            }
+        );
+        assert!(!host_sees_owed_turn(&taken), "{taken:?}");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn background_terminal_accepts_terminal_input() {
@@ -8357,7 +8445,9 @@ mod tests {
             .expect("the finished job stays in the registry");
         assert_eq!(
             info.status,
-            JobStatus::Killed,
+            JobStatus::Killed {
+                delivery: crate::Delivery::Pending
+            },
             "the promoted job should be killed at its timeout: {completed:?}"
         );
     }
@@ -8719,7 +8809,13 @@ mod tests {
             .get_by_task_id(&task_id)
             .await
             .expect("the finished job stays in the registry");
-        assert_eq!(info.status, JobStatus::Completed { exit_code: 0 });
+        assert_eq!(
+            info.status,
+            JobStatus::Completed {
+                exit_code: 0,
+                delivery: crate::Delivery::Pending
+            }
+        );
         assert!(
             tool.job_registry().format_running_jobs().await.is_empty(),
             "a finished job is no longer listed"
@@ -8766,7 +8862,11 @@ mod tests {
             .get_by_task_id(&task_id)
             .await
             .expect("the killed job stays in the registry");
-        assert_eq!(info.status, JobStatus::Killed);
+        assert!(
+            matches!(info.status, JobStatus::Killed { .. }),
+            "{:?}",
+            info.status
+        );
     }
 
     #[cfg(unix)]
@@ -8803,13 +8903,19 @@ mod tests {
         .await;
         assert_process_gone(child, "the timeout of a job whose shell exited").await;
         let receiver = tool.background_receiver();
-        wait_for_completed_task(&receiver, &task_id).await;
+        let completed = wait_for_completed_task(&receiver, &task_id).await;
         let info = tool
             .job_registry()
             .get_by_task_id(&task_id)
             .await
             .expect("the finished job stays in the registry");
-        assert_eq!(info.status, JobStatus::Killed);
+        assert_eq!(
+            info.status,
+            JobStatus::Killed {
+                delivery: crate::Delivery::Pending
+            },
+            "{completed:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -8884,7 +8990,9 @@ mod tests {
             .expect("the finished job stays in the registry");
         assert_eq!(
             info.status,
-            JobStatus::Killed,
+            JobStatus::Killed {
+                delivery: crate::Delivery::Pending
+            },
             "the job should have been killed at its timeout: {completed:?}"
         );
     }
