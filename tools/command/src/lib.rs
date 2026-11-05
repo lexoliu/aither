@@ -1,4 +1,4 @@
-use std::{borrow::Cow, path::PathBuf};
+use std::{borrow::Cow, fmt, path::PathBuf, process::ExitStatus};
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::{Tool, ToolResult};
@@ -31,9 +31,51 @@ pub struct CommandArgs {
 #[template(path = "output.txt", escape = "none")]
 pub struct CommandOutput {
     pub program: String,
-    pub status: i32,
+    pub termination: Termination,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// How a command ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Termination {
+    /// The process exited with this status code.
+    Exited(i32),
+    /// The process was killed by this signal number.
+    Signaled(i32),
+}
+
+impl Termination {
+    /// Classify a finished process.
+    ///
+    /// # Errors
+    /// Fails when the process neither exited with a code nor was killed by a
+    /// signal, which the platform does not report.
+    pub fn of(status: ExitStatus) -> Result<Self> {
+        if let Some(code) = status.code() {
+            return Ok(Self::Exited(code));
+        }
+        #[cfg(unix)]
+        if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
+            return Ok(Self::Signaled(signal));
+        }
+        bail!("process ended with neither an exit code nor a signal: {status}")
+    }
+}
+
+impl fmt::Display for Termination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exited(code) => write!(f, "exited with status {code}"),
+            Self::Signaled(number) => {
+                #[cfg(unix)]
+                if let Ok(signal) = nix::sys::signal::Signal::try_from(*number) {
+                    return write!(f, "was killed by signal {signal} ({number})");
+                }
+                write!(f, "was killed by signal {number}")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,8 +129,13 @@ impl CommandTool {
             return text;
         }
 
+        // Cut at the last character boundary within the limit.
+        let mut end = self.max_output;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
         let mut truncated = text;
-        truncated.truncate(self.max_output);
+        truncated.truncate(end);
         truncated.push_str("\n...output truncated...");
         truncated
     }
@@ -125,7 +172,7 @@ impl Tool for CommandTool {
 
         let response = CommandOutput {
             program: arguments.program,
-            status: output.status.code().unwrap_or_default(),
+            termination: Termination::of(output.status)?,
             stdout: self.truncate(String::from_utf8_lossy(&output.stdout).to_string()),
             stderr: self.truncate(String::from_utf8_lossy(&output.stderr).to_string()),
         };
@@ -138,11 +185,76 @@ impl Tool for CommandTool {
 mod tests {
     use super::*;
 
+    async fn run(tool: &CommandTool, program: &str, args: &[&str]) -> String {
+        let result = tool
+            .call(
+                CommandArgs {
+                    program: program.into(),
+                    args: args.iter().map(ToString::to_string).collect(),
+                    cwd: None,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .unwrap();
+        match result {
+            ToolResult::Text { text } => text,
+            other => panic!("unexpected result {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncation_stays_on_character_boundaries() {
+        // 'é' is two bytes: every odd limit lands inside a character.
+        let text = "é".repeat(8);
+        for limit in 0..=text.len() {
+            let tool = CommandTool::new(".").max_output(limit);
+            let cut = tool.truncate(text.clone());
+            if limit >= text.len() {
+                assert_eq!(cut, text);
+            } else {
+                let kept = cut.strip_suffix("\n...output truncated...").unwrap();
+                assert_eq!(kept.len(), limit - limit % 2);
+            }
+        }
+        let tool = CommandTool::new(".").max_output(1);
+        assert_eq!(tool.truncate("日本語".into()), "\n...output truncated...");
+    }
+
+    #[tokio::test]
+    async fn long_non_ascii_output_is_truncated_without_panic() {
+        let tool = CommandTool::new(".").max_output(5);
+        let text = run(&tool, "printf", &["日本語日本語"]).await;
+        assert!(
+            text.contains("stdout:\n日\n...output truncated..."),
+            "{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_termination_is_reported_with_the_signal() {
+        let tool = CommandTool::new(".");
+        let text = run(&tool, "sh", &["-c", "kill -KILL $$"]).await;
+        assert!(
+            text.starts_with("sh was killed by signal SIGKILL (9)."),
+            "{text}"
+        );
+        assert!(!text.contains("status 0"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn exit_status_is_still_reported() {
+        let tool = CommandTool::new(".");
+        let text = run(&tool, "sh", &["-c", "exit 3"]).await;
+        assert!(text.starts_with("sh exited with status 3."), "{text}");
+    }
+
     #[test]
     fn output_is_prose_with_labelled_streams() {
         let output = CommandOutput {
             program: "ls".into(),
-            status: 1,
+            termination: Termination::Exited(1),
             stdout: "a\nb".into(),
             stderr: "denied".into(),
         };
@@ -156,7 +268,7 @@ mod tests {
     fn silent_command_says_so() {
         let output = CommandOutput {
             program: "true".into(),
-            status: 0,
+            termination: Termination::Exited(0),
             stdout: String::new(),
             stderr: String::new(),
         };
