@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/May-Agent/aither/compare/agent-v0.15.0...agent-v0.16.0) - 2026-11-05
+
+### Added
+
+- *(agent)* [**breaking**] give both builders the agent options through one trait
+- *(agent)* [**breaking**] report a failed compaction's recovery as an AgentEvent
+- *(agent)* [**breaking**] take each model's request parameters on the builders
+
+### Other
+
+- Merge pull request #457 from May-Agent/main
+- *(agent)* accept a restoration read that finishes within the first poll
+
 ## [0.15.0](https://github.com/May-Agent/aither/compare/agent-v0.14.1...agent-v0.15.0) - 2026-11-04
 
 ### Added
