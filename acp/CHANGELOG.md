@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/May-Agent/aither/compare/acp-v0.17.0...acp-v0.18.0) - 2026-11-05
+
+### Fixed
+
+- *(acp)* connect a session's MCP servers and register their tools on its agent
+- *(acp)* cancel a pending turn instead of waiting for its next event
+- *(agent)* [**breaking**] stop a driven run only between handler calls
+- *(agent)* [**breaking**] keep a run progressing while its caller handles an event
+
+### Other
+
+- Merge pull request #528 from May-Agent/fix/479-session-mcp
+
 ## [0.16.0](https://github.com/May-Agent/aither/compare/acp-v0.15.0...acp-v0.16.0) - 2026-11-05
 
 ### Added

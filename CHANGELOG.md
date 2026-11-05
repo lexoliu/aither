@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/May-Agent/aither/compare/v0.17.0...v0.18.0) - 2026-11-05
+
+### Fixed
+
+- *(acp)* connect a session's MCP servers and register their tools on its agent
+- *(agent)* [**breaking**] keep a run progressing while its caller handles an event
+
+### Other
+
+- Merge pull request #510 from May-Agent/fix/482
+
 ## [0.15.0](https://github.com/May-Agent/aither/compare/v0.14.1...v0.15.0) - 2026-11-04
 
 ### Added

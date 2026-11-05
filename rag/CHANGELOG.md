@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/May-Agent/aither/compare/rag-v0.17.0...rag-v0.18.0) - 2026-11-05
+
+### Fixed
+
+- *(rag)* delete a document by its source id, not by probing chunk ids
+- *(rag)* look an HNSW entry up inside each remove attempt
+- *(rag)* fixed chunker always advances and cuts on characters
+
+### Other
+
+- Merge pull request #530 from May-Agent/fix/485-chunk-tracking
+
 ## [0.12.0](https://github.com/May-Agent/aither/compare/rag-v0.11.0...rag-v0.12.0) - 2026-11-03
 
 ### Other

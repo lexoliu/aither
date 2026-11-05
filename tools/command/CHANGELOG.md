@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/May-Agent/aither/compare/command-v0.17.0...command-v0.18.0) - 2026-11-05
+
+### Fixed
+
+- *(command)* truncate on character boundaries and report signals
+
 ## [0.12.0](https://github.com/May-Agent/aither/compare/command-v0.11.0...command-v0.12.0) - 2026-11-03
 
 ### Other
