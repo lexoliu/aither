@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/May-Agent/aither/compare/acp-v0.18.0...acp-v0.19.0) - 2026-11-05
+
+### Added
+
+- *(agent)* report each request's prompt-prefix hash chain
+
+### Other
+
+- Merge pull request #536 from May-Agent/chore/backmerge-0.18
+- Merge pull request #525 from May-Agent/fix/476-commit-own-blocks
+
 ## [0.18.0](https://github.com/May-Agent/aither/compare/acp-v0.17.0...acp-v0.18.0) - 2026-11-05
 
 ### Fixed
