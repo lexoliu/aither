@@ -112,7 +112,8 @@ pub use heel::NetworkAuditLog;
 /// Re-export of heel's scheduling priority types for terminal-tool configuration.
 pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use job_registry::{
-    JobInfo, JobRegistry, JobRegistryService, JobStatus, TerminalDelta, job_registry_channel,
+    Delivery, JobInfo, JobRegistry, JobRegistryService, JobStatus, OwedCompletion,
+    PendingCompletion, TerminalDelta, job_registry_channel,
 };
 #[cfg(all(unix, feature = "jobserver"))]
 pub use jobserver::{

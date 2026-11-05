@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender, WeakSender};
 use futures_lite::io::AsyncWriteExt;
 
 use crate::permission::TerminalMode;
@@ -35,6 +35,9 @@ pub struct JobInfo {
 }
 
 /// Status of a background job.
+///
+/// Every finished status carries its [`Delivery`]: the transition that
+/// finishes a job also records that its completion is owed to the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobStatus {
     /// Job is currently running.
@@ -43,14 +46,91 @@ pub enum JobStatus {
     Completed {
         /// Exit code of the process.
         exit_code: i32,
+        /// Whether the agent has taken the job's completion.
+        delivery: Delivery,
     },
     /// Job failed with an error.
     Failed {
         /// Error message.
         error: String,
+        /// Whether the agent has taken the job's completion.
+        delivery: Delivery,
     },
     /// Job was killed by user.
-    Killed,
+    Killed {
+        /// Whether the agent has taken the job's completion.
+        delivery: Delivery,
+    },
+}
+
+impl JobStatus {
+    /// How far a finished job's completion got; `None` while it runs.
+    #[must_use]
+    pub const fn delivery(&self) -> Option<Delivery> {
+        match self {
+            Self::Running => None,
+            Self::Completed { delivery, .. }
+            | Self::Failed { delivery, .. }
+            | Self::Killed { delivery } => Some(*delivery),
+        }
+    }
+
+    /// Whether the job finished and its agent has yet to take the
+    /// completion: the agent still owes its session a turn for it.
+    #[must_use]
+    pub const fn completion_pending(&self) -> bool {
+        matches!(self.delivery(), Some(Delivery::Pending))
+    }
+}
+
+/// Whether a finished job's completion has reached its agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// The completion is on its way to the agent, which has not taken it.
+    Pending,
+    /// The agent took the completion: its [`PendingCompletion`] was dropped.
+    Taken,
+}
+
+/// A finished job's completion on its way to the agent.
+///
+/// The job reads [`Delivery::Pending`] in its registry for as long as this
+/// lives; dropping it is the agent taking the completion, which marks the
+/// job [`Delivery::Taken`]. The registry hands out one per job, through
+/// [`JobRegistry::owe_completion`].
+#[must_use = "dropping it marks the completion taken"]
+pub struct PendingCompletion {
+    tx: Sender<JobCommand>,
+    task_id: String,
+}
+
+impl std::fmt::Debug for PendingCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingCompletion")
+            .field("task_id", &self.task_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PendingCompletion {
+    fn drop(&mut self) {
+        // A closed registry has no reader left to tell.
+        let _ = self.tx.try_send(
+            StateCommand::TakeCompletion {
+                task_id: std::mem::take(&mut self.task_id),
+            }
+            .into(),
+        );
+    }
+}
+
+/// What [`JobRegistry::owe_completion`] settled for a job.
+#[derive(Debug)]
+pub struct OwedCompletion {
+    /// Whether the job ended by a kill rather than on its own.
+    pub killed: bool,
+    /// Keeps the completion pending until the agent takes it.
+    pub pending: PendingCompletion,
 }
 
 /// Incremental read result for a background terminal buffer.
@@ -97,11 +177,24 @@ struct JobState {
     /// job's own flow reports meanwhile waits in `deferred_end`.
     kills_in_flight: usize,
     deferred_end: Option<Ending>,
-    /// Callers of `get_by_task_id_settled` parked until the last kill in
-    /// flight records its outcome.
-    settled_waiters: Vec<Sender<Option<JobInfo>>>,
+    /// Callers parked until the last kill in flight records its outcome.
+    settled_waiters: Vec<SettledWaiter>,
     output_redirect: Option<async_fs::File>,
     finished_at: Option<Instant>,
+    /// Whether the job's [`PendingCompletion`] was handed out.
+    completion_owed: bool,
+}
+
+/// A caller waiting for a job's kills in flight to record their outcome.
+#[derive(Debug)]
+enum SettledWaiter {
+    /// `get_by_task_id_settled`.
+    Read(Sender<Option<JobInfo>>),
+    /// `owe_completion`.
+    Owe {
+        ending: Result<i32, String>,
+        reply: Sender<Option<OwedCompletion>>,
+    },
 }
 
 /// State mutations sent to the registry service; none expect a reply.
@@ -145,6 +238,10 @@ enum StateCommand {
     RecordFileReads {
         reads: Vec<(PathBuf, FileFingerprint)>,
     },
+    /// The agent took the completion of task `task_id`.
+    TakeCompletion {
+        task_id: String,
+    },
 }
 
 /// Registry queries and job-control requests, each answered on `reply`.
@@ -163,6 +260,11 @@ enum JobRequest {
     GetByTaskIdSettled {
         task_id: String,
         reply: Sender<Option<JobInfo>>,
+    },
+    OweCompletion {
+        task_id: String,
+        ending: Result<i32, String>,
+        reply: Sender<Option<OwedCompletion>>,
     },
     BeginKill {
         pid: u32,
@@ -284,18 +386,22 @@ pub struct JobRegistry {
 #[derive(Debug)]
 pub struct JobRegistryService {
     rx: Receiver<JobCommand>,
+    /// What each [`PendingCompletion`] reports back on; weak, so the service
+    /// still ends with the last handle.
+    tx: WeakSender<JobCommand>,
 }
 
 /// Creates a registry handle and its background service.
 #[must_use]
 pub fn job_registry_channel() -> (JobRegistry, JobRegistryService) {
     let (tx, rx) = async_channel::unbounded();
+    let weak = tx.downgrade();
     (
         JobRegistry {
             tx,
             scanner: ProcessScanner::default(),
         },
-        JobRegistryService { rx },
+        JobRegistryService { rx, tx: weak },
     )
 }
 
@@ -605,6 +711,34 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
+    /// Settles how task `task_id` ended and hands out the completion it owes
+    /// its agent; its flow calls this once, after the job's process is done,
+    /// and sends the returned [`PendingCompletion`] with the completed task.
+    ///
+    /// Waits for any kill of the job in flight, as
+    /// [`Self::get_by_task_id_settled`] does. A job the registry still reads
+    /// as running ends with `ending` — `Ok(exit_code)` or `Err(error)` — so
+    /// no completion leaves a job running. `None` for a task the registry
+    /// never registered.
+    ///
+    /// # Panics
+    ///
+    /// The registry panics when the job's completion was already handed out.
+    pub async fn owe_completion(
+        &self,
+        task_id: &str,
+        ending: Result<i32, String>,
+    ) -> Option<OwedCompletion> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::OweCompletion {
+            task_id: task_id.to_string(),
+            ending,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
     /// Kills a running job by its PID.
     pub async fn kill(&self, pid: u32) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
@@ -727,6 +861,17 @@ struct ReadTracker {
     file_reads: HashMap<PathBuf, FileFingerprint>,
 }
 
+impl ReadTracker {
+    /// Whether every one of `paths` matches the fingerprint its last read
+    /// recorded; `false` for an empty list.
+    fn file_reads_unchanged(&self, paths: &[(PathBuf, FileFingerprint)]) -> bool {
+        !paths.is_empty()
+            && paths
+                .iter()
+                .all(|(path, stamp)| self.file_reads.get(path) == Some(stamp))
+    }
+}
+
 impl JobRegistryService {
     /// Runs the registry service loop until all senders are dropped.
     pub async fn serve(self) {
@@ -739,7 +884,7 @@ impl JobRegistryService {
                     handle_state_command(&mut jobs, &mut reads, command).await;
                 }
                 JobCommand::Request(request) => {
-                    handle_job_request(&mut jobs, &mut reads, request).await;
+                    handle_job_request(&mut jobs, &mut reads, &self.tx, request).await;
                 }
             }
         }
@@ -795,12 +940,22 @@ async fn handle_state_command(
         StateCommand::RecordFileReads { reads: new_reads } => {
             reads.file_reads.extend(new_reads);
         }
+        StateCommand::TakeCompletion { task_id } => {
+            // A job whose pid a later job reused left the registry with it;
+            // nothing reads its completion any more.
+            if let Some(pid) = find_pid_by_task_id(jobs, &task_id)
+                && let Some(job) = jobs.get_mut(&pid)
+            {
+                take_completion(job);
+            }
+        }
     }
 }
 
 async fn handle_job_request(
     jobs: &mut HashMap<u32, JobState>,
     reads: &mut ReadTracker,
+    tx: &WeakSender<JobCommand>,
     request: JobRequest,
 ) {
     match request {
@@ -821,6 +976,11 @@ async fn handle_job_request(
         JobRequest::GetByTaskIdSettled { task_id, reply } => {
             get_settled_by_task_id(jobs, &task_id, reply).await;
         }
+        JobRequest::OweCompletion {
+            task_id,
+            ending,
+            reply,
+        } => owe_settled_completion(jobs, &task_id, ending, reply, tx).await,
         JobRequest::BeginKill { pid, reply } => {
             let plan = begin_kill(jobs, pid).await;
             let _ = reply.send(plan).await;
@@ -841,7 +1001,7 @@ async fn handle_job_request(
         }
         JobRequest::EndKill { pid, killed, reply } => {
             let result = end_kill(jobs, pid, killed).await;
-            release_settled_waiters(jobs, pid).await;
+            release_settled_waiters(jobs, pid, tx).await;
             let _ = reply.send(result).await;
         }
         JobRequest::InputTerminal {
@@ -878,11 +1038,7 @@ async fn handle_job_request(
             reads: paths,
             reply,
         } => {
-            let unchanged = !paths.is_empty()
-                && paths
-                    .iter()
-                    .all(|(path, stamp)| reads.file_reads.get(path) == Some(stamp));
-            let _ = reply.send(unchanged).await;
+            let _ = reply.send(reads.file_reads_unchanged(&paths)).await;
         }
         JobRequest::TerminalStreamsClosed { pid, reply } => {
             let closed = jobs
@@ -958,7 +1114,116 @@ impl JobState {
             settled_waiters: Vec::new(),
             output_redirect: None,
             finished_at: None,
+            completion_owed: false,
         }
+    }
+}
+
+/// How a job ended, before the registry records it.
+enum JobEnd {
+    Completed { exit_code: i32 },
+    Failed { error: String },
+    Killed,
+}
+
+/// Records how `job` ended: the one transition out of
+/// [`JobStatus::Running`]. The same step marks its completion
+/// [`Delivery::Pending`], so no reader ever sees the job finished with
+/// nothing owed to its agent.
+fn finish(job: &mut JobState, end: JobEnd) {
+    assert!(
+        matches!(job.info.status, JobStatus::Running),
+        "job {} ended twice: it already reads {:?}",
+        job.info.pid,
+        job.info.status
+    );
+    let delivery = Delivery::Pending;
+    job.info.status = match end {
+        JobEnd::Completed { exit_code } => JobStatus::Completed {
+            exit_code,
+            delivery,
+        },
+        JobEnd::Failed { error } => JobStatus::Failed { error, delivery },
+        JobEnd::Killed => JobStatus::Killed { delivery },
+    };
+    job.finished_at = Some(Instant::now());
+    job.kill_switch = None;
+}
+
+/// Marks the completion of `job` taken: the agent dropped its
+/// [`PendingCompletion`].
+fn take_completion(job: &mut JobState) {
+    let pid = job.info.pid;
+    let delivery = match &mut job.info.status {
+        JobStatus::Running => panic!("job {pid}'s completion was taken while it runs"),
+        JobStatus::Completed { delivery, .. }
+        | JobStatus::Failed { delivery, .. }
+        | JobStatus::Killed { delivery } => delivery,
+    };
+    assert_eq!(
+        *delivery,
+        Delivery::Pending,
+        "job {pid}'s completion was taken twice"
+    );
+    *delivery = Delivery::Taken;
+}
+
+/// Hands out the completion of task `task_id`, or parks the request while a
+/// kill of it is in flight.
+async fn owe_settled_completion(
+    jobs: &mut HashMap<u32, JobState>,
+    task_id: &str,
+    ending: Result<i32, String>,
+    reply: Sender<Option<OwedCompletion>>,
+    tx: &WeakSender<JobCommand>,
+) {
+    let Some(pid) = find_pid_by_task_id(jobs, task_id) else {
+        let _ = reply.send(None).await;
+        return;
+    };
+    let job = jobs.get_mut(&pid).expect("the pid was just found");
+    if job.kills_in_flight > 0 {
+        job.settled_waiters
+            .push(SettledWaiter::Owe { ending, reply });
+        return;
+    }
+    let owed = owe_completion(jobs, pid, ending, tx).await;
+    let _ = reply.send(Some(owed)).await;
+}
+
+/// Hands out the completion of job `pid`, no kill of which is in flight; a
+/// job still running ends with `ending` first.
+async fn owe_completion(
+    jobs: &mut HashMap<u32, JobState>,
+    pid: u32,
+    ending: Result<i32, String>,
+    tx: &WeakSender<JobCommand>,
+) -> OwedCompletion {
+    if matches!(jobs[&pid].info.status, JobStatus::Running) {
+        match ending {
+            Ok(exit_code) => complete_job(jobs, pid, exit_code, None).await,
+            Err(error) => fail_job(jobs, pid, error, None).await,
+        }
+    }
+    let job = jobs.get_mut(&pid).expect("the job is registered");
+    assert!(
+        !job.completion_owed,
+        "job {pid}'s completion was handed out twice"
+    );
+    assert!(
+        job.info.status.completion_pending(),
+        "job {pid} owes a completion it never recorded: {:?}",
+        job.info.status
+    );
+    job.completion_owed = true;
+    OwedCompletion {
+        killed: matches!(job.info.status, JobStatus::Killed { .. }),
+        pending: PendingCompletion {
+            tx: tx
+                .upgrade()
+                .expect("a request arrives through a live registry handle"),
+            task_id: job.info.task_id.clone(),
+        },
     }
 }
 
@@ -976,13 +1241,17 @@ async fn append_terminal_output(
         if let Some(file) = job.output_redirect.as_mut()
             && let Err(error) = file.write_all(&chunk).await
         {
-            mark_job_failed(
-                job,
-                format!(
-                    "failed to append redirected output for task {}: {error}",
-                    job.info.task_id
-                ),
-            );
+            // A redirect the model started after the job ended fails the
+            // write alone; the job keeps the ending it already recorded.
+            if matches!(job.info.status, JobStatus::Running) {
+                mark_job_failed(
+                    job,
+                    format!(
+                        "failed to append redirected output for task {}: {error}",
+                        job.info.task_id
+                    ),
+                );
+            }
             tracing::error!(
                 pid = %pid,
                 error = %error,
@@ -1043,9 +1312,7 @@ async fn complete_job(
             mark_job_failed(job, error);
             return;
         }
-        job.info.status = JobStatus::Completed { exit_code };
-        job.finished_at = Some(Instant::now());
-        job.kill_switch = None;
+        finish(job, JobEnd::Completed { exit_code });
         if output_path.is_some() {
             job.info.output_path = output_path;
         }
@@ -1078,7 +1345,6 @@ async fn fail_job(
             error
         };
         mark_job_failed(job, status_error);
-        job.kill_switch = None;
         if output_path.is_some() {
             job.info.output_path = output_path;
         }
@@ -1236,9 +1502,7 @@ async fn start_output_redirect(
 }
 
 fn mark_job_failed(job: &mut JobState, error: String) {
-    job.info.status = JobStatus::Failed { error };
-    job.finished_at = Some(Instant::now());
-    job.kill_switch = None;
+    finish(job, JobEnd::Failed { error });
 }
 
 async fn finalize_output_redirect(job: &mut JobState) -> Result<(), String> {
@@ -1286,8 +1550,7 @@ async fn begin_kill(jobs: &mut HashMap<u32, JobState>, pid: u32) -> KillPlan {
                 "failed to flush redirected output after kill switch signal"
             );
         }
-        job.info.status = JobStatus::Killed;
-        job.finished_at = Some(Instant::now());
+        finish(job, JobEnd::Killed);
         job.stdout_closed = true;
         job.stderr_closed = true;
         tracing::info!(pid = %pid, "killed job via runtime kill switch");
@@ -1317,8 +1580,7 @@ async fn end_kill(jobs: &mut HashMap<u32, JobState>, pid: u32, killed: bool) -> 
                     "failed to flush redirected output after kill"
                 );
             }
-            job.info.status = JobStatus::Killed;
-            job.finished_at = Some(Instant::now());
+            finish(job, JobEnd::Killed);
             job.stdout_closed = true;
             job.stderr_closed = true;
             tracing::info!(pid = %pid, "killed job");
@@ -1347,7 +1609,9 @@ async fn get_settled_by_task_id(
     reply: Sender<Option<JobInfo>>,
 ) {
     match find_pid_by_task_id(jobs, task_id).and_then(|pid| jobs.get_mut(&pid)) {
-        Some(job) if job.kills_in_flight > 0 => job.settled_waiters.push(reply),
+        Some(job) if job.kills_in_flight > 0 => {
+            job.settled_waiters.push(SettledWaiter::Read(reply));
+        }
         Some(job) => {
             let _ = reply.send(Some(job.info.clone())).await;
         }
@@ -1358,7 +1622,11 @@ async fn get_settled_by_task_id(
 }
 
 /// Answers the callers parked on a job once its last kill in flight ended.
-async fn release_settled_waiters(jobs: &mut HashMap<u32, JobState>, pid: u32) {
+async fn release_settled_waiters(
+    jobs: &mut HashMap<u32, JobState>,
+    pid: u32,
+    tx: &WeakSender<JobCommand>,
+) {
     let Some(job) = jobs.get_mut(&pid) else {
         return;
     };
@@ -1366,7 +1634,15 @@ async fn release_settled_waiters(jobs: &mut HashMap<u32, JobState>, pid: u32) {
         return;
     }
     for waiter in std::mem::take(&mut job.settled_waiters) {
-        let _ = waiter.send(Some(job.info.clone())).await;
+        match waiter {
+            SettledWaiter::Read(reply) => {
+                let _ = reply.send(Some(jobs[&pid].info.clone())).await;
+            }
+            SettledWaiter::Owe { ending, reply } => {
+                let owed = owe_completion(jobs, pid, ending, tx).await;
+                let _ = reply.send(Some(owed)).await;
+            }
+        }
     }
 }
 
@@ -1532,7 +1808,13 @@ mod tests {
 
         registry.complete(12345, 0, None).await;
         let job = registry.get(12345).await.unwrap();
-        assert!(matches!(job.status, JobStatus::Completed { exit_code: 0 }));
+        assert_eq!(
+            job.status,
+            JobStatus::Completed {
+                exit_code: 0,
+                delivery: Delivery::Pending
+            }
+        );
     }
 
     #[tokio::test]
@@ -1602,7 +1884,10 @@ mod tests {
         registry.append_stderr(101, b"line3\n".to_vec()).await;
         registry.complete(101, 0, None).await;
         let job = registry.get(101).await.unwrap();
-        assert!(matches!(job.status, JobStatus::Completed { exit_code: 0 }));
+        assert!(matches!(
+            job.status,
+            JobStatus::Completed { exit_code: 0, .. }
+        ));
 
         let redirected = async_fs::read(&redirect_path).await.unwrap();
         assert_eq!(
@@ -1737,7 +2022,7 @@ mod tests {
         assert!(registry.kill_by_task_id("task-kill-switch").await);
         assert!(kill_rx.recv().await.is_ok());
         let job = registry.get(555).await.expect("job should exist");
-        assert!(matches!(job.status, JobStatus::Killed));
+        assert!(matches!(job.status, JobStatus::Killed { .. }));
     }
 
     #[tokio::test]
@@ -1763,7 +2048,7 @@ mod tests {
 
         registry.complete(556, 0, None).await;
         let job = registry.get(556).await.expect("job should exist");
-        assert!(matches!(job.status, JobStatus::Killed));
+        assert!(matches!(job.status, JobStatus::Killed { .. }));
     }
 
     /// A script longer than the preview, with a multibyte character across
@@ -1835,7 +2120,10 @@ mod tests {
         assert!(!end_kill(&mut jobs, 7, false).await);
         assert_eq!(
             jobs[&7].info.status,
-            JobStatus::Completed { exit_code: 0 },
+            JobStatus::Completed {
+                exit_code: 0,
+                delivery: Delivery::Pending
+            },
             "the last kill to fail releases the ending"
         );
     }
@@ -1847,7 +2135,12 @@ mod tests {
         assert!(matches!(begin_kill(&mut jobs, 8).await, KillPlan::Group(8)));
         complete_job(&mut jobs, 8, 0, None).await;
         assert!(end_kill(&mut jobs, 8, true).await);
-        assert_eq!(jobs[&8].info.status, JobStatus::Killed);
+        assert_eq!(
+            jobs[&8].info.status,
+            JobStatus::Killed {
+                delivery: Delivery::Pending
+            }
+        );
     }
 
     /// A job whose process exited from a kill's signal reads as running until
@@ -1903,6 +2196,164 @@ mod tests {
             .await;
         assert!(JobRegistry::recv_reply(reply_rx).await);
         let job = waiting.await.unwrap().expect("job should exist");
-        assert!(matches!(job.status, JobStatus::Killed));
+        assert!(matches!(job.status, JobStatus::Killed { .. }));
+    }
+
+    /// What a host reading the registry can tell: whether the session still
+    /// owes its agent a turn.
+    fn host_sees_owed_turn(jobs: &[JobInfo]) -> bool {
+        jobs.iter()
+            .any(|job| job.status == JobStatus::Running || job.status.completion_pending())
+    }
+
+    #[tokio::test]
+    async fn a_job_reads_its_completion_pending_from_the_transition_that_finishes_it() {
+        let registry = spawn_registry();
+        registry
+            .register(9, "task-owed", "exec", "run", TerminalMode::Sandboxed, None)
+            .await;
+        // The registry serves its commands in order, so this list sees the
+        // state the finishing transition left, before anything else runs.
+        registry.complete(9, 0, None).await;
+        let jobs = registry.list().await;
+        assert!(
+            host_sees_owed_turn(&jobs),
+            "a finished job whose completion was never delivered reads as done: {jobs:?}"
+        );
+
+        // The job's flow hands the completion out; the agent holds it.
+        let owed = registry
+            .owe_completion("task-owed", Ok(0))
+            .await
+            .expect("the job is registered");
+        assert!(!owed.killed);
+        let jobs = registry.list().await;
+        assert!(host_sees_owed_turn(&jobs), "{jobs:?}");
+
+        // The agent takes it.
+        drop(owed);
+        let jobs = registry.list().await;
+        assert_eq!(
+            jobs[0].status,
+            JobStatus::Completed {
+                exit_code: 0,
+                delivery: Delivery::Taken
+            }
+        );
+        assert!(!host_sees_owed_turn(&jobs));
+    }
+
+    #[tokio::test]
+    async fn a_completion_owed_by_a_job_still_running_ends_it_pending() {
+        let registry = spawn_registry();
+        registry
+            .register(
+                10,
+                "task-lost",
+                "exec",
+                "run",
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+        // The flow failed without the registry recording how.
+        let owed = registry
+            .owe_completion("task-lost", Err("output could not be saved".to_string()))
+            .await
+            .expect("the job is registered");
+        assert!(!owed.killed);
+        let job = registry.get(10).await.expect("job should exist");
+        assert_eq!(
+            job.status,
+            JobStatus::Failed {
+                error: "output could not be saved".to_string(),
+                delivery: Delivery::Pending
+            }
+        );
+        assert!(
+            registry
+                .owe_completion("task-never-registered", Ok(0))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completion_owed_during_a_kill_waits_for_its_outcome() {
+        let registry = spawn_registry();
+        registry
+            .register(
+                11,
+                "task-kill",
+                "exec",
+                "run",
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        registry
+            .send_command(JobRequest::BeginKill {
+                pid: 11,
+                reply: reply_tx,
+            })
+            .await;
+        assert!(matches!(
+            JobRegistry::recv_reply(reply_rx).await,
+            KillPlan::Group(11)
+        ));
+        let (reply_tx, owed) = async_channel::bounded(1);
+        registry
+            .send_command(JobRequest::OweCompletion {
+                task_id: "task-kill".to_string(),
+                ending: Ok(137),
+                reply: reply_tx,
+            })
+            .await;
+        // Served after the request above: the owed completion is parked.
+        assert_eq!(
+            registry.get(11).await.expect("job should exist").status,
+            JobStatus::Running
+        );
+        assert!(owed.is_empty(), "the kill is still in flight");
+
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        registry
+            .send_command(JobRequest::EndKill {
+                pid: 11,
+                killed: true,
+                reply: reply_tx,
+            })
+            .await;
+        assert!(JobRegistry::recv_reply(reply_rx).await);
+        let owed = JobRegistry::recv_reply(owed)
+            .await
+            .expect("the job is registered");
+        assert!(owed.killed);
+        assert_eq!(
+            registry.get(11).await.expect("job should exist").status,
+            JobStatus::Killed {
+                delivery: Delivery::Pending
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "handed out twice")]
+    async fn a_completion_is_handed_out_once() {
+        let (tx, _rx) = async_channel::unbounded();
+        let weak = tx.downgrade();
+        let mut jobs = HashMap::new();
+        register_job(
+            &mut jobs,
+            12,
+            "task-twice".to_string(),
+            "exec".to_string(),
+            "run".to_string(),
+            TerminalMode::Sandboxed,
+            None,
+        );
+        let _first = owe_completion(&mut jobs, 12, Ok(0), &weak).await;
+        let _second = owe_completion(&mut jobs, 12, Ok(0), &weak).await;
     }
 }

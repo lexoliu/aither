@@ -3449,6 +3449,7 @@ mod tests {
                 script: "sleep 2".to_string(),
                 killed: false,
                 timeout_kill: None,
+                pending: None,
                 result: Ok(aither_sandbox::CompletedCommand {
                     stdout: aither_core::llm::CommandStream::Inline {
                         text: String::new(),
@@ -3528,6 +3529,7 @@ mod tests {
                 script: "sleep 2".to_string(),
                 killed: false,
                 timeout_kill: None,
+                pending: None,
                 result: Ok(aither_sandbox::CompletedCommand {
                     stdout: aither_core::llm::CommandStream::Inline {
                         text: String::new(),
