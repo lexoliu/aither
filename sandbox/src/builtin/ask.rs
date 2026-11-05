@@ -15,6 +15,7 @@ use askama::Template;
 
 use aither_core::LanguageModel;
 use aither_core::llm::ToolContext;
+use aither_core::llm::model::Parameters;
 use aither_core::llm::{Event, LLMRequest, Message, Tool, ToolResult};
 use futures_lite::StreamExt;
 use schemars::JsonSchema;
@@ -67,12 +68,19 @@ struct AskMessageTemplate<'a> {
 ///
 /// Holds one LLM per selectable tier; [`AskCommand::new`] starts with the
 /// same model on every tier and hosts override individual tiers via the
-/// builder methods.
+/// builder methods. Each request carries the parameters of the model that
+/// answers it.
 #[derive(Debug)]
 pub struct AskCommand<LLM> {
     flagship: LLM,
     balanced: LLM,
     fast: LLM,
+    /// The parameters of the model the command was created with.
+    parameters: Parameters,
+    /// The flagship tier's own model's parameters, once it has one.
+    flagship_parameters: Option<Parameters>,
+    /// The balanced tier's own model's parameters, once it has one.
+    balanced_parameters: Option<Parameters>,
 }
 
 impl<LLM: Clone> AskCommand<LLM> {
@@ -82,21 +90,57 @@ impl<LLM: Clone> AskCommand<LLM> {
             flagship: llm.clone(),
             balanced: llm.clone(),
             fast: llm,
+            parameters: Parameters::default(),
+            flagship_parameters: None,
+            balanced_parameters: None,
         }
     }
 
-    /// Overrides the model used for `model=flagship`.
+    /// Sets the parameters of the requests sent on the model the command
+    /// was created with, on every tier that still answers with it.
     #[must_use]
-    pub fn with_flagship(mut self, llm: LLM) -> Self {
-        self.flagship = llm;
+    pub fn with_parameters(mut self, parameters: Parameters) -> Self {
+        self.parameters = parameters;
         self
     }
 
-    /// Overrides the model used for `model=balanced`.
+    /// Overrides the model used for `model=flagship`, whose requests carry
+    /// `parameters`.
     #[must_use]
-    pub fn with_balanced(mut self, llm: LLM) -> Self {
-        self.balanced = llm;
+    pub fn with_flagship(mut self, llm: LLM, parameters: Parameters) -> Self {
+        self.flagship = llm;
+        self.flagship_parameters = Some(parameters);
         self
+    }
+
+    /// Overrides the model used for `model=balanced`, whose requests carry
+    /// `parameters`.
+    #[must_use]
+    pub fn with_balanced(mut self, llm: LLM, parameters: Parameters) -> Self {
+        self.balanced = llm;
+        self.balanced_parameters = Some(parameters);
+        self
+    }
+}
+
+impl<LLM> AskCommand<LLM> {
+    /// The model that answers `tier`, with the parameters of its requests.
+    fn model_for(&self, tier: AskModelTier) -> (&LLM, &Parameters) {
+        match tier {
+            AskModelTier::Flagship => (
+                &self.flagship,
+                self.flagship_parameters
+                    .as_ref()
+                    .unwrap_or(&self.parameters),
+            ),
+            AskModelTier::Balanced => (
+                &self.balanced,
+                self.balanced_parameters
+                    .as_ref()
+                    .unwrap_or(&self.parameters),
+            ),
+            AskModelTier::Fast => (&self.fast, &self.parameters),
+        }
     }
 }
 
@@ -124,12 +168,9 @@ impl<LLM: LanguageModel> Tool for AskCommand<LLM> {
         .render()
         .expect("ask message template must render");
 
-        let request = LLMRequest::new(vec![Message::user(user_content)]);
-        let llm = match args.model {
-            AskModelTier::Flagship => &self.flagship,
-            AskModelTier::Balanced => &self.balanced,
-            AskModelTier::Fast => &self.fast,
-        };
+        let (llm, parameters) = self.model_for(args.model);
+        let request =
+            LLMRequest::new(vec![Message::user(user_content)]).with_parameters(parameters.clone());
         let response = llm.respond(request);
 
         // Collect the response text
@@ -143,5 +184,106 @@ impl<LLM: LanguageModel> Tool for AskCommand<LLM> {
         }
 
         Ok(ToolResult::text(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use aither_core::llm::model::{Profile, ReasoningEffort};
+    use futures_lite::Stream;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct NeverError;
+
+    impl std::fmt::Display for NeverError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("never fails")
+        }
+    }
+
+    impl std::error::Error for NeverError {}
+
+    impl aither_core::llm::Classify for NeverError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
+
+    /// A model that answers with its name and records the parameters of
+    /// each request under it.
+    #[derive(Clone)]
+    struct RecordingLlm {
+        name: &'static str,
+        seen: Arc<Mutex<Vec<(&'static str, Parameters)>>>,
+    }
+
+    impl LanguageModel for RecordingLlm {
+        type Error = NeverError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.seen
+                .lock()
+                .expect("seen lock")
+                .push((self.name, request.parameters().clone()));
+            futures_lite::stream::iter([Ok(Event::Text(self.name.to_string()))])
+        }
+
+        fn profile(&self) -> impl Future<Output = Result<Profile, Self::Error>> + Send {
+            std::future::ready(Ok(Profile::new(
+                self.name,
+                "test",
+                self.name,
+                "recording model",
+                100_000,
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn each_tier_asks_with_the_parameters_of_its_model() {
+        let seen = Arc::default();
+        let model = |name| RecordingLlm {
+            name,
+            seen: Arc::clone(&seen),
+        };
+        let shared = Parameters::default().reasoning_effort(ReasoningEffort::Low);
+        let flagship = Parameters::default()
+            .reasoning_effort(ReasoningEffort::High)
+            .websearch(true);
+        let ask = AskCommand::new(model("fast"))
+            .with_parameters(shared.clone())
+            .with_flagship(model("flagship"), flagship.clone());
+
+        for tier in [
+            AskModelTier::Fast,
+            AskModelTier::Balanced,
+            AskModelTier::Flagship,
+        ] {
+            let args = AskArgs {
+                prompt: "summarize".to_string(),
+                input: "some text".to_string(),
+                model: tier,
+            };
+            Tool::call(&ask, args, ToolContext::new())
+                .await
+                .expect("ask answers");
+        }
+
+        assert_eq!(
+            *seen.lock().expect("seen lock"),
+            [
+                ("fast", shared.clone()),
+                ("fast", shared),
+                ("flagship", flagship),
+            ],
+            "a tier on the created-with model takes its parameters, one with its own model takes that model's"
+        );
     }
 }
