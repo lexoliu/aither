@@ -9,7 +9,7 @@ use serde_json::json;
 
 use super::{McpClient, McpHandler, ServerNotification};
 use crate::protocol::{ErrorCode, McpError};
-use crate::test_server::{serve, sse};
+use crate::test_server::{serve, serve_routes, sse};
 use crate::transport::{ChildProcessTransport, HttpTransport};
 
 /// Forwards every notification to the test.
@@ -104,6 +104,82 @@ async fn child_process_exit_fails_the_pending_request() {
     // The loop is gone: later requests fail too, and closing is a no-op.
     assert!(client.list_tools().await.is_err());
     client.close().await;
+}
+
+#[tokio::test]
+async fn http_slow_reply_does_not_stall_other_requests_or_server_messages() {
+    use std::sync::Arc;
+
+    use tokio::sync::Notify;
+
+    let slow_arrived = Arc::new(Notify::new());
+    let release_slow = Arc::new(Notify::new());
+    let url = {
+        let slow_arrived = slow_arrived.clone();
+        let release_slow = release_slow.clone();
+        serve_routes(move |request| {
+            let slow_arrived = slow_arrived.clone();
+            let release_slow = release_slow.clone();
+            async move {
+                let reply = |result: serde_json::Value| {
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result}).to_string()
+                };
+                match request["method"].as_str().unwrap() {
+                    "initialize" => (
+                        "Content-Type: application/json\r\n",
+                        reply(json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": {"name": "http-script"}
+                        })),
+                    ),
+                    // Plain-JSON reply, held back until the test lets go.
+                    "tools/call" => {
+                        slow_arrived.notify_one();
+                        release_slow.notified().await;
+                        (
+                            "Content-Type: application/json\r\n",
+                            reply(json!({"content": [], "isError": false})),
+                        )
+                    }
+                    // SSE reply carrying a server message before the result.
+                    "tools/list" => (
+                        "Content-Type: text/event-stream\r\n",
+                        sse(&[
+                            json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}),
+                            serde_json::from_str(&reply(json!({"tools": []}))).unwrap(),
+                        ]),
+                    ),
+                    _ => ("", String::new()),
+                }
+            }
+        })
+        .await
+    };
+
+    let (handler, notifications) = recorder();
+    let client = McpClient::connect(&TokioGlobal, HttpTransport::new(url), handler)
+        .await
+        .unwrap();
+
+    let both = async {
+        tokio::join!(client.call_tool("slow", json!({})), async {
+            // Only once the slow request is at the server, issue another.
+            slow_arrived.notified().await;
+            let tools = client.list_tools().await.unwrap();
+            let first = next(&notifications).await;
+            // The slow request is still outstanding; let it finish.
+            release_slow.notify_one();
+            (tools, first)
+        })
+    };
+    let (slow, (tools, first)) = tokio::time::timeout(Duration::from_secs(10), both)
+        .await
+        .expect("a slow reply stalled the connection");
+
+    assert!(tools.is_empty());
+    assert!(matches!(first, ServerNotification::ToolsListChanged));
+    assert!(!slow.unwrap().is_error);
 }
 
 #[tokio::test]
