@@ -78,6 +78,7 @@ dependencies = [
  "aither-mcp",
  "async-channel",
  "async-process",
+ "executor-core",
  "futures-lite",
  "futures-util",
  "serde",
