@@ -137,6 +137,43 @@ async fn child_process_tool_list_changed_refreshes_the_connection_tools() {
 }
 
 #[tokio::test]
+async fn a_tool_added_by_list_changed_is_a_terminal_command_at_once() {
+    let transport = ChildProcessTransport::from_command(&mut script("changing_tools_server.sh"))
+        .expect("spawn sh");
+    let conn = McpConnection::connect(&TokioGlobal, transport, ())
+        .await
+        .unwrap();
+    let mut builder = aither_sandbox::ToolRegistryBuilder::new();
+    builder.command_set(conn);
+    // The fixture's results are empty, so nothing is saved to the directory.
+    let registry = builder.build(std::env::temp_dir());
+    let mut names = registry.registered_tool_names();
+    names.sort();
+    assert_eq!(names, ["alpha", "beta"]);
+
+    // The server answers this call, then announces a different tool list.
+    assert!(registry.query_tool_handler("alpha", &[]).await.ok);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !registry.is_tool_configured("gamma") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the tool list was not refreshed within 10s");
+
+    // The same registry, never rebuilt, follows the server's list.
+    let mut names = registry.registered_tool_names();
+    names.sort();
+    assert_eq!(names, ["beta", "gamma"]);
+    assert!(registry.tool_help("gamma").is_some());
+    let gone = registry.query_tool_handler("alpha", &[]).await;
+    assert_eq!(
+        gone.error.as_deref(),
+        Some("unknown command 'alpha'. Run 'help' to see available commands.")
+    );
+}
+
+#[tokio::test]
 async fn child_process_exit_fails_the_pending_request() {
     let transport =
         ChildProcessTransport::from_command(&mut script("exiting_server.sh")).expect("spawn sh");

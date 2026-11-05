@@ -36,6 +36,8 @@ use std::sync::Arc;
 
 use aither_core::llm::tool::ToolResultPart;
 use aither_core::llm::{CallIdentity, IntoToolResult, Tool, ToolCallId, ToolContext, ToolResult};
+
+use crate::command_set::{AnyCommandSet, CommandSet};
 use askama::Template;
 use async_channel::{Receiver, Sender};
 use heel::IpcCommand;
@@ -924,6 +926,7 @@ impl std::fmt::Debug for DynTerminalTool {
 pub struct ToolRegistryBuilder {
     entries: HashMap<String, RoleEntries<Arc<ToolEntry>>>,
     bound: HashMap<String, RoleEntries<Arc<BoundEntry>>>,
+    sets: Vec<AnyCommandSet>,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
     kept: HashSet<String>,
@@ -1043,6 +1046,7 @@ impl ToolRegistryBuilder {
     fn restrict(&mut self, configure: impl FnOnce(&mut Self), restriction: Restriction) {
         let mut restricted = Self::new();
         configure(&mut restricted);
+        restricted.assert_no_sets("restricted to the main agent");
         self.kept.extend(restricted.kept);
         for (name, entries) in restricted.entries {
             self.insert_entry(
@@ -1074,6 +1078,7 @@ impl ToolRegistryBuilder {
     pub fn sandboxed_only(&mut self, configure: impl FnOnce(&mut Self)) {
         let mut scoped = Self::new();
         configure(&mut scoped);
+        scoped.assert_no_sets("scoped to sandboxed modes");
         self.kept.extend(scoped.kept);
         for (name, mut entries) in scoped.entries {
             entries.modes = ModeScope::Sandboxed;
@@ -1093,6 +1098,7 @@ impl ToolRegistryBuilder {
     pub fn kept_through_compaction(&mut self, configure: impl FnOnce(&mut Self)) {
         let mut registered = Self::new();
         configure(&mut registered);
+        registered.assert_no_sets("kept through compaction");
         self.kept.extend(registered.kept);
         self.kept.extend(registered.entries.keys().cloned());
         self.kept.extend(registered.bound.keys().cloned());
@@ -1181,6 +1187,27 @@ impl ToolRegistryBuilder {
         );
     }
 
+    /// Registers every command `set` holds, for both roles in every mode.
+    ///
+    /// The registry asks the set for its commands whenever it lists or
+    /// resolves one, so a command the set gains is runnable from the next
+    /// terminal execution and one it loses stops being runnable. A name a
+    /// command registered any other way already has, or an earlier set
+    /// holds, stays with that command.
+    pub fn command_set(&mut self, set: impl CommandSet) {
+        self.sets.push(AnyCommandSet::new(set));
+    }
+
+    /// A set serves every role and mode alike and is never kept through
+    /// compaction, so a scoped registration holding one is a mistake in the
+    /// host.
+    fn assert_no_sets(&self, scope: &str) {
+        assert!(
+            self.sets.is_empty(),
+            "a command set serves every role and mode and cannot be {scope}"
+        );
+    }
+
     /// Has `observer` told about every call of a resolved command the main
     /// agent's registry serves. A subagent's registry is observed by the
     /// observer given to [`ToolRegistry::for_subagent`].
@@ -1207,6 +1234,7 @@ impl ToolRegistryBuilder {
             kept_rx,
             entries: self.entries,
             bound: self.bound,
+            sets: self.sets.into(),
             instances: HashMap::new(),
             output_dir: output_dir.into(),
             role: CommandRole::Main,
@@ -1402,6 +1430,9 @@ impl std::fmt::Debug for KeptExchangeReceiver {
 pub struct ToolRegistry {
     entries: HashMap<String, RoleEntries<Arc<ToolEntry>>>,
     bound: HashMap<String, RoleEntries<Arc<BoundEntry>>>,
+    /// The command sets, asked for their commands at each lookup, in
+    /// registration order.
+    sets: Arc<[AnyCommandSet]>,
     /// The terminal-bound commands built for the terminal serving this
     /// registry, in its role.
     instances: HashMap<String, Arc<ToolEntry>>,
@@ -1528,6 +1559,7 @@ impl ToolRegistry {
             kept_rx,
             entries: self.entries.clone(),
             bound: self.bound.clone(),
+            sets: self.sets.clone(),
             instances: HashMap::new(),
             output_dir: self.output_dir.clone(),
             role: CommandRole::Subagent,
@@ -1655,41 +1687,97 @@ impl ToolRegistry {
             Some(Resolved {
                 handler: Some(handler),
                 ..
-            }) => {
-                let caller = Caller {
-                    call: self.call.clone(),
-                    working_dir: working_dir.map(|dir| dir.to_string_lossy().into_owned()),
-                };
-                let outcome = match handler(caller, args.to_vec()).await {
-                    Ok(output) => handle_large_output(output, &self.output_dir).await,
-                    Err(error) => CommandEnvelope::failure(error),
-                };
-                if outcome.ok
-                    && self.kept.contains(tool_name)
-                    && let Some(call) = &self.call
-                {
-                    self.kept_tx
-                        .try_send(call.call().clone())
-                        .expect("the registry holds its kept channel open and unbounded");
-                }
-                if let Some(observer) = &self.observer {
-                    observer
-                        .command_called(&CommandCall {
-                            role: self.role,
-                            name: tool_name,
-                            call: self.call.as_ref(),
-                            args,
-                            outcome: &outcome,
-                        })
-                        .await;
-                }
-                outcome
-            }
+            }) => self.run(tool_name, handler, args, working_dir).await,
             Some(Resolved { handler: None, .. }) => {
                 CommandEnvelope::failure(reserved_for_main_text(tool_name))
             }
-            None => CommandEnvelope::failure(unknown_command_text(tool_name)),
+            None => match self.set_entry(tool_name) {
+                Some(entry) => self.run(tool_name, &entry.handler, args, working_dir).await,
+                None => CommandEnvelope::failure(unknown_command_text(tool_name)),
+            },
         }
+    }
+
+    /// Runs `handler`, the command `tool_name` resolved to, and reports the
+    /// call to the kept-exchange channel and the observer.
+    async fn run(
+        &self,
+        tool_name: &str,
+        handler: &ToolHandlerFn,
+        args: &[String],
+        working_dir: Option<&Path>,
+    ) -> CommandEnvelope {
+        let caller = Caller {
+            call: self.call.clone(),
+            working_dir: working_dir.map(|dir| dir.to_string_lossy().into_owned()),
+        };
+        let outcome = match handler(caller, args.to_vec()).await {
+            Ok(output) => handle_large_output(output, &self.output_dir).await,
+            Err(error) => CommandEnvelope::failure(error),
+        };
+        if outcome.ok
+            && self.kept.contains(tool_name)
+            && let Some(call) = &self.call
+        {
+            self.kept_tx
+                .try_send(call.call().clone())
+                .expect("the registry holds its kept channel open and unbounded");
+        }
+        if let Some(observer) = &self.observer {
+            observer
+                .command_called(&CommandCall {
+                    role: self.role,
+                    name: tool_name,
+                    call: self.call.as_ref(),
+                    args,
+                    outcome: &outcome,
+                })
+                .await;
+        }
+        outcome
+    }
+
+    /// Whether a command registered other than through a set has
+    /// `tool_name`, in any role or mode: such a name never resolves to a set.
+    fn is_fixed(&self, tool_name: &str) -> bool {
+        self.entries.contains_key(tool_name) || self.bound.contains_key(tool_name)
+    }
+
+    /// The entry of the command `tool_name` from the first set holding it,
+    /// as the set holds it now; `None` when a fixed command has the name.
+    fn set_entry(&self, tool_name: &str) -> Option<ToolEntry> {
+        if self.is_fixed(tool_name) {
+            return None;
+        }
+        self.sets.iter().find_map(|set| {
+            let definition = set
+                .definitions()
+                .into_iter()
+                .find(|definition| definition.name() == tool_name)?;
+            let set = set.clone();
+            let name = definition.name().to_string();
+            let (_, entry) = definition_entry(&definition, move |call, arguments| {
+                let set = set.clone();
+                let name = name.clone();
+                Box::pin(async move { set.call(&name, call, arguments).await })
+            });
+            Some(entry)
+        })
+    }
+
+    /// The names the sets hold now that no fixed command has, each once, in
+    /// set order.
+    fn set_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for set in self.sets.iter() {
+            for definition in set.definitions() {
+                let name = definition.name();
+                if !self.is_fixed(name) && !names.iter().any(|known| known == name) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names
     }
 
     /// Returns whether a tool is registered for this registry's role and
@@ -1697,6 +1785,9 @@ impl ToolRegistry {
     /// for a subagent, nor one for sandboxed modes alone in an unsafe one.
     #[must_use]
     pub fn is_tool_configured(&self, tool_name: &str) -> bool {
+        if !self.is_fixed(tool_name) {
+            return self.set_names().iter().any(|name| name == tool_name);
+        }
         self.bound.get(tool_name).map_or_else(
             || {
                 self.entries
@@ -1724,19 +1815,24 @@ impl ToolRegistry {
     /// Returns the help text for a tool.
     #[must_use]
     pub fn tool_help(&self, tool_name: &str) -> Option<String> {
-        self.resolve(tool_name)
-            .map(|resolved| resolved.help.to_string())
+        self.resolve(tool_name).map_or_else(
+            || self.set_entry(tool_name).map(|entry| entry.help),
+            |resolved| Some(resolved.help.to_string()),
+        )
     }
 
     /// Returns the stdin argument for a tool.
     #[must_use]
     pub fn tool_stdin_arg(&self, tool_name: &str) -> Option<String> {
-        self.resolve(tool_name)
-            .and_then(|resolved| resolved.stdin_arg.map(str::to_string))
+        self.resolve(tool_name).map_or_else(
+            || self.set_entry(tool_name).and_then(|entry| entry.stdin_arg),
+            |resolved| resolved.stdin_arg.map(str::to_string),
+        )
     }
 
     /// Returns the names of the tools registered for this registry's role and
-    /// mode, those reserved for the main agent included.
+    /// mode, those reserved for the main agent included, and the commands
+    /// the command sets hold now.
     #[must_use]
     pub fn registered_tool_names(&self) -> Vec<String> {
         self.entries
@@ -1750,7 +1846,14 @@ impl ToolRegistry {
                     .map(|(name, _)| name),
             )
             .cloned()
+            .chain(self.set_names())
             .collect()
+    }
+
+    /// The command sets this registry serves, in registration order.
+    #[must_use]
+    pub fn command_sets(&self) -> &[AnyCommandSet] {
+        &self.sets
     }
 
     /// Returns the registered tool names this registry's role can actually
@@ -3977,6 +4080,100 @@ mod tests {
         assert_eq!(pending[0].as_str(), "call_3");
         let subagent = registry.for_subagent(None, None).kept_receiver();
         assert_eq!(subagent.take_pending(), []);
+    }
+
+    /// A command set whose commands the test replaces; each command answers
+    /// with its own name and the arguments it was given.
+    #[derive(Clone, Default)]
+    struct ChangingSet(Arc<arc_swap::ArcSwap<Vec<&'static str>>>);
+
+    impl ChangingSet {
+        fn offer(&self, names: &[&'static str]) {
+            self.0.store(Arc::new(names.to_vec()));
+        }
+    }
+
+    impl CommandSet for ChangingSet {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            self.0
+                .load()
+                .iter()
+                .map(|name| {
+                    ToolDefinition::from_parts(
+                        Cow::Borrowed(*name),
+                        Cow::Borrowed("Answers with its name."),
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {"word": {"type": "string"}},
+                            "required": ["word"]
+                        }),
+                    )
+                    .expect("the fixture schema is a schema")
+                })
+                .collect()
+        }
+
+        fn call(
+            &self,
+            name: &str,
+            _call: Option<CallIdentity>,
+            arguments: Value,
+        ) -> impl Future<Output = Result<ToolResult, String>> + Send {
+            std::future::ready(Ok(ToolResult::text(format!(
+                "{name} {}",
+                arguments["word"]
+            ))))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_set_change_is_runnable_at_once_in_every_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let set = ChangingSet::default();
+        set.offer(&["alpha", "shared"]);
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(RoleTool {
+            name: "shared",
+            answer: "fixed",
+        });
+        builder.command_set(set.clone());
+        let main = builder.build(tmp.path());
+        let subagent = main.for_subagent(None, None);
+        let args = ["hi".to_string()];
+
+        let mut names = main.registered_tool_names();
+        names.sort();
+        assert_eq!(names, ["alpha", "shared"]);
+        let ran = main.query_tool_handler("alpha", &args).await;
+        assert_eq!(ran.payload.unwrap().render_for_cli(), "alpha \"hi\"");
+        // A fixed command keeps its name against a set.
+        let fixed = run_command(&main, "shared").await;
+        assert_eq!(fixed.payload.unwrap().render_for_cli(), "fixed");
+
+        set.offer(&["gamma"]);
+        for registry in [&main, &subagent] {
+            assert!(registry.is_tool_configured("gamma"));
+            assert!(!registry.is_tool_configured("alpha"));
+            assert!(
+                registry
+                    .tool_help("gamma")
+                    .is_some_and(|help| help.starts_with("Answers with its name."))
+            );
+            let ran = registry.query_tool_handler("gamma", &args).await;
+            assert_eq!(ran.payload.unwrap().render_for_cli(), "gamma \"hi\"");
+            let gone = registry.query_tool_handler("alpha", &args).await;
+            assert_eq!(
+                gone.error.as_deref(),
+                Some("unknown command 'alpha'. Run 'help' to see available commands.")
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "a command set serves every role and mode")]
+    fn a_command_set_cannot_be_reserved_for_the_main_agent() {
+        let mut builder = ToolRegistryBuilder::new();
+        builder.main_only(|main| main.command_set(ChangingSet::default()));
     }
 
     #[tokio::test]

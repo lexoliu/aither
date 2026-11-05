@@ -28,7 +28,6 @@ use tracing::debug;
 pub use handler::{McpHandler, ServerNotification};
 pub use toolset::{
     McpConnection, McpServerConfig, McpServersConfig, McpToolService, call_result_to_tool_result,
-    register_terminal_commands,
 };
 
 use connection::Command;

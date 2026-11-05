@@ -7,8 +7,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use aither_core::llm::CallIdentity;
 use aither_core::llm::tool::{ToolDefinition, ToolResult, ToolResultPart};
-use aither_sandbox::ToolRegistryBuilder;
+use aither_sandbox::CommandSet;
 use askama::Template;
 use async_process::Command;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -410,35 +411,30 @@ fn error_message_text(content: &[Content]) -> String {
     }
 }
 
-/// Registers all tools from an MCP connection as schema-driven terminal commands.
+/// The server's tools as terminal commands that follow its tool list.
 ///
-/// Each command derives its help text, positional arguments, and validation
-/// behavior from the MCP tool's JSON schema via
-/// [`aither_sandbox::ToolRegistryBuilder::configure_definition_handler`].
-pub fn register_terminal_commands(
-    registry: &mut ToolRegistryBuilder,
-    conn: McpConnection,
-) -> Vec<ToolDefinition> {
-    let definitions = conn.definitions();
-    let conn = Arc::new(conn);
-
-    for definition in &definitions {
-        let tool_name = definition.name().to_string();
-        let conn = conn.clone();
-        registry.configure_definition_handler(definition, move |_call, arguments| {
-            let conn = conn.clone();
-            let tool_name = tool_name.clone();
-            Box::pin(async move {
-                let result = conn
-                    .call(tool_name.as_str(), arguments)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                call_result_to_tool_result(result).map_err(|error| error.to_string())
-            })
-        });
+/// Register a connection with
+/// [`ToolRegistryBuilder::command_set`](aither_sandbox::ToolRegistryBuilder::command_set):
+/// each tool becomes a command whose help text, positional arguments and
+/// validation derive from its JSON schema, and a tool the server adds or
+/// removes with `notifications/tools/list_changed` becomes runnable, or stops
+/// being runnable, as soon as the connection has re-listed.
+impl CommandSet for McpConnection {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        Self::definitions(self)
     }
 
-    definitions
+    async fn call(
+        &self,
+        name: &str,
+        _call: Option<CallIdentity>,
+        arguments: serde_json::Value,
+    ) -> Result<ToolResult, String> {
+        let result = Self::call(self, name, arguments)
+            .await
+            .map_err(|error| error.to_string())?;
+        call_result_to_tool_result(result).map_err(|error| error.to_string())
+    }
 }
 
 impl McpToolService {

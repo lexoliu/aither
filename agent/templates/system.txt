@@ -28,12 +28,10 @@ You cannot run commands by writing text responses; you must use tool calls.
 </environment>
 {% endif %}
 
-<commands>
-{{ tools }}
-
+<command-runtime>
 <runtime>{{ host_runtime_context }}</runtime>
 <ipc-scope>CLI commands exposed through terminal are available on local runtime executions and unavailable on SSH runtime.</ipc-scope>
-</commands>
+</command-runtime>
 {% if has_skills %}
 <skills>
 {{ skills }}

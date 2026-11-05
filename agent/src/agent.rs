@@ -793,6 +793,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     pub(crate) kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
     /// Calls reported by `kept_receiver` whose results are not committed yet.
     pub(crate) kept_exchanges: HashSet<String>,
+    /// The commands `terminal` runs, kept current in the command table
+    /// block; `None` for an agent without a terminal agent's command table.
+    pub(crate) commands: Option<crate::command_catalog::CommandCatalog>,
     /// Receiver for the host memory pressure and machine load events.
     pub(crate) host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
     /// Registry for running background terminal tasks.
@@ -915,6 +918,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             permission_receiver: None,
             kept_receiver: None,
             kept_exchanges: HashSet::new(),
+            commands: None,
             host_load_events: None,
             job_registry: None,
             detached_task_ids: HashSet::new(),
@@ -2656,6 +2660,28 @@ where
         self.context.push_block_alert(&block);
     }
 
+    /// Brings the command table block to the commands the terminal runs now.
+    ///
+    /// The table is live content: a command a set gained or lost since the
+    /// model last learned the table is announced once, as a diff, and the
+    /// next reassembly folds the clean table into the prefix.
+    fn sync_command_table(&mut self) {
+        let Some(commands) = &self.commands else {
+            return;
+        };
+        let table = commands.render();
+        let before = self.context.conversation_chars();
+        if self
+            .context
+            .update_live(&crate::context::LiveContent::COMMANDS, |update| {
+                update.instruction(&crate::context::InstructionSlot::COMMANDS, table);
+            })
+        {
+            self.budget
+                .append(self.context.conversation_chars().saturating_sub(before));
+        }
+    }
+
     /// Delivers the context lifecycle hooks injected since the last call, one
     /// system alert per piece. A piece leaves the hooks' inbox as it is
     /// delivered, so it reaches the model once.
@@ -2672,6 +2698,7 @@ where
     async fn push_request_alerts(&mut self) {
         self.push_injected_context();
         self.push_host_load_alerts();
+        self.sync_command_table();
         let reassembled = std::mem::take(&mut self.reassembled);
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_request(reassembled).await {
@@ -3026,6 +3053,7 @@ where
 
         self.sync_compact_signal();
         self.commit_tail(&tail).await;
+        self.context.mark_prefix_sent();
         self.warmth.start_entry_now();
         self.idle_compacted = false;
         self.publish_fork_snapshot(&tail, &definitions);

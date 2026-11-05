@@ -1,0 +1,3 @@
+{{ subject }} changed. The system prompt above still shows the version before this change; apply this diff to it (the context will fold the current version in later). The diff ends only at the closing tag carrying boundary {{ boundary }}:
+<{{ tag }} boundary="{{ boundary }}">
+{{ diff }}</{{ tag }} boundary="{{ boundary }}">

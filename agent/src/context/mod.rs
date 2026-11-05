@@ -19,11 +19,15 @@
 //! - [`reassembly`] re-reads what the handoff named, within budget;
 //! - [`source`] is how everything ambient — working documents, running jobs,
 //!   active skills — reaches the model without the agent loop knowing about
-//!   any of it in particular.
+//!   any of it in particular;
+//! - [`live`] is how prefix content that changes mid-session — `AGENTS.md`,
+//!   the command table — reaches the model as one diff while the prefix is
+//!   cached and as its clean version after the next reassembly.
 
 pub mod budget;
 pub mod cache;
 pub mod compaction;
+pub mod live;
 pub mod policy;
 pub mod reassembly;
 pub(crate) mod recovery;
@@ -38,6 +42,7 @@ pub use compaction::{
     CompactionError, CompactionFork, CompletedCompaction, ContextFile, Handoff, HandoffDocument,
     LineRange, PendingCompaction, SkillCatalogEntry, build_file_index,
 };
+pub use live::{LiveContent, LiveUpdate};
 pub use policy::ContextPolicy;
 pub use reassembly::restore_context;
 pub use source::{AnyContextSource, Block, ContextSource};

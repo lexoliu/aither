@@ -152,7 +152,7 @@ pub mod transport;
 #[cfg(feature = "client")]
 pub use client::{
     McpClient, McpConnection, McpHandler, McpServerConfig, McpServersConfig, McpToolService,
-    ServerNotification, call_result_to_tool_result, register_terminal_commands,
+    ServerNotification, call_result_to_tool_result,
 };
 pub use protocol::{CallToolResult, Content, McpError, McpToolDefinition};
 #[cfg(feature = "server")]
