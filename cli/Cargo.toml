@@ -22,7 +22,6 @@ aither-cloud.workspace = true
 aither-core.workspace = true
 aither-mcp.workspace = true
 anyhow = "1.0"
-async-lock = "3"
 serde_json = "1.0"
 clap = { version = "4.6", features = ["derive"] }
 arc-swap = "1.9"

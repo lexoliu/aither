@@ -3,13 +3,14 @@
 //! Run with: cargo run --example context7 -p aither-mcp
 
 use aither_mcp::McpConnection;
+use executor_core::tokio::TokioGlobal;
 
 #[tokio::main]
 async fn main() {
     println!("Connecting to Context7 MCP server...");
 
     // Connect to Context7's remote HTTP server
-    let mut conn = match McpConnection::http("https://mcp.context7.com/mcp").await {
+    let conn = match McpConnection::http(&TokioGlobal, "https://mcp.context7.com/mcp").await {
         Ok(conn) => conn,
         Err(e) => {
             eprintln!("Failed to connect: {e}");

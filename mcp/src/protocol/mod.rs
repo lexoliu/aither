@@ -10,8 +10,8 @@ pub use message::{
 };
 pub use types::{
     CallToolParams, CallToolResult, CancelledParams, ClientCapabilities, Content, EmbeddedResource,
-    ImageContent, InitializeParams, InitializeResult, ListToolsResult, McpToolDefinition,
-    PROTOCOL_VERSION, ProgressNotificationParams, ProgressToken, PromptMessage, RequestMeta,
-    Resource, ResourceContent, ResourceContents, ServerCapabilities, ServerInfo, TextContent,
-    ToolsCapability,
+    ImageContent, InitializeParams, InitializeResult, ListToolsResult, LoggingLevel,
+    LoggingMessageParams, McpToolDefinition, PROTOCOL_VERSION, ProgressNotificationParams,
+    ProgressToken, PromptMessage, RequestMeta, Resource, ResourceContent, ResourceContents,
+    ServerCapabilities, ServerInfo, TextContent, ToolsCapability,
 };

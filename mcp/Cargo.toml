@@ -13,7 +13,7 @@ categories = ["api-bindings"]
 
 [features]
 default = ["client", "server", "http"]
-client = ["dep:aither-sandbox", "dep:askama"]
+client = ["dep:aither-sandbox", "dep:askama", "dep:executor-core"]
 server = []
 http = ["client", "dep:zenwave"]
 
@@ -21,6 +21,7 @@ http = ["client", "dep:zenwave"]
 aither-core.workspace = true
 aither-sandbox = { workspace = true, optional = true }
 askama = { version = "0.16", optional = true }
+executor-core = { version = "0.7", optional = true, default-features = false }
 # `hyper-rustls` rather than the workspace default: `default-backend` also
 # enables `native-tls`, and a crate consumed by a cross-compiled daemon must
 # not drag openssl-sys into its feature-unified graph.
@@ -35,7 +36,6 @@ thiserror = "2"
 # Drives stdin/stdout on blocking threads; see transport::stdio.
 blocking = "1"
 async-process = "2"
-async-lock = "3"
 # FuturesUnordered + Abortable for concurrent tools/call; see server.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tracing = "0.1"
@@ -45,6 +45,7 @@ name = "context7"
 required-features = ["http"]
 
 [dev-dependencies]
+executor-core = { version = "0.7", features = ["tokio"] }
 futures-lite = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

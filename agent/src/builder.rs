@@ -770,7 +770,7 @@ where
     /// use aither_mcp::McpConnection;
     ///
     /// // Connect to an MCP server
-    /// let conn = McpConnection::spawn("npx", &["-y", "@modelcontextprotocol/server-filesystem", "/"]).await?;
+    /// let conn = McpConnection::spawn(&executor, "npx", &["-y", "@modelcontextprotocol/server-filesystem", "/"]).await?;
     ///
     /// let agent = Agent::builder(llm)
     ///     .mcp(conn)
@@ -780,8 +780,8 @@ where
     /// # Multiple Servers
     ///
     /// ```rust,ignore
-    /// let filesystem = McpConnection::spawn("npx", &["-y", "@modelcontextprotocol/server-filesystem", "/"]).await?;
-    /// let github = McpConnection::spawn("npx", &["-y", "@modelcontextprotocol/server-github"]).await?;
+    /// let filesystem = McpConnection::spawn(&executor, "npx", &["-y", "@modelcontextprotocol/server-filesystem", "/"]).await?;
+    /// let github = McpConnection::spawn(&executor, "npx", &["-y", "@modelcontextprotocol/server-github"]).await?;
     ///
     /// let agent = Agent::builder(llm)
     ///     .mcp(filesystem)
@@ -795,7 +795,7 @@ where
     /// use aither_mcp::{McpConnection, McpServersConfig};
     ///
     /// let config: McpServersConfig = serde_json::from_str(&config_json)?;
-    /// let connections = McpConnection::from_configs(&config).await?;
+    /// let connections = McpConnection::from_configs(&executor, &config).await?;
     ///
     /// let mut builder = Agent::builder(llm);
     /// for (_name, conn) in connections {
