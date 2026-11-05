@@ -4,8 +4,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use aither_agent::Agent;
 use aither_core::LanguageModel;
@@ -23,7 +21,7 @@ use crate::protocol::{
     SessionInfo, SessionListCapabilities, SessionListResult, SessionNewParams, SessionNewResult,
     SessionNotification, SessionUpdate, StopReason,
 };
-use crate::session::AcpSession;
+use crate::session::{AcpSession, Cancellation};
 
 /// ACP server that exposes aither agents to code editors.
 ///
@@ -45,12 +43,12 @@ pub struct AcpServer<T: BidirectionalTransport, LLM: LanguageModel + 'static> {
     transport: T,
     info: Implementation,
     sessions: HashMap<String, AcpSession<LLM>>,
-    /// Cancellation flags indexed by session ID.
+    /// Cancellation requests indexed by session ID.
     ///
     /// A prompt turn borrows its session out of `sessions`, so a
     /// `session/cancel` notification cannot reach it through the map; the
-    /// flag is shared state that always can.
-    cancellations: HashMap<String, Arc<AtomicBool>>,
+    /// request is shared state that always can.
+    cancellations: HashMap<String, Cancellation>,
     initialized: bool,
     /// Builds a fresh agent for each new session.
     ///
@@ -193,8 +191,8 @@ impl<T: BidirectionalTransport, LLM: LanguageModel + 'static> AcpServer<T, LLM> 
         match notif.method.as_str() {
             "session/cancel" => match notif.params.clone().map(serde_json::from_value) {
                 Some(Ok(SessionCancelParams { session_id, .. })) => {
-                    if let Some(flag) = self.cancellations.get(&session_id) {
-                        flag.store(true, Ordering::SeqCst);
+                    if let Some(cancellation) = self.cancellations.get(&session_id) {
+                        cancellation.cancel();
                     } else {
                         debug!("session/cancel for unknown session: {session_id}");
                     }
