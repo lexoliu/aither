@@ -48,7 +48,7 @@ use aither_agent::sandbox::{
     schema_to_help,
 };
 use aither_agent::specialized::SubagentTool;
-use aither_agent::{Agent, Hook, TerminalAgentBuilder};
+use aither_agent::{Agent, AgentOptions, Hook, TerminalAgentBuilder};
 use aither_core::LanguageModel;
 use aither_core::llm::{Role, ToolResult};
 use aither_mcp::{McpConnection, McpServersConfig};
@@ -580,7 +580,7 @@ async fn build_agent(
 
     // Add system prompt
     let builder = if let Some(ref system) = args.system {
-        builder.system_prompt_raw(system)
+        builder.system_prompt(system)
     } else {
         builder.with_default_prompt()
     };

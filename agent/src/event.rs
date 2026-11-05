@@ -178,6 +178,23 @@ pub enum AgentEvent {
         tool_call_id: String,
     },
 
+    /// A compaction failed with the window at the
+    /// [pause point](crate::ContextPolicy::pause_point), so the context was
+    /// cleaned and the compaction reruns on it now.
+    ///
+    /// The cleanup removes system alerts and reminders and moves long tool
+    /// outputs to files. When the rerun fails too the run ends with its
+    /// [`Error`](Self::Error); otherwise the run continues on the compacted
+    /// window.
+    CompactionRecovery {
+        /// Why the compaction failed.
+        error: AgentError,
+        /// System alerts and reminders the cleanup removed.
+        alerts_removed: usize,
+        /// Long tool outputs the cleanup moved to files.
+        outputs_spilled: usize,
+    },
+
     /// A skill was activated for the current run.
     SkillActivated {
         /// Skill name.
