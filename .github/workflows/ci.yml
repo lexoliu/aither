@@ -204,9 +204,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: ci-ubuntu
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/install-protoc
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   wasm:
@@ -346,9 +344,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: patch/compose-verify-manifest.sh "${GITHUB_REPOSITORY}" "${RUNNER_TEMP}/manifest.json"
+      # The composed manifest pins every artifact verify_tools downloads, so
+      # its hash keys the cache; a new patch release changes the hash.
+      - id: tools
+        uses: ./.github/actions/restore-tool-cache
+        with:
+          files: ${{ runner.temp }}/manifest.json
       - run: >
           cargo run --locked -p aither-sandbox --example verify_tools --
-          "${RUNNER_TEMP}/manifest.json" "${RUNNER_TEMP}/tool-cache" "${RUNNER_TEMP}/workspace"
+          "${RUNNER_TEMP}/manifest.json" "${AITHER_TOOL_CACHE}" "${RUNNER_TEMP}/workspace"
+      - if: success() && steps.tools.outputs.hit != 'true' && github.ref == 'refs/heads/dev'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.tools.outputs.path }}
+          key: ${{ steps.tools.outputs.key }}
 
   # `cargo hack` expands both flags into one `cargo check` per feature
   # combination, and over a 25-crate workspace that list cannot finish inside
@@ -391,9 +400,7 @@ jobs:
           # Each partition gets its own cache: eight jobs sharing one key
           # would evict each other's artifacts on every save.
           shared-key: ci-features-${{ matrix.part }}
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/install-protoc
       - uses: taiki-e/install-action@cargo-hack
       # `--each-feature` is `--all-features`, `--no-default-features` and every
       # feature alone. The depth-2 powerset below already runs the latter two
@@ -438,9 +445,15 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
       - uses: ./.github/actions/install-heel
-      - uses: arduino/setup-protoc@v3
+      - uses: ./.github/actions/install-protoc
+      - id: tools
+        uses: ./.github/actions/restore-tool-cache
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          rustc: true
+          files: |
+            patch/third-party-tools.json
+            agent/templates/test_baseline_tool.rs
+            agent/src/test_support.rs
       # `full` would re-enable llama and ort, and --exclude only skips testing
       # a package, not building it as a dependency. So the set is spelled out.
       # Narrowed by filterset like the test jobs, so the build keeps the
@@ -455,6 +468,11 @@ jobs:
           --features derive,serde,openai,claude,gemini,agent,rag,mem0,skills,mcp,browser,websearch,webfetch,search,fs,command
           --exclude aither-llama --exclude aither-ort
           ${FILTERSET:+--no-tests=pass -E "$FILTERSET"}
+      - if: success() && steps.tools.outputs.hit != 'true' && github.ref == 'refs/heads/dev'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.tools.outputs.path }}
+          key: ${{ steps.tools.outputs.key }}
       - uses: codecov/codecov-action@v4
         with:
           files: lcov.info

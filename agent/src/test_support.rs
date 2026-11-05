@@ -58,20 +58,63 @@ impl Drop for TempDir {
     }
 }
 
+/// Where tool distributions download and prepare their runtimes.
+pub struct ToolCache {
+    path: std::path::PathBuf,
+    _temporary: Option<TempDir>,
+}
+
+impl ToolCache {
+    /// Environment variable naming a directory that outlives the test
+    /// process; CI restores it from the Actions cache so a pinned download
+    /// reaches the network only once.
+    pub const SHARED_ENVIRONMENT: &str = "AITHER_TOOL_CACHE";
+
+    /// A cache of its own, deleted on drop.
+    pub fn temporary() -> Self {
+        let directory = TempDir::new();
+        Self {
+            path: directory.path().to_path_buf(),
+            _temporary: Some(directory),
+        }
+    }
+
+    /// The directory named by [`Self::SHARED_ENVIRONMENT`], which is shared by
+    /// every test process and never deleted, or a temporary one when unset.
+    /// Its runtimes and artifacts are content-addressed and verified on reuse,
+    /// and concurrent preparers take a lock per runtime.
+    pub fn shared() -> Self {
+        std::env::var_os(Self::SHARED_ENVIRONMENT).map_or_else(Self::temporary, |path| Self {
+            path: path.into(),
+            _temporary: None,
+        })
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
 /// Compiles the baseline-tool fixture, which reports version 1.0.0 for
 /// every command, into `source`.
+///
+/// `rustc` runs in `source` on relative paths, so no absolute path is embedded
+/// and the same toolchain yields the same bytes wherever `source` is. The
+/// fixture's digest is part of a prepared runtime's cache key, so this is what
+/// lets a restored `AITHER_TOOL_CACHE` serve the runtime again.
 pub async fn compile_baseline_fixture(source: &std::path::Path) -> std::path::PathBuf {
-    let fixture = source.join("baseline_tool.rs");
+    let fixture = std::path::Path::new("baseline_tool.rs");
     async_fs::write(
-        &fixture,
+        source.join(fixture),
         include_bytes!("../templates/test_baseline_tool.rs"),
     )
     .await
     .unwrap();
-    let path = source
-        .join("baseline-tool")
-        .with_extension(std::env::consts::EXE_EXTENSION);
+    let output =
+        std::path::Path::new("baseline-tool").with_extension(std::env::consts::EXE_EXTENSION);
+    let path = source.join(&output);
     let compiled = async_process::Command::new("rustc")
+        .current_dir(source)
         .env(
             "BASELINE_ALIASES",
             aither_sandbox::ManagedTool::Coreutils.aliases().join("\n"),
@@ -85,9 +128,9 @@ pub async fn compile_baseline_fixture(source: &std::path::Path) -> std::path::Pa
         )
         .arg("--crate-name")
         .arg("baseline_tool")
-        .arg(&fixture)
+        .arg(fixture)
         .arg("-o")
-        .arg(&path)
+        .arg(&output)
         .kill_on_drop(true)
         .output()
         .await

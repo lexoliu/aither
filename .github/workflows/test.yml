@@ -61,11 +61,18 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: test-${{ matrix.os }}-${{ inputs.cache-key }}
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/install-protoc
       - uses: taiki-e/install-action@nextest
       - uses: ./.github/actions/install-heel
+      # The pinned tool artifacts and prepared runtimes the sandbox tests use.
+      - id: tools
+        uses: ./.github/actions/restore-tool-cache
+        with:
+          rustc: true
+          files: |
+            patch/third-party-tools.json
+            agent/templates/test_baseline_tool.rs
+            agent/src/test_support.rs
       - shell: bash
         env:
           FILTERSET: ${{ inputs.filterset }}
@@ -73,3 +80,8 @@ jobs:
       # cargo test never ran proc-macro doctests; keep aither-derive excluded so
       # this step covers exactly the doctests the previous job did.
       - run: cargo test --doc ${{ inputs.flags }} --exclude aither-derive
+      - if: success() && steps.tools.outputs.hit != 'true' && github.ref == 'refs/heads/dev'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.tools.outputs.path }}
+          key: ${{ steps.tools.outputs.key }}
