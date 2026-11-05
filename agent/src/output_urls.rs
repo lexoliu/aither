@@ -52,8 +52,10 @@ pub fn extract_referenced_urls(text: &str, outputs_dir: Option<&Path>) -> HashSe
     }
     if let Some(outputs_dir) = outputs_dir {
         // The directory may hold spaces, so the absolute form is found by its
-        // prefix rather than by splitting words.
-        let prefix = format!("{}/", outputs_dir.display());
+        // prefix rather than by splitting words. Joining an empty component
+        // ends the directory with the platform's separator, as the notice's
+        // own `join` does.
+        let prefix = outputs_dir.join("").display().to_string();
         for (start, _) in text.match_indices(prefix.as_str()) {
             let rest = &text[start + prefix.len()..];
             let name = rest.split_whitespace().next().unwrap_or_default();
