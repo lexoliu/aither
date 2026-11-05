@@ -1,4 +1,4 @@
-{{ program }} exited with status {{ status }}.
+{{ program }} {{ termination }}.
 {% if stdout.is_empty() && stderr.is_empty() %}(no output)
 {% endif %}{% if !stdout.is_empty() %}stdout:
 {{ stdout }}

@@ -275,8 +275,10 @@ dependencies = [
  "anyhow",
  "askama 0.16.1",
  "async-process",
+ "nix 0.31.3",
  "schemars 1.2.3",
  "serde",
+ "tokio",
 ]
 
 [[package]]
