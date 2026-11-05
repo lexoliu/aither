@@ -24,6 +24,7 @@ use aither_sandbox::{
     SubagentCommit, SubagentGrant, TerminalBinding,
 };
 use askama::Template;
+use executor_core::Executor;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -675,6 +676,154 @@ impl<LLM: LanguageModel + 'static> FinishedSubagents<LLM> {
             .slots
             .remove(&id);
     }
+
+    /// Releases `id` only while a continuation holds it checked out: its
+    /// subagent went with the call that dropped it.
+    fn release_checked_out(&self, id: u64) {
+        let mut inner = self.inner.lock().expect("finished subagents lock poisoned");
+        if matches!(inner.slots.get(&id), Some(FinishedSlot::Running)) {
+            inner.slots.remove(&id);
+        }
+    }
+}
+
+/// Stops the terminal jobs an aither agent left running.
+async fn stop_jobs(job_registry: Option<aither_sandbox::JobRegistry>, subagent: &str) {
+    if let Some(job_registry) = job_registry {
+        let killed = job_registry.kill_running().await;
+        if killed > 0 {
+            tracing::info!(
+                subagent = %subagent,
+                killed,
+                "Stopped background terminal jobs left by subagent"
+            );
+        }
+    }
+}
+
+/// A subagent's run as it is listed and owned while it executes.
+struct LiveRun<LLM> {
+    id: u64,
+    subagent: String,
+    /// The hooks told when the run stops.
+    hooks: Option<ExternalHooks>,
+    body: SubagentBody<LLM>,
+}
+
+impl<LLM: LanguageModel + 'static> LiveRun<LLM> {
+    /// Ends a run whose call was dropped the way a cancelled run ends: the
+    /// hooks hear it was cancelled, its background jobs are stopped and its
+    /// session is closed.
+    async fn abandon(self) {
+        let Self {
+            subagent,
+            hooks,
+            body,
+            ..
+        } = self;
+        if let Some(hooks) = &hooks {
+            hooks
+                .fire(&subagent_stop_input::<String>(
+                    &subagent,
+                    &SubagentOutcome::Cancelled,
+                ))
+                .await;
+        }
+        stop_jobs(body.job_registry(), &subagent).await;
+        body.end(true).await;
+    }
+}
+
+/// What one `subagent` call holds in the tool's shared state: its entry in
+/// the run registry, the continuation id it checked out, and the run it owns
+/// while it executes.
+///
+/// Dropping the hold, which is what dropping the call's future does, releases
+/// all of it, so no exit from the call leaves a run listed or an id checked
+/// out.
+struct CallHold<LLM: LanguageModel + 'static> {
+    runs: SubagentRuns,
+    finished: Arc<FinishedSubagents<LLM>>,
+    /// The terminal the tool serves, whose executor finishes an abandoned
+    /// run's cleanup. A tool bound to none launches no terminal jobs, so
+    /// there is none to stop.
+    binding: Option<TerminalBinding>,
+    /// The continued id, while it is checked out.
+    resumed: Option<u64>,
+    run: Option<LiveRun<LLM>>,
+}
+
+impl<LLM: LanguageModel + 'static> CallHold<LLM> {
+    const fn new(
+        runs: SubagentRuns,
+        finished: Arc<FinishedSubagents<LLM>>,
+        binding: Option<TerminalBinding>,
+        resumed: Option<u64>,
+    ) -> Self {
+        Self {
+            runs,
+            finished,
+            binding,
+            resumed,
+            run: None,
+        }
+    }
+
+    /// Lists the run and takes `body` for its duration; the receiver resolves
+    /// once when it is cancelled.
+    fn begin(
+        &mut self,
+        subagent: &str,
+        prompt: &str,
+        hooks: Option<ExternalHooks>,
+        body: SubagentBody<LLM>,
+    ) -> async_channel::Receiver<()> {
+        let (id, cancel_rx) = self.runs.begin(subagent, prompt);
+        self.run = Some(LiveRun {
+            id,
+            subagent: subagent.to_string(),
+            hooks,
+            body,
+        });
+        cancel_rx
+    }
+
+    /// Runs one turn on `prompt` until it ends or `cancel_rx` fires.
+    async fn run(
+        &mut self,
+        prompt: &str,
+        cancel_rx: async_channel::Receiver<()>,
+    ) -> SubagentOutcome<String> {
+        self.run
+            .as_mut()
+            .expect("a run is begun before it is run")
+            .body
+            .run(prompt, cancel_rx)
+            .await
+    }
+
+    /// Unlists the run and gives its subagent back.
+    fn finish(&mut self) -> SubagentBody<LLM> {
+        let run = self.run.take().expect("a run is begun before it finishes");
+        self.runs.finish(run.id);
+        run.body
+    }
+}
+
+impl<LLM: LanguageModel + 'static> Drop for CallHold<LLM> {
+    fn drop(&mut self) {
+        if let Some(id) = self.resumed {
+            self.finished.release_checked_out(id);
+        }
+        if let Some(run) = self.run.take() {
+            self.runs.finish(run.id);
+            // The rest of the cleanup is asynchronous and a drop cannot wait
+            // for it, so the terminal's executor finishes it.
+            if let Some(binding) = &self.binding {
+                binding.executor().spawn(run.abandon()).detach();
+            }
+        }
+    }
 }
 
 /// The `subagent` command, which runs named subagents, forks the main agent
@@ -732,7 +881,7 @@ pub struct SubagentTool<LLM> {
     cache_keep_alive: Option<crate::config::CacheKeepAlive>,
     /// Finished subagents the parent can continue; each lives until its
     /// own prompt-cache lifetime passes.
-    finished: FinishedSubagents<LLM>,
+    finished: Arc<FinishedSubagents<LLM>>,
     /// The main agent's latest request, which a fork starts from.
     fork_source: ForkSource,
     /// The external hooks of the agent this tool serves: told when a
@@ -781,7 +930,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             binding: None,
             runs: SubagentRuns::default(),
             cache_keep_alive: None,
-            finished: FinishedSubagents::new(),
+            finished: Arc::new(FinishedSubagents::new()),
             fork_source: ForkSource::default(),
             hooks: None,
             #[cfg(feature = "languages")]
@@ -875,7 +1024,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             binding: Some(binding.clone()),
             runs: self.runs.clone(),
             cache_keep_alive: self.cache_keep_alive.clone(),
-            finished: FinishedSubagents::new(),
+            finished: Arc::new(FinishedSubagents::new()),
             fork_source: self.fork_source.clone(),
             hooks: ExternalHooks::of_observer(binding.observer()).or_else(|| self.hooks.clone()),
             #[cfg(feature = "languages")]
@@ -1698,13 +1847,19 @@ where
         let prompt = self.read_prompt(args.prompt_file(), caller).await?;
 
         let (finished, resumed) = self.acquire(call, &prompt, cx.identity(), caller).await?;
+        let mut hold = CallHold::new(
+            self.runs.clone(),
+            Arc::clone(&self.finished),
+            self.binding.clone(),
+            resumed,
+        );
         let (
             FinishedSubagent {
                 subagent: subagent_id,
                 tier,
                 model,
                 commit_ledger,
-                mut body,
+                body,
             },
             commit_mark,
         ) = self.mark_commits(finished, resumed).await?;
@@ -1716,24 +1871,15 @@ where
                 })
                 .await;
         }
-        let (run_id, cancel_rx) = self.runs.begin(&subagent_id, &prompt);
-        let outcome = body.run(&prompt, cancel_rx).await;
-        self.runs.finish(run_id);
+        let cancel_rx = hold.begin(&subagent_id, &prompt, self.hooks.clone(), body);
+        let outcome = hold.run(&prompt, cancel_rx).await;
+        let body = hold.finish();
         if let Some(hooks) = &self.hooks {
             hooks
                 .fire(&subagent_stop_input(&subagent_id, &outcome))
                 .await;
         }
-        if let Some(job_registry) = body.job_registry() {
-            let killed = job_registry.kill_running().await;
-            if killed > 0 {
-                tracing::info!(
-                    subagent = %subagent_id,
-                    killed,
-                    "Stopped background terminal jobs left by subagent"
-                );
-            }
-        }
+        stop_jobs(body.job_registry(), &subagent_id).await;
         // Whatever way the run ended, the commits it made are reported; a
         // failure to list them is reported in their place and changes nothing
         // else about the run.
@@ -3767,6 +3913,121 @@ mod tests {
         assert!(
             error.to_string().contains("unknown subagent id 99"),
             "{error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Answers its first request and never answers another, so a
+    /// continuation stays in flight.
+    #[derive(Clone, Default)]
+    struct HangsAfterFirst {
+        replies: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LanguageModel for HangsAfterFirst {
+        type Error = NeverError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let n = self
+                .replies
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                futures::future::Either::Left(futures_lite::stream::iter([Ok(Event::Text(
+                    "first".to_string(),
+                ))]))
+            } else {
+                futures::future::Either::Right(futures_lite::stream::pending())
+            }
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "Anthropic",
+                "mock-model",
+                "mock model",
+                100_000,
+            )))
+        }
+    }
+
+    /// Waits until exactly one run is registered.
+    async fn the_registered_run(runs: &SubagentRuns) {
+        loop {
+            match runs.list().len() {
+                1 => return,
+                0 => tokio::task::yield_now().await,
+                other => panic!("expected one registered run, got {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_call_unregisters_its_run() {
+        let runs = SubagentRuns::default();
+        let bundled = Bundled::new().await;
+        let tool = bundled.tool(PendingLlm).with_runs(runs.clone());
+        let (dir, prompt_file) = write_prompt_file("dropped-run", "survey the codebase");
+
+        let call = tokio::spawn(async move {
+            Tool::call(&tool, explore(&prompt_file), ToolContext::new()).await
+        });
+        the_registered_run(&runs).await;
+
+        call.abort();
+        assert!(call.await.expect_err("the call was dropped").is_cancelled());
+
+        assert!(
+            runs.list().is_empty(),
+            "a dropped call must leave no run listed"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_continuation_releases_its_id() {
+        let runs = SubagentRuns::default();
+        let bundled = Bundled::new().await;
+        let tool = Arc::new(
+            bundled
+                .tool(HangsAfterFirst::default())
+                .with_runs(runs.clone())
+                .with_agent_setup("explore", |builder| builder.max_iterations(2)),
+        );
+        let (dir, prompt_file) = write_prompt_file("dropped-continuation", "first question");
+        let result = Tool::call(&*tool, explore(&prompt_file), ToolContext::new())
+            .await
+            .expect("first call");
+        let id = continuation_id(&result.render_for_model());
+        assert!(runs.list().is_empty());
+
+        let continuing = Arc::clone(&tool);
+        let follow_up = prompt_file.clone();
+        let call = tokio::spawn(async move {
+            Tool::call(
+                &*continuing,
+                resume_args(&follow_up, id),
+                ToolContext::new(),
+            )
+            .await
+        });
+        the_registered_run(&runs).await;
+
+        call.abort();
+        assert!(call.await.expect_err("the call was dropped").is_cancelled());
+
+        assert!(runs.list().is_empty(), "the dropped run is unregistered");
+        let error = Tool::call(&*tool, resume_args(&prompt_file, id), ToolContext::new())
+            .await
+            .expect_err("a dropped continuation cannot be continued");
+        assert!(
+            !error.to_string().contains("still running"),
+            "the id must not stay checked out: {error}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
