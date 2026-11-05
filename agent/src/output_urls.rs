@@ -35,9 +35,11 @@ const fn is_path_punctuation(c: char) -> bool {
 /// let urls = extract_referenced_urls(text, None);
 /// assert!(urls.contains("outputs/amber-oak-swift-river.txt"));
 ///
-/// let text = "saved to /work/outputs/bold-creek-calm-dawn.txt.";
-/// let urls = extract_referenced_urls(text, Some(Path::new("/work/outputs")));
-/// assert!(urls.contains("/work/outputs/bold-creek-calm-dawn.txt"));
+/// let dir = Path::new("/work/outputs");
+/// let saved = dir.join("bold-creek-calm-dawn.txt").display().to_string();
+/// let text = format!("saved to {saved}.");
+/// let urls = extract_referenced_urls(&text, Some(dir));
+/// assert!(urls.contains(&saved));
 /// ```
 #[must_use]
 pub fn extract_referenced_urls(text: &str, outputs_dir: Option<&Path>) -> HashSet<String> {

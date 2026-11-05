@@ -568,7 +568,10 @@ mod tests {
     #[test]
     fn build_file_index_finds_the_absolute_path_a_saved_output_notice_prints() {
         let dir = std::path::Path::new("/work/session/outputs");
-        let path = "/work/session/outputs/amber-oak-swift-river.txt";
+        // Joined the way the sandbox names the file, so the separator is the
+        // platform's.
+        let path = dir.join("amber-oak-swift-river.txt").display().to_string();
+        let path = path.as_str();
         let messages = vec![
             Message::assistant_with_tool_calls(
                 "",
