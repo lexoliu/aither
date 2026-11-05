@@ -827,11 +827,11 @@ fn usage_from_responses(raw: &ResponsesUsage) -> Usage {
         completion_tokens: raw.output_tokens,
         total_tokens: raw.total_tokens,
         reasoning_tokens: raw
-            .output_token_details
+            .output_tokens_details
             .as_ref()
             .and_then(|details| details.reasoning_tokens),
         cache_read_tokens: raw
-            .input_token_details
+            .input_tokens_details
             .as_ref()
             .and_then(|details| details.cached_tokens),
         cache_write_tokens: None,
@@ -1322,7 +1322,7 @@ mod tests {
     use super::*;
     use crate::response::{
         ChatCompletionTokensDetails, ChatCompletionUsage, ChatPromptTokensDetails,
-        DeltaToolFunction, ResponsesInputTokenDetails, ResponsesOutputTokenDetails, ResponsesUsage,
+        DeltaToolFunction, ResponsesUsage,
     };
     use std::time::Duration;
 
@@ -1611,17 +1611,15 @@ mod tests {
 
     #[test]
     fn responses_usage_mapping_keeps_reasoning_and_cache_tokens() {
-        let usage = ResponsesUsage {
-            input_tokens: Some(19),
-            output_tokens: Some(5),
-            total_tokens: Some(24),
-            input_token_details: Some(ResponsesInputTokenDetails {
-                cached_tokens: Some(4),
-            }),
-            output_token_details: Some(ResponsesOutputTokenDetails {
-                reasoning_tokens: Some(1),
-            }),
-        };
+        // Shape of `ResponseUsage` in OpenAI's OpenAPI spec.
+        let usage: ResponsesUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 19,
+            "input_tokens_details": { "cached_tokens": 4 },
+            "output_tokens": 5,
+            "output_tokens_details": { "reasoning_tokens": 1 },
+            "total_tokens": 24
+        }))
+        .expect("deserialize Responses usage");
         let mapped = usage_from_responses(&usage);
         assert_eq!(mapped.prompt_tokens, Some(19));
         assert_eq!(mapped.completion_tokens, Some(5));
