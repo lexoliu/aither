@@ -67,8 +67,14 @@ impl Chunker for FixedSizeChunker {
     fn chunk(&self, doc: &Document) -> Result<Vec<Chunk>> {
         let text = &doc.text;
 
+        // Every position below counts characters, so every cut and every
+        // overlap start is a character boundary by construction.
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let total = chars.len();
+        let byte_at = |position: usize| chars.get(position).map_or(text.len(), |&(byte, _)| byte);
+
         // If text fits in one chunk, return it as-is
-        if text.len() <= self.chunk_size {
+        if total <= self.chunk_size {
             let hash = content_hash(text);
             return Ok(vec![Chunk::with_metadata(
                 format!("{}#chunk_0", doc.id),
@@ -83,31 +89,31 @@ impl Chunker for FixedSizeChunker {
         let mut chunks = Vec::new();
         let mut start = 0;
         let mut chunk_idx = 0;
-        let step = self.chunk_size - self.overlap;
 
-        while start < text.len() {
-            let end = (start + self.chunk_size).min(text.len());
+        loop {
+            let end = (start + self.chunk_size).min(total);
 
-            // Find word boundary for cleaner cuts (look for whitespace before end)
-            let actual_end = if end < text.len() {
-                text[start..end]
-                    .rfind(char::is_whitespace)
-                    .map_or(end, |pos| start + pos)
+            // Prefer cutting at whitespace, but only where the next chunk
+            // (which starts `overlap` characters earlier) still begins after
+            // this one; otherwise cut hard at `end`, which always does since
+            // `overlap < chunk_size`.
+            let actual_end = if end < total {
+                chars[start..end]
+                    .iter()
+                    .rposition(|&(_, c)| c.is_whitespace())
+                    .map(|pos| start + pos)
+                    .filter(|&cut| cut - start > self.overlap)
+                    .unwrap_or(end)
             } else {
                 end
             };
 
-            // Don't create tiny trailing chunks
-            if actual_end <= start {
-                break;
-            }
-
-            let chunk_text = text[start..actual_end].trim();
+            let chunk_text = text[byte_at(start)..byte_at(actual_end)].trim();
             if !chunk_text.is_empty() {
                 let hash = content_hash(chunk_text);
                 let mut metadata = doc.metadata.clone();
-                metadata.insert("chunk_start".into(), start.to_string());
-                metadata.insert("chunk_end".into(), actual_end.to_string());
+                metadata.insert("chunk_start".into(), byte_at(start).to_string());
+                metadata.insert("chunk_end".into(), byte_at(actual_end).to_string());
 
                 chunks.push(Chunk::with_metadata(
                     format!("{}#chunk_{}", doc.id, chunk_idx),
@@ -120,17 +126,11 @@ impl Chunker for FixedSizeChunker {
                 chunk_idx += 1;
             }
 
-            // Move forward, accounting for overlap
-            start = if actual_end > self.overlap {
-                actual_end.saturating_sub(self.overlap)
-            } else {
-                actual_end
-            };
-
-            // Prevent infinite loop if we can't make progress
-            if start >= text.len() || (actual_end == text.len() && start + step >= text.len()) {
+            if actual_end == total {
                 break;
             }
+            // Strictly greater than the previous start: actual_end - start > overlap.
+            start = actual_end - self.overlap;
         }
 
         Ok(chunks)

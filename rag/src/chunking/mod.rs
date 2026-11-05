@@ -5,6 +5,8 @@
 
 mod code;
 mod fixed;
+#[cfg(test)]
+mod fixed_tests;
 mod paragraph;
 mod sentence;
 
