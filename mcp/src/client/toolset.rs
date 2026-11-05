@@ -75,23 +75,25 @@ pub type McpServersConfig = HashMap<String, McpServerConfig>;
 /// the constructor methods ([`spawn`](Self::spawn), [`stdio`](Self::stdio),
 /// and `http` with the `http` feature) to create connections; each takes the
 /// [`Executor`] that runs the loop.
+///
+/// The tool list follows the server: when it sends
+/// `notifications/tools/list_changed` the connection re-lists its tools, and
+/// every lookup and call after that uses the new list.
 pub struct McpConnection {
     client: McpClient,
-    tools: Vec<McpToolDefinition>,
 }
 
 /// Service wrapper that shares one MCP connection between callers.
 #[derive(Clone, Debug)]
 pub struct McpToolService {
     conn: Arc<McpConnection>,
-    tools: Vec<McpToolDefinition>,
 }
 
 impl std::fmt::Debug for McpConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpConnection")
             .field("server_name", &self.server_name())
-            .field("tool_count", &self.tools.len())
+            .field("tool_count", &self.client.tools().len())
             .finish_non_exhaustive()
     }
 }
@@ -226,7 +228,8 @@ impl McpConnection {
     {
         let client = McpClient::connect(executor, transport, handler).await?;
         let tools = client.list_tools().await?;
-        Ok(Self { client, tools })
+        client.seed_tools(tools);
+        Ok(Self { client })
     }
 
     /// Connect to an MCP server via HTTP.
@@ -274,10 +277,12 @@ impl McpConnection {
         Some(self.client.server_info().name.as_str())
     }
 
-    /// Returns the MCP tool definitions.
+    /// Returns the MCP tool definitions as of now.
+    ///
+    /// The list is a snapshot: a later `list_changed` does not alter it.
     #[must_use]
-    pub fn mcp_definitions(&self) -> &[McpToolDefinition] {
-        &self.tools
+    pub fn mcp_definitions(&self) -> Arc<Vec<McpToolDefinition>> {
+        self.client.tools()
     }
 
     /// Returns aither-compatible tool definitions.
@@ -287,25 +292,29 @@ impl McpConnection {
     /// cost the caller every other tool on the server.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        convert_definitions(self.mcp_definitions())
+        convert_definitions(&self.mcp_definitions())
     }
 
     /// Check if this connection has a tool with the given name.
     #[must_use]
     pub fn has_tool(&self, name: &str) -> bool {
-        self.mcp_definitions().iter().any(|d| d.name == name)
+        self.client.tools().iter().any(|d| d.name == name)
     }
 
     /// Call a tool on this MCP server.
     ///
     /// # Errors
     ///
-    /// Returns an error if the tool call fails.
+    /// Returns [`McpError::UnknownTool`] if the server's current tool list has
+    /// no tool called `name`, and an error if the tool call fails.
     pub async fn call(
         &self,
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult, McpError> {
+        if !self.has_tool(name) {
+            return Err(McpError::UnknownTool(name.to_string()));
+        }
         self.client.call_tool(name, arguments).await
     }
 
@@ -436,17 +445,15 @@ impl McpToolService {
     /// Creates a new MCP tool service.
     #[must_use]
     pub fn new(conn: McpConnection) -> Self {
-        let tools = conn.mcp_definitions().to_vec();
         Self {
             conn: Arc::new(conn),
-            tools,
         }
     }
 
-    /// Returns the MCP tool definitions.
+    /// Returns the MCP tool definitions as of now.
     #[must_use]
-    pub fn mcp_definitions(&self) -> &[McpToolDefinition] {
-        &self.tools
+    pub fn mcp_definitions(&self) -> Arc<Vec<McpToolDefinition>> {
+        self.conn.mcp_definitions()
     }
 
     /// Returns aither-compatible tool definitions.
@@ -454,13 +461,13 @@ impl McpToolService {
     /// See [`McpConnection::definitions`] for how an unusable schema is handled.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        convert_definitions(&self.tools)
+        self.conn.definitions()
     }
 
     /// Check if this service has a tool with the given name.
     #[must_use]
     pub fn has_tool(&self, name: &str) -> bool {
-        self.tools.iter().any(|d| d.name == name)
+        self.conn.has_tool(name)
     }
 
     /// Call a tool on this MCP service.

@@ -19,6 +19,7 @@ mod toolset;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use arc_swap::ArcSwapOption;
 use async_channel::{Receiver, Sender};
 use executor_core::{Executor, Task};
 use serde::de::DeserializeOwned;
@@ -62,8 +63,12 @@ pub struct McpClient {
     commands: Sender<Command>,
     /// Closes when the receive loop has finished.
     finished: Receiver<()>,
-    /// Next request ID.
-    next_id: AtomicI64,
+    /// Next request ID; the receive loop draws from it for its own requests.
+    next_id: Arc<AtomicI64>,
+    /// The server's tools as last listed. Only the receive loop replaces it
+    /// once the connection is up, always with a complete list, so a reader
+    /// sees the list before or after a refresh and never a mixture.
+    tools: Arc<ArcSwapOption<Vec<McpToolDefinition>>>,
     server_info: ServerInfo,
     capabilities: ServerCapabilities,
 }
@@ -90,11 +95,20 @@ impl McpClient {
     {
         let (commands, command_rx) = async_channel::unbounded();
         let (alive, finished) = async_channel::bounded(1);
+        let next_id = Arc::new(AtomicI64::new(1));
+        let tools = Arc::new(ArcSwapOption::empty());
         executor
             .spawn(connection::run(
                 transport,
                 command_rx,
+                // Weak, so the loop's own handle does not keep the
+                // connection open after the client is dropped.
+                commands.downgrade(),
                 Arc::new(handler),
+                connection::ToolCache {
+                    tools: tools.clone(),
+                    next_id: next_id.clone(),
+                },
                 alive,
             ))
             .detach();
@@ -102,7 +116,8 @@ impl McpClient {
         let mut client = Self {
             commands,
             finished,
-            next_id: AtomicI64::new(1),
+            next_id,
+            tools,
             server_info: ServerInfo {
                 name: String::new(),
                 version: None,
@@ -187,6 +202,25 @@ impl McpClient {
 
         debug!("Listed {} tools", result.tools.len());
         Ok(result.tools)
+    }
+
+    /// The server's tools as of the latest listing the client holds.
+    ///
+    /// Empty until a listing is stored. [`McpConnection`] stores the first
+    /// one when it connects; from then on the receive loop re-lists the tools
+    /// whenever the server sends `notifications/tools/list_changed` and
+    /// replaces the whole list at once.
+    #[must_use]
+    pub fn tools(&self) -> Arc<Vec<McpToolDefinition>> {
+        self.tools.load_full().unwrap_or_default()
+    }
+
+    /// Store `tools` as the cached list unless a refresh already stored a
+    /// newer one.
+    fn seed_tools(&self, tools: Vec<McpToolDefinition>) {
+        let tools = Arc::new(tools);
+        self.tools
+            .rcu(|current| current.clone().or_else(|| Some(tools.clone())));
     }
 
     /// Call a tool on the server.

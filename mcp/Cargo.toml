@@ -13,12 +13,13 @@ categories = ["api-bindings"]
 
 [features]
 default = ["client", "server", "http"]
-client = ["dep:aither-sandbox", "dep:askama", "dep:executor-core"]
+client = ["dep:aither-sandbox", "dep:arc-swap", "dep:askama", "dep:executor-core"]
 server = []
 http = ["client", "dep:zenwave"]
 
 [dependencies]
 aither-core.workspace = true
+arc-swap = { workspace = true, optional = true }
 aither-sandbox = { workspace = true, optional = true }
 askama = { version = "0.16", optional = true }
 executor-core = { version = "0.7", optional = true, default-features = false }

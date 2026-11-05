@@ -2,16 +2,18 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
-use async_channel::{Receiver, RecvError, Sender};
+use arc_swap::ArcSwapOption;
+use async_channel::{Receiver, RecvError, Sender, WeakSender};
 use futures_lite::future::or;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tracing::{debug, warn};
 
 use super::handler::{McpHandler, ServerNotification};
 use crate::protocol::{
-    JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError,
-    RequestId,
+    JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    ListToolsResult, McpError, McpToolDefinition, RequestId,
 };
 use crate::transport::BidirectionalTransport;
 
@@ -69,8 +71,61 @@ enum Event {
     Command(Result<Command, RecvError>),
     /// A message from the server, or the end of the transport.
     Incoming(Result<Option<JsonRpcMessage>, McpError>),
-    /// A notification handler finished.
-    Handled,
+    /// A notification handler or a tool refresh finished.
+    Handled(Done),
+}
+
+/// The tool list the loop keeps current, and the request ids it draws on.
+pub(super) struct ToolCache {
+    pub(super) tools: Arc<ArcSwapOption<Vec<McpToolDefinition>>>,
+    pub(super) next_id: Arc<AtomicI64>,
+}
+
+/// Work the loop polls alongside the server's traffic.
+enum Job<H> {
+    /// Deliver a notification to the handler.
+    Notify(Arc<H>, ServerNotification),
+    /// List the server's tools through the loop's own command queue.
+    ListTools(WeakSender<Command>, Arc<AtomicI64>),
+}
+
+/// The outcome of a [`Job`].
+enum Done {
+    Notified,
+    Listed(Result<Vec<McpToolDefinition>, McpError>),
+}
+
+async fn work<H: McpHandler>(job: Job<H>) -> Done {
+    match job {
+        Job::Notify(handler, notification) => {
+            handler.notification(notification).await;
+            Done::Notified
+        }
+        Job::ListTools(commands, next_id) => Done::Listed(list_tools(commands, &next_id).await),
+    }
+}
+
+async fn list_tools(
+    commands: WeakSender<Command>,
+    next_id: &AtomicI64,
+) -> Result<Vec<McpToolDefinition>, McpError> {
+    let (reply, response) = async_channel::bounded(1);
+    let request = JsonRpcRequest::new(next_id.fetch_add(1, Ordering::SeqCst), "tools/list");
+    // Hold the strong sender only while queuing, so an awaiting refresh never
+    // keeps a dropped client's connection open.
+    commands
+        .upgrade()
+        .ok_or(McpError::ConnectionClosed)?
+        .send(Command::Request { request, reply })
+        .await
+        .map_err(|_| McpError::ConnectionClosed)?;
+    let response = response
+        .recv()
+        .await
+        .map_err(|_| McpError::ConnectionClosed)??;
+    let result: ListToolsResult =
+        serde_json::from_value(response.into_result().map_err(McpError::JsonRpc)?)?;
+    Ok(result.tools)
 }
 
 /// Run the connection until the transport ends or the client closes it.
@@ -78,13 +133,19 @@ enum Event {
 /// Routes each response to the request awaiting it, answers `ping`, answers
 /// every other server request with method-not-found (the client advertises no
 /// capability that would let a server send one), and hands notifications to
-/// `handler`. On exit the transport is closed and every request still
-/// pending, queued or sent later fails with an error naming why. `alive` is
-/// dropped last, which is how the client learns the loop has finished.
+/// `handler`. On `notifications/tools/list_changed` it also re-lists the tools
+/// and replaces `cache.tools` with the complete new list; a change arriving
+/// while a listing is in flight schedules one more listing after it, so the
+/// cache always ends at the server's latest list. On exit the transport is
+/// closed and every request still pending, queued or sent later fails with an
+/// error naming why. `alive` is dropped last, which is how the client learns
+/// the loop has finished.
 pub(super) async fn run<T, H>(
     mut transport: T,
     commands: Receiver<Command>,
+    requests: WeakSender<Command>,
     handler: Arc<H>,
+    cache: ToolCache,
     alive: Sender<()>,
 ) where
     T: BidirectionalTransport,
@@ -92,6 +153,8 @@ pub(super) async fn run<T, H>(
 {
     let mut pending: HashMap<RequestId, Sender<Result<JsonRpcResponse, McpError>>> = HashMap::new();
     let mut handling = FuturesUnordered::new();
+    let mut listing = false;
+    let mut listing_again = false;
 
     let ending = loop {
         // Handlers are polled first so they keep progressing while the
@@ -100,7 +163,7 @@ pub(super) async fn run<T, H>(
             async {
                 // An empty set resolves to `None` at once; park instead.
                 match handling.next().await {
-                    Some(()) => Event::Handled,
+                    Some(done) => Event::Handled(done),
                     None => std::future::pending().await,
                 }
             },
@@ -143,9 +206,35 @@ pub(super) async fn run<T, H>(
                 }
             }
             Event::Incoming(Ok(Some(JsonRpcMessage::Notification(notification)))) => {
-                handling.push(notify(handler.clone(), notification));
+                let notification = ServerNotification::decode(notification);
+                if matches!(notification, ServerNotification::ToolsListChanged) {
+                    if listing {
+                        listing_again = true;
+                    } else {
+                        listing = true;
+                        handling.push(work(Job::ListTools(
+                            requests.clone(),
+                            cache.next_id.clone(),
+                        )));
+                    }
+                }
+                handling.push(work(Job::Notify(handler.clone(), notification)));
             }
-            Event::Handled => {}
+            Event::Handled(Done::Notified) => {}
+            Event::Handled(Done::Listed(listed)) => {
+                listing = false;
+                match listed {
+                    Ok(tools) => cache.tools.store(Some(Arc::new(tools))),
+                    Err(error) => warn!(%error, "re-listing the server's tools failed"),
+                }
+                if std::mem::take(&mut listing_again) {
+                    listing = true;
+                    handling.push(work(Job::ListTools(
+                        requests.clone(),
+                        cache.next_id.clone(),
+                    )));
+                }
+            }
         }
     };
 
@@ -176,10 +265,4 @@ fn answer(request: JsonRpcRequest) -> JsonRpcResponse {
         warn!(method = %request.method, "rejecting a server request for an unadvertised capability");
         JsonRpcResponse::error(request.id, JsonRpcError::method_not_found(&request.method))
     }
-}
-
-async fn notify<H: McpHandler>(handler: Arc<H>, notification: JsonRpcNotification) {
-    handler
-        .notification(ServerNotification::decode(notification))
-        .await;
 }

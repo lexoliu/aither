@@ -420,6 +420,7 @@ version = "0.17.0"
 dependencies = [
  "aither-core",
  "aither-sandbox",
+ "arc-swap",
  "askama 0.16.1",
  "async-channel",
  "async-process",
