@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/May-Agent/aither/compare/sandbox-v0.17.0...sandbox-v0.18.0) - 2026-11-05
+
+### Added
+
+- *(agent)* [**breaking**] keep prefix content that changes mid-session live
+- *(sandbox)* [**breaking**] expose the session sandbox policy to hosts
+
+### Fixed
+
+- *(agent)* release a subagent call's run and continuation id when it is dropped
+- *(sandbox)* [**breaking**] keep a finished job's completion pending until its agent takes it
+- *(sandbox)* [**breaking**] let an argument schema mark an optional field positional
+- *(agent)* compaction's file index finds saved outputs named by absolute path
+- *(sandbox)* saved-output and killed-descendant alerts name what holds today
+
+### Other
+
+- Merge pull request #524 from May-Agent/fix/475-drop-release
+- Merge pull request #522 from May-Agent/feat/521-live-prefix-content
+- Merge pull request #520 from May-Agent/fix/518-pending-completion
+- Merge pull request #514 from May-Agent/feat/512-sandbox-policy
+- Merge remote-tracking branch 'origin/dev' into fix/503
+
 ## [0.17.0](https://github.com/May-Agent/aither/compare/sandbox-v0.16.0...sandbox-v0.17.0) - 2026-11-05
 
 ### Added

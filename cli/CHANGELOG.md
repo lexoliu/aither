@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/May-Agent/aither/compare/cli-v0.17.0...cli-v0.18.0) - 2026-11-05
+
+### Fixed
+
+- *(acp)* connect a session's MCP servers and register their tools on its agent
+- *(mcp)* refresh the tool list when the server announces a change
+- *(mcp)* run one receive loop per client connection
+
 ## [0.16.0](https://github.com/May-Agent/aither/compare/cli-v0.15.0...cli-v0.16.0) - 2026-11-05
 
 ### Added

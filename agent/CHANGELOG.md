@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/May-Agent/aither/compare/agent-v0.17.0...agent-v0.18.0) - 2026-11-05
+
+### Added
+
+- *(agent)* [**breaking**] keep prefix content that changes mid-session live
+
+### Fixed
+
+- *(agent)* return MCP tool results through the full content conversion
+- *(agent)* release a subagent call's run and continuation id when it is dropped
+- *(agent)* retire the compaction and per-window state on checkpoint restore
+- *(sandbox)* [**breaking**] keep a finished job's completion pending until its agent takes it
+- *(agent)* let an alert carry bounded external content
+- *(agent)* [**breaking**] stop a driven run only between handler calls
+- *(agent)* match saved outputs by the platform's path separator
+- *(agent)* [**breaking**] keep a run progressing while its caller handles an event
+- *(agent)* compaction's file index finds saved outputs named by absolute path
+- *(sandbox)* saved-output and killed-descendant alerts name what holds today
+- *(mcp)* run one receive loop per client connection
+
+### Other
+
+- Merge pull request #527 from May-Agent/fix/478-mcp-content
+- Merge pull request #524 from May-Agent/fix/475-drop-release
+- Merge pull request #523 from May-Agent/fix/474-restore-compaction
+- Merge pull request #522 from May-Agent/feat/521-live-prefix-content
+- Merge pull request #520 from May-Agent/fix/518-pending-completion
+- Merge pull request #519 from May-Agent/ci/cache-downloads
+- restore pinned downloads from the Actions cache
+- Merge pull request #516 from May-Agent/fix/504
+- Merge pull request #505 from May-Agent/fix/502-stale-alerts
+- *(agent)* build saved-output paths with the platform separator
+- Merge pull request #507 from May-Agent/fix/501-run-progress
+
 ## [0.16.0](https://github.com/May-Agent/aither/compare/agent-v0.15.0...agent-v0.16.0) - 2026-11-05
 
 ### Added
