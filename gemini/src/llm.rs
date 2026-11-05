@@ -390,11 +390,13 @@ const fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
 ///
 /// A tool *result* has to look both up: Gemini scopes the signature to the call
 /// rather than the result, so the result cannot carry it.
-fn index_tool_calls(messages: &[Message]) -> (HashMap<&str, &str>, HashMap<&str, &str>) {
+fn index_tool_calls(messages: &[Message]) -> ToolCallIndex<'_> {
     let mut names = HashMap::new();
     let mut signatures = HashMap::new();
+    let mut positions = HashMap::new();
     for message in messages {
         for tc in message.tool_calls() {
+            positions.insert(tc.id.as_str(), positions.len());
             names.insert(tc.id.as_str(), tc.name.as_str());
             if let Some(signature) = tc
                 .reasoning_state
@@ -405,7 +407,43 @@ fn index_tool_calls(messages: &[Message]) -> (HashMap<&str, &str>, HashMap<&str,
             }
         }
     }
-    (names, signatures)
+    ToolCallIndex {
+        names,
+        signatures,
+        positions,
+    }
+}
+
+/// Parses a tool result as JSON, or wraps it as a string `result`.
+fn tool_response_value(content: &str) -> serde_json::Value {
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+        Ok(other) => serde_json::json!({ "result": other }),
+        Err(_) => serde_json::json!({ "result": content }),
+    }
+}
+
+/// Lookups keyed by tool-call id.
+struct ToolCallIndex<'a> {
+    names: HashMap<&'a str, &'a str>,
+    signatures: HashMap<&'a str, &'a str>,
+    /// Position of the call in the conversation, which is the order Gemini
+    /// expects its responses in.
+    positions: HashMap<&'a str, usize>,
+}
+
+/// Emits the pending tool results as one `user` Content in call order.
+///
+/// Gemini requires every `functionResponse` answering a model turn to share a
+/// single Content; results arrive in completion order, so they are sorted by
+/// the position of the call they answer.
+fn flush_tool_results(contents: &mut Vec<GeminiContent>, pending: &mut Vec<(usize, Part)>) {
+    if pending.is_empty() {
+        return;
+    }
+    pending.sort_by_key(|(position, _)| *position);
+    let parts = pending.drain(..).map(|(_, part)| part).collect();
+    contents.push(GeminiContent::with_parts("user", parts));
 }
 
 async fn messages_to_gemini(
@@ -414,9 +452,13 @@ async fn messages_to_gemini(
     let mut system_parts = Vec::new();
     let mut contents = Vec::new();
 
-    let (tool_call_names, tool_call_signatures) = index_tool_calls(messages);
+    let index = index_tool_calls(messages);
+    let mut pending_results: Vec<(usize, Part)> = Vec::new();
 
     for message in messages {
+        if message.role() != Role::Tool {
+            flush_tool_results(&mut contents, &mut pending_results);
+        }
         match message.role() {
             Role::System => system_parts.push(Part::text(message.content())),
             Role::User => {
@@ -444,43 +486,31 @@ async fn messages_to_gemini(
                 // Get the function name from the tool_call_id
                 let tool_call_id = message.tool_call_id().unwrap_or("");
                 let base_id = tool_call_id.to_string();
-                let signature = tool_call_signatures
+                let signature = index
+                    .signatures
                     .get(tool_call_id)
                     .map(|value| (*value).to_string());
 
-                if let Some(&function_name) = tool_call_names.get(tool_call_id) {
-                    // Parse the content as JSON, or wrap it as a string result
-                    let response_value =
-                        match serde_json::from_str::<serde_json::Value>(message.content()) {
-                            Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
-                            Ok(other) => {
-                                let mut map = serde_json::Map::new();
-                                map.insert("result".to_string(), other);
-                                serde_json::Value::Object(map)
-                            }
-                            Err(_) => {
-                                let mut map = serde_json::Map::new();
-                                map.insert(
-                                    "result".to_string(),
-                                    serde_json::Value::String(message.content().to_string()),
-                                );
-                                serde_json::Value::Object(map)
-                            }
-                        };
-                    contents.push(GeminiContent::function_response_with_signature(
-                        function_name.to_string(),
-                        response_value,
-                        signature,
+                if let Some(&function_name) = index.names.get(tool_call_id) {
+                    pending_results.push((
+                        index.positions[tool_call_id],
+                        Part::function_response_with_signature(
+                            function_name.to_string(),
+                            tool_response_value(message.content()),
+                            signature,
+                        ),
                     ));
                 } else {
                     // Fallback: try legacy format or send as user message
                     if let Some((name, response, sig)) = parse_tool_response(message.content()) {
-                        contents.push(GeminiContent::function_response_with_signature(
-                            name, response, sig,
+                        pending_results.push((
+                            usize::MAX,
+                            Part::function_response_with_signature(name, response, sig),
                         ));
                     } else {
                         // Last resort - wrap as text
                         debug!("Tool message without matching tool_call_id: {}", base_id);
+                        flush_tool_results(&mut contents, &mut pending_results);
                         contents.push(GeminiContent::text("user", message.content()));
                     }
                 }
@@ -518,6 +548,8 @@ async fn messages_to_gemini(
             }
         }
     }
+
+    flush_tool_results(&mut contents, &mut pending_results);
 
     let system_instruction = if system_parts.is_empty() {
         None
@@ -838,6 +870,92 @@ mod tests {
         let (_, contents) = messages_to_gemini(&[message]).await.expect("convert");
         let value = serde_json::to_value(&contents).expect("serialize contents");
         assert_eq!(value[0]["parts"][0].get("thoughtSignature"), None);
+    }
+
+    fn call(id: &str, name: &str) -> aither_core::llm::ToolCall {
+        aither_core::llm::ToolCall::new(id, name, serde_json::json!({}))
+    }
+
+    fn responses(content: &serde_json::Value) -> Vec<(String, String)> {
+        content["parts"]
+            .as_array()
+            .expect("parts")
+            .iter()
+            .map(|part| {
+                (
+                    part["functionResponse"]["name"]
+                        .as_str()
+                        .expect("function name")
+                        .to_string(),
+                    part["functionResponse"]["response"]["result"]
+                        .as_str()
+                        .expect("result")
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn pairs(items: [(&str, &str); 2]) -> Vec<(String, String)> {
+        items
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_results_share_one_content() {
+        let messages = [
+            Message::assistant_with_tool_calls("", vec![call("a", "weather"), call("b", "time")]),
+            Message::tool("a", "sunny"),
+            Message::tool("b", "noon"),
+        ];
+        let (_, contents) = messages_to_gemini(&messages).await.expect("convert");
+        let value = serde_json::to_value(&contents).expect("serialize");
+        assert_eq!(value.as_array().expect("contents").len(), 2);
+        assert_eq!(value[1]["role"], "user");
+        assert_eq!(
+            responses(&value[1]),
+            pairs([("weather", "sunny"), ("time", "noon")])
+        );
+    }
+
+    #[tokio::test]
+    async fn same_function_results_stay_distinct_and_ordered() {
+        let messages = [
+            Message::assistant_with_tool_calls("", vec![call("a", "lookup"), call("b", "lookup")]),
+            Message::tool("a", "first"),
+            Message::tool("b", "second"),
+        ];
+        let (_, contents) = messages_to_gemini(&messages).await.expect("convert");
+        let value = serde_json::to_value(&contents).expect("serialize");
+        assert_eq!(value.as_array().expect("contents").len(), 2);
+        assert_eq!(
+            responses(&value[1]),
+            pairs([("lookup", "first"), ("lookup", "second")])
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_order_results_follow_call_order_and_keep_signatures() {
+        let signed =
+            call("b", "time").with_reasoning_state(ReasoningState::new(PROVIDER_NAME, "sig-b"));
+        let messages = [
+            Message::assistant_with_tool_calls("", vec![call("a", "weather"), signed]),
+            Message::tool("b", "noon"),
+            Message::tool("a", "sunny"),
+            Message::user("thanks"),
+        ];
+        let (_, contents) = messages_to_gemini(&messages).await.expect("convert");
+        let value = serde_json::to_value(&contents).expect("serialize");
+        assert_eq!(value.as_array().expect("contents").len(), 3);
+        assert_eq!(
+            responses(&value[1]),
+            pairs([("weather", "sunny"), ("time", "noon")])
+        );
+        assert_eq!(value[1]["parts"][0].get("thoughtSignature"), None);
+        assert_eq!(value[1]["parts"][1]["thoughtSignature"], "sig-b");
+        assert_eq!(value[2]["parts"][0]["text"], "thanks");
     }
 
     /// Gemini has no "no thinking" level; the caller should omit effort instead.

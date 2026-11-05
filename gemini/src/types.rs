@@ -59,21 +59,6 @@ impl GeminiContent {
         }
     }
 
-    pub(crate) fn function_response_with_signature(
-        name: impl Into<String>,
-        response: Value,
-        thought_signature: Option<String>,
-    ) -> Self {
-        Self {
-            role: Some("user".into()),
-            parts: vec![Part::function_response_with_signature(
-                name.into(),
-                response,
-                thought_signature,
-            )],
-        }
-    }
-
     pub(crate) fn text_chunks(&self) -> Vec<String> {
         self.parts.iter().filter_map(Part::text_chunk).collect()
     }
