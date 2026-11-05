@@ -173,20 +173,10 @@ where
     /// # Returns
     /// `true` if any chunks were removed.
     pub fn delete(&self, doc_id: &str) -> bool {
-        let mut removed = self.index.remove(doc_id);
-
-        let mut chunk_idx = 0;
-        loop {
-            let chunk_id = format!("{doc_id}#chunk_{chunk_idx}");
-            if self.index.remove(&chunk_id) {
-                removed = true;
-                chunk_idx += 1;
-            } else {
-                break;
-            }
-        }
-
-        removed
+        // An entry stored under the document's own id, then every chunk the
+        // index holds for it as its source, which dedup may have thinned.
+        let removed = self.index.remove(doc_id);
+        self.index.remove_source(doc_id) > 0 || removed
     }
 
     /// Searches for chunks similar to the query.
@@ -339,6 +329,65 @@ mod tests {
         assert_eq!(inserted1, 1);
         assert_eq!(inserted2, 0);
         assert_eq!(store.len(), 1);
+    }
+
+    /// Splits a document's text at every `|`.
+    struct BarChunker;
+
+    impl Chunker for BarChunker {
+        fn chunk(&self, doc: &Document) -> Result<Vec<Chunk>> {
+            Ok(doc
+                .text
+                .split('|')
+                .enumerate()
+                .map(|(index, text)| {
+                    Chunk::new(
+                        format!("{}#chunk_{index}", doc.id),
+                        text,
+                        doc.id.clone(),
+                        index,
+                        crate::dedup::content_hash(text),
+                    )
+                })
+                .collect())
+        }
+
+        fn name(&self) -> &'static str {
+            "bar"
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_document_removes_chunks_after_one_dedup_skipped() {
+        let config = RagConfig::builder().deduplication(true).build();
+        let store = RagStore::with_config(MockEmbedder::new(4), config).with_chunker(BarChunker);
+
+        store
+            .insert(Document::new("a", "shared|first"))
+            .await
+            .unwrap();
+        // The first chunk of "b" duplicates one of "a", so only its second
+        // chunk is stored, under `b#chunk_1`.
+        assert_eq!(
+            store
+                .insert(Document::new("b", "shared|second"))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.len(), 3);
+
+        assert!(store.delete("b"));
+
+        assert_eq!(store.len(), 2);
+        assert!(
+            store
+                .index()
+                .entries()
+                .iter()
+                .all(|entry| entry.chunk.source_id == "a"),
+            "no chunk of the deleted document is left"
+        );
     }
 
     #[tokio::test]
