@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/May-Agent/aither/compare/sandbox-v0.16.0...sandbox-v0.17.0) - 2026-11-05
+
+### Added
+
+- *(sandbox)* run scripts on the terminal serving a bound command
+- *(sandbox)* register IPC commands for sandboxed modes only
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into chore/merge-main-0.16.0
+- Merge pull request #467 from May-Agent/feat/463-bound-terminal-runner
+
 ## [0.16.0](https://github.com/May-Agent/aither/compare/sandbox-v0.15.0...sandbox-v0.16.0) - 2026-11-05
 
 ### Added

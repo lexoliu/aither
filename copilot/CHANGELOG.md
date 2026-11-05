@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/May-Agent/aither/compare/copilot-v0.16.0...copilot-v0.17.0) - 2026-11-05
+
+### Fixed
+
+- *(copilot)* read the stream to its end so trailing usage is kept
+
 ## [0.15.0](https://github.com/May-Agent/aither/compare/copilot-v0.14.1...copilot-v0.15.0) - 2026-11-04
 
 ### Fixed
