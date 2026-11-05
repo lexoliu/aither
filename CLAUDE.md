@@ -48,7 +48,7 @@ Thin bindings mapping traits to vendor APIs:
 High-level orchestration framework:
 - `Agent` builder with tool registration and conversation loop
 - Subagent spawning for specialized tasks (explore, plan, etc.)
-- Streaming response handling with `AgentStream`
+- Runs driven with `Run::drive`, which hands each event to the caller while the run keeps going
 
 ### Tools (`tools/`)
 Standalone tool crates that integrate with the agent:

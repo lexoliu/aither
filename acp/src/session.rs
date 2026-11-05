@@ -2,13 +2,13 @@
 //!
 //! Each session represents an active conversation with the agent.
 
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aither_agent::{Agent, AgentEvent};
 use aither_core::LanguageModel;
-use futures_lite::StreamExt;
 use uuid::Uuid;
 
 use crate::protocol::{
@@ -100,70 +100,84 @@ impl<LLM: LanguageModel + 'static> AcpSession<LLM> {
     {
         self.reset();
 
-        let mut stream = Box::pin(self.agent.run(prompt, []));
-
-        while let Some(event) = stream.next().await {
-            if self.cancelled.load(Ordering::SeqCst) {
-                break;
-            }
-
-            match event.map_err(|err| err.to_string())?.event {
-                AgentEvent::Text(text) => {
-                    on_update(SessionUpdate::AgentMessageChunk(text_chunk(text)));
-                }
-                AgentEvent::Reasoning(text) => {
-                    on_update(SessionUpdate::AgentThoughtChunk(text_chunk(text)));
-                }
-                AgentEvent::ToolCallStart {
-                    id,
-                    name,
-                    arguments,
-                } => {
-                    on_update(SessionUpdate::ToolCall(ToolCall {
-                        tool_call_id: id,
-                        title: name,
-                        kind: None,
-                        status: Some(ToolCallStatus::InProgress),
-                        content: Vec::new(),
-                        locations: Vec::new(),
-                        raw_input: serde_json::from_str(&arguments).ok(),
-                        raw_output: None,
-                        meta: None,
-                    }));
-                }
-                AgentEvent::ToolCallEnd { id, result, .. } => {
-                    // The agent reports a typed ToolResult; ACP wants a status
-                    // and the text a reader should see.
-                    let status = if result.is_error() {
-                        ToolCallStatus::Failed
-                    } else {
-                        ToolCallStatus::Completed
-                    };
-                    let text = result.render_for_model();
-                    on_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                        tool_call_id: id,
-                        status: Some(status),
-                        content: Some(vec![ToolCallContent::Content {
-                            content: ContentBlock::Text(TextContent {
-                                text,
-                                annotations: None,
-                                meta: None,
-                            }),
-                        }]),
-                        title: None,
-                        kind: None,
-                        locations: None,
-                        raw_input: None,
-                        raw_output: None,
-                        meta: None,
-                    }));
-                }
-                // Remaining events carry no ACP equivalent.
-                _ => {}
-            }
-        }
+        let cancelled = &self.cancelled;
+        // A cancelled turn ends like a completed one.
+        let _ = self
+            .agent
+            .run(prompt, [])
+            .drive(
+                &mut on_update,
+                std::future::pending(),
+                |on_update, timed| async move {
+                    if cancelled.load(Ordering::SeqCst) {
+                        return ControlFlow::Break(());
+                    }
+                    report_event(timed.event, on_update);
+                    ControlFlow::Continue(on_update)
+                },
+            )
+            .await
+            .map_err(|err| err.to_string())?;
 
         Ok(())
+    }
+}
+
+/// Reports one agent event to the client as the matching ACP session update.
+fn report_event(event: AgentEvent, on_update: &mut impl FnMut(SessionUpdate)) {
+    match event {
+        AgentEvent::Text(text) => {
+            on_update(SessionUpdate::AgentMessageChunk(text_chunk(text)));
+        }
+        AgentEvent::Reasoning(text) => {
+            on_update(SessionUpdate::AgentThoughtChunk(text_chunk(text)));
+        }
+        AgentEvent::ToolCallStart {
+            id,
+            name,
+            arguments,
+        } => {
+            on_update(SessionUpdate::ToolCall(ToolCall {
+                tool_call_id: id,
+                title: name,
+                kind: None,
+                status: Some(ToolCallStatus::InProgress),
+                content: Vec::new(),
+                locations: Vec::new(),
+                raw_input: serde_json::from_str(&arguments).ok(),
+                raw_output: None,
+                meta: None,
+            }));
+        }
+        AgentEvent::ToolCallEnd { id, result, .. } => {
+            // The agent reports a typed ToolResult; ACP wants a status
+            // and the text a reader should see.
+            let status = if result.is_error() {
+                ToolCallStatus::Failed
+            } else {
+                ToolCallStatus::Completed
+            };
+            let text = result.render_for_model();
+            on_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                tool_call_id: id,
+                status: Some(status),
+                content: Some(vec![ToolCallContent::Content {
+                    content: ContentBlock::Text(TextContent {
+                        text,
+                        annotations: None,
+                        meta: None,
+                    }),
+                }]),
+                title: None,
+                kind: None,
+                locations: None,
+                raw_input: None,
+                raw_output: None,
+                meta: None,
+            }));
+        }
+        // Remaining events carry no ACP equivalent.
+        _ => {}
     }
 }
 

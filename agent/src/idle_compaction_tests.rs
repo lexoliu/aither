@@ -97,12 +97,8 @@ async fn agent_after_one_turn(
         builder = builder.cache_lifetime(lifetime);
     }
     let mut agent = builder.build();
-    {
-        // Over the default compaction floor, which leaves short contexts alone.
-        let events = agent.run(&"word ".repeat(40_000), []);
-        futures_lite::pin!(events);
-        while futures_lite::StreamExt::next(&mut events).await.is_some() {}
-    }
+    // Over the default compaction floor, which leaves short contexts alone.
+    let _ = test_support::finish_run(agent.run(&"word ".repeat(40_000), [])).await;
     agent
 }
 
@@ -186,10 +182,6 @@ async fn the_agent_hands_hosts_a_warmth_handle_that_follows_its_requests() {
     assert!(!warmth.is_warm());
 
     // A request after the entry went cold refreshes it for the same handle.
-    {
-        let events = agent.run("again", []);
-        futures_lite::pin!(events);
-        while futures_lite::StreamExt::next(&mut events).await.is_some() {}
-    }
+    let _ = test_support::finish_run(agent.run("again", [])).await;
     assert_eq!(warmth.cold_in(), Some(Duration::from_secs(600)));
 }
