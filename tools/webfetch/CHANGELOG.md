@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/May-Agent/aither/compare/webfetch-v0.18.0...webfetch-v0.19.0) - 2026-11-05
+
+### Fixed
+
+- *(webfetch)* give each headless fetch its own browser profile
+- *(webfetch)* check every request the headless browser makes
+
 ## [0.12.0](https://github.com/May-Agent/aither/compare/webfetch-v0.11.0...webfetch-v0.12.0) - 2026-11-03
 
 ### Other
