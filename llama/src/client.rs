@@ -70,7 +70,7 @@ impl Llama {
     /// Override generation context size.
     #[must_use]
     pub fn with_n_ctx(mut self, n_ctx: u32) -> Self {
-        Arc::make_mut(&mut self.inner).n_ctx = Some(n_ctx);
+        Arc::make_mut(&mut self.inner).n_ctx = n_ctx;
         self
     }
 }
@@ -92,9 +92,7 @@ impl LanguageModel for Llama {
 
     fn profile(&self) -> impl std::future::Future<Output = Result<Profile, Self::Error>> + Send {
         let cfg = self.inner.clone();
-        let context_length = cfg
-            .n_ctx
-            .unwrap_or_else(|| self.model.n_ctx_train().max(512));
+        let context_length = cfg.n_ctx;
         async move {
             let model_name = cfg
                 .model_path
@@ -167,7 +165,8 @@ impl EmbeddingModel for Llama {
 struct LlamaConfig {
     model_path: PathBuf,
     chat_template: Option<String>,
-    n_ctx: Option<u32>,
+    /// The context size contexts are created with and the profile reports.
+    n_ctx: u32,
     n_threads: i32,
     n_threads_batch: i32,
 }
@@ -263,7 +262,7 @@ impl Builder {
             inner: Arc::new(LlamaConfig {
                 model_path: self.model_path,
                 chat_template: self.chat_template,
-                n_ctx: self.n_ctx,
+                n_ctx: resolve_n_ctx(self.n_ctx, model.n_ctx_train()),
                 n_threads: self.n_threads,
                 n_threads_batch: self.n_threads_batch,
             }),
@@ -393,26 +392,36 @@ fn run_response_generation(
     Ok(())
 }
 
+/// The smallest context a model is run with, whatever its training window.
+const MIN_N_CTX: u32 = 512;
+
+/// The context size the model runs with: the configured one, else its
+/// training window. The session's context and the profile both use it.
+fn resolve_n_ctx(configured: Option<u32>, trained: u32) -> u32 {
+    configured.unwrap_or_else(|| trained.max(MIN_N_CTX))
+}
+
+fn context_params(cfg: &LlamaConfig, embeddings: bool) -> LlamaContextParams {
+    let mut params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(cfg.n_ctx))
+        .with_n_threads(cfg.n_threads)
+        .with_n_threads_batch(cfg.n_threads_batch);
+
+    if embeddings {
+        params = params.with_embeddings(true);
+        params = params.with_pooling_type(LlamaPoolingType::Last);
+    }
+    params
+}
+
 fn create_context<'a>(
     model: &'a LlamaModel,
     backend: &LlamaBackend,
     cfg: &LlamaConfig,
     embeddings: bool,
 ) -> Result<llama_cpp_2::context::LlamaContext<'a>, LlamaError> {
-    let mut params = LlamaContextParams::default();
-    if let Some(n_ctx) = cfg.n_ctx {
-        params = params.with_n_ctx(NonZeroU32::new(n_ctx));
-    }
-    params = params.with_n_threads(cfg.n_threads);
-    params = params.with_n_threads_batch(cfg.n_threads_batch);
-
-    if embeddings {
-        params = params.with_embeddings(true);
-        params = params.with_pooling_type(LlamaPoolingType::Last);
-    }
-
     model
-        .new_context(backend, params)
+        .new_context(backend, context_params(cfg, embeddings))
         .map_err(|err| LlamaError::Context(err.to_string()))
 }
 
@@ -667,4 +676,40 @@ fn parse_openai_message(json_text: &str) -> Result<Vec<ToolCall>, LlamaError> {
     }
 
     Ok(calls)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unset_context_size_is_the_training_window() {
+        assert_eq!(resolve_n_ctx(None, 32_768), 32_768);
+    }
+
+    #[test]
+    fn a_tiny_training_window_is_raised_to_the_floor() {
+        assert_eq!(resolve_n_ctx(None, 128), 512);
+    }
+
+    #[test]
+    fn a_configured_context_size_wins() {
+        assert_eq!(resolve_n_ctx(Some(2048), 32_768), 2048);
+    }
+
+    #[test]
+    fn the_context_a_session_creates_is_the_size_the_profile_reports() {
+        let params = context_params(&config_with(resolve_n_ctx(None, 8192)), false);
+        assert_eq!(params.n_ctx(), NonZeroU32::new(8192));
+    }
+
+    fn config_with(n_ctx: u32) -> LlamaConfig {
+        LlamaConfig {
+            model_path: PathBuf::from("model.gguf"),
+            chat_template: None,
+            n_ctx,
+            n_threads: 4,
+            n_threads_batch: 4,
+        }
+    }
 }
