@@ -1180,7 +1180,16 @@ async fn fetch_html_headless<P: intercept::RequestPolicy>(url: &str, policy: P) 
         "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     ];
 
+    // A profile of its own: Chrome holds a singleton lock on its profile, so
+    // fetches sharing one cannot run at the same time. It outlives `browser`,
+    // which is declared after it and so dropped first.
+    let profile = tempfile::Builder::new()
+        .prefix("aither-webfetch-")
+        .tempdir()
+        .map_err(|e| anyhow!("Failed to create the browser profile: {e}"))?;
+
     let config = BrowserConfig::builder()
+        .user_data_dir(profile.path())
         .viewport(Some(Viewport {
             width: 1920,
             height: 1080,
