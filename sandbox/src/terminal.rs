@@ -15,9 +15,11 @@ use crate::grants::{GrantSet, TerminalGrants};
 use crate::outage::Outages;
 use std::{
     borrow::Cow,
+    future::Future,
     io::{Read, Write},
     net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     sync::{
         Arc, Mutex,
@@ -54,7 +56,7 @@ use tracing::{debug, info, warn};
 #[cfg(all(unix, feature = "jobserver"))]
 use crate::jobserver::{JobBroker, JobPool, job_broker_channel};
 use crate::{
-    ContainerPath, MountRoot, PreparedTools, ToolDistribution, ToolRuntimeError,
+    CommandRefusal, ContainerPath, MountRoot, PreparedTools, ToolDistribution, ToolRuntimeError,
     builtin::builtin_router,
     command::{
         AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandRole, GateDecision, ToolRegistry,
@@ -1206,11 +1208,13 @@ async fn serve_launches<P, E>(
     }
 }
 
-/// What a terminal hands the commands bound to it: where it works and the
-/// launcher for the subagents it starts.
+/// What a terminal hands the commands bound to it: where it works, the
+/// launcher for the subagents it starts and the runner for the scripts it
+/// runs for them.
 #[derive(Clone, Debug)]
 pub struct TerminalBinding {
     launcher: TerminalToolFactory,
+    runner: TerminalRunner,
     working_dir: PathBuf,
     role: CommandRole,
     observer: Option<AnyCommandObserver>,
@@ -1221,6 +1225,12 @@ impl TerminalBinding {
     #[must_use]
     pub const fn launcher(&self) -> &TerminalToolFactory {
         &self.launcher
+    }
+
+    /// Runs scripts on this terminal, under its policy.
+    #[must_use]
+    pub const fn runner(&self) -> &TerminalRunner {
+        &self.runner
     }
 
     /// The terminal's working directory: the main agent's sandbox, or a
@@ -1241,6 +1251,161 @@ impl TerminalBinding {
     #[must_use]
     pub const fn observer(&self) -> Option<&AnyCommandObserver> {
         self.observer.as_ref()
+    }
+}
+
+/// A script a [`TerminalRunner`] runs to its end.
+#[derive(Debug, Clone)]
+pub struct TerminalScript {
+    script: String,
+    working_dir: PathBuf,
+    timeout: Duration,
+    mode: TerminalMode,
+}
+
+impl TerminalScript {
+    /// `script`, started in `working_dir` on the host and killed with its
+    /// process tree once `timeout` passes, in [`TerminalMode::Sandboxed`].
+    /// For a container terminal, `working_dir` lies in its workspace mount.
+    #[must_use]
+    pub fn new(
+        script: impl Into<String>,
+        working_dir: impl Into<PathBuf>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            script: script.into(),
+            working_dir: working_dir.into(),
+            timeout,
+            mode: TerminalMode::Sandboxed,
+        }
+    }
+
+    /// Runs the script in `mode`; an unsafe one is put to the terminal's
+    /// permission handler like any unsafe command.
+    #[must_use]
+    pub const fn with_mode(mut self, mode: TerminalMode) -> Self {
+        self.mode = mode;
+        self
+    }
+}
+
+/// Why a [`TerminalRunner`] run did not run to an end.
+#[derive(Debug, thiserror::Error)]
+pub enum TerminalRunError {
+    /// The terminal that served the command is gone.
+    #[error("the terminal serving this command is gone")]
+    TerminalGone,
+    /// The timeout is zero or above the terminal's cap.
+    #[error("timeout must be between 1 and {} seconds", .cap.as_secs())]
+    Timeout {
+        /// The longest timeout the terminal accepts.
+        cap: Duration,
+    },
+    /// The kill guard refused the script.
+    #[error(transparent)]
+    Refused(#[from] CommandRefusal),
+    /// The terminal's command gate blocked the script.
+    #[error(transparent)]
+    Blocked(#[from] CommandBlocked),
+    /// The terminal runs in a container that declares no workspace mount,
+    /// so no host directory maps into it.
+    #[error("the container declares no workspace mount, so a run cannot start in a host directory")]
+    NoWorkspaceMount,
+    /// The working directory lies outside the container's workspace mount.
+    #[error(transparent)]
+    OutsideWorkspace(#[from] crate::MountRootError),
+    /// The terminal could not run the script: no backend for its mode, a
+    /// refused permission or a failed execution.
+    #[error(transparent)]
+    Terminal(#[from] TerminalError),
+}
+
+/// Runs scripts on the terminal that serves a terminal-bound command.
+///
+/// A run is under that terminal's whole policy: its grants, network policy,
+/// backend (local sandbox or container), command gate, permission handler,
+/// process priority, environment and jobserver. Each run is a job of the
+/// terminal, listed and killable like any other, but never announced as a
+/// background task: its end is told to the caller alone.
+///
+/// Cloning shares the terminal.
+#[derive(Clone)]
+pub struct TerminalRunner(Arc<dyn TerminalRunnerImpl>);
+
+impl TerminalRunner {
+    /// Runs `script` to its end, through the foreground window and past it,
+    /// and returns its exit status and output; a run its timeout killed ends
+    /// [`CommandOutcome::Killed`].
+    ///
+    /// # Errors
+    /// Returns an error when the terminal is gone, the timeout is out of
+    /// range, the terminal's policy refuses the script, the working
+    /// directory does not map into the terminal's container, or the
+    /// execution fails.
+    pub async fn run(&self, script: TerminalScript) -> Result<CommandResult, TerminalRunError> {
+        self.0.run(script).await
+    }
+}
+
+impl std::fmt::Debug for TerminalRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalRunner").finish_non_exhaustive()
+    }
+}
+
+/// The object-safe twin behind [`TerminalRunner`].
+trait TerminalRunnerImpl: Send + Sync {
+    fn run(
+        &self,
+        script: TerminalScript,
+    ) -> Pin<Box<dyn Future<Output = Result<CommandResult, TerminalRunError>> + Send + '_>>;
+}
+
+/// A terminal's runner: the terminal, as configured when its registry was
+/// bound, and that bound registry.
+///
+/// The registry is held weakly: it holds the commands, which hold this
+/// runner, so the terminal's copy here holds no registry of its own and the
+/// runner ends with the terminal.
+struct BoundRunner<P, E> {
+    terminal: TerminalTool<P, E, Unconfigured>,
+    registry: std::sync::Weak<ToolRegistry>,
+}
+
+impl<P, E> TerminalRunnerImpl for BoundRunner<P, E>
+where
+    P: PermissionHandler + 'static,
+    E: Executor + Clone + 'static,
+{
+    fn run(
+        &self,
+        script: TerminalScript,
+    ) -> Pin<Box<dyn Future<Output = Result<CommandResult, TerminalRunError>> + Send + '_>> {
+        Box::pin(async move {
+            let registry = self
+                .registry
+                .upgrade()
+                .ok_or(TerminalRunError::TerminalGone)?;
+            self.terminal
+                .clone()
+                .map_state(|Unconfigured| Running { registry })
+                .run_to_end(script)
+                .await
+        })
+    }
+}
+
+/// The registry state of the copy of a terminal one run executes on: the
+/// terminal's bound registry, held for the run.
+#[derive(Clone, Debug)]
+struct Running {
+    registry: Arc<ToolRegistry>,
+}
+
+impl RegistryState for Running {
+    fn registry(&self) -> &Arc<ToolRegistry> {
+        &self.registry
     }
 }
 
@@ -1322,14 +1487,16 @@ impl CarriedDir {
     }
 }
 
-/// A foreground command that reports the directory it ended in.
+/// Where a command starts, and for a foreground command of the main agent,
+/// the report of the directory it ended in.
 #[derive(Clone)]
 struct CwdCarry {
     /// Where the command starts.
     start: Option<PathBuf>,
     /// The file the command's shell writes its final directory to when it
-    /// exits.
-    report: PathBuf,
+    /// exits; `None` for a command that carries no directory, such as a
+    /// script a [`TerminalRunner`] runs.
+    report: Option<PathBuf>,
     /// Set for a container command: the workspace mount that maps the host
     /// paths above into the container and back.
     container: Option<ContainerCarry>,
@@ -1338,12 +1505,12 @@ struct CwdCarry {
     shell: bool,
 }
 
-/// How a container command spells its directory report.
+/// How a container command spells its start and directory report.
 #[derive(Clone)]
 struct ContainerCarry {
     mount: MountRoot,
-    /// Where the container sees the report file.
-    report: ContainerPath,
+    /// Where the container sees the report file, when there is one.
+    report: Option<ContainerPath>,
     /// Where the command starts inside the container.
     start: ContainerPath,
 }
@@ -1704,23 +1871,36 @@ where
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
-    /// Starts this terminal's launcher and binds its registry to it.
+    /// Starts this terminal's launcher and binds its registry to it and to
+    /// its runner.
     fn into_served(self) -> TerminalTool<P, E, Configured> {
         let (launcher, requests) = async_channel::unbounded();
-        let binding = TerminalBinding {
-            launcher: TerminalToolFactory { tx: launcher },
-            working_dir: self.working_dir.clone(),
-            role: self.registry.registry.role(),
-            observer: self.registry.registry.observer().cloned(),
-        };
+        // A run starts where it is told and leaves the main agent's carried
+        // directory alone.
+        let mut runs_on = self.clone().map_state(|_| Unconfigured);
+        runs_on.carried_dir = None;
+        let mut binding = None;
+        let registry = Arc::new_cyclic(|bound| {
+            let served = TerminalBinding {
+                launcher: TerminalToolFactory { tx: launcher },
+                runner: TerminalRunner(Arc::new(BoundRunner {
+                    terminal: runs_on,
+                    registry: bound.clone(),
+                })),
+                working_dir: self.working_dir.clone(),
+                role: self.registry.registry.role(),
+                observer: self.registry.registry.observer().cloned(),
+            };
+            let registry = ToolRegistry::clone(&self.registry.registry).bind(&served);
+            binding = Some(served);
+            registry
+        });
+        let binding = binding.expect("binding the registry builds the binding");
         let source = self.clone();
         self.executor
             .spawn(async move { serve_launches(requests, source).await })
             .detach();
-        self.map_state(|Launching { registry }| Configured {
-            registry: Arc::new(ToolRegistry::clone(&registry).bind(&binding)),
-            binding,
-        })
+        self.map_state(|Launching { .. }| Configured { registry, binding })
     }
 }
 
@@ -2265,10 +2445,6 @@ where
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
-    const fn registry(&self) -> &Arc<ToolRegistry> {
-        &self.registry.registry
-    }
-
     /// Returns a receiver for the `terminal` calls in which a command
     /// registered with
     /// [`ToolRegistryBuilder::kept_through_compaction`](crate::ToolRegistryBuilder::kept_through_compaction)
@@ -2337,6 +2513,19 @@ where
             commit_ledger,
             role,
         }
+    }
+}
+
+/// The execution path every terminal state that serves a registry shares:
+/// a `terminal` call and a [`TerminalRunner`] run go through it alike.
+impl<P, E, S> TerminalTool<P, E, S>
+where
+    P: PermissionHandler + 'static,
+    E: Executor + Clone + 'static,
+    S: RegistryState,
+{
+    fn registry(&self) -> &Arc<ToolRegistry> {
+        self.registry.registry()
     }
 
     fn resolve_execution_target(
@@ -2419,7 +2608,7 @@ where
         &self,
         mode: TerminalMode,
         script: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TerminalError> {
         if mode.requires_approval() {
             match self
                 .permission_handler
@@ -2428,9 +2617,7 @@ where
             {
                 Review::Approved => return Ok(()),
                 Review::Denied(reason) => {
-                    return Err(anyhow::Error::new(TerminalError::from(
-                        PermissionError::Denied(reason),
-                    )));
+                    return Err(TerminalError::from(PermissionError::Denied(reason)));
                 }
                 Review::Passed => {}
             }
@@ -2449,7 +2636,7 @@ where
             self.emit_permission_event(mode, script, PermissionEventStage::Resolved)
                 .await;
         }
-        permission_result.map_err(anyhow::Error::new)
+        permission_result
     }
 
     async fn emit_permission_event(
@@ -2483,14 +2670,16 @@ where
             carry,
             call,
         } = request;
+        let ExecutionTarget { mode, backend } = target;
         // Every IPC channel this execution opens, local router or container
         // bridge, is served from this one registry, so each command its script
-        // runs, a detached job's included, is told the id of this call.
-        let registry = call.map_or_else(
-            || self.registry().clone(),
-            |call| Arc::new(self.registry().for_call(call)),
-        );
-        let ExecutionTarget { mode, backend } = target;
+        // runs, a detached job's included, is told the id of this call, and
+        // only the commands that answer in its mode are there.
+        let registry = self.registry().in_mode(mode);
+        let registry = Arc::new(match call {
+            Some(call) => registry.for_call(call),
+            None => registry,
+        });
         let (result_tx, result_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
         // Every job gets a real stdin pipe: a foreground command that blocks
@@ -2726,7 +2915,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
                     });
                 Some(ContainerCarry {
                     mount,
-                    report: container_report,
+                    report: Some(container_report),
                     start: container_start,
                 })
             }
@@ -2734,7 +2923,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
         let shell = container.is_some() || runs_in_shell(script);
         Some(CwdCarry {
             start,
-            report,
+            report: Some(report),
             container,
             shell,
         })
@@ -2783,8 +2972,9 @@ struct CarryContext<'a> {
 /// the shell ended in when it reported one. The file is consumed either
 /// way so a promoted command never leaves it behind.
 async fn take_cwd_report(carry: &CwdCarry) -> Option<String> {
-    let reported = async_fs::read_to_string(&carry.report).await;
-    let _ = async_fs::remove_file(&carry.report).await;
+    let report = carry.report.as_ref()?;
+    let reported = async_fs::read_to_string(report).await;
+    let _ = async_fs::remove_file(report).await;
     // A direct command writes no report; a shell that ended through
     // `exit` or a signal writes none either.
     reported
@@ -2902,9 +3092,16 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
         )
         .await
     }
+}
 
-    /// Shared front half of every `terminal` execution: argument
-    /// validation, target resolution, permission and the spawned job's ids.
+impl<P, E, S> TerminalTool<P, E, S>
+where
+    P: PermissionHandler + 'static,
+    E: Executor + Clone + 'static,
+    S: RegistryState,
+{
+    /// Shared front half of every `terminal` call: argument validation,
+    /// the agent's polling guards, then [`Self::admit_command`].
     async fn prepare_execution(
         &self,
         arguments: &TerminalArgs,
@@ -2935,35 +3132,126 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
             }
             .into());
         }
+        let prepared = self
+            .admit_command(
+                &arguments.script,
+                arguments.mode,
+                arguments.ssh_server_id.as_deref(),
+                arguments.max_lines,
+            )
+            .await?;
+        if !file_reads.is_empty() {
+            self.job_registry.record_file_reads(file_reads).await;
+        }
+        Ok(prepared)
+    }
+
+    /// The terminal's policy for a command, whoever runs it: the command
+    /// gate, target resolution, the read-only tools check and permission;
+    /// then the spawned job's ids.
+    async fn admit_command(
+        &self,
+        script: &str,
+        mode: TerminalExecutionMode,
+        ssh_server_id: Option<&str>,
+        max_lines: u32,
+    ) -> Result<ExecutionPreparation, TerminalRunError> {
         // Ahead of target resolution and permission, so a blocked command
         // never asks the user for anything. The decision carries no grant.
         if let Some(gate) = self.registry.registry().gate()
-            && let GateDecision::Block { reason } = gate.check(&arguments.script).await
+            && let GateDecision::Block { reason } = gate.check(script).await
         {
             return Err(CommandBlocked { reason }.into());
         }
-        let target =
-            self.resolve_execution_target(arguments.mode, arguments.ssh_server_id.as_deref())?;
+        let target = self.resolve_execution_target(mode, ssh_server_id)?;
         if let ExecutionBackend::Local(tools) = &target.backend {
             tools
                 .ensure_readonly(
                     std::iter::once(&self.working_dir)
                         .chain(self.grants.snapshot().writable.iter()),
                 )
-                .await?;
+                .await
+                .map_err(TerminalError::from)?;
         }
-        self.ensure_permission_allowed(target.mode, &arguments.script)
-            .await?;
-        if !file_reads.is_empty() {
-            self.job_registry.record_file_reads(file_reads).await;
-        }
+        self.ensure_permission_allowed(target.mode, script).await?;
         let task_id = random_task_id();
         Ok(ExecutionPreparation {
             target,
             execution_id: format!("exec-{task_id}"),
             task_id,
             store_dir: self.output_store.dir().to_path_buf(),
-            max_lines: arguments.max_lines.min(MAX_LINES_CEILING) as usize,
+            max_lines: max_lines.min(MAX_LINES_CEILING) as usize,
+        })
+    }
+
+    /// Runs `run` to its end on this terminal; see [`TerminalRunner::run`].
+    async fn run_to_end(&self, run: TerminalScript) -> Result<CommandResult, TerminalRunError> {
+        let cap = self.limits.timeout_cap;
+        if run.timeout.is_zero() || run.timeout > cap {
+            return Err(TerminalRunError::Timeout { cap });
+        }
+        crate::kill_guard::check(&run.script)?;
+        // A run starts in a host directory, so it resolves the terminal's
+        // home backend, never an SSH server.
+        let mode = match run.mode {
+            TerminalMode::Sandboxed => TerminalExecutionMode::Sandboxed,
+            TerminalMode::Unsafe => TerminalExecutionMode::Unsafe,
+        };
+        let prepared = self
+            .admit_command(&run.script, mode, None, default_max_lines())
+            .await?;
+        let start = run_start(&prepared.target, run.working_dir)?;
+        let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
+            target: prepared.target,
+            task_id: prepared.task_id.clone(),
+            execution_id: prepared.execution_id,
+            script: run.script,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            max_lines: prepared.max_lines,
+            raw: false,
+            background: false,
+            timeout: run.timeout,
+            carry: Some(start),
+            call: None,
+        });
+        match spawned.startup.recv().await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(TerminalError::Execution(error).into()),
+            Err(_) => {
+                return Err(TerminalError::Execution(
+                    "the run ended before it was registered".to_string(),
+                )
+                .into());
+            }
+        }
+        // The run is never announced as a background task, so its end is
+        // told to the caller alone, however long it takes.
+        let result = spawned
+            .result
+            .recv()
+            .await
+            .map_err(|_| TerminalError::Execution("the run ended without a result".to_string()))?
+            .map_err(TerminalError::Execution)?;
+        let killed = self
+            .job_registry
+            .get_by_task_id_settled(&prepared.task_id)
+            .await
+            .is_some_and(|job| matches!(job.status, JobStatus::Killed));
+        if !killed {
+            return Ok(CommandResult::from(result));
+        }
+        Ok(CommandResult {
+            stdout: result.stdout,
+            stderr: result.stderr,
+            interruptions: result.interruptions,
+            outcome: CommandOutcome::Killed {
+                task_id: prepared.task_id,
+                notice: spawned.timeout_watch.kill().map_or_else(
+                    || "Killed before its timeout bound passed.".to_string(),
+                    |kill| kill.notice(),
+                ),
+            },
         })
     }
 
@@ -3046,6 +3334,34 @@ struct ExecutionPreparation {
     execution_id: String,
     store_dir: PathBuf,
     max_lines: usize,
+}
+
+/// Where a run starts: `dir` on the host, mapped through the workspace
+/// mount for a container command. A run carries no directory, so it writes
+/// no report.
+fn run_start(target: &ExecutionTarget, dir: PathBuf) -> Result<CwdCarry, TerminalRunError> {
+    let container = match &target.backend {
+        ExecutionBackend::Local(_) => None,
+        ExecutionBackend::Container { runtime, .. } => {
+            let mount = runtime
+                .workspace_mount()
+                .cloned()
+                .ok_or(TerminalRunError::NoWorkspaceMount)?;
+            let start = mount.container_path(&dir)?;
+            Some(ContainerCarry {
+                mount,
+                report: None,
+                start,
+            })
+        }
+        ExecutionBackend::Ssh { .. } => unreachable!("a run resolves the home backend"),
+    };
+    Ok(CwdCarry {
+        start: Some(dir),
+        report: None,
+        container,
+        shell: false,
+    })
 }
 
 async fn wait_for_background_startup(
@@ -4144,7 +4460,7 @@ where
     let launch = build_terminal_launch(
         &context.prepared_tools.shell()?,
         context.script,
-        context.carry.map(|carry| carry.report.as_path()),
+        context.carry.and_then(|carry| carry.report.as_deref()),
     )?;
     let (program, args) = match &launch {
         TerminalLaunch::Direct { program, args } | TerminalLaunch::Shell { program, args } => {
@@ -4252,7 +4568,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     let launch = build_terminal_launch(
         &context.prepared_tools.shell()?,
         context.script,
-        context.carry.map(|carry| carry.report.as_path()),
+        context.carry.and_then(|carry| carry.report.as_deref()),
     )?;
     let (program, args) = match &launch {
         TerminalLaunch::Direct { program, args } | TerminalLaunch::Shell { program, args } => {
@@ -4772,8 +5088,8 @@ fn container_exec_script(
         format!("{preamble}{script}")
     };
     let script = prepared_tools.wrap_script(&script)?;
-    let script = match carry {
-        Some(carry) => carry_cwd_script(&script, carry.report.as_str())?,
+    let script = match carry.and_then(|carry| carry.report.as_ref()) {
+        Some(report) => carry_cwd_script(&script, report.as_str())?,
         None => script,
     };
     Ok(prepared_tools.shell_command(&script)?)
@@ -5776,11 +6092,11 @@ async fn wait_for_terminal_stream_close(job_registry: &JobRegistry, pid: u32) {
     }
 }
 
-/// Creates the IPC router with built-in and tool commands (standalone version).
+/// Creates a sandboxed execution's IPC router: the built-in commands and
+/// every command `registry` has in the execution's mode.
 fn create_ipc_router(registry: &Arc<ToolRegistry>) -> Option<IpcRouter> {
     let mut router = builtin_router();
 
-    // Register all configured tools as IPC commands
     let tool_names = registry.registered_tool_names();
     tracing::info!(tools = ?tool_names, "Creating IPC router with registered tools");
     for name in tool_names {
@@ -5791,17 +6107,14 @@ fn create_ipc_router(registry: &Arc<ToolRegistry>) -> Option<IpcRouter> {
     has_methods.then_some(router)
 }
 
+/// Creates an unsafe execution's IPC router: the `ipc` gateway and every
+/// command `registry` has in unsafe mode. A command registered for
+/// sandboxed modes alone gets no shim, so the name resolves on the host's
+/// `PATH`.
 fn create_ipc_gateway_router(registry: &Arc<ToolRegistry>) -> Option<IpcRouter> {
     let mut router = crate::register_ipc_gateway_command(IpcRouter::new(), Arc::clone(registry));
 
-    // In unsafe mode, keep tool commands usable (websearch/webfetch/ask/subagent...),
-    // but never override native shell task/process commands like kill/jobs.
-    let blocked = ["kill", "jobs"];
-    let tool_names = registry.registered_tool_names();
-    for name in tool_names {
-        if blocked.contains(&name.as_str()) {
-            continue;
-        }
+    for name in registry.registered_tool_names() {
         router = crate::register_tool_command(router, Arc::clone(registry), &name);
     }
 
@@ -6567,6 +6880,7 @@ mod tests {
         mode_checks: AtomicUsize,
         domain_checks: AtomicUsize,
         allow_domain: bool,
+        allow_unsafe: bool,
     }
 
     impl PermissionHandler for TestPermissionHandler {
@@ -6578,7 +6892,7 @@ mod tests {
             self.mode_checks.fetch_add(1, AtomicOrdering::Relaxed);
             std::future::ready(Ok(match mode {
                 TerminalMode::Sandboxed => true,
-                TerminalMode::Unsafe => false,
+                TerminalMode::Unsafe => self.allow_unsafe,
             }))
         }
 
@@ -10017,19 +10331,28 @@ mod tests {
         let report = tool.working_dir().join(".cwd-container");
         let carry = CwdCarry {
             start: None,
-            report: report.clone(),
+            report: Some(report.clone()),
             container: Some(ContainerCarry {
                 mount: mount.clone(),
-                report: mount
-                    .container_path(&report)
-                    .expect("report is in the mount"),
+                report: Some(
+                    mount
+                        .container_path(&report)
+                        .expect("report is in the mount"),
+                ),
                 start: ContainerPath::new("/workspace").unwrap(),
             }),
             shell: true,
         };
         let receiver = tool.background_receiver();
         assert_eq!(
-            carry.container.as_ref().unwrap().report.as_str(),
+            carry
+                .container
+                .as_ref()
+                .unwrap()
+                .report
+                .as_ref()
+                .unwrap()
+                .as_str(),
             format!(
                 "/workspace/{}",
                 report.file_name().unwrap().to_string_lossy()
@@ -10968,6 +11291,96 @@ mod tests {
         );
     }
 
+    /// Stands in for a host program inside sandboxed modes: answers with a
+    /// refusal naming itself.
+    #[cfg(unix)]
+    struct SandboxedUname;
+
+    #[cfg(unix)]
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct SandboxedUnameArgs {}
+
+    #[cfg(unix)]
+    impl Tool for SandboxedUname {
+        fn name(&self) -> Cow<'static, str> {
+            "uname".into()
+        }
+
+        type Arguments = SandboxedUnameArgs;
+        type Res = ToolResult;
+
+        fn call(
+            &self,
+            _arguments: Self::Arguments,
+            _cx: ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(ToolResult::text("sandboxed uname refused")))
+        }
+    }
+
+    /// A command registered for sandboxed modes answers a sandboxed script,
+    /// while an unsafe script resolves the same name on the host's `PATH`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandboxed_only_command_leaves_unsafe_scripts_the_host_program() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool = TerminalTool::new_exact(
+            dir.path(),
+            TestPermissionHandler {
+                allow_unsafe: true,
+                ..Default::default()
+            },
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
+        let mut builder = ToolRegistryBuilder::new();
+        builder.sandboxed_only(|sandboxed| sandboxed.configure_tool(SandboxedUname));
+        let tool = tool.with_registry(Arc::new(builder.build(dir.path().join("outputs"))));
+
+        let sandboxed = tool
+            .call(
+                terminal_args("sandboxed uname", "uname"),
+                ToolContext::new(),
+            )
+            .await
+            .expect("sandboxed call should succeed");
+        let sandboxed = render_terminal_result(&sandboxed);
+        assert!(
+            sandboxed.contains("sandboxed uname refused"),
+            "a sandboxed script reaches the command: {sandboxed}"
+        );
+
+        let unsafe_run = tool
+            .call(
+                TerminalArgs {
+                    mode: TerminalExecutionMode::Unsafe,
+                    ..terminal_args("host uname", "uname -s; ipc uname")
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("unsafe call should succeed");
+        let unsafe_run = render_terminal_result(&unsafe_run);
+        let host = std::process::Command::new("uname")
+            .arg("-s")
+            .output()
+            .expect("the host runs uname");
+        let host = String::from_utf8(host.stdout).expect("uname prints UTF-8");
+        assert!(
+            unsafe_run.contains(host.trim()),
+            "an unsafe script runs the host program: {unsafe_run}"
+        );
+        assert!(
+            !unsafe_run.contains("sandboxed uname refused"),
+            "an unsafe script never reaches the command, not even through `ipc`: {unsafe_run}"
+        );
+    }
+
     #[tokio::test]
     async fn a_subagent_of_a_subagent_gets_the_subagent_registry() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -11010,6 +11423,167 @@ mod tests {
         let child = child.to_dyn();
         assert!(!child.has_command("probe_echo"));
         assert_eq!(child.role(), crate::CommandRole::Subagent);
+    }
+
+    // ---- terminal runner ----------------------------------------------------
+
+    /// Runs a script on the terminal serving it and answers with how the
+    /// script ended and what it printed.
+    #[cfg(unix)]
+    struct CheckProbe {
+        runner: TerminalRunner,
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct CheckProbeArgs {
+        /// The directory the script starts in.
+        dir: String,
+        /// The script.
+        script: String,
+        /// Seconds before the script is killed.
+        timeout: u64,
+    }
+
+    #[cfg(unix)]
+    impl Tool for CheckProbe {
+        fn name(&self) -> Cow<'static, str> {
+            "check_probe".into()
+        }
+
+        type Arguments = CheckProbeArgs;
+        type Res = ToolResult;
+
+        async fn call(
+            &self,
+            arguments: Self::Arguments,
+            _cx: ToolContext,
+        ) -> aither_core::Result<Self::Res> {
+            let result = self
+                .runner
+                .run(TerminalScript::new(
+                    arguments.script,
+                    arguments.dir,
+                    Duration::from_secs(arguments.timeout),
+                ))
+                .await?;
+            let answer = match (&result.outcome, &result.stdout) {
+                (CommandOutcome::Exited { code }, CommandStream::Inline { text }) => {
+                    format!("exit={code} stdout={text}")
+                }
+                (CommandOutcome::Killed { .. }, _) => "killed".to_string(),
+                other => panic!("a run ends exited with inline output or killed: {other:?}"),
+            };
+            Ok(ToolResult::text(answer))
+        }
+    }
+
+    /// Calls `check_probe` on `terminal` and returns its answer.
+    #[cfg(unix)]
+    async fn run_check_probe(
+        terminal: &ConfiguredTestTool,
+        dir: &Path,
+        script: &str,
+        timeout: u64,
+    ) -> String {
+        let timeout = timeout.to_string();
+        let answer = query_control(
+            terminal.registry(),
+            "check_probe",
+            &[
+                "--dir",
+                dir.to_str().unwrap(),
+                "--script",
+                script,
+                "--timeout",
+                &timeout,
+            ],
+        )
+        .await;
+        assert_eq!(answer["ok"], true, "{answer}");
+        answer["payload"]["content"].as_str().unwrap().to_string()
+    }
+
+    /// A terminal-bound command runs scripts on the terminal serving it,
+    /// under that terminal's policy as it stands at the run — a grant made
+    /// after the registry was bound included — and the runner ends with the
+    /// terminal.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_bound_command_runs_a_script_under_its_terminals_policy() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let clone = tempfile::tempdir().expect("clone dir should be created");
+        let read_only = tempfile::tempdir().expect("read-only dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool = TerminalTool::new_exact(
+            dir.path(),
+            TestPermissionHandler::default(),
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_readable_paths([read_only.path()]);
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_terminal_bound_tool("check_probe", |binding: &TerminalBinding| {
+            CheckProbe {
+                runner: binding.runner().clone(),
+            }
+        });
+        let terminal = tool.with_registry(Arc::new(builder.build(dir.path().join("outputs"))));
+        terminal.grants().add_writable(clone.path());
+
+        let clone_dir = std::fs::canonicalize(clone.path()).unwrap();
+        let answer = run_check_probe(&terminal, &clone_dir, "pwd && touch checked", 30).await;
+        assert!(answer.starts_with("exit=0 "), "{answer}");
+        assert!(
+            answer.contains(clone_dir.to_str().unwrap()),
+            "the run starts in the directory it names: {answer}"
+        );
+        assert!(clone_dir.join("checked").exists());
+
+        let read_only_dir = std::fs::canonicalize(read_only.path()).unwrap();
+        let answer = run_check_probe(&terminal, &read_only_dir, "touch denied", 30).await;
+        assert!(
+            !answer.starts_with("exit=0 "),
+            "a read-only grant stays read-only: {answer}"
+        );
+        assert!(!read_only_dir.join("denied").exists());
+
+        let answer = run_check_probe(&terminal, &clone_dir, "sleep 30", 1).await;
+        assert_eq!(answer, "killed", "the timeout kills the run");
+
+        let runner = terminal.binding().runner().clone();
+        let unsafe_run = runner
+            .run(
+                TerminalScript::new("true", &clone_dir, Duration::from_secs(30))
+                    .with_mode(TerminalMode::Unsafe),
+            )
+            .await;
+        assert!(
+            matches!(
+                unsafe_run,
+                Err(TerminalRunError::Terminal(TerminalError::PermissionDenied(
+                    TerminalMode::Unsafe
+                )))
+            ),
+            "an unsafe run is put to the permission handler: {unsafe_run:?}"
+        );
+
+        drop(terminal);
+        let gone = runner
+            .run(TerminalScript::new(
+                "true",
+                &clone_dir,
+                Duration::from_secs(30),
+            ))
+            .await;
+        assert!(
+            matches!(gone, Err(TerminalRunError::TerminalGone)),
+            "the runner ends with its terminal: {gone:?}"
+        );
     }
 
     // ---- call identity ------------------------------------------------------

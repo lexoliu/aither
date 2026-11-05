@@ -147,8 +147,9 @@ pub use terminal::{
     DirectoryResetReason, JobAlert, LongRunningJob, PermissionEvent, PermissionEventReceiver,
     PermissionEventStage, StartedBackgroundTask, StdinBlockedJob, StdinProbeFailedJob,
     TerminalArgs, TerminalBinding, TerminalEnvSource, TerminalError, TerminalExecutionMode,
-    TerminalTool, TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
-    background_task_channel, open_network_audit_log,
+    TerminalRunError, TerminalRunner, TerminalScript, TerminalTool, TerminalToolFactory,
+    TerminalToolFactoryError, TimeoutKill, Unconfigured, background_task_channel,
+    open_network_audit_log,
 };
 pub use tool_distribution::{
     HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,
