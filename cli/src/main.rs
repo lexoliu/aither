@@ -54,7 +54,6 @@ use aither_core::llm::{Role, ToolResult};
 use aither_mcp::{McpConnection, McpServersConfig};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use async_lock::Mutex as AsyncMutex;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -273,7 +272,7 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
         })
         .collect();
 
-    let conn = Arc::new(AsyncMutex::new(conn));
+    let conn = Arc::new(conn);
 
     for (name, description, schema) in tools {
         let conn = conn.clone();
@@ -298,7 +297,6 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
                 };
 
                 // Call the MCP tool
-                let mut conn = conn.lock().await;
                 match conn.call(&tool_name, arguments).await {
                     Ok(result) => {
                         // Extract text content from result
@@ -519,7 +517,7 @@ async fn build_agent(
 
     // Add Context7 MCP server by default (documentation lookup)
     if !args.no_context7 {
-        match McpConnection::http("https://mcp.context7.com/mcp").await {
+        match McpConnection::http(&TokioGlobal, "https://mcp.context7.com/mcp").await {
             Ok(conn) => {
                 if !args.quiet {
                     println!("Connected to Context7 MCP server");
@@ -548,7 +546,7 @@ async fn build_agent(
         let config: McpServersConfig =
             serde_json::from_str(&config_str).with_context(|| "failed to parse MCP config")?;
 
-        let connections = McpConnection::from_configs(&config).await?;
+        let connections = McpConnection::from_configs(&TokioGlobal, &config).await?;
         for (name, conn) in connections {
             if !args.quiet {
                 println!("Connected to MCP server: {name}");

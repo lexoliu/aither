@@ -2,23 +2,42 @@
 //!
 //! The client connects to MCP servers and provides methods to list and call
 //! tools, read resources, and so on. [`McpConnection`] wraps a client together
-//! with the transport that drives it, ready to hand to an agent.
+//! with the tools it discovered, ready to hand to an agent.
+//!
+//! Each client owns one receive loop (see [`McpClient::connect`]) that is the
+//! only reader and writer of its transport. It routes responses to the
+//! requests awaiting them, answers the server's `ping`, rejects server
+//! requests for capabilities the client does not advertise, and hands
+//! notifications to the [`McpHandler`] given at connect time.
 
+mod connection;
+mod handler;
+#[cfg(all(test, feature = "http"))]
+mod tests;
 mod toolset;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use async_channel::{Receiver, Sender};
+use executor_core::{Executor, Task};
+use serde::de::DeserializeOwned;
+use tracing::debug;
+
+pub use handler::{McpHandler, ServerNotification};
 pub use toolset::{
     McpConnection, McpServerConfig, McpServersConfig, McpToolService, call_result_to_tool_result,
     register_terminal_commands,
 };
 
-use tracing::debug;
+use connection::Command;
 
 use crate::protocol::{
-    CallToolParams, CallToolResult, InitializeParams, InitializeResult, JsonRpcRequest,
-    ListToolsResult, McpError, McpToolDefinition, Resource, ResourceContents, ServerCapabilities,
-    ServerInfo,
+    CallToolParams, CallToolResult, InitializeParams, InitializeResult, JsonRpcNotification,
+    JsonRpcRequest, ListToolsResult, McpError, McpToolDefinition, Resource, ResourceContents,
+    ServerCapabilities, ServerInfo,
 };
-use crate::transport::Transport;
+use crate::transport::BidirectionalTransport;
 
 /// MCP client for connecting to and interacting with MCP servers.
 ///
@@ -26,9 +45,10 @@ use crate::transport::Transport;
 ///
 /// ```ignore
 /// use aither_mcp::{McpClient, ChildProcessTransport};
+/// use executor_core::tokio::TokioGlobal;
 ///
 /// let transport = ChildProcessTransport::spawn("npx", &["-y", "@mcp/server"])?;
-/// let mut client = McpClient::connect(transport).await?;
+/// let client = McpClient::connect(&TokioGlobal, transport, ()).await?;
 ///
 /// // List available tools
 /// let tools = client.list_tools().await?;
@@ -37,38 +57,67 @@ use crate::transport::Transport;
 /// let result = client.call_tool("my_tool", serde_json::json!({"arg": "value"})).await?;
 /// ```
 #[derive(Debug)]
-pub struct McpClient<T: Transport> {
-    transport: T,
-    server_info: Option<ServerInfo>,
+pub struct McpClient {
+    /// Requests and notifications for the receive loop to write.
+    commands: Sender<Command>,
+    /// Closes when the receive loop has finished.
+    finished: Receiver<()>,
+    /// Next request ID.
+    next_id: AtomicI64,
+    server_info: ServerInfo,
     capabilities: ServerCapabilities,
 }
 
-impl<T: Transport> McpClient<T> {
+impl McpClient {
     /// Connect to an MCP server and perform initialization.
+    ///
+    /// `executor` runs the connection's receive loop, which takes ownership of
+    /// `transport`. The loop ends with the connection: when the transport
+    /// reports EOF or fails, or when [`close`](Self::close) is called or the
+    /// client is dropped. Requests pending at that point fail with an error
+    /// that says why.
+    ///
+    /// `handler` receives the server's notifications.
     ///
     /// # Errors
     ///
     /// Returns an error if the connection or initialization fails.
-    pub async fn connect(transport: T) -> Result<Self, McpError> {
+    pub async fn connect<T, H, E>(executor: &E, transport: T, handler: H) -> Result<Self, McpError>
+    where
+        T: BidirectionalTransport + 'static,
+        H: McpHandler,
+        E: Executor,
+    {
+        let (commands, command_rx) = async_channel::unbounded();
+        let (alive, finished) = async_channel::bounded(1);
+        executor
+            .spawn(connection::run(
+                transport,
+                command_rx,
+                Arc::new(handler),
+                alive,
+            ))
+            .detach();
+
         let mut client = Self {
-            transport,
-            server_info: None,
+            commands,
+            finished,
+            next_id: AtomicI64::new(1),
+            server_info: ServerInfo {
+                name: String::new(),
+                version: None,
+            },
             capabilities: ServerCapabilities::default(),
         };
-
         client.initialize().await?;
-
         Ok(client)
     }
 
     /// Perform MCP initialization handshake.
     async fn initialize(&mut self) -> Result<(), McpError> {
-        let params = InitializeParams::default();
-        let request = JsonRpcRequest::with_params(0i64, "initialize", params);
-
-        let response = self.transport.request(request).await?;
-        let result: InitializeResult =
-            serde_json::from_value(response.into_result().map_err(McpError::JsonRpc)?)?;
+        let result: InitializeResult = self
+            .request("initialize", Some(InitializeParams::default()))
+            .await?;
 
         debug!(
             "Connected to MCP server: {} v{}",
@@ -76,20 +125,50 @@ impl<T: Transport> McpClient<T> {
             result.server_info.version.as_deref().unwrap_or("unknown")
         );
 
-        self.server_info = Some(result.server_info);
+        self.server_info = result.server_info;
         self.capabilities = result.capabilities;
 
         // Send initialized notification
-        let notif = crate::protocol::JsonRpcNotification::new("notifications/initialized");
-        self.transport.notify(notif).await?;
+        let (reply, sent) = async_channel::bounded(1);
+        self.commands
+            .send(Command::Notification {
+                notification: JsonRpcNotification::new("notifications/initialized"),
+                reply,
+            })
+            .await
+            .map_err(|_| McpError::ConnectionClosed)?;
+        sent.recv().await.map_err(|_| McpError::ConnectionClosed)?
+    }
 
-        Ok(())
+    /// Send a request through the receive loop and decode its result.
+    async fn request<P, R>(&self, method: &str, params: Option<P>) -> Result<R, McpError>
+    where
+        P: serde::Serialize,
+        R: DeserializeOwned,
+    {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let mut request = JsonRpcRequest::new(id, method);
+        request.params = params.map(serde_json::to_value).transpose()?;
+
+        let (reply, response) = async_channel::bounded(1);
+        self.commands
+            .send(Command::Request { request, reply })
+            .await
+            .map_err(|_| McpError::ConnectionClosed)?;
+        let response = response
+            .recv()
+            .await
+            .map_err(|_| McpError::ConnectionClosed)??;
+
+        Ok(serde_json::from_value(
+            response.into_result().map_err(McpError::JsonRpc)?,
+        )?)
     }
 
     /// Get the server information.
     #[must_use]
-    pub const fn server_info(&self) -> Option<&ServerInfo> {
-        self.server_info.as_ref()
+    pub const fn server_info(&self) -> &ServerInfo {
+        &self.server_info
     }
 
     /// Get the server capabilities.
@@ -103,11 +182,8 @@ impl<T: Transport> McpClient<T> {
     /// # Errors
     ///
     /// Returns an error if the request fails.
-    pub async fn list_tools(&mut self) -> Result<Vec<McpToolDefinition>, McpError> {
-        let request = JsonRpcRequest::new(0i64, "tools/list");
-        let response = self.transport.request(request).await?;
-        let result: ListToolsResult =
-            serde_json::from_value(response.into_result().map_err(McpError::JsonRpc)?)?;
+    pub async fn list_tools(&self) -> Result<Vec<McpToolDefinition>, McpError> {
+        let result: ListToolsResult = self.request("tools/list", None::<()>).await?;
 
         debug!("Listed {} tools", result.tools.len());
         Ok(result.tools)
@@ -124,7 +200,7 @@ impl<T: Transport> McpClient<T> {
     ///
     /// Returns an error if the request fails.
     pub async fn call_tool(
-        &mut self,
+        &self,
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult, McpError> {
@@ -133,11 +209,7 @@ impl<T: Transport> McpClient<T> {
             arguments,
             meta: None,
         };
-        let request = JsonRpcRequest::with_params(0i64, "tools/call", params);
-
-        let response = self.transport.request(request).await?;
-        let result: CallToolResult =
-            serde_json::from_value(response.into_result().map_err(McpError::JsonRpc)?)?;
+        let result: CallToolResult = self.request("tools/call", Some(params)).await?;
 
         debug!(
             "Tool {} returned {} content items",
@@ -152,16 +224,13 @@ impl<T: Transport> McpClient<T> {
     /// # Errors
     ///
     /// Returns an error if the request fails or resources are not supported.
-    pub async fn list_resources(&mut self) -> Result<Vec<Resource>, McpError> {
+    pub async fn list_resources(&self) -> Result<Vec<Resource>, McpError> {
         #[derive(serde::Deserialize)]
         struct ListResourcesResult {
             resources: Vec<Resource>,
         }
 
-        let request = JsonRpcRequest::new(0i64, "resources/list");
-        let response = self.transport.request(request).await?;
-        let result: ListResourcesResult =
-            serde_json::from_value(response.into_result().map_err(McpError::JsonRpc)?)?;
+        let result: ListResourcesResult = self.request("resources/list", None::<()>).await?;
 
         debug!("Listed {} resources", result.resources.len());
         Ok(result.resources)
@@ -176,7 +245,7 @@ impl<T: Transport> McpClient<T> {
     /// # Errors
     ///
     /// Returns an error if the request fails.
-    pub async fn read_resource(&mut self, uri: &str) -> Result<ResourceContents, McpError> {
+    pub async fn read_resource(&self, uri: &str) -> Result<ResourceContents, McpError> {
         #[derive(serde::Serialize)]
         struct ReadResourceParams {
             uri: String,
@@ -190,11 +259,7 @@ impl<T: Transport> McpClient<T> {
         let params = ReadResourceParams {
             uri: uri.to_string(),
         };
-        let request = JsonRpcRequest::with_params(0i64, "resources/read", params);
-
-        let response = self.transport.request(request).await?;
-        let result: ReadResourceResult =
-            serde_json::from_value(response.into_result().map_err(McpError::JsonRpc)?)?;
+        let result: ReadResourceResult = self.request("resources/read", Some(params)).await?;
 
         result
             .contents
@@ -205,10 +270,12 @@ impl<T: Transport> McpClient<T> {
 
     /// Close the client connection.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if closing fails.
-    pub async fn close(&mut self) -> Result<(), McpError> {
-        self.transport.close().await
+    /// Stops the receive loop, which closes the transport (terminating a
+    /// child process) and fails every request still pending, and waits for it
+    /// to finish. Closing an already closed connection does nothing.
+    pub async fn close(&self) {
+        self.commands.close();
+        // The loop drops its end when it is done; nothing is ever sent.
+        let _ = self.finished.recv().await;
     }
 }
