@@ -123,8 +123,10 @@ pub struct ChatCompletionRequest {
     parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormatPayload>,
+    /// Chat Completions takes the effort as a top-level string; the nested
+    /// `reasoning` object belongs to the Responses API.
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ReasoningPayload>,
+    reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,7 +173,7 @@ impl ChatCompletionRequest {
             tool_choice: tool_choice(params, has_tools),
             parallel_tool_calls: has_tools.then_some(params.parallel_tool_calls).flatten(),
             response_format: response_format(params),
-            reasoning: reasoning(params),
+            reasoning_effort: params.reasoning_effort.map(openai_effort),
             prompt_cache_key: params.prompt_cache_key.clone(),
             prompt_cache_retention: prompt_cache_retention(params),
         }
@@ -528,13 +530,6 @@ const fn openai_effort(effort: ReasoningEffort) -> &'static str {
         ReasoningEffort::XHigh => "xhigh",
         ReasoningEffort::Max => "max",
     }
-}
-
-fn reasoning(params: &ParameterSnapshot) -> Option<ReasoningPayload> {
-    params.reasoning_effort.map(|effort| ReasoningPayload {
-        effort: Some(openai_effort(effort)),
-        summary: None,
-    })
 }
 
 /// Builds the Responses API `reasoning` config.
@@ -1551,18 +1546,32 @@ mod tests {
         assert!(responses_reasoning(&snapshot).is_none());
     }
 
-    /// Chat Completions has no `summary` field, so the shared payload must not
-    /// grow one just because the Responses builder needs it.
+    /// Chat Completions takes a top-level `reasoning_effort`; the nested
+    /// `reasoning` object is the Responses shape and is not a Chat field.
     #[test]
-    fn chat_reasoning_never_carries_a_summary() {
+    fn chat_request_sends_top_level_reasoning_effort() {
         let params = Parameters::default()
             .include_reasoning(true)
             .reasoning_effort(ReasoningEffort::Low);
-        let snapshot = ParameterSnapshot::from(&params);
-        let payload = reasoning(&snapshot).expect("reasoning payload");
-        let value = serde_json::to_value(payload).expect("serialize reasoning");
-        assert_eq!(value["effort"], "low");
-        assert_eq!(value.get("summary"), None);
+        let value = chat_request_with_tool(&params);
+        assert_eq!(value["reasoning_effort"], "low");
+        assert_eq!(value.get("reasoning"), None);
+
+        let unset = chat_request_with_tool(&Parameters::default());
+        assert_eq!(unset.get("reasoning_effort"), None);
+        assert_eq!(unset.get("reasoning"), None);
+    }
+
+    /// The Responses API nests effort and summary under `reasoning`.
+    #[test]
+    fn responses_request_nests_reasoning_effort_and_summary() {
+        let params = Parameters::default()
+            .include_reasoning(true)
+            .reasoning_effort(ReasoningEffort::Low);
+        let value = responses_request_with_tool(&params);
+        assert_eq!(value["reasoning"]["effort"], "low");
+        assert_eq!(value["reasoning"]["summary"], "auto");
+        assert_eq!(value.get("reasoning_effort"), None);
     }
 
     #[test]
