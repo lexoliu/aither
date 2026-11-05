@@ -521,12 +521,65 @@ impl ExternalContent {
     }
 }
 
-/// One external block as the prefix template reads it.
+impl ExternalContent {
+    /// The block as the templates read it.
+    fn view(&self) -> ExternalBlockView<'_> {
+        ExternalBlockView {
+            boundary: self.boundary(),
+            kind: self.kind.label(),
+            source: &self.source,
+            content: &self.content,
+        }
+    }
+
+    /// The content inside its provenance-labelled boundary, for a host that
+    /// places it in text of its own — an alert's template, say.
+    ///
+    /// The closing tag carries a boundary derived from the block's own
+    /// bytes, which therefore never occurs in it, exactly as in the system
+    /// prompt. The same block always renders the same text. The text does
+    /// not repeat the notice that external content is data; see
+    /// [`Block::external`](super::Block::external) for a block that does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the template fails to render.
+    #[must_use]
+    pub fn render(&self) -> String {
+        ExternalBlockTemplate { block: self.view() }
+            .render()
+            .expect("external block template must render")
+    }
+
+    /// The block with the notice that external content is data before it,
+    /// for an alert that arrives where the system prompt has no such notice.
+    pub(crate) fn render_with_notice(&self) -> String {
+        ExternalAlertTemplate { block: self.view() }
+            .render()
+            .expect("external alert template must render")
+    }
+}
+
+/// One external block as the templates read it.
 struct ExternalBlockView<'a> {
     boundary: String,
     kind: &'static str,
     source: &'a str,
     content: &'a str,
+}
+
+/// One external block, bounded.
+#[derive(Template)]
+#[template(path = "external_block.txt", escape = "none")]
+struct ExternalBlockTemplate<'a> {
+    block: ExternalBlockView<'a>,
+}
+
+/// One external block, bounded and preceded by the notice that it is data.
+#[derive(Template)]
+#[template(path = "external_alert.txt", escape = "none")]
+struct ExternalAlertTemplate<'a> {
+    block: ExternalBlockView<'a>,
 }
 
 /// The whole cacheable system prefix.
@@ -548,15 +601,7 @@ pub(crate) fn render_prefix(
     }
     let template = SystemPrefixTemplate {
         instructions: instructions.iter().map(|(_, text)| text.as_str()).collect(),
-        external: external
-            .iter()
-            .map(|(_, block)| ExternalBlockView {
-                boundary: block.boundary(),
-                kind: block.kind.label(),
-                source: &block.source,
-                content: &block.content,
-            })
-            .collect(),
+        external: external.iter().map(|(_, block)| block.view()).collect(),
     };
     Some(
         template

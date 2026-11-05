@@ -1,0 +1,3 @@
+<external-content boundary="{{ block.boundary }}" kind="{{ block.kind }}" source="{{ block.source|escape("html") }}">
+{{ block.content }}
+</external-content boundary="{{ block.boundary }}">

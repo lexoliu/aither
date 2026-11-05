@@ -1,0 +1,2 @@
+{% include "external_notice.txt" %}
+{% include "external_block.txt" %}
