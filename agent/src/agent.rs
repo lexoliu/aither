@@ -3525,7 +3525,7 @@ mod tests {
         });
         assert_eq!(
             killed,
-            "The command ended while sleep (pid 41), node (pid 42) and 3 more kept running, so they were killed with it. A process meant to keep running belongs in terminal_background."
+            "The command ended while sleep (pid 41), node (pid 42) and 3 more kept running, so they were killed with it. A process meant to keep running is started with `background: true`."
         );
         let one = job_alert_text(&JobAlertText::DescendantsKilled {
             processes: &[JobProcess {
