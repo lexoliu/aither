@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/May-Agent/aither/compare/openai-v0.16.0...openai-v0.17.0) - 2026-11-05
+
+### Fixed
+
+- *(openai)* send Chat Completions effort as top-level reasoning_effort
+- *(openai)* read Responses usage details under their API names
+
+### Other
+
+- Merge pull request #488 from May-Agent/fix/469
+
 ## [0.15.0](https://github.com/May-Agent/aither/compare/openai-v0.14.1...openai-v0.15.0) - 2026-11-04
 
 ### Fixed
