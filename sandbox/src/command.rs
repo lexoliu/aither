@@ -162,12 +162,18 @@ fn push_help_line(help: &mut String, line: &str) {
     help.push('\n');
 }
 
-fn render_positional_usage(name: &str) -> String {
+fn render_positional_usage(name: &str, required: bool) -> String {
     let kebab = name.replace('_', "-");
-    let mut output = String::with_capacity(kebab.len() + 2);
+    let mut output = String::with_capacity(kebab.len() + 4);
+    if !required {
+        output.push('[');
+    }
     output.push('<');
     output.push_str(kebab.as_str());
     output.push('>');
+    if !required {
+        output.push(']');
+    }
     output
 }
 
@@ -2478,16 +2484,6 @@ fn parse_object(root_schema: &Value, schema: &Value, args: &[String]) -> anyhow:
         i += 1;
     }
 
-    if schema.command_capture_enabled
-        && !state.seen_positionals.is_empty()
-        && !state.result.contains_key("command")
-    {
-        state.result.insert(
-            "command".to_string(),
-            Value::String(state.seen_positionals.join(" ")),
-        );
-    }
-
     for req in &schema.required {
         if !state.result.contains_key(req) {
             anyhow::bail!("missing required argument: {req}");
@@ -2501,7 +2497,6 @@ struct ObjectParseSchema {
     properties: serde_json::Map<String, Value>,
     required: Vec<String>,
     positional_fields: Vec<String>,
-    command_capture_enabled: bool,
     short_to_field: HashMap<char, String>,
     long_names: Vec<String>,
 }
@@ -2525,16 +2520,12 @@ impl ObjectParseSchema {
             })
             .unwrap_or_default();
         let positional_fields = positional_fields(root_schema, &properties, &required);
-        let command_capture_enabled = properties
-            .get("command")
-            .is_some_and(|schema| get_instance_type(root_schema, schema) == Some("string"));
         let (short_to_field, _) = build_short_option_maps(&properties);
         let long_names = properties.keys().map(|k| k.replace('_', "-")).collect();
         Self {
             properties,
             required,
             positional_fields,
-            command_capture_enabled,
             short_to_field,
             long_names,
         }
@@ -2545,23 +2536,58 @@ impl ObjectParseSchema {
 struct ObjectParseState {
     result: HashMap<String, Value>,
     positional_idx: usize,
-    seen_positionals: Vec<String>,
     end_of_options: bool,
 }
 
+/// The schema keyword that marks an optional field positional.
+///
+/// A tool's argument schema binds bare words, in order, to its required
+/// non-array fields. Setting this keyword to `true` on a field's schema
+/// binds words to that field too, after the required ones, though the field
+/// is optional:
+///
+/// ```ignore
+/// #[derive(JsonSchema)]
+/// struct Args {
+///     question: String,
+///     #[schemars(extend("x-positional" = true))]
+///     context: Option<String>,
+/// }
+/// ```
+///
+/// An array field is never positional; it is filled by repeated flags.
+pub const POSITIONAL_KEYWORD: &str = "x-positional";
+
+/// The fields bare words bind to, in order: the required non-array fields,
+/// then the optional non-array fields marked with [`POSITIONAL_KEYWORD`].
 fn positional_fields(
     root_schema: &Value,
     properties: &serde_json::Map<String, Value>,
     required: &[String],
 ) -> Vec<String> {
+    let is_array = |name: &str| {
+        properties
+            .get(name)
+            .is_some_and(|schema| get_instance_type(root_schema, schema) == Some("array"))
+    };
+    let marked = |schema: &Value| {
+        schema
+            .get(POSITIONAL_KEYWORD)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
     required
         .iter()
-        .filter(|name| {
-            properties.get(name.as_str()).is_none_or(|prop_schema| {
-                get_instance_type(root_schema, prop_schema) != Some("array")
-            })
-        })
+        .filter(|name| !is_array(name))
         .cloned()
+        .chain(
+            properties
+                .iter()
+                .filter(|(name, schema)| {
+                    !required.contains(name) && marked(schema) && !is_array(name)
+                })
+                .map(|(name, _)| name.clone()),
+        )
         .collect()
 }
 
@@ -2580,9 +2606,6 @@ fn parse_positional_arg(
                 .insert(field_name.clone(), parse_value(arg, prop_type));
         }
         state.positional_idx += 1;
-        state.seen_positionals.push(arg.to_string());
-    } else if schema.command_capture_enabled {
-        state.seen_positionals.push(arg.to_string());
     } else {
         anyhow::bail!("unexpected positional argument: {arg}");
     }
@@ -2911,15 +2934,12 @@ pub fn schema_to_help(schema: &Value) -> String {
             .map(|arr| arr.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
 
-        // Show positional usage: only non-array required fields are positional
-        let positional: Vec<_> = required
+        // Show positional usage: the fields bare words bind to, optional
+        // ones in brackets.
+        let required_names: Vec<String> = required.iter().map(|n| (*n).to_string()).collect();
+        let positional: Vec<_> = positional_fields(schema, props, &required_names)
             .iter()
-            .filter(|n| {
-                props
-                    .get(**n)
-                    .is_none_or(|s| get_instance_type(s, s) != Some("array"))
-            })
-            .map(|n| render_positional_usage(n))
+            .map(|name| render_positional_usage(name, required.contains(&name.as_str())))
             .collect();
         // Show required array fields as repeatable flags in usage
         let repeatable: Vec<_> = required
@@ -3552,25 +3572,96 @@ mod tests {
         command: Option<String>,
     }
 
+    /// A field named `command` is an ordinary optional field: bare words
+    /// bind to the required `query` only, and nothing is captured into it.
     #[test]
-    fn test_command_field_captures_single_positional_for_session_like_tools() {
+    fn test_command_field_has_no_special_meaning() {
         let schema = schemars::schema_for!(SessionLikeArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
         let value = cli_to_json(&schema, &["gold".into()]).unwrap();
         assert_eq!(value["query"], "gold");
-        assert_eq!(value["command"], "gold");
+        assert!(value.get("command").is_none(), "got: {value}");
+
+        let err = cli_to_json(&schema, &["abc123".into(), "search".into(), "gold".into()])
+            .expect_err("a second bare word has no field to bind to");
+        assert!(
+            err.to_string().contains("unexpected positional argument"),
+            "got: {err}"
+        );
+
+        let value = cli_to_json(&schema, &["gold".into(), "--command".into(), "go".into()])
+            .expect("the flag still sets the field");
+        assert_eq!(value["command"], "go");
+    }
+
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct OptionalPositionalArgs {
+        question: String,
+        #[schemars(extend("x-positional" = true))]
+        context: Option<String>,
+        note: Option<String>,
+        options: Vec<String>,
+    }
+
+    /// An optional field marked positional takes the words after the
+    /// required ones; an unmarked optional field stays flag-only.
+    #[test]
+    fn test_marked_optional_field_binds_positional_words() {
+        let schema = schemars::schema_for!(OptionalPositionalArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        let value = cli_to_json(
+            &schema,
+            &[
+                "Pick one".into(),
+                "Some context".into(),
+                "--options".into(),
+                "A".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(value["question"], "Pick one");
+        assert_eq!(value["context"], "Some context");
+        assert!(value.get("note").is_none(), "got: {value}");
+
+        // The marked field is optional: leaving it out is fine.
+        let value = cli_to_json(
+            &schema,
+            &["Pick one".into(), "--options".into(), "A".into()],
+        )
+        .unwrap();
+        assert!(value.get("context").is_none(), "got: {value}");
+
+        // `note` is optional and unmarked, so a third word has no field.
+        let err = cli_to_json(
+            &schema,
+            &[
+                "Q".into(),
+                "C".into(),
+                "N".into(),
+                "--options".into(),
+                "A".into(),
+            ],
+        )
+        .expect_err("an unmarked optional field is flag-only");
+        assert!(
+            err.to_string().contains("unexpected positional argument"),
+            "got: {err}"
+        );
     }
 
     #[test]
-    fn test_command_field_captures_multi_positional_for_session_like_tools() {
-        let schema = schemars::schema_for!(SessionLikeArgs);
+    fn test_marked_optional_field_shows_in_usage() {
+        let schema = schemars::schema_for!(OptionalPositionalArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
-        let value = cli_to_json(&schema, &["abc123".into(), "search".into(), "gold".into()])
-            .expect("session-like positional command should parse");
-        assert_eq!(value["query"], "abc123");
-        assert_eq!(value["command"], "abc123 search gold");
+        let help = schema_to_help(&schema);
+        assert!(
+            help.contains("<question> [<context>]"),
+            "usage should show the optional positional, got:\n{help}"
+        );
+        assert!(!help.contains("[<note>]"), "got:\n{help}");
     }
 
     // ========================================================================

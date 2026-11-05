@@ -95,9 +95,10 @@ pub use bollard_exec::BollardContainerExec;
 pub use command::{
     AnyCommandGate, AnyCommandObserver, CommandCall, CommandEnvelope, CommandGate, CommandObserver,
     CommandPayload, CommandRole, CommandUsage, DynTerminalTool, DynToolHandler, GateDecision,
-    IpcToolCommand, KeptExchangeReceiver, ToolCallCommand, ToolCommand, ToolRegistry,
-    ToolRegistryBuilder, cli_to_json, output_saved_text, register_ipc_gateway_command,
-    register_tool_command, register_tool_direct, schema_to_help, tool_output_to_payload,
+    IpcToolCommand, KeptExchangeReceiver, POSITIONAL_KEYWORD, ToolCallCommand, ToolCommand,
+    ToolRegistry, ToolRegistryBuilder, cli_to_json, output_saved_text,
+    register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
+    tool_output_to_payload,
 };
 pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
