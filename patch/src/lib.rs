@@ -121,7 +121,7 @@ pub fn apply_patch_text(patch: &str, base: &Path) -> Result<Vec<FileOutcome>, Pa
     // patch applies cleanly.
     let patched = apply_actions(&actions, &files)?;
     let outcomes = file_outcomes(&actions);
-    commit(base, &patched, &modes, &outcomes)?;
+    commit(base, &patched, modes, &outcomes)?;
     Ok(outcomes)
 }
 
@@ -267,7 +267,7 @@ fn file_outcomes(actions: &[Action]) -> Vec<FileOutcome> {
 fn commit(
     base: &Path,
     patched: &HashMap<String, String>,
-    modes: &HashMap<String, fs::Permissions>,
+    mut modes: HashMap<String, fs::Permissions>,
     outcomes: &[FileOutcome],
 ) -> Result<(), PatchError> {
     for outcome in outcomes {
@@ -285,13 +285,15 @@ fn commit(
             FileOutcome::Renamed { from, to } => {
                 let content = patched.get(to).map_or("", String::as_str);
                 write_file(base, to, content)?;
-                if let Some(mode) = modes.get(from) {
+                if let Some(mode) = modes.remove(from) {
                     fs::set_permissions(base.join(to), mode.clone()).map_err(|source| {
                         PatchError::Io {
                             path: to.clone(),
                             source,
                         }
                     })?;
+                    // The mode follows the file through a later move.
+                    modes.insert(to.clone(), mode);
                 }
                 fs::remove_file(base.join(from)).map_err(|source| PatchError::Io {
                     path: from.clone(),
@@ -596,6 +598,29 @@ mod tests {
                 .mode()
                 & 0o777,
             0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mode_follows_a_file_through_chained_moves() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        write(dir.path(), "a.sh", "echo a\n");
+        fs::set_permissions(dir.path().join("a.sh"), fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+        let patch = "*** Begin Patch\n*** Update File: a.sh\n*** Move to: b.sh\n@@\n-echo a\n+echo b\n*** Update File: b.sh\n*** Move to: c.sh\n@@\n-echo b\n+echo c\n*** End Patch";
+        apply_patch_text(patch, dir.path()).expect("patch applies");
+        assert_eq!(read(dir.path(), "c.sh"), "echo c\n");
+        assert!(!dir.path().join("a.sh").exists());
+        assert!(!dir.path().join("b.sh").exists());
+        assert_eq!(
+            fs::metadata(dir.path().join("c.sh"))
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
         );
     }
 
