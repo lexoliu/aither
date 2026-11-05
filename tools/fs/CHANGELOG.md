@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/May-Agent/aither/compare/fs-v0.17.0...fs-v0.18.0) - 2026-11-05
+
+### Fixed
+
+- *(fs)* contain every path before anything is written
+
 ## [0.12.0](https://github.com/May-Agent/aither/compare/fs-v0.11.0...fs-v0.12.0) - 2026-11-03
 
 ### Other
