@@ -51,8 +51,8 @@ const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 pub struct HttpTransport {
     /// Base URL of the MCP server.
     base_url: String,
-    /// Optional authorization header value.
-    auth: Option<String>,
+    /// Headers sent with every request, such as authorization.
+    headers: Vec<(String, String)>,
     /// Session ID returned by server during initialization.
     session_id: Option<String>,
     /// Protocol version negotiated by `initialize`, sent on every later request.
@@ -100,7 +100,7 @@ enum Reply {
 /// in flight while the transport itself is used.
 struct Endpoint {
     url: String,
-    auth: Option<String>,
+    headers: Vec<(String, String)>,
     session_id: Option<String>,
     protocol_version: Option<String>,
 }
@@ -152,7 +152,7 @@ impl HttpTransport {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            auth: None,
+            headers: Vec::new(),
             session_id: None,
             protocol_version: None,
             initialize_id: None,
@@ -166,8 +166,14 @@ impl HttpTransport {
 
     /// Set the authorization header.
     #[must_use]
-    pub fn with_auth(mut self, auth: impl Into<String>) -> Self {
-        self.auth = Some(auth.into());
+    pub fn with_auth(self, auth: impl Into<String>) -> Self {
+        self.with_header(header::AUTHORIZATION.as_str(), auth)
+    }
+
+    /// Send a header with every request.
+    #[must_use]
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
         self
     }
 
@@ -180,7 +186,7 @@ impl HttpTransport {
     fn endpoint(&self) -> Endpoint {
         Endpoint {
             url: self.base_url.clone(),
-            auth: self.auth.clone(),
+            headers: self.headers.clone(),
             session_id: self.session_id.clone(),
             protocol_version: self.protocol_version.clone(),
         }
@@ -277,9 +283,9 @@ impl HttpTransport {
             .header(header::USER_AGENT.as_str(), "aither-mcp/0.1")
             .map_err(|e| failed(&e))?;
 
-        if let Some(auth) = &endpoint.auth {
+        for (name, value) in &endpoint.headers {
             builder = builder
-                .header(header::AUTHORIZATION.as_str(), auth.clone())
+                .header(name.clone(), value.clone())
                 .map_err(|e| failed(&e))?;
         }
 

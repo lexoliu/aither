@@ -436,10 +436,15 @@ async fn main() -> Result<()> {
 async fn run_acp_server(cloud: CloudProvider) -> Result<()> {
     use aither_acp::AcpServer;
 
-    let mut server = AcpServer::stdio("aither", env!("CARGO_PKG_VERSION"), move |cwd| {
-        let cloud = cloud.clone();
-        async move { acp_session_agent(cloud, cwd).await }
-    });
+    let mut server = AcpServer::stdio(
+        "aither",
+        env!("CARGO_PKG_VERSION"),
+        TokioGlobal,
+        move |setup| {
+            let cloud = cloud.clone();
+            async move { acp_session_agent(cloud, setup).await }
+        },
+    );
     server.run().await?;
     Ok(())
 }
@@ -447,7 +452,7 @@ async fn run_acp_server(cloud: CloudProvider) -> Result<()> {
 /// Build the agent backing a single ACP session.
 async fn acp_session_agent(
     cloud: CloudProvider,
-    cwd: std::path::PathBuf,
+    setup: aither_acp::SessionSetup,
 ) -> std::result::Result<
     Agent<CloudProvider, CloudProvider, CloudProvider>,
     aither_acp::protocol::AcpError,
@@ -456,14 +461,20 @@ async fn acp_session_agent(
 
     let permission_handler = InteractivePermissionHandler::new();
     let terminal_tool =
-        aither_agent::sandbox::TerminalTool::new_in(&cwd, permission_handler, TokioGlobal)
+        aither_agent::sandbox::TerminalTool::new_in(&setup.cwd, permission_handler, TokioGlobal)
             .await
             .map_err(|err| to_acp(err.into()))?;
 
-    let agent = TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
-        .tool(aither_agent::websearch::WebSearchTool::default())
-        .tool(aither_agent::webfetch::WebFetchTool::new())
-        .tool(aither_agent::sandbox::builtin::AskCommand::new(cloud))
+    let agent = setup
+        .mcp
+        .into_iter()
+        .fold(
+            TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
+                .tool(aither_agent::websearch::WebSearchTool::default())
+                .tool(aither_agent::webfetch::WebFetchTool::new())
+                .tool(aither_agent::sandbox::builtin::AskCommand::new(cloud)),
+            TerminalAgentBuilder::mcp_connection,
+        )
         .with_default_prompt()
         .build();
 
