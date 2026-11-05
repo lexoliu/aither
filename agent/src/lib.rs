@@ -58,6 +58,7 @@ mod idle_compaction_tests;
 pub mod language;
 mod model_group;
 mod output_urls;
+mod request_parameters;
 mod stream;
 mod subagent_file;
 mod terminal_agent;
