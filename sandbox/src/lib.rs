@@ -115,7 +115,7 @@ pub use heel::NetworkAuditLog;
 pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use job_registry::{
     Delivery, JobInfo, JobRegistry, JobRegistryService, JobStatus, OwedCompletion,
-    PendingCompletion, TerminalDelta, job_registry_channel,
+    PendingCompletion, TerminalDelta, TerminalReadError, job_registry_channel,
 };
 #[cfg(all(unix, feature = "jobserver"))]
 pub use jobserver::{
@@ -131,6 +131,7 @@ pub use network_policy::{
 };
 pub use output::{MediaResolution, OutputFormat, OutputStore};
 pub use permission::{PermissionHandler, PermissionRequest, Review, TerminalMode};
+pub use poll_guard::PollRefusal;
 pub use process_tree::{
     JOB_MARKER_VAR, JobProcess, KillTreeError, ProcessTableError, kill_process_tree,
 };

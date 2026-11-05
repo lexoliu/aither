@@ -11,6 +11,7 @@ use async_channel::{Receiver, Sender, WeakSender};
 use futures_lite::io::AsyncWriteExt;
 
 use crate::permission::TerminalMode;
+use crate::poll_guard::PollRefusal;
 use crate::process_tree::{JobMarker, JobTree, KillTreeError, ProcessScanner};
 
 /// Information about a running or completed background job.
@@ -146,6 +147,17 @@ pub struct TerminalDelta {
     pub bytes: Vec<u8>,
     /// Current task status at the time of the read.
     pub status: JobStatus,
+}
+
+/// Why [`JobRegistry::terminal_read`] returned no delta.
+#[derive(Debug, thiserror::Error)]
+pub enum TerminalReadError {
+    /// The read would return what the task's last read returned.
+    #[error(transparent)]
+    Refused(PollRefusal),
+    /// The read could not be served, such as an unknown task id.
+    #[error("{0}")]
+    Failed(String),
 }
 
 /// Sender used by the registry to push bytes into a running process stdin.
@@ -305,7 +317,7 @@ enum JobRequest {
         /// tracked by the unchanged-read refusal; a monitor pump's reads are
         /// not, and read the complete-line buffer instead.
         tracked: bool,
-        reply: Sender<Result<TerminalDelta, String>>,
+        reply: Sender<Result<TerminalDelta, TerminalReadError>>,
     },
     FileReadsUnchanged {
         reads: Vec<(PathBuf, FileFingerprint)>,
@@ -584,13 +596,15 @@ impl JobRegistry {
     /// Returns terminal output added since the provided cursor.
     ///
     /// # Errors
-    /// Returns an error when the task id is unknown.
+    /// [`TerminalReadError::Refused`] when the read would return what the
+    /// task's last read returned; [`TerminalReadError::Failed`] when the
+    /// task id is unknown.
     pub async fn terminal_read(
         &self,
         task_id: &str,
         cursor: usize,
         max_bytes: usize,
-    ) -> Result<TerminalDelta, String> {
+    ) -> Result<TerminalDelta, TerminalReadError> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::ReadTerminalDelta {
             task_id: task_id.to_string(),
@@ -624,7 +638,13 @@ impl JobRegistry {
             reply: reply_tx,
         })
         .await;
-        Self::recv_reply(reply_rx).await
+        match Self::recv_reply(reply_rx).await {
+            Ok(delta) => Ok(delta),
+            Err(TerminalReadError::Failed(error)) => Err(error),
+            Err(TerminalReadError::Refused(refusal)) => {
+                unreachable!("an untracked read is never refused: {refusal:?}")
+            }
+        }
     }
 
     /// Whether every `reads` entry matches what the last read of that path
@@ -1031,6 +1051,7 @@ async fn handle_job_request(
             reply,
         } => {
             let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes, !tracked)
+                .map_err(TerminalReadError::Failed)
                 .and_then(|delta| tracked_delta(reads, &task_id, delta, tracked));
             let _ = reply.send(result).await;
         }
@@ -1422,13 +1443,15 @@ fn tracked_delta(
     task_id: &str,
     delta: TerminalDelta,
     tracked: bool,
-) -> Result<TerminalDelta, String> {
+) -> Result<TerminalDelta, TerminalReadError> {
     let returned = (delta.cursor, delta.total_bytes, delta.status.clone());
     if !tracked {
         return Ok(delta);
     }
     if reads.delta_reads.get(task_id) == Some(&returned) {
-        Err(crate::poll_guard::unchanged_task_read(task_id))
+        Err(TerminalReadError::Refused(PollRefusal::UnchangedTaskRead {
+            task_id: task_id.to_string(),
+        }))
     } else {
         reads.delta_reads.insert(task_id.to_string(), returned);
         Ok(delta)
@@ -1750,8 +1773,12 @@ mod tests {
             .expect("first read succeeds");
         let second = registry.terminal_read("task-a", first.cursor, 1024).await;
         assert!(
-            second.is_err(),
-            "an unchanged repeat read must be refused: {second:?}"
+            matches!(
+                &second,
+                Err(TerminalReadError::Refused(refusal @ PollRefusal::UnchangedTaskRead { task_id }))
+                    if task_id == "task-a" && refusal.is_unchanged_read()
+            ),
+            "an unchanged repeat read must be refused as a poll: {second:?}"
         );
 
         registry.append_stdout(7, b"two".to_vec()).await;
