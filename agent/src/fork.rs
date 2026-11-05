@@ -89,7 +89,7 @@ impl ForkSnapshot {
 ///
 /// Create one with [`SubagentTool::fork_source`](crate::specialized::SubagentTool::fork_source)
 /// and hand it to the main agent's builder with
-/// [`AgentBuilder::fork_source`](crate::AgentBuilder::fork_source); the agent
+/// [`AgentOptions::fork_source`](crate::AgentOptions::fork_source); the agent
 /// publishes every request it sends, the tool reads the newest.
 #[derive(Debug, Clone, Default)]
 pub struct ForkSource {

@@ -96,7 +96,7 @@ pub use aither_sandbox as sandbox;
 // Public API
 pub use agent::{Agent, BackgroundWake, CompactResult};
 pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser};
-pub use builder::AgentBuilder;
+pub use builder::{AgentBuilder, AgentOptions, AgentSettings};
 pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
 pub use clock::{AnyClock, Clock, Instant, ManualClock, SystemClock};

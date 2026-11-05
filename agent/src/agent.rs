@@ -3373,6 +3373,7 @@ fn truncate_script(script: &str, max_chars: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentOptions;
 
     use crate::Handoff;
     use aither_sandbox::{CompletedCommand, CompletedTask, TerminalError};

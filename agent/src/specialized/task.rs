@@ -28,7 +28,6 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::external::{AnyExternalSession, AnyExternalSubagent, ExternalStart, ExternalSubagent};
-use crate::AgentBuilder;
 use crate::context::CacheLifetime;
 use crate::external_hook::{self, ExternalHooks};
 use crate::fork::{ForkSnapshot, ForkSource};
@@ -36,6 +35,7 @@ use crate::fs_util::path_exists;
 use crate::model_group::ModelTier;
 use crate::request_parameters::TierParameters;
 use crate::subagent_file::{Listed, SubagentAccess, SubagentDefinition, SubagentLookup};
+use crate::{AgentBuilder, AgentOptions};
 
 async fn checked_path_exists(path: &Path) -> anyhow::Result<bool> {
     path_exists(path)
@@ -815,7 +815,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
     /// the router's while the fast tier does.
     ///
     /// Each subagent's agent sets the fields aither owns per request over
-    /// them, as [`AgentBuilder::request_parameters`] describes. A fork
+    /// them, as [`AgentOptions::request_parameters`] describes. A fork
     /// sends the main agent's parameters instead, since its requests start
     /// as the main agent's.
     #[must_use]
@@ -903,7 +903,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
 
     /// Where the main agent publishes its requests for the `fork` subagent
     /// kind; give it to the main agent's builder with
-    /// [`AgentBuilder::fork_source`](crate::AgentBuilder::fork_source) before
+    /// [`AgentOptions::fork_source`] before
     /// handing the tool over, like [`runs`](Self::runs).
     #[must_use]
     pub fn fork_source(&self) -> ForkSource {

@@ -8,7 +8,7 @@
 //! place every new kind of ambient context had to be threaded through.
 //! A [`ContextSource`] is that contract, so the loop knows only the trait and
 //! hosts register whatever else they need with
-//! [`AgentBuilder::context_source`](crate::AgentBuilder::context_source).
+//! [`AgentOptions::context_source`](crate::AgentOptions::context_source).
 //!
 //! Every source renders into the *tail* of the request, never into the middle
 //! of it. The prefix a provider has cached stays byte-identical as the
