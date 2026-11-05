@@ -2483,14 +2483,16 @@ where
             carry,
             call,
         } = request;
+        let ExecutionTarget { mode, backend } = target;
         // Every IPC channel this execution opens, local router or container
         // bridge, is served from this one registry, so each command its script
-        // runs, a detached job's included, is told the id of this call.
-        let registry = call.map_or_else(
-            || self.registry().clone(),
-            |call| Arc::new(self.registry().for_call(call)),
-        );
-        let ExecutionTarget { mode, backend } = target;
+        // runs, a detached job's included, is told the id of this call, and
+        // only the commands that answer in its mode are there.
+        let registry = self.registry().in_mode(mode);
+        let registry = Arc::new(match call {
+            Some(call) => registry.for_call(call),
+            None => registry,
+        });
         let (result_tx, result_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
         // Every job gets a real stdin pipe: a foreground command that blocks
@@ -5776,11 +5778,11 @@ async fn wait_for_terminal_stream_close(job_registry: &JobRegistry, pid: u32) {
     }
 }
 
-/// Creates the IPC router with built-in and tool commands (standalone version).
+/// Creates a sandboxed execution's IPC router: the built-in commands and
+/// every command `registry` has in the execution's mode.
 fn create_ipc_router(registry: &Arc<ToolRegistry>) -> Option<IpcRouter> {
     let mut router = builtin_router();
 
-    // Register all configured tools as IPC commands
     let tool_names = registry.registered_tool_names();
     tracing::info!(tools = ?tool_names, "Creating IPC router with registered tools");
     for name in tool_names {
@@ -5791,17 +5793,14 @@ fn create_ipc_router(registry: &Arc<ToolRegistry>) -> Option<IpcRouter> {
     has_methods.then_some(router)
 }
 
+/// Creates an unsafe execution's IPC router: the `ipc` gateway and every
+/// command `registry` has in unsafe mode. A command registered for
+/// sandboxed modes alone gets no shim, so the name resolves on the host's
+/// `PATH`.
 fn create_ipc_gateway_router(registry: &Arc<ToolRegistry>) -> Option<IpcRouter> {
     let mut router = crate::register_ipc_gateway_command(IpcRouter::new(), Arc::clone(registry));
 
-    // In unsafe mode, keep tool commands usable (websearch/webfetch/ask/subagent...),
-    // but never override native shell task/process commands like kill/jobs.
-    let blocked = ["kill", "jobs"];
-    let tool_names = registry.registered_tool_names();
-    for name in tool_names {
-        if blocked.contains(&name.as_str()) {
-            continue;
-        }
+    for name in registry.registered_tool_names() {
         router = crate::register_tool_command(router, Arc::clone(registry), &name);
     }
 
@@ -6567,6 +6566,7 @@ mod tests {
         mode_checks: AtomicUsize,
         domain_checks: AtomicUsize,
         allow_domain: bool,
+        allow_unsafe: bool,
     }
 
     impl PermissionHandler for TestPermissionHandler {
@@ -6578,7 +6578,7 @@ mod tests {
             self.mode_checks.fetch_add(1, AtomicOrdering::Relaxed);
             std::future::ready(Ok(match mode {
                 TerminalMode::Sandboxed => true,
-                TerminalMode::Unsafe => false,
+                TerminalMode::Unsafe => self.allow_unsafe,
             }))
         }
 
@@ -10965,6 +10965,96 @@ mod tests {
         assert!(
             grandchild.contains(&child_space),
             "the grandchild works inside its caller's space: {grandchild} vs {child_space}"
+        );
+    }
+
+    /// Stands in for a host program inside sandboxed modes: answers with a
+    /// refusal naming itself.
+    #[cfg(unix)]
+    struct SandboxedUname;
+
+    #[cfg(unix)]
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct SandboxedUnameArgs {}
+
+    #[cfg(unix)]
+    impl Tool for SandboxedUname {
+        fn name(&self) -> Cow<'static, str> {
+            "uname".into()
+        }
+
+        type Arguments = SandboxedUnameArgs;
+        type Res = ToolResult;
+
+        fn call(
+            &self,
+            _arguments: Self::Arguments,
+            _cx: ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(ToolResult::text("sandboxed uname refused")))
+        }
+    }
+
+    /// A command registered for sandboxed modes answers a sandboxed script,
+    /// while an unsafe script resolves the same name on the host's `PATH`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandboxed_only_command_leaves_unsafe_scripts_the_host_program() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool = TerminalTool::new_exact(
+            dir.path(),
+            TestPermissionHandler {
+                allow_unsafe: true,
+                ..Default::default()
+            },
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
+        let mut builder = ToolRegistryBuilder::new();
+        builder.sandboxed_only(|sandboxed| sandboxed.configure_tool(SandboxedUname));
+        let tool = tool.with_registry(Arc::new(builder.build(dir.path().join("outputs"))));
+
+        let sandboxed = tool
+            .call(
+                terminal_args("sandboxed uname", "uname"),
+                ToolContext::new(),
+            )
+            .await
+            .expect("sandboxed call should succeed");
+        let sandboxed = render_terminal_result(&sandboxed);
+        assert!(
+            sandboxed.contains("sandboxed uname refused"),
+            "a sandboxed script reaches the command: {sandboxed}"
+        );
+
+        let unsafe_run = tool
+            .call(
+                TerminalArgs {
+                    mode: TerminalExecutionMode::Unsafe,
+                    ..terminal_args("host uname", "uname -s; ipc uname")
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("unsafe call should succeed");
+        let unsafe_run = render_terminal_result(&unsafe_run);
+        let host = std::process::Command::new("uname")
+            .arg("-s")
+            .output()
+            .expect("the host runs uname");
+        let host = String::from_utf8(host.stdout).expect("uname prints UTF-8");
+        assert!(
+            unsafe_run.contains(host.trim()),
+            "an unsafe script runs the host program: {unsafe_run}"
+        );
+        assert!(
+            !unsafe_run.contains("sandboxed uname refused"),
+            "an unsafe script never reaches the command, not even through `ipc`: {unsafe_run}"
         );
     }
 

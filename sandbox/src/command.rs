@@ -318,11 +318,34 @@ pub enum CommandRole {
     Subagent,
 }
 
-/// What a command resolves to in each role.
+/// What a command resolves to in each role, and the terminal modes it
+/// answers in.
 #[derive(Debug)]
 struct RoleEntries<T> {
     main: T,
     subagent: SubagentSide<T>,
+    modes: ModeScope,
+}
+
+/// The terminal modes a command answers in.
+#[derive(Debug, Clone, Copy)]
+enum ModeScope {
+    /// Every mode.
+    Every,
+    /// Sandboxed modes alone: an unsafe command has no such command, so its
+    /// shell resolves the name on the host's `PATH`.
+    Sandboxed,
+}
+
+impl ModeScope {
+    /// Whether a command in this scope answers in `mode`; `None`, a registry
+    /// no terminal execution serves, has every command.
+    const fn admits(self, mode: Option<TerminalMode>) -> bool {
+        match (self, mode) {
+            (Self::Every, _) | (Self::Sandboxed, None | Some(TerminalMode::Sandboxed)) => true,
+            (Self::Sandboxed, Some(TerminalMode::Unsafe)) => false,
+        }
+    }
 }
 
 /// What the subagent role has of a command.
@@ -362,12 +385,13 @@ impl<T: Clone> Clone for RoleEntries<T> {
                 SubagentSide::Reserved => SubagentSide::Reserved,
                 SubagentSide::Absent => SubagentSide::Absent,
             },
+            modes: self.modes,
         }
     }
 }
 
 impl<T> RoleEntries<T> {
-    /// One entry serving both roles.
+    /// One entry serving both roles in every mode.
     fn shared(entry: T) -> Self
     where
         T: Clone,
@@ -375,6 +399,7 @@ impl<T> RoleEntries<T> {
         Self {
             main: entry.clone(),
             subagent: SubagentSide::Serves(entry),
+            modes: ModeScope::Every,
         }
     }
 
@@ -388,13 +413,14 @@ impl<T> RoleEntries<T> {
         }
     }
 
-    /// Whether `role` has the command at all, reserved or not: a command
-    /// absent from it is neither listed nor callable there.
-    const fn exists_for(&self, role: CommandRole) -> bool {
-        !matches!(
-            (role, &self.subagent),
-            (CommandRole::Subagent, SubagentSide::Absent)
-        )
+    /// Whether `role` has the command at all in `mode`, reserved or not: a
+    /// command absent from it is neither listed nor callable there.
+    const fn exists_for(&self, role: CommandRole, mode: Option<TerminalMode>) -> bool {
+        self.modes.admits(mode)
+            && !matches!(
+                (role, &self.subagent),
+                (CommandRole::Subagent, SubagentSide::Absent)
+            )
     }
 }
 
@@ -633,6 +659,7 @@ fn reserved_for_main_text(name: &str) -> String {
 }
 
 use crate::output::{INLINE_OUTPUT_LIMIT, generate_word_filename};
+use crate::permission::TerminalMode;
 use crate::terminal::TerminalBinding;
 
 /// Handles large outputs by saving to file in the sandbox output directory.
@@ -876,7 +903,9 @@ impl std::fmt::Debug for DynTerminalTool {
 /// main agent), and [`Self::configure_role_tools`] registers one handler per
 /// role. A command whose handler depends on the terminal serving it is
 /// registered with [`Self::configure_terminal_bound_tool`] and built anew for
-/// every terminal, a subagent's included.
+/// every terminal, a subagent's included. Every command answers in every
+/// [`TerminalMode`]; [`Self::sandboxed_only`] leaves what it registers out of
+/// unsafe commands.
 #[derive(Debug, Default)]
 pub struct ToolRegistryBuilder {
     entries: HashMap<String, RoleEntries<Arc<ToolEntry>>>,
@@ -1007,6 +1036,7 @@ impl ToolRegistryBuilder {
                 RoleEntries {
                     main: entries.main,
                     subagent: restriction.side(),
+                    modes: entries.modes,
                 },
             );
         }
@@ -1016,8 +1046,28 @@ impl ToolRegistryBuilder {
                 RoleEntries {
                     main: entries.main,
                     subagent: restriction.side(),
+                    modes: entries.modes,
                 },
             );
+        }
+    }
+
+    /// Registers every command `configure` registers for sandboxed terminal
+    /// modes alone. An unsafe command has no such command, neither listed
+    /// nor callable, so its shell resolves the name on the host's `PATH`:
+    /// a sandboxed `gh` can answer with a refusal while an unsafe one runs
+    /// the real program.
+    pub fn sandboxed_only(&mut self, configure: impl FnOnce(&mut Self)) {
+        let mut scoped = Self::new();
+        configure(&mut scoped);
+        self.kept.extend(scoped.kept);
+        for (name, mut entries) in scoped.entries {
+            entries.modes = ModeScope::Sandboxed;
+            self.insert_entry(name, entries);
+        }
+        for (name, mut entries) in scoped.bound {
+            entries.modes = ModeScope::Sandboxed;
+            self.insert_bound(name, entries);
         }
     }
 
@@ -1063,6 +1113,7 @@ impl ToolRegistryBuilder {
             RoleEntries {
                 main: Arc::new(main),
                 subagent: SubagentSide::Serves(Arc::new(subagent)),
+                modes: ModeScope::Every,
             },
         );
     }
@@ -1145,6 +1196,7 @@ impl ToolRegistryBuilder {
             instances: HashMap::new(),
             output_dir: output_dir.into(),
             role: CommandRole::Main,
+            mode: None,
             observer: self.observer,
             gate: self.gate,
             call: None,
@@ -1341,6 +1393,9 @@ pub struct ToolRegistry {
     instances: HashMap<String, Arc<ToolEntry>>,
     output_dir: PathBuf,
     role: CommandRole,
+    /// The mode of the terminal execution this registry serves, once
+    /// [`Self::in_mode`] has scoped it to one; `None` has every command.
+    mode: Option<TerminalMode>,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
     /// The `terminal` call this registry serves, once [`Self::for_call`] has
@@ -1462,6 +1517,7 @@ impl ToolRegistry {
             instances: HashMap::new(),
             output_dir: self.output_dir.clone(),
             role: CommandRole::Subagent,
+            mode: None,
             observer,
             gate,
             call: None,
@@ -1479,6 +1535,17 @@ impl ToolRegistry {
     pub fn for_call(&self, call: CallIdentity) -> Self {
         Self {
             call: Some(call),
+            ..self.clone()
+        }
+    }
+
+    /// The registry that serves one terminal execution in `mode`: this
+    /// registry's commands that answer in `mode`, the others neither listed
+    /// nor callable (see [`ToolRegistryBuilder::sandboxed_only`]).
+    #[must_use]
+    pub fn in_mode(&self, mode: TerminalMode) -> Self {
+        Self {
+            mode: Some(mode),
             ..self.clone()
         }
     }
@@ -1512,7 +1579,7 @@ impl ToolRegistry {
     /// has bound this registry; a terminal binds the registry it serves.
     fn resolve(&self, tool_name: &str) -> Option<Resolved<'_>> {
         if let Some(bound) = self.bound.get(tool_name) {
-            if !bound.exists_for(self.role) {
+            if !bound.exists_for(self.role, self.mode) {
                 return None;
             }
             let entry = bound.for_role(self.role);
@@ -1532,7 +1599,7 @@ impl ToolRegistry {
         let entries = self
             .entries
             .get(tool_name)
-            .filter(|entries| entries.exists_for(self.role))?;
+            .filter(|entries| entries.exists_for(self.role, self.mode))?;
         let shown = entries.for_role(self.role).unwrap_or(&entries.main);
         Some(Resolved {
             handler: entries.for_role(self.role).map(|entry| &entry.handler),
@@ -1611,18 +1678,18 @@ impl ToolRegistry {
         }
     }
 
-    /// Returns whether a tool is registered for this registry's role; a
-    /// command registered for the main agent alone is not registered for a
-    /// subagent.
+    /// Returns whether a tool is registered for this registry's role and
+    /// mode; a command registered for the main agent alone is not registered
+    /// for a subagent, nor one for sandboxed modes alone in an unsafe one.
     #[must_use]
     pub fn is_tool_configured(&self, tool_name: &str) -> bool {
         self.bound.get(tool_name).map_or_else(
             || {
                 self.entries
                     .get(tool_name)
-                    .is_some_and(|entries| entries.exists_for(self.role))
+                    .is_some_and(|entries| entries.exists_for(self.role, self.mode))
             },
-            |bound| bound.exists_for(self.role),
+            |bound| bound.exists_for(self.role, self.mode),
         )
     }
 
@@ -1654,18 +1721,18 @@ impl ToolRegistry {
             .and_then(|resolved| resolved.stdin_arg.map(str::to_string))
     }
 
-    /// Returns the names of the tools registered for this registry's role,
-    /// those reserved for the main agent included.
+    /// Returns the names of the tools registered for this registry's role and
+    /// mode, those reserved for the main agent included.
     #[must_use]
     pub fn registered_tool_names(&self) -> Vec<String> {
         self.entries
             .iter()
-            .filter(|(_, entries)| entries.exists_for(self.role))
+            .filter(|(_, entries)| entries.exists_for(self.role, self.mode))
             .map(|(name, _)| name)
             .chain(
                 self.bound
                     .iter()
-                    .filter(|(_, entries)| entries.exists_for(self.role))
+                    .filter(|(_, entries)| entries.exists_for(self.role, self.mode))
                     .map(|(name, _)| name),
             )
             .cloned()
@@ -3936,6 +4003,48 @@ mod tests {
 
         let shared = run_command(&subagent, "shared").await;
         assert!(shared.ok, "a shared command stays available: {shared:?}");
+    }
+
+    #[tokio::test]
+    async fn sandboxed_only_command_is_absent_from_an_unsafe_execution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = ToolRegistryBuilder::new();
+        builder.main_only(|reserved| {
+            reserved.sandboxed_only(|sandboxed| {
+                sandboxed.configure_tool(RoleTool {
+                    name: "gh",
+                    answer: "use `issue`",
+                });
+            });
+        });
+        builder.configure_tool(RoleTool {
+            name: "shared",
+            answer: "every mode ran it",
+        });
+        let main = builder.build(tmp.path());
+
+        let sandboxed = main.in_mode(TerminalMode::Sandboxed);
+        let answered = run_command(&sandboxed, "gh").await;
+        assert!(answered.ok, "a sandboxed command has it: {answered:?}");
+        assert_eq!(answered.payload.unwrap().render_for_cli(), "use `issue`");
+        assert!(sandboxed.registered_tool_names().contains(&"gh".into()));
+
+        let unsafe_mode = main.in_mode(TerminalMode::Unsafe);
+        assert!(!unsafe_mode.is_tool_configured("gh"));
+        assert!(!unsafe_mode.registered_tool_names().contains(&"gh".into()));
+        let unknown = run_command(&unsafe_mode, "gh").await;
+        assert!(!unknown.ok);
+        assert!(unsafe_mode.tool_help("gh").is_none());
+        assert!(run_command(&unsafe_mode, "shared").await.ok);
+
+        // The main-only restriction wrapped around the scope keeps it.
+        let subagent = main.for_subagent(None, None).in_mode(TerminalMode::Unsafe);
+        assert!(!subagent.registered_tool_names().contains(&"gh".into()));
+        assert!(
+            main.for_subagent(None, None)
+                .in_mode(TerminalMode::Sandboxed)
+                .is_reserved("gh")
+        );
     }
 
     #[tokio::test]
