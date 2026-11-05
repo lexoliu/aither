@@ -121,6 +121,7 @@ impl SessionUpdateMapper {
             | AgentEvent::TurnComplete { .. }
             | AgentEvent::Complete { .. }
             | AgentEvent::Error(_)
+            | AgentEvent::PromptPrefix(_)
             | AgentEvent::Usage(_)
             | AgentEvent::ReplyTranslated { .. } => None,
         }

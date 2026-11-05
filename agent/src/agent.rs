@@ -20,7 +20,7 @@ use crate::{
     context::{
         AnyContextSource, BackgroundJobs, Block, CacheLifetime, CompactionFork,
         CompletedCompaction, Context, ContextBudget, HandoffDocument, InstructionSlot,
-        PendingCompaction, PromptCache, TasksDocument,
+        PendingCompaction, PrefixChain, PrefixRewrites, PromptCache, PromptPrefix, TasksDocument,
         recovery::{SpillLimits, clean_for_recovery},
         restore_context,
     },
@@ -787,6 +787,13 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// request begin, which wipes every durable alert they pushed before.
     pub(crate) reassembled: bool,
 
+    /// What rewrote the prompt prefix since the previous request, reported
+    /// with the next one's [`AgentEvent::PromptPrefix`].
+    pub(crate) prefix_rewrites: PrefixRewrites,
+
+    /// How many requests this agent has sent.
+    pub(crate) requests_sent: u64,
+
     /// The one compaction in the making: running alongside the turn, or
     /// finished and waiting for a request boundary.
     pub(crate) compaction: CompactionState,
@@ -930,6 +937,8 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             prompt_cache,
             context_sources: Vec::new(),
             reassembled: false,
+            prefix_rewrites: PrefixRewrites::default(),
+            requests_sent: 0,
             compaction: CompactionState::default(),
             compaction_failure: None,
             tool_results: VecDeque::new(),
@@ -2560,6 +2569,7 @@ where
             self.context.push_block_alert(&block);
         }
         self.reassembled = true;
+        self.prefix_rewrites.compacted = true;
         self.compaction_failure = None;
         if let Some(signal) = &self.compact_signal {
             signal.landed();
@@ -2648,6 +2658,7 @@ where
             outputs_spilled: report.outputs_spilled,
         });
         self.reassembled = true;
+        self.prefix_rewrites.reassembled = true;
         let result = Box::pin(self.compact(None)).await?;
         Ok(result.is_some())
     }
@@ -3115,6 +3126,12 @@ where
         self.publish_fork_snapshot(&tail, &definitions);
 
         let has_tools = !definitions.is_empty();
+        events.emit(AgentEvent::PromptPrefix(PromptPrefix {
+            chain: PrefixChain::of(&definitions, &messages),
+            rewrites: std::mem::take(&mut self.prefix_rewrites),
+            first_request: self.requests_sent == 0,
+        }));
+        self.requests_sent += 1;
         self.prompt_cache
             .observe_prefix(self.context.stable_prefix_fingerprint());
         let parameters =
@@ -3273,6 +3290,7 @@ where
         }
         let report = self.context.reassemble();
         self.reassembled |= report.system_messages_pruned > 0;
+        self.prefix_rewrites.reassembled |= report.changed();
         if report.changed() {
             tracing::debug!(
                 system_messages = report.system_messages_pruned,
@@ -3954,7 +3972,10 @@ mod tests {
             .await
             .expect("the run succeeds");
         assert_eq!(flow, ControlFlow::Break("first".to_string()));
-        assert_eq!(handled, 2, "the run start and the first chunk");
+        assert_eq!(
+            handled, 3,
+            "the run start, the request's prompt prefix and the first chunk"
+        );
         assert_eq!(
             agent.query("again").await.expect("the agent runs again"),
             "firstsecond"
@@ -5370,6 +5391,85 @@ mod tests {
     }
 
     const HANDOFF_JSON: &str = r#"{"current_task":"keep going","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["continue"],"recovery_hints":[],"skills":[]}"#;
+
+    /// The prompt prefix the agent reports for its next request.
+    async fn next_prompt_prefix(agent: &mut Agent<ScriptedLlm>) -> PromptPrefix {
+        let (sender, events) = async_channel::unbounded();
+        agent
+            .prepare_request(&EventSink { sender })
+            .await
+            .expect("request boundary")
+            .expect("a request goes out");
+        std::iter::from_fn(|| events.try_recv().ok())
+            .find_map(|timed| match timed.event {
+                AgentEvent::PromptPrefix(prefix) => Some(prefix),
+                _ => None,
+            })
+            .expect("every request reports its prompt prefix")
+    }
+
+    /// A conversation that only grows keeps the previous request's cached
+    /// prefix, and only the agent's first request says it is the first.
+    #[tokio::test]
+    async fn a_growing_conversation_keeps_its_prompt_prefix() {
+        let llm = ScriptedLlm::new(1_000_000, []);
+        let mut agent = Agent::new(llm);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        let first = next_prompt_prefix(&mut agent).await;
+        agent.push_message(Message::assistant("hi"));
+        agent.push_message(Message::user("and again"));
+        let second = next_prompt_prefix(&mut agent).await;
+
+        assert!(first.first_request);
+        assert!(!second.first_request);
+        assert_eq!(second.chain.first_divergence(&first.chain), None);
+        assert_eq!(second.rewrites, PrefixRewrites::default());
+    }
+
+    /// A compaction is reported once, with the next request, and that
+    /// request no longer repeats the conversation it replaced.
+    #[tokio::test]
+    async fn a_compaction_is_reported_with_the_next_request() {
+        let llm = ScriptedLlm::new(200_000, [HANDOFF_JSON.to_string()]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = agent_with_long_output(&llm, 100_000, dir.path()).await;
+        let before = next_prompt_prefix(&mut agent).await;
+        agent
+            .compact(None)
+            .await
+            .expect("compaction runs")
+            .expect("there is something to compact");
+        let after = next_prompt_prefix(&mut agent).await;
+        let later = next_prompt_prefix(&mut agent).await;
+
+        assert!(after.rewrites.compacted);
+        assert!(matches!(
+            after.chain.first_divergence(&before.chain),
+            Some(crate::context::PrefixBlock::Message { .. })
+        ));
+        assert!(!later.rewrites.compacted, "reported once");
+    }
+
+    /// A tool registered between two requests changes the prefix at the
+    /// tool definitions, ahead of every message.
+    #[tokio::test]
+    async fn a_changed_tool_set_diverges_at_the_tool_definitions() {
+        let llm = ScriptedLlm::new(1_000_000, []);
+        let mut agent = Agent::new(llm);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent.push_message(Message::assistant("hi"));
+        agent.push_message(Message::user("go on"));
+        let before = next_prompt_prefix(&mut agent).await;
+        agent.register_tool(QuickTool).expect("registers");
+        let after = next_prompt_prefix(&mut agent).await;
+
+        assert_eq!(
+            after.chain.first_divergence(&before.chain),
+            Some(crate::context::PrefixBlock::Tools)
+        );
+    }
 
     /// A config whose compaction distances fit the few-hundred-token windows
     /// [`window_for_usage`] sizes: the fork starts 50 tokens before the
