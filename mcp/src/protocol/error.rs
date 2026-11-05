@@ -140,4 +140,8 @@ pub enum McpError {
     /// Invalid configuration.
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+
+    /// The server does not offer a tool with this name (any more).
+    #[error("The server offers no tool named '{0}'")]
+    UnknownTool(String),
 }

@@ -6,7 +6,7 @@ read -r initialize
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"script"}}}'
 read -r initialized
 read -r list
-printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}'
 printf '%s\n' '{"jsonrpc":"2.0","id":"ping-1","method":"ping"}'
 read -r pong
 printf '{"jsonrpc":"2.0","method":"test/echo","params":%s}\n' "$pong"

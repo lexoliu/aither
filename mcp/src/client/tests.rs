@@ -7,7 +7,7 @@ use async_process::Command;
 use executor_core::tokio::TokioGlobal;
 use serde_json::json;
 
-use super::{McpClient, McpHandler, ServerNotification};
+use super::{McpClient, McpConnection, McpHandler, ServerNotification};
 use crate::protocol::{ErrorCode, McpError};
 use crate::test_server::{serve, serve_routes, sse};
 use crate::transport::{ChildProcessTransport, HttpTransport};
@@ -79,12 +79,61 @@ async fn child_process_server_messages_interleave_with_a_request() {
 
     assert!(matches!(
         next(&notifications).await,
-        ServerNotification::ToolsListChanged
+        ServerNotification::ResourcesListChanged
     ));
     assert_ping_answered(&echoed(next(&notifications).await));
     assert_method_not_found(&echoed(next(&notifications).await));
 
     client.close().await;
+}
+
+#[tokio::test]
+async fn child_process_tool_list_changed_refreshes_the_connection_tools() {
+    let (handler, notifications) = recorder();
+    let transport = ChildProcessTransport::from_command(&mut script("changing_tools_server.sh"))
+        .expect("spawn sh");
+    let conn = McpConnection::connect(&TokioGlobal, transport, handler)
+        .await
+        .unwrap();
+    let names = |conn: &McpConnection| {
+        conn.mcp_definitions()
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&conn), ["alpha", "beta"]);
+    let before = conn.mcp_definitions();
+
+    // The server answers this call, then announces a different tool list.
+    conn.call("alpha", json!({})).await.unwrap();
+    assert!(matches!(
+        next(&notifications).await,
+        ServerNotification::ToolsListChanged
+    ));
+
+    // The re-listing runs beside the handler; wait for it, bounded.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !conn.has_tool("gamma") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the tool list was not refreshed within 10s");
+
+    assert_eq!(names(&conn), ["beta", "gamma"]);
+    assert_eq!(conn.definitions().len(), 2);
+    // A list taken before the refresh is unchanged, never a mixture.
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[0].name, "alpha");
+
+    // The removed tool is no longer offered or called.
+    assert!(!conn.has_tool("alpha"));
+    assert!(matches!(
+        conn.call("alpha", json!({})).await,
+        Err(McpError::UnknownTool(name)) if name == "alpha"
+    ));
+
+    conn.close().await;
 }
 
 #[tokio::test]
@@ -146,7 +195,7 @@ async fn http_slow_reply_does_not_stall_other_requests_or_server_messages() {
                     "tools/list" => (
                         "Content-Type: text/event-stream\r\n",
                         sse(&[
-                            json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}),
+                            json!({"jsonrpc": "2.0", "method": "notifications/resources/list_changed"}),
                             serde_json::from_str(&reply(json!({"tools": []}))).unwrap(),
                         ]),
                     ),
@@ -178,7 +227,7 @@ async fn http_slow_reply_does_not_stall_other_requests_or_server_messages() {
         .expect("a slow reply stalled the connection");
 
     assert!(tools.is_empty());
-    assert!(matches!(first, ServerNotification::ToolsListChanged));
+    assert!(matches!(first, ServerNotification::ResourcesListChanged));
     assert!(!slow.unwrap().is_error);
 }
 

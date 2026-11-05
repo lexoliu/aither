@@ -523,7 +523,7 @@ async fn build_agent(
                     println!("Connected to Context7 MCP server");
                 }
                 // Collect MCP tool descriptions and register
-                for def in conn.mcp_definitions() {
+                for def in conn.mcp_definitions().iter() {
                     let desc = def.description.clone().unwrap_or_default();
                     let desc = desc.split('.').next().unwrap_or(&desc).trim().to_string();
                     builder = builder.tool_description(def.name.clone(), desc);
@@ -551,7 +551,7 @@ async fn build_agent(
             if !args.quiet {
                 println!("Connected to MCP server: {name}");
             }
-            for def in conn.mcp_definitions() {
+            for def in conn.mcp_definitions().iter() {
                 let desc = def.description.clone().unwrap_or_default();
                 let desc = desc.split('.').next().unwrap_or(&desc).trim().to_string();
                 builder = builder.tool_description(def.name.clone(), desc);
