@@ -31,13 +31,15 @@ use crate::{
         StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
     },
     model_group::ModelTier,
+    request_parameters::{TierParameters, WithParameters},
     tools::AgentTools,
 };
 use aither_core::{
     LanguageModel,
     llm::{
         Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, StoredFile,
-        ToolCall, model::Profile as ModelProfile,
+        ToolCall,
+        model::{Parameters, Profile as ModelProfile},
     },
 };
 use askama::Template;
@@ -553,7 +555,7 @@ impl PermissionPauseTracker {
 ///
 /// - `Advanced`: The primary LLM for main reasoning (most capable)
 /// - `Balanced`: LLM for moderate tasks like subagents (defaults to Advanced)
-/// - `Fast`: LLM for quick tasks like compaction (defaults to Balanced)
+/// - `Fast`: LLM for quick tasks like translating a reply (defaults to Balanced)
 /// - `H`: Composed hooks for customizing behavior (defaults to `()`)
 /// - `Compactor`: The optional compaction model, see
 ///   [`AgentBuilder::compaction_model`](crate::builder::AgentBuilder::compaction_model)
@@ -576,16 +578,17 @@ impl PermissionPauseTracker {
 /// let agent = Agent::new(claude);
 /// let response = agent.query("What is 2+2?").await?;
 ///
-/// // With tiered models
+/// // With tiered models, each with the parameters of its requests
 /// let agent = Agent::builder(opus)
-///     .balanced_model(sonnet)
-///     .fast_model(haiku)
+///     .request_parameters(opus_parameters)
+///     .balanced_model(sonnet, sonnet_parameters)
+///     .fast_model(haiku, haiku_parameters)
 ///     .build();
 ///
 /// // Subagent using balanced tier
 /// let explore_agent = Agent::builder(opus)
-///     .balanced_model(sonnet)
-///     .fast_model(haiku)
+///     .balanced_model(sonnet, sonnet_parameters)
+///     .fast_model(haiku, haiku_parameters)
 ///     .tier(ModelTier::Balanced)  // Use sonnet for reasoning
 ///     .build();
 /// ```
@@ -611,8 +614,11 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// A different model cannot read the conversation's prompt cache, so with
     /// one set compaction is never run early to catch the cache warm (see
     /// [`Agent::compact_when_idle`]), and an idle gap past the cache lifetime
-    /// reassembles the window instead.
-    pub(crate) compaction_model: Option<Arc<Compactor>>,
+    /// reassembles the window instead. Its requests carry its own parameters.
+    pub(crate) compaction_model: Option<WithParameters<Arc<Compactor>>>,
+
+    /// The parameters of the requests sent on each tier's model.
+    pub(crate) parameters: TierParameters,
 
     /// Whether the idle compaction already ran since the last request, so one
     /// idle gap compacts once.
@@ -775,6 +781,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             balanced: Arc::new(llm.clone()),
             fast: Arc::new(llm),
             compaction_model: None,
+            parameters: TierParameters::default(),
             idle_compacted: false,
             tier: ModelTier::default(),
             tools: AgentTools::new(),
@@ -1197,7 +1204,14 @@ where
             .render()
             .expect("language alert template must render"),
         );
-        match crate::language::translate(self.fast.as_ref(), reply, language).await {
+        match crate::language::translate(
+            self.fast.as_ref(),
+            self.parameters.get(ModelTier::Fast),
+            reply,
+            language,
+        )
+        .await
+        {
             Ok(text) => events.emit(AgentEvent::ReplyTranslated {
                 text,
                 language: language.code().to_string(),
@@ -2131,15 +2145,7 @@ where
         let tail = self.render_tail().await;
         let definitions = self.tools.active_definitions();
         let messages = self.context.build_request(&tail);
-        // The same cache controls as the requests that wrote the prefix, so a
-        // compaction on the session's own model is served from that cache.
-        let request = LLMRequest::new(messages.clone())
-            .with_parameters(self.prompt_cache.apply(
-                self.config.request_parameters.clone(),
-                &messages,
-                !definitions.is_empty(),
-            ))
-            .with_tool_definitions(definitions);
+        let request = self.compaction_request(messages, definitions);
         #[cfg(feature = "skills")]
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
@@ -2169,14 +2175,41 @@ where
         }))
     }
 
+    /// The parameters of the requests the agent sends on its own tier's model.
+    fn own_parameters(&self) -> &Parameters {
+        self.parameters.get(self.tier)
+    }
+
+    /// A compaction request over `messages` and `definitions`: the
+    /// compaction model's parameters when one is set, else the session
+    /// model's, under the cache controls the requests that wrote the prefix
+    /// carry, so a compaction on the session's own model is served from that
+    /// cache.
+    fn compaction_request(
+        &self,
+        messages: Vec<Message>,
+        definitions: Vec<aither_core::llm::tool::ToolDefinition>,
+    ) -> LLMRequest {
+        let parameters = self
+            .compaction_model
+            .as_ref()
+            .map_or_else(|| self.own_parameters(), |compactor| &*compactor.parameters);
+        let parameters =
+            self.prompt_cache
+                .apply(parameters.clone(), &messages, !definitions.is_empty());
+        LLMRequest::new(messages)
+            .with_parameters(parameters)
+            .with_tool_definitions(definitions)
+    }
+
     /// Runs `fork` to completion on the compaction model: the configured one,
     /// or else the session's own tier.
     async fn compaction_future(
         &self,
         fork: CompactionFork,
     ) -> Result<HandoffDocument, crate::context::CompactionError> {
-        if let Some(model) = &self.compaction_model {
-            return fork.run(Arc::clone(model)).await;
+        if let Some(compactor) = &self.compaction_model {
+            return fork.run(Arc::clone(&compactor.model)).await;
         }
         match self.tier {
             ModelTier::Advanced => fork.run(Arc::clone(&self.advanced)).await,
@@ -2188,8 +2221,8 @@ where
     /// Starts `fork` in the background on the compaction model: the
     /// configured one, or else the session's own tier.
     fn start_pending_compaction(&self, fork: CompactionFork) -> PendingCompaction {
-        if let Some(model) = &self.compaction_model {
-            return PendingCompaction::start(fork, Arc::clone(model));
+        if let Some(compactor) = &self.compaction_model {
+            return PendingCompaction::start(fork, Arc::clone(&compactor.model));
         }
         match self.tier {
             ModelTier::Advanced => PendingCompaction::start(fork, Arc::clone(&self.advanced)),
@@ -2818,13 +2851,7 @@ where
                 .should_compact(self.budget.estimated_tokens(), self.budget.window()))
             && !self.compaction.is_active()
         {
-            let fork_request = LLMRequest::new(messages.clone())
-                .with_parameters(self.prompt_cache.apply(
-                    self.config.request_parameters.clone(),
-                    &messages,
-                    !definitions.is_empty(),
-                ))
-                .with_tool_definitions(definitions.clone());
+            let fork_request = self.compaction_request(messages.clone(), definitions.clone());
             self.hooks
                 .on_lifecycle(&external_hook::BeforeCompaction {
                     messages: self.context.len_recent(),
@@ -2873,7 +2900,7 @@ where
             .observe_prefix(self.context.stable_prefix_fingerprint());
         let parameters =
             self.prompt_cache
-                .apply(self.config.request_parameters.clone(), &messages, has_tools);
+                .apply(self.own_parameters().clone(), &messages, has_tools);
         let request = LLMRequest::new(messages)
             .with_parameters(parameters)
             .with_tool_definitions(definitions);
@@ -2958,7 +2985,7 @@ where
                 .profile
                 .clone()
                 .expect("a request is only sent by an initialized agent, which has its profile"),
-            request_parameters: self.config.request_parameters.clone(),
+            request_parameters: self.own_parameters().clone(),
             context_policy: self.config.context_policy,
             definitions: definitions.to_vec(),
             usage: self.budget.usage(),
@@ -5097,7 +5124,10 @@ mod tests {
         let mut agent = Agent::builder(MockLlm {
             context_length: 1_000_000,
         })
-        .compaction_model(ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]))
+        .compaction_model(
+            ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]),
+            Parameters::default(),
+        )
         .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
@@ -5147,9 +5177,12 @@ mod tests {
         let mut agent = Agent::builder(MockLlm {
             context_length: 1_000_000,
         })
-        .compaction_model(MockLlm {
-            context_length: 1_000_000,
-        })
+        .compaction_model(
+            MockLlm {
+                context_length: 1_000_000,
+            },
+            Parameters::default(),
+        )
         .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.use_cache_lifetime(CacheLifetime::Permanent);
@@ -5395,7 +5428,7 @@ mod tests {
         let main = ScriptedLlm::new(1_000_000, []);
         let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let mut agent = Agent::builder(main.clone())
-            .compaction_model(compactor.clone())
+            .compaction_model(compactor.clone(), Parameters::default())
             .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
@@ -5417,7 +5450,7 @@ mod tests {
         // The forked compaction goes to the compaction model as well.
         let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let mut agent = Agent::builder(ScriptedLlm::new(1_000_000, []))
-            .compaction_model(compactor.clone())
+            .compaction_model(compactor.clone(), Parameters::default())
             .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
@@ -5428,6 +5461,92 @@ mod tests {
         assert_eq!(compactor.recorded().len(), 1);
     }
 
+    /// The host's parameters reach the provider on the turns and the
+    /// compaction the agent sends its model, beside the cache controls aither
+    /// derives and, on the compaction, structured output.
+    #[tokio::test]
+    async fn the_hosts_parameters_arrive_with_the_cache_controls_and_structured_output() {
+        use crate::request_parameters::test_support::{
+            assert_cache_controls, host_parameters, host_part,
+        };
+        let host = host_parameters(aither_core::llm::model::ReasoningEffort::High, 0.3);
+        let llm = ScriptedLlm::new(
+            1_000_000,
+            ["the answer".to_string(), HANDOFF_JSON.to_string()],
+        );
+        let mut agent = Agent::builder(llm.clone())
+            .request_parameters(host.clone())
+            .prompt_cache(PromptCache::new("session-1"))
+            .build();
+        agent.query("hello").await.expect("the turn runs");
+        agent.compact(None).await.expect("compaction succeeds");
+
+        let [turn, compaction]: [LLMRequest; 2] = llm
+            .recorded()
+            .try_into()
+            .expect("a turn, then the compaction");
+        for request in [&turn, &compaction] {
+            assert_eq!(host_part(request), host, "the host's parameters arrive");
+            assert_cache_controls(request);
+        }
+        assert_eq!(
+            turn.parameters()
+                .cache
+                .openai
+                .as_ref()
+                .and_then(|openai| openai.key.as_deref()),
+            Some("session-1:0"),
+            "the turn carries the session's cache key"
+        );
+        assert!(!turn.parameters().structured_outputs);
+        assert!(
+            compaction.parameters().structured_outputs,
+            "the compaction asks for structured output"
+        );
+        assert_eq!(
+            compaction.parameters().cache.openai,
+            turn.parameters().cache.openai,
+            "the compaction reads the cache the turn wrote"
+        );
+    }
+
+    /// A compaction model's requests carry its own parameters, not the
+    /// session model's, under the cache controls and structured output.
+    #[tokio::test]
+    async fn a_compaction_model_gets_its_own_parameters_under_aithers_fields() {
+        use crate::request_parameters::test_support::{
+            assert_cache_controls, host_parameters, host_part,
+        };
+        use aither_core::llm::model::ReasoningEffort;
+        let session = host_parameters(ReasoningEffort::High, 0.3);
+        let compacting = host_parameters(ReasoningEffort::Low, 0.9);
+        let main = ScriptedLlm::new(1_000_000, ["the answer".to_string()]);
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = Agent::builder(main.clone())
+            .request_parameters(session.clone())
+            .compaction_model(compactor.clone(), compacting.clone())
+            .build();
+        agent.query("hello").await.expect("the turn runs");
+        agent.compact(None).await.expect("compaction succeeds");
+
+        let [turn]: [LLMRequest; 1] = main
+            .recorded()
+            .try_into()
+            .expect("one turn on the session's model");
+        let [compaction]: [LLMRequest; 1] = compactor
+            .recorded()
+            .try_into()
+            .expect("the compaction on the compaction model");
+        assert_eq!(host_part(&turn), session);
+        assert_eq!(
+            host_part(&compaction),
+            compacting,
+            "the compaction model's own parameters arrive"
+        );
+        assert_cache_controls(&compaction);
+        assert!(compaction.parameters().structured_outputs);
+    }
+
     /// Idle reassembly and idle compaction exclude each other: an idle gap
     /// past the cache lifetime reassembles only when idle compaction is off.
     #[tokio::test]
@@ -5436,7 +5555,9 @@ mod tests {
             let llm = ScriptedLlm::new(1_000_000, []);
             let builder = Agent::builder(llm);
             let mut agent = if let Some(model) = compaction_model {
-                builder.compaction_model(model).build()
+                builder
+                    .compaction_model(model, Parameters::default())
+                    .build()
             } else {
                 builder.build()
             };
@@ -5475,7 +5596,9 @@ mod tests {
     ) -> Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, (), ScriptedLlm> {
         let builder = Agent::builder(main);
         let mut agent = match compactor {
-            Some(compactor) => builder.compaction_model(compactor).build(),
+            Some(compactor) => builder
+                .compaction_model(compactor, Parameters::default())
+                .build(),
             None => builder.build(),
         };
         agent.ensure_initialized().await.expect("agent initializes");

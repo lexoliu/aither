@@ -807,12 +807,28 @@ where
         self
     }
 
-    /// Sets the model compaction runs on, instead of the session's own.
+    /// Sets the parameters of every request aither sends the agent's model:
+    /// its turns, compactions on that model, keep-alives and a fork's first
+    /// request, under the fields aither sets per request.
+    ///
+    /// See [`AgentBuilder::request_parameters`].
+    #[must_use]
+    pub fn request_parameters(mut self, parameters: aither_core::llm::model::Parameters) -> Self {
+        self.inner = self.inner.request_parameters(parameters);
+        self
+    }
+
+    /// Sets the model compaction runs on, instead of the session's own, and
+    /// the parameters of the compaction requests it serves.
     ///
     /// See [`AgentBuilder::compaction_model`].
     #[must_use]
-    pub fn compaction_model(mut self, model: LLM) -> Self {
-        self.inner = self.inner.compaction_model(model);
+    pub fn compaction_model(
+        mut self,
+        model: LLM,
+        parameters: aither_core::llm::model::Parameters,
+    ) -> Self {
+        self.inner = self.inner.compaction_model(model, parameters);
         self
     }
 
@@ -1732,6 +1748,66 @@ mod tests {
         for command in ["apply_patch", "rg", "ast-grep", "jq"] {
             assert!(catalog.contains(command));
         }
+    }
+
+    /// The parameters a host gives `TerminalAgentBuilder` reach the provider
+    /// on the agent's turns, and a compaction model's own on its compaction,
+    /// each beside the cache controls and structured output aither sets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_agent_requests_carry_the_hosts_parameters_under_aithers_fields() {
+        use crate::request_parameters::test_support::{
+            assert_cache_controls, host_parameters, host_part,
+        };
+        use aither_core::llm::model::ReasoningEffort;
+
+        let dir = tempdir().expect("tempdir should exist");
+        let source = tempdir().unwrap();
+        let cache = crate::test_support::TempDir::new();
+        let binary = compile_baseline_fixture(source.path()).await;
+        let distribution = fixture_distribution(&binary, "1.0.0").await;
+        let session = host_parameters(ReasoningEffort::High, 0.3);
+        let compacting = host_parameters(ReasoningEffort::Low, 0.9);
+        let (requests, turns) = async_channel::unbounded();
+        let (compactor_requests, compactions) = async_channel::unbounded();
+        let mut agent =
+            TerminalAgentBuilder::new(MockLlm { requests }, noop_terminal(dir.path()).await)
+                .request_parameters(session.clone())
+                .compaction_model(
+                    MockLlm {
+                        requests: compactor_requests,
+                    },
+                    compacting.clone(),
+                )
+                .max_iterations(1)
+                .with_default_prompt()
+                .initialize_tools(&distribution, cache.path())
+                .await
+                .expect("tools prepare")
+                .build();
+        {
+            let events = agent.run("Inspect the repository", []);
+            futures_lite::pin!(events);
+            while futures_lite::StreamExt::next(&mut events).await.is_some() {}
+        }
+        // The scripted compactor answers nothing, so the compaction fails
+        // once its request is out; only that request matters here.
+        let _ = agent.compact(None).await;
+
+        let turn = turns.try_recv().expect("the turn reached the model");
+        assert_eq!(host_part(&turn), session, "the host's parameters arrive");
+        assert_cache_controls(&turn);
+        assert!(!turn.parameters().structured_outputs);
+
+        let compaction = compactions
+            .try_recv()
+            .expect("the compaction reached the compaction model");
+        assert_eq!(
+            host_part(&compaction),
+            compacting,
+            "the compaction model's own parameters arrive"
+        );
+        assert_cache_controls(&compaction);
+        assert!(compaction.parameters().structured_outputs);
     }
 
     #[tokio::test(flavor = "multi_thread")]

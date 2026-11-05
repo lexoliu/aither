@@ -24,8 +24,10 @@ use crate::{
     },
     hook::{HCons, Hook},
     model_group::ModelTier,
+    request_parameters::{TierParameters, WithParameters},
     tools::AgentTools,
 };
+use aither_core::llm::model::Parameters;
 
 #[cfg(feature = "mcp")]
 use aither_mcp::McpConnection;
@@ -35,7 +37,10 @@ use aither_mcp::McpConnection;
 /// Supports tiered LLM configuration:
 /// - Advanced: Primary model for main reasoning (most capable)
 /// - Balanced: Model for moderate tasks like subagents (defaults to advanced)
-/// - Fast: Model for quick tasks like compaction (defaults to balanced)
+/// - Fast: Model for quick tasks like translating a reply (defaults to balanced)
+///
+/// Each model comes with the parameters of the requests aither sends it; see
+/// [`request_parameters`](Self::request_parameters).
 ///
 /// # Example
 ///
@@ -44,9 +49,10 @@ use aither_mcp::McpConnection;
 /// let agent = Agent::builder(claude).build();
 ///
 /// // Tiered: different models for different tasks
-/// let agent = Agent::builder(opus)      // Advanced
-///     .balanced_model(sonnet)           // Balanced
-///     .fast_model(haiku)                // Fast
+/// let agent = Agent::builder(opus)                          // Advanced
+///     .request_parameters(opus_parameters)
+///     .balanced_model(sonnet, sonnet_parameters)            // Balanced
+///     .fast_model(haiku, haiku_parameters)                  // Fast
 ///     .system_prompt("You are a helpful assistant.")
 ///     .tool(FileSystemTool::read_only("."))
 ///     .build();
@@ -62,7 +68,11 @@ pub struct AgentBuilder<
     advanced: Advanced,
     balanced: Balanced,
     fast: Fast,
-    compaction_model: Option<Compactor>,
+    /// The model compaction runs on instead of the session's own, with the
+    /// parameters of its requests.
+    compaction_model: Option<WithParameters<Compactor>>,
+    /// The parameters of the requests sent on each tier's model.
+    parameters: TierParameters,
     tier: ModelTier,
     tools: AgentTools,
     hooks: H,
@@ -127,6 +137,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             balanced: llm.clone(),
             fast: llm,
             compaction_model: None,
+            parameters: TierParameters::default(),
             tier: ModelTier::default(),
             tools: AgentTools::new(),
             hooks: (),
@@ -162,19 +173,23 @@ where
     Compactor: LanguageModel,
     H: Hook,
 {
-    /// Sets the balanced model for moderate tasks (e.g., subagents).
+    /// Sets the balanced model for moderate tasks (e.g., subagents), and the
+    /// parameters of the requests aither sends it.
     ///
     /// This model is used when spawning subagents that don't need
     /// the full capabilities of the advanced model.
     pub fn balanced_model<B2: LanguageModel>(
-        self,
+        mut self,
         model: B2,
+        parameters: Parameters,
     ) -> AgentBuilder<Advanced, B2, Fast, H, Compactor> {
+        self.parameters.set_balanced(parameters);
         AgentBuilder {
             advanced: self.advanced,
             balanced: model,
             fast: self.fast,
             compaction_model: self.compaction_model,
+            parameters: self.parameters,
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,
@@ -201,19 +216,23 @@ where
         }
     }
 
-    /// Sets the fast model for quick tasks (e.g., compaction, ask command).
+    /// Sets the fast model for quick tasks (e.g., translating a reply), and
+    /// the parameters of the requests aither sends it.
     ///
     /// This model is used for tasks where speed and cost matter more
-    /// than capability, such as context compression.
+    /// than capability.
     pub fn fast_model<F2: LanguageModel>(
-        self,
+        mut self,
         model: F2,
+        parameters: Parameters,
     ) -> AgentBuilder<Advanced, Balanced, F2, H, Compactor> {
+        self.parameters.set_fast(parameters);
         AgentBuilder {
             advanced: self.advanced,
             balanced: self.balanced,
             fast: model,
             compaction_model: self.compaction_model,
+            parameters: self.parameters,
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,
@@ -248,15 +267,24 @@ where
     /// read that cache, so with one set compaction requests go to it, idle
     /// compaction never runs, and an idle gap past the cache lifetime
     /// reassembles the window instead.
+    ///
+    /// Compaction requests to it carry `parameters`, the model's own, in
+    /// place of the session model's, under the cache controls and structured
+    /// output aither sets on every compaction.
     pub fn compaction_model<C2: LanguageModel>(
         self,
         model: C2,
+        parameters: Parameters,
     ) -> AgentBuilder<Advanced, Balanced, Fast, H, C2> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: self.balanced,
             fast: self.fast,
-            compaction_model: Some(model),
+            compaction_model: Some(WithParameters {
+                model,
+                parameters: Box::new(parameters),
+            }),
+            parameters: self.parameters,
             tier: self.tier,
             tools: self.tools,
             hooks: self.hooks,
@@ -295,8 +323,8 @@ where
     /// ```rust,ignore
     /// // Create an explore subagent using the balanced model
     /// let explore_agent = Agent::builder(opus)
-    ///     .balanced_model(sonnet)
-    ///     .fast_model(haiku)
+    ///     .balanced_model(sonnet, Parameters::default())
+    ///     .fast_model(haiku, Parameters::default())
     ///     .tier(ModelTier::Balanced)  // Use sonnet for reasoning
     ///     .build();
     /// ```
@@ -419,7 +447,7 @@ where
     ) -> Self {
         self.context = fork.context.clone();
         self.prompt_cache = fork.prompt_cache.clone();
-        self.config.request_parameters = fork.request_parameters.clone();
+        self.parameters.set_shared(fork.request_parameters.clone());
         self.config.context_policy = fork.context_policy;
         self.inherited = Some(Inherited {
             budget: fork.budget,
@@ -467,6 +495,7 @@ where
             balanced: self.balanced,
             fast: self.fast,
             compaction_model: self.compaction_model,
+            parameters: self.parameters,
             tier: self.tier,
             tools: self.tools,
             hooks: HCons::new(hook, self.hooks),
@@ -751,6 +780,23 @@ where
         self
     }
 
+    /// Sets the parameters of every request aither sends the model the
+    /// builder was created with: the agent's turns, its compactions on that
+    /// model, its cache keep-alives and the first request of a fork, plus
+    /// the balanced and fast tiers' requests while they run on that model.
+    ///
+    /// aither sets the fields it owns per request over them — the prompt-
+    /// cache controls, structured output on a compaction, and the token cap
+    /// of a keep-alive — and sends every other field as given here. A tier
+    /// given a model of its own ([`balanced_model`](Self::balanced_model),
+    /// [`fast_model`](Self::fast_model)) and the
+    /// [`compaction_model`](Self::compaction_model) take that model's
+    /// parameters instead.
+    pub fn request_parameters(mut self, parameters: Parameters) -> Self {
+        self.parameters.set_shared(parameters);
+        self
+    }
+
     /// Overrides the session's prompt-cache controller.
     ///
     /// The default derives a fresh session key per agent, so every rebuild
@@ -877,7 +923,11 @@ where
             advanced: std::sync::Arc::new(self.advanced),
             balanced: std::sync::Arc::new(self.balanced),
             fast: std::sync::Arc::new(self.fast),
-            compaction_model: self.compaction_model.map(std::sync::Arc::new),
+            compaction_model: self.compaction_model.map(|compactor| WithParameters {
+                model: std::sync::Arc::new(compactor.model),
+                parameters: compactor.parameters,
+            }),
+            parameters: self.parameters,
             idle_compacted: false,
             session: crate::agent::SessionPhase::NotStarted,
             tier: self.tier,
