@@ -139,9 +139,9 @@ pub struct ResponsesUsage {
     #[serde(default)]
     pub total_tokens: Option<u32>,
     #[serde(default)]
-    pub input_token_details: Option<ResponsesInputTokenDetails>,
+    pub input_tokens_details: Option<ResponsesInputTokenDetails>,
     #[serde(default)]
-    pub output_token_details: Option<ResponsesOutputTokenDetails>,
+    pub output_tokens_details: Option<ResponsesOutputTokenDetails>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
