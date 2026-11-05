@@ -407,6 +407,24 @@ fn ensure_non_empty_tool_call_ids(
     )))
 }
 
+/// The blocks rendered into a request's tail, each with the context source
+/// that rendered it, so a commit reaches only that source.
+#[derive(Debug, Default)]
+struct RenderedTail {
+    blocks: Vec<Block>,
+    /// The index into the agent's context sources of the source that rendered
+    /// the block at the same position; `None` for a block no source owns.
+    sources: Vec<Option<usize>>,
+}
+
+impl std::ops::Deref for RenderedTail {
+    type Target = [Block];
+
+    fn deref(&self) -> &[Block] {
+        &self.blocks
+    }
+}
+
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
 pub struct CompactResult {
@@ -2615,7 +2633,7 @@ where
     /// Rendering is concurrent because the sources are independent — one
     /// reading `tasks.md` from disk must not wait on another polling the job
     /// registry.
-    async fn render_tail(&self) -> Vec<Block> {
+    async fn render_tail(&self) -> RenderedTail {
         #[cfg(feature = "skills")]
         let skills = self.active_skills.render();
         #[cfg(not(feature = "skills"))]
@@ -2625,21 +2643,28 @@ where
             skills,
         )
         .await;
-        rendered
-            .into_iter()
-            .chain(std::iter::once(skills))
-            .flatten()
-            .collect()
+        let mut tail = RenderedTail::default();
+        for (source, block) in rendered.into_iter().enumerate() {
+            if let Some(block) = block {
+                tail.blocks.push(block);
+                tail.sources.push(Some(source));
+            }
+        }
+        if let Some(block) = skills {
+            tail.blocks.push(block);
+            tail.sources.push(None);
+        }
+        tail
     }
 
-    /// Tells each source that the tail it produced has been sent.
+    /// Tells each source that the block it produced has been sent.
     ///
     /// Separate from rendering so that only a request that actually goes out
     /// advances a source's baseline.
-    async fn commit_tail(&mut self, tail: &[Block]) {
-        for block in tail {
-            for source in &mut self.context_sources {
-                source.commit(block).await;
+    async fn commit_tail(&mut self, tail: &RenderedTail) {
+        for (block, source) in tail.blocks.iter().zip(&tail.sources) {
+            if let Some(source) = *source {
+                self.context_sources[source].commit(block).await;
             }
         }
     }
@@ -4607,6 +4632,56 @@ mod tests {
             resources: HashMap::new(),
         });
         Arc::new(registry)
+    }
+
+    /// A source that renders one named block and records what it is told was
+    /// sent.
+    struct Recording {
+        name: &'static str,
+        committed: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl crate::context::ContextSource for Recording {
+        fn render(&self) -> impl std::future::Future<Output = Option<Block>> + Send {
+            std::future::ready(Some(Block::new(self.name, self.name)))
+        }
+
+        async fn commit(&mut self, block: &Block) {
+            self.committed
+                .lock()
+                .expect("commit log")
+                .push(block.content().to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn each_source_is_committed_only_the_block_it_rendered() {
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 200_000,
+            },
+            AgentConfig::default(),
+        );
+        let logs: Vec<_> = ["alpha", "beta"]
+            .into_iter()
+            .map(|name| {
+                let committed = Arc::new(std::sync::Mutex::new(Vec::new()));
+                agent
+                    .context_sources
+                    .push(crate::context::AnyContextSource::new(Recording {
+                        name,
+                        committed: Arc::clone(&committed),
+                    }));
+                committed
+            })
+            .collect();
+
+        let tail = agent.render_tail().await;
+        assert_eq!(tail.len(), 2);
+        agent.commit_tail(&tail).await;
+
+        assert_eq!(*logs[0].lock().unwrap(), ["alpha"]);
+        assert_eq!(*logs[1].lock().unwrap(), ["beta"]);
     }
 
     #[cfg(feature = "skills")]
