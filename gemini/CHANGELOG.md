@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/May-Agent/aither/compare/gemini-v0.16.0...gemini-v0.17.0) - 2026-11-05
+
+### Fixed
+
+- *(gemini)* fold parallel tool results into one Content in call order
+
 ## [0.15.0](https://github.com/May-Agent/aither/compare/gemini-v0.14.1...gemini-v0.15.0) - 2026-11-04
 
 ### Fixed

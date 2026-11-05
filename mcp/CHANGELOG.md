@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/May-Agent/aither/compare/mcp-v0.16.0...mcp-v0.17.0) - 2026-11-05
+
+### Fixed
+
+- *(mcp)* read SSE responses and send MCP-Protocol-Version over HTTP
+
 ## [0.15.0](https://github.com/May-Agent/aither/compare/mcp-v0.14.1...mcp-v0.15.0) - 2026-11-04
 
 ### Added

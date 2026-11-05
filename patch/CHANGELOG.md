@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/May-Agent/aither/compare/patch-v0.16.0...patch-v0.17.0) - 2026-11-05
+
+### Fixed
+
+- *(patch)* carry a file's mode through chained moves
+
 ## [0.15.0](https://github.com/May-Agent/aither/compare/patch-v0.14.1...patch-v0.15.0) - 2026-11-04
 
 ### Other
