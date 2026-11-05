@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/May-Agent/aither/compare/cli-v0.15.0...cli-v0.16.0) - 2026-11-05
+
+### Added
+
+- *(agent)* [**breaking**] give both builders the agent options through one trait
+
 ## [0.15.0](https://github.com/May-Agent/aither/compare/cli-v0.14.1...cli-v0.15.0) - 2026-11-04
 
 ### Added
