@@ -1502,9 +1502,8 @@ mod tests {
         .await
         .expect("second agent adopts the prepared registry")
         .build();
-        let events = second.run("Check the baseline commands", []);
-        futures_lite::pin!(events);
-        while futures_lite::StreamExt::next(&mut events).await.is_some() {}
+        let _ =
+            crate::test_support::finish_run(second.run("Check the baseline commands", [])).await;
 
         let first_request = captured
             .try_recv()
@@ -1614,9 +1613,7 @@ mod tests {
                 "terminal_read"
             ]
         );
-        let events = agent.run("Inspect the repository", []);
-        futures_lite::pin!(events);
-        while futures_lite::StreamExt::next(&mut events).await.is_some() {}
+        let _ = crate::test_support::finish_run(agent.run("Inspect the repository", [])).await;
         let request = captured
             .try_recv()
             .expect("first model request was recorded");
@@ -1680,11 +1677,7 @@ mod tests {
                 .await
                 .expect("tools prepare")
                 .build();
-        {
-            let events = agent.run("Inspect the repository", []);
-            futures_lite::pin!(events);
-            while futures_lite::StreamExt::next(&mut events).await.is_some() {}
-        }
+        let _ = crate::test_support::finish_run(agent.run("Inspect the repository", [])).await;
         // The scripted compactor answers nothing, so the compaction fails
         // once its request is out; only that request matters here.
         let _ = agent.compact(None).await;
@@ -1853,9 +1846,7 @@ mod tests {
         .unwrap()
         .build();
 
-        let events = agent.run("Stop the background task", []);
-        futures_lite::pin!(events);
-        while futures_lite::StreamExt::next(&mut events).await.is_some() {}
+        let _ = crate::test_support::finish_run(agent.run("Stop the background task", [])).await;
 
         kill_rx
             .try_recv()

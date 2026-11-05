@@ -3,6 +3,17 @@
 /// The `CPython` version the baseline fixture's `uv` installs and reports.
 const BASELINE_PYTHON_VERSION: &str = "3.13.1";
 
+/// Drives `run` to its end without looking at its events.
+pub async fn finish_run(
+    run: crate::Run<impl std::future::Future<Output = Result<(), crate::AgentError>>>,
+) -> Result<(), crate::AgentError> {
+    run.drive((), |(), _| async {
+        std::ops::ControlFlow::<std::convert::Infallible, _>::Continue(())
+    })
+    .await
+    .map(|_| ())
+}
+
 /// A temporary directory that can hold prepared tool runtimes: the managed
 /// interpreter tree is read-only, which a plain `TempDir` cannot delete.
 pub struct TempDir(tempfile::TempDir);
