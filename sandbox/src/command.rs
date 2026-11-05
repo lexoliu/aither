@@ -76,7 +76,8 @@ struct StoredBinaryPartTemplate<'a> {
 #[template(path = "command_output_saved.txt", escape = "none")]
 struct CommandOutputSavedTemplate<'a> {
     preview: &'a str,
-    filename: &'a str,
+    /// Absolute path of the file holding the full output.
+    path: &'a str,
     line_count: usize,
     byte_count: usize,
 }
@@ -115,16 +116,24 @@ fn tool_usage_error(message: &str, tool_name: &str) -> String {
     .expect("tool usage error template must render")
 }
 
-fn output_saved_text(
+/// The notice a command's output is replaced by when it was too large for the
+/// window: a preview of `rendered` and the absolute `path` of the file that
+/// holds all of it.
+///
+/// # Panics
+///
+/// Panics if the compiled-in template fails to render.
+#[must_use]
+pub fn output_saved_text(
     rendered: &str,
-    filename: &str,
+    path: &str,
     line_count: usize,
     byte_count: usize,
 ) -> String {
     let preview = crate::output_compress::stored_preview(rendered, usize::MAX, INLINE_OUTPUT_LIMIT);
     CommandOutputSavedTemplate {
         preview: preview.trim_end_matches('\n'),
-        filename,
+        path,
         line_count,
         byte_count,
     }
@@ -702,7 +711,12 @@ async fn handle_large_output(output: ToolResult, output_dir: &Path) -> CommandEn
     }
 
     CommandEnvelope::success(CommandPayload::Text {
-        content: output_saved_text(&rendered, filename.as_str(), line_count, rendered.len()),
+        content: output_saved_text(
+            &rendered,
+            &filepath.to_string_lossy(),
+            line_count,
+            rendered.len(),
+        ),
     })
 }
 

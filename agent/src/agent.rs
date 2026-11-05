@@ -2270,7 +2270,8 @@ where
             focus,
             &skills,
         )
-        .map_err(AgentError::from)?;
+        .map_err(AgentError::from)?
+        .with_outputs_dir(self.outputs_dir());
         let fork_point = fork.fork_point();
         let handoff = self
             .compaction_future(fork)
@@ -2291,6 +2292,12 @@ where
     /// The parameters of the requests the agent sends on its own tier's model.
     fn own_parameters(&self) -> &Parameters {
         self.parameters.get(self.tier)
+    }
+
+    /// The session's outputs directory, where saved command outputs are
+    /// written, when the agent has a sandbox.
+    fn outputs_dir(&self) -> Option<PathBuf> {
+        self.sandbox_dir.as_ref().map(|dir| dir.join("outputs"))
     }
 
     /// A compaction request over `messages` and `definitions`: the
@@ -2429,7 +2436,9 @@ where
             self.context.handoff_file_index(),
             focus,
             &skills,
-        ) {
+        )
+        .map(|fork| fork.with_outputs_dir(self.outputs_dir()))
+        {
             Ok(fork) => {
                 tracing::debug!(
                     fork_point = fork.fork_point(),
@@ -3629,7 +3638,7 @@ mod tests {
         });
         assert_eq!(
             killed,
-            "The command ended while sleep (pid 41), node (pid 42) and 3 more kept running, so they were killed with it. A process meant to keep running belongs in terminal_background."
+            "The command ended while sleep (pid 41), node (pid 42) and 3 more kept running, so they were killed with it. A process meant to keep running is started with `background: true`."
         );
         let one = job_alert_text(&JobAlertText::DescendantsKilled {
             processes: &[JobProcess {
