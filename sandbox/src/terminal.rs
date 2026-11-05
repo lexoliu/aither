@@ -1218,9 +1218,17 @@ pub struct TerminalBinding {
     working_dir: PathBuf,
     role: CommandRole,
     observer: Option<AnyCommandObserver>,
+    executor: Arc<executor_core::AnyExecutor>,
 }
 
 impl TerminalBinding {
+    /// The executor the terminal runs its tasks on, for work that must
+    /// outlive the call that started it.
+    #[must_use]
+    pub fn executor(&self) -> &executor_core::AnyExecutor {
+        &self.executor
+    }
+
     /// Launches subagents from this terminal, within its authority.
     #[must_use]
     pub const fn launcher(&self) -> &TerminalToolFactory {
@@ -1890,6 +1898,7 @@ where
                 working_dir: self.working_dir.clone(),
                 role: self.registry.registry.role(),
                 observer: self.registry.registry.observer().cloned(),
+                executor: Arc::new(executor_core::AnyExecutor::new(self.executor.clone())),
             };
             let registry = ToolRegistry::clone(&self.registry.registry).bind(&served);
             binding = Some(served);
