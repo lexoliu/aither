@@ -2805,6 +2805,15 @@ where
     /// Returns an error when the checkpoint cannot be restored into this agent.
     pub fn restore_checkpoint(&mut self, checkpoint: AgentCheckpoint) -> Result<(), AgentError> {
         self.context.restore(checkpoint.context);
+        // Everything below belongs to the window just replaced: its fork
+        // point, its failure, its parked tool results and its last request
+        // mean nothing in the restored one.
+        self.compaction.retire();
+        self.compaction_failure = None;
+        self.idle_compacted = false;
+        self.tool_results.clear();
+        self.kept_exchanges.clear();
+        self.last_request = None;
         #[cfg(feature = "skills")]
         {
             self.active_skills.set(Vec::new());
@@ -4674,6 +4683,54 @@ mod tests {
         agent
             .restore_checkpoint(empty_checkpoint())
             .expect("restore checkpoint must succeed");
+    }
+
+    /// A compaction forked from the window being replaced describes a
+    /// conversation the restored window never had.
+    #[tokio::test]
+    async fn restoring_a_checkpoint_retires_a_landed_compaction() {
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 200_000,
+            },
+            AgentConfig::default(),
+        );
+        agent.push_message(Message::user("before"));
+        let checkpoint = agent.export_checkpoint().await.expect("checkpoint");
+        agent.push_message(Message::user("after"));
+        agent.compaction.land(
+            agent.context.fork_point(),
+            HandoffDocument {
+                current_task: "stale".to_string(),
+                ..HandoffDocument::default()
+            },
+        );
+
+        agent.restore_checkpoint(checkpoint).expect("restore");
+
+        assert!(!agent.compaction.is_active(), "the landed handoff is gone");
+    }
+
+    #[tokio::test]
+    async fn restoring_a_checkpoint_retires_a_running_compaction() {
+        let llm = ScriptedLlm::new(200_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = Agent::with_config(llm.clone(), AgentConfig::default());
+        agent.push_message(Message::user("before"));
+        let checkpoint = agent.export_checkpoint().await.expect("checkpoint");
+        agent.push_message(Message::user("after"));
+        let tail = agent.render_tail().await;
+        let request = LLMRequest::new(agent.context.build_request(&tail));
+        let fork = CompactionFork::new(&request, agent.context.fork_point(), &[], None, &[])
+            .expect("fork");
+        agent.compaction.start(PendingCompaction::start(fork, llm));
+        agent.compaction_failure = Some(crate::context::CompactionError::Empty);
+        agent.idle_compacted = true;
+
+        agent.restore_checkpoint(checkpoint).expect("restore");
+
+        assert!(!agent.compaction.is_active(), "the running fork is retired");
+        assert!(agent.compaction_failure.is_none());
+        assert!(!agent.idle_compacted);
     }
 
     #[cfg(feature = "skills")]
