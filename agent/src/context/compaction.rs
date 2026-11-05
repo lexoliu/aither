@@ -201,9 +201,14 @@ impl Handoff {
 /// each with the description of the tool call that produced it. `previous` is
 /// the file index of the handoff being replaced: its entries are kept, so a
 /// file indexed by an earlier compaction stays indexed. Later mentions of the
-/// same path win.
+/// same path win. `outputs_dir` is the session's outputs directory, whose
+/// absolute paths saved-output notices print.
 #[must_use]
-pub fn build_file_index(previous: &[String], messages: &[Message]) -> Vec<String> {
+pub fn build_file_index(
+    previous: &[String],
+    messages: &[Message],
+    outputs_dir: Option<&std::path::Path>,
+) -> Vec<String> {
     use std::collections::HashMap;
 
     let mut call_description: HashMap<&str, &str> = HashMap::new();
@@ -237,7 +242,7 @@ pub fn build_file_index(previous: &[String], messages: &[Message]) -> Vec<String
         let description = call_description
             .get(tool_call_id.as_str())
             .map(|description| (*description).to_string());
-        for url in crate::output_urls::extract_referenced_urls(content) {
+        for url in crate::output_urls::extract_referenced_urls(content, outputs_dir) {
             index.insert(url, description.clone());
         }
         for word in content.split_whitespace() {
@@ -266,6 +271,8 @@ pub struct CompactionFork {
     fork_point: u64,
     /// The file index of the handoff this compaction replaces.
     previous_file_index: Vec<String>,
+    /// The session's outputs directory, for the file index.
+    outputs_dir: Option<std::path::PathBuf>,
     /// The main request, source blocks, tools and cache parameters included,
     /// with the handoff instruction appended to its messages. Replaying it is
     /// what lets the provider serve the compaction from the same prefix
@@ -315,10 +322,19 @@ impl CompactionFork {
         Ok(Self {
             fork_point,
             previous_file_index: previous_file_index.to_vec(),
+            outputs_dir: None,
             request: LLMRequest::new(messages)
                 .with_parameters(request.parameters().clone())
                 .with_tool_definitions(request.tool_definitions().to_vec()),
         })
+    }
+
+    /// Sets the session's outputs directory, so the file index also finds
+    /// saved outputs the conversation names by absolute path.
+    #[must_use]
+    pub fn with_outputs_dir(mut self, outputs_dir: Option<std::path::PathBuf>) -> Self {
+        self.outputs_dir = outputs_dir;
+        self
     }
 
     /// The sequence number items must reach to survive this compaction.
@@ -352,13 +368,18 @@ impl CompactionFork {
         let Self {
             request,
             previous_file_index,
+            outputs_dir,
             ..
         } = self;
         let conversation = request.messages().to_vec();
         let reason = match model.generate::<HandoffDocument>(request.clone()).await {
             Ok(document) => match document.validate() {
                 Ok(mut document) => {
-                    document.file_index = build_file_index(&previous_file_index, &conversation);
+                    document.file_index = build_file_index(
+                        &previous_file_index,
+                        &conversation,
+                        outputs_dir.as_deref(),
+                    );
                     return Ok(document);
                 }
                 Err(error) => error.to_string(),
@@ -385,7 +406,8 @@ impl CompactionFork {
             .with_tool_definitions(definitions);
         let response = collect_text(&model, retry_request).await?;
         let mut document = parse_handoff(&response)?.validate()?;
-        document.file_index = build_file_index(&previous_file_index, &conversation);
+        document.file_index =
+            build_file_index(&previous_file_index, &conversation, outputs_dir.as_deref());
         Ok(document)
     }
 }
@@ -533,7 +555,7 @@ mod tests {
             Message::tool("call_2", "wrote artifacts/slides.md"),
         ];
 
-        let index = build_file_index(&[], &messages);
+        let index = build_file_index(&[], &messages, None);
         assert_eq!(index.len(), 2);
         assert!(
             index[0].contains("outputs/amber-oak-swift-river.txt")
@@ -541,6 +563,32 @@ mod tests {
             "index entry should pair path with description: {index:?}"
         );
         assert!(index[1].contains("artifacts/slides.md") && index[1].contains("Write deck"));
+    }
+
+    #[test]
+    fn build_file_index_finds_the_absolute_path_a_saved_output_notice_prints() {
+        let dir = std::path::Path::new("/work/session/outputs");
+        // Joined the way the sandbox names the file, so the separator is the
+        // platform's.
+        let path = dir.join("amber-oak-swift-river.txt").display().to_string();
+        let path = path.as_str();
+        let messages = vec![
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "call_1",
+                    "terminal",
+                    serde_json::json!({"description": "Run the suite"}),
+                )],
+            ),
+            Message::tool(
+                "call_1",
+                aither_sandbox::output_saved_text("head", path, 100, 5000),
+            ),
+        ];
+        let index = build_file_index(&[], &messages, Some(dir));
+        assert_eq!(index.len(), 1, "{index:?}");
+        assert!(index[0].contains(path) && index[0].contains("Run the suite"));
     }
 
     #[test]
@@ -566,7 +614,7 @@ mod tests {
             Message::tool("call_2", "updated artifacts/report.md"),
         ];
 
-        let index = build_file_index(&[], &messages);
+        let index = build_file_index(&[], &messages, None);
         assert_eq!(index.len(), 1);
         assert!(index[0].contains("final revision"));
     }
@@ -590,7 +638,11 @@ mod tests {
     fn compact(context: &mut crate::context::Context) -> HandoffDocument {
         let handoff = HandoffDocument {
             current_task: "task".to_string(),
-            file_index: build_file_index(context.handoff_file_index(), &context.build_request(&[])),
+            file_index: build_file_index(
+                context.handoff_file_index(),
+                &context.build_request(&[]),
+                None,
+            ),
             ..HandoffDocument::default()
         };
         context.apply_handoff(&handoff, u64::MAX, 0);
