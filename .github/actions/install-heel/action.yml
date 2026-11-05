@@ -1,12 +1,33 @@
 name: Install Heel Runtime
-description: Prepare the released heel executable required by sandbox IPC tests.
+description: Prepare the released heel executable required by sandbox IPC tests, restored from the Actions cache and built from crates.io only on a miss.
+inputs:
+  version:
+    description: heel release to install.
+    default: "0.8.0"
+  save:
+    description: Whether a cache miss saves the build. Only dev saves caches, as in the Rust caches.
+    default: ${{ github.ref == 'refs/heads/dev' }}
 runs:
   using: composite
   steps:
+    - id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/heel-runtime
+        key: heel-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+    - if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: cargo install heel --version "${VERSION}" --locked --debug --root "${RUNNER_TEMP}/heel-runtime" --target-dir target/heel-runtime-build
+    - if: steps.restore.outputs.cache-hit != 'true' && inputs.save == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/heel-runtime
+        key: heel-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
     - shell: bash
       run: |
         set -euo pipefail
-        cargo install heel --version 0.8.0 --locked --debug --root "${RUNNER_TEMP}/heel-runtime" --target-dir target/heel-runtime-build
         executable="${RUNNER_TEMP}/heel-runtime/bin/heel"
         if [[ "${RUNNER_OS}" == Windows ]]; then
           executable="${executable}.exe"
