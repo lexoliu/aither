@@ -48,6 +48,8 @@
 //! ```
 
 pub mod guard;
+#[cfg(feature = "headless")]
+pub mod intercept;
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -496,7 +498,7 @@ pub async fn fetch_with_browser(url: &str) -> Result<FetchResult> {
 #[cfg(feature = "headless")]
 pub async fn fetch_html_raw(url: &str) -> Result<String> {
     guard::guard_url(url).await?;
-    fetch_html_headless(url).await
+    fetch_html_headless(url, intercept::PublicOnly).await
 }
 
 /// Smart fetch with strict fallback order:
@@ -1132,7 +1134,7 @@ impl WebFetcher for HeadlessFetcher {
             ));
         }
 
-        let html = fetch_html_headless(&req.url)
+        let html = fetch_html_headless(&req.url, intercept::PublicOnly)
             .await
             .map_err(|err| ProviderError::http(self.name(), err))?;
         let mut result = html_to_result_with_metadata(&req.url, &html, None, None)
@@ -1144,8 +1146,11 @@ impl WebFetcher for HeadlessFetcher {
 }
 
 /// Fetches raw HTML using a headless Chrome browser with anti-detection measures.
+///
+/// Every request the browser makes, redirects and subresources included, is
+/// judged by `policy` before it is sent. A refused navigation fails the fetch.
 #[cfg(feature = "headless")]
-async fn fetch_html_headless(url: &str) -> Result<String> {
+async fn fetch_html_headless<P: intercept::RequestPolicy>(url: &str, policy: P) -> Result<String> {
     use chromiumoxide::browser::{Browser, BrowserConfig};
     use chromiumoxide::handler::viewport::Viewport;
     use futures_lite::StreamExt;
@@ -1163,7 +1168,9 @@ async fn fetch_html_headless(url: &str) -> Result<String> {
         "--window-size=1920,1080",
         "--start-maximized",
         "--disable-extensions",
-        "--disable-popup-blocking",
+        // Frames stay in the page's process, where its interception sees
+        // their requests; a popup is blocked rather than opened unchecked.
+        "--disable-features=IsolateOrigins,site-per-process",
         "--disable-background-networking",
         "--disable-sync",
         "--disable-translate",
@@ -1211,10 +1218,16 @@ async fn fetch_html_headless(url: &str) -> Result<String> {
         .await
         .ok();
 
+    // From here on the browser sends nothing the policy has not approved.
+    let interception = intercept::Interception::start(&page, policy).await?;
+
     // Now navigate to the actual URL
-    page.goto(url)
-        .await
-        .map_err(|e| anyhow!("Failed to navigate: {e}"))?;
+    let navigated = page.goto(url).await;
+    if let Some(refusal) = interception.blocked_navigation() {
+        handle.abort();
+        return Err(anyhow!("Navigation refused: {refusal}"));
+    }
+    navigated.map_err(|e| anyhow!("Failed to navigate: {e}"))?;
 
     // Wait for page to load
     tokio::time::sleep(Duration::from_millis(5000)).await;
@@ -1670,6 +1683,117 @@ mod headless_tests {
         let result = result.unwrap();
         assert!(result.title.is_some());
         assert_ne!(result.content, "");
+    }
+
+    /// A local HTTP server answering every request with `respond(path)`; it
+    /// counts the requests it received.
+    async fn serve(
+        respond: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        let respond = std::sync::Arc::new(respond);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let counted = counted.clone();
+                let respond = respond.clone();
+                tokio::spawn(async move {
+                    let mut buffer = vec![0; 8192];
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&buffer[..read]);
+                    let Some(path) = head.split_whitespace().nth(1) else {
+                        return;
+                    };
+                    // Browsers also ask for /favicon.ico; it is not what the
+                    // test is about.
+                    if path != "/favicon.ico" {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _ = stream.write_all(respond(path).as_bytes()).await;
+                });
+            }
+        });
+        (port, requests)
+    }
+
+    fn http_ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Stands in for the public-only policy on loopback servers: it allows
+    /// one port and refuses every other destination.
+    #[derive(Clone)]
+    struct OnlyPort(u16);
+
+    impl intercept::RequestPolicy for OnlyPort {
+        async fn check(&self, url: &str) -> std::result::Result<(), guard::UrlPolicyError> {
+            let parsed = url::Url::parse(url)?;
+            if parsed.port() == Some(self.0) {
+                Ok(())
+            } else {
+                Err(guard::UrlPolicyError::BlockedAddress {
+                    host: parsed.host_str().unwrap_or_default().to_string(),
+                    addr: std::net::Ipv4Addr::LOCALHOST.into(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_allowed_page_still_loads_through_the_interception() {
+        let (port, requests) =
+            serve(|_| http_ok("<html><body><p>hello there</p></body></html>")).await;
+
+        let html = fetch_html_headless(&format!("http://127.0.0.1:{port}/"), OnlyPort(port))
+            .await
+            .expect("an approved page loads");
+
+        assert!(html.contains("hello there"), "{html}");
+        assert!(requests.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_refused_address_is_never_requested() {
+        use std::sync::atomic::Ordering;
+
+        let (refused_port, refused_requests) = serve(|_| http_ok("<p>secret</p>")).await;
+        let (public_port, public_requests) = serve(move |_| {
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{refused_port}/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        })
+        .await;
+
+        let fetched = fetch_html_headless(
+            &format!("http://127.0.0.1:{public_port}/"),
+            OnlyPort(public_port),
+        )
+        .await;
+
+        assert_eq!(
+            public_requests.load(Ordering::SeqCst),
+            1,
+            "the first URL is requested: {fetched:?}"
+        );
+        assert_eq!(
+            refused_requests.load(Ordering::SeqCst),
+            0,
+            "the redirect target must never receive a request"
+        );
+        assert!(fetched.is_err(), "the blocked navigation fails the fetch");
     }
 
     #[tokio::test]

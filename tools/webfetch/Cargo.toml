@@ -38,7 +38,7 @@ futures-lite = { version = "2.6", optional = true }
 tokio = { version = "1.53", optional = true, features = ["rt", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 futures-lite = "2.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
