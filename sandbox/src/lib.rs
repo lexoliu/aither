@@ -54,6 +54,7 @@
 
 mod bollard_exec;
 mod command;
+mod command_set;
 mod container;
 mod foreground_wait;
 mod grants;
@@ -101,6 +102,7 @@ pub use command::{
     register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
     tool_output_to_payload,
 };
+pub use command_set::{AnyCommandSet, CommandSet};
 pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
     MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,

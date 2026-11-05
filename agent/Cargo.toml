@@ -73,6 +73,8 @@ tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 url = "2.5.8"
 aither-openai.workspace = true
+# An in-process MCP server drives the command table through a real connection.
+aither-mcp = { workspace = true, default-features = false, features = ["client"] }
 
 [features]
 default = []

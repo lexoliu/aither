@@ -39,6 +39,9 @@ mod cache_stats;
 mod call_identity_tests;
 mod checkpoint;
 mod clock;
+mod command_catalog;
+#[cfg(test)]
+mod command_table_tests;
 mod compact_tool;
 mod compaction_state;
 mod config;
@@ -106,8 +109,8 @@ pub use context::ActiveSkills;
 pub use context::{
     AnyContextSource, BackgroundJobs, Block, CompactionError, CompletedCompaction, Context,
     ContextBudget, ContextCheckpoint, ContextItem, ContextPolicy, ContextSource, ExternalContent,
-    ExternalSlot, Handoff, HandoffDocument, InstructionSlot, PromptCache, ReassemblyReport,
-    SystemLayout, TasksDocument,
+    ExternalSlot, Handoff, HandoffDocument, InstructionSlot, LiveContent, LiveUpdate, PromptCache,
+    ReassemblyReport, SystemLayout, TasksDocument,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;
