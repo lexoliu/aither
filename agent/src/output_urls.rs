@@ -2,10 +2,11 @@
 //!
 //! When a terminal command produces more output than belongs in the window,
 //! the sandbox writes it to `outputs/` under a four-word name and reports the
-//! path instead of the content. Those paths are the only way the model can
-//! get back to the full output, so compaction has to find them in a
-//! conversation that is about to be thrown away and carry them into the
-//! handoff's file index.
+//! path instead of the content, relative (`outputs/<name>`) in some notices
+//! and absolute inside the session's outputs directory in others. Those paths
+//! are the only way the model can get back to the full output, so compaction
+//! has to find them in a conversation that is about to be thrown away and
+//! carry them into the handoff's file index.
 //!
 //! Recognition is by shape rather than by bookkeeping: four lowercase
 //! hyphenated words and an alphanumeric extension. Anything else that happens
@@ -13,29 +14,53 @@
 //! invented — is not a real artifact and is not worth a line in the handoff.
 
 use std::collections::HashSet;
+use std::path::Path;
 
-/// Extracts the sandbox output URLs referenced anywhere in `text`.
+/// Characters that can wrap a path in prose without being part of it.
+const fn is_path_punctuation(c: char) -> bool {
+    matches!(c, '"' | '\'' | '`' | ',' | '.' | ')' | ']')
+}
+
+/// Extracts the sandbox output paths referenced anywhere in `text`: relative
+/// `outputs/<name>` words, and, when `outputs_dir` is the session's outputs
+/// directory, `<outputs_dir>/<name>` as the notices print it.
 ///
 /// # Example
 ///
 /// ```
+/// use std::path::Path;
 /// use aither_agent::extract_referenced_urls;
 ///
 /// let text = "Output saved to outputs/amber-oak-swift-river.txt (5000 bytes)";
-/// let urls = extract_referenced_urls(text);
+/// let urls = extract_referenced_urls(text, None);
 /// assert!(urls.contains("outputs/amber-oak-swift-river.txt"));
+///
+/// let text = "saved to /work/outputs/bold-creek-calm-dawn.txt.";
+/// let urls = extract_referenced_urls(text, Some(Path::new("/work/outputs")));
+/// assert!(urls.contains("/work/outputs/bold-creek-calm-dawn.txt"));
 /// ```
 #[must_use]
-pub fn extract_referenced_urls(text: &str) -> HashSet<String> {
+pub fn extract_referenced_urls(text: &str, outputs_dir: Option<&Path>) -> HashSet<String> {
     let mut urls = HashSet::new();
     for word in text.split_whitespace() {
-        let word = word.trim_matches(|c: char| {
-            c == '"' || c == '\'' || c == '`' || c == ',' || c == '.' || c == ')' || c == ']'
-        });
+        let word = word.trim_matches(is_path_punctuation);
         if let Some(filename) = word.strip_prefix("outputs/")
             && is_valid_output_filename(filename)
         {
             urls.insert(word.to_string());
+        }
+    }
+    if let Some(outputs_dir) = outputs_dir {
+        // The directory may hold spaces, so the absolute form is found by its
+        // prefix rather than by splitting words.
+        let prefix = format!("{}/", outputs_dir.display());
+        for (start, _) in text.match_indices(prefix.as_str()) {
+            let rest = &text[start + prefix.len()..];
+            let name = rest.split_whitespace().next().unwrap_or_default();
+            let name = name.trim_end_matches(is_path_punctuation);
+            if is_valid_output_filename(name) {
+                urls.insert(format!("{prefix}{name}"));
+            }
         }
     }
     urls
@@ -64,7 +89,7 @@ mod tests {
     #[test]
     fn extracts_every_referenced_output() {
         let text = "The agent read config from outputs/amber-oak-swift-river.txt and saved data to outputs/bold-creek-calm-dawn.json.";
-        let urls = extract_referenced_urls(text);
+        let urls = extract_referenced_urls(text, None);
         assert_eq!(urls.len(), 2);
         assert!(urls.contains("outputs/amber-oak-swift-river.txt"));
         assert!(urls.contains("outputs/bold-creek-calm-dawn.json"));
@@ -73,13 +98,34 @@ mod tests {
     #[test]
     fn surrounding_punctuation_is_stripped() {
         let text = r#"See "outputs/jade-mist-clear-pool.txt" for details."#;
-        assert!(extract_referenced_urls(text).contains("outputs/jade-mist-clear-pool.txt"));
+        assert!(extract_referenced_urls(text, None).contains("outputs/jade-mist-clear-pool.txt"));
+    }
+
+    #[test]
+    fn the_saved_output_notice_the_sandbox_renders_is_found() {
+        let dir = Path::new("/home/me/My Sessions/s1/outputs");
+        let path = dir.join("amber-oak-swift-river.txt");
+        let notice =
+            aither_sandbox::output_saved_text("preview line", &path.to_string_lossy(), 900, 48_000);
+        let urls = extract_referenced_urls(&notice, Some(dir));
+        assert_eq!(
+            urls,
+            HashSet::from([path.to_string_lossy().into_owned()]),
+            "notice: {notice}"
+        );
+    }
+
+    #[test]
+    fn absolute_paths_outside_the_outputs_directory_are_ignored() {
+        let text =
+            "saved to /elsewhere/outputs/amber-oak-swift-river.txt and /work/outputs/not-valid.txt";
+        assert!(extract_referenced_urls(text, Some(Path::new("/work/outputs"))).is_empty());
     }
 
     #[test]
     fn paths_that_are_not_artifacts_are_ignored() {
         let text = "Not valid: outputs/single.txt outputs/two-words.txt outputs/ outputs/one-two-three.txt";
-        assert!(extract_referenced_urls(text).is_empty());
+        assert!(extract_referenced_urls(text, None).is_empty());
     }
 
     #[test]

@@ -116,7 +116,20 @@ fn tool_usage_error(message: &str, tool_name: &str) -> String {
     .expect("tool usage error template must render")
 }
 
-fn output_saved_text(rendered: &str, path: &str, line_count: usize, byte_count: usize) -> String {
+/// The notice a command's output is replaced by when it was too large for the
+/// window: a preview of `rendered` and the absolute `path` of the file that
+/// holds all of it.
+///
+/// # Panics
+///
+/// Panics if the compiled-in template fails to render.
+#[must_use]
+pub fn output_saved_text(
+    rendered: &str,
+    path: &str,
+    line_count: usize,
+    byte_count: usize,
+) -> String {
     let preview = crate::output_compress::stored_preview(rendered, usize::MAX, INLINE_OUTPUT_LIMIT);
     CommandOutputSavedTemplate {
         preview: preview.trim_end_matches('\n'),
