@@ -13,7 +13,7 @@ use aither_core::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::Agent;
+use crate::{Agent, AgentOptions};
 
 /// A sub-agent tool that spawns a fresh agent for each call.
 ///

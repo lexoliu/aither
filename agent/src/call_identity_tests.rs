@@ -13,8 +13,8 @@ use futures_core::Stream;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::AgentBuilder;
 use crate::specialized::{SubagentArgs, SubagentTool};
+use crate::{AgentBuilder, AgentOptions};
 
 #[derive(Debug)]
 struct NeverError;

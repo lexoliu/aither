@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::context::CacheLifetime;
 use crate::sandbox::TerminalTool;
 use crate::sandbox::permission::NoopPermissionHandler;
-use crate::{Agent, ManualClock, TerminalAgentBuilder};
+use crate::{Agent, AgentOptions, ManualClock, TerminalAgentBuilder};
 use aither_core::LanguageModel;
 use aither_core::llm::{Event, LLMRequest, model::Profile as ModelProfile};
 use executor_core::tokio::TokioGlobal;
