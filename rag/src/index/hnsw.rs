@@ -170,12 +170,15 @@ impl VectorIndex for HnswIndex {
     }
 
     fn remove(&self, chunk_id: &str) -> bool {
-        let current = self.state.load();
-        let Some(&idx) = current.id_to_index.get(chunk_id) else {
-            return false;
-        };
-
+        let mut found = false;
+        // The closure runs again on a newer state when another update wins,
+        // so the entry is looked up in the state each attempt sees.
         self.state.rcu(|state| {
+            let Some(&idx) = state.id_to_index.get(chunk_id) else {
+                found = false;
+                return Arc::clone(state);
+            };
+            found = true;
             let mut next = state.clone_without_index();
             let hash = next.entries[idx].chunk.content_hash;
             next.content_hashes.remove(&hash);
@@ -188,9 +191,9 @@ impl VectorIndex for HnswIndex {
                 next.id_to_index.insert(swapped_id, idx);
             }
 
-            next
+            Arc::new(next)
         });
-        true
+        found
     }
 
     fn search(&self, query: &[f32], top_k: usize, threshold: f32) -> Result<Vec<SearchResult>> {
@@ -332,6 +335,47 @@ mod tests {
         assert!(index.remove("c1"));
         assert_eq!(index.len(), 0);
         assert!(!index.remove("c1"));
+    }
+
+    /// Two removals of one entry race on a shared index: exactly one removes
+    /// it, and no other entry is lost. Each round starts both threads on a
+    /// barrier so their lookups and updates overlap.
+    #[test]
+    fn concurrent_removals_of_one_entry_remove_it_once() {
+        for round in 0..2000 {
+            let index = HnswIndex::new(2);
+            for (n, id) in ["c0", "c1", "c2"].into_iter().enumerate() {
+                let hash = u64::try_from(n).unwrap();
+                index
+                    .insert(
+                        Chunk::new(id, id, "doc", n, hash),
+                        vec![1.0, f32::from(u8::try_from(n).unwrap())],
+                    )
+                    .unwrap();
+            }
+
+            let barrier = std::sync::Barrier::new(2);
+            let removed = std::thread::scope(|scope| {
+                let racers: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            index.remove("c0")
+                        })
+                    })
+                    .collect();
+                racers
+                    .into_iter()
+                    .map(|racer| racer.join().expect("racer"))
+                    .filter(|removed| *removed)
+                    .count()
+            });
+            assert_eq!(removed, 1, "round {round}: one removal wins");
+
+            let mut left: Vec<_> = index.entries().into_iter().map(|e| e.chunk.id).collect();
+            left.sort();
+            assert_eq!(left, ["c1", "c2"], "round {round}");
+        }
     }
 
     #[test]
