@@ -654,7 +654,6 @@ fn process_sse_data(
     data: &str,
     usage: &mut Option<Usage>,
     tool_calls: &mut HashMap<usize, ToolCallAccumulator>,
-    saw_finish: &mut bool,
 ) -> Result<ProcessedSse, CopilotError> {
     if data.is_empty() {
         return Ok(ProcessedSse {
@@ -685,14 +684,6 @@ fn process_sse_data(
     let mut saw_payload = chunk.usage.is_some();
     if let Some(chunk_usage) = &chunk.usage {
         *usage = Some(usage_from_chat_completion(chunk_usage));
-    }
-    if !chunk.choices.is_empty()
-        && chunk
-            .choices
-            .iter()
-            .all(|choice| choice.finish_reason.is_some())
-    {
-        *saw_finish = true;
     }
     for choice in &chunk.choices {
         if let Some(content) = &choice.delta.content
@@ -832,7 +823,6 @@ fn stream_chat_completion_events(
 ) -> impl Stream<Item = Result<Event, CopilotError>> + Send {
     async_stream::stream! {
         let mut event_count = 0usize;
-        let mut saw_finish = false;
         let mut saw_payload = false;
         let mut last_progress = Instant::now();
         let mut tool_calls: HashMap<usize, ToolCallAccumulator> = HashMap::new();
@@ -850,12 +840,9 @@ fn stream_chat_completion_events(
                     }
                     tracing::trace!(sse_event = %data, "Received Copilot SSE event");
                     event_count += 1;
-                    let processed = match process_sse_data(
-                        data,
-                        &mut usage,
-                        &mut tool_calls,
-                        &mut saw_finish,
-                    ) {
+                    // A `finish_reason` only ends the content: with `include_usage`
+                    // the usage arrives in a later chunk, before `[DONE]`.
+                    let processed = match process_sse_data(data, &mut usage, &mut tool_calls) {
                         Ok(processed) => processed,
                         Err(err) => {
                             yield Err(err);
@@ -886,9 +873,6 @@ fn stream_chat_completion_events(
                     yield Err(CopilotError::Timeout);
                     return;
                 }
-            }
-            if saw_finish {
-                break;
             }
         }
 
@@ -925,5 +909,54 @@ fn usage_from_chat_completion(raw: &ChatCompletionUsage) -> Usage {
         cache_write_tokens: None,
         cost_usd: None,
         stop_reason: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zenwave::ResponseExt;
+
+    fn sse_body(chunks: &[&str]) -> zenwave::sse::SseStream {
+        let body = chunks
+            .iter()
+            .map(|data| format!("data: {data}\n\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        zenwave::Response::new(body.into()).into_sse()
+    }
+
+    /// With `include_usage` the finish chunk is followed by a usage chunk with
+    /// empty `choices`, then `[DONE]`.
+    #[tokio::test]
+    async fn usage_after_finish_reason_is_reported() {
+        let stream = sse_body(&[
+            r#"{"choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}}"#,
+            "[DONE]",
+        ]);
+        let events: Vec<Event> = stream_chat_completion_events(stream)
+            .map(|event| event.expect("stream event"))
+            .collect()
+            .await;
+
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hello");
+        let Some(Event::Usage(usage)) = events.last() else {
+            panic!("expected trailing usage event, got {events:?}");
+        };
+        assert_eq!(usage.prompt_tokens, Some(11));
+        assert_eq!(usage.completion_tokens, Some(7));
+        assert_eq!(usage.total_tokens, Some(18));
+        assert_eq!(usage.reasoning_tokens, Some(2));
+        assert_eq!(usage.cache_read_tokens, Some(3));
     }
 }
