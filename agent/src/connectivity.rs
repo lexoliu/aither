@@ -101,6 +101,7 @@ mod tests {
         llm::{Classify, Failure, FailureKind, LLMRequest, model::Profile as ModelProfile},
     };
     use futures_lite::{StreamExt, future};
+    use std::ops::ControlFlow;
 
     use super::*;
     use crate::Agent;
@@ -151,38 +152,34 @@ mod tests {
     /// first text arrives, and returns how the run ended.
     async fn run_with(
         change: impl FnOnce(&aither_connectivity::Controller),
-    ) -> Option<Result<crate::TimedEvent, AgentError>> {
+    ) -> Result<(), AgentError> {
         let (connectivity, controller) = Connectivity::manual(true);
         let mut agent = Agent::builder(StallingLlm)
             .connectivity(connectivity)
             .build();
-        let stream = agent.run("hello", std::iter::empty());
-        futures_lite::pin!(stream);
-        loop {
-            let item = stream.next().await.expect("the run is alive");
-            if matches!(
-                item.as_ref().map(|timed| &timed.event),
-                Ok(crate::AgentEvent::Text(_))
-            ) {
-                break;
-            }
-        }
-        change(&controller);
-        let mut last = None;
-        while let Some(item) = stream.next().await {
-            if item.is_err() {
-                return Some(item);
-            }
-            last = Some(item);
-        }
-        last
+        let controller = &controller;
+        agent
+            .run("hello", std::iter::empty())
+            .drive(
+                Some(change),
+                std::future::pending(),
+                |mut change, timed| async move {
+                    if matches!(timed.event, crate::AgentEvent::Text(_))
+                        && let Some(change) = change.take()
+                    {
+                        change(controller);
+                    }
+                    ControlFlow::<std::convert::Infallible, _>::Continue(change)
+                },
+            )
+            .await
+            .map(|_| ())
     }
 
     #[tokio::test]
     async fn waking_mid_stream_ends_the_attempt_with_a_network_failure() {
         let error = run_with(aither_connectivity::Controller::wake)
             .await
-            .expect("the run reports")
             .expect_err("the attempt is abandoned");
         let AgentError::Llm { message, failure } = &error else {
             panic!("expected an LLM error, got {error}");
@@ -195,7 +192,6 @@ mod tests {
     async fn going_offline_mid_stream_ends_the_attempt_with_a_network_failure() {
         let error = run_with(|controller| controller.set_online(false))
             .await
-            .expect("the run reports")
             .expect_err("the attempt is abandoned");
         let AgentError::Llm { message, failure } = &error else {
             panic!("expected an LLM error, got {error}");

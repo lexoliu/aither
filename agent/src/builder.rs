@@ -148,6 +148,8 @@ struct Wiring {
     permission_receiver: Option<PermissionEventReceiver>,
     /// The terminal calls in which a kept command succeeded.
     kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
+    /// The commands the terminal runs, kept current in the command table.
+    commands: Option<crate::command_catalog::CommandCatalog>,
     host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
     job_registry: Option<JobRegistry>,
     /// Directory whose working documents (`tasks.md`) the agent supervises:
@@ -759,6 +761,25 @@ where
         self.settings.context.instructions().contains(slot)
     }
 
+    /// Lists `commands` in [`InstructionSlot::COMMANDS`] and has the built
+    /// agent keep that table current as live content.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no [`InstructionSlot::COMMANDS`] slot.
+    pub(crate) fn command_catalog(
+        mut self,
+        commands: crate::command_catalog::CommandCatalog,
+    ) -> Self {
+        self.settings
+            .context
+            .update_live(&crate::context::LiveContent::COMMANDS, |update| {
+                update.instruction(&InstructionSlot::COMMANDS, commands.render());
+            });
+        self.wiring.commands = Some(commands);
+        self
+    }
+
     /// Registers an MCP connection.
     ///
     /// All tools from the MCP server will be available for the agent to use.
@@ -770,7 +791,7 @@ where
     /// use aither_mcp::McpConnection;
     ///
     /// // Connect to an MCP server
-    /// let conn = McpConnection::spawn("npx", &["-y", "@modelcontextprotocol/server-filesystem", "/"]).await?;
+    /// let conn = McpConnection::spawn(&executor, "npx", &["-y", "@modelcontextprotocol/server-filesystem", "/"]).await?;
     ///
     /// let agent = Agent::builder(llm)
     ///     .mcp(conn)
@@ -780,8 +801,8 @@ where
     /// # Multiple Servers
     ///
     /// ```rust,ignore
-    /// let filesystem = McpConnection::spawn("npx", &["-y", "@modelcontextprotocol/server-filesystem", "/"]).await?;
-    /// let github = McpConnection::spawn("npx", &["-y", "@modelcontextprotocol/server-github"]).await?;
+    /// let filesystem = McpConnection::spawn(&executor, "npx", &["-y", "@modelcontextprotocol/server-filesystem", "/"]).await?;
+    /// let github = McpConnection::spawn(&executor, "npx", &["-y", "@modelcontextprotocol/server-github"]).await?;
     ///
     /// let agent = Agent::builder(llm)
     ///     .mcp(filesystem)
@@ -795,7 +816,7 @@ where
     /// use aither_mcp::{McpConnection, McpServersConfig};
     ///
     /// let config: McpServersConfig = serde_json::from_str(&config_json)?;
-    /// let connections = McpConnection::from_configs(&config).await?;
+    /// let connections = McpConnection::from_configs(&executor, &config).await?;
     ///
     /// let mut builder = Agent::builder(llm);
     /// for (_name, conn) in connections {
@@ -955,6 +976,7 @@ where
             background_receiver,
             permission_receiver,
             kept_receiver,
+            commands,
             host_load_events,
             job_registry,
             sandbox_dir,
@@ -995,6 +1017,7 @@ where
             background_receiver,
             permission_receiver,
             kept_receiver,
+            commands,
             host_load_events,
             job_registry,
             detached_task_ids: std::collections::HashSet::new(),

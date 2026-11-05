@@ -1,0 +1,52 @@
+name: Restore managed tool cache
+description: Restore the directory the sandbox tests and verify_tools download pinned tool artifacts and prepare runtimes into, keyed on the manifest that pins them, so a warm run reaches GitHub for none of them. The caller saves it after its tests with actions/cache/save and the outputs below.
+inputs:
+  files:
+    description: Newline-separated files whose content determines what lands in the cache (the tool manifest, plus anything that changes a prepared runtime's digest). Absolute, or relative to the workspace.
+    required: true
+  rustc:
+    description: Whether the toolchain is part of the key, for tests that compile a fixture into the runtime.
+    default: "false"
+outputs:
+  path:
+    description: The cache directory, also exported as AITHER_TOOL_CACHE.
+    value: ${{ steps.key.outputs.path }}
+  key:
+    description: The cache key.
+    value: ${{ steps.key.outputs.key }}
+  hit:
+    description: "'true' when the key was restored exactly."
+    value: ${{ steps.restore.outputs.cache-hit }}
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      env:
+        FILES: ${{ inputs.files }}
+        WITH_RUSTC: ${{ inputs.rustc }}
+      run: |
+        set -euo pipefail
+        digest() { sha256sum "$@" 2>/dev/null || shasum -a 256 "$@"; }
+        list=()
+        while IFS= read -r file; do
+          [[ -n "${file}" ]] && list+=("${file}")
+        done <<< "${FILES}"
+        hash="$(
+          {
+            for file in "${list[@]}"; do cat "${file}"; done
+            if [[ "${WITH_RUSTC}" == true ]]; then rustc -vV; fi
+          } | digest | cut -d' ' -f1
+        )"
+        path="${RUNNER_TEMP}/aither-tool-cache"
+        mkdir -p "${path}"
+        {
+          echo "key=tools-${RUNNER_OS}-${RUNNER_ARCH}-${hash}"
+          echo "path=${path}"
+        } >> "${GITHUB_OUTPUT}"
+        echo "AITHER_TOOL_CACHE=${path}" >> "${GITHUB_ENV}"
+    - id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.key.outputs.path }}
+        key: ${{ steps.key.outputs.key }}

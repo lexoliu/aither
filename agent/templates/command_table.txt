@@ -1,0 +1,5 @@
+<{{ tag }}>
+{% for command in commands -%}
+- {{ command.name }}: {{ command.description }}
+{% endfor -%}
+</{{ tag }}>

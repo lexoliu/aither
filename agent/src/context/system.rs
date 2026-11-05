@@ -53,8 +53,8 @@ pub trait BlockKind: sealed::Sealed + Debug + Clone + PartialEq + Eq + Ord {
     /// The region's name, for diagnostics.
     const REGION: &'static str;
 
-    /// The size of `content` in bytes, for reassembly reports.
-    fn content_len(content: &Self::Content) -> usize;
+    /// The text of `content` the model reads, which a change is diffed on.
+    fn text(content: &Self::Content) -> &str;
 }
 
 /// Instruction blocks: the agent's own prompt, rendered first.
@@ -67,8 +67,8 @@ impl BlockKind for Instruction {
     type Content = String;
     const REGION: &'static str = "instruction";
 
-    fn content_len(content: &Self::Content) -> usize {
-        content.len()
+    fn text(content: &Self::Content) -> &str {
+        content
     }
 }
 
@@ -82,8 +82,8 @@ impl BlockKind for External {
     type Content = ExternalContent;
     const REGION: &'static str = "external";
 
-    fn content_len(content: &Self::Content) -> usize {
-        content.content.len()
+    fn text(content: &Self::Content) -> &str {
+        &content.content
     }
 }
 
@@ -138,6 +138,10 @@ impl InstructionSlot {
     pub const KNOWLEDGE_AND_TIME: Self = Self::new("knowledge_and_time");
     /// The filesystem permission model.
     pub const PERMISSIONS: Self = Self::new("permissions");
+    /// The table of the CLI commands `terminal` runs, which a terminal agent
+    /// keeps current as live content (see
+    /// [`Context::update_live`](crate::Context::update_live)).
+    pub const COMMANDS: Self = Self::new("commands");
     /// The communication and working languages, present only while a
     /// communication language is enforced.
     #[cfg(feature = "languages")]
@@ -145,18 +149,6 @@ impl InstructionSlot {
 
     /// Every built-in instruction slot, in the default layout's order.
     #[cfg(not(feature = "languages"))]
-    pub const BUILTIN: [Self; 7] = [
-        Self::BASE_SYSTEM,
-        Self::PERSONA,
-        Self::PREPARED_TOOLS,
-        Self::SHELL_RUNTIME,
-        Self::WORKSPACE_FACTS,
-        Self::KNOWLEDGE_AND_TIME,
-        Self::PERMISSIONS,
-    ];
-
-    /// Every built-in instruction slot, in the default layout's order.
-    #[cfg(feature = "languages")]
     pub const BUILTIN: [Self; 8] = [
         Self::BASE_SYSTEM,
         Self::PERSONA,
@@ -165,6 +157,20 @@ impl InstructionSlot {
         Self::WORKSPACE_FACTS,
         Self::KNOWLEDGE_AND_TIME,
         Self::PERMISSIONS,
+        Self::COMMANDS,
+    ];
+
+    /// Every built-in instruction slot, in the default layout's order.
+    #[cfg(feature = "languages")]
+    pub const BUILTIN: [Self; 9] = [
+        Self::BASE_SYSTEM,
+        Self::PERSONA,
+        Self::PREPARED_TOOLS,
+        Self::SHELL_RUNTIME,
+        Self::WORKSPACE_FACTS,
+        Self::KNOWLEDGE_AND_TIME,
+        Self::PERMISSIONS,
+        Self::COMMANDS,
         Self::LANGUAGES,
     ];
 }
@@ -247,14 +253,21 @@ fn unique_slots<K: BlockKind>(slots: impl IntoIterator<Item = Slot<K>>) -> Vec<S
 pub struct SystemRegion<K: BlockKind> {
     order: Vec<Slot<K>>,
     blocks: BTreeMap<Slot<K>, K::Content>,
-    /// Replacements applied on the next reassembly.
+    /// Live-content changes applied on the next reassembly: the new content,
+    /// or `None` for a block that goes away.
     ///
-    /// Rewriting a block mid-session invalidates the prompt-cache prefix, so
-    /// a host stages the new content here (surfacing the change to the model
-    /// as an appended alert instead) and lets reassembly fold it in once the
-    /// cache is already going to be invalidated.
+    /// Rewriting a block while the prefix is cached invalidates it, so a
+    /// change is parked here (and announced to the model as an appended diff
+    /// alert instead) until reassembly, which rewrites the prefix anyway.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    staged: BTreeMap<Slot<K>, K::Content>,
+    staged: BTreeMap<Slot<K>, Option<K::Content>>,
+}
+
+/// One live block's change, as the model is told it: the text it knew and
+/// the text it is to know.
+pub(crate) struct TextChange {
+    pub(crate) before: String,
+    pub(crate) after: String,
 }
 
 impl<K: BlockKind> SystemRegion<K> {
@@ -340,59 +353,78 @@ impl<K: BlockKind> SystemRegion<K> {
             .filter_map(|slot| self.blocks.get(slot).map(|content| (slot, content)))
     }
 
-    /// Stages a replacement for the block in `slot`, deferring the
-    /// cache-invalidating rewrite until the next reassembly.
+    /// The content the model knows `slot` to hold: the prefix's block with
+    /// every announced change applied.
+    fn known(&self, slot: &Slot<K>) -> Option<&K::Content> {
+        self.staged
+            .get(slot)
+            .map_or_else(|| self.blocks.get(slot), Option::as_ref)
+    }
+
+    /// Brings the live block in `slot` to `desired` (`None` removes it).
     ///
-    /// If the slot is empty the content is inserted at once (there is
-    /// nothing cached to preserve) and `false` is returned; content equal to
-    /// the current block drops any staged replacement and returns `false`.
-    /// Otherwise the replacement is staged and `true` is returned: the host
-    /// should surface the change to the model as an appended alert.
+    /// While the prefix is `warm` the block is left as the cache holds it and
+    /// the change is staged for the next reassembly; the change is returned
+    /// when the text the model reads differs from what it knows, so the
+    /// caller announces it. A cold prefix is rewritten at once and nothing
+    /// is returned: no request has carried the old version.
     ///
     /// # Panics
     ///
     /// Panics if the layout has no such slot.
-    pub fn stage(&mut self, slot: &Slot<K>, content: impl Into<K::Content>) -> bool {
+    pub(crate) fn change(
+        &mut self,
+        slot: &Slot<K>,
+        desired: Option<K::Content>,
+        warm: bool,
+    ) -> Option<TextChange> {
         self.assert_placed(slot);
-        let content = content.into();
-        match self.blocks.get(slot) {
-            Some(existing) if *existing == content => {
-                self.staged.remove(slot);
-                false
-            }
-            Some(_) => {
-                self.staged.insert(slot.clone(), content);
-                true
-            }
-            None => {
-                self.blocks.insert(slot.clone(), content);
-                false
-            }
+        let known = self.known(slot);
+        if known == desired.as_ref() {
+            return None;
         }
+        if warm {
+            let change = TextChange {
+                before: known.map_or("", K::text).to_owned(),
+                after: desired.as_ref().map_or("", K::text).to_owned(),
+            };
+            if self.blocks.get(slot) == desired.as_ref() {
+                self.staged.remove(slot);
+            } else {
+                self.staged.insert(slot.clone(), desired);
+            }
+            return (change.before != change.after).then_some(change);
+        }
+        self.staged.remove(slot);
+        match desired {
+            Some(content) => self.blocks.insert(slot.clone(), content),
+            None => self.blocks.remove(slot),
+        };
+        None
     }
 
-    /// The staged replacement for `slot`, if any.
-    #[must_use]
-    pub fn staged(&self, slot: &Slot<K>) -> Option<&K::Content> {
-        self.staged.get(slot)
-    }
-
-    /// Whether any replacement is waiting for reassembly.
+    /// Whether any change is waiting for reassembly.
     #[must_use]
     pub fn has_staged(&self) -> bool {
         !self.staged.is_empty()
     }
 
-    /// Folds the staged replacements in, returning how many were applied and
-    /// how many bytes they freed.
+    /// Folds the staged changes in, returning how many were applied and how
+    /// many bytes they freed.
     pub(crate) fn apply_staged(&mut self) -> (usize, usize) {
         let mut applied = 0;
         let mut freed = 0;
         for (slot, content) in std::mem::take(&mut self.staged) {
-            if let Some(existing) = self.blocks.get(&slot) {
-                freed += K::content_len(existing).saturating_sub(K::content_len(&content));
-            }
-            self.blocks.insert(slot, content);
+            let before = self
+                .blocks
+                .get(&slot)
+                .map_or(0, |block| K::text(block).len());
+            let after = content.as_ref().map_or(0, |block| K::text(block).len());
+            freed += before.saturating_sub(after);
+            match content {
+                Some(content) => self.blocks.insert(slot, content),
+                None => self.blocks.remove(&slot),
+            };
             applied += 1;
         }
         (applied, freed)
@@ -502,31 +534,90 @@ impl ExternalContent {
     /// occurs in the label or the content is skipped, so the boundary never
     /// does.
     fn boundary(&self) -> String {
-        let mut attempt: u64 = 0;
-        loop {
-            let digest = Sha256::new()
-                .chain_update(self.kind.label())
-                .chain_update([0])
-                .chain_update(&self.source)
-                .chain_update([0])
-                .chain_update(&self.content)
-                .chain_update(attempt.to_le_bytes())
-                .finalize();
-            let candidate = crate::agent::hex_encode(&digest[..8]);
-            if !self.source.contains(&candidate) && !self.content.contains(&candidate) {
-                return candidate;
-            }
-            attempt += 1;
-        }
+        boundary(&[self.kind.label(), &self.source, &self.content])
     }
 }
 
-/// One external block as the prefix template reads it.
+/// A boundary that occurs in none of `parts`: hex of a hash of them, rehashed
+/// until it is absent, so the same parts always get the same boundary.
+pub(crate) fn boundary(parts: &[&str]) -> String {
+    let mut attempt: u64 = 0;
+    loop {
+        let mut hasher = Sha256::new();
+        for (index, part) in parts.iter().enumerate() {
+            if index > 0 {
+                hasher.update([0]);
+            }
+            hasher.update(part);
+        }
+        hasher.update(attempt.to_le_bytes());
+        let candidate = crate::agent::hex_encode(&hasher.finalize()[..8]);
+        if parts.iter().all(|part| !part.contains(&candidate)) {
+            return candidate;
+        }
+        attempt += 1;
+    }
+}
+
+impl ExternalContent {
+    /// The block as the templates read it.
+    fn view(&self) -> ExternalBlockView<'_> {
+        ExternalBlockView {
+            boundary: self.boundary(),
+            kind: self.kind.label(),
+            source: &self.source,
+            content: &self.content,
+        }
+    }
+
+    /// The content inside its provenance-labelled boundary, for a host that
+    /// places it in text of its own — an alert's template, say.
+    ///
+    /// The closing tag carries a boundary derived from the block's own
+    /// bytes, which therefore never occurs in it, exactly as in the system
+    /// prompt. The same block always renders the same text. The text does
+    /// not repeat the notice that external content is data; see
+    /// [`Block::external`](super::Block::external) for a block that does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the template fails to render.
+    #[must_use]
+    pub fn render(&self) -> String {
+        ExternalBlockTemplate { block: self.view() }
+            .render()
+            .expect("external block template must render")
+    }
+
+    /// The block with the notice that external content is data before it,
+    /// for an alert that arrives where the system prompt has no such notice.
+    pub(crate) fn render_with_notice(&self) -> String {
+        ExternalAlertTemplate { block: self.view() }
+            .render()
+            .expect("external alert template must render")
+    }
+}
+
+/// One external block as the templates read it.
 struct ExternalBlockView<'a> {
     boundary: String,
     kind: &'static str,
     source: &'a str,
     content: &'a str,
+}
+
+/// One external block, bounded.
+#[derive(Template)]
+#[template(path = "external_block.txt", escape = "none")]
+struct ExternalBlockTemplate<'a> {
+    block: ExternalBlockView<'a>,
+}
+
+/// One external block, bounded and preceded by the notice that it is data.
+#[derive(Template)]
+#[template(path = "external_alert.txt", escape = "none")]
+struct ExternalAlertTemplate<'a> {
+    block: ExternalBlockView<'a>,
 }
 
 /// The whole cacheable system prefix.
@@ -548,15 +639,7 @@ pub(crate) fn render_prefix(
     }
     let template = SystemPrefixTemplate {
         instructions: instructions.iter().map(|(_, text)| text.as_str()).collect(),
-        external: external
-            .iter()
-            .map(|(_, block)| ExternalBlockView {
-                boundary: block.boundary(),
-                kind: block.kind.label(),
-                source: &block.source,
-                content: &block.content,
-            })
-            .collect(),
+        external: external.iter().map(|(_, block)| block.view()).collect(),
     };
     Some(
         template

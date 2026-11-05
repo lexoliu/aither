@@ -218,6 +218,40 @@ pub struct ProgressNotificationParams {
     pub message: Option<String>,
 }
 
+/// Severity of a `notifications/message` log entry, in increasing order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoggingLevel {
+    /// Detailed debugging information.
+    Debug,
+    /// General informational messages.
+    Info,
+    /// Normal but significant events.
+    Notice,
+    /// Warning conditions.
+    Warning,
+    /// Error conditions.
+    Error,
+    /// Critical conditions.
+    Critical,
+    /// Action must be taken immediately.
+    Alert,
+    /// The system is unusable.
+    Emergency,
+}
+
+/// Parameters of a `notifications/message` (logging) notification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggingMessageParams {
+    /// Severity of the entry.
+    pub level: LoggingLevel,
+    /// Name of the logger that produced the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logger: Option<String>,
+    /// Any JSON-serializable payload.
+    pub data: Value,
+}
+
 /// Tool call result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

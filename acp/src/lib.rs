@@ -116,9 +116,12 @@
 //! }
 //!
 //! # async fn run() -> Result<(), AcpError> {
-//! let mut server = AcpServer::stdio("echo-agent", "0.1.0", |_cwd| async {
-//!     Ok::<_, AcpError>(Agent::new(EchoModel))
-//! });
+//! let mut server = AcpServer::stdio(
+//!     "echo-agent",
+//!     "0.1.0",
+//!     executor_core::tokio::TokioGlobal,
+//!     |_setup| async { Ok::<_, AcpError>(Agent::new(EchoModel)) },
+//! );
 //! server.run().await
 //! # }
 //! ```
@@ -134,6 +137,7 @@ mod adapter;
 mod client;
 pub mod ext;
 mod macros;
+mod mcp;
 pub mod protocol;
 mod server;
 mod session;
@@ -142,5 +146,5 @@ pub mod vendor;
 pub use adapter::SessionUpdateMapper;
 pub use client::{AcpClient, ClientError, ClientHandler, ResponseFuture};
 pub use protocol::*;
-pub use server::AcpServer;
+pub use server::{AcpServer, SessionSetup};
 pub use session::AcpSession;

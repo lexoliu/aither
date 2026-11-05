@@ -75,7 +75,7 @@ fn ast_grep_hook(dir: &Path, log: &Path) -> CommandHookConfig {
 /// The managed tools every terminal here is prepared with.
 struct Tools {
     distribution: aither_sandbox::ToolDistribution,
-    cache: crate::test_support::TempDir,
+    cache: crate::test_support::ToolCache,
     _source: tempfile::TempDir,
 }
 
@@ -87,7 +87,7 @@ impl Tools {
         let binary = crate::test_support::compile_baseline_fixture(source.path()).await;
         Self {
             distribution: crate::test_support::fixture_distribution(&binary, "1.0.0").await,
-            cache: crate::test_support::TempDir::new(),
+            cache: crate::test_support::ToolCache::temporary(),
             _source: source,
         }
     }
@@ -99,7 +99,7 @@ impl Tools {
         let binary = crate::test_support::compile_baseline_fixture(source.path()).await;
         Self {
             distribution: crate::test_support::real_distribution(&binary).await,
-            cache: crate::test_support::TempDir::new(),
+            cache: crate::test_support::ToolCache::shared(),
             _source: source,
         }
     }

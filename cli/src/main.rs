@@ -54,7 +54,6 @@ use aither_core::llm::{Role, ToolResult};
 use aither_mcp::{McpConnection, McpServersConfig};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use async_lock::Mutex as AsyncMutex;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -273,7 +272,7 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
         })
         .collect();
 
-    let conn = Arc::new(AsyncMutex::new(conn));
+    let conn = Arc::new(conn);
 
     for (name, description, schema) in tools {
         let conn = conn.clone();
@@ -298,7 +297,6 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
                 };
 
                 // Call the MCP tool
-                let mut conn = conn.lock().await;
                 match conn.call(&tool_name, arguments).await {
                     Ok(result) => {
                         // Extract text content from result
@@ -438,10 +436,15 @@ async fn main() -> Result<()> {
 async fn run_acp_server(cloud: CloudProvider) -> Result<()> {
     use aither_acp::AcpServer;
 
-    let mut server = AcpServer::stdio("aither", env!("CARGO_PKG_VERSION"), move |cwd| {
-        let cloud = cloud.clone();
-        async move { acp_session_agent(cloud, cwd).await }
-    });
+    let mut server = AcpServer::stdio(
+        "aither",
+        env!("CARGO_PKG_VERSION"),
+        TokioGlobal,
+        move |setup| {
+            let cloud = cloud.clone();
+            async move { acp_session_agent(cloud, setup).await }
+        },
+    );
     server.run().await?;
     Ok(())
 }
@@ -449,7 +452,7 @@ async fn run_acp_server(cloud: CloudProvider) -> Result<()> {
 /// Build the agent backing a single ACP session.
 async fn acp_session_agent(
     cloud: CloudProvider,
-    cwd: std::path::PathBuf,
+    setup: aither_acp::SessionSetup,
 ) -> std::result::Result<
     Agent<CloudProvider, CloudProvider, CloudProvider>,
     aither_acp::protocol::AcpError,
@@ -458,14 +461,20 @@ async fn acp_session_agent(
 
     let permission_handler = InteractivePermissionHandler::new();
     let terminal_tool =
-        aither_agent::sandbox::TerminalTool::new_in(&cwd, permission_handler, TokioGlobal)
+        aither_agent::sandbox::TerminalTool::new_in(&setup.cwd, permission_handler, TokioGlobal)
             .await
             .map_err(|err| to_acp(err.into()))?;
 
-    let agent = TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
-        .tool(aither_agent::websearch::WebSearchTool::default())
-        .tool(aither_agent::webfetch::WebFetchTool::new())
-        .tool(aither_agent::sandbox::builtin::AskCommand::new(cloud))
+    let agent = setup
+        .mcp
+        .into_iter()
+        .fold(
+            TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
+                .tool(aither_agent::websearch::WebSearchTool::default())
+                .tool(aither_agent::webfetch::WebFetchTool::new())
+                .tool(aither_agent::sandbox::builtin::AskCommand::new(cloud)),
+            TerminalAgentBuilder::mcp_connection,
+        )
         .with_default_prompt()
         .build();
 
@@ -519,13 +528,13 @@ async fn build_agent(
 
     // Add Context7 MCP server by default (documentation lookup)
     if !args.no_context7 {
-        match McpConnection::http("https://mcp.context7.com/mcp").await {
+        match McpConnection::http(&TokioGlobal, "https://mcp.context7.com/mcp").await {
             Ok(conn) => {
                 if !args.quiet {
                     println!("Connected to Context7 MCP server");
                 }
                 // Collect MCP tool descriptions and register
-                for def in conn.mcp_definitions() {
+                for def in conn.mcp_definitions().iter() {
                     let desc = def.description.clone().unwrap_or_default();
                     let desc = desc.split('.').next().unwrap_or(&desc).trim().to_string();
                     builder = builder.tool_description(def.name.clone(), desc);
@@ -548,12 +557,12 @@ async fn build_agent(
         let config: McpServersConfig =
             serde_json::from_str(&config_str).with_context(|| "failed to parse MCP config")?;
 
-        let connections = McpConnection::from_configs(&config).await?;
+        let connections = McpConnection::from_configs(&TokioGlobal, &config).await?;
         for (name, conn) in connections {
             if !args.quiet {
                 println!("Connected to MCP server: {name}");
             }
-            for def in conn.mcp_definitions() {
+            for def in conn.mcp_definitions().iter() {
                 let desc = def.description.clone().unwrap_or_default();
                 let desc = desc.split('.').next().unwrap_or(&desc).trim().to_string();
                 builder = builder.tool_description(def.name.clone(), desc);

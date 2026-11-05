@@ -55,6 +55,7 @@ use serde::de::DeserializeOwned;
 #[cfg(feature = "skills")]
 use crate::builder::sealed::Sealed as _;
 use crate::builder::{AgentSettings, sealed};
+use crate::command_catalog::short_description;
 use crate::context::InstructionSlot;
 use crate::hook::Hook;
 use crate::{Agent, AgentBuilder, AgentOptions};
@@ -76,7 +77,6 @@ struct SystemPrompt {
     arch: &'static str,
     user_cwd: String,
     sandbox_dir: String,
-    tools: String,
     host_profile: &'static str,
     host_runtime_context: String,
     skills: String,
@@ -480,19 +480,28 @@ where
         self
     }
 
-    /// Registers all tools from one MCP connection as terminal commands.
+    /// Registers every command `set` holds as a terminal command, for as long
+    /// as it holds it.
+    ///
+    /// The set is read whenever a command is listed or resolved, so a command
+    /// it gains mid-session is runnable from the next terminal execution. The
+    /// built agent lists the set's commands in the command table
+    /// ([`InstructionSlot::COMMANDS`]) and keeps that table current as live
+    /// content (see [`Context::update_live`](crate::Context::update_live)): a
+    /// change is announced once as a diff while the prefix is cached, and the
+    /// next compaction folds the clean table in.
+    #[must_use]
+    pub fn command_set(mut self, set: impl aither_sandbox::CommandSet) -> Self {
+        self.registry_builder.command_set(set);
+        self
+    }
+
+    /// Registers the tools of one MCP connection as terminal commands that
+    /// follow the server's tool list; see [`Self::command_set`].
     #[cfg(feature = "mcp")]
     #[must_use]
-    pub fn mcp_connection(mut self, conn: McpConnection) -> Self {
-        let definitions = aither_mcp::register_terminal_commands(&mut self.registry_builder, conn);
-        self.tool_descriptions
-            .extend(definitions.into_iter().map(|definition| {
-                (
-                    definition.name().to_string(),
-                    short_description(definition.description()),
-                )
-            }));
-        self
+    pub fn mcp_connection(self, conn: McpConnection) -> Self {
+        self.command_set(conn)
     }
 
     /// Registers a tool with a custom description.
@@ -617,9 +626,6 @@ where
         let host_runtime_context =
             describe_host_runtime_context(host_profile, &availability, ssh_context.as_str());
 
-        // Build tools description
-        let tools = render_tool_descriptions(&self.tool_descriptions);
-
         // Build skills description
         let has_skills = !self.skills.is_empty();
         let skills = render_skill_descriptions(&self.skills);
@@ -640,7 +646,6 @@ where
             arch,
             user_cwd,
             sandbox_dir,
-            tools,
             host_profile,
             host_runtime_context,
             skills,
@@ -900,16 +905,18 @@ where
                 .build(self.terminal_tool.outputs_dir()),
         );
 
+        let commands = crate::command_catalog::CommandCatalog::new(
+            self.tool_descriptions,
+            registry.command_sets().to_vec(),
+        );
         // Configure terminal tool
         let terminal_tool = self.terminal_tool.with_registry(registry);
 
-        let inner = if self
-            .inner
-            .has_instruction(&InstructionSlot::KNOWLEDGE_AND_TIME)
-        {
-            self.inner
+        let inner = self.inner.command_catalog(commands);
+        let inner = if inner.has_instruction(&InstructionSlot::KNOWLEDGE_AND_TIME) {
+            inner
         } else {
-            self.inner.system_named(
+            inner.system_named(
                 &InstructionSlot::KNOWLEDGE_AND_TIME,
                 &crate::agent::KnowledgeAndTimeTemplate { websearch_command }
                     .render()
@@ -1064,33 +1071,12 @@ where
     }
 }
 
-fn short_description(description: &str) -> String {
-    description
-        .split('.')
-        .next()
-        .unwrap_or(description)
-        .trim()
-        .to_string()
-}
-
 fn push_bullet_line(output: &mut String, body: &str) {
     if !output.is_empty() {
         output.push('\n');
     }
     output.push_str("- ");
     output.push_str(body);
-}
-
-fn render_tool_descriptions(entries: &[(String, String)]) -> String {
-    let mut output = String::new();
-    for (name, description) in entries {
-        let mut line = String::with_capacity(name.len() + description.len() + 2);
-        line.push_str(name.as_str());
-        line.push_str(": ");
-        line.push_str(description.as_str());
-        push_bullet_line(&mut output, line.as_str());
-    }
-    output
 }
 
 fn render_skill_descriptions(entries: &[SkillInfo]) -> String {
@@ -1251,7 +1237,6 @@ mod tests {
             arch: "",
             user_cwd: String::new(),
             sandbox_dir: String::new(),
-            tools: String::new(),
             host_profile: "heel",
             host_runtime_context: String::new(),
             skills: String::new(),
@@ -1373,7 +1358,6 @@ mod tests {
             arch: "arm64",
             user_cwd: "/tmp/project".to_string(),
             sandbox_dir: "/tmp/sandbox".to_string(),
-            tools: "- terminal: Execute terminal commands".to_string(),
             host_profile: "container",
             host_runtime_context: "runtime=linux_container".to_string(),
             skills: String::new(),
@@ -1398,7 +1382,6 @@ mod tests {
             arch: "arm64",
             user_cwd: "/tmp/project".to_string(),
             sandbox_dir: "/tmp/sandbox".to_string(),
-            tools: "- terminal: Execute terminal commands".to_string(),
             host_profile: "heel",
             host_runtime_context: "runtime=user_local_machine".to_string(),
             skills: String::new(),
@@ -1502,9 +1485,8 @@ mod tests {
         .await
         .expect("second agent adopts the prepared registry")
         .build();
-        let events = second.run("Check the baseline commands", []);
-        futures_lite::pin!(events);
-        while futures_lite::StreamExt::next(&mut events).await.is_some() {}
+        let _ =
+            crate::test_support::finish_run(second.run("Check the baseline commands", [])).await;
 
         let first_request = captured
             .try_recv()
@@ -1614,9 +1596,7 @@ mod tests {
                 "terminal_read"
             ]
         );
-        let events = agent.run("Inspect the repository", []);
-        futures_lite::pin!(events);
-        while futures_lite::StreamExt::next(&mut events).await.is_some() {}
+        let _ = crate::test_support::finish_run(agent.run("Inspect the repository", [])).await;
         let request = captured
             .try_recv()
             .expect("first model request was recorded");
@@ -1680,11 +1660,7 @@ mod tests {
                 .await
                 .expect("tools prepare")
                 .build();
-        {
-            let events = agent.run("Inspect the repository", []);
-            futures_lite::pin!(events);
-            while futures_lite::StreamExt::next(&mut events).await.is_some() {}
-        }
+        let _ = crate::test_support::finish_run(agent.run("Inspect the repository", [])).await;
         // The scripted compactor answers nothing, so the compaction fails
         // once its request is out; only that request matters here.
         let _ = agent.compact(None).await;
@@ -1853,9 +1829,7 @@ mod tests {
         .unwrap()
         .build();
 
-        let events = agent.run("Stop the background task", []);
-        futures_lite::pin!(events);
-        while futures_lite::StreamExt::next(&mut events).await.is_some() {}
+        let _ = crate::test_support::finish_run(agent.run("Stop the background task", [])).await;
 
         kill_rx
             .try_recv()

@@ -22,11 +22,11 @@
 //! pressure — lives in the tail, after the last cacheable byte, instead of
 //! being interleaved with the conversation where it would invalidate the
 //! prefix of every request that followed it. A rewrite of the stable part is
-//! not forbidden, it is *scheduled*: [`SystemRegion::stage`] parks the new
-//! content until [`Context::reassemble`] runs at a moment the cache is
-//! already cold. The order of the system blocks is the host's
-//! [`SystemLayout`], never the order they were inserted in, so the same
-//! inputs always render the same prefix.
+//! not forbidden, it is *scheduled*: [`Context::update_live`] parks the new
+//! content, announced as a diff, until [`Context::reassemble`] runs at a
+//! moment the prefix is rewritten anyway. The order of the system blocks is
+//! the host's [`SystemLayout`], never the order they were inserted in, so the
+//! same inputs always render the same prefix.
 //!
 //! Each item carries a monotonic sequence number. Compaction reads the window
 //! at a request boundary and finishes several turns later, and `seq` is what
@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use aither_core::llm::{Message, Role, ToolCall};
 
 use super::compaction::{Handoff, HandoffDocument};
+use super::live::{LiveContent, LiveUpdate};
 use super::source::Block;
 use super::system::{
     External, Instruction, SystemLayout, SystemRegion, TaggedBlockTemplate, render_prefix,
@@ -72,6 +73,11 @@ pub struct ContextItem {
     /// never tombstoned or spilled.
     #[serde(default)]
     kept: bool,
+    /// Whether this is the alert announcing a change to live content: the
+    /// next reassembly folds the change into the prefix, so it removes the
+    /// alert whatever its position.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    live: bool,
 }
 
 impl ContextItem {
@@ -107,6 +113,16 @@ impl ContextItem {
     }
 }
 
+/// What an item is appended as.
+#[derive(Clone, Copy)]
+enum ItemKind {
+    Ordinary,
+    /// A tool result closing an exchange kept verbatim through compaction.
+    Kept,
+    /// The alert announcing a change to live content.
+    LiveAlert,
+}
+
 /// The entire context window state. Fully serializable for persistence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Context {
@@ -133,6 +149,12 @@ pub struct Context {
     /// Sequence number the next item will receive.
     #[serde(default)]
     next_seq: u64,
+
+    /// Whether a request has carried the system prefix since it was last
+    /// rewritten: from then on a provider may cache it, so a live-content
+    /// change is staged and announced instead of written into it.
+    #[serde(default)]
+    prefix_sent: bool,
 }
 
 impl Default for Context {
@@ -166,6 +188,7 @@ impl Context {
             handoff: None,
             items: Vec::new(),
             next_seq: 0,
+            prefix_sent: false,
         }
     }
 
@@ -191,7 +214,8 @@ impl Context {
     /// The instruction blocks, for change.
     ///
     /// Inserting or replacing a block rewrites the cacheable prefix
-    /// immediately; prefer [`SystemRegion::stage`] mid-session.
+    /// immediately; content that changes mid-session goes through
+    /// [`update_live`](Self::update_live) instead.
     #[must_use]
     pub const fn instructions_mut(&mut self) -> &mut SystemRegion<Instruction> {
         &mut self.instructions
@@ -206,10 +230,52 @@ impl Context {
     /// The external-content blocks, for change.
     ///
     /// Inserting or replacing a block rewrites the cacheable prefix
-    /// immediately; prefer [`SystemRegion::stage`] mid-session.
+    /// immediately; content that changes mid-session goes through
+    /// [`update_live`](Self::update_live) instead.
     #[must_use]
     pub const fn external_mut(&mut self) -> &mut SystemRegion<External> {
         &mut self.external
+    }
+
+    /// Brings live content — system blocks that change while the session
+    /// runs, such as a repository's `AGENTS.md` or the command table — to
+    /// the versions `update` gives, without rewriting a prefix a provider
+    /// may have cached.
+    ///
+    /// Before any request has carried the prefix, the blocks are written
+    /// into it. After, the prefix is left byte-identical: the changes are
+    /// staged for the next reassembly and announced in one durable alert
+    /// naming `content`, carrying the diff from what the model knows (the
+    /// prefix with every earlier announced change applied) to the new
+    /// versions. The next reassembly — a compaction, or a cache gone cold —
+    /// folds the clean versions in and removes every such alert, so nothing
+    /// restates a change. An update that leaves the model's view as it is
+    /// announces nothing, so a host may call this every turn.
+    ///
+    /// Returns whether an alert was appended.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `update` names a slot the layout does not have.
+    pub fn update_live(
+        &mut self,
+        content: &LiveContent,
+        update: impl FnOnce(&mut LiveUpdate<'_>),
+    ) -> bool {
+        let mut live =
+            LiveUpdate::new(&mut self.instructions, &mut self.external, self.prefix_sent);
+        update(&mut live);
+        let Some(alert) = live.into_alert(content) else {
+            return false;
+        };
+        self.push_item(Message::system(alert), ItemKind::LiveAlert);
+        true
+    }
+
+    /// Records that a request carried the current system prefix, which a
+    /// provider may now cache.
+    pub(crate) const fn mark_prefix_sent(&mut self) {
+        self.prefix_sent = true;
     }
 
     /// Returns the number of persistent system blocks.
@@ -277,23 +343,24 @@ impl Context {
 
     /// Appends a message to the window and returns its sequence number.
     pub fn push(&mut self, message: Message) -> u64 {
-        self.push_item(message, false)
+        self.push_item(message, ItemKind::Ordinary)
     }
 
     /// Appends a tool result that closes an exchange kept verbatim through
     /// compaction, and returns its sequence number.
     pub fn push_kept(&mut self, message: Message) -> u64 {
-        self.push_item(message, true)
+        self.push_item(message, ItemKind::Kept)
     }
 
-    fn push_item(&mut self, message: Message, kept: bool) -> u64 {
+    fn push_item(&mut self, message: Message, kind: ItemKind) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.items.push(ContextItem {
             seq,
             message,
             committed_at: Timestamp::now(),
-            kept,
+            kept: matches!(kind, ItemKind::Kept),
+            live: matches!(kind, ItemKind::LiveAlert),
         });
         seq
     }
@@ -487,6 +554,7 @@ impl Context {
     pub fn clear_all(&mut self) {
         self.instructions.clear();
         self.external.clear();
+        self.prefix_sent = false;
         self.clear_history();
     }
 
@@ -620,11 +688,12 @@ impl Context {
     }
 
     /// [`reassemble`](Self::reassemble) that removes only the durable system
-    /// alerts numbered below `fork_point`.
+    /// alerts numbered below `fork_point`, and every live-content alert.
     ///
     /// Applying a compaction handoff uses it: alerts at or after the fork
     /// arrived while the handoff was written, are not described by it and
-    /// must reach the model.
+    /// must reach the model. A live-content alert is the exception: the
+    /// change it announced is folded into the prefix here.
     pub fn reassemble_below(&mut self, fork_point: u64) -> ReassemblyReport {
         let mut report = ReassemblyReport::default();
 
@@ -635,11 +704,12 @@ impl Context {
             report.staged_updates_applied += applied;
             report.bytes_freed += freed;
         }
+        self.prefix_sent = false;
 
         let mut system_messages_pruned = 0usize;
         let mut removed_bytes = 0usize;
         self.items.retain(|item| {
-            if item.message.role() == Role::System && item.seq < fork_point {
+            if item.message.role() == Role::System && (item.seq < fork_point || item.live) {
                 system_messages_pruned += 1;
                 removed_bytes += item.message.content().len();
                 false
@@ -1222,18 +1292,37 @@ mod tests {
         assert!(after.last().expect("tail present").content().contains("v2"));
     }
 
+    const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");
+
+    fn set_memory(context: &mut Context, text: &str) -> bool {
+        context.update_live(&MEMORY_CONTENT, |update| {
+            update.external(&MEMORY, Some(ExternalContent::data("memory", text)));
+        })
+    }
+
+    /// The live-content alerts in the conversation, in order.
+    fn live_alerts(context: &Context) -> Vec<String> {
+        context
+            .checkpoint()
+            .items()
+            .iter()
+            .filter(|item| item.live)
+            .map(|item| item.message().content().to_string())
+            .collect()
+    }
+
     #[test]
     fn staged_system_text_defers_the_prefix_rewrite() {
         let mut context = Context::with_layout(SystemLayout::new([], [MEMORY]));
-        let v1 = ExternalContent::data("memory", "v1");
-        let v2 = ExternalContent::data("memory", "v2");
-        assert!(!context.external_mut().stage(&MEMORY, v1.clone()));
-        assert!(!context.external_mut().stage(&MEMORY, v1));
+        // Before any request carried the prefix there is nothing to keep.
+        assert!(!set_memory(&mut context, "v1"));
+        assert!(!set_memory(&mut context, "v1"));
+        assert!(context.build_messages()[0].content().contains("\nv1\n"));
+        context.mark_prefix_sent();
 
-        assert!(context.external_mut().stage(&MEMORY, v2.clone()));
+        assert!(set_memory(&mut context, "v2"));
         assert!(context.has_staged_system_updates());
         assert!(context.build_messages()[0].content().contains("\nv1\n"));
-        assert_eq!(context.external().staged(&MEMORY), Some(&v2));
         let fingerprint = context.stable_prefix_fingerprint();
 
         let report = context.reassemble();
@@ -1241,6 +1330,158 @@ mod tests {
         assert!(!context.has_staged_system_updates());
         assert!(context.build_messages()[0].content().contains("\nv2\n"));
         assert_ne!(context.stable_prefix_fingerprint(), fingerprint);
+    }
+
+    #[test]
+    fn each_live_change_is_announced_once_as_its_own_diff() {
+        let mut context = Context::with_layout(SystemLayout::new([], [MEMORY]));
+        set_memory(&mut context, "one\n");
+        context.mark_prefix_sent();
+        let prefix = context.system_prefix();
+
+        assert!(set_memory(&mut context, "one\ntwo\n"));
+        // Re-reading the same version announces nothing.
+        assert!(!set_memory(&mut context, "one\ntwo\n"));
+        assert!(set_memory(&mut context, "one\ntwo\nthree\n"));
+        // Back to what the prefix holds is a change the model must hear of.
+        assert!(set_memory(&mut context, "one\n"));
+        assert!(!context.has_staged_system_updates());
+
+        let alerts = live_alerts(&context);
+        assert_eq!(alerts.len(), 3);
+        assert!(alerts[0].starts_with("MEMORY.md changed."));
+        assert!(alerts[0].contains("\n+two\n"));
+        // The second diff starts from what the first announced: it does not
+        // restate `two`.
+        assert!(!alerts[1].contains("+two"));
+        assert!(alerts[1].contains("\n+three\n"));
+        assert!(alerts[2].contains("\n-two\n-three\n"));
+        assert_eq!(context.system_prefix(), prefix, "the cached prefix stays");
+    }
+
+    #[test]
+    fn a_live_block_added_or_removed_mid_session_waits_for_reassembly() {
+        let mut context = Context::with_layout(SystemLayout::new([RULES], [MEMORY]));
+        context.instructions_mut().insert(&RULES, "house rules");
+        context.mark_prefix_sent();
+        let prefix = context.system_prefix();
+
+        assert!(set_memory(&mut context, "remembered"));
+        assert!(context.update_live(&MEMORY_CONTENT, |update| {
+            update.instruction(&RULES, None);
+        }));
+        assert_eq!(context.system_prefix(), prefix);
+        assert!(live_alerts(&context)[0].contains("+remembered"));
+        assert!(live_alerts(&context)[1].contains("-house rules"));
+
+        context.reassemble();
+        let folded = context.system_prefix().expect("memory is in the prefix");
+        assert!(folded.contains("\nremembered\n"));
+        assert!(!folded.contains("house rules"));
+        assert_eq!(live_alerts(&context), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_compaction_folds_live_content_in_and_drops_every_diff() {
+        let mut context = Context::with_layout(SystemLayout::new([], [MEMORY]));
+        set_memory(&mut context, "v1");
+        context.mark_prefix_sent();
+        context.push(Message::user("before the fork"));
+        assert!(set_memory(&mut context, "v2"));
+        let fork_point = context.fork_point();
+        // A change announced while the handoff was being written.
+        assert!(set_memory(&mut context, "v3"));
+        context.push(Message::system("<alert>after the fork</alert>"));
+
+        context.reassemble_below(fork_point);
+        context.apply_handoff(&HandoffDocument::default(), fork_point, 0);
+        assert_eq!(
+            live_alerts(&context),
+            Vec::<String>::new(),
+            "no diff after compaction"
+        );
+        let messages = context.build_messages();
+        assert!(messages[0].content().contains("\nv3\n"));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content() == "<alert>after the fork</alert>"),
+            "other alerts after the fork still reach the model"
+        );
+
+        // The clean version is what the model knows: re-reading it is
+        // silent, and the next change is announced against it.
+        assert!(!set_memory(&mut context, "v3"));
+        context.mark_prefix_sent();
+        assert!(!set_memory(&mut context, "v3"));
+        assert!(set_memory(&mut context, "v4"));
+        assert_eq!(live_alerts(&context).len(), 1);
+    }
+
+    /// `AGENTS.md` as a host lays it out: the rules on how to treat the
+    /// files, the launch directory's own file and the files a handoff linked,
+    /// brought up to date together.
+    #[test]
+    fn agents_md_changes_reach_the_model_as_one_diff_then_clean() {
+        const AGENTS_MD_CONTENT: LiveContent =
+            LiveContent::new("The launch directory's AGENTS.md files", "agents_md_diff");
+        const HANDOFF_AGENTS_MD: ExternalSlot = ExternalSlot::new("handoff_agents_md");
+        let sync = |context: &mut Context, rules: &str, root: &str, handoff: Option<&str>| {
+            context.update_live(&AGENTS_MD_CONTENT, |update| {
+                update
+                    .instruction(&RULES, Some(rules.to_string()))
+                    .external(
+                        &AGENTS_MD,
+                        Some(ExternalContent::repository_instructions("AGENTS.md", root)),
+                    )
+                    .external(
+                        &HANDOFF_AGENTS_MD,
+                        handoff.map(|text| {
+                            ExternalContent::repository_instructions("crates/a/AGENTS.md", text)
+                        }),
+                    );
+            })
+        };
+        let mut context =
+            Context::with_layout(SystemLayout::new([RULES], [AGENTS_MD, HANDOFF_AGENTS_MD]));
+        assert!(!sync(&mut context, "rules\n", "root v1\n", None));
+        context.mark_prefix_sent();
+        let prefix = context.system_prefix();
+        assert!(!sync(&mut context, "rules\n", "root v1\n", None));
+
+        assert!(sync(
+            &mut context,
+            "rules\nnested\n",
+            "root v2\n",
+            Some("crate\n")
+        ));
+        let alerts = live_alerts(&context);
+        assert_eq!(alerts.len(), 1, "the three blocks change in one alert");
+        let alert = &alerts[0];
+        assert!(alert.starts_with("The launch directory's AGENTS.md files changed."));
+        for line in ["\n+nested\n", "\n-root v1\n+root v2\n", "\n+crate\n"] {
+            assert!(alert.contains(line), "{line:?} missing from {alert}");
+        }
+        let boundary = alert
+            .split("<agents_md_diff boundary=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("the diff is bounded");
+        assert!(alert.ends_with(&format!("</agents_md_diff boundary=\"{boundary}\">")));
+        assert_eq!(context.system_prefix(), prefix);
+
+        context.reassemble();
+        let folded = context.system_prefix().expect("prefix");
+        assert!(folded.contains("rules\nnested\n"));
+        assert!(folded.contains("\nroot v2\n"));
+        assert!(folded.contains("\ncrate\n"));
+        assert_eq!(live_alerts(&context), Vec::<String>::new());
+        assert!(!sync(
+            &mut context,
+            "rules\nnested\n",
+            "root v2\n",
+            Some("crate\n")
+        ));
     }
 
     #[test]

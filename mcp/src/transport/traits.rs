@@ -70,5 +70,10 @@ pub trait BidirectionalTransport: Transport {
     /// [`recv`](Self::recv). This is the counterpart to [`Transport::request`]
     /// for full-duplex connections where a single reader routes every
     /// inbound message.
+    ///
+    /// An implementation whose peer can take arbitrarily long to accept or
+    /// answer a request must not wait for it here: it queues the request and
+    /// completes it while [`recv`](Self::recv) is polled, so a slow request
+    /// never holds up the other traffic of a connection driven by one task.
     fn send_request(&mut self, req: JsonRpcRequest) -> impl Future<Output = Result<()>> + Send;
 }

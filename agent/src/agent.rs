@@ -4,9 +4,11 @@
 //! It manages the context window, forks compaction in the background, and
 //! handles tool execution in an agent-controlled loop.
 
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "skills")]
@@ -135,12 +137,6 @@ impl EventSink {
     }
 }
 
-/// One step of the merged run/event stream in [`Agent::run`].
-enum RunStep {
-    Event(Option<TimedEvent>),
-    Finished(Result<(), AgentError>),
-}
-
 /// What [`Agent::wait_background`] took from the background channel.
 #[derive(Debug)]
 pub struct BackgroundWake {
@@ -151,41 +147,153 @@ pub struct BackgroundWake {
     /// the background completed, or one is blocked on stdin. The host then
     /// calls [`Agent::resume`].
     pub needs_model: bool,
+    /// The completions this wake recorded. Each job reads
+    /// [`Delivery::Pending`](aither_sandbox::Delivery) in its registry until
+    /// this is dropped, so a host that drops the wake only once the turn it
+    /// starts is visible never reads a finished job with nothing owed.
+    pub pending: Vec<aither_sandbox::PendingCompletion>,
 }
 
-/// Streams the events of one run, then its error if it failed.
-fn drive_run<'a, F, Fut>(run: F) -> impl Stream<Item = Result<TimedEvent, AgentError>> + 'a
-where
-    F: FnOnce(EventSink) -> Fut + 'a,
-    Fut: std::future::Future<Output = Result<(), AgentError>> + 'a,
-{
-    async_stream::stream! {
-        let (sender, receiver) = async_channel::unbounded();
-        // The run owns the sink and drops it as it finishes.
-        let run = run(EventSink { sender });
-        futures_lite::pin!(run);
+/// One run of an [`Agent`], from [`Agent::run`] or [`Agent::resume`].
+///
+/// A run does nothing until [`drive`](Self::drive) consumes it. Driving hands
+/// each event to the caller's handler while the run itself keeps going, so a
+/// handler that waits on something the run holds lets the run release it.
+#[must_use = "a run does nothing until it is driven"]
+pub struct Run<F> {
+    /// The run's state machine spans every turn and is tens of kilobytes;
+    /// boxed so a `Run` moves into the caller's future without copying it.
+    run: Pin<Box<F>>,
+    events: async_channel::Receiver<TimedEvent>,
+}
 
+impl<F> std::fmt::Debug for Run<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Run")
+            .field("queued_events", &self.events.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F> Run<F>
+where
+    F: Future<Output = Result<(), AgentError>>,
+{
+    fn new(start: impl FnOnce(EventSink) -> F) -> Self {
+        let (sender, events) = async_channel::unbounded();
+        // The run owns the sink and drops it as it finishes.
+        Self {
+            run: Box::pin(start(EventSink { sender })),
+            events,
+        }
+    }
+
+    /// Runs to the end, handing each event to `handler` in the order the run
+    /// emitted it, one call at a time.
+    ///
+    /// The run is polled together with every handler call, so it keeps
+    /// making progress while the handler awaits; events it emits meanwhile
+    /// queue for the next call. The run stays on the caller's task.
+    ///
+    /// `state` is what the handler works on, typically `&mut` borrows of the
+    /// caller's locals: each call takes it and returns it in
+    /// [`ControlFlow::Continue`] for the next. Threading it through, rather
+    /// than capturing it in an async closure, keeps the driven future `Send`
+    /// whenever the state is. A handler returns [`ControlFlow::Break`] to
+    /// stop: the run is cancelled, its queued events are discarded, and
+    /// `drive` returns that `Break`. Otherwise `drive` returns the state in
+    /// `Continue` once the run has finished and its every event was handled.
+    ///
+    /// `stop` cancels the run from outside, such as on a user's request: it
+    /// is polled, ahead of the run and its next event, only while no handler
+    /// call is in progress, so a call already running always finishes. Once
+    /// it completes, the run is dropped with its queued events and `drive`
+    /// returns its value in `Break`. A caller with nothing to stop on passes
+    /// [`std::future::pending`].
+    ///
+    /// # Errors
+    ///
+    /// The run's error, after the handler has seen every event emitted
+    /// before it.
+    pub async fn drive<S, B, H>(
+        self,
+        mut state: S,
+        stop: impl Future<Output = B>,
+        mut handler: impl FnMut(S, TimedEvent) -> H,
+    ) -> Result<ControlFlow<B, S>, AgentError>
+    where
+        H: Future<Output = ControlFlow<B, S>>,
+    {
+        let Self { mut run, events } = self;
+        futures_lite::pin!(events);
+        futures_lite::pin!(stop);
         let mut outcome = None;
-        while outcome.is_none() {
-            let step = futures_lite::future::or(
-                async { RunStep::Event(receiver.recv().await.ok()) },
-                async { RunStep::Finished((&mut run).await) },
-            )
+        loop {
+            let next = std::future::poll_fn(|cx| {
+                if let Poll::Ready(value) = stop.as_mut().poll(cx) {
+                    return Poll::Ready(RunStep::Stopped(value));
+                }
+                poll_run(run.as_mut(), &mut outcome, cx);
+                if let Some(result) = outcome.take() {
+                    // Finished: what it emitted is all queued.
+                    return Poll::Ready(match events.try_recv() {
+                        Ok(event) => {
+                            outcome = Some(result);
+                            RunStep::Event(event)
+                        }
+                        Err(_) => RunStep::Finished(result),
+                    });
+                }
+                match Stream::poll_next(events.as_mut(), cx) {
+                    Poll::Ready(Some(event)) => Poll::Ready(RunStep::Event(event)),
+                    // Every sink is gone but the run has not returned; its
+                    // own wake-up reports the end.
+                    Poll::Ready(None) | Poll::Pending => Poll::Pending,
+                }
+            })
             .await;
-            match step {
-                RunStep::Event(Some(event)) => yield Ok(event),
-                // Sink dropped: the run is wrapping up — await its outcome.
-                RunStep::Event(None) => outcome = Some((&mut run).await),
-                RunStep::Finished(result) => outcome = Some(result),
-            }
+            let event = match next {
+                RunStep::Event(event) => event,
+                RunStep::Finished(result) => {
+                    result?;
+                    return Ok(ControlFlow::Continue(state));
+                }
+                RunStep::Stopped(value) => return Ok(ControlFlow::Break(value)),
+            };
+            let call = handler(state, event);
+            futures_lite::pin!(call);
+            let flow = std::future::poll_fn(|cx| {
+                poll_run(run.as_mut(), &mut outcome, cx);
+                call.as_mut().poll(cx)
+            })
+            .await;
+            state = match flow {
+                ControlFlow::Continue(state) => state,
+                ControlFlow::Break(value) => return Ok(ControlFlow::Break(value)),
+            };
         }
-        // Deliver events that raced with run completion.
-        while let Ok(event) = receiver.try_recv() {
-            yield Ok(event);
-        }
-        if let Some(Err(error)) = outcome {
-            yield Err(error);
-        }
+    }
+}
+
+/// What [`Run::drive`] waits for between handler calls.
+enum RunStep<B> {
+    Event(TimedEvent),
+    Finished(Result<(), AgentError>),
+    Stopped(B),
+}
+
+/// Polls `run` unless it already finished, recording its result.
+fn poll_run<F>(
+    run: Pin<&mut F>,
+    outcome: &mut Option<Result<(), AgentError>>,
+    cx: &mut std::task::Context<'_>,
+) where
+    F: Future<Output = Result<(), AgentError>>,
+{
+    if outcome.is_none()
+        && let Poll::Ready(result) = run.poll(cx)
+    {
+        *outcome = Some(result);
     }
 }
 
@@ -690,6 +798,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     pub(crate) kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
     /// Calls reported by `kept_receiver` whose results are not committed yet.
     pub(crate) kept_exchanges: HashSet<String>,
+    /// The commands `terminal` runs, kept current in the command table
+    /// block; `None` for an agent without a terminal agent's command table.
+    pub(crate) commands: Option<crate::command_catalog::CommandCatalog>,
     /// Receiver for the host memory pressure and machine load events.
     pub(crate) host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
     /// Registry for running background terminal tasks.
@@ -812,6 +923,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             permission_receiver: None,
             kept_receiver: None,
             kept_exchanges: HashSet::new(),
+            commands: None,
             host_load_events: None,
             job_registry: None,
             detached_task_ids: HashSet::new(),
@@ -1593,7 +1705,9 @@ where
         receiver: &BackgroundTaskReceiver,
         events: &EventSink,
     ) -> Result<bool, AgentError> {
-        let mut needs_model = self.drain_background_receiver(receiver, events);
+        let (mut needs_model, taken) = self.drain_background_receiver(receiver, events);
+        // The run itself recorded them: the agent has taken them.
+        drop(taken);
         loop {
             // A job blocked on stdin can never complete, so parking on it
             // would hide its alert from the model for the whole wait. Other
@@ -1869,17 +1983,22 @@ where
         }
     }
 
+    /// Records every queued completion; returns whether any was announced,
+    /// with the completions still pending in their registries. Dropping
+    /// those is the agent taking them.
     fn drain_background_receiver(
         &mut self,
         receiver: &BackgroundTaskReceiver,
         events: &EventSink,
-    ) -> bool {
+    ) -> (bool, Vec<aither_sandbox::PendingCompletion>) {
         let mut announced = false;
-        for task in receiver.take_completed() {
+        let mut pending = Vec::new();
+        for mut task in receiver.take_completed() {
             tracing::info!(task_id = %task.task_id, "background task completed (final check)");
+            pending.extend(task.pending.take());
             announced |= self.push_completed_task_event(task, events);
         }
-        announced
+        (announced, pending)
     }
 
     /// Records a completed job in the context; returns whether it was
@@ -1962,61 +2081,62 @@ where
     /// - A hook aborts the operation
     /// - Tool execution fails
     pub async fn query(&mut self, prompt: &str) -> Result<String, AgentError> {
-        use futures_lite::StreamExt;
-
-        let stream = self.run(prompt, std::iter::empty());
-        futures_lite::pin!(stream);
-
-        let mut final_text = String::new();
-        while let Some(event) = stream.next().await {
-            match event?.event {
-                AgentEvent::Text(chunk) => final_text.push_str(&chunk),
-                AgentEvent::Complete {
-                    final_text: text, ..
-                } => {
-                    return Ok(text);
-                }
-                _ => {}
-            }
-        }
-        Ok(final_text)
+        let flow = self
+            .run(prompt, std::iter::empty())
+            .drive(
+                String::new(),
+                std::future::pending(),
+                |mut text, timed| async move {
+                    match timed.event {
+                        AgentEvent::Text(chunk) => text.push_str(&chunk),
+                        AgentEvent::Complete { final_text, .. } => {
+                            return ControlFlow::Break(final_text);
+                        }
+                        _ => {}
+                    }
+                    ControlFlow::Continue(text)
+                },
+            )
+            .await?;
+        Ok(match flow {
+            ControlFlow::Break(text) | ControlFlow::Continue(text) => text,
+        })
     }
 
-    /// Runs the agent with streaming events.
-    ///
-    /// Returns a stream of `AgentEvent`s that can be consumed to observe
-    /// the agent's progress in real-time. Text chunks are yielded as they
-    /// arrive from the LLM for true streaming display.
+    /// Starts a run on `prompt`; [`Run::drive`] runs it and hands each event
+    /// to the caller as it happens, text chunks as they arrive from the LLM.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// use futures::StreamExt;
+    /// use std::ops::ControlFlow;
     ///
-    /// let mut stream = agent.run("Implement the feature", std::iter::empty());
-    /// while let Some(event) = stream.next().await {
-    ///     match event? {
-    ///         AgentEvent::Text(t) => print!("{}", t),
-    ///         AgentEvent::Complete { .. } => break,
-    ///         _ => {}
-    ///     }
-    /// }
+    /// let mut shown = String::new();
+    /// agent
+    ///     .run("Implement the feature", std::iter::empty())
+    ///     .drive(&mut shown, std::future::pending(), |shown, timed| async move {
+    ///         if let AgentEvent::Text(text) = timed.event {
+    ///             shown.push_str(&text);
+    ///         }
+    ///         ControlFlow::<(), _>::Continue(shown)
+    ///     })
+    ///     .await?;
     /// ```
     pub fn run(
         &mut self,
         prompt: &str,
         attachments: impl IntoIterator<Item = Attachment>,
-    ) -> impl Stream<Item = Result<TimedEvent, AgentError>> + '_ {
+    ) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
         let prompt = prompt.to_string();
         let attachments: Vec<Attachment> = attachments.into_iter().collect();
-        drive_run(move |sink| async move { self.run_streaming(prompt, attachments, &sink).await })
+        Run::new(move |sink| async move { self.run_streaming(prompt, attachments, &sink).await })
     }
 
     /// Continues the conversation without a new user message, so the model
     /// acts on the background events [`wait_background`](Self::wait_background)
-    /// recorded. Streams like [`run`](Self::run).
-    pub fn resume(&mut self) -> impl Stream<Item = Result<TimedEvent, AgentError>> + '_ {
-        drive_run(move |sink| async move { self.resume_streaming(&sink).await })
+    /// recorded. Driven like [`run`](Self::run).
+    pub fn resume(&mut self) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
+        Run::new(move |sink| async move { self.resume_streaming(&sink).await })
     }
 
     /// Waits, between runs, for a background command of an earlier run to
@@ -2028,6 +2148,11 @@ where
     /// [`BackgroundWake::needs_model`] is set, the host continues with
     /// [`resume`](Self::resume). The wait is cancel-safe: nothing is taken
     /// until it completes. Without a terminal it never completes.
+    ///
+    /// The completions it recorded stay pending in their job registries
+    /// until the host drops the wake's [`BackgroundWake::pending`]: the host
+    /// takes them on the agent's behalf, once its own state shows the turn
+    /// they start.
     pub async fn wait_background(&mut self) -> BackgroundWake {
         let Some(receiver) = self.background_receiver.clone() else {
             return std::future::pending().await;
@@ -2035,14 +2160,18 @@ where
         let event = receiver.recv_event().await;
         let (sender, emitted) = async_channel::unbounded();
         let sink = EventSink { sender };
+        let mut pending = Vec::new();
         let mut needs_model = match event {
-            BackgroundTaskEvent::Completed(task) => {
+            BackgroundTaskEvent::Completed(mut task) => {
                 tracing::info!(task_id = %task.task_id, "background task completed (idle)");
+                pending.extend(task.pending.take());
                 self.push_completed_task_event(*task, &sink)
             }
             BackgroundTaskEvent::Alert(alert) => self.push_job_alert(alert),
         };
-        needs_model |= self.drain_background_receiver(&receiver, &sink);
+        let (announced, drained) = self.drain_background_receiver(&receiver, &sink);
+        needs_model |= announced;
+        pending.extend(drained);
         needs_model |= self.push_job_alerts();
         drop(sink);
         let mut events = Vec::new();
@@ -2052,6 +2181,7 @@ where
         BackgroundWake {
             events,
             needs_model,
+            pending,
         }
     }
 
@@ -2166,7 +2296,8 @@ where
             focus,
             &skills,
         )
-        .map_err(AgentError::from)?;
+        .map_err(AgentError::from)?
+        .with_outputs_dir(self.outputs_dir());
         let fork_point = fork.fork_point();
         let handoff = self
             .compaction_future(fork)
@@ -2187,6 +2318,12 @@ where
     /// The parameters of the requests the agent sends on its own tier's model.
     fn own_parameters(&self) -> &Parameters {
         self.parameters.get(self.tier)
+    }
+
+    /// The session's outputs directory, where saved command outputs are
+    /// written, when the agent has a sandbox.
+    fn outputs_dir(&self) -> Option<PathBuf> {
+        self.sandbox_dir.as_ref().map(|dir| dir.join("outputs"))
     }
 
     /// A compaction request over `messages` and `definitions`: the
@@ -2325,7 +2462,9 @@ where
             self.context.handoff_file_index(),
             focus,
             &skills,
-        ) {
+        )
+        .map(|fork| fork.with_outputs_dir(self.outputs_dir()))
+        {
             Ok(fork) => {
                 tracing::debug!(
                     fork_point = fork.fork_point(),
@@ -2543,6 +2682,28 @@ where
         self.context.push_block_alert(&block);
     }
 
+    /// Brings the command table block to the commands the terminal runs now.
+    ///
+    /// The table is live content: a command a set gained or lost since the
+    /// model last learned the table is announced once, as a diff, and the
+    /// next reassembly folds the clean table into the prefix.
+    fn sync_command_table(&mut self) {
+        let Some(commands) = &self.commands else {
+            return;
+        };
+        let table = commands.render();
+        let before = self.context.conversation_chars();
+        if self
+            .context
+            .update_live(&crate::context::LiveContent::COMMANDS, |update| {
+                update.instruction(&crate::context::InstructionSlot::COMMANDS, table);
+            })
+        {
+            self.budget
+                .append(self.context.conversation_chars().saturating_sub(before));
+        }
+    }
+
     /// Delivers the context lifecycle hooks injected since the last call, one
     /// system alert per piece. A piece leaves the hooks' inbox as it is
     /// delivered, so it reaches the model once.
@@ -2559,6 +2720,7 @@ where
     async fn push_request_alerts(&mut self) {
         self.push_injected_context();
         self.push_host_load_alerts();
+        self.sync_command_table();
         let reassembled = std::mem::take(&mut self.reassembled);
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_request(reassembled).await {
@@ -2643,6 +2805,15 @@ where
     /// Returns an error when the checkpoint cannot be restored into this agent.
     pub fn restore_checkpoint(&mut self, checkpoint: AgentCheckpoint) -> Result<(), AgentError> {
         self.context.restore(checkpoint.context);
+        // Everything below belongs to the window just replaced: its fork
+        // point, its failure, its parked tool results and its last request
+        // mean nothing in the restored one.
+        self.compaction.retire();
+        self.compaction_failure = None;
+        self.idle_compacted = false;
+        self.tool_results.clear();
+        self.kept_exchanges.clear();
+        self.last_request = None;
         #[cfg(feature = "skills")]
         {
             self.active_skills.set(Vec::new());
@@ -2913,6 +3084,7 @@ where
 
         self.sync_compact_signal();
         self.commit_tail(&tail).await;
+        self.context.mark_prefix_sent();
         self.warmth.start_entry_now();
         self.idle_compacted = false;
         self.publish_fork_snapshot(&tail, &definitions);
@@ -3392,6 +3564,7 @@ mod tests {
             result,
             killed: false,
             timeout_kill: None,
+            pending: None,
         }
     }
 
@@ -3525,7 +3698,7 @@ mod tests {
         });
         assert_eq!(
             killed,
-            "The command ended while sleep (pid 41), node (pid 42) and 3 more kept running, so they were killed with it. A process meant to keep running belongs in terminal_background."
+            "The command ended while sleep (pid 41), node (pid 42) and 3 more kept running, so they were killed with it. A process meant to keep running is started with `background: true`."
         );
         let one = job_alert_text(&JobAlertText::DescendantsKilled {
             processes: &[JobProcess {
@@ -3628,10 +3801,276 @@ mod tests {
         }
     }
 
+    /// Answers every request with two text chunks.
+    #[derive(Clone)]
+    struct TwoChunkLlm;
+
+    impl LanguageModel for TwoChunkLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            futures_lite::stream::iter([Ok(Event::text("first")), Ok(Event::text("second"))])
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "test",
+                "two-chunk",
+                "two chunks",
+                200_000,
+            )))
+        }
+    }
+
+    /// Fails every request.
+    #[derive(Clone)]
+    struct FailingLlm;
+
+    impl LanguageModel for FailingLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            futures_lite::stream::once(Err(MockError))
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock", "test", "failing", "failing", 200_000,
+            )))
+        }
+    }
+
+    /// Takes `lock` on the first chunk and keeps it across that chunk's
+    /// emit, releasing it on the next chunk after a suspension: the shape of
+    /// a run that holds a resource (a database writer) across an emit.
+    struct HoldAcrossEmit {
+        lock: Arc<futures::lock::Mutex<()>>,
+        held: std::sync::Mutex<Option<futures::lock::OwnedMutexGuard<()>>>,
+    }
+
+    impl Hook for HoldAcrossEmit {
+        async fn on_text(&self, text: &str) {
+            if text == "first" {
+                let guard = Arc::clone(&self.lock).lock_owned().await;
+                *self.held.lock().expect("held lock") = Some(guard);
+            } else {
+                futures_lite::future::yield_now().await;
+                self.held.lock().expect("held lock").take();
+            }
+        }
+    }
+
+    /// aither#501: the run keeps making progress while the caller handles an
+    /// event, so a handler waiting on a resource the run holds lets the run
+    /// release it instead of waiting forever.
+    #[tokio::test]
+    async fn the_run_progresses_while_the_caller_handles_an_event() {
+        let lock = Arc::new(futures::lock::Mutex::new(()));
+        let mut agent = Agent::builder(TwoChunkLlm)
+            .hook(HoldAcrossEmit {
+                lock: Arc::clone(&lock),
+                held: std::sync::Mutex::default(),
+            })
+            .build();
+        let lock = &lock;
+        let drive = agent.run("hello", []).drive(
+            Vec::new(),
+            std::future::pending(),
+            |mut texts, timed| async move {
+                if let AgentEvent::Text(text) = timed.event {
+                    if text == "first" {
+                        drop(lock.lock().await);
+                    }
+                    texts.push(text);
+                }
+                ControlFlow::<(), _>::Continue(texts)
+            },
+        );
+        let flow = tokio::time::timeout(Duration::from_secs(5), drive)
+            .await
+            .expect("the handler waiting on the run's resource must not hang")
+            .expect("the run succeeds");
+        drop(agent);
+        assert_eq!(
+            flow,
+            ControlFlow::Continue(vec!["first".to_string(), "second".to_string()])
+        );
+    }
+
+    /// A handler that breaks stops the run and gets its value back.
+    #[tokio::test]
+    async fn a_breaking_handler_stops_the_run() {
+        let mut agent = Agent::new(TwoChunkLlm);
+        let mut handled = 0;
+        let flow = agent
+            .run("hello", [])
+            .drive(
+                &mut handled,
+                std::future::pending(),
+                |handled, timed| async move {
+                    *handled += 1;
+                    match timed.event {
+                        AgentEvent::Text(text) => ControlFlow::Break(text),
+                        _ => ControlFlow::Continue(handled),
+                    }
+                },
+            )
+            .await
+            .expect("the run succeeds");
+        assert_eq!(flow, ControlFlow::Break("first".to_string()));
+        assert_eq!(handled, 2, "the run start and the first chunk");
+        assert_eq!(
+            agent.query("again").await.expect("the agent runs again"),
+            "firstsecond"
+        );
+    }
+
+    /// The run's error reaches the caller after every event emitted before
+    /// it was handled.
+    #[tokio::test]
+    async fn a_failed_run_returns_its_error_after_its_events() {
+        let mut agent = Agent::new(FailingLlm);
+        let mut kinds = Vec::new();
+        let result = agent
+            .run("hello", [])
+            .drive(
+                &mut kinds,
+                std::future::pending(),
+                |kinds, timed| async move {
+                    kinds.push(std::mem::discriminant(&timed.event));
+                    ControlFlow::<(), _>::Continue(kinds)
+                },
+            )
+            .await;
+        assert!(result.is_err(), "the model's failure ends the run");
+        assert!(!kinds.is_empty(), "the run start was handled first");
+    }
+
+    /// Starts each response and never sends anything: a run busy with no
+    /// events, like one waiting on a long tool call.
+    #[derive(Clone)]
+    struct SilentLlm;
+
+    impl LanguageModel for SilentLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            futures_lite::stream::pending()
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock", "test", "silent", "silent", 200_000,
+            )))
+        }
+    }
+
+    /// A stop that fires while the run works without emitting ends it at
+    /// once.
+    #[tokio::test]
+    async fn a_stop_ends_a_run_busy_without_events() {
+        let mut agent = Agent::new(SilentLlm);
+        let (cancel, cancelled) = async_channel::bounded::<&str>(1);
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.send("cancelled").await.expect("the run listens");
+        });
+        let drive = agent.run("hello", []).drive(
+            0,
+            async move { cancelled.recv().await.expect("the stopper sends") },
+            |handled, _| async move { ControlFlow::Continue(handled + 1) },
+        );
+        let flow = tokio::time::timeout(Duration::from_secs(5), drive)
+            .await
+            .expect("the stop must end the run promptly")
+            .expect("a stopped run is no error");
+        assert_eq!(flow, ControlFlow::Break("cancelled"));
+        stopper.await.expect("the stopper finishes");
+    }
+
+    /// A stop that fires during a handler call takes effect once that call
+    /// returned, before the next event is handled.
+    #[tokio::test]
+    async fn a_stop_never_interrupts_a_handler_call() {
+        let mut agent = Agent::new(TwoChunkLlm);
+        let (cancel, cancelled) = async_channel::bounded::<()>(1);
+        let cancel = &cancel;
+        let mut completed = Vec::new();
+        let flow = agent
+            .run("hello", [])
+            .drive(
+                &mut completed,
+                async move { cancelled.recv().await.expect("the handler cancels") },
+                |completed, timed| async move {
+                    cancel.send(()).await.expect("the run listens");
+                    // Suspends with the stop ready: polling it here would
+                    // drop this call before it records its completion.
+                    futures_lite::future::yield_now().await;
+                    completed.push(timed.event);
+                    ControlFlow::Continue(completed)
+                },
+            )
+            .await
+            .expect("a stopped run is no error");
+        assert!(flow.is_break(), "the stop ended the run");
+        assert_eq!(
+            completed.len(),
+            1,
+            "the running call finished, no other began"
+        );
+        assert!(matches!(completed[0], AgentEvent::RunStart { .. }));
+    }
+
+    /// A host spawns its turn loop onto a multi-threaded executor, so the
+    /// driven future must be `Send` while its handler borrows the host's
+    /// locals, including inside an outer future.
+    #[test]
+    fn a_driven_run_is_send() {
+        fn assert_send(_: &impl Send) {}
+        let mut agent = Agent::new(TwoChunkLlm);
+        let turn = async move {
+            let mut texts = Vec::new();
+            let mut stopped = None;
+            let (_cancel, cancelled) = async_channel::bounded::<()>(1);
+            let outcome = agent
+                .run("hello", [])
+                .drive(
+                    (&mut texts, &mut stopped),
+                    async move { cancelled.recv().await.ok() },
+                    |(texts, stopped), timed| async move {
+                        if let AgentEvent::Text(text) = timed.event {
+                            texts.push(text);
+                        }
+                        futures_lite::future::yield_now().await;
+                        *stopped = Some(());
+                        ControlFlow::Continue((texts, stopped))
+                    },
+                )
+                .await
+                .map(|_| ());
+            (outcome, texts, stopped)
+        };
+        assert_send(&turn);
+    }
+
     #[tokio::test]
     async fn events_carry_their_emission_time() {
-        use futures_lite::StreamExt;
-
         let mut agent = Agent::with_config(
             MockLlm {
                 context_length: 200_000,
@@ -3639,17 +4078,18 @@ mod tests {
             AgentConfig::default(),
         );
         let before = jiff::Timestamp::now();
-        let events: Vec<TimedEvent> = {
-            let stream = agent.run("hello", std::iter::empty());
-            futures_lite::pin!(stream);
-            let mut events = Vec::new();
-            while let Some(item) = stream.next().await {
-                if let Ok(event) = item {
-                    events.push(event);
-                }
-            }
-            events
-        };
+        let ControlFlow::Continue(events) = agent
+            .run("hello", std::iter::empty())
+            .drive(
+                Vec::new(),
+                std::future::pending(),
+                |mut events, timed| async move {
+                    events.push(timed);
+                    ControlFlow::<std::convert::Infallible, _>::Continue(events)
+                },
+            )
+            .await
+            .expect("the run succeeds");
         let after = jiff::Timestamp::now();
 
         assert!(matches!(
@@ -3903,15 +4343,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
 
-        let events = {
-            let stream = agent.run("keep going", []);
-            futures_lite::pin!(stream);
-            let mut events = Vec::new();
-            while let Some(event) = futures_lite::StreamExt::next(&mut stream).await {
-                events.push(event.expect("the run streams events").event);
-            }
-            events
-        };
+        let events = drain_run(agent.run("keep going", [])).await;
 
         let recovery = events
             .iter()
@@ -4251,6 +4683,54 @@ mod tests {
         agent
             .restore_checkpoint(empty_checkpoint())
             .expect("restore checkpoint must succeed");
+    }
+
+    /// A compaction forked from the window being replaced describes a
+    /// conversation the restored window never had.
+    #[tokio::test]
+    async fn restoring_a_checkpoint_retires_a_landed_compaction() {
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 200_000,
+            },
+            AgentConfig::default(),
+        );
+        agent.push_message(Message::user("before"));
+        let checkpoint = agent.export_checkpoint().await.expect("checkpoint");
+        agent.push_message(Message::user("after"));
+        agent.compaction.land(
+            agent.context.fork_point(),
+            HandoffDocument {
+                current_task: "stale".to_string(),
+                ..HandoffDocument::default()
+            },
+        );
+
+        agent.restore_checkpoint(checkpoint).expect("restore");
+
+        assert!(!agent.compaction.is_active(), "the landed handoff is gone");
+    }
+
+    #[tokio::test]
+    async fn restoring_a_checkpoint_retires_a_running_compaction() {
+        let llm = ScriptedLlm::new(200_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = Agent::with_config(llm.clone(), AgentConfig::default());
+        agent.push_message(Message::user("before"));
+        let checkpoint = agent.export_checkpoint().await.expect("checkpoint");
+        agent.push_message(Message::user("after"));
+        let tail = agent.render_tail().await;
+        let request = LLMRequest::new(agent.context.build_request(&tail));
+        let fork = CompactionFork::new(&request, agent.context.fork_point(), &[], None, &[])
+            .expect("fork");
+        agent.compaction.start(PendingCompaction::start(fork, llm));
+        agent.compaction_failure = Some(crate::context::CompactionError::Empty);
+        agent.idle_compacted = true;
+
+        agent.restore_checkpoint(checkpoint).expect("restore");
+
+        assert!(!agent.compaction.is_active(), "the running fork is retired");
+        assert!(agent.compaction_failure.is_none());
+        assert!(!agent.idle_compacted);
     }
 
     #[cfg(feature = "skills")]
@@ -4605,6 +5085,7 @@ mod tests {
                                 script: "cat".to_string(),
                                 killed: false,
                                 timeout_kill: None,
+                                pending: None,
                                 result: Err(aither_sandbox::TerminalError::Execution(
                                     "fed and finished".to_string(),
                                 )),
@@ -5503,9 +5984,7 @@ mod tests {
         // A stale fork would land during the first run and apply at the
         // boundary of the second.
         for prompt in ["go on", "and again"] {
-            let stream = agent.run(prompt, std::iter::empty());
-            futures_lite::pin!(stream);
-            while futures_lite::StreamExt::next(&mut stream).await.is_some() {}
+            let _ = crate::test_support::finish_run(agent.run(prompt, std::iter::empty())).await;
         }
         let Some(Handoff::Document(document)) = agent.context().handoff() else {
             panic!("the manual handoff stays in the window");
@@ -6189,27 +6668,15 @@ mod tests {
             .expect("registers");
         agent.register_tool(QuickTool).expect("registers");
 
-        {
-            let stream = agent.run("go", std::iter::empty());
-            futures_lite::pin!(stream);
-            let mut running = false;
-            while !running {
-                tokio::select! {
-                    _ = started_rx.recv() => running = true,
-                    event = stream.next() => {
-                        event.expect("run is alive").expect("no error");
-                    }
-                }
+        // Dropping the driven run once the blocking tool started cancels it.
+        tokio::select! {
+            started = started_rx.recv() => started.expect("the blocking tool starts"),
+            outcome = drain_run(agent.run("go", std::iter::empty())) => {
+                panic!("the run ended before its blocking tool started: {outcome:?}");
             }
         }
 
-        {
-            let stream = agent.run("again", std::iter::empty());
-            futures_lite::pin!(stream);
-            while let Some(event) = stream.next().await {
-                event.expect("second run succeeds");
-            }
-        }
+        drain_run(agent.run("again", std::iter::empty())).await;
         let requests = llm.requests.lock().expect("requests lock");
         assert_eq!(requests.len(), 2, "one request per run");
         requests[1].messages().to_vec()
@@ -6269,14 +6736,18 @@ mod tests {
         assert!(slow.content().contains("cancelled"), "{}", slow.content());
     }
 
-    async fn drain_run(
-        stream: impl Stream<Item = Result<TimedEvent, AgentError>>,
-    ) -> Vec<AgentEvent> {
-        futures_lite::pin!(stream);
-        let mut events = Vec::new();
-        while let Some(item) = stream.next().await {
-            events.push(item.expect("the run should succeed").event);
-        }
+    async fn drain_run(run: Run<impl Future<Output = Result<(), AgentError>>>) -> Vec<AgentEvent> {
+        let ControlFlow::Continue(events) = run
+            .drive(
+                Vec::new(),
+                std::future::pending(),
+                |mut events, timed| async move {
+                    events.push(timed.event);
+                    ControlFlow::<std::convert::Infallible, _>::Continue(events)
+                },
+            )
+            .await
+            .expect("the run should succeed");
         events
     }
 
@@ -6307,6 +6778,7 @@ mod tests {
             killed: false,
             timeout_kill: None,
             result: Err(aither_sandbox::TerminalError::Execution(output.to_string())),
+            pending: None,
         }
     }
 
@@ -6546,6 +7018,45 @@ mod tests {
             .expect("the queued completion ends the wait");
         assert!(!wake.needs_model);
         assert!(wake.events.is_empty(), "{:?}", wake.events);
+    }
+
+    /// The idle agent's wake keeps a finished job's completion pending in
+    /// its registry until the host drops it: a host reading the registry in
+    /// between always sees a turn owed.
+    #[tokio::test]
+    async fn a_wake_keeps_its_completions_pending_until_the_host_drops_it() {
+        let (mut agent, sender, _llm) = detached_agent(Vec::new());
+        agent.detached_task_ids.insert("task-build".to_string());
+        let (jobs, service) = aither_sandbox::job_registry_channel();
+        tokio::spawn(service.serve());
+        jobs.register(
+            41,
+            "task-build",
+            "exec",
+            "make",
+            aither_sandbox::TerminalMode::Sandboxed,
+            None,
+        )
+        .await;
+        let owed = jobs
+            .owe_completion("task-build", Err("linker error".to_string()))
+            .await
+            .expect("the job is registered");
+        let mut task = finished("task-build", "linker error");
+        task.pending = Some(owed.pending);
+        sender.send_completed(task).await;
+
+        let wake = tokio::time::timeout(Duration::from_secs(5), agent.wait_background())
+            .await
+            .expect("the queued completion ends the wait");
+        assert!(wake.needs_model);
+        assert_eq!(wake.pending.len(), 1);
+        let status = jobs.get(41).await.expect("job should exist").status;
+        assert!(status.completion_pending(), "{status:?}");
+
+        drop(wake);
+        let status = jobs.get(41).await.expect("job should exist").status;
+        assert_eq!(status.delivery(), Some(aither_sandbox::Delivery::Taken));
     }
 
     /// The idle wait gives the event up when it is dropped before anything

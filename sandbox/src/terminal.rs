@@ -61,7 +61,7 @@ use crate::{
     command::{
         AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandRole, GateDecision, ToolRegistry,
     },
-    job_registry::{JobRegistry, JobStatus, job_registry_channel},
+    job_registry::{JobRegistry, JobStatus, PendingCompletion, job_registry_channel},
     output::{
         INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, save_raw_to_file,
         stored_path,
@@ -814,6 +814,10 @@ pub struct CompletedTask {
     pub killed: bool,
     /// Set when the kill was the `timeout` bound passing.
     pub timeout_kill: Option<TimeoutKill>,
+    /// Keeps the job reading [`Delivery::Pending`](crate::Delivery) in its
+    /// registry until the agent takes the completion by dropping it; `None`
+    /// for a command the registry never registered.
+    pub pending: Option<PendingCompletion>,
 }
 
 /// Stage of a permission-lifecycle event for `terminal`.
@@ -1218,9 +1222,17 @@ pub struct TerminalBinding {
     working_dir: PathBuf,
     role: CommandRole,
     observer: Option<AnyCommandObserver>,
+    executor: Arc<executor_core::AnyExecutor>,
 }
 
 impl TerminalBinding {
+    /// The executor the terminal runs its tasks on, for work that must
+    /// outlive the call that started it.
+    #[must_use]
+    pub fn executor(&self) -> &executor_core::AnyExecutor {
+        &self.executor
+    }
+
     /// Launches subagents from this terminal, within its authority.
     #[must_use]
     pub const fn launcher(&self) -> &TerminalToolFactory {
@@ -1890,6 +1902,7 @@ where
                 working_dir: self.working_dir.clone(),
                 role: self.registry.registry.role(),
                 observer: self.registry.registry.observer().cloned(),
+                executor: Arc::new(executor_core::AnyExecutor::new(self.executor.clone())),
             };
             let registry = ToolRegistry::clone(&self.registry.registry).bind(&served);
             binding = Some(served);
@@ -2824,7 +2837,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                     .job_registry
                     .get_by_task_id(&prepared.task_id)
                     .await
-                    .is_some_and(|job| matches!(job.status, JobStatus::Killed));
+                    .is_some_and(|job| matches!(job.status, JobStatus::Killed { .. }));
                 let command = if killed {
                     CommandResult {
                         stdout: result.stdout,
@@ -3237,7 +3250,7 @@ where
             .job_registry
             .get_by_task_id_settled(&prepared.task_id)
             .await
-            .is_some_and(|job| matches!(job.status, JobStatus::Killed));
+            .is_some_and(|job| matches!(job.status, JobStatus::Killed { .. }));
         if !killed {
             return Ok(CommandResult::from(result));
         }
@@ -3764,11 +3777,14 @@ where
     };
     let _ = result_tx.send(quick_result).await;
     // A kill's signal can end the process before the kill records its
-    // outcome, so the read waits for any kill still in flight.
-    let killed = status_registry
-        .get_by_task_id_settled(&task_id)
-        .await
-        .is_some_and(|job| matches!(job.status, JobStatus::Killed));
+    // outcome, so the registry settles the ending once no kill is in flight;
+    // the job reads its completion pending from the moment it ended.
+    let ending = match &result {
+        Ok(command) => Ok(command.exit_code),
+        Err(error) => Err(error.to_string()),
+    };
+    let owed = status_registry.owe_completion(&task_id, ending).await;
+    let killed = owed.as_ref().is_some_and(|owed| owed.killed);
     // Every job reports completion; the agent reinjects the result only for
     // tasks it saw promoted or detached (`take_started`), so a plain
     // foreground result is not delivered twice.
@@ -3779,6 +3795,7 @@ where
             result,
             killed,
             timeout_kill: timeout_watch.kill().filter(|_| killed),
+            pending: owed.map(|owed| owed.pending),
         })
         .await;
     running_tasks.fetch_sub(1, Ordering::AcqRel);
@@ -4315,18 +4332,26 @@ fn committed_git_environment(
     Ok(())
 }
 
-fn local_path_grants(
+/// The object a spelled path names, in the spelling a resolved grant
+/// checks: canonicalized, without the verbatim prefix Windows adds — an
+/// 8.3 alias or a symlinked component does not name the same object.
+fn resolved(path: &Path) -> heel::Result<ResolvedPath> {
+    ResolvedPath::new(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
+/// The grant a command's jobserver fifo needs: it writes tokens back to it.
+#[cfg(all(unix, feature = "jobserver"))]
+pub fn job_fifo_grant(path: &Path) -> heel::Result<Grant> {
+    Ok(Grant::new(resolved(path)?, Access::WRITE))
+}
+
+/// The grants a session sandbox gives every command; see
+/// [`crate::SessionSandboxPolicy`], the public way to build them.
+pub fn local_path_grants(
     writable: &[PathBuf],
     readable: &[PathBuf],
     tools: &PreparedTools<PathBuf>,
-    job_fifo: Option<&Path>,
 ) -> heel::Result<Vec<Grant>> {
-    /// The object a spelled path names, in the spelling a resolved grant
-    /// checks: canonicalized, without the verbatim prefix Windows adds — an
-    /// 8.3 alias or a symlinked component does not name the same object.
-    fn resolved(path: &Path) -> heel::Result<ResolvedPath> {
-        ResolvedPath::new(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
-    }
     writable
         .iter()
         // A writable directory also executes: a sandboxed process can already
@@ -4348,11 +4373,6 @@ fn local_path_grants(
             tools
                 .uv_dir()
                 .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE | Access::EXEC))),
-        )
-        .chain(
-            job_fifo
-                .iter()
-                .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE))),
         )
         .chain(toolchain_grants(resolved))
         .collect()
@@ -4390,18 +4410,6 @@ fn toolchain_grants(
         .map(move |(_, path)| Ok(Grant::new(resolved(&path)?, Access::WRITE | Access::EXEC)))
 }
 
-/// Adds a command's private jobserver variables to its process environment.
-#[cfg(all(unix, feature = "jobserver"))]
-fn with_jobserver_environment(
-    mut environment: Vec<(String, String)>,
-    fifo: Option<&crate::jobserver::CommandFifo>,
-) -> Vec<(String, String)> {
-    if let Some(fifo) = fifo {
-        environment.extend(fifo.environment());
-    }
-    environment
-}
-
 async fn execute_sandboxed_background<E, N>(
     context: LocalBackgroundExecution<'_, E>,
     policy: N,
@@ -4410,26 +4418,9 @@ where
     E: Executor + Clone + 'static,
     N: NetworkPolicy + 'static,
 {
-    let mut runtime_environment = local_runtime_environment(&context).await?;
+    let (grants, mut runtime_environment) = local_launch_policy(&context).await?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
-    #[cfg(all(unix, feature = "jobserver"))]
-    let runtime_environment =
-        with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
-    #[cfg(all(unix, feature = "jobserver"))]
-    let job_fifo_path = context
-        .job_fifo
-        .as_ref()
-        .map(crate::jobserver::CommandFifo::path);
-    #[cfg(not(all(unix, feature = "jobserver")))]
-    let job_fifo_path: Option<&Path> = None;
-    let grants = local_path_grants(
-        context.writable_paths,
-        context.readable_paths,
-        context.prepared_tools,
-        job_fifo_path,
-    )
-    .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(policy)
         .working_dir(
@@ -4520,26 +4511,9 @@ where
 async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let mut runtime_environment = local_runtime_environment(&context).await?;
+    let (grants, mut runtime_environment) = local_launch_policy(&context).await?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
-    #[cfg(all(unix, feature = "jobserver"))]
-    let runtime_environment =
-        with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
-    #[cfg(all(unix, feature = "jobserver"))]
-    let job_fifo_path = context
-        .job_fifo
-        .as_ref()
-        .map(crate::jobserver::CommandFifo::path);
-    #[cfg(not(all(unix, feature = "jobserver")))]
-    let job_fifo_path: Option<&Path> = None;
-    let grants = local_path_grants(
-        context.writable_paths,
-        context.readable_paths,
-        context.prepared_tools,
-        job_fifo_path,
-    )
-    .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(AllowAll)
         .working_dir(
@@ -5398,22 +5372,35 @@ fn shell_escape(value: &str) -> String {
     output
 }
 
-/// Builds the local session environment: git shim, computed session env,
-/// committed grant vars, then the embedder's extra envs (which override).
-async fn local_runtime_environment<E: Executor>(
+/// Builds a local command's grants and environment: the session policy
+/// (the one [`crate::SessionSandboxPolicy`] exposes to hosts, with the
+/// command's jobserver fifo), the git shim, committed grant vars, then the
+/// embedder's extra envs (which override).
+async fn local_launch_policy<E: Executor>(
     context: &LocalBackgroundExecution<'_, E>,
-) -> Result<Vec<(String, String)>, TerminalError> {
+) -> Result<(Vec<Grant>, Vec<(String, String)>), TerminalError> {
     write_git_shim(context.prepared_tools).await?;
-    let mut env =
-        prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    let policy = crate::SessionSandboxPolicy::new(
+        context.working_dir,
+        context.writable_paths,
+        context.readable_paths,
+        context.prepared_tools,
+    )
+    .await?;
+    #[cfg(all(unix, feature = "jobserver"))]
+    let policy = match &context.job_fifo {
+        Some(fifo) => policy.with_job_fifo(fifo)?,
+        None => policy,
+    };
+    let (grants, mut env) = policy.into_parts();
     committed_git_environment(context.registry, &mut env, |path| {
         Ok(path.display().to_string())
     })?;
     env.extend(context.env_source.iter().flat_map(|s| s.env()));
-    Ok(env)
+    Ok((grants, env))
 }
 
-async fn prepare_session_runtime_environment(
+pub async fn prepare_session_runtime_environment(
     working_dir: &Path,
     tools: &PreparedTools<PathBuf>,
 ) -> Result<Vec<(String, String)>, TerminalError> {
@@ -6752,7 +6739,7 @@ mod tests {
             .await
             .unwrap();
         let uv = ready.uv_dir().expect("the test host has a managed uv");
-        let grants = local_path_grants(&[], &[], &ready, None).expect("grants build");
+        let grants = local_path_grants(&[], &[], &ready).expect("grants build");
         let access_of = |path: &Path| {
             let path = std::fs::canonicalize(path).unwrap();
             grants
@@ -6829,7 +6816,6 @@ mod tests {
             &[workdir.path().to_path_buf()],
             &[readonly.path().to_path_buf()],
             &tools,
-            None,
         )
         .expect("grants build");
         let canonical = |dir: &tempfile::TempDir| std::fs::canonicalize(dir.path()).unwrap();
@@ -7772,6 +7758,128 @@ mod tests {
         }
     }
 
+    /// The policy a host gets from `SessionSandboxPolicy` is the one the
+    /// terminal runs a command under: the grants name the writable and
+    /// readable sets, the tools and the `uv` directory with the access the
+    /// terminal gives them, and a sandboxed terminal command sees exactly
+    /// the environment the policy lists and is confined by the same grants.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn session_policy_is_the_policy_the_terminal_runs_commands_under() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let writable = tempfile::tempdir().unwrap();
+        let readable = tempfile::tempdir().unwrap();
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tools = shell_sessions.local_tools().unwrap().clone();
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
+        let working_dir = tool.working_dir().clone();
+        let writable_paths = vec![writable.path().to_path_buf()];
+        let readable_paths = vec![readable.path().to_path_buf()];
+
+        let policy = crate::SessionSandboxPolicy::new(
+            &working_dir,
+            &writable_paths,
+            &readable_paths,
+            &tools,
+        )
+        .await
+        .expect("policy builds");
+        let access_of = |path: &Path| {
+            let path = std::fs::canonicalize(path).unwrap();
+            policy
+                .grants()
+                .iter()
+                .find(|grant| grant.resolved_path().as_path() == path)
+                .map(heel::Grant::access)
+        };
+        assert_eq!(
+            access_of(writable.path()),
+            Some(Access::WRITE | Access::EXEC)
+        );
+        assert_eq!(access_of(readable.path()), Some(Access::READ));
+        assert_eq!(access_of(tools.bin_dir()), Some(Access::EXEC));
+        if let Some(uv) = tools.uv_dir() {
+            assert_eq!(access_of(uv), Some(Access::WRITE | Access::EXEC));
+        }
+
+        let names = ["HOME", "TMPDIR", "XDG_CACHE_HOME", "PATH", "PYTHONPATH"];
+        let written = writable.path().join("written");
+        let refused = readable.path().join("refused");
+        let prints = names
+            .iter()
+            .map(|name| format!("echo \"${name}\""))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let script = format!(
+            "{prints}; touch {} && echo write-ok; touch {} && echo read-write-ok; true",
+            written.display(),
+            refused.display(),
+        );
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let job_registry = tool.job_registry();
+        let (startup_tx, _startup_rx) = async_channel::bounded(1);
+        let result = execute_script_standalone(StandaloneExecution {
+            working_dir,
+            writable_paths,
+            readable_paths,
+            env_source: None,
+            executor: executor_core::tokio::TokioGlobal,
+            registry,
+            permission_handler: Arc::new(TestPermissionHandler::default()),
+            job_registry,
+            task_id: "task-policy".to_string(),
+            execution_id: "exec-policy".to_string(),
+            background: false,
+            carry: None,
+            carried_dir: None,
+            alert_tx: async_channel::unbounded().0,
+            script,
+            mode: TerminalMode::Sandboxed,
+            backend: ExecutionBackend::Local(tools),
+            stdin_alerts: None,
+            lifetime: JobLifetime::Foreground {
+                alerts: async_channel::unbounded().0,
+            },
+            background_startup: BackgroundStartup::new(startup_tx),
+            network_audit: None,
+            priority: ProcessPriority::default(),
+            #[cfg(all(unix, feature = "jobserver"))]
+            jobserver: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            store_dir: tool.outputs_dir(),
+            max_lines: 50,
+            raw: false,
+        })
+        .await
+        .expect("the sandboxed script runs");
+        let stdout = output_text(&result.stdout).expect("inline stdout");
+        let mut lines = stdout.lines();
+        for name in names {
+            let expected = policy
+                .environment()
+                .iter()
+                .rev()
+                .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+                .unwrap_or_else(|| panic!("the policy lists {name}"));
+            assert_eq!(lines.next(), Some(expected), "{name} in the command");
+        }
+        assert_eq!(lines.next(), Some("write-ok"));
+        assert_eq!(lines.next(), None, "a readable-only path stays read-only");
+        assert!(written.exists() && !refused.exists());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_command_reports_nonzero_exit_code() {
@@ -7827,6 +7935,86 @@ mod tests {
             result.command().map(|command| &command.outcome),
             Some(&CommandOutcome::Exited { code: 42 })
         );
+    }
+
+    /// What a host reading the registry can tell: whether the session still
+    /// owes its agent a turn.
+    fn host_sees_owed_turn(jobs: &[crate::JobInfo]) -> bool {
+        jobs.iter()
+            .any(|job| job.status == JobStatus::Running || job.status.completion_pending())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_detached_job_reads_pending_until_its_completion_is_taken() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
+            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                local: true,
+                container: false,
+                ssh: false,
+            });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let tool = tool.with_registry(registry);
+        let receiver = tool.background_receiver();
+        let jobs = tool.job_registry();
+
+        tool.run_background(TerminalArgs {
+            description: "finish at once".to_string(),
+            script: "exit 3".to_string(),
+            mode: TerminalExecutionMode::Sandboxed,
+            ssh_server_id: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            max_lines: 50,
+            raw: false,
+            timeout: 30,
+            background: true,
+        })
+        .await
+        .expect("terminal call should succeed");
+        let task_id = started_task_id(&receiver);
+
+        // The agent's receiver is the gate: the completion it receives is
+        // held, not yet taken, while the host reads the registry.
+        let completed = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
+            .await
+            .expect("the job should deliver its completion")
+            .expect("the completion channel stays open");
+        assert_eq!(completed.task_id, task_id);
+        let held = jobs.list().await;
+        assert!(
+            held.iter().all(|job| job.status != JobStatus::Running),
+            "the job has finished: {held:?}"
+        );
+        assert!(
+            host_sees_owed_turn(&held),
+            "a finished job whose completion the agent has not taken reads as done: {held:?}"
+        );
+
+        // The agent takes the completion; the registry serves the take
+        // before the list that follows it.
+        drop(completed);
+        let taken = jobs.list().await;
+        assert_eq!(
+            taken[0].status,
+            JobStatus::Completed {
+                exit_code: 3,
+                delivery: crate::Delivery::Taken
+            }
+        );
+        assert!(!host_sees_owed_turn(&taken), "{taken:?}");
     }
 
     #[cfg(unix)]
@@ -8357,7 +8545,9 @@ mod tests {
             .expect("the finished job stays in the registry");
         assert_eq!(
             info.status,
-            JobStatus::Killed,
+            JobStatus::Killed {
+                delivery: crate::Delivery::Pending
+            },
             "the promoted job should be killed at its timeout: {completed:?}"
         );
     }
@@ -8719,7 +8909,13 @@ mod tests {
             .get_by_task_id(&task_id)
             .await
             .expect("the finished job stays in the registry");
-        assert_eq!(info.status, JobStatus::Completed { exit_code: 0 });
+        assert_eq!(
+            info.status,
+            JobStatus::Completed {
+                exit_code: 0,
+                delivery: crate::Delivery::Pending
+            }
+        );
         assert!(
             tool.job_registry().format_running_jobs().await.is_empty(),
             "a finished job is no longer listed"
@@ -8766,7 +8962,11 @@ mod tests {
             .get_by_task_id(&task_id)
             .await
             .expect("the killed job stays in the registry");
-        assert_eq!(info.status, JobStatus::Killed);
+        assert!(
+            matches!(info.status, JobStatus::Killed { .. }),
+            "{:?}",
+            info.status
+        );
     }
 
     #[cfg(unix)]
@@ -8803,13 +9003,19 @@ mod tests {
         .await;
         assert_process_gone(child, "the timeout of a job whose shell exited").await;
         let receiver = tool.background_receiver();
-        wait_for_completed_task(&receiver, &task_id).await;
+        let completed = wait_for_completed_task(&receiver, &task_id).await;
         let info = tool
             .job_registry()
             .get_by_task_id(&task_id)
             .await
             .expect("the finished job stays in the registry");
-        assert_eq!(info.status, JobStatus::Killed);
+        assert_eq!(
+            info.status,
+            JobStatus::Killed {
+                delivery: crate::Delivery::Pending
+            },
+            "{completed:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -8884,7 +9090,9 @@ mod tests {
             .expect("the finished job stays in the registry");
         assert_eq!(
             info.status,
-            JobStatus::Killed,
+            JobStatus::Killed {
+                delivery: crate::Delivery::Pending
+            },
             "the job should have been killed at its timeout: {completed:?}"
         );
     }

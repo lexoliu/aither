@@ -78,6 +78,7 @@ dependencies = [
  "aither-mcp",
  "async-channel",
  "async-process",
+ "executor-core",
  "futures-lite",
  "futures-util",
  "serde",
@@ -218,7 +219,6 @@ dependencies = [
  "aither-mcp",
  "anyhow",
  "arc-swap",
- "async-lock",
  "clap",
  "crossterm",
  "dirs 7.0.0",
@@ -276,8 +276,10 @@ dependencies = [
  "anyhow",
  "askama 0.16.1",
  "async-process",
+ "nix 0.31.3",
  "schemars 1.2.3",
  "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -372,6 +374,7 @@ dependencies = [
  "glob",
  "schemars 1.2.3",
  "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -421,12 +424,13 @@ version = "0.17.0"
 dependencies = [
  "aither-core",
  "aither-sandbox",
+ "arc-swap",
  "askama 0.16.1",
  "async-channel",
- "async-lock",
  "async-process",
  "base64 0.23.1",
  "blocking",
+ "executor-core",
  "futures-lite",
  "futures-util",
  "mime",

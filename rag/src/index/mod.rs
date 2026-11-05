@@ -28,6 +28,11 @@ pub trait VectorIndex: Send + Sync {
     /// Returns `true` if a chunk was removed, `false` if not found.
     fn remove(&self, chunk_id: &str) -> bool;
 
+    /// Removes every chunk of the document `source_id`, whatever their IDs.
+    ///
+    /// Returns the number of chunks removed.
+    fn remove_source(&self, source_id: &str) -> usize;
+
     /// Searches for the most similar chunks to the query vector.
     ///
     /// # Arguments

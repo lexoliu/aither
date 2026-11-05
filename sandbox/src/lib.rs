@@ -54,6 +54,7 @@
 
 mod bollard_exec;
 mod command;
+mod command_set;
 mod container;
 mod foreground_wait;
 mod grants;
@@ -65,6 +66,7 @@ mod output;
 mod output_compress;
 pub(crate) mod poll_guard;
 mod process_tree;
+mod session_policy;
 mod shell_session;
 mod stdin_watch;
 mod subagent;
@@ -95,10 +97,12 @@ pub use bollard_exec::BollardContainerExec;
 pub use command::{
     AnyCommandGate, AnyCommandObserver, CommandCall, CommandEnvelope, CommandGate, CommandObserver,
     CommandPayload, CommandRole, CommandUsage, DynTerminalTool, DynToolHandler, GateDecision,
-    IpcToolCommand, KeptExchangeReceiver, ToolCallCommand, ToolCommand, ToolRegistry,
-    ToolRegistryBuilder, cli_to_json, register_ipc_gateway_command, register_tool_command,
-    register_tool_direct, schema_to_help, tool_output_to_payload,
+    IpcToolCommand, KeptExchangeReceiver, POSITIONAL_KEYWORD, ToolCallCommand, ToolCommand,
+    ToolRegistry, ToolRegistryBuilder, cli_to_json, output_saved_text,
+    register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
+    tool_output_to_payload,
 };
+pub use command_set::{AnyCommandSet, CommandSet};
 pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
     MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,
@@ -110,7 +114,8 @@ pub use heel::NetworkAuditLog;
 /// Re-export of heel's scheduling priority types for terminal-tool configuration.
 pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use job_registry::{
-    JobInfo, JobRegistry, JobRegistryService, JobStatus, TerminalDelta, job_registry_channel,
+    Delivery, JobInfo, JobRegistry, JobRegistryService, JobStatus, OwedCompletion,
+    PendingCompletion, TerminalDelta, job_registry_channel,
 };
 #[cfg(all(unix, feature = "jobserver"))]
 pub use jobserver::{
@@ -129,6 +134,7 @@ pub use permission::{PermissionHandler, PermissionRequest, Review, TerminalMode}
 pub use process_tree::{
     JOB_MARKER_VAR, JobProcess, KillTreeError, ProcessTableError, kill_process_tree,
 };
+pub use session_policy::SessionSandboxPolicy;
 pub use shell_session::{
     AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
     ContainerExecOutcome, ContainerIpcRoute, ContainerShellRuntime, ExecLifetime, ShellBackend,

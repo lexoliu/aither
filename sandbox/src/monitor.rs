@@ -476,11 +476,11 @@ async fn watch_task(watch: Watch) {
                 } else {
                     match delta.status {
                         JobStatus::Running => None,
-                        JobStatus::Completed { exit_code } => {
+                        JobStatus::Completed { exit_code, .. } => {
                             Some(MonitorEnd::Exited { exit_code })
                         }
-                        JobStatus::Failed { error } => Some(MonitorEnd::Failed { error }),
-                        JobStatus::Killed => Some(MonitorEnd::Killed),
+                        JobStatus::Failed { error, .. } => Some(MonitorEnd::Failed { error }),
+                        JobStatus::Killed { .. } => Some(MonitorEnd::Killed),
                     }
                 }
             }

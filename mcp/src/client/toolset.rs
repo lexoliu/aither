@@ -7,20 +7,21 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use aither_core::llm::CallIdentity;
 use aither_core::llm::tool::{ToolDefinition, ToolResult, ToolResultPart};
-use aither_sandbox::ToolRegistryBuilder;
+use aither_sandbox::CommandSet;
 use askama::Template;
-use async_lock::Mutex;
 use async_process::Command;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use executor_core::Executor;
 use serde::Deserialize;
 
 use crate::protocol::{CallToolResult, Content, EmbeddedResource, McpError, McpToolDefinition};
 #[cfg(feature = "http")]
 use crate::transport::HttpTransport;
-use crate::transport::{ChildProcessTransport, StdioTransport};
+use crate::transport::{BidirectionalTransport, ChildProcessTransport, StdioTransport};
 
-use super::McpClient;
+use super::{McpClient, McpHandler};
 
 /// Configuration for a single MCP server.
 ///
@@ -71,67 +72,30 @@ pub type McpServersConfig = HashMap<String, McpServerConfig>;
 
 /// A single MCP connection with its cached tools.
 ///
-/// This enum handles all transport types internally, hiding the
-/// transport abstraction from users. Use the constructor methods
-/// ([`spawn`](Self::spawn), [`stdio`](Self::stdio), and `http` with
-/// the `http` feature) to create connections.
-#[non_exhaustive]
-#[allow(missing_docs)]
-pub enum McpConnection {
-    /// Connection via spawned child process.
-    Process {
-        client: McpClient<ChildProcessTransport>,
-        tools: Vec<McpToolDefinition>,
-        server_name: Option<String>,
-    },
-    /// Connection via HTTP (requires the `http` feature).
-    #[cfg(feature = "http")]
-    Http {
-        client: McpClient<HttpTransport>,
-        tools: Vec<McpToolDefinition>,
-        server_name: Option<String>,
-    },
-    /// Connection via stdio (for use as a subprocess).
-    Stdio {
-        client: McpClient<StdioTransport>,
-        tools: Vec<McpToolDefinition>,
-        server_name: Option<String>,
-    },
+/// The transport is hidden behind the receive loop the connection owns. Use
+/// the constructor methods ([`spawn`](Self::spawn), [`stdio`](Self::stdio),
+/// and `http` with the `http` feature) to create connections; each takes the
+/// [`Executor`] that runs the loop.
+///
+/// The tool list follows the server: when it sends
+/// `notifications/tools/list_changed` the connection re-lists its tools, and
+/// every lookup and call after that uses the new list.
+pub struct McpConnection {
+    client: McpClient,
 }
 
-/// Service wrapper that serializes MCP tool calls through a command channel.
+/// Service wrapper that shares one MCP connection between callers.
 #[derive(Clone, Debug)]
 pub struct McpToolService {
-    conn: Arc<Mutex<McpConnection>>,
-    tools: Vec<McpToolDefinition>,
+    conn: Arc<McpConnection>,
 }
 
 impl std::fmt::Debug for McpConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Process {
-                server_name, tools, ..
-            } => f
-                .debug_struct("McpConnection::Process")
-                .field("server_name", server_name)
-                .field("tool_count", &tools.len())
-                .finish(),
-            #[cfg(feature = "http")]
-            Self::Http {
-                server_name, tools, ..
-            } => f
-                .debug_struct("McpConnection::Http")
-                .field("server_name", server_name)
-                .field("tool_count", &tools.len())
-                .finish(),
-            Self::Stdio {
-                server_name, tools, ..
-            } => f
-                .debug_struct("McpConnection::Stdio")
-                .field("server_name", server_name)
-                .field("tool_count", &tools.len())
-                .finish(),
-        }
+        f.debug_struct("McpConnection")
+            .field("server_name", &self.server_name())
+            .field("tool_count", &self.client.tools().len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -147,17 +111,20 @@ impl McpConnection {
     ///     url: None,
     ///     env: HashMap::new(),
     /// };
-    /// let conn = McpConnection::from_config(&config).await?;
+    /// let conn = McpConnection::from_config(&executor, &config).await?;
     /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if the configuration is invalid or connection fails.
-    pub async fn from_config(config: &McpServerConfig) -> Result<Self, McpError> {
+    pub async fn from_config<E: Executor>(
+        executor: &E,
+        config: &McpServerConfig,
+    ) -> Result<Self, McpError> {
         if let Some(ref url) = config.url {
             // HTTP-based server
             #[cfg(feature = "http")]
-            return Self::http(url).await;
+            return Self::http(executor, url).await;
             #[cfg(not(feature = "http"))]
             return Err(McpError::InvalidConfig(format!(
                 "HTTP MCP server '{url}' requires the `http` feature"
@@ -167,7 +134,7 @@ impl McpConnection {
             // Process-based server
             let mut cmd = Command::new(command);
             cmd.args(&config.args).envs(&config.env);
-            Self::spawn_command(&mut cmd).await
+            Self::spawn_command(executor, &mut cmd).await
         } else {
             Err(McpError::InvalidConfig(
                 "Config must have either 'command' or 'url'".to_string(),
@@ -189,17 +156,20 @@ impl McpConnection {
     ///     }
     /// }"#)?;
     ///
-    /// let connections = McpConnection::from_configs(&config).await?;
+    /// let connections = McpConnection::from_configs(&executor, &config).await?;
     /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if any connection fails.
-    pub async fn from_configs(configs: &McpServersConfig) -> Result<Vec<(String, Self)>, McpError> {
+    pub async fn from_configs<E: Executor>(
+        executor: &E,
+        configs: &McpServersConfig,
+    ) -> Result<Vec<(String, Self)>, McpError> {
         let mut connections = Vec::new();
 
         for (name, config) in configs {
-            let conn = Self::from_config(config).await.map_err(|e| {
+            let conn = Self::from_config(executor, config).await.map_err(|e| {
                 McpError::InvalidConfig(format!("Failed to connect to MCP server '{name}': {e}"))
             })?;
             tracing::info!("Connected to MCP server: {name}");
@@ -214,14 +184,18 @@ impl McpConnection {
     /// # Example
     ///
     /// ```ignore
-    /// let conn = McpConnection::spawn("npx", &["-y", "@modelcontextprotocol/server-filesystem"]).await?;
+    /// let conn = McpConnection::spawn(&executor, "npx", &["-y", "@modelcontextprotocol/server-filesystem"]).await?;
     /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if the process cannot be spawned or connection fails.
-    pub async fn spawn(program: &str, args: &[&str]) -> Result<Self, McpError> {
-        Self::from_transport(ChildProcessTransport::spawn(program, args)?).await
+    pub async fn spawn<E: Executor>(
+        executor: &E,
+        program: &str,
+        args: &[&str],
+    ) -> Result<Self, McpError> {
+        Self::connect(executor, ChildProcessTransport::spawn(program, args)?, ()).await
     }
 
     /// Connect to an MCP server launched from a prepared [`Command`].
@@ -233,20 +207,30 @@ impl McpConnection {
     /// # Errors
     ///
     /// Returns an error if the process cannot be spawned or connection fails.
-    pub async fn spawn_command(command: &mut Command) -> Result<Self, McpError> {
-        Self::from_transport(ChildProcessTransport::from_command(command)?).await
+    pub async fn spawn_command<E: Executor>(
+        executor: &E,
+        command: &mut Command,
+    ) -> Result<Self, McpError> {
+        Self::connect(executor, ChildProcessTransport::from_command(command)?, ()).await
     }
 
-    async fn from_transport(transport: ChildProcessTransport) -> Result<Self, McpError> {
-        let mut client = McpClient::connect(transport).await?;
+    /// Connect over any bidirectional transport, delivering the server's
+    /// notifications to `handler`, and list the server's tools.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection, initialization or tool listing
+    /// fails.
+    pub async fn connect<T, H, E>(executor: &E, transport: T, handler: H) -> Result<Self, McpError>
+    where
+        T: BidirectionalTransport + 'static,
+        H: McpHandler,
+        E: Executor,
+    {
+        let client = McpClient::connect(executor, transport, handler).await?;
         let tools = client.list_tools().await?;
-        let server_name = client.server_info().map(|i| i.name.clone());
-
-        Ok(Self::Process {
-            client,
-            tools,
-            server_name,
-        })
+        client.seed_tools(tools);
+        Ok(Self { client })
     }
 
     /// Connect to an MCP server via HTTP.
@@ -254,24 +238,15 @@ impl McpConnection {
     /// # Example
     ///
     /// ```ignore
-    /// let conn = McpConnection::http("http://localhost:3000/mcp").await?;
+    /// let conn = McpConnection::http(&executor, "http://localhost:3000/mcp").await?;
     /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if the HTTP connection fails.
     #[cfg(feature = "http")]
-    pub async fn http(url: &str) -> Result<Self, McpError> {
-        let transport = HttpTransport::new(url);
-        let mut client = McpClient::connect(transport).await?;
-        let tools = client.list_tools().await?;
-        let server_name = client.server_info().map(|i| i.name.clone());
-
-        Ok(Self::Http {
-            client,
-            tools,
-            server_name,
-        })
+    pub async fn http<E: Executor>(executor: &E, url: &str) -> Result<Self, McpError> {
+        Self::connect(executor, HttpTransport::new(url), ()).await
     }
 
     /// Connect to an MCP server via HTTP with authentication.
@@ -280,17 +255,12 @@ impl McpConnection {
     ///
     /// Returns an error if the HTTP connection fails.
     #[cfg(feature = "http")]
-    pub async fn http_with_auth(url: &str, auth: &str) -> Result<Self, McpError> {
-        let transport = HttpTransport::new(url).with_auth(auth);
-        let mut client = McpClient::connect(transport).await?;
-        let tools = client.list_tools().await?;
-        let server_name = client.server_info().map(|i| i.name.clone());
-
-        Ok(Self::Http {
-            client,
-            tools,
-            server_name,
-        })
+    pub async fn http_with_auth<E: Executor>(
+        executor: &E,
+        url: &str,
+        auth: &str,
+    ) -> Result<Self, McpError> {
+        Self::connect(executor, HttpTransport::new(url).with_auth(auth), ()).await
     }
 
     /// Connect via stdio (when running as a subprocess).
@@ -298,39 +268,22 @@ impl McpConnection {
     /// # Errors
     ///
     /// Returns an error if stdio cannot be initialized.
-    pub async fn stdio() -> Result<Self, McpError> {
-        let transport = StdioTransport::new();
-        let mut client = McpClient::connect(transport).await?;
-        let tools = client.list_tools().await?;
-        let server_name = client.server_info().map(|i| i.name.clone());
-
-        Ok(Self::Stdio {
-            client,
-            tools,
-            server_name,
-        })
+    pub async fn stdio<E: Executor>(executor: &E) -> Result<Self, McpError> {
+        Self::connect(executor, StdioTransport::new(), ()).await
     }
 
     /// Returns the server name if available.
     #[must_use]
-    pub fn server_name(&self) -> Option<&str> {
-        match self {
-            Self::Process { server_name, .. } | Self::Stdio { server_name, .. } => {
-                server_name.as_deref()
-            }
-            #[cfg(feature = "http")]
-            Self::Http { server_name, .. } => server_name.as_deref(),
-        }
+    pub const fn server_name(&self) -> Option<&str> {
+        Some(self.client.server_info().name.as_str())
     }
 
-    /// Returns the MCP tool definitions.
+    /// Returns the MCP tool definitions as of now.
+    ///
+    /// The list is a snapshot: a later `list_changed` does not alter it.
     #[must_use]
-    pub fn mcp_definitions(&self) -> &[McpToolDefinition] {
-        match self {
-            Self::Process { tools, .. } | Self::Stdio { tools, .. } => tools,
-            #[cfg(feature = "http")]
-            Self::Http { tools, .. } => tools,
-        }
+    pub fn mcp_definitions(&self) -> Arc<Vec<McpToolDefinition>> {
+        self.client.tools()
     }
 
     /// Returns aither-compatible tool definitions.
@@ -340,45 +293,35 @@ impl McpConnection {
     /// cost the caller every other tool on the server.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        convert_definitions(self.mcp_definitions())
+        convert_definitions(&self.mcp_definitions())
     }
 
     /// Check if this connection has a tool with the given name.
     #[must_use]
     pub fn has_tool(&self, name: &str) -> bool {
-        self.mcp_definitions().iter().any(|d| d.name == name)
+        self.client.tools().iter().any(|d| d.name == name)
     }
 
     /// Call a tool on this MCP server.
     ///
     /// # Errors
     ///
-    /// Returns an error if the tool call fails.
+    /// Returns [`McpError::UnknownTool`] if the server's current tool list has
+    /// no tool called `name`, and an error if the tool call fails.
     pub async fn call(
-        &mut self,
+        &self,
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult, McpError> {
-        match self {
-            Self::Process { client, .. } => client.call_tool(name, arguments).await,
-            #[cfg(feature = "http")]
-            Self::Http { client, .. } => client.call_tool(name, arguments).await,
-            Self::Stdio { client, .. } => client.call_tool(name, arguments).await,
+        if !self.has_tool(name) {
+            return Err(McpError::UnknownTool(name.to_string()));
         }
+        self.client.call_tool(name, arguments).await
     }
 
-    /// Close the connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if closing fails.
-    pub async fn close(&mut self) -> Result<(), McpError> {
-        match self {
-            Self::Process { client, .. } => client.close().await,
-            #[cfg(feature = "http")]
-            Self::Http { client, .. } => client.close().await,
-            Self::Stdio { client, .. } => client.close().await,
-        }
+    /// Close the connection, terminating the child process if any.
+    pub async fn close(&self) {
+        self.client.close().await;
     }
 }
 
@@ -468,54 +411,45 @@ fn error_message_text(content: &[Content]) -> String {
     }
 }
 
-/// Registers all tools from an MCP connection as schema-driven terminal commands.
+/// The server's tools as terminal commands that follow its tool list.
 ///
-/// Each command derives its help text, positional arguments, and validation
-/// behavior from the MCP tool's JSON schema via
-/// [`aither_sandbox::ToolRegistryBuilder::configure_definition_handler`].
-pub fn register_terminal_commands(
-    registry: &mut ToolRegistryBuilder,
-    conn: McpConnection,
-) -> Vec<ToolDefinition> {
-    let definitions = conn.definitions();
-    let conn = std::sync::Arc::new(async_lock::Mutex::new(conn));
-
-    for definition in &definitions {
-        let tool_name = definition.name().to_string();
-        let conn = conn.clone();
-        registry.configure_definition_handler(definition, move |_call, arguments| {
-            let conn = conn.clone();
-            let tool_name = tool_name.clone();
-            Box::pin(async move {
-                let result = {
-                    let mut conn = conn.lock().await;
-                    conn.call(tool_name.as_str(), arguments)
-                        .await
-                        .map_err(|error| error.to_string())?
-                };
-                call_result_to_tool_result(result).map_err(|error| error.to_string())
-            })
-        });
+/// Register a connection with
+/// [`ToolRegistryBuilder::command_set`](aither_sandbox::ToolRegistryBuilder::command_set):
+/// each tool becomes a command whose help text, positional arguments and
+/// validation derive from its JSON schema, and a tool the server adds or
+/// removes with `notifications/tools/list_changed` becomes runnable, or stops
+/// being runnable, as soon as the connection has re-listed.
+impl CommandSet for McpConnection {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        Self::definitions(self)
     }
 
-    definitions
+    async fn call(
+        &self,
+        name: &str,
+        _call: Option<CallIdentity>,
+        arguments: serde_json::Value,
+    ) -> Result<ToolResult, String> {
+        let result = Self::call(self, name, arguments)
+            .await
+            .map_err(|error| error.to_string())?;
+        call_result_to_tool_result(result).map_err(|error| error.to_string())
+    }
 }
 
 impl McpToolService {
     /// Creates a new MCP tool service.
     #[must_use]
     pub fn new(conn: McpConnection) -> Self {
-        let tools = conn.mcp_definitions().to_vec();
         Self {
-            conn: Arc::new(Mutex::new(conn)),
-            tools,
+            conn: Arc::new(conn),
         }
     }
 
-    /// Returns the MCP tool definitions.
+    /// Returns the MCP tool definitions as of now.
     #[must_use]
-    pub fn mcp_definitions(&self) -> &[McpToolDefinition] {
-        &self.tools
+    pub fn mcp_definitions(&self) -> Arc<Vec<McpToolDefinition>> {
+        self.conn.mcp_definitions()
     }
 
     /// Returns aither-compatible tool definitions.
@@ -523,13 +457,13 @@ impl McpToolService {
     /// See [`McpConnection::definitions`] for how an unusable schema is handled.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        convert_definitions(&self.tools)
+        self.conn.definitions()
     }
 
     /// Check if this service has a tool with the given name.
     #[must_use]
     pub fn has_tool(&self, name: &str) -> bool {
-        self.tools.iter().any(|d| d.name == name)
+        self.conn.has_tool(name)
     }
 
     /// Call a tool on this MCP service.
@@ -542,17 +476,12 @@ impl McpToolService {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult, McpError> {
-        let mut conn = self.conn.lock().await;
-        conn.call(name, arguments).await
+        self.conn.call(name, arguments).await
     }
 
     /// Close the underlying connection, terminating the child process if any.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if closing the transport fails.
-    pub async fn close(&self) -> Result<(), McpError> {
-        self.conn.lock().await.close().await
+    pub async fn close(&self) {
+        self.conn.close().await;
     }
 }
 

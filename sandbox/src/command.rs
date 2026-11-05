@@ -36,6 +36,8 @@ use std::sync::Arc;
 
 use aither_core::llm::tool::ToolResultPart;
 use aither_core::llm::{CallIdentity, IntoToolResult, Tool, ToolCallId, ToolContext, ToolResult};
+
+use crate::command_set::{AnyCommandSet, CommandSet};
 use askama::Template;
 use async_channel::{Receiver, Sender};
 use heel::IpcCommand;
@@ -76,7 +78,8 @@ struct StoredBinaryPartTemplate<'a> {
 #[template(path = "command_output_saved.txt", escape = "none")]
 struct CommandOutputSavedTemplate<'a> {
     preview: &'a str,
-    filename: &'a str,
+    /// Absolute path of the file holding the full output.
+    path: &'a str,
     line_count: usize,
     byte_count: usize,
 }
@@ -115,16 +118,24 @@ fn tool_usage_error(message: &str, tool_name: &str) -> String {
     .expect("tool usage error template must render")
 }
 
-fn output_saved_text(
+/// The notice a command's output is replaced by when it was too large for the
+/// window: a preview of `rendered` and the absolute `path` of the file that
+/// holds all of it.
+///
+/// # Panics
+///
+/// Panics if the compiled-in template fails to render.
+#[must_use]
+pub fn output_saved_text(
     rendered: &str,
-    filename: &str,
+    path: &str,
     line_count: usize,
     byte_count: usize,
 ) -> String {
     let preview = crate::output_compress::stored_preview(rendered, usize::MAX, INLINE_OUTPUT_LIMIT);
     CommandOutputSavedTemplate {
         preview: preview.trim_end_matches('\n'),
-        filename,
+        path,
         line_count,
         byte_count,
     }
@@ -153,12 +164,18 @@ fn push_help_line(help: &mut String, line: &str) {
     help.push('\n');
 }
 
-fn render_positional_usage(name: &str) -> String {
+fn render_positional_usage(name: &str, required: bool) -> String {
     let kebab = name.replace('_', "-");
-    let mut output = String::with_capacity(kebab.len() + 2);
+    let mut output = String::with_capacity(kebab.len() + 4);
+    if !required {
+        output.push('[');
+    }
     output.push('<');
     output.push_str(kebab.as_str());
     output.push('>');
+    if !required {
+        output.push(']');
+    }
     output
 }
 
@@ -702,7 +719,12 @@ async fn handle_large_output(output: ToolResult, output_dir: &Path) -> CommandEn
     }
 
     CommandEnvelope::success(CommandPayload::Text {
-        content: output_saved_text(&rendered, filename.as_str(), line_count, rendered.len()),
+        content: output_saved_text(
+            &rendered,
+            &filepath.to_string_lossy(),
+            line_count,
+            rendered.len(),
+        ),
     })
 }
 
@@ -910,6 +932,7 @@ impl std::fmt::Debug for DynTerminalTool {
 pub struct ToolRegistryBuilder {
     entries: HashMap<String, RoleEntries<Arc<ToolEntry>>>,
     bound: HashMap<String, RoleEntries<Arc<BoundEntry>>>,
+    sets: Vec<AnyCommandSet>,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
     kept: HashSet<String>,
@@ -1029,6 +1052,7 @@ impl ToolRegistryBuilder {
     fn restrict(&mut self, configure: impl FnOnce(&mut Self), restriction: Restriction) {
         let mut restricted = Self::new();
         configure(&mut restricted);
+        restricted.assert_no_sets("restricted to the main agent");
         self.kept.extend(restricted.kept);
         for (name, entries) in restricted.entries {
             self.insert_entry(
@@ -1060,6 +1084,7 @@ impl ToolRegistryBuilder {
     pub fn sandboxed_only(&mut self, configure: impl FnOnce(&mut Self)) {
         let mut scoped = Self::new();
         configure(&mut scoped);
+        scoped.assert_no_sets("scoped to sandboxed modes");
         self.kept.extend(scoped.kept);
         for (name, mut entries) in scoped.entries {
             entries.modes = ModeScope::Sandboxed;
@@ -1079,6 +1104,7 @@ impl ToolRegistryBuilder {
     pub fn kept_through_compaction(&mut self, configure: impl FnOnce(&mut Self)) {
         let mut registered = Self::new();
         configure(&mut registered);
+        registered.assert_no_sets("kept through compaction");
         self.kept.extend(registered.kept);
         self.kept.extend(registered.entries.keys().cloned());
         self.kept.extend(registered.bound.keys().cloned());
@@ -1167,6 +1193,27 @@ impl ToolRegistryBuilder {
         );
     }
 
+    /// Registers every command `set` holds, for both roles in every mode.
+    ///
+    /// The registry asks the set for its commands whenever it lists or
+    /// resolves one, so a command the set gains is runnable from the next
+    /// terminal execution and one it loses stops being runnable. A name a
+    /// command registered any other way already has, or an earlier set
+    /// holds, stays with that command.
+    pub fn command_set(&mut self, set: impl CommandSet) {
+        self.sets.push(AnyCommandSet::new(set));
+    }
+
+    /// A set serves every role and mode alike and is never kept through
+    /// compaction, so a scoped registration holding one is a mistake in the
+    /// host.
+    fn assert_no_sets(&self, scope: &str) {
+        assert!(
+            self.sets.is_empty(),
+            "a command set serves every role and mode and cannot be {scope}"
+        );
+    }
+
     /// Has `observer` told about every call of a resolved command the main
     /// agent's registry serves. A subagent's registry is observed by the
     /// observer given to [`ToolRegistry::for_subagent`].
@@ -1193,6 +1240,7 @@ impl ToolRegistryBuilder {
             kept_rx,
             entries: self.entries,
             bound: self.bound,
+            sets: self.sets.into(),
             instances: HashMap::new(),
             output_dir: output_dir.into(),
             role: CommandRole::Main,
@@ -1388,6 +1436,9 @@ impl std::fmt::Debug for KeptExchangeReceiver {
 pub struct ToolRegistry {
     entries: HashMap<String, RoleEntries<Arc<ToolEntry>>>,
     bound: HashMap<String, RoleEntries<Arc<BoundEntry>>>,
+    /// The command sets, asked for their commands at each lookup, in
+    /// registration order.
+    sets: Arc<[AnyCommandSet]>,
     /// The terminal-bound commands built for the terminal serving this
     /// registry, in its role.
     instances: HashMap<String, Arc<ToolEntry>>,
@@ -1514,6 +1565,7 @@ impl ToolRegistry {
             kept_rx,
             entries: self.entries.clone(),
             bound: self.bound.clone(),
+            sets: self.sets.clone(),
             instances: HashMap::new(),
             output_dir: self.output_dir.clone(),
             role: CommandRole::Subagent,
@@ -1641,41 +1693,97 @@ impl ToolRegistry {
             Some(Resolved {
                 handler: Some(handler),
                 ..
-            }) => {
-                let caller = Caller {
-                    call: self.call.clone(),
-                    working_dir: working_dir.map(|dir| dir.to_string_lossy().into_owned()),
-                };
-                let outcome = match handler(caller, args.to_vec()).await {
-                    Ok(output) => handle_large_output(output, &self.output_dir).await,
-                    Err(error) => CommandEnvelope::failure(error),
-                };
-                if outcome.ok
-                    && self.kept.contains(tool_name)
-                    && let Some(call) = &self.call
-                {
-                    self.kept_tx
-                        .try_send(call.call().clone())
-                        .expect("the registry holds its kept channel open and unbounded");
-                }
-                if let Some(observer) = &self.observer {
-                    observer
-                        .command_called(&CommandCall {
-                            role: self.role,
-                            name: tool_name,
-                            call: self.call.as_ref(),
-                            args,
-                            outcome: &outcome,
-                        })
-                        .await;
-                }
-                outcome
-            }
+            }) => self.run(tool_name, handler, args, working_dir).await,
             Some(Resolved { handler: None, .. }) => {
                 CommandEnvelope::failure(reserved_for_main_text(tool_name))
             }
-            None => CommandEnvelope::failure(unknown_command_text(tool_name)),
+            None => match self.set_entry(tool_name) {
+                Some(entry) => self.run(tool_name, &entry.handler, args, working_dir).await,
+                None => CommandEnvelope::failure(unknown_command_text(tool_name)),
+            },
         }
+    }
+
+    /// Runs `handler`, the command `tool_name` resolved to, and reports the
+    /// call to the kept-exchange channel and the observer.
+    async fn run(
+        &self,
+        tool_name: &str,
+        handler: &ToolHandlerFn,
+        args: &[String],
+        working_dir: Option<&Path>,
+    ) -> CommandEnvelope {
+        let caller = Caller {
+            call: self.call.clone(),
+            working_dir: working_dir.map(|dir| dir.to_string_lossy().into_owned()),
+        };
+        let outcome = match handler(caller, args.to_vec()).await {
+            Ok(output) => handle_large_output(output, &self.output_dir).await,
+            Err(error) => CommandEnvelope::failure(error),
+        };
+        if outcome.ok
+            && self.kept.contains(tool_name)
+            && let Some(call) = &self.call
+        {
+            self.kept_tx
+                .try_send(call.call().clone())
+                .expect("the registry holds its kept channel open and unbounded");
+        }
+        if let Some(observer) = &self.observer {
+            observer
+                .command_called(&CommandCall {
+                    role: self.role,
+                    name: tool_name,
+                    call: self.call.as_ref(),
+                    args,
+                    outcome: &outcome,
+                })
+                .await;
+        }
+        outcome
+    }
+
+    /// Whether a command registered other than through a set has
+    /// `tool_name`, in any role or mode: such a name never resolves to a set.
+    fn is_fixed(&self, tool_name: &str) -> bool {
+        self.entries.contains_key(tool_name) || self.bound.contains_key(tool_name)
+    }
+
+    /// The entry of the command `tool_name` from the first set holding it,
+    /// as the set holds it now; `None` when a fixed command has the name.
+    fn set_entry(&self, tool_name: &str) -> Option<ToolEntry> {
+        if self.is_fixed(tool_name) {
+            return None;
+        }
+        self.sets.iter().find_map(|set| {
+            let definition = set
+                .definitions()
+                .into_iter()
+                .find(|definition| definition.name() == tool_name)?;
+            let set = set.clone();
+            let name = definition.name().to_string();
+            let (_, entry) = definition_entry(&definition, move |call, arguments| {
+                let set = set.clone();
+                let name = name.clone();
+                Box::pin(async move { set.call(&name, call, arguments).await })
+            });
+            Some(entry)
+        })
+    }
+
+    /// The names the sets hold now that no fixed command has, each once, in
+    /// set order.
+    fn set_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for set in self.sets.iter() {
+            for definition in set.definitions() {
+                let name = definition.name();
+                if !self.is_fixed(name) && !names.iter().any(|known| known == name) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names
     }
 
     /// Returns whether a tool is registered for this registry's role and
@@ -1683,6 +1791,9 @@ impl ToolRegistry {
     /// for a subagent, nor one for sandboxed modes alone in an unsafe one.
     #[must_use]
     pub fn is_tool_configured(&self, tool_name: &str) -> bool {
+        if !self.is_fixed(tool_name) {
+            return self.set_names().iter().any(|name| name == tool_name);
+        }
         self.bound.get(tool_name).map_or_else(
             || {
                 self.entries
@@ -1710,19 +1821,24 @@ impl ToolRegistry {
     /// Returns the help text for a tool.
     #[must_use]
     pub fn tool_help(&self, tool_name: &str) -> Option<String> {
-        self.resolve(tool_name)
-            .map(|resolved| resolved.help.to_string())
+        self.resolve(tool_name).map_or_else(
+            || self.set_entry(tool_name).map(|entry| entry.help),
+            |resolved| Some(resolved.help.to_string()),
+        )
     }
 
     /// Returns the stdin argument for a tool.
     #[must_use]
     pub fn tool_stdin_arg(&self, tool_name: &str) -> Option<String> {
-        self.resolve(tool_name)
-            .and_then(|resolved| resolved.stdin_arg.map(str::to_string))
+        self.resolve(tool_name).map_or_else(
+            || self.set_entry(tool_name).and_then(|entry| entry.stdin_arg),
+            |resolved| resolved.stdin_arg.map(str::to_string),
+        )
     }
 
     /// Returns the names of the tools registered for this registry's role and
-    /// mode, those reserved for the main agent included.
+    /// mode, those reserved for the main agent included, and the commands
+    /// the command sets hold now.
     #[must_use]
     pub fn registered_tool_names(&self) -> Vec<String> {
         self.entries
@@ -1736,7 +1852,14 @@ impl ToolRegistry {
                     .map(|(name, _)| name),
             )
             .cloned()
+            .chain(self.set_names())
             .collect()
+    }
+
+    /// The command sets this registry serves, in registration order.
+    #[must_use]
+    pub fn command_sets(&self) -> &[AnyCommandSet] {
+        &self.sets
     }
 
     /// Returns the registered tool names this registry's role can actually
@@ -2464,16 +2587,6 @@ fn parse_object(root_schema: &Value, schema: &Value, args: &[String]) -> anyhow:
         i += 1;
     }
 
-    if schema.command_capture_enabled
-        && !state.seen_positionals.is_empty()
-        && !state.result.contains_key("command")
-    {
-        state.result.insert(
-            "command".to_string(),
-            Value::String(state.seen_positionals.join(" ")),
-        );
-    }
-
     for req in &schema.required {
         if !state.result.contains_key(req) {
             anyhow::bail!("missing required argument: {req}");
@@ -2487,7 +2600,6 @@ struct ObjectParseSchema {
     properties: serde_json::Map<String, Value>,
     required: Vec<String>,
     positional_fields: Vec<String>,
-    command_capture_enabled: bool,
     short_to_field: HashMap<char, String>,
     long_names: Vec<String>,
 }
@@ -2511,16 +2623,12 @@ impl ObjectParseSchema {
             })
             .unwrap_or_default();
         let positional_fields = positional_fields(root_schema, &properties, &required);
-        let command_capture_enabled = properties
-            .get("command")
-            .is_some_and(|schema| get_instance_type(root_schema, schema) == Some("string"));
         let (short_to_field, _) = build_short_option_maps(&properties);
         let long_names = properties.keys().map(|k| k.replace('_', "-")).collect();
         Self {
             properties,
             required,
             positional_fields,
-            command_capture_enabled,
             short_to_field,
             long_names,
         }
@@ -2531,23 +2639,58 @@ impl ObjectParseSchema {
 struct ObjectParseState {
     result: HashMap<String, Value>,
     positional_idx: usize,
-    seen_positionals: Vec<String>,
     end_of_options: bool,
 }
 
+/// The schema keyword that marks an optional field positional.
+///
+/// A tool's argument schema binds bare words, in order, to its required
+/// non-array fields. Setting this keyword to `true` on a field's schema
+/// binds words to that field too, after the required ones, though the field
+/// is optional:
+///
+/// ```ignore
+/// #[derive(JsonSchema)]
+/// struct Args {
+///     question: String,
+///     #[schemars(extend("x-positional" = true))]
+///     context: Option<String>,
+/// }
+/// ```
+///
+/// An array field is never positional; it is filled by repeated flags.
+pub const POSITIONAL_KEYWORD: &str = "x-positional";
+
+/// The fields bare words bind to, in order: the required non-array fields,
+/// then the optional non-array fields marked with [`POSITIONAL_KEYWORD`].
 fn positional_fields(
     root_schema: &Value,
     properties: &serde_json::Map<String, Value>,
     required: &[String],
 ) -> Vec<String> {
+    let is_array = |name: &str| {
+        properties
+            .get(name)
+            .is_some_and(|schema| get_instance_type(root_schema, schema) == Some("array"))
+    };
+    let marked = |schema: &Value| {
+        schema
+            .get(POSITIONAL_KEYWORD)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
     required
         .iter()
-        .filter(|name| {
-            properties.get(name.as_str()).is_none_or(|prop_schema| {
-                get_instance_type(root_schema, prop_schema) != Some("array")
-            })
-        })
+        .filter(|name| !is_array(name))
         .cloned()
+        .chain(
+            properties
+                .iter()
+                .filter(|(name, schema)| {
+                    !required.contains(name) && marked(schema) && !is_array(name)
+                })
+                .map(|(name, _)| name.clone()),
+        )
         .collect()
 }
 
@@ -2566,9 +2709,6 @@ fn parse_positional_arg(
                 .insert(field_name.clone(), parse_value(arg, prop_type));
         }
         state.positional_idx += 1;
-        state.seen_positionals.push(arg.to_string());
-    } else if schema.command_capture_enabled {
-        state.seen_positionals.push(arg.to_string());
     } else {
         anyhow::bail!("unexpected positional argument: {arg}");
     }
@@ -2897,15 +3037,12 @@ pub fn schema_to_help(schema: &Value) -> String {
             .map(|arr| arr.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
 
-        // Show positional usage: only non-array required fields are positional
-        let positional: Vec<_> = required
+        // Show positional usage: the fields bare words bind to, optional
+        // ones in brackets.
+        let required_names: Vec<String> = required.iter().map(|n| (*n).to_string()).collect();
+        let positional: Vec<_> = positional_fields(schema, props, &required_names)
             .iter()
-            .filter(|n| {
-                props
-                    .get(**n)
-                    .is_none_or(|s| get_instance_type(s, s) != Some("array"))
-            })
-            .map(|n| render_positional_usage(n))
+            .map(|name| render_positional_usage(name, required.contains(&name.as_str())))
             .collect();
         // Show required array fields as repeatable flags in usage
         let repeatable: Vec<_> = required
@@ -3538,25 +3675,96 @@ mod tests {
         command: Option<String>,
     }
 
+    /// A field named `command` is an ordinary optional field: bare words
+    /// bind to the required `query` only, and nothing is captured into it.
     #[test]
-    fn test_command_field_captures_single_positional_for_session_like_tools() {
+    fn test_command_field_has_no_special_meaning() {
         let schema = schemars::schema_for!(SessionLikeArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
         let value = cli_to_json(&schema, &["gold".into()]).unwrap();
         assert_eq!(value["query"], "gold");
-        assert_eq!(value["command"], "gold");
+        assert!(value.get("command").is_none(), "got: {value}");
+
+        let err = cli_to_json(&schema, &["abc123".into(), "search".into(), "gold".into()])
+            .expect_err("a second bare word has no field to bind to");
+        assert!(
+            err.to_string().contains("unexpected positional argument"),
+            "got: {err}"
+        );
+
+        let value = cli_to_json(&schema, &["gold".into(), "--command".into(), "go".into()])
+            .expect("the flag still sets the field");
+        assert_eq!(value["command"], "go");
+    }
+
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct OptionalPositionalArgs {
+        question: String,
+        #[schemars(extend("x-positional" = true))]
+        context: Option<String>,
+        note: Option<String>,
+        options: Vec<String>,
+    }
+
+    /// An optional field marked positional takes the words after the
+    /// required ones; an unmarked optional field stays flag-only.
+    #[test]
+    fn test_marked_optional_field_binds_positional_words() {
+        let schema = schemars::schema_for!(OptionalPositionalArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        let value = cli_to_json(
+            &schema,
+            &[
+                "Pick one".into(),
+                "Some context".into(),
+                "--options".into(),
+                "A".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(value["question"], "Pick one");
+        assert_eq!(value["context"], "Some context");
+        assert!(value.get("note").is_none(), "got: {value}");
+
+        // The marked field is optional: leaving it out is fine.
+        let value = cli_to_json(
+            &schema,
+            &["Pick one".into(), "--options".into(), "A".into()],
+        )
+        .unwrap();
+        assert!(value.get("context").is_none(), "got: {value}");
+
+        // `note` is optional and unmarked, so a third word has no field.
+        let err = cli_to_json(
+            &schema,
+            &[
+                "Q".into(),
+                "C".into(),
+                "N".into(),
+                "--options".into(),
+                "A".into(),
+            ],
+        )
+        .expect_err("an unmarked optional field is flag-only");
+        assert!(
+            err.to_string().contains("unexpected positional argument"),
+            "got: {err}"
+        );
     }
 
     #[test]
-    fn test_command_field_captures_multi_positional_for_session_like_tools() {
-        let schema = schemars::schema_for!(SessionLikeArgs);
+    fn test_marked_optional_field_shows_in_usage() {
+        let schema = schemars::schema_for!(OptionalPositionalArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
-        let value = cli_to_json(&schema, &["abc123".into(), "search".into(), "gold".into()])
-            .expect("session-like positional command should parse");
-        assert_eq!(value["query"], "abc123");
-        assert_eq!(value["command"], "abc123 search gold");
+        let help = schema_to_help(&schema);
+        assert!(
+            help.contains("<question> [<context>]"),
+            "usage should show the optional positional, got:\n{help}"
+        );
+        assert!(!help.contains("[<note>]"), "got:\n{help}");
     }
 
     // ========================================================================
@@ -3963,6 +4171,100 @@ mod tests {
         assert_eq!(pending[0].as_str(), "call_3");
         let subagent = registry.for_subagent(None, None).kept_receiver();
         assert_eq!(subagent.take_pending(), []);
+    }
+
+    /// A command set whose commands the test replaces; each command answers
+    /// with its own name and the arguments it was given.
+    #[derive(Clone, Default)]
+    struct ChangingSet(Arc<arc_swap::ArcSwap<Vec<&'static str>>>);
+
+    impl ChangingSet {
+        fn offer(&self, names: &[&'static str]) {
+            self.0.store(Arc::new(names.to_vec()));
+        }
+    }
+
+    impl CommandSet for ChangingSet {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            self.0
+                .load()
+                .iter()
+                .map(|name| {
+                    ToolDefinition::from_parts(
+                        Cow::Borrowed(*name),
+                        Cow::Borrowed("Answers with its name."),
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {"word": {"type": "string"}},
+                            "required": ["word"]
+                        }),
+                    )
+                    .expect("the fixture schema is a schema")
+                })
+                .collect()
+        }
+
+        fn call(
+            &self,
+            name: &str,
+            _call: Option<CallIdentity>,
+            arguments: Value,
+        ) -> impl Future<Output = Result<ToolResult, String>> + Send {
+            std::future::ready(Ok(ToolResult::text(format!(
+                "{name} {}",
+                arguments["word"]
+            ))))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_set_change_is_runnable_at_once_in_every_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let set = ChangingSet::default();
+        set.offer(&["alpha", "shared"]);
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(RoleTool {
+            name: "shared",
+            answer: "fixed",
+        });
+        builder.command_set(set.clone());
+        let main = builder.build(tmp.path());
+        let subagent = main.for_subagent(None, None);
+        let args = ["hi".to_string()];
+
+        let mut names = main.registered_tool_names();
+        names.sort();
+        assert_eq!(names, ["alpha", "shared"]);
+        let ran = main.query_tool_handler("alpha", &args).await;
+        assert_eq!(ran.payload.unwrap().render_for_cli(), "alpha \"hi\"");
+        // A fixed command keeps its name against a set.
+        let fixed = run_command(&main, "shared").await;
+        assert_eq!(fixed.payload.unwrap().render_for_cli(), "fixed");
+
+        set.offer(&["gamma"]);
+        for registry in [&main, &subagent] {
+            assert!(registry.is_tool_configured("gamma"));
+            assert!(!registry.is_tool_configured("alpha"));
+            assert!(
+                registry
+                    .tool_help("gamma")
+                    .is_some_and(|help| help.starts_with("Answers with its name."))
+            );
+            let ran = registry.query_tool_handler("gamma", &args).await;
+            assert_eq!(ran.payload.unwrap().render_for_cli(), "gamma \"hi\"");
+            let gone = registry.query_tool_handler("alpha", &args).await;
+            assert_eq!(
+                gone.error.as_deref(),
+                Some("unknown command 'alpha'. Run 'help' to see available commands.")
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "a command set serves every role and mode")]
+    fn a_command_set_cannot_be_reserved_for_the_main_agent() {
+        let mut builder = ToolRegistryBuilder::new();
+        builder.main_only(|main| main.command_set(ChangingSet::default()));
     }
 
     #[tokio::test]

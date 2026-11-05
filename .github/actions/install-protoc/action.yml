@@ -1,0 +1,74 @@
+name: Install protoc
+description: Put the pinned protoc on PATH, restored from the Actions cache and downloaded from the protobuf release only on a miss.
+inputs:
+  version:
+    description: protoc release to install; the digests below pin it.
+    default: "36.2"
+  save:
+    description: Whether a cache miss saves the download. Only dev saves caches, as in the Rust caches.
+    default: ${{ github.ref == 'refs/heads/dev' }}
+runs:
+  using: composite
+  steps:
+    - id: asset
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        # The digests are the release's published SHA-256 values for 36.2;
+        # a version bump replaces them with the new release's.
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64) platform=linux-x86_64; sha256=121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278 ;;
+          Linux-ARM64) platform=linux-aarch_64; sha256=8b8f18bd2b30346efbc698dd5a73dd7c805f3ef8380f6dfc95c768f3f1852f6a ;;
+          macOS-ARM64) platform=osx-aarch_64; sha256=9cd98a532c5c5e0c4161314de0225de27e4c8a323917b6ea7b1b714d3ae23466 ;;
+          Windows-X64) platform=win64; sha256=f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3 ;;
+          *) echo "no pinned protoc for ${RUNNER_OS}-${RUNNER_ARCH}" >&2; exit 1 ;;
+        esac
+        {
+          echo "name=protoc-${VERSION}-${platform}.zip"
+          echo "sha256=${sha256}"
+          echo "directory=${RUNNER_TEMP}/protoc"
+        } >> "${GITHUB_OUTPUT}"
+    - id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/protoc
+        key: protoc-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+    - if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        NAME: ${{ steps.asset.outputs.name }}
+        SHA256: ${{ steps.asset.outputs.sha256 }}
+        DIRECTORY: ${{ steps.asset.outputs.directory }}
+      run: |
+        set -euo pipefail
+        archive="${RUNNER_TEMP}/${NAME}"
+        curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+          --output "${archive}" \
+          "https://github.com/protocolbuffers/protobuf/releases/download/v${VERSION}/${NAME}"
+        echo "${SHA256}  ${archive}" | (sha256sum --check - 2>/dev/null || shasum -a 256 --check -)
+        mkdir -p "${DIRECTORY}"
+        echo "archive=${archive}" >> "${GITHUB_ENV}"
+    - if: steps.restore.outputs.cache-hit != 'true' && runner.os != 'Windows'
+      shell: bash
+      env:
+        DIRECTORY: ${{ steps.asset.outputs.directory }}
+      run: unzip -q -o "${archive}" -d "${DIRECTORY}"
+    - if: steps.restore.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      shell: pwsh
+      env:
+        DIRECTORY: ${{ steps.asset.outputs.directory }}
+      run: Expand-Archive -Path $env:archive -DestinationPath $env:DIRECTORY -Force
+    - if: steps.restore.outputs.cache-hit != 'true' && inputs.save == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/protoc
+        key: protoc-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+    - shell: bash
+      env:
+        DIRECTORY: ${{ steps.asset.outputs.directory }}
+      run: |
+        set -euo pipefail
+        echo "${DIRECTORY}/bin" >> "${GITHUB_PATH}"

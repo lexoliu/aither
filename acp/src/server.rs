@@ -4,16 +4,17 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use aither_agent::Agent;
 use aither_core::LanguageModel;
+use aither_mcp::McpConnection;
 use aither_mcp::transport::{BidirectionalTransport, StdioTransport};
+use executor_core::{AnyExecutor, Executor};
 use futures_lite::future::or;
 use serde::de::DeserializeOwned;
 use tracing::debug;
 
+use crate::mcp::{ConnectError, connect_all};
 use crate::protocol::{
     AcpError, AgentCapabilities, ContentBlock, Implementation, InitializeParams, InitializeResult,
     JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
@@ -23,7 +24,7 @@ use crate::protocol::{
     SessionInfo, SessionListCapabilities, SessionListResult, SessionNewParams, SessionNewResult,
     SessionNotification, SessionUpdate, StopReason,
 };
-use crate::session::AcpSession;
+use crate::session::{AcpSession, Cancellation};
 
 /// ACP server that exposes aither agents to code editors.
 ///
@@ -32,25 +33,26 @@ use crate::session::AcpSession;
 /// ```ignore
 /// use aither_acp::AcpServer;
 ///
-/// let mut server = AcpServer::stdio("my-agent", "1.0.0");
-/// server.run(|config| async {
-///     // Create agent for this session
-///     let agent = Agent::builder(llm)
-///         .system_prompt("You are helpful")
-///         .build();
-///     Ok(agent)
-/// }).await?;
+/// let mut server = AcpServer::stdio("my-agent", "1.0.0", executor, |setup| async move {
+///     // Create the agent for this session, with the MCP servers it was opened with
+///     let mut builder = Agent::builder(llm).system_prompt("You are helpful");
+///     for connection in setup.mcp {
+///         builder = builder.mcp(connection);
+///     }
+///     Ok(builder.build())
+/// });
+/// server.run().await?;
 /// ```
 pub struct AcpServer<T: BidirectionalTransport, LLM: LanguageModel + 'static> {
     transport: T,
     info: Implementation,
     sessions: HashMap<String, AcpSession<LLM>>,
-    /// Cancellation flags indexed by session ID.
+    /// Cancellation requests indexed by session ID.
     ///
     /// A prompt turn borrows its session out of `sessions`, so a
     /// `session/cancel` notification cannot reach it through the map; the
-    /// flag is shared state that always can.
-    cancellations: HashMap<String, Arc<AtomicBool>>,
+    /// request is shared state that always can.
+    cancellations: HashMap<String, Cancellation>,
     initialized: bool,
     /// Builds a fresh agent for each new session.
     ///
@@ -58,11 +60,24 @@ pub struct AcpServer<T: BidirectionalTransport, LLM: LanguageModel + 'static> {
     /// rather than sharing one and interleaving their contexts. Building one
     /// is async because setting up a sandbox touches the filesystem.
     make_agent: AgentFactory<LLM>,
+    /// Runs the connections to the MCP servers sessions are opened with.
+    executor: AnyExecutor,
 }
 
-/// Builds the agent backing a new session, given that session's working directory.
+/// What the agent of a new session is built from.
+#[derive(Debug)]
+pub struct SessionSetup {
+    /// The session's working directory.
+    pub cwd: PathBuf,
+    /// The MCP servers the client opened the session with, connected and in
+    /// the order it listed them. The agent registers their tools.
+    pub mcp: Vec<McpConnection>,
+}
+
+/// Builds the agent backing a new session.
 pub type AgentFactory<LLM> = Box<
-    dyn Fn(PathBuf) -> Pin<Box<dyn Future<Output = Result<Agent<LLM, LLM, LLM>>> + Send>> + Send,
+    dyn Fn(SessionSetup) -> Pin<Box<dyn Future<Output = Result<Agent<LLM, LLM, LLM>>> + Send>>
+        + Send,
 >;
 
 impl<T: BidirectionalTransport, LLM: LanguageModel + 'static> std::fmt::Debug
@@ -87,15 +102,42 @@ impl<LLM: LanguageModel + 'static> AcpServer<StdioTransport, LLM> {
     ///
     /// * `name` - The agent name.
     /// * `version` - The agent version.
-    /// * `make_agent` - Builds the agent backing each new session, given the
-    ///   session's working directory.
-    pub fn stdio<F, Fut>(name: impl Into<String>, version: impl Into<String>, make_agent: F) -> Self
+    /// * `executor` - Runs the connections to the MCP servers sessions are
+    ///   opened with.
+    /// * `make_agent` - Builds the agent backing each new session from its
+    ///   [`SessionSetup`].
+    pub fn stdio<F, Fut>(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        executor: impl Executor + 'static,
+        make_agent: F,
+    ) -> Self
     where
-        F: Fn(PathBuf) -> Fut + Send + 'static,
+        F: Fn(SessionSetup) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Agent<LLM, LLM, LLM>>> + Send + 'static,
+    {
+        Self::new(StdioTransport::new(), name, version, executor, make_agent)
+    }
+}
+
+impl<T: BidirectionalTransport, LLM: LanguageModel + 'static> AcpServer<T, LLM> {
+    /// Create an ACP server over a custom transport.
+    ///
+    /// For most use cases, prefer [`AcpServer::stdio`]. Arguments are as for
+    /// that constructor.
+    pub fn new<F, Fut>(
+        transport: T,
+        name: impl Into<String>,
+        version: impl Into<String>,
+        executor: impl Executor + 'static,
+        make_agent: F,
+    ) -> Self
+    where
+        F: Fn(SessionSetup) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Agent<LLM, LLM, LLM>>> + Send + 'static,
     {
         Self {
-            transport: StdioTransport::new(),
+            transport,
             info: Implementation {
                 name: name.into(),
                 title: None,
@@ -104,7 +146,8 @@ impl<LLM: LanguageModel + 'static> AcpServer<StdioTransport, LLM> {
             sessions: HashMap::new(),
             cancellations: HashMap::new(),
             initialized: false,
-            make_agent: Box::new(move |cwd| Box::pin(make_agent(cwd))),
+            make_agent: Box::new(move |setup| Box::pin(make_agent(setup))),
+            executor: AnyExecutor::new(executor),
         }
     }
 }
@@ -193,8 +236,8 @@ impl<T: BidirectionalTransport, LLM: LanguageModel + 'static> AcpServer<T, LLM> 
         match notif.method.as_str() {
             "session/cancel" => match notif.params.clone().map(serde_json::from_value) {
                 Some(Ok(SessionCancelParams { session_id, .. })) => {
-                    if let Some(flag) = self.cancellations.get(&session_id) {
-                        flag.store(true, Ordering::SeqCst);
+                    if let Some(cancellation) = self.cancellations.get(&session_id) {
+                        cancellation.cancel();
                     } else {
                         debug!("session/cancel for unknown session: {session_id}");
                     }
@@ -283,7 +326,26 @@ impl<T: BidirectionalTransport, LLM: LanguageModel + 'static> AcpServer<T, LLM> 
             }
         };
 
-        let agent = match (self.make_agent)(params.cwd.clone()).await {
+        let mcp = match connect_all(&self.executor, &params.mcp_servers).await {
+            Ok(mcp) => mcp,
+            Err(err @ ConnectError::Unsupported(_)) => {
+                return JsonRpcResponse::error(
+                    req.id,
+                    JsonRpcError::invalid_params(err.to_string()),
+                );
+            }
+            Err(err @ ConnectError::Failed { .. }) => {
+                return JsonRpcResponse::error(
+                    req.id,
+                    JsonRpcError::internal_error(err.to_string()),
+                );
+            }
+        };
+        let setup = SessionSetup {
+            cwd: params.cwd.clone(),
+            mcp,
+        };
+        let agent = match (self.make_agent)(setup).await {
             Ok(agent) => agent,
             Err(err) => {
                 return JsonRpcResponse::error(

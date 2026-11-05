@@ -23,7 +23,7 @@
 //!
 //! # Features
 //!
-//! - **Ergonomic API**: Simple `query()` for one-shot tasks, `run()` for streaming
+//! - **Ergonomic API**: Simple `query()` for one-shot tasks, `run()` to handle each event as it happens
 //! - **Internal Loop**: Tool execution handled automatically
 //! - **Trait-based Hooks**: Intercept operations at compile time
 //! - **Context Management**: One policy, a cache-aware window, async compaction
@@ -39,6 +39,9 @@ mod cache_stats;
 mod call_identity_tests;
 mod checkpoint;
 mod clock;
+mod command_catalog;
+#[cfg(test)]
+mod command_table_tests;
 mod compact_tool;
 mod compaction_state;
 mod config;
@@ -59,7 +62,6 @@ pub mod language;
 mod model_group;
 mod output_urls;
 mod request_parameters;
-mod stream;
 mod subagent_file;
 mod terminal_agent;
 #[cfg(test)]
@@ -94,7 +96,7 @@ pub use aither_websearch as websearch;
 pub use aither_sandbox as sandbox;
 
 // Public API
-pub use agent::{Agent, BackgroundWake, CompactResult};
+pub use agent::{Agent, BackgroundWake, CompactResult, Run};
 pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser};
 pub use builder::{AgentBuilder, AgentOptions, AgentSettings};
 pub use cache_stats::CacheStats;
@@ -107,8 +109,8 @@ pub use context::ActiveSkills;
 pub use context::{
     AnyContextSource, BackgroundJobs, Block, CompactionError, CompletedCompaction, Context,
     ContextBudget, ContextCheckpoint, ContextItem, ContextPolicy, ContextSource, ExternalContent,
-    ExternalSlot, Handoff, HandoffDocument, InstructionSlot, PromptCache, ReassemblyReport,
-    SystemLayout, TasksDocument,
+    ExternalSlot, Handoff, HandoffDocument, InstructionSlot, LiveContent, LiveUpdate, PromptCache,
+    ReassemblyReport, SystemLayout, TasksDocument,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;
@@ -129,7 +131,6 @@ pub use host_load::{
 #[cfg(feature = "languages")]
 pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
-pub use stream::AgentStream;
 pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};
 pub use tools::AgentTools;
 pub use warmth::{CacheState, CacheWarmth};
