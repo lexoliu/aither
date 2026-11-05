@@ -2,8 +2,6 @@
 
 use std::time::Duration;
 
-use aither_core::llm::model::Parameters;
-
 use crate::context::ContextPolicy;
 
 /// Agent specialization mode.
@@ -74,13 +72,6 @@ pub struct AgentConfig {
     /// missing entirely. Set to `usize::MAX` to disable the alert.
     pub tasks_stale_after_turns: usize,
 
-    /// Request-level model parameters applied to each LLM call.
-    ///
-    /// This is the only path for request parameters: the agent fills in the
-    /// prompt cache controls it derives from the window layout and sends
-    /// everything else exactly as configured here.
-    pub request_parameters: Parameters,
-
     /// Prompt-cache keep-alive while the run waits on its own background
     /// commands. `None` disables keep-alive.
     pub cache_keep_alive: Option<CacheKeepAlive>,
@@ -104,7 +95,6 @@ impl Default for AgentConfig {
             persona_prompt: None,
             agent_kind: AgentKind::default(),
             tasks_stale_after_turns: 4,
-            request_parameters: Parameters::default(),
             cache_keep_alive: None,
             background_jobs: BackgroundJobPolicy::default(),
             #[cfg(feature = "languages")]
@@ -172,13 +162,6 @@ impl AgentConfig {
     #[must_use]
     pub const fn with_agent_kind(mut self, kind: AgentKind) -> Self {
         self.agent_kind = kind;
-        self
-    }
-
-    /// Sets default request-level model parameters for each LLM call.
-    #[must_use]
-    pub fn with_request_parameters(mut self, parameters: Parameters) -> Self {
-        self.request_parameters = parameters;
         self
     }
 

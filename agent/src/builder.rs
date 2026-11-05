@@ -2,6 +2,12 @@
 //!
 //! The builder pattern allows fluent configuration of agents with
 //! tools, hooks, and various settings.
+//!
+//! The agent-level options — prompts, context policy, prompt cache, request
+//! parameters and the rest — are the methods of [`AgentOptions`], which
+//! [`AgentBuilder`] and [`TerminalAgentBuilder`](crate::TerminalAgentBuilder)
+//! both implement over the same [`AgentSettings`]. An option added there is
+//! set the same way on either builder.
 
 #[cfg(feature = "skills")]
 use std::sync::Arc;
@@ -24,8 +30,10 @@ use crate::{
     },
     hook::{HCons, Hook},
     model_group::ModelTier,
+    request_parameters::{TierParameters, WithParameters},
     tools::AgentTools,
 };
+use aither_core::llm::model::Parameters;
 
 #[cfg(feature = "mcp")]
 use aither_mcp::McpConnection;
@@ -35,18 +43,26 @@ use aither_mcp::McpConnection;
 /// Supports tiered LLM configuration:
 /// - Advanced: Primary model for main reasoning (most capable)
 /// - Balanced: Model for moderate tasks like subagents (defaults to advanced)
-/// - Fast: Model for quick tasks like compaction (defaults to balanced)
+/// - Fast: Model for quick tasks like translating a reply (defaults to balanced)
+///
+/// Each model comes with the parameters of the requests aither sends it; see
+/// [`AgentOptions::request_parameters`].
+///
+/// The agent-level options are the methods of [`AgentOptions`].
 ///
 /// # Example
 ///
 /// ```rust,ignore
+/// use aither_agent::AgentOptions;
+///
 /// // Simple: all tiers use the same model
 /// let agent = Agent::builder(claude).build();
 ///
 /// // Tiered: different models for different tasks
-/// let agent = Agent::builder(opus)      // Advanced
-///     .balanced_model(sonnet)           // Balanced
-///     .fast_model(haiku)                // Fast
+/// let agent = Agent::builder(opus)                          // Advanced
+///     .request_parameters(opus_parameters)
+///     .balanced_model(sonnet, sonnet_parameters)            // Balanced
+///     .fast_model(haiku, haiku_parameters)                  // Fast
 ///     .system_prompt("You are a helpful assistant.")
 ///     .tool(FileSystemTool::read_only("."))
 ///     .build();
@@ -62,14 +78,71 @@ pub struct AgentBuilder<
     advanced: Advanced,
     balanced: Balanced,
     fast: Fast,
-    compaction_model: Option<Compactor>,
-    tier: ModelTier,
-    tools: AgentTools,
+    /// The model compaction runs on instead of the session's own, with the
+    /// parameters of its requests.
+    compaction_model: Option<WithParameters<Compactor>>,
     hooks: H,
-    config: AgentConfig,
-    context: Context,
-    prompt_cache: crate::context::PromptCache,
-    clock: crate::AnyClock,
+    settings: AgentSettings,
+    wiring: Wiring,
+}
+
+/// What the [`AgentOptions`] of a builder set.
+///
+/// Opaque: it is read and written only through the options, and carried
+/// whole through the builder steps that change a builder's type.
+pub struct AgentSettings {
+    /// The parameters of the requests sent on each tier's model.
+    pub(crate) parameters: TierParameters,
+    pub(crate) tier: ModelTier,
+    pub(crate) config: AgentConfig,
+    pub(crate) context: Context,
+    pub(crate) prompt_cache: crate::context::PromptCache,
+    pub(crate) clock: crate::AnyClock,
+    pub(crate) context_sources: Vec<AnyContextSource>,
+    /// Resolves `BLOCKING` marks in `tasks.md`; a mark it reports dead no
+    /// longer holds the item.
+    pub(crate) blocker_resolver: Option<crate::working_docs::AnyTaskBlockerResolver>,
+    /// Where the built agent publishes each request for a fork to start from.
+    pub(crate) fork_source: Option<crate::fork::ForkSource>,
+    /// Who the built agent's tool calls are made by.
+    pub(crate) identity: aither_core::llm::AgentIdentity,
+    #[cfg(feature = "skills")]
+    pub(crate) skill_registry: Option<Arc<SkillRegistry>>,
+}
+
+impl std::fmt::Debug for AgentSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentSettings")
+            .field("tier", &self.tier)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self {
+            parameters: TierParameters::default(),
+            tier: ModelTier::default(),
+            config: AgentConfig::default(),
+            context: Context::default(),
+            prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
+            clock: crate::AnyClock::default(),
+            context_sources: Vec::new(),
+            blocker_resolver: None,
+            fork_source: None,
+            identity: aither_core::llm::AgentIdentity::Main,
+            #[cfg(feature = "skills")]
+            skill_registry: None,
+        }
+    }
+}
+
+/// What the builder wires up from the tools and channels it is given, as
+/// opposed to the options a host sets.
+#[derive(Default)]
+struct Wiring {
+    tools: AgentTools,
     connectivity: crate::connectivity::Watch,
     background_receiver: Option<BackgroundTaskReceiver>,
     permission_receiver: Option<PermissionEventReceiver>,
@@ -77,26 +150,16 @@ pub struct AgentBuilder<
     kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
     host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
     job_registry: Option<JobRegistry>,
-    context_sources: Vec<AnyContextSource>,
     /// Directory whose working documents (`tasks.md`) the agent supervises:
     /// the main agent's sandbox.
     sandbox_dir: Option<std::path::PathBuf>,
-    /// Resolves `BLOCKING` marks in `tasks.md`; a mark it reports dead no
-    /// longer holds the item.
-    blocker_resolver: Option<crate::working_docs::AnyTaskBlockerResolver>,
     /// Directory files are restored from after a forked compaction: the
     /// directory the agent's terminal works in.
     restore_dir: Option<std::path::PathBuf>,
-    /// Where the built agent publishes each request for a fork to start from.
-    fork_source: Option<crate::fork::ForkSource>,
     /// What the `compact` tool shares with the built agent, once registered.
     compact_signal: Option<std::sync::Arc<crate::compact_tool::CompactSignal>>,
-    /// Who the built agent's tool calls are made by.
-    identity: aither_core::llm::AgentIdentity,
     /// The window state a fork inherits, which replaces initialization.
     inherited: Option<Inherited>,
-    #[cfg(feature = "skills")]
-    skill_registry: Option<Arc<SkillRegistry>>,
 }
 
 /// What a fork carries over from the main agent besides its context.
@@ -111,178 +174,29 @@ impl<Advanced, Balanced, Fast, H, Compactor> std::fmt::Debug
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentBuilder")
-            .field("tier", &self.tier)
-            .field("config", &self.config)
+            .field("tier", &self.settings.tier)
+            .field("config", &self.settings.config)
             .finish_non_exhaustive()
     }
 }
 
-impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
-    /// Creates a new agent builder with default configuration.
-    ///
-    /// All model tiers (advanced/balanced/fast) use the same model.
-    pub fn new(llm: LLM) -> Self {
-        Self {
-            advanced: llm.clone(),
-            balanced: llm.clone(),
-            fast: llm,
-            compaction_model: None,
-            tier: ModelTier::default(),
-            tools: AgentTools::new(),
-            hooks: (),
-            config: AgentConfig::default(),
-            context: Context::default(),
-            prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
-            clock: crate::AnyClock::default(),
-            connectivity: crate::connectivity::Watch::default(),
-            background_receiver: None,
-            permission_receiver: None,
-            kept_receiver: None,
-            host_load_events: None,
-            job_registry: None,
-            context_sources: Vec::new(),
-            sandbox_dir: None,
-            blocker_resolver: None,
-            restore_dir: None,
-            fork_source: None,
-            compact_signal: None,
-            identity: aither_core::llm::AgentIdentity::Main,
-            inherited: None,
-            #[cfg(feature = "skills")]
-            skill_registry: None,
-        }
+pub mod sealed {
+    /// Gives [`AgentOptions`](super::AgentOptions) the settings it sets.
+    /// Private, so only the crate's own builders take the options.
+    pub trait Sealed {
+        /// The settings the options write.
+        fn settings(&mut self) -> &mut super::AgentSettings;
     }
 }
 
-impl<Advanced, Balanced, Fast, H, Compactor> AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
-where
-    Advanced: LanguageModel,
-    Balanced: LanguageModel,
-    Fast: LanguageModel,
-    Compactor: LanguageModel,
-    H: Hook,
-{
-    /// Sets the balanced model for moderate tasks (e.g., subagents).
-    ///
-    /// This model is used when spawning subagents that don't need
-    /// the full capabilities of the advanced model.
-    pub fn balanced_model<B2: LanguageModel>(
-        self,
-        model: B2,
-    ) -> AgentBuilder<Advanced, B2, Fast, H, Compactor> {
-        AgentBuilder {
-            advanced: self.advanced,
-            balanced: model,
-            fast: self.fast,
-            compaction_model: self.compaction_model,
-            tier: self.tier,
-            tools: self.tools,
-            hooks: self.hooks,
-            config: self.config,
-            context: self.context,
-            prompt_cache: self.prompt_cache,
-            clock: self.clock,
-            connectivity: self.connectivity,
-            background_receiver: self.background_receiver,
-            permission_receiver: self.permission_receiver,
-            kept_receiver: self.kept_receiver,
-            host_load_events: self.host_load_events,
-            job_registry: self.job_registry,
-            context_sources: self.context_sources,
-            sandbox_dir: self.sandbox_dir,
-            blocker_resolver: self.blocker_resolver.clone(),
-            restore_dir: self.restore_dir,
-            fork_source: self.fork_source,
-            compact_signal: self.compact_signal,
-            identity: self.identity,
-            inherited: self.inherited,
-            #[cfg(feature = "skills")]
-            skill_registry: self.skill_registry,
-        }
-    }
-
-    /// Sets the fast model for quick tasks (e.g., compaction, ask command).
-    ///
-    /// This model is used for tasks where speed and cost matter more
-    /// than capability, such as context compression.
-    pub fn fast_model<F2: LanguageModel>(
-        self,
-        model: F2,
-    ) -> AgentBuilder<Advanced, Balanced, F2, H, Compactor> {
-        AgentBuilder {
-            advanced: self.advanced,
-            balanced: self.balanced,
-            fast: model,
-            compaction_model: self.compaction_model,
-            tier: self.tier,
-            tools: self.tools,
-            hooks: self.hooks,
-            config: self.config,
-            context: self.context,
-            prompt_cache: self.prompt_cache,
-            clock: self.clock,
-            connectivity: self.connectivity,
-            background_receiver: self.background_receiver,
-            permission_receiver: self.permission_receiver,
-            kept_receiver: self.kept_receiver,
-            host_load_events: self.host_load_events,
-            job_registry: self.job_registry,
-            context_sources: self.context_sources,
-            sandbox_dir: self.sandbox_dir,
-            blocker_resolver: self.blocker_resolver.clone(),
-            restore_dir: self.restore_dir,
-            fork_source: self.fork_source,
-            compact_signal: self.compact_signal,
-            identity: self.identity,
-            inherited: self.inherited,
-            #[cfg(feature = "skills")]
-            skill_registry: self.skill_registry,
-        }
-    }
-
-    /// Sets the model compaction runs on, instead of the session's own.
-    ///
-    /// Without one, compaction reads the conversation's prompt cache on the
-    /// session's model, and an idle session is compacted shortly before the
-    /// cache expires ([`Agent::compact_when_idle`]). A different model cannot
-    /// read that cache, so with one set compaction requests go to it, idle
-    /// compaction never runs, and an idle gap past the cache lifetime
-    /// reassembles the window instead.
-    pub fn compaction_model<C2: LanguageModel>(
-        self,
-        model: C2,
-    ) -> AgentBuilder<Advanced, Balanced, Fast, H, C2> {
-        AgentBuilder {
-            advanced: self.advanced,
-            balanced: self.balanced,
-            fast: self.fast,
-            compaction_model: Some(model),
-            tier: self.tier,
-            tools: self.tools,
-            hooks: self.hooks,
-            config: self.config,
-            context: self.context,
-            prompt_cache: self.prompt_cache,
-            clock: self.clock,
-            connectivity: self.connectivity,
-            background_receiver: self.background_receiver,
-            permission_receiver: self.permission_receiver,
-            kept_receiver: self.kept_receiver,
-            host_load_events: self.host_load_events,
-            job_registry: self.job_registry,
-            context_sources: self.context_sources,
-            sandbox_dir: self.sandbox_dir,
-            blocker_resolver: self.blocker_resolver.clone(),
-            restore_dir: self.restore_dir,
-            fork_source: self.fork_source,
-            compact_signal: self.compact_signal,
-            identity: self.identity,
-            inherited: self.inherited,
-            #[cfg(feature = "skills")]
-            skill_registry: self.skill_registry,
-        }
-    }
-
+/// The agent-level options of [`AgentBuilder`] and
+/// [`TerminalAgentBuilder`](crate::TerminalAgentBuilder).
+///
+/// Both builders implement it over the same [`AgentSettings`], so every
+/// option here — and every one added later — is set the same way on either.
+/// The builder steps that change a builder's type (its hooks and its models)
+/// are methods of each builder.
+pub trait AgentOptions: sealed::Sealed + Sized {
     /// Sets which model tier to use for the agent's main reasoning loop.
     ///
     /// This allows creating subagents that use different capability levels:
@@ -295,97 +209,23 @@ where
     /// ```rust,ignore
     /// // Create an explore subagent using the balanced model
     /// let explore_agent = Agent::builder(opus)
-    ///     .balanced_model(sonnet)
-    ///     .fast_model(haiku)
+    ///     .balanced_model(sonnet, Parameters::default())
+    ///     .fast_model(haiku, Parameters::default())
     ///     .tier(ModelTier::Balanced)  // Use sonnet for reasoning
     ///     .build();
     /// ```
-    pub const fn tier(mut self, tier: ModelTier) -> Self {
-        self.tier = tier;
+    #[must_use]
+    fn tier(mut self, tier: ModelTier) -> Self {
+        self.settings().tier = tier;
         self
-    }
-
-    /// Registers an eager (always-loaded) tool.
-    ///
-    /// Eager tools are included in every LLM request.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tool cannot be registered: another tool already uses
-    /// its name, or it carries no description for the model to read. Both
-    /// are mistakes in the calling program.
-    pub fn tool<T: Tool + 'static>(mut self, tool: T) -> Self {
-        self.tools
-            .register(tool)
-            .expect("tool registration must succeed: duplicate name or missing description");
-        self
-    }
-
-    /// Registers a dynamic terminal tool (type-erased).
-    ///
-    /// This is used for child terminal capability bundles in subagents where the
-    /// concrete terminal type is not known at compile time.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `knowledge_and_time` prompt template fails to render.
-    pub fn dyn_terminal(mut self, dyn_tool: aither_sandbox::DynTerminalTool) -> Self {
-        let instructions = self.context.instructions_mut();
-        instructions.insert(
-            &InstructionSlot::PREPARED_TOOLS,
-            dyn_tool
-                .prepared_tools()
-                .render()
-                .expect("prepared tool catalog must render"),
-        );
-        // Seed knowledge/time guidance against the shared command registry so
-        // subagents are not told to run commands that were never registered
-        // (e.g. `websearch` when a provider-hosted search tool is active).
-        if !instructions.contains(&InstructionSlot::KNOWLEDGE_AND_TIME) {
-            let websearch_command = dyn_tool.has_command("websearch");
-            instructions.insert_tagged(
-                &InstructionSlot::KNOWLEDGE_AND_TIME,
-                &crate::agent::KnowledgeAndTimeTemplate { websearch_command }
-                    .render()
-                    .expect("failed to render knowledge_and_time template"),
-            );
-        }
-        self.background_receiver = Some(dyn_tool.background_receiver());
-        self.permission_receiver = Some(dyn_tool.permission_receiver());
-        self.kept_receiver = Some(dyn_tool.kept_receiver());
-        self.job_registry = Some(dyn_tool.job_registry());
-        // Files are restored after compaction, and `tasks.md` is kept, in
-        // wherever the terminal works: a subagent's are in its own space,
-        // never its parent's.
-        self.restore_dir = Some(dyn_tool.working_dir().clone());
-        self.sandbox_dir = Some(dyn_tool.working_dir().clone());
-        self.tools.register_dyn_terminal(dyn_tool);
-        self
-    }
-
-    /// Registers the native `compact` tool and arms the pre-compaction alert.
-    ///
-    /// The model calls `compact` to start an asynchronous compaction at the
-    /// next request boundary, through the same fork and apply path as
-    /// automatic compaction; the call returns at once. When usage comes
-    /// within [`ContextPolicy::warn_distance`](crate::ContextPolicy::warn_distance)
-    /// of the auto-compact point, one alert tells the model to save its work,
-    /// bring its `tasks.md` up to date and call `compact` itself.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a tool named `compact` is already registered.
-    pub fn compact_tool(mut self) -> Self {
-        let signal = std::sync::Arc::new(crate::compact_tool::CompactSignal::default());
-        self.compact_signal = Some(std::sync::Arc::clone(&signal));
-        self.tool(crate::compact_tool::CompactTool::new(signal))
     }
 
     /// Sets the identity every tool call of the built agent carries as the
     /// agent making it. An agent is the main agent unless a subagent tool
     /// builds it as a subagent.
-    pub fn identity(mut self, identity: aither_core::llm::AgentIdentity) -> Self {
-        self.identity = identity;
+    #[must_use]
+    fn identity(mut self, identity: aither_core::llm::AgentIdentity) -> Self {
+        self.settings().identity = identity;
         self
     }
 
@@ -394,54 +234,358 @@ where
     ///
     /// Take the source from
     /// [`SubagentTool::fork_source`](crate::specialized::SubagentTool::fork_source).
-    pub fn fork_source(mut self, source: crate::fork::ForkSource) -> Self {
-        self.fork_source = Some(source);
+    #[must_use]
+    fn fork_source(mut self, source: crate::fork::ForkSource) -> Self {
+        self.settings().fork_source = Some(source);
         self
     }
 
-    /// Makes the built agent a fork of the main agent that sent `fork`.
+    /// Sets the system prompt.
     ///
-    /// The agent starts from the main agent's request: its window, with the
-    /// live tail as the last message, its tool definitions as the model saw
-    /// them, its request parameters and its prompt-cache identity, so its
-    /// first request is the main agent's followed by the prompt it is given
-    /// and reads the main agent's cache. Nothing is initialized on top of
-    /// that, since initialization would rewrite the window.
-    ///
-    /// The tools run in `terminal`, the fork's own terminal. A tool of the
-    /// main agent that `terminal` does not provide stays in the definitions,
-    /// to keep the request identical, and refuses when called. The exception
-    /// is `compact`, which compacts the fork through a signal of its own.
-    pub fn forked_from(
-        mut self,
-        fork: &crate::fork::ForkSnapshot,
-        terminal: aither_sandbox::DynTerminalTool,
-    ) -> Self {
-        self.context = fork.context.clone();
-        self.prompt_cache = fork.prompt_cache.clone();
-        self.config.request_parameters = fork.request_parameters.clone();
-        self.config.context_policy = fork.context_policy;
-        self.inherited = Some(Inherited {
-            budget: fork.budget,
-            profile: Some(fork.profile.clone()),
-        });
-        self.background_receiver = Some(terminal.background_receiver());
-        self.permission_receiver = Some(terminal.permission_receiver());
-        self.kept_receiver = Some(terminal.kept_receiver());
-        self.job_registry = Some(terminal.job_registry());
-        // A fork keeps its own `tasks.md` in its own space, like any
-        // subagent, not the main agent's it inherited the context of.
-        self.restore_dir = Some(terminal.working_dir().clone());
-        self.sandbox_dir = Some(terminal.working_dir().clone());
-        // The inherited `compact` definition runs over the fork's own
-        // signal, so a call compacts the fork, never the main agent.
-        self.compact_signal = fork
-            .definitions
-            .iter()
-            .any(|definition| definition.name() == crate::compact_tool::COMPACT_TOOL_NAME)
-            .then(std::sync::Arc::default);
-        self.tools = AgentTools::forked(&fork.definitions, terminal, self.compact_signal.as_ref());
+    /// The system prompt is prepended to every conversation and
+    /// remains stable for prompt caching.
+    #[must_use]
+    fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.settings().config.system_prompt = Some(prompt.into());
         self
+    }
+
+    /// Enforces the communication and working languages `guard` holds on the
+    /// agent's replies and on `tasks.md`, and states them in the system
+    /// prompt. Give the same guard (a clone) to the tools and harness
+    /// commands that take text from the agent, so their refusals reach it as
+    /// alerts. Nothing happens while the communication language is unset or
+    /// English.
+    #[cfg(feature = "languages")]
+    #[must_use]
+    fn languages(mut self, guard: crate::LanguageGuard) -> Self {
+        self.settings().config.languages = Some(guard);
+        self
+    }
+
+    /// Sets the maximum number of iterations (turns).
+    ///
+    /// The agent will stop and return an error if this limit is exceeded.
+    #[must_use]
+    fn max_iterations(mut self, limit: usize) -> Self {
+        self.settings().config.max_iterations = limit;
+        self
+    }
+
+    /// Sets the context management policy: when compaction starts, where the
+    /// window pauses, and the budgets compaction and recovery work within.
+    #[must_use]
+    fn context_policy(mut self, policy: ContextPolicy) -> Self {
+        self.settings().config.context_policy = policy;
+        self
+    }
+
+    /// Registers a source rendered into the tail of every request.
+    ///
+    /// Sources are rendered in registration order, after the built-in ones,
+    /// and each is told when the request it contributed to was sent.
+    #[must_use]
+    fn context_source<S: ContextSource>(mut self, source: S) -> Self {
+        self.settings()
+            .context_sources
+            .push(AnyContextSource::new(source));
+        self
+    }
+
+    /// Sets an optional persona overlay prompt.
+    #[must_use]
+    fn persona_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.settings().config.persona_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Sets agent kind (coding or chatbot).
+    #[must_use]
+    fn agent_kind(mut self, kind: AgentKind) -> Self {
+        self.settings().config.agent_kind = kind;
+        self
+    }
+
+    /// Resolves `BLOCKING` mark payloads in `tasks.md`: a mark it reports
+    /// dead no longer holds the item — the work counts as runnable and the
+    /// turn cannot stop on it. Without a resolver every mark is trusted.
+    #[must_use]
+    fn blocker_resolver(mut self, resolver: impl crate::working_docs::TaskBlockerResolver) -> Self {
+        self.settings().blocker_resolver =
+            Some(crate::working_docs::AnyTaskBlockerResolver::new(resolver));
+        self
+    }
+
+    /// Sets the skill registry used for runtime skill matching and activation.
+    #[cfg(feature = "skills")]
+    #[must_use]
+    fn skill_registry(mut self, registry: Arc<SkillRegistry>) -> Self {
+        self.settings().skill_registry = Some(registry);
+        self
+    }
+
+    /// Lays the system prompt out in `layout`'s order.
+    ///
+    /// Every system block, the built-in ones included, renders at its slot's
+    /// position. Set the layout before adding blocks the default layout does
+    /// not place.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a block already added has no slot in `layout`.
+    #[must_use]
+    fn system_layout(mut self, layout: SystemLayout) -> Self {
+        self.settings().context.set_layout(layout);
+        self
+    }
+
+    /// Inserts or replaces the instruction block in `slot`, wrapped in a tag
+    /// named after the slot.
+    ///
+    /// A built-in slot set here keeps the host's text: this is how a host
+    /// replaces built-in prose such as [`InstructionSlot::PERMISSIONS`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no such slot.
+    #[must_use]
+    fn system_named(mut self, slot: &InstructionSlot, content: &str) -> Self {
+        self.settings()
+            .context
+            .instructions_mut()
+            .insert_tagged(slot, content);
+        self
+    }
+
+    /// Inserts or replaces the instruction block in `slot` with raw text.
+    ///
+    /// Unlike [`system_named`](Self::system_named), the `content` is stored
+    /// verbatim without any wrapping, for prose blocks (runtime metadata,
+    /// environment hints) where a tag adds tokens without meaning.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no such slot.
+    #[must_use]
+    fn system_text(mut self, slot: &InstructionSlot, content: impl Into<String>) -> Self {
+        self.settings()
+            .context
+            .instructions_mut()
+            .insert(slot, content);
+        self
+    }
+
+    /// Inserts or replaces the external-content block in `slot`: memory, a
+    /// repository's instructions, a fetched page or a file, rendered after
+    /// every instruction block inside a boundary it cannot close.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout has no such slot.
+    #[must_use]
+    fn external_content(mut self, slot: &ExternalSlot, content: ExternalContent) -> Self {
+        self.settings().context.external_mut().insert(slot, content);
+        self
+    }
+
+    /// Sets the full agent configuration.
+    #[must_use]
+    fn config(mut self, config: AgentConfig) -> Self {
+        self.settings().config = config;
+        self
+    }
+
+    /// Sets the parameters of every request aither sends the model the
+    /// builder was created with: the agent's turns, its compactions on that
+    /// model, its cache keep-alives and the first request of a fork, plus
+    /// the balanced and fast tiers' requests while they run on that model.
+    ///
+    /// aither sets the fields it owns per request over them — the prompt-
+    /// cache controls, structured output on a compaction, and the token cap
+    /// of a keep-alive — and sends every other field as given here. A tier
+    /// given a model of its own ([`AgentBuilder::balanced_model`],
+    /// [`AgentBuilder::fast_model`]) and the
+    /// [`compaction_model`](AgentBuilder::compaction_model) take that
+    /// model's parameters instead.
+    #[must_use]
+    fn request_parameters(mut self, parameters: Parameters) -> Self {
+        self.settings().parameters.set_shared(parameters);
+        self
+    }
+
+    /// Overrides the session's prompt-cache controller.
+    ///
+    /// The default derives a fresh session key per agent, so every rebuild
+    /// asks for a new cache shard; a host that rebuilds its agent supplies
+    /// the session's identity (and the replaced agent's epoch, through
+    /// [`PromptCache::with_epoch`](crate::context::PromptCache::with_epoch))
+    /// so the key stays the same across rebuilds. The same value sets the
+    /// Claude breakpoint retention, which is one hour by default.
+    #[must_use]
+    fn prompt_cache(mut self, cache: crate::context::PromptCache) -> Self {
+        self.settings().prompt_cache = cache;
+        self
+    }
+
+    /// Sets the Claude cache retention of the session's prompt cache,
+    /// keeping its session key; the cache lifetime follows the retention.
+    #[must_use]
+    fn claude_cache_ttl(mut self, ttl: aither_core::llm::model::ClaudePromptCacheTtl) -> Self {
+        let settings = self.settings();
+        settings.prompt_cache = settings.prompt_cache.clone().with_ttl(ttl);
+        self
+    }
+
+    /// Sets the conversation's cache lifetime, keeping the rest of its
+    /// prompt cache. Idle compaction, idle reassembly and keep-alive follow it.
+    #[must_use]
+    fn cache_lifetime(mut self, lifetime: crate::context::CacheLifetime) -> Self {
+        let settings = self.settings();
+        settings.prompt_cache = settings.prompt_cache.clone().with_lifetime(lifetime);
+        self
+    }
+
+    /// Sets the time source idle compaction, idle reassembly and cache
+    /// keep-alive read; the system clock by default.
+    #[must_use]
+    fn clock(mut self, clock: impl crate::Clock) -> Self {
+        self.settings().clock = crate::AnyClock::new(clock);
+        self
+    }
+
+    /// Enables prompt-cache keep-alive while the run waits on its own
+    /// background commands.
+    ///
+    /// `SubagentTool` sets this on child agents; ordinary agents leave it
+    /// off. It is a no-op unless the run's model is an Anthropic one.
+    #[must_use]
+    fn cache_keep_alive(mut self, keep_alive: crate::config::CacheKeepAlive) -> Self {
+        self.settings().config.cache_keep_alive = Some(keep_alive);
+        self
+    }
+
+    /// Sets what a run does with background commands still running when the
+    /// model ends its turn; [`BackgroundJobPolicy::Await`] by default.
+    ///
+    /// [`BackgroundJobPolicy::Await`]: crate::BackgroundJobPolicy::Await
+    #[must_use]
+    fn background_jobs(mut self, policy: crate::BackgroundJobPolicy) -> Self {
+        self.settings().config.background_jobs = policy;
+        self
+    }
+}
+
+impl<Advanced, Balanced, Fast, H, Compactor> sealed::Sealed
+    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+{
+    fn settings(&mut self) -> &mut AgentSettings {
+        &mut self.settings
+    }
+}
+
+impl<Advanced, Balanced, Fast, H, Compactor> AgentOptions
+    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+{
+}
+
+impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
+    /// Creates a new agent builder with default configuration.
+    ///
+    /// All model tiers (advanced/balanced/fast) use the same model.
+    pub fn new(llm: LLM) -> Self {
+        Self {
+            advanced: llm.clone(),
+            balanced: llm.clone(),
+            fast: llm,
+            compaction_model: None,
+            hooks: (),
+            settings: AgentSettings::default(),
+            wiring: Wiring::default(),
+        }
+    }
+}
+
+impl<Advanced, Balanced, Fast, H, Compactor> AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+where
+    Advanced: LanguageModel,
+    Balanced: LanguageModel,
+    Fast: LanguageModel,
+    Compactor: LanguageModel,
+    H: Hook,
+{
+    /// Sets the balanced model for moderate tasks (e.g., subagents), and the
+    /// parameters of the requests aither sends it.
+    ///
+    /// This model is used when spawning subagents that don't need
+    /// the full capabilities of the advanced model.
+    pub fn balanced_model<B2: LanguageModel>(
+        mut self,
+        model: B2,
+        parameters: Parameters,
+    ) -> AgentBuilder<Advanced, B2, Fast, H, Compactor> {
+        self.settings.parameters.set_balanced(parameters);
+        AgentBuilder {
+            advanced: self.advanced,
+            balanced: model,
+            fast: self.fast,
+            compaction_model: self.compaction_model,
+            hooks: self.hooks,
+            settings: self.settings,
+            wiring: self.wiring,
+        }
+    }
+
+    /// Sets the fast model for quick tasks (e.g., translating a reply), and
+    /// the parameters of the requests aither sends it.
+    ///
+    /// This model is used for tasks where speed and cost matter more
+    /// than capability.
+    pub fn fast_model<F2: LanguageModel>(
+        mut self,
+        model: F2,
+        parameters: Parameters,
+    ) -> AgentBuilder<Advanced, Balanced, F2, H, Compactor> {
+        self.settings.parameters.set_fast(parameters);
+        AgentBuilder {
+            advanced: self.advanced,
+            balanced: self.balanced,
+            fast: model,
+            compaction_model: self.compaction_model,
+            hooks: self.hooks,
+            settings: self.settings,
+            wiring: self.wiring,
+        }
+    }
+
+    /// Sets the model compaction runs on, instead of the session's own.
+    ///
+    /// Without one, compaction reads the conversation's prompt cache on the
+    /// session's model, and an idle session is compacted shortly before the
+    /// cache expires ([`Agent::compact_when_idle`]). A different model cannot
+    /// read that cache, so with one set compaction requests go to it, idle
+    /// compaction never runs, and an idle gap past the cache lifetime
+    /// reassembles the window instead.
+    ///
+    /// Compaction requests to it carry `parameters`, the model's own, in
+    /// place of the session model's, under the cache controls and structured
+    /// output aither sets on every compaction.
+    pub fn compaction_model<C2: LanguageModel>(
+        self,
+        model: C2,
+        parameters: Parameters,
+    ) -> AgentBuilder<Advanced, Balanced, Fast, H, C2> {
+        AgentBuilder {
+            advanced: self.advanced,
+            balanced: self.balanced,
+            fast: self.fast,
+            compaction_model: Some(WithParameters {
+                model,
+                parameters: Box::new(parameters),
+            }),
+            hooks: self.hooks,
+            settings: self.settings,
+            wiring: self.wiring,
+        }
     }
 
     /// Adds a hook to intercept agent operations.
@@ -467,85 +611,137 @@ where
             balanced: self.balanced,
             fast: self.fast,
             compaction_model: self.compaction_model,
-            tier: self.tier,
-            tools: self.tools,
             hooks: HCons::new(hook, self.hooks),
-            config: self.config,
-            context: self.context,
-            prompt_cache: self.prompt_cache,
-            clock: self.clock,
-            connectivity: self.connectivity,
-            background_receiver: self.background_receiver,
-            permission_receiver: self.permission_receiver,
-            kept_receiver: self.kept_receiver,
-            host_load_events: self.host_load_events,
-            job_registry: self.job_registry,
-            context_sources: self.context_sources,
-            sandbox_dir: self.sandbox_dir,
-            blocker_resolver: self.blocker_resolver.clone(),
-            restore_dir: self.restore_dir,
-            fork_source: self.fork_source,
-            compact_signal: self.compact_signal,
-            identity: self.identity,
-            inherited: self.inherited,
-            #[cfg(feature = "skills")]
-            skill_registry: self.skill_registry,
+            settings: self.settings,
+            wiring: self.wiring,
         }
     }
 
-    /// Sets the system prompt.
+    /// Registers an eager (always-loaded) tool.
     ///
-    /// The system prompt is prepended to every conversation and
-    /// remains stable for prompt caching.
-    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.config.system_prompt = Some(prompt.into());
-        self
-    }
-
-    /// Enforces the communication and working languages `guard` holds on the
-    /// agent's replies and on `tasks.md`, and states them in the system
-    /// prompt. Give the same guard (a clone) to the tools and harness
-    /// commands that take text from the agent, so their refusals reach it as
-    /// alerts. Nothing happens while the communication language is unset or
-    /// English.
-    #[cfg(feature = "languages")]
-    pub fn languages(mut self, guard: crate::LanguageGuard) -> Self {
-        self.config.languages = Some(guard);
-        self
-    }
-
-    /// Sets the maximum number of iterations (turns).
+    /// Eager tools are included in every LLM request.
     ///
-    /// The agent will stop and return an error if this limit is exceeded.
-    pub const fn max_iterations(mut self, limit: usize) -> Self {
-        self.config.max_iterations = limit;
-        self
-    }
-
-    /// Sets the context management policy.
-    pub const fn context_policy(mut self, policy: ContextPolicy) -> Self {
-        self.config.context_policy = policy;
-        self
-    }
-
-    /// Registers a source rendered into the tail of every request.
+    /// # Panics
     ///
-    /// Sources are rendered in registration order, after the built-in ones,
-    /// and each is told when the request it contributed to was sent.
-    pub fn context_source<S: ContextSource>(mut self, source: S) -> Self {
-        self.context_sources.push(AnyContextSource::new(source));
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
+    pub fn tool<T: Tool + 'static>(mut self, tool: T) -> Self {
+        self.wiring
+            .tools
+            .register(tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self
     }
 
-    /// Sets an optional persona overlay prompt.
-    pub fn persona_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.config.persona_prompt = Some(prompt.into());
+    /// Registers a dynamic terminal tool (type-erased).
+    ///
+    /// This is used for child terminal capability bundles in subagents where the
+    /// concrete terminal type is not known at compile time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `knowledge_and_time` prompt template fails to render.
+    pub fn dyn_terminal(mut self, dyn_tool: aither_sandbox::DynTerminalTool) -> Self {
+        let instructions = self.settings.context.instructions_mut();
+        instructions.insert(
+            &InstructionSlot::PREPARED_TOOLS,
+            dyn_tool
+                .prepared_tools()
+                .render()
+                .expect("prepared tool catalog must render"),
+        );
+        // Seed knowledge/time guidance against the shared command registry so
+        // subagents are not told to run commands that were never registered
+        // (e.g. `websearch` when a provider-hosted search tool is active).
+        if !instructions.contains(&InstructionSlot::KNOWLEDGE_AND_TIME) {
+            let websearch_command = dyn_tool.has_command("websearch");
+            instructions.insert_tagged(
+                &InstructionSlot::KNOWLEDGE_AND_TIME,
+                &crate::agent::KnowledgeAndTimeTemplate { websearch_command }
+                    .render()
+                    .expect("failed to render knowledge_and_time template"),
+            );
+        }
+        let wiring = &mut self.wiring;
+        wiring.background_receiver = Some(dyn_tool.background_receiver());
+        wiring.permission_receiver = Some(dyn_tool.permission_receiver());
+        wiring.kept_receiver = Some(dyn_tool.kept_receiver());
+        wiring.job_registry = Some(dyn_tool.job_registry());
+        // Files are restored after compaction, and `tasks.md` is kept, in
+        // wherever the terminal works: a subagent's are in its own space,
+        // never its parent's.
+        wiring.restore_dir = Some(dyn_tool.working_dir().clone());
+        wiring.sandbox_dir = Some(dyn_tool.working_dir().clone());
+        wiring.tools.register_dyn_terminal(dyn_tool);
         self
     }
 
-    /// Sets agent kind (coding or chatbot).
-    pub const fn agent_kind(mut self, kind: AgentKind) -> Self {
-        self.config.agent_kind = kind;
+    /// Registers the native `compact` tool and arms the pre-compaction alert.
+    ///
+    /// The model calls `compact` to start an asynchronous compaction at the
+    /// next request boundary, through the same fork and apply path as
+    /// automatic compaction; the call returns at once. When usage comes
+    /// within [`ContextPolicy::warn_distance`](crate::ContextPolicy::warn_distance)
+    /// of the auto-compact point, one alert tells the model to save its work,
+    /// bring its `tasks.md` up to date and call `compact` itself.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a tool named `compact` is already registered.
+    pub fn compact_tool(mut self) -> Self {
+        let signal = std::sync::Arc::new(crate::compact_tool::CompactSignal::default());
+        self.wiring.compact_signal = Some(std::sync::Arc::clone(&signal));
+        self.tool(crate::compact_tool::CompactTool::new(signal))
+    }
+
+    /// Makes the built agent a fork of the main agent that sent `fork`.
+    ///
+    /// The agent starts from the main agent's request: its window, with the
+    /// live tail as the last message, its tool definitions as the model saw
+    /// them, its request parameters and its prompt-cache identity, so its
+    /// first request is the main agent's followed by the prompt it is given
+    /// and reads the main agent's cache. Nothing is initialized on top of
+    /// that, since initialization would rewrite the window.
+    ///
+    /// The tools run in `terminal`, the fork's own terminal. A tool of the
+    /// main agent that `terminal` does not provide stays in the definitions,
+    /// to keep the request identical, and refuses when called. The exception
+    /// is `compact`, which compacts the fork through a signal of its own.
+    pub fn forked_from(
+        mut self,
+        fork: &crate::fork::ForkSnapshot,
+        terminal: aither_sandbox::DynTerminalTool,
+    ) -> Self {
+        let settings = &mut self.settings;
+        settings.context = fork.context.clone();
+        settings.prompt_cache = fork.prompt_cache.clone();
+        settings
+            .parameters
+            .set_shared(fork.request_parameters.clone());
+        settings.config.context_policy = fork.context_policy;
+        let wiring = &mut self.wiring;
+        wiring.inherited = Some(Inherited {
+            budget: fork.budget,
+            profile: Some(fork.profile.clone()),
+        });
+        wiring.background_receiver = Some(terminal.background_receiver());
+        wiring.permission_receiver = Some(terminal.permission_receiver());
+        wiring.kept_receiver = Some(terminal.kept_receiver());
+        wiring.job_registry = Some(terminal.job_registry());
+        // A fork keeps its own `tasks.md` in its own space, like any
+        // subagent, not the main agent's it inherited the context of.
+        wiring.restore_dir = Some(terminal.working_dir().clone());
+        wiring.sandbox_dir = Some(terminal.working_dir().clone());
+        // The inherited `compact` definition runs over the fork's own
+        // signal, so a call compacts the fork, never the main agent.
+        wiring.compact_signal = fork
+            .definitions
+            .iter()
+            .any(|definition| definition.name() == crate::compact_tool::COMPACT_TOOL_NAME)
+            .then(std::sync::Arc::default);
+        wiring.tools =
+            AgentTools::forked(&fork.definitions, terminal, wiring.compact_signal.as_ref());
         self
     }
 
@@ -553,86 +749,14 @@ where
     /// supervised and its files restored after compaction.
     pub fn sandbox_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         let path = path.into();
-        self.restore_dir = Some(path.clone());
-        self.sandbox_dir = Some(path);
-        self
-    }
-
-    /// Resolves `BLOCKING` mark payloads in `tasks.md`: a mark it reports
-    /// dead no longer holds the item — the work counts as runnable and the
-    /// turn cannot stop on it. Without a resolver every mark is trusted.
-    pub fn blocker_resolver(
-        mut self,
-        resolver: impl crate::working_docs::TaskBlockerResolver,
-    ) -> Self {
-        self.blocker_resolver = Some(crate::working_docs::AnyTaskBlockerResolver::new(resolver));
-        self
-    }
-
-    /// Sets the skill registry used for runtime skill matching and activation.
-    #[cfg(feature = "skills")]
-    pub fn skill_registry(mut self, registry: Arc<SkillRegistry>) -> Self {
-        self.skill_registry = Some(registry);
-        self
-    }
-
-    /// Lays the system prompt out in `layout`'s order.
-    ///
-    /// Every system block, the built-in ones included, renders at its slot's
-    /// position. Set the layout before adding blocks the default layout does
-    /// not place.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a block already added has no slot in `layout`.
-    pub fn system_layout(mut self, layout: SystemLayout) -> Self {
-        self.context.set_layout(layout);
-        self
-    }
-
-    /// Inserts or replaces the instruction block in `slot`, wrapped in a tag
-    /// named after the slot.
-    ///
-    /// A built-in slot set here keeps the host's text: this is how a host
-    /// replaces built-in prose such as [`InstructionSlot::PERMISSIONS`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the layout has no such slot.
-    pub fn system_named(mut self, slot: &InstructionSlot, content: &str) -> Self {
-        self.context.instructions_mut().insert_tagged(slot, content);
+        self.wiring.restore_dir = Some(path.clone());
+        self.wiring.sandbox_dir = Some(path);
         self
     }
 
     /// Whether the instruction block in `slot` is already set.
     pub(crate) fn has_instruction(&self, slot: &InstructionSlot) -> bool {
-        self.context.instructions().contains(slot)
-    }
-
-    /// Inserts or replaces the instruction block in `slot` with raw text.
-    ///
-    /// Unlike [`system_named`](Self::system_named), the `content` is stored
-    /// verbatim without any wrapping, for prose blocks (runtime metadata,
-    /// environment hints) where a tag adds tokens without meaning.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the layout has no such slot.
-    pub fn system_text(mut self, slot: &InstructionSlot, content: impl Into<String>) -> Self {
-        self.context.instructions_mut().insert(slot, content);
-        self
-    }
-
-    /// Inserts or replaces the external-content block in `slot`: memory, a
-    /// repository's instructions, a fetched page or a file, rendered after
-    /// every instruction block inside a boundary it cannot close.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the layout has no such slot.
-    pub fn external_content(mut self, slot: &ExternalSlot, content: ExternalContent) -> Self {
-        self.context.external_mut().insert(slot, content);
-        self
+        self.settings.context.instructions().contains(slot)
     }
 
     /// Registers an MCP connection.
@@ -681,7 +805,7 @@ where
     /// ```
     #[cfg(feature = "mcp")]
     pub fn mcp(mut self, conn: McpConnection) -> Self {
-        self.tools.register_mcp(conn);
+        self.wiring.tools.register_mcp(conn);
         self
     }
 
@@ -723,65 +847,23 @@ where
         P: aither_sandbox::PermissionHandler + 'static,
         E: executor_core::Executor + Clone + 'static,
     {
-        self.context.instructions_mut().insert(
+        self.settings.context.instructions_mut().insert(
             &InstructionSlot::PREPARED_TOOLS,
             terminal_tool
                 .prepared_tools_context()
                 .expect("terminal tools must be initialized before agent construction"),
         );
-        let background_receiver = terminal_tool.background_receiver();
-        let permission_receiver = terminal_tool.permission_receiver();
-        let kept_receiver = terminal_tool.kept_receiver();
-        let job_registry = terminal_tool.job_registry();
-        self.sandbox_dir = Some(terminal_tool.working_dir().clone());
-        self.restore_dir = Some(terminal_tool.working_dir().clone());
-        self.tools
+        let wiring = &mut self.wiring;
+        wiring.background_receiver = Some(terminal_tool.background_receiver());
+        wiring.permission_receiver = Some(terminal_tool.permission_receiver());
+        wiring.kept_receiver = Some(terminal_tool.kept_receiver());
+        wiring.job_registry = Some(terminal_tool.job_registry());
+        wiring.sandbox_dir = Some(terminal_tool.working_dir().clone());
+        wiring.restore_dir = Some(terminal_tool.working_dir().clone());
+        wiring
+            .tools
             .register(terminal_tool)
             .expect("tool registration must succeed: duplicate name or missing description");
-        self.background_receiver = Some(background_receiver);
-        self.permission_receiver = Some(permission_receiver);
-        self.kept_receiver = Some(kept_receiver);
-        self.job_registry = Some(job_registry);
-        self
-    }
-
-    /// Sets the full agent configuration.
-    pub fn config(mut self, config: AgentConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Overrides the session's prompt-cache controller.
-    ///
-    /// The default derives a fresh session key per agent, so every rebuild
-    /// asks for a new cache shard; a host that rebuilds its agent supplies
-    /// the session's identity (and the replaced agent's epoch, through
-    /// [`PromptCache::with_epoch`](crate::context::PromptCache::with_epoch))
-    /// so the key stays the same across rebuilds. The same value sets the
-    /// Claude breakpoint retention, which is one hour by default.
-    pub fn prompt_cache(mut self, cache: crate::context::PromptCache) -> Self {
-        self.prompt_cache = cache;
-        self
-    }
-
-    /// Sets the Claude cache retention of the session's prompt cache,
-    /// keeping its session key; the cache lifetime follows the retention.
-    pub fn claude_cache_ttl(mut self, ttl: aither_core::llm::model::ClaudePromptCacheTtl) -> Self {
-        self.prompt_cache = self.prompt_cache.with_ttl(ttl);
-        self
-    }
-
-    /// Sets the conversation's cache lifetime, keeping the rest of its
-    /// prompt cache. Idle compaction, idle reassembly and keep-alive follow it.
-    pub fn cache_lifetime(mut self, lifetime: crate::context::CacheLifetime) -> Self {
-        self.prompt_cache = self.prompt_cache.with_lifetime(lifetime);
-        self
-    }
-
-    /// Sets the time source idle compaction, idle reassembly and cache
-    /// keep-alive read; the system clock by default.
-    pub fn clock(mut self, clock: impl crate::Clock) -> Self {
-        self.clock = crate::AnyClock::new(clock);
         self
     }
 
@@ -795,26 +877,7 @@ where
     /// change reaches the agent's context.
     #[cfg(feature = "connectivity")]
     pub fn connectivity(mut self, connectivity: aither_connectivity::Connectivity) -> Self {
-        self.connectivity = crate::connectivity::Watch::new(connectivity);
-        self
-    }
-
-    /// Enables prompt-cache keep-alive while the run waits on its own
-    /// background commands.
-    ///
-    /// `SubagentTool` sets this on child agents; ordinary agents leave it
-    /// off. It is a no-op unless the run's model is an Anthropic one.
-    pub const fn cache_keep_alive(mut self, keep_alive: crate::config::CacheKeepAlive) -> Self {
-        self.config.cache_keep_alive = Some(keep_alive);
-        self
-    }
-
-    /// Sets what a run does with background commands still running when the
-    /// model ends its turn; [`BackgroundJobPolicy::Await`] by default.
-    ///
-    /// [`BackgroundJobPolicy::Await`]: crate::BackgroundJobPolicy::Await
-    pub const fn background_jobs(mut self, policy: crate::BackgroundJobPolicy) -> Self {
-        self.config.background_jobs = policy;
+        self.wiring.connectivity = crate::connectivity::Watch::new(connectivity);
         self
     }
 
@@ -823,8 +886,8 @@ where
     /// load becomes high and when it ends.
     ///
     /// The monitor lengthens `foreground_wait` while high load lasts and runs
-    /// until the agent is dropped. It reads the builder's [`clock`](Self::clock),
-    /// so set the clock first.
+    /// until the agent is dropped. It reads the builder's
+    /// [`clock`](AgentOptions::clock), so set the clock first.
     pub fn host_load<R, E>(
         mut self,
         executor: &E,
@@ -837,10 +900,10 @@ where
         E: executor_core::Executor,
     {
         let monitor = crate::HostLoadMonitor::new(reader, config, foreground_wait);
-        self.host_load_events = Some(crate::host_load::spawn(
+        self.wiring.host_load_events = Some(crate::host_load::spawn(
             executor,
             monitor,
-            self.clock.clone(),
+            self.settings.clock.clone(),
         ));
         self
     }
@@ -856,8 +919,8 @@ where
         receiver: BackgroundTaskReceiver,
         job_registry: JobRegistry,
     ) -> Self {
-        self.background_receiver = Some(receiver);
-        self.job_registry = Some(job_registry);
+        self.wiring.background_receiver = Some(receiver);
+        self.wiring.job_registry = Some(job_registry);
         self
     }
 
@@ -867,58 +930,88 @@ where
     /// order the tool registry holds them.
     #[must_use]
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.active_definitions()
+        self.wiring.tools.active_definitions()
     }
 
     /// Builds the agent.
     pub fn build(self) -> Agent<Advanced, Balanced, Fast, H, Compactor> {
+        let AgentSettings {
+            parameters,
+            tier,
+            config,
+            context,
+            prompt_cache,
+            clock,
+            context_sources,
+            blocker_resolver,
+            fork_source,
+            identity,
+            #[cfg(feature = "skills")]
+            skill_registry,
+        } = self.settings;
+        let Wiring {
+            tools,
+            connectivity,
+            background_receiver,
+            permission_receiver,
+            kept_receiver,
+            host_load_events,
+            job_registry,
+            sandbox_dir,
+            restore_dir,
+            compact_signal,
+            inherited,
+        } = self.wiring;
         Agent {
-            warmth: crate::CacheWarmth::new(self.prompt_cache.lifetime(), self.clock.clone()),
+            warmth: crate::CacheWarmth::new(prompt_cache.lifetime(), clock),
             advanced: std::sync::Arc::new(self.advanced),
             balanced: std::sync::Arc::new(self.balanced),
             fast: std::sync::Arc::new(self.fast),
-            compaction_model: self.compaction_model.map(std::sync::Arc::new),
+            compaction_model: self.compaction_model.map(|compactor| WithParameters {
+                model: std::sync::Arc::new(compactor.model),
+                parameters: compactor.parameters,
+            }),
+            parameters,
             idle_compacted: false,
             session: crate::agent::SessionPhase::NotStarted,
-            tier: self.tier,
-            tools: self.tools,
+            tier,
+            tools,
             hooks: self.hooks,
-            budget: self
-                .inherited
+            budget: inherited
                 .as_ref()
                 .map_or_else(crate::context::ContextBudget::default, |inherited| {
                     inherited.budget
                 }),
-            prompt_cache: self.prompt_cache,
-            context_sources: self.context_sources,
+            prompt_cache,
+            context_sources,
             reassembled: false,
             compaction: crate::compaction_state::CompactionState::default(),
             compaction_failure: None,
             tool_results: std::collections::VecDeque::new(),
-            config: self.config,
-            context: self.context,
-            initialized: self.inherited.is_some(),
-            profile: self.inherited.and_then(|inherited| inherited.profile),
-            background_receiver: self.background_receiver,
-            permission_receiver: self.permission_receiver,
-            kept_receiver: self.kept_receiver,
-            host_load_events: self.host_load_events,
-            job_registry: self.job_registry,
+            config,
+            context,
+            initialized: inherited.is_some(),
+            profile: inherited.and_then(|inherited| inherited.profile),
+            background_receiver,
+            permission_receiver,
+            kept_receiver,
+            host_load_events,
+            job_registry,
             detached_task_ids: std::collections::HashSet::new(),
-            sandbox_dir: self.sandbox_dir,
-            blocker_resolver: self.blocker_resolver.clone(),
-            restore_dir: self.restore_dir,
-            fork_source: self.fork_source,
-            compact_signal: self.compact_signal,
+            sandbox_dir,
+            blocker_resolver,
+            restore_dir,
+            fork_source,
+            compact_signal,
             compaction_warning: crate::agent::CompactionWarning::Armed,
             kept_exchanges: std::collections::HashSet::new(),
-            identity: self.identity,
-            connectivity: self.connectivity,
+            identity,
+            connectivity,
             last_request: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
-            skill_registry: self.skill_registry,
+            skill_registry,
             #[cfg(feature = "skills")]
             active_skills: crate::context::ActiveSkills::new(),
             #[cfg(feature = "skills")]
@@ -1061,6 +1154,25 @@ mod tests {
         // Type check: agent has HCons<MockHook, HCons<MockHook, ()>>
     }
 
+    /// Options set before a step that changes the builder's type survive it.
+    #[test]
+    fn options_survive_the_steps_that_change_the_builders_type() {
+        let policy = ContextPolicy {
+            safe_buffer: 1_234,
+            ..ContextPolicy::default()
+        };
+        let agent = AgentBuilder::new(MockLlm)
+            .context_policy(policy)
+            .max_iterations(7)
+            .hook(MockHook)
+            .balanced_model(MockLlm, Parameters::default())
+            .fast_model(MockLlm, Parameters::default())
+            .compaction_model(MockLlm, Parameters::default())
+            .build();
+        assert_eq!(agent.config.context_policy, policy);
+        assert_eq!(agent.config.max_iterations, 7);
+    }
+
     #[test]
     fn test_builder_max_iterations() {
         let agent = AgentBuilder::new(MockLlm).max_iterations(100).build();
@@ -1147,21 +1259,21 @@ mod tests {
         let main_dir = terminal.working_dir().clone();
         let main = AgentBuilder::new(MockLlm).dyn_terminal(terminal.clone().to_dyn());
         assert_eq!(
-            main.sandbox_dir.as_ref(),
+            main.wiring.sandbox_dir.as_ref(),
             Some(&main_dir),
             "the main agent keeps its working documents in its sandbox"
         );
         let main = AgentBuilder::new(MockLlm).terminal(terminal);
-        assert_eq!(main.sandbox_dir.as_ref(), Some(&main_dir));
+        assert_eq!(main.wiring.sandbox_dir.as_ref(), Some(&main_dir));
         let child = AgentBuilder::new(MockLlm).dyn_terminal(subagent);
         assert_ne!(space, main_dir);
         assert_eq!(
-            child.sandbox_dir.as_ref(),
+            child.wiring.sandbox_dir.as_ref(),
             Some(&space),
             "a subagent's tasks.md is in its own space, not its parent's"
         );
         assert_eq!(
-            child.restore_dir,
+            child.wiring.restore_dir,
             Some(space),
             "a subagent's files are restored after compaction"
         );

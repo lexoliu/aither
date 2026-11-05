@@ -17,7 +17,7 @@ use std::time::Instant;
 use aither_core::llm::{AgentIdentity, CallIdentity, SubagentIdentity, ToolContext};
 use aither_core::{
     LanguageModel,
-    llm::{Tool, ToolResult, oneshot},
+    llm::{Tool, ToolResult, model::Parameters, oneshot},
 };
 use aither_sandbox::{
     CommandRole, CommandUsage, CommitLedger, CommitLedgerError, CommitMark, DynTerminalTool,
@@ -28,13 +28,14 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::external::{AnyExternalSession, AnyExternalSubagent, ExternalStart, ExternalSubagent};
-use crate::AgentBuilder;
 use crate::context::CacheLifetime;
 use crate::external_hook::{self, ExternalHooks};
 use crate::fork::{ForkSnapshot, ForkSource};
 use crate::fs_util::path_exists;
 use crate::model_group::ModelTier;
+use crate::request_parameters::TierParameters;
 use crate::subagent_file::{Listed, SubagentAccess, SubagentDefinition, SubagentLookup};
+use crate::{AgentBuilder, AgentOptions};
 
 async fn checked_path_exists(path: &Path) -> anyhow::Result<bool> {
     path_exists(path)
@@ -704,6 +705,9 @@ pub struct SubagentTool<LLM> {
     /// Model a subagent runs on when the fast tier is selected; also routes
     /// the briefs of subagents that declare no tier.
     fast: LLM,
+    /// The parameters of the requests sent on each tier's model: a
+    /// subagent's, and the router's on the fast model.
+    parameters: TierParameters,
     /// The global subagents directory, looked in before the calling
     /// terminal's `agents/`.
     global_dir: PathBuf,
@@ -758,7 +762,9 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
     ///
     /// The host keeps the bundled subagents there with
     /// [`install_bundled_subagents`](crate::install_bundled_subagents). All
-    /// three model tiers use `llm`; configure distinct ones with
+    /// three model tiers use `llm`, with the parameters
+    /// [`with_request_parameters`](Self::with_request_parameters) sets;
+    /// configure distinct ones with
     /// [`with_balanced_model`](Self::with_balanced_model) and
     /// [`with_fast_model`](Self::with_fast_model).
     pub fn new(llm: LLM, global_dir: impl Into<PathBuf>) -> Self {
@@ -766,6 +772,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             advanced: llm.clone(),
             balanced: llm.clone(),
             fast: llm,
+            parameters: TierParameters::default(),
             global_dir: global_dir.into(),
             setups: HashMap::new(),
             externals: BTreeMap::new(),
@@ -803,18 +810,36 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         self
     }
 
-    /// Sets the model that runs a subagent when the balanced tier is selected.
+    /// Sets the parameters of the requests sent on the model the tool was
+    /// created with: those of every subagent on a tier that runs on it, and
+    /// the router's while the fast tier does.
+    ///
+    /// Each subagent's agent sets the fields aither owns per request over
+    /// them, as [`AgentOptions::request_parameters`] describes. A fork
+    /// sends the main agent's parameters instead, since its requests start
+    /// as the main agent's.
     #[must_use]
-    pub fn with_balanced_model(mut self, model: LLM) -> Self {
+    pub fn with_request_parameters(mut self, parameters: Parameters) -> Self {
+        self.parameters.set_shared(parameters);
+        self
+    }
+
+    /// Sets the model that runs a subagent when the balanced tier is
+    /// selected, and the parameters of its requests.
+    #[must_use]
+    pub fn with_balanced_model(mut self, model: LLM, parameters: Parameters) -> Self {
         self.balanced = model;
+        self.parameters.set_balanced(parameters);
         self
     }
 
     /// Sets the model that runs a subagent when the fast tier is selected and
-    /// that routes prompts with no model selector.
+    /// that routes prompts with no model selector, and the parameters of its
+    /// requests.
     #[must_use]
-    pub fn with_fast_model(mut self, model: LLM) -> Self {
+    pub fn with_fast_model(mut self, model: LLM, parameters: Parameters) -> Self {
         self.fast = model;
+        self.parameters.set_fast(parameters);
         self
     }
 
@@ -841,6 +866,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             advanced: self.advanced.clone(),
             balanced: self.balanced.clone(),
             fast: self.fast.clone(),
+            parameters: self.parameters.clone(),
             global_dir: self.global_dir.clone(),
             setups: self.setups.clone(),
             externals: self.externals.clone(),
@@ -877,7 +903,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
 
     /// Where the main agent publishes its requests for the `fork` subagent
     /// kind; give it to the main agent's builder with
-    /// [`AgentBuilder::fork_source`](crate::AgentBuilder::fork_source) before
+    /// [`AgentOptions::fork_source`] before
     /// handing the tool over, like [`runs`](Self::runs).
     #[must_use]
     pub fn fork_source(&self) -> ForkSource {
@@ -1399,11 +1425,14 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             }
             None => self.select_model(prompt, declared).await?,
         };
-        let selected = self.model_for(tier).clone();
+        // A fork's builder takes the main agent's parameters over these when
+        // it is made a fork of it.
+        let selected = crate::AgentBuilder::new(self.model_for(tier).clone())
+            .request_parameters(self.parameters.get(tier).clone());
 
         let agent_builder = match source {
             Source::Definition { definition, setup } => {
-                let builder = crate::AgentBuilder::new(selected)
+                let builder = selected
                     .agent_kind(crate::AgentKind::Chatbot)
                     .system_prompt(&definition.prompt);
                 match setup {
@@ -1411,7 +1440,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                     None => builder,
                 }
             }
-            Source::Fork => crate::AgentBuilder::new(selected),
+            Source::Fork => selected,
         };
         tracing::info!(subagent = %subagent_id, model = %model, "Starting subagent");
         let child_hooks = self
@@ -1588,13 +1617,11 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         .render()
         .map_err(|error| anyhow::anyhow!("failed to render the subagent router prompt: {error}"))?;
 
-        let routing: SubagentRouting = self
-            .fast
-            .generate(oneshot(system, prompt.to_string()))
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("the fast model failed to route the subagent prompt: {error}")
-            })?;
+        let request = oneshot(system, prompt.to_string())
+            .with_parameters(self.parameters.get(ModelTier::Fast).clone());
+        let routing: SubagentRouting = self.fast.generate(request).await.map_err(|error| {
+            anyhow::anyhow!("the fast model failed to route the subagent prompt: {error}")
+        })?;
 
         let name = match routing.model {
             ModelTier::Advanced => advanced.name,
@@ -2853,8 +2880,11 @@ mod tests {
     fn tiered_tool(bundled: &Bundled, routed: &'static str) -> SubagentTool<TextLlm> {
         bundled
             .tool(TextLlm::new("advanced-model"))
-            .with_balanced_model(TextLlm::new("balanced-model"))
-            .with_fast_model(TextLlm::routing("fast-model", routed))
+            .with_balanced_model(TextLlm::new("balanced-model"), Parameters::default())
+            .with_fast_model(
+                TextLlm::routing("fast-model", routed),
+                Parameters::default(),
+            )
     }
 
     /// Runs `args` and returns its result text.
@@ -2869,6 +2899,98 @@ mod tests {
             panic!("expected text result, got {result:?}");
         };
         text
+    }
+
+    /// A [`TextLlm`] that records each request under its name.
+    #[derive(Clone)]
+    struct RecordingTextLlm {
+        text: TextLlm,
+        seen: async_channel::Sender<(&'static str, LLMRequest)>,
+    }
+
+    impl LanguageModel for RecordingTextLlm {
+        type Error = NeverError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.seen
+                .try_send((self.text.name, request.clone()))
+                .expect("record model request");
+            self.text.respond(request)
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            self.text.profile()
+        }
+    }
+
+    #[tokio::test]
+    async fn each_tiers_requests_carry_its_models_parameters_under_aithers_fields() {
+        use crate::request_parameters::test_support::{
+            assert_cache_controls, host_parameters, host_part,
+        };
+        use aither_core::llm::model::ReasoningEffort;
+
+        let bundled = Bundled::new().await;
+        let local = bundled.work().join(crate::LOCAL_SUBAGENTS_DIR);
+        write_definition(&local, "routed", None, "worktrees", "ROUTED-ROLE");
+        write_definition(&local, "deep", Some("advanced"), "worktrees", "DEEP-ROLE");
+        let (seen_tx, seen_rx) = async_channel::unbounded();
+        let recording = |text| RecordingTextLlm {
+            text,
+            seen: seen_tx.clone(),
+        };
+        let shared = host_parameters(ReasoningEffort::High, 0.2);
+        let balanced = host_parameters(ReasoningEffort::Medium, 0.5);
+        let fast = host_parameters(ReasoningEffort::Low, 0.8);
+        let tool = bundled
+            .tool(recording(TextLlm::new("advanced-model")))
+            .with_request_parameters(shared.clone())
+            .with_balanced_model(recording(TextLlm::new("balanced-model")), balanced.clone())
+            .with_fast_model(
+                recording(TextLlm::routing("fast-model", r#"{"model":"balanced"}"#)),
+                fast.clone(),
+            );
+        let (dir, prompt_file) = write_prompt_file("tier-parameters", "do the task");
+
+        completed_text(&tool, named("routed", &prompt_file)).await;
+        let requests: Vec<_> = std::iter::from_fn(|| seen_rx.try_recv().ok()).collect();
+        let [("fast-model", router), ("balanced-model", turn)] = requests.as_slice() else {
+            panic!(
+                "the router ran on the fast model, then the subagent on the balanced one: {:?}",
+                requests.iter().map(|(name, _)| name).collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(
+            host_part(router),
+            fast,
+            "the router carries the fast model's"
+        );
+        assert!(router.parameters().structured_outputs);
+        assert_eq!(host_part(turn), balanced, "the subagent carries its tier's");
+        assert_cache_controls(turn);
+        assert!(!turn.parameters().structured_outputs);
+
+        completed_text(&tool, named("deep", &prompt_file)).await;
+        let requests: Vec<_> = std::iter::from_fn(|| seen_rx.try_recv().ok()).collect();
+        let [("advanced-model", turn)] = requests.as_slice() else {
+            panic!(
+                "the declared tier ran without routing: {:?}",
+                requests.iter().map(|(name, _)| name).collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(
+            host_part(turn),
+            shared,
+            "a tier on the created-with model carries its parameters"
+        );
+        assert_cache_controls(turn);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -3030,8 +3152,8 @@ mod tests {
         };
         let tool = bundled
             .tool(role("advanced-model"))
-            .with_balanced_model(role("balanced-model"))
-            .with_fast_model(role("fast-model"));
+            .with_balanced_model(role("balanced-model"), Parameters::default())
+            .with_fast_model(role("fast-model"), Parameters::default());
         let (dir, prompt_file) = write_prompt_file("definitions", "do the task");
 
         let shared = completed_text(&tool, named("shared", &prompt_file)).await;
@@ -3207,6 +3329,14 @@ mod tests {
         }
     }
 
+    /// The host's parameters of the keep-alive tool's model.
+    fn keep_alive_host_parameters() -> Parameters {
+        crate::request_parameters::test_support::host_parameters(
+            aither_core::llm::model::ReasoningEffort::High,
+            0.4,
+        )
+    }
+
     /// Builds a subagent tool whose child agent waits on a background
     /// channel driven by the test — no terminal backend needed. Returns the
     /// tool plus the sender halves and the child's job registry, so the
@@ -3225,11 +3355,13 @@ mod tests {
         let (sender, receiver) = aither_sandbox::background_task_channel();
         let (job_registry, job_service) = aither_sandbox::job_registry_channel();
         let child_jobs = job_registry.clone();
-        let tool = bundled.tool(KeepAliveMockLlm {
-            author,
-            requests,
-            turns: Arc::default(),
-        });
+        let tool = bundled
+            .tool(KeepAliveMockLlm {
+                author,
+                requests,
+                turns: Arc::default(),
+            })
+            .with_request_parameters(keep_alive_host_parameters());
         let tool = match keep_alive {
             Some(keep_alive) => tool.with_cache_keep_alive(keep_alive),
             None => tool,
@@ -3336,6 +3468,7 @@ mod tests {
         assert!(text.starts_with("Subagent 'explore' completed"), "{text}");
 
         keep_alives.extend(keep_alive_requests(&request_rx));
+        let host = keep_alive_host_parameters();
         for request in &keep_alives {
             let params = request.parameters();
             assert_eq!(params.max_tokens, Some(0));
@@ -3345,13 +3478,16 @@ mod tests {
                 "keep-alive must be non-streaming"
             );
             assert_eq!(
-                params.reasoning_effort, None,
+                params.reasoning_effort, host.reasoning_effort,
                 "keep-alive must preserve the last request's effort"
             );
             assert!(
-                !params.include_reasoning,
+                params.include_reasoning,
                 "keep-alive must preserve the last request's thinking"
             );
+            assert_eq!(params.temperature, host.temperature);
+            assert_eq!(params.websearch, host.websearch);
+            crate::request_parameters::test_support::assert_cache_controls(request);
         }
 
         // Two keep-alives crossed the configured threshold: the parent gets
@@ -3999,8 +4135,12 @@ mod tests {
             seen: &async_channel::Sender<(&'static str, LLMRequest)>,
         ) -> SubagentTool<ScriptedLlm> {
             SubagentTool::new(main.clone(), self.bundled.global())
-                .with_balanced_model(ScriptedLlm::new("balanced", seen))
-                .with_fast_model(ScriptedLlm::new("fast", seen))
+                .with_request_parameters(crate::request_parameters::test_support::host_parameters(
+                    aither_core::llm::model::ReasoningEffort::Low,
+                    0.9,
+                ))
+                .with_balanced_model(ScriptedLlm::new("balanced", seen), Parameters::default())
+                .with_fast_model(ScriptedLlm::new("fast", seen), Parameters::default())
                 .for_terminal(self.terminal.binding())
         }
 
@@ -4013,6 +4153,7 @@ mod tests {
         ) -> crate::Agent<LLM, LLM, LLM, ()> {
             let jobs = self.terminal.job_registry();
             crate::AgentBuilder::new(llm)
+                .request_parameters(main_agent_parameters())
                 .config(
                     crate::AgentConfig::new()
                         .with_system_prompt("You are the main agent.")
@@ -4029,6 +4170,15 @@ mod tests {
                 .fork_source(source)
                 .build()
         }
+    }
+
+    /// The host's parameters of the fixture's main agent; the subagent tool's
+    /// own tiers carry others.
+    fn main_agent_parameters() -> Parameters {
+        crate::request_parameters::test_support::host_parameters(
+            aither_core::llm::model::ReasoningEffort::High,
+            0.1,
+        )
     }
 
     /// A `fork` call, with the directory holding its prompt file.
@@ -4126,6 +4276,14 @@ mod tests {
             last_main.parameters().cache.openai,
             "the fork reads the main agent's cache"
         );
+        let host_part = crate::request_parameters::test_support::host_part;
+        assert_eq!(host_part(last_main), main_agent_parameters());
+        assert_eq!(
+            host_part(first),
+            main_agent_parameters(),
+            "the fork sends the main agent's parameters, not its tier's"
+        );
+        crate::request_parameters::test_support::assert_cache_controls(first);
 
         let _ = std::fs::remove_dir_all(dir);
     }

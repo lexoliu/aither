@@ -52,9 +52,12 @@ use executor_core::Executor;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
-use crate::context::{ExternalContent, ExternalSlot, InstructionSlot, SystemLayout};
+#[cfg(feature = "skills")]
+use crate::builder::sealed::Sealed as _;
+use crate::builder::{AgentSettings, sealed};
+use crate::context::InstructionSlot;
 use crate::hook::Hook;
-use crate::{Agent, AgentBuilder, config::AgentKind};
+use crate::{Agent, AgentBuilder, AgentOptions};
 use aither_core::llm::ToolResult;
 use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalDeltaTool};
 use aither_sandbox::{
@@ -158,21 +161,33 @@ pub struct Prepared;
 ///
 /// `S` tracks whether the terminal's tool environments are prepared
 /// ([`Unprepared`] or [`Prepared`]); shell backends are configured only before
-/// preparation.
-pub struct TerminalAgentBuilder<LLM, P, E, H = (), S = Unprepared>
-where
+/// preparation. `Balanced`, `Fast` and `Compactor` are the models of the
+/// agent's balanced and fast tiers and of its compactions, `LLM` until
+/// [`balanced_model`](Self::balanced_model), [`fast_model`](Self::fast_model)
+/// or [`compaction_model`](Self::compaction_model) sets another.
+///
+/// Every agent-level option is a method of [`AgentOptions`], shared with
+/// [`AgentBuilder`].
+pub struct TerminalAgentBuilder<
+    LLM,
+    P,
+    E,
+    H = (),
+    S = Unprepared,
+    Balanced = LLM,
+    Fast = Balanced,
+    Compactor = LLM,
+> where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
-    inner: AgentBuilder<LLM, LLM, LLM, H>,
+    inner: AgentBuilder<LLM, Balanced, Fast, H, Compactor>,
     terminal_tool: TerminalTool<P, E, Unconfigured>,
     registry_builder: ToolRegistryBuilder,
     tool_descriptions: Vec<(String, String)>,
     skills: Vec<SkillInfo>,
     host_load: HostLoadSetup,
-    #[cfg(feature = "skills")]
-    skill_registry: Option<SkillRegistry>,
     state: PhantomData<S>,
 }
 
@@ -194,7 +209,8 @@ impl Default for HostLoadSetup {
     }
 }
 
-impl<LLM, P, E, H, S> std::fmt::Debug for TerminalAgentBuilder<LLM, P, E, H, S>
+impl<LLM, P, E, H, S, Balanced, Fast, Compactor> std::fmt::Debug
+    for TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
@@ -250,25 +266,52 @@ where
             tool_descriptions,
             skills: Vec::new(),
             host_load: HostLoadSetup::default(),
-            #[cfg(feature = "skills")]
-            skill_registry: None,
             state: PhantomData,
         }
     }
 }
 
-impl<LLM, P, E, H, S> TerminalAgentBuilder<LLM, P, E, H, S>
+impl<LLM, P, E, H, S, Balanced, Fast, Compactor> sealed::Sealed
+    for TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
+{
+    fn settings(&mut self) -> &mut AgentSettings {
+        sealed::Sealed::settings(&mut self.inner)
+    }
+}
+
+/// The terminal agent's options are its inner [`AgentBuilder`]'s settings.
+impl<LLM, P, E, H, S, Balanced, Fast, Compactor> AgentOptions
+    for TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor>
+where
+    LLM: LanguageModel + Clone,
+    P: PermissionHandler + 'static,
+    E: Executor + Clone + 'static,
+{
+}
+
+impl<LLM, P, E, H, S, Balanced, Fast, Compactor>
+    TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor>
+where
+    LLM: LanguageModel + Clone,
+    P: PermissionHandler + 'static,
+    E: Executor + Clone + 'static,
+    Balanced: LanguageModel,
+    Fast: LanguageModel,
+    Compactor: LanguageModel,
     H: Hook,
 {
-    /// Moves every part into a builder with another hook chain or state.
-    fn rebuild<NH, NS>(
+    /// Moves every part into a builder with another hook chain, models or
+    /// state.
+    fn rebuild<NH, NS, NB, NF, NC>(
         self,
-        inner: impl FnOnce(AgentBuilder<LLM, LLM, LLM, H>) -> AgentBuilder<LLM, LLM, LLM, NH>,
-    ) -> TerminalAgentBuilder<LLM, P, E, NH, NS> {
+        inner: impl FnOnce(
+            AgentBuilder<LLM, Balanced, Fast, H, Compactor>,
+        ) -> AgentBuilder<LLM, NB, NF, NH, NC>,
+    ) -> TerminalAgentBuilder<LLM, P, E, NH, NS, NB, NF, NC> {
         TerminalAgentBuilder {
             inner: inner(self.inner),
             terminal_tool: self.terminal_tool,
@@ -276,8 +319,6 @@ where
             tool_descriptions: self.tool_descriptions,
             skills: self.skills,
             host_load: self.host_load,
-            #[cfg(feature = "skills")]
-            skill_registry: self.skill_registry,
             state: PhantomData,
         }
     }
@@ -535,103 +576,6 @@ where
         self
     }
 
-    /// Sets a custom system prompt (raw string, no template processing).
-    #[must_use]
-    pub fn system_prompt_raw(mut self, prompt: impl Into<String>) -> Self {
-        self.inner = self.inner.system_prompt(prompt.into());
-        self
-    }
-
-    /// Sets an optional persona overlay prompt.
-    #[must_use]
-    pub fn persona_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.inner = self.inner.persona_prompt(prompt.into());
-        self
-    }
-
-    /// Sets agent kind (coding/chatbot).
-    #[must_use]
-    pub fn agent_kind(mut self, kind: AgentKind) -> Self {
-        self.inner = self.inner.agent_kind(kind);
-        self
-    }
-
-    /// Registers a source rendered into the tail of every request.
-    #[must_use]
-    pub fn context_source<Source: crate::context::ContextSource>(mut self, source: Source) -> Self {
-        self.inner = self.inner.context_source(source);
-        self
-    }
-
-    /// Resolves `BLOCKING` mark payloads in `tasks.md`: a mark it reports
-    /// dead no longer holds the item. Without a resolver every mark is
-    /// trusted.
-    #[must_use]
-    pub fn blocker_resolver(
-        mut self,
-        resolver: impl crate::working_docs::TaskBlockerResolver,
-    ) -> Self {
-        self.inner = self.inner.blocker_resolver(resolver);
-        self
-    }
-
-    /// Publishes every request the agent sends to `source`, which is where
-    /// the `fork` subagent kind starts from; take it from
-    /// [`SubagentTool::fork_source`](crate::specialized::SubagentTool::fork_source).
-    #[must_use]
-    pub fn fork_source(mut self, source: crate::fork::ForkSource) -> Self {
-        self.inner = self.inner.fork_source(source);
-        self
-    }
-
-    /// Lays the system prompt out in `layout`'s order; see
-    /// [`AgentBuilder::system_layout`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if a block already added has no slot in `layout`.
-    #[must_use]
-    pub fn system_layout(mut self, layout: SystemLayout) -> Self {
-        self.inner = self.inner.system_layout(layout);
-        self
-    }
-
-    /// Inserts or replaces the instruction block in `slot`, wrapped in a tag
-    /// named after the slot; see [`AgentBuilder::system_named`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the layout has no such slot.
-    #[must_use]
-    pub fn system_named(mut self, slot: &InstructionSlot, content: &str) -> Self {
-        self.inner = self.inner.system_named(slot, content);
-        self
-    }
-
-    /// Inserts or replaces the instruction block in `slot` with raw text; see
-    /// [`AgentBuilder::system_text`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the layout has no such slot.
-    #[must_use]
-    pub fn system_text(mut self, slot: &InstructionSlot, content: impl Into<String>) -> Self {
-        self.inner = self.inner.system_text(slot, content);
-        self
-    }
-
-    /// Inserts or replaces the external-content block in `slot`; see
-    /// [`AgentBuilder::external_content`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the layout has no such slot.
-    #[must_use]
-    pub fn external_content(mut self, slot: &ExternalSlot, content: ExternalContent) -> Self {
-        self.inner = self.inner.external_content(slot, content);
-        self
-    }
-
     /// Generates and sets the default system prompt using the built-in template.
     ///
     /// This should be called after all tools are registered.
@@ -712,15 +656,47 @@ where
         self
     }
 
-    /// Adds a hook to intercept agent operations.
+    /// Adds a hook to intercept agent operations; see [`AgentBuilder::hook`].
     pub fn hook<NH: Hook>(
         self,
         hook: NH,
-    ) -> TerminalAgentBuilder<LLM, P, E, crate::HCons<NH, H>, S> {
+    ) -> TerminalAgentBuilder<LLM, P, E, crate::HCons<NH, H>, S, Balanced, Fast, Compactor> {
         self.rebuild(|inner| inner.hook(hook))
     }
 
-    /// Loads skills from a filesystem path.
+    /// Sets the balanced tier's model and the parameters of the requests
+    /// aither sends it; see [`AgentBuilder::balanced_model`].
+    pub fn balanced_model<NB: LanguageModel>(
+        self,
+        model: NB,
+        parameters: aither_core::llm::model::Parameters,
+    ) -> TerminalAgentBuilder<LLM, P, E, H, S, NB, Fast, Compactor> {
+        self.rebuild(|inner| inner.balanced_model(model, parameters))
+    }
+
+    /// Sets the fast tier's model and the parameters of the requests aither
+    /// sends it; see [`AgentBuilder::fast_model`].
+    pub fn fast_model<NF: LanguageModel>(
+        self,
+        model: NF,
+        parameters: aither_core::llm::model::Parameters,
+    ) -> TerminalAgentBuilder<LLM, P, E, H, S, Balanced, NF, Compactor> {
+        self.rebuild(|inner| inner.fast_model(model, parameters))
+    }
+
+    /// Sets the model compaction runs on, instead of the session's own, and
+    /// the parameters of the compaction requests it serves; see
+    /// [`AgentBuilder::compaction_model`].
+    pub fn compaction_model<NC: LanguageModel>(
+        self,
+        model: NC,
+        parameters: aither_core::llm::model::Parameters,
+    ) -> TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, NC> {
+        self.rebuild(|inner| inner.compaction_model(model, parameters))
+    }
+
+    /// Loads skills from a filesystem path into the builder's skill
+    /// registry, the one [`AgentOptions::skill_registry`] set or a new one.
     ///
     /// Creates the directory if it does not exist and always creates a
     /// read-only `skills` symlink inside the sandbox so the agent can
@@ -736,7 +712,14 @@ where
         let path = path.as_ref().to_path_buf();
         let abs_path = Self::resolve_absolute_dir(&path, "skills").await?;
         let loader = SkillLoader::new().add_path(&abs_path);
-        let mut registry = self.skill_registry.take().unwrap_or_default();
+        let mut registry = match self.settings().skill_registry.take() {
+            Some(registry) => Arc::try_unwrap(registry).map_err(|_| {
+                crate::AgentError::Config(
+                    "skills load into a skill registry nothing else holds".to_string(),
+                )
+            })?,
+            None => SkillRegistry::default(),
+        };
         registry.load_from(&loader).await.map_err(|error| {
             crate::AgentError::Config(path_error_text(
                 "failed to load skills from '",
@@ -755,7 +738,7 @@ where
                 description: skill.description,
             });
         }
-        self.skill_registry = Some(registry);
+        self.settings().skill_registry = Some(Arc::new(registry));
 
         Ok(self)
     }
@@ -807,73 +790,6 @@ where
         self
     }
 
-    /// Sets the model compaction runs on, instead of the session's own.
-    ///
-    /// See [`AgentBuilder::compaction_model`].
-    #[must_use]
-    pub fn compaction_model(mut self, model: LLM) -> Self {
-        self.inner = self.inner.compaction_model(model);
-        self
-    }
-
-    /// Overrides the session's prompt-cache controller.
-    ///
-    /// See [`AgentBuilder::prompt_cache`].
-    #[must_use]
-    pub fn prompt_cache(mut self, cache: crate::context::PromptCache) -> Self {
-        self.inner = self.inner.prompt_cache(cache);
-        self
-    }
-
-    /// Sets the conversation's cache lifetime, which idle compaction, idle
-    /// reassembly and keep-alive follow.
-    ///
-    /// See [`AgentBuilder::cache_lifetime`].
-    #[must_use]
-    pub fn cache_lifetime(mut self, lifetime: crate::context::CacheLifetime) -> Self {
-        self.inner = self.inner.cache_lifetime(lifetime);
-        self
-    }
-
-    /// Sets the Claude cache retention of the session's prompt cache.
-    ///
-    /// See [`AgentBuilder::claude_cache_ttl`].
-    #[must_use]
-    pub fn claude_cache_ttl(mut self, ttl: aither_core::llm::model::ClaudePromptCacheTtl) -> Self {
-        self.inner = self.inner.claude_cache_ttl(ttl);
-        self
-    }
-
-    /// Enables prompt-cache keep-alive while the run waits on its own
-    /// background commands.
-    ///
-    /// See [`AgentBuilder::cache_keep_alive`].
-    #[must_use]
-    pub fn cache_keep_alive(mut self, keep_alive: crate::config::CacheKeepAlive) -> Self {
-        self.inner = self.inner.cache_keep_alive(keep_alive);
-        self
-    }
-
-    /// Sets what a run does with background commands still running when the
-    /// model ends its turn.
-    ///
-    /// See [`AgentBuilder::background_jobs`].
-    #[must_use]
-    pub fn background_jobs(mut self, policy: crate::BackgroundJobPolicy) -> Self {
-        self.inner = self.inner.background_jobs(policy);
-        self
-    }
-
-    /// Sets the time source idle compaction, idle reassembly and cache
-    /// keep-alive read; the system clock by default.
-    ///
-    /// See [`AgentBuilder::clock`].
-    #[must_use]
-    pub fn clock(mut self, clock: impl crate::Clock) -> Self {
-        self.inner = self.inner.clock(clock);
-        self
-    }
-
     /// Sets when host memory pressure and machine load count as high, how
     /// long they must hold to start and to end, how often the host is read,
     /// and the terminal's foreground window while high load lasts.
@@ -911,13 +827,6 @@ where
     pub fn connectivity(mut self, connectivity: aither_connectivity::Connectivity) -> Self {
         self.terminal_tool = self.terminal_tool.with_connectivity(&connectivity);
         self.inner = self.inner.connectivity(connectivity);
-        self
-    }
-
-    /// Sets the maximum number of iterations.
-    #[must_use]
-    pub fn max_iterations(mut self, limit: usize) -> Self {
-        self.inner = self.inner.max_iterations(limit);
         self
     }
 
@@ -980,7 +889,7 @@ where
     /// # Panics
     ///
     /// Panics if the `knowledge_and_time` prompt template fails to render.
-    pub fn build(self) -> Agent<LLM, LLM, LLM, H> {
+    pub fn build(self) -> Agent<LLM, Balanced, Fast, H, Compactor> {
         // Render knowledge/time guidance against the actual command registry so
         // it never references a command that was not registered.
         let websearch_command = self.has_command("websearch");
@@ -1029,25 +938,22 @@ where
             ),
             None => inner,
         };
-        let inner = inner
+        inner
             .terminal(terminal_tool.clone())
-            .tool(aither_sandbox::MonitorTool::new(terminal_tool));
-        #[cfg(feature = "skills")]
-        let inner = if let Some(registry) = self.skill_registry {
-            inner.skill_registry(Arc::new(registry))
-        } else {
-            inner
-        };
-
-        inner.build()
+            .tool(aither_sandbox::MonitorTool::new(terminal_tool))
+            .build()
     }
 }
 
-impl<LLM, P, E, H> TerminalAgentBuilder<LLM, P, E, H, Unprepared>
+impl<LLM, P, E, H, Balanced, Fast, Compactor>
+    TerminalAgentBuilder<LLM, P, E, H, Unprepared, Balanced, Fast, Compactor>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
+    Balanced: LanguageModel,
+    Fast: LanguageModel,
+    Compactor: LanguageModel,
     H: Hook,
 {
     /// Sets runtime shell backend availability for `terminal`.
@@ -1108,7 +1014,10 @@ where
         mut self,
         distribution: &ToolDistribution,
         cache_root: &std::path::Path,
-    ) -> Result<TerminalAgentBuilder<LLM, P, E, H, Prepared>, ToolRuntimeError> {
+    ) -> Result<
+        TerminalAgentBuilder<LLM, P, E, H, Prepared, Balanced, Fast, Compactor>,
+        ToolRuntimeError,
+    > {
         self.terminal_tool = self
             .terminal_tool
             .initialize_tools(distribution, cache_root)
@@ -1131,18 +1040,21 @@ where
     pub async fn prepared_shell_sessions(
         mut self,
         sessions: ShellSessionRegistry,
-    ) -> Result<TerminalAgentBuilder<LLM, P, E, H, Prepared>, ToolRuntimeError> {
+    ) -> Result<
+        TerminalAgentBuilder<LLM, P, E, H, Prepared, Balanced, Fast, Compactor>,
+        ToolRuntimeError,
+    > {
         self.terminal_tool = self.terminal_tool.adopt_prepared_tools(sessions).await?;
         Ok(self.rebuild(std::convert::identity))
     }
 }
 
-impl<LLM, P, E, H> TerminalAgentBuilder<LLM, P, E, H, Prepared>
+impl<LLM, P, E, H, Balanced, Fast, Compactor>
+    TerminalAgentBuilder<LLM, P, E, H, Prepared, Balanced, Fast, Compactor>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
-    H: Hook,
 {
     /// The prepared registry, for a later builder to adopt with
     /// [`TerminalAgentBuilder::prepared_shell_sessions`].
@@ -1732,6 +1644,118 @@ mod tests {
         for command in ["apply_patch", "rg", "ast-grep", "jq"] {
             assert!(catalog.contains(command));
         }
+    }
+
+    /// The parameters a host gives `TerminalAgentBuilder` reach the provider
+    /// on the agent's turns, and a compaction model's own on its compaction,
+    /// each beside the cache controls and structured output aither sets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_agent_requests_carry_the_hosts_parameters_under_aithers_fields() {
+        use crate::request_parameters::test_support::{
+            assert_cache_controls, host_parameters, host_part,
+        };
+        use aither_core::llm::model::ReasoningEffort;
+
+        let dir = tempdir().expect("tempdir should exist");
+        let source = tempdir().unwrap();
+        let cache = crate::test_support::TempDir::new();
+        let binary = compile_baseline_fixture(source.path()).await;
+        let distribution = fixture_distribution(&binary, "1.0.0").await;
+        let session = host_parameters(ReasoningEffort::High, 0.3);
+        let compacting = host_parameters(ReasoningEffort::Low, 0.9);
+        let (requests, turns) = async_channel::unbounded();
+        let (compactor_requests, compactions) = async_channel::unbounded();
+        let mut agent =
+            TerminalAgentBuilder::new(MockLlm { requests }, noop_terminal(dir.path()).await)
+                .request_parameters(session.clone())
+                .compaction_model(
+                    MockLlm {
+                        requests: compactor_requests,
+                    },
+                    compacting.clone(),
+                )
+                .max_iterations(1)
+                .with_default_prompt()
+                .initialize_tools(&distribution, cache.path())
+                .await
+                .expect("tools prepare")
+                .build();
+        {
+            let events = agent.run("Inspect the repository", []);
+            futures_lite::pin!(events);
+            while futures_lite::StreamExt::next(&mut events).await.is_some() {}
+        }
+        // The scripted compactor answers nothing, so the compaction fails
+        // once its request is out; only that request matters here.
+        let _ = agent.compact(None).await;
+
+        let turn = turns.try_recv().expect("the turn reached the model");
+        assert_eq!(host_part(&turn), session, "the host's parameters arrive");
+        assert_cache_controls(&turn);
+        assert!(!turn.parameters().structured_outputs);
+
+        let compaction = compactions
+            .try_recv()
+            .expect("the compaction reached the compaction model");
+        assert_eq!(
+            host_part(&compaction),
+            compacting,
+            "the compaction model's own parameters arrive"
+        );
+        assert_cache_controls(&compaction);
+        assert!(compaction.parameters().structured_outputs);
+    }
+
+    /// The agent options reach a terminal agent through the same trait as
+    /// `AgentBuilder`, and the steps that change the builder's type keep
+    /// them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_agent_runs_on_the_options_the_host_sets() {
+        struct NoopHook;
+        impl Hook for NoopHook {}
+
+        let source = tempdir().unwrap();
+        let binary = compile_baseline_fixture(source.path()).await;
+        let distribution = fixture_distribution(&binary, "1.0.0").await;
+        let cache = crate::test_support::TempDir::new();
+        let dir = tempdir().unwrap();
+        let (requests, _captured) = async_channel::unbounded();
+        let policy = crate::ContextPolicy {
+            compact_at: 0.5,
+            compact_ceiling: 300_000,
+            start_distance: 20_000,
+            safe_buffer: 5_000,
+            ..crate::ContextPolicy::default()
+        };
+        let agent = TerminalAgentBuilder::new(
+            MockLlm {
+                requests: requests.clone(),
+            },
+            noop_terminal(dir.path()).await,
+        )
+        .context_policy(policy)
+        .tier(crate::ModelTier::Balanced)
+        .persona_prompt("persona")
+        .hook(NoopHook)
+        .balanced_model(
+            MockLlm {
+                requests: requests.clone(),
+            },
+            aither_core::llm::model::Parameters::default(),
+        )
+        .compaction_model(
+            MockLlm { requests },
+            aither_core::llm::model::Parameters::default(),
+        )
+        .initialize_tools(&distribution, cache.path())
+        .await
+        .unwrap()
+        .build();
+
+        assert_eq!(agent.config.context_policy, policy);
+        assert_eq!(agent.tier, crate::ModelTier::Balanced);
+        assert_eq!(agent.config.persona_prompt.as_deref(), Some("persona"));
+        assert!(agent.compaction_model.is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]

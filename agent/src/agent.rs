@@ -31,13 +31,15 @@ use crate::{
         StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
     },
     model_group::ModelTier,
+    request_parameters::{TierParameters, WithParameters},
     tools::AgentTools,
 };
 use aither_core::{
     LanguageModel,
     llm::{
         Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, StoredFile,
-        ToolCall, model::Profile as ModelProfile,
+        ToolCall,
+        model::{Parameters, Profile as ModelProfile},
     },
 };
 use askama::Template;
@@ -116,6 +118,15 @@ struct EventSink {
 }
 
 impl EventSink {
+    /// A sink whose events nobody reads, for tests driving one step of the
+    /// loop.
+    #[cfg(test)]
+    fn discarding() -> Self {
+        Self {
+            sender: async_channel::unbounded().0,
+        }
+    }
+
     fn emit(&self, event: AgentEvent) {
         let _ = self.sender.try_send(TimedEvent {
             at: jiff::Timestamp::now(),
@@ -553,7 +564,7 @@ impl PermissionPauseTracker {
 ///
 /// - `Advanced`: The primary LLM for main reasoning (most capable)
 /// - `Balanced`: LLM for moderate tasks like subagents (defaults to Advanced)
-/// - `Fast`: LLM for quick tasks like compaction (defaults to Balanced)
+/// - `Fast`: LLM for quick tasks like translating a reply (defaults to Balanced)
 /// - `H`: Composed hooks for customizing behavior (defaults to `()`)
 /// - `Compactor`: The optional compaction model, see
 ///   [`AgentBuilder::compaction_model`](crate::builder::AgentBuilder::compaction_model)
@@ -576,16 +587,17 @@ impl PermissionPauseTracker {
 /// let agent = Agent::new(claude);
 /// let response = agent.query("What is 2+2?").await?;
 ///
-/// // With tiered models
+/// // With tiered models, each with the parameters of its requests
 /// let agent = Agent::builder(opus)
-///     .balanced_model(sonnet)
-///     .fast_model(haiku)
+///     .request_parameters(opus_parameters)
+///     .balanced_model(sonnet, sonnet_parameters)
+///     .fast_model(haiku, haiku_parameters)
 ///     .build();
 ///
 /// // Subagent using balanced tier
 /// let explore_agent = Agent::builder(opus)
-///     .balanced_model(sonnet)
-///     .fast_model(haiku)
+///     .balanced_model(sonnet, sonnet_parameters)
+///     .fast_model(haiku, haiku_parameters)
 ///     .tier(ModelTier::Balanced)  // Use sonnet for reasoning
 ///     .build();
 /// ```
@@ -611,8 +623,11 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// A different model cannot read the conversation's prompt cache, so with
     /// one set compaction is never run early to catch the cache warm (see
     /// [`Agent::compact_when_idle`]), and an idle gap past the cache lifetime
-    /// reassembles the window instead.
-    pub(crate) compaction_model: Option<Arc<Compactor>>,
+    /// reassembles the window instead. Its requests carry its own parameters.
+    pub(crate) compaction_model: Option<WithParameters<Arc<Compactor>>>,
+
+    /// The parameters of the requests sent on each tier's model.
+    pub(crate) parameters: TierParameters,
 
     /// Whether the idle compaction already ran since the last request, so one
     /// idle gap compacts once.
@@ -775,6 +790,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             balanced: Arc::new(llm.clone()),
             fast: Arc::new(llm),
             compaction_model: None,
+            parameters: TierParameters::default(),
             idle_compacted: false,
             tier: ModelTier::default(),
             tools: AgentTools::new(),
@@ -1045,7 +1061,7 @@ where
         turn: usize,
         events: &EventSink,
     ) -> Result<TurnControl, AgentError> {
-        let Some(request) = self.prepare_request().await? else {
+        let Some(request) = self.prepare_request(events).await? else {
             events.emit(AgentEvent::run_paused(
                 RunPauseReason::ContextExhausted,
                 String::new(),
@@ -1197,7 +1213,14 @@ where
             .render()
             .expect("language alert template must render"),
         );
-        match crate::language::translate(self.fast.as_ref(), reply, language).await {
+        match crate::language::translate(
+            self.fast.as_ref(),
+            self.parameters.get(ModelTier::Fast),
+            reply,
+            language,
+        )
+        .await
+        {
             Ok(text) => events.emit(AgentEvent::ReplyTranslated {
                 text,
                 language: language.code().to_string(),
@@ -2131,15 +2154,7 @@ where
         let tail = self.render_tail().await;
         let definitions = self.tools.active_definitions();
         let messages = self.context.build_request(&tail);
-        // The same cache controls as the requests that wrote the prefix, so a
-        // compaction on the session's own model is served from that cache.
-        let request = LLMRequest::new(messages.clone())
-            .with_parameters(self.prompt_cache.apply(
-                self.config.request_parameters.clone(),
-                &messages,
-                !definitions.is_empty(),
-            ))
-            .with_tool_definitions(definitions);
+        let request = self.compaction_request(messages, definitions);
         #[cfg(feature = "skills")]
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
@@ -2169,14 +2184,41 @@ where
         }))
     }
 
+    /// The parameters of the requests the agent sends on its own tier's model.
+    fn own_parameters(&self) -> &Parameters {
+        self.parameters.get(self.tier)
+    }
+
+    /// A compaction request over `messages` and `definitions`: the
+    /// compaction model's parameters when one is set, else the session
+    /// model's, under the cache controls the requests that wrote the prefix
+    /// carry, so a compaction on the session's own model is served from that
+    /// cache.
+    fn compaction_request(
+        &self,
+        messages: Vec<Message>,
+        definitions: Vec<aither_core::llm::tool::ToolDefinition>,
+    ) -> LLMRequest {
+        let parameters = self
+            .compaction_model
+            .as_ref()
+            .map_or_else(|| self.own_parameters(), |compactor| &*compactor.parameters);
+        let parameters =
+            self.prompt_cache
+                .apply(parameters.clone(), &messages, !definitions.is_empty());
+        LLMRequest::new(messages)
+            .with_parameters(parameters)
+            .with_tool_definitions(definitions)
+    }
+
     /// Runs `fork` to completion on the compaction model: the configured one,
     /// or else the session's own tier.
     async fn compaction_future(
         &self,
         fork: CompactionFork,
     ) -> Result<HandoffDocument, crate::context::CompactionError> {
-        if let Some(model) = &self.compaction_model {
-            return fork.run(Arc::clone(model)).await;
+        if let Some(compactor) = &self.compaction_model {
+            return fork.run(Arc::clone(&compactor.model)).await;
         }
         match self.tier {
             ModelTier::Advanced => fork.run(Arc::clone(&self.advanced)).await,
@@ -2188,8 +2230,8 @@ where
     /// Starts `fork` in the background on the compaction model: the
     /// configured one, or else the session's own tier.
     fn start_pending_compaction(&self, fork: CompactionFork) -> PendingCompaction {
-        if let Some(model) = &self.compaction_model {
-            return PendingCompaction::start(fork, Arc::clone(model));
+        if let Some(compactor) = &self.compaction_model {
+            return PendingCompaction::start(fork, Arc::clone(&compactor.model));
         }
         match self.tier {
             ModelTier::Advanced => PendingCompaction::start(fork, Arc::clone(&self.advanced)),
@@ -2383,7 +2425,8 @@ where
     /// A compaction that fails — the one in flight, one that failed earlier
     /// alongside the run, or the one run here — sends the context through
     /// recovery: alerts and reminders are removed, long tool outputs move to
-    /// files, and the compaction reruns synchronously.
+    /// files, [`AgentEvent::CompactionRecovery`] tells the host, and the
+    /// compaction reruns synchronously.
     ///
     /// Returns `false` when there was nothing to compact, so the window is
     /// still over the pause point and the run cannot issue another request.
@@ -2392,8 +2435,8 @@ where
     ///
     /// Returns the error of the rerun when it fails too, or of the file
     /// write recovery needed.
-    async fn make_room(&mut self) -> Result<bool, AgentError> {
-        let mut failed = self.compaction_failure.is_some();
+    async fn make_room(&mut self, events: &EventSink) -> Result<bool, AgentError> {
+        let mut failure = self.compaction_failure.take().map(AgentError::from);
         if let Some(mut pending) = self.compaction.take_running() {
             let fork_point = pending.fork_point();
             match pending.wait().await {
@@ -2404,16 +2447,20 @@ where
                 }
                 Err(error) => {
                     tracing::warn!(%error, "compaction failed with the window exhausted");
-                    failed = true;
+                    failure = Some(error.into());
                 }
             }
         }
-        if !failed {
-            match Box::pin(self.compact(None)).await {
+        let failure = match failure {
+            Some(failure) => failure,
+            None => match Box::pin(self.compact(None)).await {
                 Ok(result) => return Ok(result.is_some()),
-                Err(error) => tracing::warn!(%error, "compaction failed with the window exhausted"),
-            }
-        }
+                Err(error) => {
+                    tracing::warn!(%error, "compaction failed with the window exhausted");
+                    error
+                }
+            },
+        };
 
         let policy = self.config.context_policy;
         let limits = SpillLimits {
@@ -2438,6 +2485,11 @@ where
             outputs_spilled = report.outputs_spilled,
             "rerunning the failed compaction on the cleaned context"
         );
+        events.emit(AgentEvent::CompactionRecovery {
+            error: failure,
+            alerts_removed: report.alerts_removed,
+            outputs_spilled: report.outputs_spilled,
+        });
         self.reassembled = true;
         let result = Box::pin(self.compact(None)).await?;
         Ok(result.is_some())
@@ -2790,7 +2842,10 @@ where
     ///
     /// [`ContextPolicy::start_point`]: crate::ContextPolicy::start_point
     /// [`ContextPolicy::safe_buffer`]: crate::ContextPolicy::safe_buffer
-    async fn prepare_request(&mut self) -> Result<Option<LLMRequest>, AgentError> {
+    async fn prepare_request(
+        &mut self,
+        events: &EventSink,
+    ) -> Result<Option<LLMRequest>, AgentError> {
         self.apply_completed_compaction().await;
         self.rebuild_if_cache_is_cold().await?;
         self.push_request_alerts().await;
@@ -2818,13 +2873,7 @@ where
                 .should_compact(self.budget.estimated_tokens(), self.budget.window()))
             && !self.compaction.is_active()
         {
-            let fork_request = LLMRequest::new(messages.clone())
-                .with_parameters(self.prompt_cache.apply(
-                    self.config.request_parameters.clone(),
-                    &messages,
-                    !definitions.is_empty(),
-                ))
-                .with_tool_definitions(definitions.clone());
+            let fork_request = self.compaction_request(messages.clone(), definitions.clone());
             self.hooks
                 .on_lifecycle(&external_hook::BeforeCompaction {
                     messages: self.context.len_recent(),
@@ -2843,7 +2892,7 @@ where
                 tokens = self.budget.estimated_tokens(),
                 "context window at the safe buffer; waiting for compaction"
             );
-            if !self.make_room().await? {
+            if !self.make_room(events).await? {
                 return Ok(None);
             }
             self.push_request_alerts().await;
@@ -2873,7 +2922,7 @@ where
             .observe_prefix(self.context.stable_prefix_fingerprint());
         let parameters =
             self.prompt_cache
-                .apply(self.config.request_parameters.clone(), &messages, has_tools);
+                .apply(self.own_parameters().clone(), &messages, has_tools);
         let request = LLMRequest::new(messages)
             .with_parameters(parameters)
             .with_tool_definitions(definitions);
@@ -2958,7 +3007,7 @@ where
                 .profile
                 .clone()
                 .expect("a request is only sent by an initialized agent, which has its profile"),
-            request_parameters: self.config.request_parameters.clone(),
+            request_parameters: self.own_parameters().clone(),
             context_policy: self.config.context_policy,
             definitions: definitions.to_vec(),
             usage: self.budget.usage(),
@@ -3324,6 +3373,7 @@ fn truncate_script(script: &str, max_chars: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentOptions;
 
     use crate::Handoff;
     use aither_sandbox::{CompletedCommand, CompletedTask, TerminalError};
@@ -3730,15 +3780,23 @@ mod tests {
         let mut agent = Agent::with_config(llm.clone(), config);
         agent.push_message(Message::user("hello"));
         agent.ensure_initialized().await.expect("agent initializes");
+        let (sender, events) = async_channel::unbounded();
 
         let error = agent
-            .prepare_request()
+            .prepare_request(&EventSink { sender })
             .await
             .expect_err("no request is sent on a window this far over the pause point");
 
         assert!(
             error.to_string().contains("compaction"),
             "the compaction's own error stops the run: {error}"
+        );
+        let recoveries = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|timed| matches!(timed.event, AgentEvent::CompactionRecovery { .. }))
+            .count();
+        assert_eq!(
+            recoveries, 1,
+            "the host hears of the first failure and the rerun"
         );
         // The forked attempt and the rerun each get a request and a
         // corrective retry.
@@ -3779,7 +3837,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut agent = agent_with_long_output(&llm, 360_000, dir.path()).await;
 
-        let request = agent.prepare_request().await.expect("request boundary");
+        let request = agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
 
         assert!(request.is_some(), "the turn is not held back");
         assert!(agent.compaction.is_running(), "the fork started");
@@ -3796,7 +3857,7 @@ mod tests {
 
         assert!(
             agent
-                .prepare_request()
+                .prepare_request(&EventSink::discarding())
                 .await
                 .expect("request boundary")
                 .is_some()
@@ -3812,7 +3873,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
         // The fork the boundary starts is the compaction it then waits for.
-        let request = agent.prepare_request().await.expect("request boundary");
+        let request = agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
 
         assert!(request.is_some());
         assert!(!agent.compaction.is_active());
@@ -3821,6 +3885,44 @@ mod tests {
             "the request waited for the handoff and went out on the compacted window"
         );
         assert_eq!(llm.recorded().len(), 1);
+    }
+
+    /// The recovery of a failed compaction reaches the host on the run's
+    /// stream, ahead of the turn that goes out on the compacted window.
+    #[tokio::test]
+    async fn a_run_streams_the_recovery_of_a_failed_compaction() {
+        let llm = ScriptedLlm::new(
+            1_000_000,
+            [
+                "bad".to_string(),
+                "bad".to_string(),
+                HANDOFF_JSON.to_string(),
+                "done".to_string(),
+            ],
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
+
+        let events = {
+            let stream = agent.run("keep going", []);
+            futures_lite::pin!(stream);
+            let mut events = Vec::new();
+            while let Some(event) = futures_lite::StreamExt::next(&mut stream).await {
+                events.push(event.expect("the run streams events").event);
+            }
+            events
+        };
+
+        let recovery = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::CompactionRecovery { .. }))
+            .expect("the host is told of the failure and the rerun");
+        let reply = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Text(text) if text == "done"))
+            .expect("the turn goes out after the rerun");
+        assert!(recovery < reply);
+        assert!(events.iter().any(AgentEvent::is_complete));
     }
 
     /// A failed compaction strips the alerts and reminders, moves the long
@@ -3838,10 +3940,39 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
 
-        let request = agent.prepare_request().await.expect("recovery succeeds");
+        let (sender, events) = async_channel::unbounded();
+        let request = agent
+            .prepare_request(&EventSink { sender })
+            .await
+            .expect("recovery succeeds");
 
         assert!(request.is_some());
         assert!(agent.context().handoff().is_some());
+        let recoveries = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|timed| match timed.event {
+                AgentEvent::CompactionRecovery {
+                    error,
+                    alerts_removed,
+                    outputs_spilled,
+                } => Some((error.to_string(), alerts_removed, outputs_spilled)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recoveries.len(),
+            1,
+            "one failure, one rerun: {recoveries:?}"
+        );
+        let (error, alerts_removed, outputs_spilled) = &recoveries[0];
+        assert!(
+            error.contains("compaction"),
+            "the event names the failure: {error}"
+        );
+        assert_eq!(
+            (*alerts_removed, *outputs_spilled),
+            (1, 1),
+            "the event reports the cleanup"
+        );
         let recorded = llm.recorded();
         assert_eq!(
             recorded.len(),
@@ -4173,7 +4304,7 @@ mod tests {
         agent.ensure_initialized().await.expect("agent initializes");
 
         let messages = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("a fresh window must accept a request")
@@ -4330,7 +4461,7 @@ mod tests {
         agent.push_system_alert("no native tool named foo");
 
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("a fresh window must accept a request");
@@ -4352,7 +4483,7 @@ mod tests {
 
         async fn mentions(agent: &mut Agent<MockLlm, MockLlm, MockLlm, ()>, text: &str) -> usize {
             let request = agent
-                .prepare_request()
+                .prepare_request(&EventSink::discarding())
                 .await
                 .expect("request boundary")
                 .expect("a fresh window must accept a request");
@@ -4750,7 +4881,10 @@ mod tests {
         agent.context_mut().set_handoff("resume here");
         agent.push_message(Message::user("hello"));
 
-        let request = agent.prepare_request().await.expect("request boundary");
+        let request = agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
 
         assert!(
             request.is_some(),
@@ -4785,7 +4919,10 @@ mod tests {
             agent.push_message(message);
         }
 
-        let request = agent.prepare_request().await.expect("request boundary");
+        let request = agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
 
         assert!(
             request.is_some(),
@@ -4830,7 +4967,10 @@ mod tests {
             .compaction
             .start(PendingCompaction::start(fork, llm.clone()));
 
-        let request = agent.prepare_request().await.expect("request boundary");
+        let request = agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
 
         assert!(
             request.is_some(),
@@ -4875,7 +5015,7 @@ mod tests {
         );
 
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after compaction");
@@ -4911,7 +5051,7 @@ mod tests {
         );
 
         agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after apply");
@@ -4953,7 +5093,7 @@ mod tests {
         );
 
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after apply");
@@ -4968,6 +5108,10 @@ mod tests {
     /// Dropping the apply while it reads the files to restore commits
     /// nothing: the compaction stays landed and the next boundary applies it
     /// in full, restored files included.
+    ///
+    /// The read runs on the blocking pool, which may finish it within the
+    /// first poll; the apply must then have committed in full. Either way
+    /// the apply is never seen half done.
     #[tokio::test]
     async fn dropping_the_apply_during_restoration_leaves_the_compaction_pending() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4992,13 +5136,17 @@ mod tests {
             },
         );
 
-        let dropped = futures_lite::future::poll_once(agent.apply_completed_compaction()).await;
-        assert!(dropped.is_none(), "the apply was waiting on the file read");
-        assert!(agent.context().handoff().is_none(), "nothing was committed");
-        assert!(agent.compaction.landed().is_some(), "still pending");
+        let first_poll = futures_lite::future::poll_once(agent.apply_completed_compaction()).await;
+        if first_poll.is_none() {
+            assert!(agent.context().handoff().is_none(), "nothing was committed");
+            assert!(agent.compaction.landed().is_some(), "still pending");
+        } else {
+            assert!(agent.context().handoff().is_some(), "committed in full");
+            assert!(agent.compaction.landed().is_none(), "nothing left pending");
+        }
 
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after apply");
@@ -5029,7 +5177,12 @@ mod tests {
         agent
             .compaction
             .start(PendingCompaction::start(fork, llm.clone()));
-        assert!(agent.make_room().await.expect("compaction lands"));
+        assert!(
+            agent
+                .make_room(&EventSink::discarding())
+                .await
+                .expect("compaction lands")
+        );
 
         let recorded = llm.recorded();
         let compaction = &recorded[0];
@@ -5068,7 +5221,7 @@ mod tests {
             .expect("preview");
 
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after preview");
@@ -5089,7 +5242,10 @@ mod tests {
         let mut agent = Agent::builder(MockLlm {
             context_length: 1_000_000,
         })
-        .compaction_model(ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]))
+        .compaction_model(
+            ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]),
+            Parameters::default(),
+        )
         .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
@@ -5101,7 +5257,7 @@ mod tests {
         agent.backdate_cache_entry(Duration::from_secs(300));
         assert!(
             agent
-                .prepare_request()
+                .prepare_request(&EventSink::discarding())
                 .await
                 .expect("request boundary")
                 .is_some()
@@ -5112,7 +5268,7 @@ mod tests {
         agent.backdate_cache_entry(Duration::from_secs(3540));
         assert!(
             agent
-                .prepare_request()
+                .prepare_request(&EventSink::discarding())
                 .await
                 .expect("request boundary")
                 .is_some()
@@ -5124,7 +5280,7 @@ mod tests {
         agent.backdate_cache_entry(Duration::from_secs(3660));
         assert!(
             agent
-                .prepare_request()
+                .prepare_request(&EventSink::discarding())
                 .await
                 .expect("request boundary")
                 .is_some()
@@ -5139,9 +5295,12 @@ mod tests {
         let mut agent = Agent::builder(MockLlm {
             context_length: 1_000_000,
         })
-        .compaction_model(MockLlm {
-            context_length: 1_000_000,
-        })
+        .compaction_model(
+            MockLlm {
+                context_length: 1_000_000,
+            },
+            Parameters::default(),
+        )
         .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.use_cache_lifetime(CacheLifetime::Permanent);
@@ -5155,7 +5314,7 @@ mod tests {
         agent.backdate_cache_entry(Duration::from_secs(86_400));
         assert!(
             agent
-                .prepare_request()
+                .prepare_request(&EventSink::discarding())
                 .await
                 .expect("request boundary")
                 .is_some()
@@ -5188,7 +5347,7 @@ mod tests {
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user(text));
         agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("the first request goes out");
@@ -5271,7 +5430,7 @@ mod tests {
         // The next request re-arms it for the next gap.
         agent.push_message(Message::user("again"));
         agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after idle");
@@ -5387,12 +5546,12 @@ mod tests {
         let main = ScriptedLlm::new(1_000_000, []);
         let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let mut agent = Agent::builder(main.clone())
-            .compaction_model(compactor.clone())
+            .compaction_model(compactor.clone(), Parameters::default())
             .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
         agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("first request");
@@ -5409,15 +5568,106 @@ mod tests {
         // The forked compaction goes to the compaction model as well.
         let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let mut agent = Agent::builder(ScriptedLlm::new(1_000_000, []))
-            .compaction_model(compactor.clone())
+            .compaction_model(compactor.clone(), Parameters::default())
             .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
         let tail = agent.render_tail().await;
         let request = LLMRequest::new(agent.context.build_request(&tail));
         agent.start_compaction(&request, None);
-        assert!(agent.make_room().await.expect("compaction lands"));
+        assert!(
+            agent
+                .make_room(&EventSink::discarding())
+                .await
+                .expect("compaction lands")
+        );
         assert_eq!(compactor.recorded().len(), 1);
+    }
+
+    /// The host's parameters reach the provider on the turns and the
+    /// compaction the agent sends its model, beside the cache controls aither
+    /// derives and, on the compaction, structured output.
+    #[tokio::test]
+    async fn the_hosts_parameters_arrive_with_the_cache_controls_and_structured_output() {
+        use crate::request_parameters::test_support::{
+            assert_cache_controls, host_parameters, host_part,
+        };
+        let host = host_parameters(aither_core::llm::model::ReasoningEffort::High, 0.3);
+        let llm = ScriptedLlm::new(
+            1_000_000,
+            ["the answer".to_string(), HANDOFF_JSON.to_string()],
+        );
+        let mut agent = Agent::builder(llm.clone())
+            .request_parameters(host.clone())
+            .prompt_cache(PromptCache::new("session-1"))
+            .build();
+        agent.query("hello").await.expect("the turn runs");
+        agent.compact(None).await.expect("compaction succeeds");
+
+        let [turn, compaction]: [LLMRequest; 2] = llm
+            .recorded()
+            .try_into()
+            .expect("a turn, then the compaction");
+        for request in [&turn, &compaction] {
+            assert_eq!(host_part(request), host, "the host's parameters arrive");
+            assert_cache_controls(request);
+        }
+        assert_eq!(
+            turn.parameters()
+                .cache
+                .openai
+                .as_ref()
+                .and_then(|openai| openai.key.as_deref()),
+            Some("session-1:0"),
+            "the turn carries the session's cache key"
+        );
+        assert!(!turn.parameters().structured_outputs);
+        assert!(
+            compaction.parameters().structured_outputs,
+            "the compaction asks for structured output"
+        );
+        assert_eq!(
+            compaction.parameters().cache.openai,
+            turn.parameters().cache.openai,
+            "the compaction reads the cache the turn wrote"
+        );
+    }
+
+    /// A compaction model's requests carry its own parameters, not the
+    /// session model's, under the cache controls and structured output.
+    #[tokio::test]
+    async fn a_compaction_model_gets_its_own_parameters_under_aithers_fields() {
+        use crate::request_parameters::test_support::{
+            assert_cache_controls, host_parameters, host_part,
+        };
+        use aither_core::llm::model::ReasoningEffort;
+        let session = host_parameters(ReasoningEffort::High, 0.3);
+        let compacting = host_parameters(ReasoningEffort::Low, 0.9);
+        let main = ScriptedLlm::new(1_000_000, ["the answer".to_string()]);
+        let compactor = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = Agent::builder(main.clone())
+            .request_parameters(session.clone())
+            .compaction_model(compactor.clone(), compacting.clone())
+            .build();
+        agent.query("hello").await.expect("the turn runs");
+        agent.compact(None).await.expect("compaction succeeds");
+
+        let [turn]: [LLMRequest; 1] = main
+            .recorded()
+            .try_into()
+            .expect("one turn on the session's model");
+        let [compaction]: [LLMRequest; 1] = compactor
+            .recorded()
+            .try_into()
+            .expect("the compaction on the compaction model");
+        assert_eq!(host_part(&turn), session);
+        assert_eq!(
+            host_part(&compaction),
+            compacting,
+            "the compaction model's own parameters arrive"
+        );
+        assert_cache_controls(&compaction);
+        assert!(compaction.parameters().structured_outputs);
     }
 
     /// Idle reassembly and idle compaction exclude each other: an idle gap
@@ -5428,7 +5678,9 @@ mod tests {
             let llm = ScriptedLlm::new(1_000_000, []);
             let builder = Agent::builder(llm);
             let mut agent = if let Some(model) = compaction_model {
-                builder.compaction_model(model).build()
+                builder
+                    .compaction_model(model, Parameters::default())
+                    .build()
             } else {
                 builder.build()
             };
@@ -5440,7 +5692,7 @@ mod tests {
             agent.backdate_cache_entry(Duration::from_secs(3660));
             assert!(
                 agent
-                    .prepare_request()
+                    .prepare_request(&EventSink::discarding())
                     .await
                     .expect("request boundary")
                     .is_some()
@@ -5467,7 +5719,9 @@ mod tests {
     ) -> Agent<ScriptedLlm, ScriptedLlm, ScriptedLlm, (), ScriptedLlm> {
         let builder = Agent::builder(main);
         let mut agent = match compactor {
-            Some(compactor) => builder.compaction_model(compactor).build(),
+            Some(compactor) => builder
+                .compaction_model(compactor, Parameters::default())
+                .build(),
             None => builder.build(),
         };
         agent.ensure_initialized().await.expect("agent initializes");
@@ -5475,7 +5729,7 @@ mod tests {
         agent.push_message(Message::assistant("an old answer"));
         agent.push_message(Message::user("the next question"));
         agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("the first request goes out");
@@ -5501,7 +5755,7 @@ mod tests {
 
         agent.backdate_cache_entry(Duration::from_secs(3660));
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after the gap");
@@ -5517,7 +5771,7 @@ mod tests {
 
         // The send restarts the cache entry: the next one is warm.
         agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("next request");
@@ -5540,7 +5794,7 @@ mod tests {
 
         agent.backdate_cache_entry(Duration::from_secs(3660));
         agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after the gap");
@@ -5564,7 +5818,7 @@ mod tests {
 
         agent.backdate_cache_entry(Duration::from_secs(3540));
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request inside the lifetime");
@@ -5580,7 +5834,7 @@ mod tests {
 
         agent.backdate_cache_entry(Duration::from_secs(86_400));
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after the gap");
@@ -5603,7 +5857,7 @@ mod tests {
 
         agent.backdate_cache_entry(Duration::from_secs(86_400));
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after the gap");
@@ -5624,7 +5878,12 @@ mod tests {
         .await;
 
         agent.backdate_cache_entry(Duration::from_secs(3660));
-        assert!(agent.prepare_request().await.is_err());
+        assert!(
+            agent
+                .prepare_request(&EventSink::discarding())
+                .await
+                .is_err()
+        );
     }
 
     /// Messages of `request` that carry the whole tasks.md.
@@ -5654,7 +5913,7 @@ mod tests {
         agent.push_message(Message::user("hello"));
 
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("first request");
@@ -5671,7 +5930,7 @@ mod tests {
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
         let first = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("first request");
@@ -5679,7 +5938,7 @@ mod tests {
         agent.push_message(Message::assistant("working"));
         agent.push_message(Message::user("go on"));
         let later = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("later request");
@@ -5708,7 +5967,7 @@ mod tests {
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
         agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("first request");
@@ -5716,7 +5975,7 @@ mod tests {
         std::fs::write(dir.path().join("tasks.md"), "- [x] first\n- [ ] second\n")
             .expect("rewrite tasks.md");
         let changed = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after change");
@@ -5728,7 +5987,7 @@ mod tests {
         );
 
         let after = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after that");
@@ -5748,14 +6007,14 @@ mod tests {
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
         agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("first request");
 
         agent.backdate_cache_entry(Duration::from_secs(3660));
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after idle");
@@ -5771,7 +6030,7 @@ mod tests {
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
         agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("first request");
@@ -5785,7 +6044,7 @@ mod tests {
             },
         );
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after compaction");
@@ -5796,7 +6055,7 @@ mod tests {
             "the compaction dropped the earlier copy; exactly one is sent again"
         );
         let next = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request after that");
@@ -6371,7 +6630,10 @@ mod tests {
             "the tool itself starts nothing"
         );
 
-        let request = agent.prepare_request().await.expect("request boundary");
+        let request = agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
         assert!(request.is_some(), "the turn is not held back");
         assert!(agent.compaction.is_running(), "the fork started");
         assert!(llm.recorded().is_empty(), "nothing waited for it");
@@ -6382,7 +6644,10 @@ mod tests {
         let handoff = pending.wait().await.expect("handoff");
         agent.compaction.land(fork_point, handoff);
         assert!(agent.context().handoff().is_none());
-        agent.prepare_request().await.expect("later boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("later boundary");
         assert!(agent.context().handoff().is_some());
     }
 
@@ -6395,17 +6660,26 @@ mod tests {
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("work on it"));
         assert!(call_compact(&tool).await.contains("Compaction started"));
-        agent.prepare_request().await.expect("request boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
         let mut pending = agent.compaction.take_running().expect("in flight");
         let fork_point = pending.fork_point();
         let handoff = pending.wait().await.expect("handoff");
         agent.compaction.land(fork_point, handoff);
-        agent.prepare_request().await.expect("later boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("later boundary");
         assert!(agent.context().handoff().is_some(), "the compaction landed");
 
         let answer = call_compact(&tool).await;
         assert!(answer.contains("nothing has been done since"), "{answer}");
-        agent.prepare_request().await.expect("next boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("next boundary");
         assert!(!agent.compaction.is_active(), "nothing was started");
 
         // The model acts: the valve opens again.
@@ -6428,20 +6702,32 @@ mod tests {
         let (mut agent, tool) = agent_with_compact_tool_under(&llm, policy);
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("work on it"));
-        agent.prepare_request().await.expect("request boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
 
         let answer = call_compact(&tool).await;
         assert!(answer.contains("fewer than 30000 tokens"), "{answer}");
-        agent.prepare_request().await.expect("next boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("next boundary");
         assert!(!agent.compaction.is_active(), "nothing was started");
 
         let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let (mut agent, tool) = agent_with_compact_tool_under(&llm, policy);
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("u".repeat(4 * 60_000)));
-        agent.prepare_request().await.expect("request boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
         assert!(call_compact(&tool).await.contains("Compaction started"));
-        agent.prepare_request().await.expect("next boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("next boundary");
         assert!(agent.compaction.is_running(), "the fork started");
     }
 
@@ -6459,7 +6745,10 @@ mod tests {
             call_compact(&tool).await.contains("already in flight"),
             "requested twice before the boundary"
         );
-        agent.prepare_request().await.expect("request boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
         let fork_point = agent
             .compaction
             .take_running()
@@ -6472,7 +6761,10 @@ mod tests {
 
         agent.push_message(Message::user("more work"));
         assert!(call_compact(&tool).await.contains("already in flight"));
-        agent.prepare_request().await.expect("next boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("next boundary");
         let still = agent.compaction.take_running().expect("still the first");
         assert_eq!(
             still.fork_point(),
@@ -6488,7 +6780,10 @@ mod tests {
         let (mut agent, tool) = agent_with_compact_tool(&llm);
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("u".repeat(4 * 360_000)));
-        agent.prepare_request().await.expect("request boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
         assert!(agent.compaction.is_running());
 
         assert!(call_compact(&tool).await.contains("already in flight"));
@@ -6519,21 +6814,36 @@ mod tests {
 
         // 330k tokens: past the warning point (320k), short of the fork (350k).
         agent.push_message(Message::user("u".repeat(4 * 330_000)));
-        agent.prepare_request().await.expect("request boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
         assert_eq!(count_alerts(&agent), 1);
         assert!(!agent.compaction.is_active(), "the alert only asks");
 
         agent.push_message(Message::user("more"));
-        agent.prepare_request().await.expect("next boundary");
-        agent.prepare_request().await.expect("and again");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("next boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("and again");
         assert_eq!(count_alerts(&agent), 1, "one-shot");
 
         // A compaction shrinks the window; the next approach warns again.
         agent.context.clear_history();
-        agent.prepare_request().await.expect("below the point");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("below the point");
         assert_eq!(count_alerts(&agent), 0);
         agent.push_message(Message::user("u".repeat(4 * 330_000)));
-        agent.prepare_request().await.expect("second approach");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("second approach");
         assert_eq!(count_alerts(&agent), 1);
     }
 
@@ -6547,7 +6857,7 @@ mod tests {
         agent.push_message(Message::user("u".repeat(4 * 330_000)));
 
         let request = agent
-            .prepare_request()
+            .prepare_request(&EventSink::discarding())
             .await
             .expect("request boundary")
             .expect("request");
@@ -6573,7 +6883,10 @@ mod tests {
         let mut agent = Agent::new(llm.clone());
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("u".repeat(4 * 330_000)));
-        agent.prepare_request().await.expect("request boundary");
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary");
         assert!(
             agent
                 .context()

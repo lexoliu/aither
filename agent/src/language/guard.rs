@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use aither_core::{
     LanguageModel,
-    llm::{Event, oneshot},
+    llm::{Event, model::Parameters, oneshot},
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -220,22 +220,25 @@ impl LanguageGuard {
     }
 }
 
-/// Translates `text` into `language` on `model`.
+/// Translates `text` into `language` on `model`, whose requests carry
+/// `parameters`.
 ///
 /// # Errors
 ///
 /// The model's failure.
 pub async fn translate<M: LanguageModel>(
     model: &M,
+    parameters: &Parameters,
     text: &str,
     language: Language,
 ) -> Result<String, AgentError> {
     let system = TranslateTemplate { language }
         .render()
         .expect("language translate template must render");
+    let request = oneshot(system, text).with_parameters(parameters.clone());
     // Boxed so the provider's large stream state does not inflate the run
     // future that awaits this (aither#143).
-    let mut stream = Box::pin(model.respond(oneshot(system, text)));
+    let mut stream = Box::pin(model.respond(request));
     let mut translated = String::new();
     while let Some(event) = stream.next().await {
         if let Event::Text(chunk) = event.map_err(|error| AgentError::from_model_error(&error))? {
