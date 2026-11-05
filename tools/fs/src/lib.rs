@@ -14,7 +14,8 @@ use anyhow::{Result, anyhow};
 use arc_swap::ArcSwap;
 use askama::Template;
 use async_fs::{
-    OpenOptions, create_dir_all, read_dir, read_to_string, remove_dir, remove_file, write,
+    OpenOptions, canonicalize, create_dir_all, read_dir, read_to_string, remove_dir, remove_file,
+    symlink_metadata, write,
 };
 use futures_lite::{AsyncWriteExt, StreamExt};
 use schemars::JsonSchema;
@@ -282,35 +283,61 @@ impl LocalFileSystem {
         })
     }
 
-    async fn resolve(&self, relative: &Path, create_parent: bool) -> io::Result<PathBuf> {
+    /// Resolve `relative` to an absolute path inside the root without touching
+    /// the filesystem.
+    ///
+    /// The longest existing prefix (a dangling symlink counts as existing and
+    /// fails to canonicalize) is canonicalized, so symlinks and `..` in it are
+    /// resolved by the OS; the not-yet-existing remainder may only hold plain
+    /// names. The result must lie under the canonical root.
+    async fn resolve(&self, relative: &Path) -> io::Result<PathBuf> {
         let candidate = if relative.as_os_str().is_empty() {
             self.root.clone()
         } else {
             self.root.join(relative)
         };
+        let components: Vec<Component<'_>> = candidate.components().collect();
 
-        if create_parent && let Some(parent) = candidate.parent() {
-            create_dir_all(parent).await?;
+        let mut existing = components.len();
+        while existing > 0 {
+            let prefix: PathBuf = components[..existing].iter().collect();
+            if symlink_metadata(&prefix).await.is_ok() {
+                break;
+            }
+            existing -= 1;
+        }
+        let prefix: PathBuf = components[..existing].iter().collect();
+        let mut resolved = canonicalize(&prefix).await?;
+        for component in &components[existing..] {
+            match component {
+                Component::Normal(name) => resolved.push(name),
+                Component::CurDir => {}
+                _ => return Err(self.escape_error(&candidate)),
+            }
         }
 
-        let canonical = if candidate.exists() {
-            candidate.canonicalize()?
-        } else {
-            candidate.clone()
-        };
-
-        if !canonical.starts_with(&self.canonical_root) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "Access to '{}' escapes filesystem root {}",
-                    canonical.display(),
-                    self.canonical_root.display()
-                ),
-            ));
+        if !resolved.starts_with(&self.canonical_root) {
+            return Err(self.escape_error(&resolved));
         }
+        Ok(resolved)
+    }
 
-        Ok(canonical)
+    fn escape_error(&self, path: &Path) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "Access to '{}' escapes filesystem root {}",
+                path.display(),
+                self.canonical_root.display()
+            ),
+        )
+    }
+
+    async fn create_parent(target: &Path) -> io::Result<()> {
+        match target.parent() {
+            Some(parent) => create_dir_all(parent).await,
+            None => Ok(()),
+        }
     }
 
     fn ensure_writable(&self) -> io::Result<()> {
@@ -327,19 +354,21 @@ impl LocalFileSystem {
 
 impl FileSystem for LocalFileSystem {
     async fn read_file<'a>(&'a self, path: &'a Path) -> io::Result<String> {
-        let target = self.resolve(path, false).await?;
+        let target = self.resolve(path).await?;
         read_to_string(&target).await
     }
 
     async fn write_file<'a>(&'a self, path: &'a Path, contents: String) -> io::Result<()> {
         self.ensure_writable()?;
-        let target = self.resolve(path, true).await?;
+        let target = self.resolve(path).await?;
+        Self::create_parent(&target).await?;
         write(&target, contents).await
     }
 
     async fn append_file<'a>(&'a self, path: &'a Path, contents: String) -> io::Result<()> {
         self.ensure_writable()?;
-        let target = self.resolve(path, true).await?;
+        let target = self.resolve(path).await?;
+        Self::create_parent(&target).await?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -350,12 +379,12 @@ impl FileSystem for LocalFileSystem {
 
     async fn remove_file<'a>(&'a self, path: &'a Path) -> io::Result<()> {
         self.ensure_writable()?;
-        let target = self.resolve(path, false).await?;
+        let target = self.resolve(path).await?;
         remove_file(&target).await
     }
 
     async fn list_dir<'a>(&'a self, dir: &'a Path) -> io::Result<Vec<DirEntry>> {
-        let target = self.resolve(dir, false).await?;
+        let target = self.resolve(dir).await?;
         let mut reader = read_dir(&target).await?;
         let mut entries = Vec::new();
         while let Some(entry) = reader.next().await {
@@ -371,17 +400,23 @@ impl FileSystem for LocalFileSystem {
 
     async fn create_dir<'a>(&'a self, dir: &'a Path) -> io::Result<()> {
         self.ensure_writable()?;
-        let target = self.resolve(dir, true).await?;
+        let target = self.resolve(dir).await?;
         create_dir_all(&target).await
     }
 
     async fn remove_dir<'a>(&'a self, dir: &'a Path) -> io::Result<()> {
         self.ensure_writable()?;
-        let target = self.resolve(dir, false).await?;
+        let target = self.resolve(dir).await?;
         remove_dir(&target).await
     }
 
     fn glob(&self, pattern: &str) -> io::Result<Vec<String>> {
+        if Path::new(pattern)
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+        {
+            return Err(self.escape_error(Path::new(pattern)));
+        }
         let full_pattern = self.root.join(pattern);
         let pattern_str = full_pattern.to_string_lossy();
 
@@ -390,7 +425,14 @@ impl FileSystem for LocalFileSystem {
 
         let mut results = Vec::new();
         for entry in entries.flatten() {
-            // Convert to relative path
+            // Symlinks may lead out of the root: only matches that resolve
+            // inside it are reported.
+            let Ok(canonical) = fs::canonicalize(&entry) else {
+                continue;
+            };
+            if !canonical.starts_with(&self.canonical_root) {
+                continue;
+            }
             if let Ok(relative) = entry.strip_prefix(&self.root) {
                 results.push(relative.to_string_lossy().into_owned());
             }
@@ -945,6 +987,9 @@ where
         self.inner.remove_dir(dir)
     }
 }
+
+#[cfg(test)]
+mod escape_tests;
 
 #[cfg(test)]
 mod template_tests {

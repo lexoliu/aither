@@ -371,6 +371,7 @@ dependencies = [
  "glob",
  "schemars 1.2.3",
  "serde",
+ "tokio",
 ]
 
 [[package]]
