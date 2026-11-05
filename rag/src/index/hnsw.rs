@@ -87,6 +87,20 @@ impl IndexState {
         next
     }
 
+    /// A state holding `entries`, with the lookups derived from them.
+    fn from_entries(entries: Vec<IndexEntry>) -> Self {
+        let mut state = Self::new();
+        for (idx, entry) in entries.into_iter().enumerate() {
+            state.id_to_index.insert(entry.chunk.id.clone(), idx);
+            state
+                .content_hashes
+                .insert(entry.chunk.content_hash, entry.chunk.id.clone());
+            state.entries.push(entry);
+        }
+        state.dirty = true;
+        state
+    }
+
     fn clone_without_index(&self) -> Self {
         Self {
             entries: self.entries.clone(),
@@ -193,6 +207,24 @@ impl VectorIndex for HnswIndex {
         true
     }
 
+    fn remove_source(&self, source_id: &str) -> usize {
+        let mut count = 0;
+        self.state.rcu(|state| {
+            let kept: Vec<IndexEntry> = state
+                .entries
+                .iter()
+                .filter(|entry| entry.chunk.source_id != source_id)
+                .cloned()
+                .collect();
+            count = state.entries.len() - kept.len();
+            if count == 0 {
+                return Arc::clone(state);
+            }
+            Arc::new(IndexState::from_entries(kept))
+        });
+        count
+    }
+
     fn search(&self, query: &[f32], top_k: usize, threshold: f32) -> Result<Vec<SearchResult>> {
         if query.len() != self.dimension {
             return Err(RagError::DimensionMismatch {
@@ -270,24 +302,18 @@ impl VectorIndex for HnswIndex {
     }
 
     fn load(&self, entries: Vec<IndexEntry>) -> Result<()> {
-        let mut state = IndexState::new();
-
-        for (idx, entry) in entries.into_iter().enumerate() {
-            if entry.embedding.len() != self.dimension {
-                return Err(RagError::DimensionMismatch {
-                    expected: self.dimension,
-                    actual: entry.embedding.len(),
-                });
-            }
-            state.id_to_index.insert(entry.chunk.id.clone(), idx);
-            state
-                .content_hashes
-                .insert(entry.chunk.content_hash, entry.chunk.id.clone());
-            state.entries.push(entry);
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.embedding.len() != self.dimension)
+        {
+            return Err(RagError::DimensionMismatch {
+                expected: self.dimension,
+                actual: entry.embedding.len(),
+            });
         }
 
-        state.dirty = true;
-        self.state.store(Arc::new(state));
+        self.state
+            .store(Arc::new(IndexState::from_entries(entries)));
         Ok(())
     }
 
