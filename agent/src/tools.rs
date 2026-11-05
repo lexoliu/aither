@@ -216,21 +216,8 @@ impl AgentTools {
                     .await
                     .map_err(|e| anyhow::anyhow!("MCP tool error: {e}"))?;
 
-                let output = result
-                    .content
-                    .into_iter()
-                    .filter_map(|c| match c {
-                        aither_mcp::Content::Text(t) => Some(t.text),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                return if result.is_error {
-                    Err(anyhow::anyhow!("{output}"))
-                } else {
-                    output.into_tool_result()
-                };
+                return aither_mcp::call_result_to_tool_result(result)
+                    .map_err(|e| anyhow::anyhow!("MCP tool error: {e}"));
             }
         }
 
@@ -312,6 +299,64 @@ mod tests {
         ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
             std::future::ready(Ok(ToolResult::text("ok")))
         }
+    }
+
+    /// A tool that answers with a PNG.
+    #[cfg(feature = "mcp")]
+    struct Screenshot;
+
+    #[cfg(feature = "mcp")]
+    impl Tool for Screenshot {
+        fn name(&self) -> Cow<'static, str> {
+            Cow::Borrowed("screenshot")
+        }
+
+        type Arguments = DummyArgs;
+
+        type Res = ToolResult;
+
+        fn call(
+            &self,
+            _args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(ToolResult::image(
+                vec![0x89, b'P', b'N', b'G'],
+                "image/png",
+            )))
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn an_mcp_image_result_reaches_the_model_as_an_image() {
+        use aither_mcp::transport::DuplexTransport;
+
+        let (server_end, client_end) = DuplexTransport::pair();
+        let mut exposed = aither_core::llm::tool::Tools::new();
+        exposed.register(Screenshot).expect("screenshot registers");
+        let mut mcp_server = aither_mcp::McpServer::new(server_end, exposed, "screens", "1");
+        let running = tokio::spawn(async move { mcp_server.run().await });
+
+        let conn = McpConnection::connect(&executor_core::tokio::TokioGlobal, client_end, ())
+            .await
+            .expect("connects");
+        let mut tools = AgentTools::new();
+        tools.register_mcp(conn);
+
+        let result = tools
+            .call("screenshot", "{}", aither_core::llm::ToolContext::new())
+            .await
+            .expect("the call succeeds");
+
+        assert_eq!(
+            result,
+            ToolResult::Binary {
+                mime: "image/png".to_string(),
+                content: vec![0x89, b'P', b'N', b'G'],
+            }
+        );
+        running.abort();
     }
 
     #[test]
