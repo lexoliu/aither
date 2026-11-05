@@ -303,6 +303,17 @@ struct RunLoopOutcome {
     iteration: usize,
 }
 
+/// What a tool turn's results gave the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolTurn {
+    /// Some call returned something, or a background event arrived with the
+    /// results.
+    Progress,
+    /// Every call was refused for re-reading unchanged output, and no
+    /// background event arrived with them.
+    OnlyUnchangedReads,
+}
+
 enum TurnControl {
     Continue,
     Break {
@@ -317,7 +328,18 @@ enum ModelEventAction {
     RetryMalformed,
 }
 
-type ToolExecutionResult = Result<(String, String, aither_core::llm::ToolResult), AgentError>;
+/// A finished tool call, waiting to be paired with its call in the context.
+#[derive(Debug)]
+pub struct FinishedToolCall {
+    id: String,
+    name: String,
+    result: aither_core::llm::ToolResult,
+    /// The call was refused for re-reading output that had not changed
+    /// ([`aither_sandbox::PollRefusal::is_unchanged_read`]).
+    unchanged_read: bool,
+}
+
+type ToolExecutionResult = Result<FinishedToolCall, AgentError>;
 type ToolExecutionSignal = ExecutionSignal<ToolExecutionResult>;
 
 async fn handle_model_event<H: Hook>(
@@ -1226,10 +1248,31 @@ where
 
         Self::push_tool_start_events(&tool_calls, events);
         self.execute_tool_calls(&tool_calls, turn, events).await;
-        self.apply_tool_results(events)?;
+        let polled = self.apply_tool_results(events)?;
         self.push_tool_turn_alerts().await;
-        self.push_turn_boundary_events(run_id, turn, &response_text, events)
-            .await
+        let control = self
+            .push_turn_boundary_events(run_id, turn, &response_text, events)
+            .await?;
+        // Another request would only re-read the same output: park until the
+        // background work reports instead. Every call already has its result,
+        // so the transcript stays valid while the run waits.
+        if polled == ToolTurn::OnlyUnchangedReads
+            && matches!(control, TurnControl::Continue)
+            && self
+                .background_receiver
+                .as_ref()
+                .is_some_and(BackgroundTaskReceiver::has_running)
+        {
+            tracing::info!(
+                turn,
+                "every call re-read unchanged output; parking the run until background work reports"
+            );
+            return Ok(TurnControl::Break {
+                final_text: response_text,
+                stop_reason: StopReason::AwaitingBackground,
+            });
+        }
+        Ok(control)
     }
 
     /// Runs one model turn while a forked compaction keeps running.
@@ -1391,10 +1434,10 @@ where
         for call in unresolved {
             let finished = parked
                 .iter()
-                .position(|result| matches!(result, Ok((id, _, _)) if *id == call.id))
+                .position(|result| matches!(result, Ok(finished) if finished.id == call.id))
                 .and_then(|index| parked.remove(index));
             let content = match finished {
-                Some(Ok((_, _, result))) => result.render_for_model(),
+                Some(Ok(finished)) => finished.result.render_for_model(),
                 _ => ToolCallCancelledTemplate { tool: &call.name }
                     .render()
                     .expect("tool call cancelled template must render"),
@@ -1455,7 +1498,7 @@ where
                     turn,
                     message_count,
                 };
-                let (result, duration) =
+                let (result, duration, unchanged_read) =
                     Self::call_tool_with_hooks(hooks, tools, call, &args_json, &tool_ctx).await?;
                 let result_ctx = ToolResultContext {
                     tool_name: &call.name,
@@ -1473,7 +1516,12 @@ where
                     PostToolAction::Replace(replacement) => replacement,
                     PostToolAction::Keep => result,
                 };
-                Ok((call.id.clone(), call.name.clone(), tool_result))
+                Ok(FinishedToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    result: tool_result,
+                    unchanged_read,
+                })
             }
         });
 
@@ -1504,29 +1552,34 @@ where
         call: &ToolCall,
         args_json: &str,
         tool_ctx: &ToolUseContext<'_>,
-    ) -> Result<(aither_core::llm::ToolResult, Duration), AgentError> {
+    ) -> Result<(aither_core::llm::ToolResult, Duration, bool), AgentError> {
         match hooks.pre_tool_use(tool_ctx).await {
             PreToolAction::Abort(reason) => Err(AgentError::HookRejected {
                 hook: "pre_tool_use",
                 reason,
             }),
-            PreToolAction::Deny(reason) => {
-                Ok((aither_core::llm::ToolResult::error(reason), Duration::ZERO))
-            }
+            PreToolAction::Deny(reason) => Ok((
+                aither_core::llm::ToolResult::error(reason),
+                Duration::ZERO,
+                false,
+            )),
             PreToolAction::Allow => {
                 let start = Instant::now();
                 // The agent loop has nowhere to show a tool's progress, but
                 // the tool learns which call, of which agent, it serves.
                 let cx = aither_core::llm::ToolContext::new().with_identity(tool_ctx.call.clone());
-                let result = tools
-                    .call(&call.name, args_json, cx)
-                    .await
-                    .unwrap_or_else(|error| {
+                let (result, unchanged_read) = match tools.call(&call.name, args_json, cx).await {
+                    Ok(result) => (result, false),
+                    Err(error) => {
+                        let unchanged_read = error
+                            .downcast_ref::<aither_sandbox::PollRefusal>()
+                            .is_some_and(aither_sandbox::PollRefusal::is_unchanged_read);
                         let mut message = String::from("Error: ");
                         message.push_str(error.to_string().as_str());
-                        aither_core::llm::ToolResult::error(message)
-                    });
-                Ok((result, start.elapsed()))
+                        (aither_core::llm::ToolResult::error(message), unchanged_read)
+                    }
+                };
+                Ok((result, start.elapsed(), unchanged_read))
             }
         }
     }
@@ -1549,8 +1602,9 @@ where
     /// Moves the parked tool results into the context.
     ///
     /// Results not reached because one failed stay parked for
-    /// [`Self::settle_interrupted_tool_calls`].
-    fn apply_tool_results(&mut self, events: &EventSink) -> Result<(), AgentError> {
+    /// [`Self::settle_interrupted_tool_calls`]. Returns whether the turn gave
+    /// the model anything new.
+    fn apply_tool_results(&mut self, events: &EventSink) -> Result<ToolTurn, AgentError> {
         if let Some(receiver) = &self.kept_receiver {
             self.kept_exchanges.extend(
                 receiver
@@ -1567,8 +1621,15 @@ where
             .into_iter()
             .map(|definition| definition.name().to_string())
             .collect();
+        let mut only_unchanged_reads = !self.tool_results.is_empty();
         while let Some(result) = self.tool_results.pop_front() {
-            let (call_id, call_name, tool_result) = result?;
+            let FinishedToolCall {
+                id: call_id,
+                name: call_name,
+                result: tool_result,
+                unchanged_read,
+            } = result?;
+            only_unchanged_reads &= unchanged_read;
             let is_terminal_call = call_name == "terminal";
             if !known_tools.contains(&call_name) && !unknown_tools.contains(&call_name) {
                 unknown_tools.push(call_name.clone());
@@ -1582,7 +1643,9 @@ where
                 events.emit(AgentEvent::run_resumed(reason, call_id.clone()));
             }
             let content = tool_result.render_for_model();
-            has_tool_error |= tool_result_is_error(&tool_result, &content);
+            // A refused re-read is no failure to re-assess: its refusal
+            // already says how to wait.
+            has_tool_error |= !unchanged_read && tool_result_is_error(&tool_result, &content);
             self.push_terminal_followup_events(is_terminal_call, &tool_result, events);
             let message = Message::tool(&call_id, content);
             if call_name == crate::ask_user::TOOL_NAME || self.kept_exchanges.remove(&call_id) {
@@ -1607,8 +1670,12 @@ where
                 "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain terminal, terminal_kill, terminal_input, and terminal_read.",
             );
         }
-        self.push_completed_background_events(events);
-        Ok(())
+        let background_news = self.push_completed_background_events(events);
+        Ok(if only_unchanged_reads && !background_news {
+            ToolTurn::OnlyUnchangedReads
+        } else {
+            ToolTurn::Progress
+        })
     }
 
     fn push_terminal_followup_events(
@@ -1641,14 +1708,19 @@ where
         }
     }
 
-    fn push_completed_background_events(&mut self, events: &EventSink) {
-        if let Some(receiver) = self.background_receiver.clone() {
-            self.push_job_alerts();
-            for task in receiver.take_completed() {
-                tracing::info!(task_id = %task.task_id, "background task completed");
-                self.push_completed_task_event(task, events);
-            }
+    /// Records queued background completions and alerts; returns whether
+    /// any of them is news the model must act on — an announced completion
+    /// or an alert that would wake a parked wait.
+    fn push_completed_background_events(&mut self, events: &EventSink) -> bool {
+        let Some(receiver) = self.background_receiver.clone() else {
+            return false;
+        };
+        let mut news = self.push_job_alerts();
+        for task in receiver.take_completed() {
+            tracing::info!(task_id = %task.task_id, "background task completed");
+            news |= self.push_completed_task_event(task, events);
         }
+        news
     }
 
     async fn push_turn_boundary_events(
@@ -4950,16 +5022,18 @@ mod tests {
                 call("native", "ask_user"),
             ],
         ));
-        for id in ["kept", "plain"] {
-            agent
-                .tool_results
-                .push_back(Ok((id.into(), "terminal".into(), ToolResult::text(id))));
+        for (id, name) in [
+            ("kept", "terminal"),
+            ("plain", "terminal"),
+            ("native", "ask_user"),
+        ] {
+            agent.tool_results.push_back(Ok(FinishedToolCall {
+                id: id.into(),
+                name: name.into(),
+                result: ToolResult::text(id),
+                unchanged_read: false,
+            }));
         }
-        agent.tool_results.push_back(Ok((
-            "native".into(),
-            "ask_user".into(),
-            ToolResult::text("native"),
-        )));
         let (sender, _events) = async_channel::unbounded();
         agent
             .apply_tool_results(&EventSink { sender })

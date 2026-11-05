@@ -61,6 +61,8 @@ mod idle_compaction_tests;
 pub mod language;
 mod model_group;
 mod output_urls;
+#[cfg(test)]
+mod poll_park_tests;
 mod request_parameters;
 mod subagent_file;
 mod terminal_agent;
