@@ -8,10 +8,16 @@
 //! and handing the result back as tool output.
 //!
 //! Every entry point therefore resolves the host and refuses any address that
-//! is not publicly routable. Redirects are not a hole here because the HTTP
-//! client is built without redirect-following middleware, so a `302` is
-//! returned rather than followed; if that ever changes, each hop must be
-//! re-checked through [`guard_url`].
+//! is not publicly routable.
+//!
+//! Redirects are not a hole in the HTTP client, which is built without
+//! redirect-following middleware, so a `302` is returned rather than followed;
+//! if that ever changes, each hop must be re-checked through [`guard_url`].
+//! The headless browser does follow redirects and load subresources, so it
+//! checks every request it makes against this same policy through
+//! [`crate::intercept`] instead of trusting the first URL. That interception
+//! cannot see which address the browser itself resolves a host to, so DNS
+//! rebinding against the browser is not covered; see that module.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

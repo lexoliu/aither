@@ -1007,6 +1007,8 @@ where
             prompt_cache,
             context_sources,
             reassembled: false,
+            prefix_rewrites: crate::context::PrefixRewrites::default(),
+            requests_sent: 0,
             compaction: crate::compaction_state::CompactionState::default(),
             compaction_failure: None,
             tool_results: std::collections::VecDeque::new(),

@@ -213,6 +213,13 @@ pub enum AgentEvent {
         turns: usize,
     },
 
+    /// A request to the model is about to be sent: the hash chain of its
+    /// prompt prefix and what rewrote that prefix since the previous one.
+    ///
+    /// The request's [`Usage`](Self::Usage) follows once the provider
+    /// reports it, so a host pairs the two to tell where a cache miss began.
+    PromptPrefix(crate::context::PromptPrefix),
+
     /// Token usage information from LLM.
     Usage(aither_core::llm::Usage),
 

@@ -36,15 +36,17 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 chromiumoxide = { version = "0.9", optional = true, default-features = false, features = ["bytes"] }
 futures-lite = { version = "2.6", optional = true }
 tokio = { version = "1.53", optional = true, features = ["rt", "time"] }
+# Each headless fetch gets a browser profile of its own.
+tempfile = { version = "3.27", optional = true, default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 futures-lite = "2.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 default = []
-headless = ["dep:chromiumoxide", "dep:futures-lite", "dep:tokio"]
+headless = ["dep:chromiumoxide", "dep:futures-lite", "dep:tokio", "dep:tempfile"]
 
 [[example]]
 name = "headless"

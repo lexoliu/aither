@@ -28,6 +28,9 @@ const HANDOFF_JSON: &str = r#"{"current_task":"keep going","key_decisions":[],"c
 /// The tag the command table's diff alert wraps its diff in.
 const DIFF_TAG: &str = "<commands_diff boundary=";
 
+/// The `timeout` of the terminal call that runs `gamma`.
+const GAMMA_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Fails the test instead of hanging it when `wait` does not finish.
 async fn bounded<T>(what: &str, wait: impl Future<Output = T>) -> T {
     future::or(wait, async {
@@ -170,7 +173,7 @@ impl LanguageModel for ScriptedLlm {
                             "description": "Run the tool the server just added",
                             "script": "gamma",
                             "mode": "sandboxed",
-                            "timeout": 30
+                            "timeout": GAMMA_TIMEOUT.as_secs()
                         }),
                     ))
                 }
@@ -224,7 +227,11 @@ async fn an_mcp_tool_added_mid_session_runs_at_once_and_is_announced_once() {
     let dir = tempdir().expect("temp dir");
     let terminal = TerminalTool::new_exact(dir.path(), NoopPermissionHandler, TokioGlobal)
         .await
-        .expect("terminal tool initializes");
+        .expect("terminal tool initializes")
+        // The call's own timeout ends `gamma` before the window can promote
+        // it to a background job, however slow the machine: the result is
+        // always in the second request.
+        .with_foreground_wait(GAMMA_TIMEOUT * 2);
     let tools = tempdir().expect("tool dir");
     let cache = test_support::TempDir::new();
     let binary = test_support::compile_baseline_fixture(tools.path()).await;

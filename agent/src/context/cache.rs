@@ -212,7 +212,7 @@ impl PromptCache {
 /// for byte, in the next request.
 ///
 /// Returns `None` when there is nothing but the prefix and the live tail.
-const fn stable_conversation_end(messages: &[Message]) -> Option<usize> {
+pub(crate) const fn stable_conversation_end(messages: &[Message]) -> Option<usize> {
     // The final message is the live tail; the one before it is the newest
     // append-only item.
     messages.len().checked_sub(2)

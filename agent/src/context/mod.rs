@@ -14,6 +14,8 @@
 //! - [`policy`] holds every threshold there is — when to compact, when to
 //!   wait for it, when to rebuild, how much may be restored;
 //! - [`cache`] translates the layout into per-provider cache controls;
+//! - [`prefix`] hashes each request's prefix block by block, so a host can
+//!   tell where the prefix changed when the cache misses;
 //! - [`compaction`] forks a typed handoff at a request boundary and applies
 //!   it at the next one, so the run never stops to summarize itself;
 //! - [`reassembly`] re-reads what the handoff named, within budget;
@@ -29,6 +31,7 @@ pub mod cache;
 pub mod compaction;
 pub mod live;
 pub mod policy;
+pub mod prefix;
 pub mod reassembly;
 pub(crate) mod recovery;
 pub mod source;
@@ -44,6 +47,7 @@ pub use compaction::{
 };
 pub use live::{LiveContent, LiveUpdate};
 pub use policy::ContextPolicy;
+pub use prefix::{PrefixBlock, PrefixChain, PrefixRewrites, PromptPrefix};
 pub use reassembly::restore_context;
 pub use source::{AnyContextSource, Block, ContextSource};
 #[cfg(feature = "skills")]
