@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/May-Agent/aither/compare/agent-v0.18.0...agent-v0.19.0) - 2026-11-05
+
+### Added
+
+- *(agent)* report each request's prompt-prefix hash chain
+
+### Fixed
+
+- *(agent)* commit each rendered block only to the source that rendered it
+
+### Other
+
+- Merge pull request #536 from May-Agent/chore/backmerge-0.18
+- *(agent)* keep the mid-session MCP tool call in the foreground
+- Merge main into dev after the 0.18.0 release
+- Merge pull request #525 from May-Agent/fix/476-commit-own-blocks
+
 ## [0.18.0](https://github.com/May-Agent/aither/compare/agent-v0.17.0...agent-v0.18.0) - 2026-11-05
 
 ### Added
