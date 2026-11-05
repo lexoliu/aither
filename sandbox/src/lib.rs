@@ -65,6 +65,7 @@ mod output;
 mod output_compress;
 pub(crate) mod poll_guard;
 mod process_tree;
+mod session_policy;
 mod shell_session;
 mod stdin_watch;
 mod subagent;
@@ -129,6 +130,7 @@ pub use permission::{PermissionHandler, PermissionRequest, Review, TerminalMode}
 pub use process_tree::{
     JOB_MARKER_VAR, JobProcess, KillTreeError, ProcessTableError, kill_process_tree,
 };
+pub use session_policy::SessionSandboxPolicy;
 pub use shell_session::{
     AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
     ContainerExecOutcome, ContainerIpcRoute, ContainerShellRuntime, ExecLifetime, ShellBackend,

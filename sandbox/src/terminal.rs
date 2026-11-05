@@ -4315,18 +4315,26 @@ fn committed_git_environment(
     Ok(())
 }
 
-fn local_path_grants(
+/// The object a spelled path names, in the spelling a resolved grant
+/// checks: canonicalized, without the verbatim prefix Windows adds — an
+/// 8.3 alias or a symlinked component does not name the same object.
+fn resolved(path: &Path) -> heel::Result<ResolvedPath> {
+    ResolvedPath::new(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
+/// The grant a command's jobserver fifo needs: it writes tokens back to it.
+#[cfg(all(unix, feature = "jobserver"))]
+pub fn job_fifo_grant(path: &Path) -> heel::Result<Grant> {
+    Ok(Grant::new(resolved(path)?, Access::WRITE))
+}
+
+/// The grants a session sandbox gives every command; see
+/// [`crate::SessionSandboxPolicy`], the public way to build them.
+pub fn local_path_grants(
     writable: &[PathBuf],
     readable: &[PathBuf],
     tools: &PreparedTools<PathBuf>,
-    job_fifo: Option<&Path>,
 ) -> heel::Result<Vec<Grant>> {
-    /// The object a spelled path names, in the spelling a resolved grant
-    /// checks: canonicalized, without the verbatim prefix Windows adds — an
-    /// 8.3 alias or a symlinked component does not name the same object.
-    fn resolved(path: &Path) -> heel::Result<ResolvedPath> {
-        ResolvedPath::new(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
-    }
     writable
         .iter()
         // A writable directory also executes: a sandboxed process can already
@@ -4348,11 +4356,6 @@ fn local_path_grants(
             tools
                 .uv_dir()
                 .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE | Access::EXEC))),
-        )
-        .chain(
-            job_fifo
-                .iter()
-                .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE))),
         )
         .chain(toolchain_grants(resolved))
         .collect()
@@ -4390,18 +4393,6 @@ fn toolchain_grants(
         .map(move |(_, path)| Ok(Grant::new(resolved(&path)?, Access::WRITE | Access::EXEC)))
 }
 
-/// Adds a command's private jobserver variables to its process environment.
-#[cfg(all(unix, feature = "jobserver"))]
-fn with_jobserver_environment(
-    mut environment: Vec<(String, String)>,
-    fifo: Option<&crate::jobserver::CommandFifo>,
-) -> Vec<(String, String)> {
-    if let Some(fifo) = fifo {
-        environment.extend(fifo.environment());
-    }
-    environment
-}
-
 async fn execute_sandboxed_background<E, N>(
     context: LocalBackgroundExecution<'_, E>,
     policy: N,
@@ -4410,26 +4401,9 @@ where
     E: Executor + Clone + 'static,
     N: NetworkPolicy + 'static,
 {
-    let mut runtime_environment = local_runtime_environment(&context).await?;
+    let (grants, mut runtime_environment) = local_launch_policy(&context).await?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
-    #[cfg(all(unix, feature = "jobserver"))]
-    let runtime_environment =
-        with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
-    #[cfg(all(unix, feature = "jobserver"))]
-    let job_fifo_path = context
-        .job_fifo
-        .as_ref()
-        .map(crate::jobserver::CommandFifo::path);
-    #[cfg(not(all(unix, feature = "jobserver")))]
-    let job_fifo_path: Option<&Path> = None;
-    let grants = local_path_grants(
-        context.writable_paths,
-        context.readable_paths,
-        context.prepared_tools,
-        job_fifo_path,
-    )
-    .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(policy)
         .working_dir(
@@ -4520,26 +4494,9 @@ where
 async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let mut runtime_environment = local_runtime_environment(&context).await?;
+    let (grants, mut runtime_environment) = local_launch_policy(&context).await?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
-    #[cfg(all(unix, feature = "jobserver"))]
-    let runtime_environment =
-        with_jobserver_environment(runtime_environment, context.job_fifo.as_ref());
-    #[cfg(all(unix, feature = "jobserver"))]
-    let job_fifo_path = context
-        .job_fifo
-        .as_ref()
-        .map(crate::jobserver::CommandFifo::path);
-    #[cfg(not(all(unix, feature = "jobserver")))]
-    let job_fifo_path: Option<&Path> = None;
-    let grants = local_path_grants(
-        context.writable_paths,
-        context.readable_paths,
-        context.prepared_tools,
-        job_fifo_path,
-    )
-    .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(AllowAll)
         .working_dir(
@@ -5398,22 +5355,35 @@ fn shell_escape(value: &str) -> String {
     output
 }
 
-/// Builds the local session environment: git shim, computed session env,
-/// committed grant vars, then the embedder's extra envs (which override).
-async fn local_runtime_environment<E: Executor>(
+/// Builds a local command's grants and environment: the session policy
+/// (the one [`crate::SessionSandboxPolicy`] exposes to hosts, with the
+/// command's jobserver fifo), the git shim, committed grant vars, then the
+/// embedder's extra envs (which override).
+async fn local_launch_policy<E: Executor>(
     context: &LocalBackgroundExecution<'_, E>,
-) -> Result<Vec<(String, String)>, TerminalError> {
+) -> Result<(Vec<Grant>, Vec<(String, String)>), TerminalError> {
     write_git_shim(context.prepared_tools).await?;
-    let mut env =
-        prepare_session_runtime_environment(context.working_dir, context.prepared_tools).await?;
+    let policy = crate::SessionSandboxPolicy::new(
+        context.working_dir,
+        context.writable_paths,
+        context.readable_paths,
+        context.prepared_tools,
+    )
+    .await?;
+    #[cfg(all(unix, feature = "jobserver"))]
+    let policy = match &context.job_fifo {
+        Some(fifo) => policy.with_job_fifo(fifo)?,
+        None => policy,
+    };
+    let (grants, mut env) = policy.into_parts();
     committed_git_environment(context.registry, &mut env, |path| {
         Ok(path.display().to_string())
     })?;
     env.extend(context.env_source.iter().flat_map(|s| s.env()));
-    Ok(env)
+    Ok((grants, env))
 }
 
-async fn prepare_session_runtime_environment(
+pub async fn prepare_session_runtime_environment(
     working_dir: &Path,
     tools: &PreparedTools<PathBuf>,
 ) -> Result<Vec<(String, String)>, TerminalError> {
@@ -6752,7 +6722,7 @@ mod tests {
             .await
             .unwrap();
         let uv = ready.uv_dir().expect("the test host has a managed uv");
-        let grants = local_path_grants(&[], &[], &ready, None).expect("grants build");
+        let grants = local_path_grants(&[], &[], &ready).expect("grants build");
         let access_of = |path: &Path| {
             let path = std::fs::canonicalize(path).unwrap();
             grants
@@ -6829,7 +6799,6 @@ mod tests {
             &[workdir.path().to_path_buf()],
             &[readonly.path().to_path_buf()],
             &tools,
-            None,
         )
         .expect("grants build");
         let canonical = |dir: &tempfile::TempDir| std::fs::canonicalize(dir.path()).unwrap();
@@ -7770,6 +7739,128 @@ mod tests {
             }
             Err(error) => panic!("sandboxed pwd should succeed, got error: {error}"),
         }
+    }
+
+    /// The policy a host gets from `SessionSandboxPolicy` is the one the
+    /// terminal runs a command under: the grants name the writable and
+    /// readable sets, the tools and the `uv` directory with the access the
+    /// terminal gives them, and a sandboxed terminal command sees exactly
+    /// the environment the policy lists and is confined by the same grants.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn session_policy_is_the_policy_the_terminal_runs_commands_under() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let writable = tempfile::tempdir().unwrap();
+        let readable = tempfile::tempdir().unwrap();
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tools = shell_sessions.local_tools().unwrap().clone();
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
+        let working_dir = tool.working_dir().clone();
+        let writable_paths = vec![writable.path().to_path_buf()];
+        let readable_paths = vec![readable.path().to_path_buf()];
+
+        let policy = crate::SessionSandboxPolicy::new(
+            &working_dir,
+            &writable_paths,
+            &readable_paths,
+            &tools,
+        )
+        .await
+        .expect("policy builds");
+        let access_of = |path: &Path| {
+            let path = std::fs::canonicalize(path).unwrap();
+            policy
+                .grants()
+                .iter()
+                .find(|grant| grant.resolved_path().as_path() == path)
+                .map(heel::Grant::access)
+        };
+        assert_eq!(
+            access_of(writable.path()),
+            Some(Access::WRITE | Access::EXEC)
+        );
+        assert_eq!(access_of(readable.path()), Some(Access::READ));
+        assert_eq!(access_of(tools.bin_dir()), Some(Access::EXEC));
+        if let Some(uv) = tools.uv_dir() {
+            assert_eq!(access_of(uv), Some(Access::WRITE | Access::EXEC));
+        }
+
+        let names = ["HOME", "TMPDIR", "XDG_CACHE_HOME", "PATH", "PYTHONPATH"];
+        let written = writable.path().join("written");
+        let refused = readable.path().join("refused");
+        let prints = names
+            .iter()
+            .map(|name| format!("echo \"${name}\""))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let script = format!(
+            "{prints}; touch {} && echo write-ok; touch {} && echo read-write-ok; true",
+            written.display(),
+            refused.display(),
+        );
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let job_registry = tool.job_registry();
+        let (startup_tx, _startup_rx) = async_channel::bounded(1);
+        let result = execute_script_standalone(StandaloneExecution {
+            working_dir,
+            writable_paths,
+            readable_paths,
+            env_source: None,
+            executor: executor_core::tokio::TokioGlobal,
+            registry,
+            permission_handler: Arc::new(TestPermissionHandler::default()),
+            job_registry,
+            task_id: "task-policy".to_string(),
+            execution_id: "exec-policy".to_string(),
+            background: false,
+            carry: None,
+            carried_dir: None,
+            alert_tx: async_channel::unbounded().0,
+            script,
+            mode: TerminalMode::Sandboxed,
+            backend: ExecutionBackend::Local(tools),
+            stdin_alerts: None,
+            lifetime: JobLifetime::Foreground {
+                alerts: async_channel::unbounded().0,
+            },
+            background_startup: BackgroundStartup::new(startup_tx),
+            network_audit: None,
+            priority: ProcessPriority::default(),
+            #[cfg(all(unix, feature = "jobserver"))]
+            jobserver: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            store_dir: tool.outputs_dir(),
+            max_lines: 50,
+            raw: false,
+        })
+        .await
+        .expect("the sandboxed script runs");
+        let stdout = output_text(&result.stdout).expect("inline stdout");
+        let mut lines = stdout.lines();
+        for name in names {
+            let expected = policy
+                .environment()
+                .iter()
+                .rev()
+                .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+                .unwrap_or_else(|| panic!("the policy lists {name}"));
+            assert_eq!(lines.next(), Some(expected), "{name} in the command");
+        }
+        assert_eq!(lines.next(), Some("write-ok"));
+        assert_eq!(lines.next(), None, "a readable-only path stays read-only");
+        assert!(written.exists() && !refused.exists());
     }
 
     #[cfg(unix)]
