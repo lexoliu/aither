@@ -7,7 +7,7 @@ const BASELINE_PYTHON_VERSION: &str = "3.13.1";
 pub async fn finish_run(
     run: crate::Run<impl std::future::Future<Output = Result<(), crate::AgentError>>>,
 ) -> Result<(), crate::AgentError> {
-    run.drive((), |(), _| async {
+    run.drive((), std::future::pending(), |(), _| async {
         std::ops::ControlFlow::<std::convert::Infallible, _>::Continue(())
     })
     .await

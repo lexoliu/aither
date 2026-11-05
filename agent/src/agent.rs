@@ -188,9 +188,7 @@ where
     ///
     /// The run is polled together with every handler call, so it keeps
     /// making progress while the handler awaits; events it emits meanwhile
-    /// queue for the next call. The run stays on the caller's task: dropping
-    /// the returned future cancels it, which is how a caller races
-    /// cancellation against the run.
+    /// queue for the next call. The run stays on the caller's task.
     ///
     /// `state` is what the handler works on, typically `&mut` borrows of the
     /// caller's locals: each call takes it and returns it in
@@ -201,6 +199,13 @@ where
     /// `drive` returns that `Break`. Otherwise `drive` returns the state in
     /// `Continue` once the run has finished and its every event was handled.
     ///
+    /// `stop` cancels the run from outside, such as on a user's request: it
+    /// is polled, ahead of the run and its next event, only while no handler
+    /// call is in progress, so a call already running always finishes. Once
+    /// it completes, the run is dropped with its queued events and `drive`
+    /// returns its value in `Break`. A caller with nothing to stop on passes
+    /// [`std::future::pending`].
+    ///
     /// # Errors
     ///
     /// The run's error, after the handler has seen every event emitted
@@ -208,6 +213,7 @@ where
     pub async fn drive<S, B, H>(
         self,
         mut state: S,
+        stop: impl Future<Output = B>,
         mut handler: impl FnMut(S, TimedEvent) -> H,
     ) -> Result<ControlFlow<B, S>, AgentError>
     where
@@ -215,9 +221,13 @@ where
     {
         let Self { mut run, events } = self;
         futures_lite::pin!(events);
+        futures_lite::pin!(stop);
         let mut outcome = None;
         loop {
-            let step = std::future::poll_fn(|cx| {
+            let next = std::future::poll_fn(|cx| {
+                if let Poll::Ready(value) = stop.as_mut().poll(cx) {
+                    return Poll::Ready(RunStep::Stopped(value));
+                }
                 poll_run(run.as_mut(), &mut outcome, cx);
                 if let Some(result) = outcome.take() {
                     // Finished: what it emitted is all queued.
@@ -237,12 +247,13 @@ where
                 }
             })
             .await;
-            let event = match step {
+            let event = match next {
                 RunStep::Event(event) => event,
                 RunStep::Finished(result) => {
                     result?;
                     return Ok(ControlFlow::Continue(state));
                 }
+                RunStep::Stopped(value) => return Ok(ControlFlow::Break(value)),
             };
             let call = handler(state, event);
             futures_lite::pin!(call);
@@ -260,9 +271,10 @@ where
 }
 
 /// What [`Run::drive`] waits for between handler calls.
-enum RunStep {
+enum RunStep<B> {
     Event(TimedEvent),
     Finished(Result<(), AgentError>),
+    Stopped(B),
 }
 
 /// Polls `run` unless it already finished, recording its result.
@@ -2055,16 +2067,20 @@ where
     pub async fn query(&mut self, prompt: &str) -> Result<String, AgentError> {
         let flow = self
             .run(prompt, std::iter::empty())
-            .drive(String::new(), |mut text, timed| async move {
-                match timed.event {
-                    AgentEvent::Text(chunk) => text.push_str(&chunk),
-                    AgentEvent::Complete { final_text, .. } => {
-                        return ControlFlow::Break(final_text);
+            .drive(
+                String::new(),
+                std::future::pending(),
+                |mut text, timed| async move {
+                    match timed.event {
+                        AgentEvent::Text(chunk) => text.push_str(&chunk),
+                        AgentEvent::Complete { final_text, .. } => {
+                            return ControlFlow::Break(final_text);
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-                ControlFlow::Continue(text)
-            })
+                    ControlFlow::Continue(text)
+                },
+            )
             .await?;
         Ok(match flow {
             ControlFlow::Break(text) | ControlFlow::Continue(text) => text,
@@ -2082,7 +2098,7 @@ where
     /// let mut shown = String::new();
     /// agent
     ///     .run("Implement the feature", std::iter::empty())
-    ///     .drive(&mut shown, |shown, timed| async move {
+    ///     .drive(&mut shown, std::future::pending(), |shown, timed| async move {
     ///         if let AgentEvent::Text(text) = timed.event {
     ///             shown.push_str(&text);
     ///         }
@@ -3799,9 +3815,10 @@ mod tests {
             })
             .build();
         let lock = &lock;
-        let drive = agent
-            .run("hello", [])
-            .drive(Vec::new(), |mut texts, timed| async move {
+        let drive = agent.run("hello", []).drive(
+            Vec::new(),
+            std::future::pending(),
+            |mut texts, timed| async move {
                 if let AgentEvent::Text(text) = timed.event {
                     if text == "first" {
                         drop(lock.lock().await);
@@ -3809,7 +3826,8 @@ mod tests {
                     texts.push(text);
                 }
                 ControlFlow::<(), _>::Continue(texts)
-            });
+            },
+        );
         let flow = tokio::time::timeout(Duration::from_secs(5), drive)
             .await
             .expect("the handler waiting on the run's resource must not hang")
@@ -3828,13 +3846,17 @@ mod tests {
         let mut handled = 0;
         let flow = agent
             .run("hello", [])
-            .drive(&mut handled, |handled, timed| async move {
-                *handled += 1;
-                match timed.event {
-                    AgentEvent::Text(text) => ControlFlow::Break(text),
-                    _ => ControlFlow::Continue(handled),
-                }
-            })
+            .drive(
+                &mut handled,
+                std::future::pending(),
+                |handled, timed| async move {
+                    *handled += 1;
+                    match timed.event {
+                        AgentEvent::Text(text) => ControlFlow::Break(text),
+                        _ => ControlFlow::Continue(handled),
+                    }
+                },
+            )
             .await
             .expect("the run succeeds");
         assert_eq!(flow, ControlFlow::Break("first".to_string()));
@@ -3853,13 +3875,97 @@ mod tests {
         let mut kinds = Vec::new();
         let result = agent
             .run("hello", [])
-            .drive(&mut kinds, |kinds, timed| async move {
-                kinds.push(std::mem::discriminant(&timed.event));
-                ControlFlow::<(), _>::Continue(kinds)
-            })
+            .drive(
+                &mut kinds,
+                std::future::pending(),
+                |kinds, timed| async move {
+                    kinds.push(std::mem::discriminant(&timed.event));
+                    ControlFlow::<(), _>::Continue(kinds)
+                },
+            )
             .await;
         assert!(result.is_err(), "the model's failure ends the run");
         assert!(!kinds.is_empty(), "the run start was handled first");
+    }
+
+    /// Starts each response and never sends anything: a run busy with no
+    /// events, like one waiting on a long tool call.
+    #[derive(Clone)]
+    struct SilentLlm;
+
+    impl LanguageModel for SilentLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            futures_lite::stream::pending()
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock", "test", "silent", "silent", 200_000,
+            )))
+        }
+    }
+
+    /// A stop that fires while the run works without emitting ends it at
+    /// once.
+    #[tokio::test]
+    async fn a_stop_ends_a_run_busy_without_events() {
+        let mut agent = Agent::new(SilentLlm);
+        let (cancel, cancelled) = async_channel::bounded::<&str>(1);
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.send("cancelled").await.expect("the run listens");
+        });
+        let drive = agent.run("hello", []).drive(
+            0,
+            async move { cancelled.recv().await.expect("the stopper sends") },
+            |handled, _| async move { ControlFlow::Continue(handled + 1) },
+        );
+        let flow = tokio::time::timeout(Duration::from_secs(5), drive)
+            .await
+            .expect("the stop must end the run promptly")
+            .expect("a stopped run is no error");
+        assert_eq!(flow, ControlFlow::Break("cancelled"));
+        stopper.await.expect("the stopper finishes");
+    }
+
+    /// A stop that fires during a handler call takes effect once that call
+    /// returned, before the next event is handled.
+    #[tokio::test]
+    async fn a_stop_never_interrupts_a_handler_call() {
+        let mut agent = Agent::new(TwoChunkLlm);
+        let (cancel, cancelled) = async_channel::bounded::<()>(1);
+        let cancel = &cancel;
+        let mut completed = Vec::new();
+        let flow = agent
+            .run("hello", [])
+            .drive(
+                &mut completed,
+                async move { cancelled.recv().await.expect("the handler cancels") },
+                |completed, timed| async move {
+                    cancel.send(()).await.expect("the run listens");
+                    // Suspends with the stop ready: polling it here would
+                    // drop this call before it records its completion.
+                    futures_lite::future::yield_now().await;
+                    completed.push(timed.event);
+                    ControlFlow::Continue(completed)
+                },
+            )
+            .await
+            .expect("a stopped run is no error");
+        assert!(flow.is_break(), "the stop ended the run");
+        assert_eq!(
+            completed.len(),
+            1,
+            "the running call finished, no other began"
+        );
+        assert!(matches!(completed[0], AgentEvent::RunStart { .. }));
     }
 
     /// A host spawns its turn loop onto a multi-threaded executor, so the
@@ -3872,17 +3978,19 @@ mod tests {
         let turn = async move {
             let mut texts = Vec::new();
             let mut stopped = None;
+            let (_cancel, cancelled) = async_channel::bounded::<()>(1);
             let outcome = agent
                 .run("hello", [])
                 .drive(
                     (&mut texts, &mut stopped),
+                    async move { cancelled.recv().await.ok() },
                     |(texts, stopped), timed| async move {
                         if let AgentEvent::Text(text) = timed.event {
                             texts.push(text);
                         }
                         futures_lite::future::yield_now().await;
                         *stopped = Some(());
-                        ControlFlow::<(), _>::Continue((texts, stopped))
+                        ControlFlow::Continue((texts, stopped))
                     },
                 )
                 .await
@@ -3903,10 +4011,14 @@ mod tests {
         let before = jiff::Timestamp::now();
         let ControlFlow::Continue(events) = agent
             .run("hello", std::iter::empty())
-            .drive(Vec::new(), |mut events, timed| async move {
-                events.push(timed);
-                ControlFlow::<std::convert::Infallible, _>::Continue(events)
-            })
+            .drive(
+                Vec::new(),
+                std::future::pending(),
+                |mut events, timed| async move {
+                    events.push(timed);
+                    ControlFlow::<std::convert::Infallible, _>::Continue(events)
+                },
+            )
             .await
             .expect("the run succeeds");
         let after = jiff::Timestamp::now();
@@ -6508,10 +6620,14 @@ mod tests {
 
     async fn drain_run(run: Run<impl Future<Output = Result<(), AgentError>>>) -> Vec<AgentEvent> {
         let ControlFlow::Continue(events) = run
-            .drive(Vec::new(), |mut events, timed| async move {
-                events.push(timed.event);
-                ControlFlow::<std::convert::Infallible, _>::Continue(events)
-            })
+            .drive(
+                Vec::new(),
+                std::future::pending(),
+                |mut events, timed| async move {
+                    events.push(timed.event);
+                    ControlFlow::<std::convert::Infallible, _>::Continue(events)
+                },
+            )
             .await
             .expect("the run should succeed");
         events

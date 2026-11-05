@@ -160,14 +160,18 @@ mod tests {
         let controller = &controller;
         agent
             .run("hello", std::iter::empty())
-            .drive(Some(change), |mut change, timed| async move {
-                if matches!(timed.event, crate::AgentEvent::Text(_))
-                    && let Some(change) = change.take()
-                {
-                    change(controller);
-                }
-                ControlFlow::<std::convert::Infallible, _>::Continue(change)
-            })
+            .drive(
+                Some(change),
+                std::future::pending(),
+                |mut change, timed| async move {
+                    if matches!(timed.event, crate::AgentEvent::Text(_))
+                        && let Some(change) = change.take()
+                    {
+                        change(controller);
+                    }
+                    ControlFlow::<std::convert::Infallible, _>::Continue(change)
+                },
+            )
             .await
             .map(|_| ())
     }

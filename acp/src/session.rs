@@ -105,13 +105,17 @@ impl<LLM: LanguageModel + 'static> AcpSession<LLM> {
         let _ = self
             .agent
             .run(prompt, [])
-            .drive(&mut on_update, |on_update, timed| async move {
-                if cancelled.load(Ordering::SeqCst) {
-                    return ControlFlow::Break(());
-                }
-                report_event(timed.event, on_update);
-                ControlFlow::Continue(on_update)
-            })
+            .drive(
+                &mut on_update,
+                std::future::pending(),
+                |on_update, timed| async move {
+                    if cancelled.load(Ordering::SeqCst) {
+                        return ControlFlow::Break(());
+                    }
+                    report_event(timed.event, on_update);
+                    ControlFlow::Continue(on_update)
+                },
+            )
             .await
             .map_err(|err| err.to_string())?;
 
