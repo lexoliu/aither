@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/May-Agent/aither/compare/sandbox-v0.15.0...sandbox-v0.16.0) - 2026-11-05
+
+### Added
+
+- *(sandbox)* [**breaking**] ask with the parameters of the answering model
+
 ## [0.15.0](https://github.com/May-Agent/aither/compare/sandbox-v0.14.1...sandbox-v0.15.0) - 2026-11-04
 
 ### Added
