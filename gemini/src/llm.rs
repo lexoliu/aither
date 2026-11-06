@@ -1,7 +1,8 @@
 use aither_core::{
     LanguageModel,
     llm::{
-        Attachment, Event, GenerateError, LLMRequest, Message, ReasoningState, Role, Usage,
+        Attachment, Event, GenerateError, LLMRequest, Message, ReasoningState, RetryPolicy, Role,
+        Usage,
         model::{Ability, Parameters, Profile, ToolChoice},
         tool::ToolDefinition,
     },
@@ -15,7 +16,7 @@ use tracing::debug;
 
 use crate::PROVIDER_NAME;
 use crate::{
-    client::stream_generate,
+    client::{RETRY_POLICY, stream_generate},
     config::Gemini,
     error::GeminiError,
     types::{
@@ -57,6 +58,10 @@ impl LanguageModel for Gemini {
                 response: text.chars().take(500).collect(),
             })
         }
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        RETRY_POLICY
     }
 
     fn profile(&self) -> impl core::future::Future<Output = Result<Profile, Self::Error>> + Send {

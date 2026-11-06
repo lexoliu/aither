@@ -15,7 +15,7 @@ pub use aither_openai::{self as openai, OpenAI, OpenAIProvider};
 use aither_core::{
     EmbeddingModel, LanguageModel,
     llm::{
-        Classify, Event, LLMRequest, LanguageModelProvider, model::Profile,
+        Classify, Event, LLMRequest, LanguageModelProvider, RetryPolicy, model::Profile,
         provider::Profile as ProviderProfile,
     },
 };
@@ -255,6 +255,16 @@ impl LanguageModel for CloudProvider {
                     }
                 }
             }
+        }
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        match self {
+            Self::OpenAI(inner) => inner.retry_policy(),
+            Self::Claude(inner) => inner.retry_policy(),
+            Self::Gemini(inner) => inner.retry_policy(),
+            Self::Copilot(inner) => inner.retry_policy(),
+            Self::Codex(inner) => inner.retry_policy(),
         }
     }
 
