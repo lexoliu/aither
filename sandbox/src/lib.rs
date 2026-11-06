@@ -114,7 +114,7 @@ pub use container::{
     MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,
 };
 pub use foreground_wait::ForegroundWait;
-pub use grants::{GrantSet, TerminalGrants};
+pub use grants::{GitDirAccess, GrantSet, TerminalGrants};
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
 pub use heel::NetworkAuditLog;
 /// Re-export of heel's scheduling priority types for terminal-tool configuration.

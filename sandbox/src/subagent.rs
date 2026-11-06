@@ -6,7 +6,9 @@
 //! subagent may write, and the worktrees it may commit in.
 //!
 //! A linked worktree keeps its git data in the main repository, outside the
-//! worktree, so a worktree grant alone leaves `git commit` failing. A commit
+//! worktree, so a worktree grant alone leaves `git commit` failing: the
+//! subagent's terminal reads that data ([`crate::GitDirAccess::ReadOnly`]), so `git
+//! status` and `git log` work, and writes none of it. A commit
 //! grant gives the worktree a repository of its own, created by the host when
 //! the grant is first given, that the worktree's `.git` file names: it holds
 //! the worktree's `HEAD`, index, refs and new objects, reads the main object
