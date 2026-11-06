@@ -304,3 +304,19 @@ fn the_alerts_name_the_condition_and_the_window() {
         "{ended}"
     );
 }
+
+#[test]
+fn a_host_without_sources_states_nothing_and_never_raises_load_events() {
+    let clock = ManualClock::new();
+    let any_clock = AnyClock::new(clock.clone());
+    let mut monitor = HostLoadMonitor::new(
+        UnwatchedHost,
+        HostLoadConfig::new(),
+        ForegroundWait::new(NORMAL_WAIT),
+    );
+    assert_eq!(monitor.read(), HostSample::new(None, None));
+    for _ in 0..3 {
+        clock.advance(Duration::from_secs(600));
+        assert_eq!(monitor.tick(&any_clock), []);
+    }
+}

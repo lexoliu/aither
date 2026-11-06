@@ -642,7 +642,8 @@ fn job_alert_text(alert: &JobAlertText<'_>) -> String {
 /// What a killed memory runaway held, as the text reports it.
 struct RunawayText {
     footprint: aither_sandbox::MemorySize,
-    physical: aither_sandbox::MemorySize,
+    capacity: aither_sandbox::MemorySize,
+    domain: aither_sandbox::MemoryDomain,
 }
 
 /// How a finished background task ended.
@@ -3542,10 +3543,12 @@ fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String
                 runaway: match task.kill {
                     Some(aither_sandbox::KillCause::MemoryRunaway {
                         footprint_bytes,
-                        physical_bytes,
+                        capacity_bytes,
+                        domain,
                     }) => Some(RunawayText {
                         footprint: aither_sandbox::MemorySize(footprint_bytes),
-                        physical: aither_sandbox::MemorySize(physical_bytes),
+                        capacity: aither_sandbox::MemorySize(capacity_bytes),
+                        domain,
                     }),
                     Some(aither_sandbox::KillCause::User) | None => None,
                 },

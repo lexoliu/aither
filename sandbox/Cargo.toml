@@ -101,6 +101,16 @@ typed-path = "0.12.3"
 aither-connectivity = { workspace = true, optional = true }
 jiff = { version = "0.2.39", default-features = false, features = ["std"] }
 
+# Job memory footprints on Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
 [features]
 default = []
 # Detect source code in command output so it can be folded with tree-sitter.

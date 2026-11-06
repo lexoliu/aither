@@ -19,13 +19,13 @@ use crate::runaway::RunawayGuard;
 use std::fmt;
 use std::time::Duration;
 
-use aither_sandbox::{ForegroundWait, JobFootprint, MemorySize};
+use aither_sandbox::{ForegroundWait, JobFootprint, MemoryDomain, MemorySize};
 use askama::Template;
 use async_channel::{Receiver, Sender};
 
 use crate::clock::{AnyClock, Instant};
 
-pub use system::SystemReader;
+pub use system::{SystemReader, psi_memory_pressure};
 
 /// How hard the host's memory is pressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -115,6 +115,37 @@ pub trait HostReader: Send + 'static {
     ///
     /// Fails when the host's source cannot be read.
     fn machine_load(&mut self) -> Result<MachineLoad, ReadError>;
+}
+
+fn log_failed_read(error: &ReadError, what: &str) {
+    if matches!(error, ReadError::Unsupported { .. }) {
+        tracing::trace!(%error, "{what} is not available on this host");
+    } else {
+        tracing::warn!(%error, "{what} could not be read");
+    }
+}
+
+/// A host that offers neither memory pressure nor machine load, such as a
+/// Linux kernel built without PSI.
+///
+/// The monitor over it states nothing about the machine, yet still watches
+/// what does not need the host's sources: a container's memory and the free
+/// space of a volume.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnwatchedHost;
+
+impl HostReader for UnwatchedHost {
+    fn memory_pressure(&mut self) -> Result<MemoryPressure, ReadError> {
+        Err(ReadError::Unsupported {
+            what: "host memory pressure",
+        })
+    }
+
+    fn machine_load(&mut self) -> Result<MachineLoad, ReadError> {
+        Err(ReadError::Unsupported {
+            what: "host machine load",
+        })
+    }
 }
 
 /// A type-erased [`HostReader`], what the builders store.
@@ -252,42 +283,54 @@ pub enum HostLoadEvent {
         /// The terminal's foreground window again.
         foreground_wait: Duration,
     },
-    /// Host memory pressure turned warning.
+    /// Memory pressure turned warning in the machine or the container.
     MemoryYellow {
-        /// The agent's running jobs, the largest first.
+        /// Whose memory it is.
+        domain: MemoryDomain,
+        /// The agent's running jobs in the domain, the largest first.
         jobs: Vec<JobFootprint>,
     },
-    /// Host memory pressure turned critical.
+    /// Memory pressure turned critical in the machine or the container.
     MemoryRed {
-        /// The agent's running jobs, the largest first.
+        /// Whose memory it is.
+        domain: MemoryDomain,
+        /// The agent's running jobs in the domain, the largest first.
         jobs: Vec<JobFootprint>,
     },
     /// A job is killed unless the agent acts within the window.
     MemoryFinalWarning {
+        /// Whose memory it is.
+        domain: MemoryDomain,
         /// The job that goes.
         job: JobFootprint,
         /// How long the agent has.
         window: Duration,
-        /// The machine's physical memory.
-        physical: MemorySize,
+        /// The domain's memory: the machine's physical memory, or the
+        /// container's limit.
+        capacity: MemorySize,
     },
-    /// Host memory pressure fell from critical to warning, or to normal.
+    /// Memory pressure fell from critical to warning, or to normal.
     MemoryDroppedBack {
+        /// Whose memory it is.
+        domain: MemoryDomain,
         /// The level it fell to.
         level: MemoryPressure,
-        /// The agent's running jobs, the largest first.
+        /// The agent's running jobs in the domain, the largest first.
         jobs: Vec<JobFootprint>,
     },
     /// A job was killed for the memory it held.
     JobKilledForMemory {
+        /// Whose memory it is.
+        domain: MemoryDomain,
         /// The job's task ID.
         task_id: String,
         /// The script the job ran.
         command: String,
         /// What its processes held.
         footprint: MemorySize,
-        /// The machine's physical memory.
-        physical: MemorySize,
+        /// The domain's memory: the machine's physical memory, or the
+        /// container's limit.
+        capacity: MemorySize,
     },
 }
 
@@ -392,16 +435,19 @@ impl<R: HostReader> HostLoadMonitor<R> {
 
     /// Reads the host. A source that fails is logged and left out of the
     /// sample, which leaves its condition as it was.
+    ///
+    /// A host that has no such source at all ([`UnwatchedHost`]) is not an
+    /// error each time it is read; the embedder was told once.
     pub fn read(&mut self) -> HostSample {
         let memory = self
             .reader
             .memory_pressure()
-            .inspect_err(|error| tracing::warn!(%error, "memory pressure could not be read"))
+            .inspect_err(|error| log_failed_read(error, "memory pressure"))
             .ok();
         let load = self
             .reader
             .machine_load()
-            .inspect_err(|error| tracing::warn!(%error, "machine load could not be read"))
+            .inspect_err(|error| log_failed_read(error, "machine load"))
             .ok();
         HostSample { memory, load }
     }

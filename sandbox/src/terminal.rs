@@ -13,8 +13,8 @@
 use crate::foreground_wait::ForegroundWait;
 use crate::grants::{GrantSet, TerminalGrants};
 use crate::memory::{
-    AnyFootprintReader, AnyFootprintRegistry, FootprintReader, FootprintRegistry, JobMemory,
-    ResponseWindow, SystemFootprints,
+    AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, FootprintReader,
+    FootprintRegistry, JobMemory, ProbedContainerMemory, ResponseWindow, SystemFootprints,
 };
 use crate::outage::Outages;
 use std::{
@@ -2101,13 +2101,37 @@ where
     /// The memory the terminal's jobs hold, for a guard that warns about and
     /// kills a runaway job.
     #[must_use]
+    ///
+    /// The machine the embedder runs on is always judged. When the terminal
+    /// runs in a container, the container's own memory limit is judged too,
+    /// read inside the container. Jobs of a remote execution environment are
+    /// never judged.
     pub fn job_memory(&self) -> JobMemory {
-        JobMemory::new(
+        let memory = JobMemory::new(
             self.job_registry(),
             self.limits.footprints.clone(),
             self.limits.footprint_registry.clone(),
             self.limits.response_window.clone(),
-        )
+        );
+        match self.container_probe() {
+            Some(probe) => {
+                memory.with_container(AnyContainerMemory::new(ProbedContainerMemory::new(probe)))
+            }
+            None => memory,
+        }
+    }
+
+    /// A reader of the container the agent works in, when the terminal's
+    /// home environment is a container; `None` when it is the local
+    /// machine. A remote execution environment is never a home environment.
+    #[must_use]
+    pub fn container_probe(&self) -> Option<crate::ContainerProbe> {
+        if self.shell_sessions.resolve_local_backend() != Ok(ShellBackend::Container) {
+            return None;
+        }
+        self.shell_sessions
+            .container_runtime()
+            .map(ContainerShellRuntime::probe)
     }
 
     /// Sets the largest `timeout` a command accepts.
@@ -4548,6 +4572,7 @@ where
             context.mode,
             None,
             Some(tree.clone()),
+            crate::JobPlace::Host,
         )
         .await;
     context.background_startup.report_ready().await;
@@ -4639,6 +4664,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
             context.mode,
             None,
             Some(tree.clone()),
+            crate::JobPlace::Host,
         )
         .await;
     context.background_startup.report_ready().await;
@@ -5131,6 +5157,7 @@ fn container_exec_script(
     Ok(prepared_tools.shell_command(&script)?)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_container_background<E: Executor + Clone + 'static>(
     context: ContainerBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
@@ -5147,13 +5174,13 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
     let (input_tx, input_rx) = async_channel::unbounded::<Vec<u8>>();
     context
         .job_registry
-        .register(
+        .register_at(
+            crate::JobPlace::Container,
             pid,
             context.task_id,
             context.execution_id,
             context.script,
             context.mode,
-            None,
         )
         .await;
     let script = container_exec_script(
@@ -5164,6 +5191,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         context.script,
     )?;
     let script = inject_env_exports(script, context.env_source.as_ref())?;
+    let script = mark_container_job(script, context.task_id)?;
     // A foreground command gets no input channel: the dropped sender is the
     // EOF its stdin reads. StdinAlerts may ride along either way; they are
     // the background job's blocked-reader wiring.
@@ -5356,15 +5384,17 @@ async fn execute_ssh_background(
         .map_err(|e| TerminalError::Execution(e.to_string()))?;
 
     let pid = child.id();
+    // The local `ssh` process stands for a job that runs on the remote host,
+    // whose memory is never judged.
     context
         .job_registry
-        .register(
+        .register_at(
+            crate::JobPlace::Remote,
             pid,
             context.task_id,
             context.execution_id,
             context.script,
             context.mode,
-            None,
         )
         .await;
     context.background_startup.report_ready().await;
@@ -5423,6 +5453,17 @@ fn inject_env_exports(
     }
     rendered.push_str(&script);
     Ok(rendered)
+}
+
+/// Marks every process of a container job with its task ID, the marker the
+/// container's memory reader finds the job's processes by: each process the
+/// job starts inherits it.
+fn mark_container_job(script: String, task_id: &str) -> Result<String, TerminalError> {
+    let marker: Arc<dyn TerminalEnvSource> = Arc::new(vec![(
+        crate::memory::JOB_MARKER_ENV.to_string(),
+        task_id.to_string(),
+    )]);
+    inject_env_exports(script, Some(&marker))
 }
 
 fn shell_escape(value: &str) -> String {
@@ -6477,6 +6518,57 @@ mod tests {
         let stdout = render_terminal_result(&result);
         assert!(!stdout.contains("Exit code:"), "{stdout}");
         assert!(stdout.contains("managed=1.0.0 bash"), "{stdout}");
+    }
+
+    /// A command run on an SSH server is a remote job: its local `ssh`
+    /// process stands for work whose memory is never judged here.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_run_over_ssh_is_a_remote_job() {
+        let authorizer = Arc::new(CountingSshAuthorizer::default());
+        let tools_cache = tempfile::tempdir().unwrap();
+        let tools = crate::tool_runtime::tests::bundle()
+            .prepare_local(tools_cache.path())
+            .await
+            .unwrap();
+        let prepared = local_and_ssh_registry(&authorizer)
+            .with_test_tools(tools.clone())
+            .with_test_ssh(build_server(), tools);
+        let directory = tempfile::tempdir().unwrap();
+        let terminal = fresh_terminal(directory.path())
+            .await
+            .adopt_prepared_tools(prepared)
+            .await
+            .expect("a prepared registry should be adopted");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+        let terminal = terminal.with_registry(registry);
+        let _ = terminal
+            .call(
+                TerminalArgs {
+                    description: "run remotely".to_string(),
+                    script: "echo remote-job".to_string(),
+                    mode: TerminalExecutionMode::Ssh,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    max_lines: 50,
+                    raw: true,
+                    timeout: 30,
+                    background: true,
+                },
+                ToolContext::new(),
+            )
+            .await;
+
+        let jobs = terminal.job_registry().list().await;
+        let job = jobs
+            .iter()
+            .find(|job| job.script == "echo remote-job")
+            .expect("the remote job is registered");
+        assert_eq!(job.place, crate::JobPlace::Remote);
+        let machine = terminal.job_memory().snapshot().await.unwrap();
+        assert_eq!(machine.jobs, []);
+        terminal.job_registry().kill_running().await;
     }
 
     #[cfg(unix)]
@@ -12179,6 +12271,54 @@ mod tests {
         .expect("prepared tools should be adopted");
         let parent = tool.with_registry(Arc::new(ToolRegistryBuilder::new().build(dir)));
         (scripts, parent)
+    }
+
+    /// A container terminal's jobs are the container's: they carry the
+    /// marker its memory reader finds them by, are registered as running
+    /// there, and the terminal judges the container's memory too.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn container_jobs_are_marked_and_placed_in_the_container() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (scripts, parent) = recording_container_terminal(dir.path(), None).await;
+        assert!(parent.container_probe().is_some());
+        assert!(parent.job_memory().has_container());
+
+        assert_eq!(exit_code_of(&parent, "echo marked-command").await, 0);
+
+        let scripts = scripts.lock().unwrap().clone();
+        let script = scripts
+            .iter()
+            .find(|script| script.contains("marked-command"))
+            .expect("the command ran");
+        let jobs = parent.job_registry().list().await;
+        let job = jobs
+            .iter()
+            .find(|job| job.script == "echo marked-command")
+            .expect("the job is registered");
+        assert_eq!(job.place, crate::JobPlace::Container);
+        assert!(
+            script.contains(&format!(
+                "export {}='{}'",
+                crate::memory::JOB_MARKER_ENV,
+                job.task_id
+            )),
+            "{script}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_local_terminal_judges_no_container() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        assert!(tool.container_probe().is_none());
+        assert!(!tool.job_memory().has_container());
     }
 
     #[cfg(unix)]

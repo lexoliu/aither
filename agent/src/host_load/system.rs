@@ -55,9 +55,8 @@ impl HostReader for SystemReader {
 
 /// The 10-second average of a PSI line, in percent.
 ///
-/// `content` is the text of a `/proc/pressure/*` file and `kind` the line to
-/// read, `some` or `full`.
-#[cfg(any(target_os = "linux", target_os = "android", test))]
+/// `content` is the text of a `/proc/pressure/*` file or of a cgroup's
+/// `memory.pressure`, and `kind` the line to read, `some` or `full`.
 fn psi_avg10(content: &str, kind: &str) -> Option<f64> {
     content
         .lines()
@@ -66,6 +65,25 @@ fn psi_avg10(content: &str, kind: &str) -> Option<f64> {
         .find_map(|field| field.strip_prefix("avg10="))?
         .parse()
         .ok()
+}
+
+/// Percent of the last ten seconds some task stalled on memory at which
+/// pressure is a warning.
+const PSI_WARNING_PERCENT: f64 = 10.0;
+/// Percent of the last ten seconds every task stalled on memory at which
+/// pressure is critical.
+const PSI_CRITICAL_PERCENT: f64 = 10.0;
+
+/// The memory pressure the text of a PSI memory file (`/proc/pressure/memory`
+/// or a cgroup's `memory.pressure`) states; `None` when the text is not PSI.
+pub fn psi_memory_pressure(content: &str) -> Option<MemoryPressure> {
+    Some(if psi_avg10(content, "full")? >= PSI_CRITICAL_PERCENT {
+        MemoryPressure::Critical
+    } else if psi_avg10(content, "some")? >= PSI_WARNING_PERCENT {
+        MemoryPressure::Warning
+    } else {
+        MemoryPressure::Normal
+    })
 }
 
 #[cfg(target_vendor = "apple")]
@@ -150,18 +168,11 @@ mod apple {
 mod linux {
     use std::fs;
 
-    use super::{MachineLoad, MemoryPressure, ReadError, psi_avg10};
+    use super::{MachineLoad, MemoryPressure, ReadError, psi_avg10, psi_memory_pressure};
 
     /// Stall time of the last ten seconds at which tasks waiting for a CPU
     /// are a load worth telling the agent about.
     pub const DEFAULT_LOAD_THRESHOLD: f64 = 0.3;
-
-    /// Percent of the last ten seconds some task stalled on memory at which
-    /// pressure is a warning.
-    const MEMORY_WARNING_PERCENT: f64 = 10.0;
-    /// Percent of the last ten seconds every task stalled on memory at which
-    /// pressure is critical.
-    const MEMORY_CRITICAL_PERCENT: f64 = 10.0;
 
     const MEMORY: &str = "/proc/pressure/memory";
     const CPU: &str = "/proc/pressure/cpu";
@@ -189,13 +200,10 @@ mod linux {
 
     pub fn memory_pressure(_: &State) -> Result<MemoryPressure, ReadError> {
         let content = read(MEMORY)?;
-        if avg10(MEMORY, &content, "full")? >= MEMORY_CRITICAL_PERCENT {
-            Ok(MemoryPressure::Critical)
-        } else if avg10(MEMORY, &content, "some")? >= MEMORY_WARNING_PERCENT {
-            Ok(MemoryPressure::Warning)
-        } else {
-            Ok(MemoryPressure::Normal)
-        }
+        psi_memory_pressure(&content).ok_or_else(|| ReadError::Malformed {
+            what: MEMORY,
+            content,
+        })
     }
 
     pub fn machine_load(_: &mut State) -> Result<MachineLoad, ReadError> {
@@ -360,6 +368,28 @@ mod tests {
         assert_eq!(psi_avg10(PSI_MEMORY, "full"), Some(0.4));
         assert_eq!(psi_avg10("some avg60=1.0", "some"), None);
         assert_eq!(psi_avg10("", "full"), None);
+    }
+
+    #[test]
+    fn psi_text_states_a_memory_pressure_level() {
+        let stall = |some, full| {
+            format!(
+                "some avg10={some} avg60=0.00 avg300=0.00 total=1\nfull avg10={full} avg60=0.00 avg300=0.00 total=1\n"
+            )
+        };
+        assert_eq!(
+            psi_memory_pressure(&stall("0.00", "0.00")),
+            Some(MemoryPressure::Normal)
+        );
+        assert_eq!(
+            psi_memory_pressure(&stall("12.00", "0.00")),
+            Some(MemoryPressure::Warning)
+        );
+        assert_eq!(
+            psi_memory_pressure(&stall("30.00", "10.00")),
+            Some(MemoryPressure::Critical)
+        );
+        assert_eq!(psi_memory_pressure("not pressure"), None);
     }
 
     #[cfg(any(target_vendor = "apple", windows))]

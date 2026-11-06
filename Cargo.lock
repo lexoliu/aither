@@ -598,6 +598,7 @@ dependencies = [
  "url",
  "uuid",
  "vte",
+ "windows-sys 0.61.2",
  "zenwave",
  "zip",
 ]

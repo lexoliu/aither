@@ -115,8 +115,8 @@ pub use heel::NetworkAuditLog;
 /// Re-export of heel's scheduling priority types for terminal-tool configuration.
 pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use job_registry::{
-    Delivery, JobInfo, JobRegistry, JobRegistryService, JobStatus, KillCause, OwedCompletion,
-    PendingCompletion, TerminalDelta, TerminalReadError, job_registry_channel,
+    Delivery, JobInfo, JobPlace, JobRegistry, JobRegistryService, JobStatus, KillCause,
+    OwedCompletion, PendingCompletion, TerminalDelta, TerminalReadError, job_registry_channel,
 };
 #[cfg(all(unix, feature = "jobserver"))]
 pub use jobserver::{
@@ -124,9 +124,10 @@ pub use jobserver::{
 };
 pub use kill_guard::CommandRefusal;
 pub use memory::{
-    AnyFootprintReader, AnyFootprintRegistry, FileFootprintRegistry, FootprintError,
-    FootprintReader, FootprintRegistry, JobFootprint, JobMemory, MemorySize, MemorySnapshot,
-    ResponseWindow, SystemFootprints,
+    AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, CgroupMemory, ContainerMemory,
+    ContainerSnapshot, FileFootprintRegistry, FootprintError, FootprintReader, FootprintRegistry,
+    JOB_MARKER_ENV, JobFootprint, JobMemory, MemoryDomain, MemorySize, MemorySnapshot,
+    ProbedContainerMemory, ResponseWindow, SystemFootprints,
 };
 pub use monitor::{
     MonitorArgs, MonitorEnd, MonitorEnded, MonitorIncrement, MonitorLanguage, MonitorRefusal,
@@ -144,9 +145,10 @@ pub use process_tree::{
 pub use session_policy::SessionSandboxPolicy;
 pub use shell_session::{
     AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
-    ContainerExecOutcome, ContainerIpcRoute, ContainerShellRuntime, ExecLifetime, ShellBackend,
-    ShellRuntimeAvailability, ShellSessionRegistry, SshAuthorizationError, SshRuntimeProfile,
-    SshServer, SshSessionAuthorizer, bootstrap_ssh_runtime,
+    ContainerExecOutcome, ContainerIpcRoute, ContainerProbe, ContainerProbeError,
+    ContainerShellRuntime, ExecLifetime, ShellBackend, ShellRuntimeAvailability,
+    ShellSessionRegistry, SshAuthorizationError, SshRuntimeProfile, SshServer,
+    SshSessionAuthorizer, bootstrap_ssh_runtime,
 };
 pub use stdin_watch::StdinWatchSignal;
 pub use subagent::{

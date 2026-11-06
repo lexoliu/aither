@@ -131,7 +131,7 @@ pub use hook::{
 };
 pub use host_load::{
     AnyHostReader, HostLoadConfig, HostLoadEvent, HostLoadMonitor, HostReader, HostSample,
-    MachineLoad, MemoryPressure, ReadError, SystemReader,
+    MachineLoad, MemoryPressure, ReadError, SystemReader, UnwatchedHost,
 };
 #[cfg(feature = "languages")]
 pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
