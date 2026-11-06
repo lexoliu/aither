@@ -2680,6 +2680,7 @@ where
             raw,
             background,
             timeout,
+            file_reads,
             carry,
             call,
         } = request;
@@ -2734,6 +2735,7 @@ where
                 execution_id,
                 background,
                 timeout_watch: timeout_watch.clone(),
+                file_reads,
                 carry,
                 carried_dir: self.carried_dir.clone(),
                 alert_tx: self.alert_tx.clone(),
@@ -2809,6 +2811,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             raw: arguments.raw,
             background: arguments.background,
             timeout,
+            file_reads: prepared.file_reads,
             carry: carry.clone(),
             call: cx.identity().cloned(),
         });
@@ -3153,10 +3156,10 @@ where
                 arguments.max_lines,
             )
             .await?;
-        if !file_reads.is_empty() {
-            self.job_registry.record_file_reads(file_reads).await;
-        }
-        Ok(prepared)
+        Ok(ExecutionPreparation {
+            file_reads,
+            ..prepared
+        })
     }
 
     /// The terminal's policy for a command, whoever runs it: the command
@@ -3189,6 +3192,7 @@ where
         self.ensure_permission_allowed(target.mode, script).await?;
         let task_id = random_task_id();
         Ok(ExecutionPreparation {
+            file_reads: Vec::new(),
             target,
             execution_id: format!("exec-{task_id}"),
             task_id,
@@ -3225,6 +3229,7 @@ where
             raw: false,
             background: false,
             timeout: run.timeout,
+            file_reads: Vec::new(),
             carry: Some(start),
             call: None,
         });
@@ -3341,7 +3346,12 @@ where
     }
 }
 
+/// A command's file reads with the fingerprints taken at admission.
+type FileReads = Vec<(std::path::PathBuf, crate::job_registry::FileFingerprint)>;
+
 struct ExecutionPreparation {
+    /// Fingerprinted at admission, recorded once the command exits 0.
+    file_reads: FileReads,
     target: ExecutionTarget,
     task_id: String,
     execution_id: String,
@@ -3497,6 +3507,7 @@ struct StandaloneExecution<P, E> {
     task_id: String,
     execution_id: String,
     background: bool,
+    file_reads: FileReads,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     alert_tx: Sender<JobAlert>,
@@ -3643,6 +3654,9 @@ struct TerminalSpawnRequest {
     raw: bool,
     background: bool,
     timeout: Duration,
+    /// Files the command reads, recorded for the unchanged-file guard once
+    /// it exits 0.
+    file_reads: FileReads,
     carry: Option<CwdCarry>,
     /// The `terminal` call this execution belongs to.
     call: Option<CallIdentity>,
@@ -3666,6 +3680,7 @@ struct SpawnedTerminalTask<P, E> {
     execution_id: String,
     background: bool,
     timeout_watch: Arc<TimeoutWatch>,
+    file_reads: FileReads,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     alert_tx: Sender<JobAlert>,
@@ -3709,6 +3724,7 @@ where
         execution_id,
         background,
         timeout_watch,
+        file_reads,
         carry,
         carried_dir,
         alert_tx,
@@ -3745,6 +3761,7 @@ where
         task_id: task_id.clone(),
         execution_id,
         background,
+        file_reads,
         carry,
         carried_dir,
         alert_tx,
@@ -3822,6 +3839,7 @@ where
         task_id,
         execution_id,
         background,
+        file_reads,
         carry,
         carried_dir,
         alert_tx,
@@ -3898,6 +3916,11 @@ where
 
     let output_path = stored_path(&result.stdout);
     job_registry.complete(pid, exit_code, output_path).await;
+    // Only a read that succeeded counts for the unchanged-file guard: a
+    // denied or failed read must run again and show its failure.
+    if exit_code == 0 && !file_reads.is_empty() {
+        job_registry.record_file_reads(file_reads).await;
+    }
 
     // The command's directory report arrives with its end, whether the call
     // answered in the foreground window or the command promoted: the task
@@ -7727,6 +7750,7 @@ mod tests {
             task_id: "task-test".to_string(),
             execution_id: "exec-test".to_string(),
             background: false,
+            file_reads: Vec::new(),
             carry: None,
             carried_dir: None,
             alert_tx: async_channel::unbounded().0,
@@ -7841,6 +7865,7 @@ mod tests {
             task_id: "task-policy".to_string(),
             execution_id: "exec-policy".to_string(),
             background: false,
+            file_reads: Vec::new(),
             carry: None,
             carried_dir: None,
             alert_tx: async_channel::unbounded().0,
@@ -10114,6 +10139,48 @@ mod tests {
             Duration::from_secs(600),
         )
         .await
+    }
+
+    /// A read that failed is not recorded by the unchanged-file guard, so a
+    /// plain retry runs and shows the failure again; a read that succeeded
+    /// is, so its unchanged re-read is refused.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_successful_read_arms_the_unchanged_file_guard() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let denied = tool.working_dir().join("denied.txt");
+        std::fs::write(&denied, "secret").expect("fixture should be written");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))
+            .expect("fixture should be locked");
+        let readable = tool.working_dir().join("readable.txt");
+        std::fs::write(&readable, "content").expect("fixture should be written");
+
+        let first = exit_code_of(&tool, "cat denied.txt").await;
+        if first == 0 {
+            // Running as a user the mode does not bind: nothing is denied.
+            return;
+        }
+        assert_eq!(
+            exit_code_of(&tool, "cat denied.txt").await,
+            first,
+            "a plain retry of a failed read runs and fails again"
+        );
+
+        assert_eq!(exit_code_of(&tool, "cat readable.txt").await, 0);
+        let refusal = tool
+            .call(
+                terminal_args("re-read", "cat readable.txt"),
+                ToolContext::new(),
+            )
+            .await
+            .expect_err("an unchanged re-read of a successful read is refused");
+        assert!(
+            refusal.to_string().contains("unchanged"),
+            "unexpected refusal: {refusal}"
+        );
     }
 
     /// A script the sandboxed command writes into its working directory and
