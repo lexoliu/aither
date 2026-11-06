@@ -253,6 +253,17 @@ struct SubagentResultTemplate<'a> {
     /// or why they could not be listed; `None` for a subagent launched
     /// without a commit grant.
     commits: Option<&'a CommitListing>,
+    /// The working copies its space was prepared with, where its work stays.
+    working_copies: &'a [PathBuf],
+}
+
+/// A fresh subagent's first prompt when its space was prepared with working
+/// copies: where to work, then the brief.
+#[derive(Template)]
+#[template(path = "subagent_brief.txt", escape = "none")]
+struct SubagentBriefTemplate<'a> {
+    working_copies: &'a [PathBuf],
+    brief: &'a str,
 }
 
 /// The commits listed for one run of a subagent holding a commit grant, or
@@ -316,6 +327,8 @@ struct SubagentErrorTemplate<'a> {
     /// Commits the subagent made before it failed; `None` for a subagent
     /// launched without a commit grant.
     commits: Option<&'a CommitListing>,
+    /// The working copies its space was prepared with, where its work stays.
+    working_copies: &'a [PathBuf],
     history: &'a [HistoryEntry],
 }
 
@@ -545,7 +558,38 @@ struct FinishedSubagent<LLM> {
     /// Lists the commits the subagent makes; set when it was launched with a
     /// commit grant.
     commit_ledger: Option<CommitLedger>,
+    /// The working copies the launching terminal's spaces prepared for it.
+    working_copies: Vec<PathBuf>,
     body: SubagentBody<LLM>,
+}
+
+/// What a run is prompted with: a fresh subagent with working copies learns
+/// where they are before its brief; a continued one was told when it started.
+fn run_prompt<'a>(
+    prompt: &'a str,
+    resumed: Option<u64>,
+    working_copies: &[PathBuf],
+) -> Cow<'a, str> {
+    if resumed.is_some() || working_copies.is_empty() {
+        return Cow::Borrowed(prompt);
+    }
+    Cow::Owned(
+        SubagentBriefTemplate {
+            working_copies,
+            brief: prompt,
+        }
+        .render()
+        .expect("subagent brief template must render"),
+    )
+}
+
+/// The working copies the launcher's spaces prepared for the subagent
+/// `terminal` serves.
+fn prepared_working_copies(terminal: &DynTerminalTool) -> Vec<PathBuf> {
+    terminal
+        .prepared_space()
+        .map(|space| space.working_copies().to_vec())
+        .unwrap_or_default()
 }
 
 /// What runs a subagent's turns.
@@ -1493,18 +1537,20 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
     }
 
     /// Launches the terminal a subagent holding `grant` works from, within the
-    /// authority of the terminal this tool serves; `None` for a tool bound to
-    /// no terminal when nothing is granted.
+    /// authority of the terminal this tool serves, for a call made from
+    /// `caller`; `None` for a tool bound to no terminal when nothing is
+    /// granted.
     async fn launch_terminal(
         &self,
         grant: SubagentGrant,
         observer: Option<aither_sandbox::AnyCommandObserver>,
         gate: Option<aither_sandbox::AnyCommandGate>,
+        caller: Option<&Path>,
     ) -> anyhow::Result<Option<DynTerminalTool>> {
         if let Some(binding) = &self.binding {
             let terminal = binding
                 .launcher()
-                .create(grant, observer, gate)
+                .create(grant, observer, gate, caller)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to create subagent terminal tool: {e}"))?;
             Ok(Some(terminal))
@@ -1547,15 +1593,23 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         })?;
         let grant = requested.grant(Some(working_dir));
         let (worktrees, commit_worktrees) = requested.paths(Some(working_dir));
-        let terminal = self.launch_terminal(grant, None, None).await?.map(Box::new);
+        let terminal = self
+            .launch_terminal(grant, None, None, Some(working_dir))
+            .await?
+            .map(Box::new);
         let commit_ledger = terminal
             .as_ref()
             .and_then(|terminal| terminal.commit_ledger().cloned());
+        let working_copies = terminal
+            .as_deref()
+            .map(prepared_working_copies)
+            .unwrap_or_default();
         let session = backend
             .open(ExternalStart {
                 working_dir,
                 worktrees: &worktrees,
                 commit_worktrees: &commit_worktrees,
+                working_copies: &working_copies,
             })
             .await
             .map_err(|error| {
@@ -1567,6 +1621,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             tier: None,
             model: session.model(),
             commit_ledger,
+            working_copies,
             body: SubagentBody::External {
                 session,
                 _terminal: terminal,
@@ -1586,6 +1641,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         grant: SubagentGrant,
         prompt: &str,
         started_by: Option<&CallIdentity>,
+        caller: Option<&Path>,
     ) -> anyhow::Result<FinishedSubagent<LLM>> {
         // A fork is checked before anything is started, and runs on the
         // main agent's model.
@@ -1636,20 +1692,26 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         let command_gate = self.hooks.is_some().then(|| child_hooks.command_gate());
 
         // Launch the subagent's terminal from the terminal this tool serves.
-        let (agent_builder, child_job_registry, commit_ledger) = match self
-            .launch_terminal(grant, command_observer, command_gate)
+        let (agent_builder, child_job_registry, commit_ledger, working_copies) = match self
+            .launch_terminal(grant, command_observer, command_gate, caller)
             .await?
         {
             Some(dyn_terminal) => {
                 let job_registry = dyn_terminal.job_registry();
                 let commit_ledger = dyn_terminal.commit_ledger().cloned();
+                let working_copies = prepared_working_copies(&dyn_terminal);
                 let agent_builder = match &fork {
                     Some(fork) => agent_builder.forked_from(fork, dyn_terminal),
                     None => agent_builder.dyn_terminal(dyn_terminal),
                 };
-                (agent_builder, Some(job_registry), commit_ledger)
+                (
+                    agent_builder,
+                    Some(job_registry),
+                    commit_ledger,
+                    working_copies,
+                )
             }
-            None => (agent_builder, None, None),
+            None => (agent_builder, None, None, Vec::new()),
         };
 
         let identity = AgentIdentity::Subagent(SubagentIdentity::new(
@@ -1667,6 +1729,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             tier: Some(tier),
             model: Some(model),
             commit_ledger,
+            working_copies,
             body: SubagentBody::Agent {
                 agent: Box::new(agent),
                 child_job_registry,
@@ -1724,9 +1787,10 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             ),
             Call::Named { name, grant } => (self.named_source(name, grant, caller).await?, grant),
         };
-        let grant = grant.grant(self.caller_dir(caller));
+        let caller = self.caller_dir(caller);
+        let grant = grant.grant(caller);
         Ok((
-            self.start_agent(resolved, grant, prompt, started_by)
+            self.start_agent(resolved, grant, prompt, started_by, caller)
                 .await?,
             None,
         ))
@@ -1875,6 +1939,7 @@ where
     type Arguments = SubagentArgs;
     type Res = ToolResult;
 
+    #[allow(clippy::too_many_lines)]
     async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
         let call = args.call()?;
         // The task prompt comes from a file; inline prompt text is rejected.
@@ -1895,13 +1960,16 @@ where
                 tier,
                 model,
                 commit_ledger,
+                working_copies,
                 body,
             },
             commit_mark,
         ) = self.mark_commits(finished, resumed).await?;
         self.announce_start(&subagent_id, &prompt).await;
         let cancel_rx = hold.begin(&subagent_id, &prompt, self.hooks.clone(), body);
-        let outcome = hold.run(&prompt, cancel_rx).await;
+        let outcome = hold
+            .run(&run_prompt(&prompt, resumed, &working_copies), cancel_rx)
+            .await;
         let body = hold.finish();
         self.record(crate::tasks::TaskEvent::SubagentFinished(
             subagent_id.clone(),
@@ -1929,6 +1997,7 @@ where
                         subagent: &subagent_id,
                         outcome: SubagentReport::Cancelled,
                         commits: commits.as_ref(),
+                        working_copies: &working_copies,
                     }
                     .render()
                     .expect("subagent result template must render"),
@@ -1939,8 +2008,15 @@ where
                 if let Some(id) = resumed {
                     self.finished.release(id);
                 }
-                let history = body.recent_history();
-                let error_text = failure_text(&subagent_id, &error, commits.as_ref(), &history);
+                let error_text = SubagentErrorTemplate {
+                    subagent: &subagent_id,
+                    error: &error,
+                    commits: commits.as_ref(),
+                    working_copies: &working_copies,
+                    history: &body.recent_history(),
+                }
+                .render()
+                .expect("subagent error template must render");
                 body.end(false).await;
                 return Err(anyhow::anyhow!(error_text));
             }
@@ -1961,6 +2037,7 @@ where
                 tier,
                 model: model.clone(),
                 commit_ledger,
+                working_copies: working_copies.clone(),
                 body,
             },
         );
@@ -1977,6 +2054,7 @@ where
                     alert: alert.as_deref(),
                 },
                 commits: commits.as_ref(),
+                working_copies: &working_copies,
             }
             .render()
             .expect("subagent result template must render"),
@@ -2003,23 +2081,6 @@ struct SubagentUsageTemplate<'a> {
     fork: &'a str,
     /// The connected external agents, by name, with their descriptions.
     externals: Vec<(&'a str, &'a str)>,
-}
-
-/// The error text for a failed run, with the tail of its history.
-fn failure_text(
-    subagent: &str,
-    error: &str,
-    commits: Option<&CommitListing>,
-    history: &[HistoryEntry],
-) -> String {
-    SubagentErrorTemplate {
-        subagent,
-        error,
-        commits,
-        history,
-    }
-    .render()
-    .expect("subagent error template must render")
 }
 
 impl<LLM: LanguageModel + 'static> SubagentBody<LLM> {
@@ -2236,6 +2297,7 @@ mod tests {
             subagent: "research",
             error: "boom",
             commits: None,
+            working_copies: &[],
             history: &history,
         }
         .render()
@@ -2259,6 +2321,7 @@ mod tests {
                 alert: None,
             },
             commits: None,
+            working_copies: &[],
         }
         .render()
         .expect("subagent result should render");
@@ -2278,6 +2341,7 @@ mod tests {
                 alert: None,
             },
             commits: None,
+            working_copies: &[],
         }
         .render()
         .expect("subagent result should render");
@@ -2297,6 +2361,7 @@ mod tests {
                 alert: Some("It idled too often."),
             },
             commits: None,
+            working_copies: &[],
         }
         .render()
         .expect("subagent result should render");
@@ -2309,6 +2374,7 @@ mod tests {
             subagent: "explore",
             outcome: SubagentReport::Cancelled,
             commits: None,
+            working_copies: &[],
         }
         .render()
         .expect("cancelled result should render");
@@ -2336,6 +2402,7 @@ mod tests {
                 alert: Some("It idled too often."),
             },
             commits: Some(&listed),
+            working_copies: &[],
         }
         .render()
         .expect("subagent result should render");
@@ -2352,6 +2419,7 @@ mod tests {
             subagent: "worker",
             outcome: SubagentReport::Cancelled,
             commits: Some(&none),
+            working_copies: &[],
         }
         .render()
         .expect("cancelled result should render");
@@ -2371,6 +2439,7 @@ mod tests {
             subagent: "worker",
             error: "model failed",
             commits: Some(&failed),
+            working_copies: &[],
             history: &[],
         }
         .render()
@@ -2701,8 +2770,20 @@ mod tests {
         worktree: PathBuf,
     }
 
+    /// The fixture's terminal before its registry is bound.
+    type UnboundTerminal = aither_sandbox::TerminalTool<
+        aither_sandbox::permission::NoopPermissionHandler,
+        executor_core::tokio::TokioGlobal,
+    >;
+
     impl CommitFixture {
         async fn new() -> Self {
+            Self::configured(|terminal| terminal).await
+        }
+
+        /// The fixture with `configure` applied to its terminal before the
+        /// registry is bound.
+        async fn configured(configure: impl FnOnce(UnboundTerminal) -> UnboundTerminal) -> Self {
             use aither_sandbox::permission::NoopPermissionHandler;
             use aither_sandbox::{TerminalTool, ToolRegistryBuilder};
             use executor_core::tokio::TokioGlobal;
@@ -2736,6 +2817,7 @@ mod tests {
                 .initialize_tools(&distribution, cache.path())
                 .await
                 .expect("tools should prepare");
+            let terminal = configure(terminal);
             let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
             let terminal = terminal.with_registry(registry);
             Self {
@@ -2868,6 +2950,109 @@ mod tests {
                 subject
             })
             .collect()
+    }
+
+    /// Clones the launcher's `repository` into each subagent space, as an
+    /// embedder gives a run a clone of its session's repository.
+    struct CloneSpaces;
+
+    impl aither_sandbox::SubagentSpaces for CloneSpaces {
+        type Error = std::io::Error;
+
+        async fn prepare(
+            &self,
+            run: aither_sandbox::RunSpace<'_>,
+        ) -> Result<aither_sandbox::PreparedSpace, std::io::Error> {
+            let source = run.launcher.join("repository");
+            let clone = run.space.join("repo");
+            let target = clone.clone();
+            blocking::unblock(move || {
+                git(
+                    &source,
+                    &["clone", "-q", "--local", ".", target.to_str().unwrap()],
+                )
+            })
+            .await;
+            Ok(aither_sandbox::PreparedSpace::new().with_working_copy(clone))
+        }
+    }
+
+    /// The last message of the last turn a [`RecordingTextLlm`] recorded.
+    fn last_prompt(seen: &async_channel::Receiver<(&'static str, LLMRequest)>) -> String {
+        std::iter::from_fn(|| seen.try_recv().ok())
+            .map(|(_, request)| request)
+            .filter(|request| !request.parameters().structured_outputs)
+            .last()
+            .expect("the subagent ran a turn")
+            .messages()
+            .last()
+            .expect("a turn sends messages")
+            .content()
+            .to_string()
+    }
+
+    /// The working copies a result or failure text lists.
+    fn listed_working_copies(text: &str) -> Vec<PathBuf> {
+        let (_, listing) = text
+            .split_once("Its work stays in its working copies until you merge it:\n")
+            .unwrap_or_else(|| panic!("the text lists working copies: {text}"));
+        listing
+            .lines()
+            .map_while(|line| line.strip_prefix("- "))
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    /// A run whose space the terminal's spaces prepared is told its working
+    /// copies in its first prompt, and its result names them to the main
+    /// agent, on every run; they stay after the run for the main agent to
+    /// merge.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_works_in_the_working_copies_its_space_was_prepared_with() {
+        let fixture =
+            CommitFixture::configured(|terminal| terminal.with_subagent_spaces(CloneSpaces)).await;
+        let runs = SubagentRuns::default();
+        let (seen, seen_rx) = async_channel::unbounded();
+        let tool = fixture.tool(
+            RecordingTextLlm {
+                text: TextLlm::routing("model", ROUTE_FAST),
+                seen,
+            },
+            &runs,
+        );
+        let (dir, prompt_file) = write_prompt_file("prepared-space", "fix the parser");
+
+        let first = completed_text(&tool, named("general", &prompt_file)).await;
+        let session = std::fs::canonicalize(fixture.terminal.working_dir()).unwrap();
+        let [clone] = listed_working_copies(&first)
+            .try_into()
+            .unwrap_or_else(|copies| panic!("one working copy: {copies:?}"));
+        assert!(
+            clone.starts_with(session.join("subagent-spaces")),
+            "{first}"
+        );
+        assert!(clone.join(".git").is_dir(), "the clone outlives the run");
+        let prompt = last_prompt(&seen_rx);
+        assert!(
+            prompt.starts_with(&format!(
+                "Your working copies, prepared for this run; commit your work in them, since only commits reach the agent that launched you:\n- {}\n\nfix the parser\n",
+                clone.display()
+            )),
+            "{prompt}"
+        );
+
+        let follow_up = dir.join("follow-up.txt");
+        std::fs::write(&follow_up, "and the lexer").unwrap();
+        let resumed = completed_text(&tool, resume_args(&follow_up, continuation_id(&first))).await;
+        assert_eq!(listed_working_copies(&resumed), [clone]);
+        let prompt = last_prompt(&seen_rx);
+        assert!(
+            prompt.starts_with("and the lexer\n"),
+            "a continued run was told its working copies when it started: {prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // Sandboxed git runs only off Windows: a package's ancestors carry

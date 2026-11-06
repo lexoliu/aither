@@ -406,6 +406,7 @@ async fn a_subagent_terminal_is_gated_and_its_hooks_see_the_subagent_role() {
             SubagentGrant::new(),
             Some(child_hooks.command_observer()),
             Some(child_hooks.command_gate()),
+            None,
         )
         .await
         .expect("the subagent terminal launches");

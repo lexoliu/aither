@@ -21,6 +21,7 @@ mod host_git;
 mod import;
 mod repository;
 mod sandboxed;
+mod space;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,9 @@ pub use repository::Spelling;
 use sandboxed::Bounds;
 pub use sandboxed::ExportError;
 pub use sandboxed::{SandboxedExit, SandboxedGitImpl, SandboxedRun, SubagentGit};
+pub use space::{
+    AnySubagentSpaces, PreparedSpace, RunSpace, SpacePreparationError, SubagentSpaces,
+};
 
 /// What a launcher grants a subagent beyond its own space.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -196,6 +200,28 @@ pub enum SubagentGrantError {
         path: PathBuf,
         /// The failure.
         source: io::Error,
+    },
+    /// The embedder's [`SubagentSpaces`] could not prepare the subagent's
+    /// space. The space was removed.
+    #[error("cannot prepare the subagent space {}: {source}", .space.display())]
+    Preparation {
+        /// The space.
+        space: PathBuf,
+        /// The embedder's error.
+        source: SpacePreparationError,
+    },
+    /// The embedder named a working copy outside the space it prepared. The
+    /// space was removed.
+    #[error(
+        "the working copy {} prepared for a subagent is outside its space {}",
+        .path.display(),
+        .space.display()
+    )]
+    PreparedOutsideSpace {
+        /// The working copy.
+        path: PathBuf,
+        /// The space.
+        space: PathBuf,
     },
     /// The repository of a committing worktree could not be created.
     #[error("cannot create the subagent repository at {}: {source}", .path.display())]

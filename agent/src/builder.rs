@@ -1307,7 +1307,7 @@ mod tests {
         let subagent = terminal
             .binding()
             .launcher()
-            .create(SubagentGrant::new(), None, None)
+            .create(SubagentGrant::new(), None, None, None)
             .await
             .unwrap();
         let space = subagent.working_dir().clone();

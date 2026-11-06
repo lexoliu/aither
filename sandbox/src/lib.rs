@@ -157,8 +157,9 @@ pub use shell_session::{
 };
 pub use stdin_watch::StdinWatchSignal;
 pub use subagent::{
-    CommitLedger, CommitLedgerError, CommitMark, ImportBudget, SubagentCommit, SubagentGrant,
-    SubagentGrantError,
+    AnySubagentSpaces, CommitLedger, CommitLedgerError, CommitMark, ImportBudget, PreparedSpace,
+    RunSpace, SpacePreparationError, SubagentCommit, SubagentGrant, SubagentGrantError,
+    SubagentSpaces,
 };
 pub use terminal::{
     BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand,
