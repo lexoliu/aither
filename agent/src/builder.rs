@@ -903,8 +903,8 @@ where
     }
 
     /// Starts a [`HostLoadMonitor`](crate::HostLoadMonitor) on `executor` and
-    /// tells the agent, once per event, when host memory pressure or machine
-    /// load becomes high and when it ends.
+    /// tells the agent, once per event, when machine load becomes high and when
+    /// it ends.
     ///
     /// With `memory`, the same readings drive the agent's
     /// [`RunawayGuard`](crate::RunawayGuard): memory warnings listing its

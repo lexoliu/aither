@@ -1,7 +1,7 @@
-//! Alerts for high host memory pressure and high machine load.
+//! Alerts for high machine load.
 //!
 //! A [`HostLoadMonitor`] reads the host through a [`HostReader`] and turns
-//! each of the two conditions into events: a condition *starts* when it stays
+//! sustained machine load into events: the load *starts* when it stays
 //! above its threshold for the start window, and *ends* when it stays below
 //! for the end window, so a brief spike does not flap. The agent hears each
 //! event once; nothing is injected while a condition persists.
@@ -182,8 +182,6 @@ impl fmt::Debug for AnyHostReader {
 /// When the monitor calls a condition high, and how long it must hold.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostLoadConfig {
-    /// Memory pressure at or above this level is high.
-    pub memory_threshold: MemoryPressure,
     /// Machine load at or above this is high; see [`MachineLoad`] for what
     /// the platform measures.
     pub load_threshold: MachineLoad,
@@ -202,20 +200,12 @@ impl HostLoadConfig {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            memory_threshold: MemoryPressure::Warning,
             load_threshold: MachineLoad(SystemReader::DEFAULT_LOAD_THRESHOLD),
             start_after: Duration::from_secs(30),
             end_after: Duration::from_secs(60),
             poll_interval: Duration::from_secs(5),
             high_load_foreground_wait: Duration::from_secs(60),
         }
-    }
-
-    /// Sets the memory pressure at which the condition is high.
-    #[must_use]
-    pub const fn memory_threshold(mut self, threshold: MemoryPressure) -> Self {
-        self.memory_threshold = threshold;
-        self
     }
 
     /// Sets the machine load at which the condition is high.
@@ -263,16 +253,6 @@ impl Default for HostLoadConfig {
 /// A condition starting or ending, as the agent is told.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostLoadEvent {
-    /// Memory pressure stayed high for the start window.
-    MemoryPressureHigh {
-        /// The pressure when the window passed.
-        level: MemoryPressure,
-    },
-    /// Memory pressure stayed below the threshold for the end window.
-    MemoryPressureEnded {
-        /// The pressure when the window passed.
-        level: MemoryPressure,
-    },
     /// Machine load stayed high for the start window.
     LoadHigh {
         /// The load when the window passed.
@@ -430,14 +410,12 @@ impl HostSample {
     }
 }
 
-/// Watches the host and turns sustained memory pressure and machine load
-/// into [`HostLoadEvent`]s.
+/// Watches the host and turns sustained machine load into [`HostLoadEvent`]s.
 #[derive(Debug)]
 pub struct HostLoadMonitor<R> {
     reader: R,
     config: HostLoadConfig,
     foreground_wait: ForegroundWait,
-    memory: Condition,
     load: Condition,
     disk: Option<DiskWatch>,
 }
@@ -482,7 +460,6 @@ impl<R: HostReader> HostLoadMonitor<R> {
             reader,
             config,
             foreground_wait,
-            memory: Condition::default(),
             load: Condition::default(),
             disk: None,
         }
@@ -514,21 +491,6 @@ impl<R: HostReader> HostLoadMonitor<R> {
     pub fn observe(&mut self, now: Instant, sample: HostSample) -> Vec<HostLoadEvent> {
         let config = &self.config;
         let mut events = Vec::new();
-        if let Some(level) = sample.memory {
-            let high = level >= config.memory_threshold;
-            match self
-                .memory
-                .observe(now, high, config.start_after, config.end_after)
-            {
-                Some(Transition::Started) => {
-                    events.push(HostLoadEvent::MemoryPressureHigh { level });
-                }
-                Some(Transition::Ended) => {
-                    events.push(HostLoadEvent::MemoryPressureEnded { level });
-                }
-                None => {}
-            }
-        }
         if let Some(load) = sample.load {
             let high = load >= config.load_threshold;
             match self
