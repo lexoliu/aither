@@ -821,6 +821,7 @@ pub struct DynTerminalTool {
     pub(crate) command_names: Vec<String>,
     pub(crate) prepared_tools: crate::ToolCatalog,
     pub(crate) commit_ledger: Option<crate::subagent::CommitLedger>,
+    pub(crate) prepared_space: Option<crate::subagent::PreparedSpace>,
     pub(crate) role: CommandRole,
 }
 
@@ -867,6 +868,14 @@ impl DynTerminalTool {
     #[must_use]
     pub const fn commit_ledger(&self) -> Option<&crate::subagent::CommitLedger> {
         self.commit_ledger.as_ref()
+    }
+
+    /// What the launcher's [`SubagentSpaces`](crate::SubagentSpaces) made in
+    /// the space of the subagent this bundle serves; `None` when the
+    /// launcher has none, and for the main agent's terminal.
+    #[must_use]
+    pub const fn prepared_space(&self) -> Option<&crate::subagent::PreparedSpace> {
+        self.prepared_space.as_ref()
     }
 
     /// The role the bundle's command registry serves: [`CommandRole::Main`]

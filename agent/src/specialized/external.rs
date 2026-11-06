@@ -22,6 +22,10 @@ pub struct ExternalStart<'a> {
     /// Linked git worktrees the caller granted the subagent to write and
     /// commit in. Their commits are listed in the subagent's result.
     pub commit_worktrees: &'a [PathBuf],
+    /// The working copies the terminal's
+    /// [`SubagentSpaces`](aither_sandbox::SubagentSpaces) prepared for the
+    /// run in its space; empty when the terminal has none.
+    pub working_copies: &'a [PathBuf],
 }
 
 /// A backend that opens subagent sessions running outside aither.

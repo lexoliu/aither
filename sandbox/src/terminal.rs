@@ -76,8 +76,9 @@ use crate::{
         EpisodeDetector, FeedCounter, LocalStdinProbe, STDIN_WATCH_INTERVAL, StdinWatchSignal,
     },
     subagent::{
-        CommitLedger, CommittingWorktree, ImportBudget, ImportLimits, LaunchHistory, Launcher,
-        Spelling, SubagentGit, SubagentGrant, SubagentGrantError, canonical as canonical_path,
+        AnySubagentSpaces, CommitLedger, CommittingWorktree, ImportBudget, ImportLimits,
+        LaunchHistory, Launcher, PreparedSpace, ResolvedGrant, RunSpace, Spelling, SubagentGit,
+        SubagentGrant, SubagentGrantError, SubagentSpaces, canonical as canonical_path,
     },
 };
 
@@ -1128,6 +1129,7 @@ struct TerminalToolRequest {
     grant: SubagentGrant,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
+    caller: Option<PathBuf>,
     reply: Sender<Result<crate::command::DynTerminalTool, SubagentGrantError>>,
 }
 
@@ -1153,16 +1155,21 @@ impl TerminalToolFactory {
     /// inside the launching terminal's working directory; `grant` is
     /// everything it may write beyond that space, and must lie inside what the
     /// launching terminal can write. The commands it calls are told to
-    /// `observer`, and every shell command it runs is put to `gate`.
+    /// `observer`, and every shell command it runs is put to `gate`. When the
+    /// launching terminal has [`SubagentSpaces`], they prepare the space
+    /// first and are told `caller`, the directory the launch is asked for
+    /// from (the launching terminal's working directory when `None`).
     ///
     /// # Errors
     /// Returns an error when the launching terminal is gone or does not
-    /// respond, or when the grant cannot be given.
+    /// respond, when the grant cannot be given, or when the space cannot be
+    /// prepared.
     pub async fn create(
         &self,
         grant: SubagentGrant,
         observer: Option<AnyCommandObserver>,
         gate: Option<AnyCommandGate>,
+        caller: Option<&Path>,
     ) -> Result<crate::command::DynTerminalTool, TerminalToolFactoryError> {
         let (reply, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -1170,6 +1177,7 @@ impl TerminalToolFactory {
                 grant,
                 observer,
                 gate,
+                caller: caller.map(Path::to_path_buf),
                 reply,
             })
             .await
@@ -1181,8 +1189,9 @@ impl TerminalToolFactory {
     }
 }
 
-/// Serves a terminal's launch requests one at a time, so the grants handed
-/// out from it are recorded in one place.
+/// Serves a terminal's launch requests: their grants are resolved one at a
+/// time, so the grants handed out from it are recorded in one place, and
+/// each launch then goes on, its space prepared, beside the others.
 ///
 /// `source` is the terminal with its registry not yet bound: it holds no
 /// handle to its own launcher, so the loop ends once every terminal-bound
@@ -1199,16 +1208,33 @@ async fn serve_launches<P, E>(
         grant,
         observer,
         gate,
+        caller,
         reply,
     }) = requests.recv().await
     {
-        let tool = source
-            .subagent(&mut history, grant, observer, gate)
-            .await
-            .map(TerminalTool::to_dyn);
-        if reply.send(tool).await.is_err() {
-            warn!("terminal tool factory response channel dropped");
-        }
+        let resolved = match source.resolve_launch(&mut history, grant).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                if reply.send(Err(error)).await.is_err() {
+                    warn!("terminal tool factory response channel dropped");
+                }
+                continue;
+            }
+        };
+        let source = source.clone();
+        source
+            .executor
+            .clone()
+            .spawn(async move {
+                let tool = source
+                    .launch_resolved(resolved, observer, gate, caller.as_deref())
+                    .await
+                    .map(TerminalTool::to_dyn);
+                if reply.send(tool).await.is_err() {
+                    warn!("terminal tool factory response channel dropped");
+                }
+            })
+            .detach();
     }
 }
 
@@ -1482,6 +1508,21 @@ struct SubagentAuthority {
     /// space and granted paths, mapped through the container's workspace
     /// mount when it was launched.
     container: Option<ContainerConfinement>,
+    /// What the launcher's [`SubagentSpaces`] made in its space; `None` when
+    /// the launcher has none.
+    prepared: Option<PreparedSpace>,
+}
+
+/// A subagent launch whose grant is resolved: everything the launch still
+/// needs from what the launching terminal handed out.
+struct ResolvedLaunch {
+    /// The launching terminal's working directory and grants, canonical.
+    authority: Vec<PathBuf>,
+    /// Where the subagent's space goes.
+    spaces_root: PathBuf,
+    /// The container workspace mount, for a container terminal.
+    mount: Option<MountRoot>,
+    granted: ResolvedGrant,
 }
 
 /// The main agent's working directory, carried from one foreground command
@@ -1578,6 +1619,9 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     jobserver: Option<JobBroker>,
     /// Records the outages commands run through.
     outages: Outages,
+    /// Prepares the space of every subagent launched from this terminal and,
+    /// at any depth, from theirs.
+    subagent_spaces: Option<AnySubagentSpaces>,
     /// Tool registry state.
     registry: State,
 }
@@ -1611,6 +1655,7 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver.clone(),
             outages: self.outages.clone(),
+            subagent_spaces: self.subagent_spaces.clone(),
             registry: self.registry.clone(),
         }
     }
@@ -1657,6 +1702,16 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
     #[must_use]
     pub fn with_network_audit_log(mut self, log: NetworkAuditLog) -> Self {
         self.network_audit = Some(log);
+        self
+    }
+
+    /// Has `spaces` prepare the space of every subagent launched from this
+    /// terminal and, at any depth, from theirs, before the subagent's
+    /// terminal exists. A launch whose space cannot be prepared fails with
+    /// the error `spaces` gives.
+    #[must_use]
+    pub fn with_subagent_spaces(mut self, spaces: impl SubagentSpaces) -> Self {
+        self.subagent_spaces = Some(AnySubagentSpaces::new(spaces));
         self
     }
 
@@ -1731,6 +1786,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
             outages: Outages::none(),
+            subagent_spaces: None,
             registry: Unconfigured,
         })
     }
@@ -1800,6 +1856,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
             outages: Outages::none(),
+            subagent_spaces: None,
             registry: Unconfigured,
         })
     }
@@ -1834,6 +1891,7 @@ impl<P, E, State> TerminalTool<P, E, State> {
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver,
             outages: self.outages,
+            subagent_spaces: self.subagent_spaces,
             registry: state(self.registry),
         }
     }
@@ -1868,13 +1926,8 @@ where
 {
     /// A subagent terminal with an empty grant, told to no observer or gate.
     async fn subagent_without_grant(&self) -> Result<Self, SubagentGrantError> {
-        self.subagent(
-            &mut LaunchHistory::default(),
-            SubagentGrant::new(),
-            None,
-            None,
-        )
-        .await
+        self.subagent(&mut LaunchHistory::default(), SubagentGrant::new(), None)
+            .await
     }
 }
 
@@ -2269,31 +2322,33 @@ where
     E: Executor + Clone + 'static,
     State: RegistryState,
 {
-    /// Creates the terminal tool of a subagent this terminal launches.
-    ///
-    /// The subagent shares the permission handler, output store and prepared
-    /// tools, serves the subagent registry (so nothing reserved for the main
-    /// agent is reachable, however deep subagents nest) with its
-    /// terminal-bound commands built for it, and has its own launcher and
-    /// background task tracking. It works in a space of its own inside this
-    /// terminal's working directory; everything this terminal can write is
-    /// read-only to it, apart from what `grant` hands over, which never
+    /// Creates the terminal tool of a subagent this terminal launches, as
+    /// [`Self::resolve_launch`] and [`Self::launch_resolved`] do one after
+    /// the other.
+    #[cfg(test)]
+    pub(crate) async fn subagent(
+        &self,
+        history: &mut LaunchHistory,
+        grant: SubagentGrant,
+        caller: Option<&Path>,
+    ) -> Result<TerminalTool<P, E, Configured>, SubagentGrantError> {
+        let resolved = self.resolve_launch(history, grant).await?;
+        self.launch_resolved(resolved, None, None, caller).await
+    }
+
+    /// Resolves the grant of a subagent this terminal launches: it never
     /// exceeds what this terminal can write or commit. `history` records what
     /// the main agent's terminal handed out.
     ///
     /// # Errors
     /// Returns an error when `grant` names a path this terminal cannot write
-    /// or a commit it cannot grant, when the grant cannot be resolved, when a
-    /// container session cannot express the subagent's paths, or when the
-    /// subagent's space cannot be created.
-    #[allow(clippy::too_many_lines)]
-    pub(crate) async fn subagent(
+    /// or a commit it cannot grant, when the grant cannot be resolved, or when
+    /// a container session has no workspace mount.
+    async fn resolve_launch(
         &self,
         history: &mut LaunchHistory,
         grant: SubagentGrant,
-        observer: Option<AnyCommandObserver>,
-        gate: Option<AnyCommandGate>,
-    ) -> Result<TerminalTool<P, E, Configured>, SubagentGrantError> {
+    ) -> Result<ResolvedLaunch, SubagentGrantError> {
         // Grants are compared by real path, so every path of the subagent's
         // view is canonical.
         let working_dir = canonical_path(&self.working_dir).await?;
@@ -2322,7 +2377,45 @@ where
         self.registry
             .registry()
             .record_committed(&granted.committing);
+        Ok(ResolvedLaunch {
+            authority,
+            spaces_root,
+            mount,
+            granted,
+        })
+    }
 
+    /// Creates the terminal tool of a subagent this terminal launches with
+    /// the grant `resolved` holds.
+    ///
+    /// The subagent shares the permission handler, output store and prepared
+    /// tools, serves the subagent registry (so nothing reserved for the main
+    /// agent is reachable, however deep subagents nest) with its
+    /// terminal-bound commands built for it, and has its own launcher and
+    /// background task tracking. It works in a space of its own inside this
+    /// terminal's working directory, which this terminal's
+    /// [`SubagentSpaces`] fill first; everything this terminal can write is
+    /// read-only to it, apart from what the grant hands over. The commands
+    /// it calls are told to `observer`, and every shell command it runs is
+    /// put to `gate`.
+    ///
+    /// # Errors
+    /// Returns an error when a container session cannot express the
+    /// subagent's paths, or when the subagent's space cannot be created or
+    /// prepared.
+    #[allow(clippy::too_many_lines)]
+    async fn launch_resolved(
+        &self,
+        ResolvedLaunch {
+            authority,
+            spaces_root,
+            mount,
+            granted,
+        }: ResolvedLaunch,
+        observer: Option<AnyCommandObserver>,
+        gate: Option<AnyCommandGate>,
+        caller: Option<&Path>,
+    ) -> Result<TerminalTool<P, E, Configured>, SubagentGrantError> {
         let space = spaces_root.join(crate::naming::random_word_slug(4));
         let container = mount
             .as_ref()
@@ -2334,6 +2427,32 @@ where
                 path: space.clone(),
                 source,
             })?;
+        let prepared = match &self.subagent_spaces {
+            Some(spaces) => {
+                let launcher = &authority[0];
+                let run = RunSpace {
+                    space: &space,
+                    launcher,
+                    caller: caller.unwrap_or(launcher),
+                };
+                match prepare_space(spaces, run).await {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        // No run ever worked in the space, so it is no one's
+                        // to keep.
+                        if let Err(removal) = async_fs::remove_dir_all(&space).await {
+                            warn!(
+                                space = %space.display(),
+                                %removal,
+                                "cannot remove a subagent space whose preparation failed"
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            None => None,
+        };
 
         let (completed_tx, completed_rx) = async_channel::unbounded();
         let (alert_tx, alert_rx) = async_channel::unbounded();
@@ -2396,6 +2515,7 @@ where
                 committing: granted.committing,
                 git,
                 container,
+                prepared,
             }),
             carried_dir: None,
             env_source: self.env_source.clone(),
@@ -2404,9 +2524,19 @@ where
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver.clone(),
             outages: self.outages.clone(),
+            subagent_spaces: self.subagent_spaces.clone(),
             registry: Launching { registry },
         };
         Ok(launching.into_served())
+    }
+
+    /// What this terminal's launcher prepared in its space; `None` for the
+    /// main agent's terminal and when the launcher has no
+    /// [`SubagentSpaces`].
+    fn prepared_space(&self) -> Option<PreparedSpace> {
+        self.subagent
+            .as_ref()
+            .and_then(|subagent| subagent.prepared.clone())
     }
 
     /// The workspace mount of this terminal's home container, with its host
@@ -2427,6 +2557,22 @@ where
             mount.container_root.clone(),
         )))
     }
+}
+
+/// Has `spaces` prepare `run`'s space and confines what they name to it.
+async fn prepare_space(
+    spaces: &AnySubagentSpaces,
+    run: RunSpace<'_>,
+) -> Result<PreparedSpace, SubagentGrantError> {
+    spaces
+        .prepare(run)
+        .await
+        .map_err(|source| SubagentGrantError::Preparation {
+            space: run.space.to_path_buf(),
+            source,
+        })?
+        .confine(run.space)
+        .await
 }
 
 /// The sandbox a subagent's commands run in inside a container: its space and
@@ -2506,6 +2652,7 @@ where
         let working_dir = self.working_dir().clone();
         let command_names = self.registry().available_tool_names();
         let commit_ledger = self.commit_ledger();
+        let prepared_space = self.prepared_space();
         let role = self.registry().role();
         let prepared_tools = self
             .shell_sessions
@@ -2524,6 +2671,7 @@ where
             command_names,
             prepared_tools,
             commit_ledger,
+            prepared_space,
             role,
         }
     }
@@ -8852,6 +9000,22 @@ mod tests {
         crate::tool_runtime::tests::UnlockingTempDir,
         TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
     ) {
+        let (cache, tool) =
+            unconfigured_test_terminal(dir, foreground_wait, timeout_cap, alert_after).await;
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        (cache, tool.with_registry(registry))
+    }
+
+    /// [`configured_test_terminal`] before its registry is bound.
+    async fn unconfigured_test_terminal(
+        dir: &Path,
+        foreground_wait: Duration,
+        timeout_cap: Duration,
+        alert_after: Duration,
+    ) -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Unconfigured>,
+    ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
         let tool = TerminalTool::new_exact(
             dir,
@@ -8866,8 +9030,7 @@ mod tests {
         .with_foreground_wait(foreground_wait)
         .with_timeout_cap(timeout_cap)
         .with_long_job_alert_after(alert_after);
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
-        (cache, tool.with_registry(registry))
+        (cache, tool)
     }
 
     /// A foreground command still running at the window promotes to a
@@ -10635,8 +10798,253 @@ mod tests {
         grant: SubagentGrant,
     ) -> Result<ConfiguredTestTool, SubagentGrantError> {
         parent
-            .subagent(&mut LaunchHistory::default(), grant, None, None)
+            .subagent(&mut LaunchHistory::default(), grant, None)
             .await
+    }
+
+    /// What a [`CloneSpaces`] was asked to prepare, as `(space, launcher,
+    /// caller)`.
+    type SeenSpace = (PathBuf, PathBuf, PathBuf);
+
+    /// How a test's [`SubagentSpaces`] fills a space.
+    #[derive(Clone, Copy)]
+    enum Filling {
+        /// Clones the source repository into `repo` and names it.
+        Clone,
+        /// Writes a file into the space, then fails.
+        Fail,
+        /// Names the launcher's working directory as the working copy.
+        Outside,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the session has no clone to give")]
+    struct NoClone;
+
+    /// Prepares each space from `source`, the launcher's repository, and
+    /// records what it was asked.
+    struct CloneSpaces {
+        source: PathBuf,
+        filling: Filling,
+        seen: async_channel::Sender<SeenSpace>,
+    }
+
+    impl SubagentSpaces for CloneSpaces {
+        type Error = NoClone;
+
+        async fn prepare(&self, run: RunSpace<'_>) -> Result<PreparedSpace, NoClone> {
+            self.seen
+                .send((
+                    run.space.to_path_buf(),
+                    run.launcher.to_path_buf(),
+                    run.caller.to_path_buf(),
+                ))
+                .await
+                .expect("the test records each space");
+            let clone = run.space.join("repo");
+            match self.filling {
+                Filling::Clone => {
+                    let (source, target) = (self.source.clone(), clone.clone());
+                    blocking::unblock(move || {
+                        crate::test_git::git(
+                            &source,
+                            &["clone", "-q", "--local", ".", target.to_str().unwrap()],
+                        )
+                    })
+                    .await;
+                    Ok(PreparedSpace::new().with_working_copy(clone))
+                }
+                Filling::Fail => {
+                    async_fs::write(run.space.join("half-done"), "x")
+                        .await
+                        .unwrap();
+                    Err(NoClone)
+                }
+                Filling::Outside => Ok(PreparedSpace::new().with_working_copy(run.launcher)),
+            }
+        }
+    }
+
+    /// A terminal in `dir` whose subagents' spaces `filling` prepares from
+    /// the repository `dir/repo`, with the receiver of what it is asked.
+    async fn spaced_terminal(
+        dir: &Path,
+        filling: Filling,
+    ) -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        ConfiguredTestTool,
+        async_channel::Receiver<SeenSpace>,
+    ) {
+        let source = dir.join("repo");
+        std::fs::create_dir_all(&source).unwrap();
+        crate::test_git::git(&source, &["init", "-q", "--initial-branch=main"]);
+        crate::test_git::git(&source, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let (seen, seen_rx) = async_channel::unbounded();
+        let (cache, tool) = unconfigured_test_terminal(
+            dir,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        let tool = tool.with_subagent_spaces(CloneSpaces {
+            source,
+            filling,
+            seen,
+        });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        (cache, tool.with_registry(registry), seen_rx)
+    }
+
+    /// A subagent works in the clone its launcher's spaces prepared: it
+    /// commits there, cannot push into the launcher's repository, and its
+    /// work reaches the launcher only when the launcher fetches it. The space
+    /// outlives the subagent's terminal for that, and the launcher can
+    /// remove it; a subagent's own launches are prepared by the same spaces.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_works_in_the_clone_its_launchers_spaces_prepared() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let (_cache, parent, seen) = spaced_terminal(dir.path(), Filling::Clone).await;
+        let caller = dir.path().join("repo");
+        let child = parent
+            .subagent(
+                &mut LaunchHistory::default(),
+                SubagentGrant::new(),
+                Some(&caller),
+            )
+            .await
+            .expect("the space is prepared");
+
+        let (space, launcher, asked_from) = seen.try_recv().expect("the spaces were asked");
+        assert_eq!(&space, child.working_dir(), "the run works in the space");
+        assert!(space.starts_with(root.join(SUBAGENT_SPACES_DIR)));
+        assert_eq!(launcher, root, "the launcher is the main agent's terminal");
+        assert_eq!(asked_from, caller, "the caller's directory is passed on");
+        let clone = space.join("repo");
+        assert_eq!(
+            child.prepared_space().unwrap().working_copies(),
+            std::slice::from_ref(&clone)
+        );
+        let dyn_child = child.clone().to_dyn();
+        assert_eq!(
+            dyn_child.prepared_space().unwrap().working_copies(),
+            std::slice::from_ref(&clone),
+            "the bundle a subagent's agent gets names its working copies"
+        );
+        assert!(parent.prepared_space().is_none());
+
+        let git = "git -c user.name=t -c user.email=t@t -c commit.gpgSign=false";
+        assert_eq!(
+            exit_code_of(
+                &child,
+                &format!(
+                    "cd '{}' && echo work > file && {git} add file && {git} commit -q -m work",
+                    clone.display()
+                ),
+            )
+            .await,
+            0,
+            "the subagent commits in its clone"
+        );
+        assert_ne!(
+            exit_code_of(
+                &child,
+                &format!(
+                    "cd '{}' && {git} push -q origin HEAD:refs/heads/pushed",
+                    clone.display()
+                ),
+            )
+            .await,
+            0,
+            "the launcher's repository is read-only to the subagent"
+        );
+        assert!(!crate::test_git::succeeds(
+            &caller,
+            &["rev-parse", "--verify", "-q", "refs/heads/pushed"]
+        ));
+
+        let nested = child
+            .subagent(&mut LaunchHistory::default(), SubagentGrant::new(), None)
+            .await
+            .expect("a nested space is prepared");
+        let (nested_space, nested_launcher, nested_caller) = seen.try_recv().unwrap();
+        assert_eq!(&nested_space, nested.working_dir());
+        assert_eq!(nested_launcher, space, "a subagent launches from its space");
+        assert_eq!(nested_caller, space, "the caller defaults to the launcher");
+        drop((nested, dyn_child, child));
+
+        assert!(clone.join(".git").is_dir(), "the space outlives the run");
+        assert_eq!(
+            exit_code_of(
+                &parent,
+                &format!(
+                    "cd repo && {git} fetch -q '{}' HEAD && {git} merge -q --ff-only FETCH_HEAD",
+                    clone.display()
+                ),
+            )
+            .await,
+            0,
+            "the launcher merges the run's work"
+        );
+        assert_eq!(
+            crate::test_git::git(&caller, &["log", "-1", "--format=%s"]),
+            "work"
+        );
+        assert_eq!(
+            exit_code_of(&parent, &format!("rm -rf '{}'", space.display())).await,
+            0,
+            "the launcher owns the space"
+        );
+        assert!(!space.exists());
+    }
+
+    /// A space the launcher's spaces cannot prepare fails the launch with
+    /// their error, and is removed with what they left in it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_that_cannot_be_prepared_fails_the_launch_and_is_removed() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, parent, seen) = spaced_terminal(dir.path(), Filling::Fail).await;
+        let error = parent
+            .binding()
+            .launcher()
+            .create(SubagentGrant::new(), None, None, None)
+            .await
+            .expect_err("the launch fails");
+        let (asked, _, _) = seen.try_recv().unwrap();
+        let TerminalToolFactoryError::Grant(SubagentGrantError::Preparation { space, source }) =
+            &error
+        else {
+            panic!("the launch fails with the preparation error: {error}");
+        };
+        assert_eq!(space, &asked);
+        assert!(source.downcast_ref::<NoClone>().is_some(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("the session has no clone to give")
+        );
+        assert!(!space.exists(), "the failed space is removed");
+    }
+
+    /// A working copy named outside the space fails the launch, and the space
+    /// is removed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_working_copy_outside_the_space_fails_the_launch() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, parent, seen) = spaced_terminal(dir.path(), Filling::Outside).await;
+        let error = launch(&parent, SubagentGrant::new())
+            .await
+            .expect_err("the launch fails");
+        let (asked, launcher, _) = seen.try_recv().unwrap();
+        let SubagentGrantError::PreparedOutsideSpace { path, space } = &error else {
+            panic!("the launch fails on the working copy: {error}");
+        };
+        assert_eq!((path, space), (&launcher, &asked));
+        assert!(!asked.exists(), "the refused space is removed");
     }
 
     #[cfg(unix)]
@@ -11858,7 +12266,11 @@ mod tests {
                 .worktree
                 .into_iter()
                 .fold(SubagentGrant::new(), SubagentGrant::with_worktree);
-            let launched = self.binding.launcher().create(grant, None, None).await?;
+            let launched = self
+                .binding
+                .launcher()
+                .create(grant, None, None, None)
+                .await?;
             Ok(ToolResult::Text {
                 text: launched.working_dir().display().to_string(),
             })

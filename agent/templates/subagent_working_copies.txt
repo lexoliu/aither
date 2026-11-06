@@ -1,0 +1,4 @@
+{% if !working_copies.is_empty() %}
+
+Its work stays in its working copies until you merge it:{% for path in working_copies %}
+- {{ path.display() }}{% endfor %}{% endif %}
