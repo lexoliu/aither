@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0](https://github.com/May-Agent/aither/compare/core-v0.19.0...core-v0.20.0) - 2026-11-06
+
+### Fixed
+
+- *(core)* [**breaking**] report each model's retry policy
+
 ## [0.15.0](https://github.com/May-Agent/aither/compare/core-v0.14.1...core-v0.15.0) - 2026-11-04
 
 ### Added
