@@ -59,6 +59,8 @@ mod host_load;
 mod idle_compaction_tests;
 #[cfg(feature = "languages")]
 pub mod language;
+#[cfg(test)]
+mod midstream_retry_tests;
 mod model_group;
 mod output_urls;
 #[cfg(test)]

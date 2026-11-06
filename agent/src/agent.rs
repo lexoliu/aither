@@ -39,8 +39,8 @@ use crate::{
 use aither_core::{
     LanguageModel,
     llm::{
-        Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, StoredFile,
-        ToolCall,
+        Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, RetryPolicy,
+        StoredFile, ToolCall,
         model::{Parameters, Profile as ModelProfile},
     },
 };
@@ -326,6 +326,13 @@ enum ModelEventAction {
     Emit(AgentEvent),
     Continue,
     RetryMalformed,
+}
+
+/// A response stream that ended with an error instead of finishing.
+struct BrokenStream {
+    error: AgentError,
+    /// Whether an event arrived before the error: the stream had opened.
+    opened: bool,
 }
 
 /// A finished tool call, waiting to be paired with its call in the context.
@@ -1044,15 +1051,80 @@ where
         connectivity.guard(stream)
     }
 
+    /// The retry policy of the active tier's model.
+    fn retry_policy(&self) -> RetryPolicy {
+        match self.tier {
+            ModelTier::Advanced => self.advanced.retry_policy(),
+            ModelTier::Balanced => self.balanced.retry_policy(),
+            ModelTier::Fast => self.fast.retry_policy(),
+        }
+    }
+
+    /// Streams the model's response to `request`, sending the request again
+    /// when the stream breaks after it opened.
+    ///
+    /// A failure before the first event is the provider's to retry, since it
+    /// retries establishing the stream itself; a break after it is retried
+    /// here, under the model's [`RetryPolicy`], unless the machine is
+    /// offline. The broken attempt's text, calls and reasoning are dropped
+    /// with it, and the request sent again is the one recorded as the last
+    /// request, so the provider reads the same cached prefix.
     async fn collect_model_turn(
+        &mut self,
+        mut request: LLMRequest,
+        events: &EventSink,
+    ) -> Result<ModelTurn, AgentError> {
+        let policy = self.retry_policy();
+        let mut retries = 0;
+        loop {
+            let broken = match self.stream_model_turn(request, events).await {
+                Ok(turn) => return Ok(turn),
+                Err(broken) => broken,
+            };
+            let failure = match broken.error.failure() {
+                Some(failure)
+                    if broken.opened
+                        && policy.allows(retries, failure)
+                        && !self.connectivity.is_offline() =>
+                {
+                    *failure
+                }
+                _ => return Err(broken.error),
+            };
+            let delay = policy.delay(retries, &failure);
+            retries += 1;
+            tracing::warn!(
+                retry = retries,
+                max_retries = policy.max_retries,
+                delay_ms = delay.as_millis(),
+                error = %broken.error,
+                "model response stream broke mid-response; sending the request again"
+            );
+            events.emit(AgentEvent::ResponseRetry {
+                error: broken.error,
+                retry: retries,
+                max_retries: policy.max_retries,
+                delay,
+            });
+            async_io::Timer::after(delay).await;
+            request = self
+                .last_request
+                .clone()
+                .expect("a request that reached the model is recorded as the last request");
+        }
+    }
+
+    /// One attempt at streaming the model's response to `request`.
+    async fn stream_model_turn(
         &mut self,
         request: LLMRequest,
         events: &EventSink,
-    ) -> Result<ModelTurn, AgentError> {
+    ) -> Result<ModelTurn, BrokenStream> {
         let mut text_chunks = Vec::new();
         let mut tool_calls = Vec::new();
         let mut reasoning = Vec::new();
         let mut malformed_function_call = false;
+        let mut opened = false;
 
         let stream = Self::respond_stream(
             self.tier,
@@ -1064,7 +1136,8 @@ where
         );
         futures_lite::pin!(stream);
         while let Some(event) = stream.next().await {
-            match handle_model_event(
+            let received = event.is_ok();
+            let action = handle_model_event(
                 &self.hooks,
                 &mut self.cache_stats,
                 &mut self.budget,
@@ -1073,8 +1146,10 @@ where
                 &mut tool_calls,
                 &mut reasoning,
             )
-            .await?
-            {
+            .await
+            .map_err(|error| BrokenStream { error, opened })?;
+            opened |= received;
+            match action {
                 ModelEventAction::Emit(event) => events.emit(event),
                 ModelEventAction::Continue => {}
                 ModelEventAction::RetryMalformed => {
