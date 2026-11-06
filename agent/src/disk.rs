@@ -285,9 +285,19 @@ impl ContainerDisk {
     }
 }
 
+/// How the agent is told the container's filesystem.
+#[derive(askama::Template)]
+#[template(path = "container_volume.txt", escape = "none")]
+struct ContainerVolume<'a> {
+    home: &'a aither_sandbox::ContainerPath,
+}
+
 impl DiskReader for ContainerDisk {
     fn volume(&self) -> String {
-        format!("the container's filesystem ({})", self.probe.home())
+        askama::Template::render(&ContainerVolume {
+            home: self.probe.home(),
+        })
+        .expect("the container volume template renders")
     }
 
     async fn free_bytes(&self) -> Result<u64, ReadError> {
