@@ -62,6 +62,10 @@ pub enum JobserverError {
     /// A path was not valid UTF-8/CStr-compatible.
     #[error("jobserver fifo path is not valid: {0}")]
     InvalidPath(PathBuf),
+    /// The relay that brokers a container command's fifo inside the
+    /// container could not be started.
+    #[error("jobserver container relay failed to start: {0}")]
+    ContainerRelay(String),
 }
 
 impl From<rustix_io::Errno> for JobserverError {
@@ -194,6 +198,41 @@ fn jobserver_makeflags(auth_path: &str) -> String {
     format!("-j --jobserver-auth=fifo:{auth_path}")
 }
 
+/// The `MAKEFLAGS`/`CARGO_MAKEFLAGS`/`MFLAGS` values naming the fifo at
+/// `auth_path`, spelled as the command's own filesystem sees it.
+pub(crate) fn jobserver_environment(auth_path: &str) -> Vec<(String, String)> {
+    let flags = jobserver_makeflags(auth_path);
+    ["MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS"]
+        .iter()
+        .map(|name| ((*name).to_string(), flags.clone()))
+        .collect()
+}
+
+/// Opens a command fifo the way a jobserver client does: read-write, so
+/// opening never waits for a peer and the fifo never reports EOF to it.
+pub(crate) fn open_client_end(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Nonblocking single-token read for a client end; `WouldBlock` when the
+/// fifo is empty.
+pub(crate) fn take_client_token(file: &File) -> io::Result<()> {
+    match read_token(file)? {
+        TokenRead::Token => Ok(()),
+        TokenRead::Empty => Err(io::ErrorKind::WouldBlock.into()),
+        TokenRead::Eof => unreachable!("a read-write fifo end never sees EOF"),
+    }
+}
+
+/// Nonblocking single-token write for a client end.
+pub(crate) fn return_client_token(file: &File) -> io::Result<()> {
+    write_token(file)
+}
+
 /// What woke the broker loop.
 enum Wake {
     Command(Result<BrokerCommand, async_channel::RecvError>),
@@ -254,11 +293,7 @@ impl CommandFifo {
             .path
             .to_str()
             .expect("jobserver fifo dir is validated UTF-8 at broker setup");
-        let flags = jobserver_makeflags(auth_path);
-        ["MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS"]
-            .iter()
-            .map(|name| ((*name).to_string(), flags.clone()))
-            .collect()
+        jobserver_environment(auth_path)
     }
 }
 
@@ -907,12 +942,7 @@ mod tests {
         async fn command(&self) -> (CommandFifo, File) {
             let lease = self.broker.open_fifo().await.unwrap();
             // The command's processes open the fifo read-write, like make does.
-            let child = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(lease.path())
-                .unwrap();
+            let child = open_client_end(lease.path()).unwrap();
             (lease, child)
         }
 

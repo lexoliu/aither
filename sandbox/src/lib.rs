@@ -56,6 +56,8 @@ mod bollard_exec;
 mod command;
 mod command_set;
 mod container;
+#[cfg(all(unix, feature = "jobserver"))]
+mod container_jobserver;
 mod foreground_wait;
 mod grants;
 mod heel_binary;
