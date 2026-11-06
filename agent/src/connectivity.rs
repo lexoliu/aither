@@ -36,6 +36,21 @@ impl Watch {
         }
         stream
     }
+
+    /// Whether the watched source reports the machine offline; an unwatched
+    /// agent never knows it is.
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "connectivity"),
+        allow(clippy::unused_self, clippy::missing_const_for_fn)
+    )]
+    pub fn is_offline(&self) -> bool {
+        #[cfg(feature = "connectivity")]
+        if let Some(source) = &self.source {
+            return !source.is_online();
+        }
+        false
+    }
 }
 
 #[cfg(feature = "connectivity")]
@@ -98,7 +113,9 @@ mod tests {
     use aither_connectivity::Connectivity;
     use aither_core::{
         LanguageModel,
-        llm::{Classify, Failure, FailureKind, LLMRequest, model::Profile as ModelProfile},
+        llm::{
+            Classify, Failure, FailureKind, LLMRequest, RetryPolicy, model::Profile as ModelProfile,
+        },
     };
     use futures_lite::{StreamExt, future};
     use std::ops::ControlFlow;
@@ -124,9 +141,11 @@ mod tests {
     }
 
     /// Streams one chunk of text and then goes silent, like a socket that died
-    /// while the machine slept.
+    /// while the machine slept; an abandoned attempt is retried under `policy`.
     #[derive(Clone)]
-    struct StallingLlm;
+    struct StallingLlm {
+        policy: RetryPolicy,
+    }
 
     impl LanguageModel for StallingLlm {
         type Error = StallError;
@@ -139,6 +158,10 @@ mod tests {
                 .chain(futures_lite::stream::pending())
         }
 
+        fn retry_policy(&self) -> RetryPolicy {
+            self.policy
+        }
+
         fn profile(
             &self,
         ) -> impl core::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
@@ -148,15 +171,18 @@ mod tests {
         }
     }
 
-    /// Runs one prompt against the stalling model, injects `change` once the
-    /// first text arrives, and returns how the run ended.
+    /// Runs one prompt against the stalling model, which never retries,
+    /// injects `change` once the first text arrives, and returns how the run
+    /// ended.
     async fn run_with(
         change: impl FnOnce(&aither_connectivity::Controller),
     ) -> Result<(), AgentError> {
         let (connectivity, controller) = Connectivity::manual(true);
-        let mut agent = Agent::builder(StallingLlm)
-            .connectivity(connectivity)
-            .build();
+        let mut agent = Agent::builder(StallingLlm {
+            policy: RetryPolicy::none(),
+        })
+        .connectivity(connectivity)
+        .build();
         let controller = &controller;
         agent
             .run("hello", std::iter::empty())
@@ -183,6 +209,41 @@ mod tests {
             .expect_err("the attempt is abandoned");
         let AgentError::Llm { message, failure } = &error else {
             panic!("expected an LLM error, got {error}");
+        };
+        assert_eq!(failure.kind, FailureKind::Network);
+        assert!(message.contains("woke"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_abandoned_on_wake_is_sent_again() {
+        let (connectivity, controller) = Connectivity::manual(true);
+        let mut agent = Agent::builder(StallingLlm {
+            policy: RetryPolicy {
+                max_retries: 1,
+                initial_delay: core::time::Duration::ZERO,
+                max_delay: core::time::Duration::ZERO,
+                multiplier: 2,
+            },
+        })
+        .connectivity(connectivity)
+        .build();
+        let controller = &controller;
+        let flow = agent
+            .run("hello", std::iter::empty())
+            .drive(false, std::future::pending(), |woke, timed| async move {
+                match timed.event {
+                    crate::AgentEvent::Text(_) if !woke => {
+                        controller.wake();
+                        ControlFlow::Continue(true)
+                    }
+                    crate::AgentEvent::ResponseRetry { error, .. } => ControlFlow::Break(error),
+                    _ => ControlFlow::Continue(woke),
+                }
+            })
+            .await
+            .expect("the run is stopped at its retry");
+        let ControlFlow::Break(AgentError::Llm { message, failure }) = flow else {
+            panic!("expected the abandoned attempt to be retried");
         };
         assert_eq!(failure.kind, FailureKind::Network);
         assert!(message.contains("woke"), "{message}");

@@ -104,6 +104,8 @@ jiff = { version = "0.2.39", default-features = false, features = ["std"] }
 
 [features]
 default = []
+# Expose `test_git`, git isolated from the host configuration, to dependents' tests.
+test-git = []
 # Detect source code in command output so it can be folded with tree-sitter.
 # Pulls in ONNX Runtime via `magika`.
 code-folding = ["dep:magika", "dep:ort", "dep:tree-sitter", "dep:rs-tree-sitter-languages"]

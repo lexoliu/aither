@@ -59,12 +59,15 @@ mod host_load;
 mod idle_compaction_tests;
 #[cfg(feature = "languages")]
 pub mod language;
+#[cfg(test)]
+mod midstream_retry_tests;
 mod model_group;
 mod output_urls;
 #[cfg(test)]
 mod poll_park_tests;
 mod request_parameters;
 mod subagent_file;
+pub mod tasks;
 mod terminal_agent;
 #[cfg(test)]
 mod test_support;
@@ -134,10 +137,14 @@ pub use host_load::{
 #[cfg(feature = "languages")]
 pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
+pub use tasks::{
+    AnyWorkTracker, TaskEvent, TaskEvents, WorkItem, WorkRef, WorkState, WorkTracker,
+    WorkTrackerError,
+};
 pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};
 pub use tools::AgentTools;
 pub use warmth::{CacheState, CacheWarmth};
-pub use working_docs::{AnyTaskBlockerResolver, TaskBlockerResolver};
+pub use working_docs::{AnyTaskBlockerResolver, TaskBlockerError, TaskBlockerResolver};
 
 // Model groups for budget tracking and fallback
 pub use model_group::{

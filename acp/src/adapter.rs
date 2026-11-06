@@ -110,6 +110,14 @@ impl SessionUpdateMapper {
                 map_builtin(event)
             }
 
+            // The broken attempt's calls never run and the replacement
+            // streams its own, so their accumulated arguments are dropped.
+            // ACP has no update that withdraws streamed message chunks.
+            AgentEvent::ResponseRetry { .. } => {
+                self.tool_arguments.clear();
+                None
+            }
+
             AgentEvent::RunStart { .. }
             | AgentEvent::Checkpoint { .. }
             | AgentEvent::BackgroundTaskStarted { .. }
@@ -347,6 +355,35 @@ mod tests {
         } else {
             panic!("Expected ToolCallUpdate");
         }
+    }
+
+    #[test]
+    fn a_response_retry_drops_the_broken_attempts_arguments() {
+        let mut mapper = SessionUpdateMapper::default();
+        let delta = |fragment: &str| AgentEvent::ToolCallDelta {
+            id: "call-1".to_string(),
+            name: "terminal".to_string(),
+            arguments_fragment: fragment.to_string(),
+        };
+        let _ = mapper.map(&delta(r#"{"description":"bro"#));
+        let retry = AgentEvent::ResponseRetry {
+            error: aither_agent::AgentError::llm_local("stream broke"),
+            retry: 1,
+            max_retries: 3,
+            delay: std::time::Duration::ZERO,
+        };
+        assert!(mapper.map(&retry).is_none());
+
+        let update = mapper.map(&delta(r#"{"description":"whole"}"#)).unwrap();
+        let SessionUpdate::ToolCallUpdate(update) = update else {
+            panic!("Expected ToolCallUpdate");
+        };
+        assert_eq!(
+            update.raw_input,
+            Some(serde_json::Value::String(
+                r#"{"description":"whole"}"#.to_string()
+            ))
+        );
     }
 
     #[test]

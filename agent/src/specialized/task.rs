@@ -887,6 +887,9 @@ pub struct SubagentTool<LLM> {
     /// The external hooks of the agent this tool serves: told when a
     /// subagent starts and stops, and the parent of each subagent's own scope.
     hooks: Option<ExternalHooks>,
+    /// The main agent's tasks inbox, told when a subagent starts and
+    /// finishes.
+    task_events: Option<crate::tasks::TaskEvents>,
     /// Holds subagent prompts to the working language.
     #[cfg(feature = "languages")]
     languages: Option<crate::LanguageGuard>,
@@ -933,6 +936,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             finished: Arc::new(FinishedSubagents::new()),
             fork_source: ForkSource::default(),
             hooks: None,
+            task_events: None,
             #[cfg(feature = "languages")]
             languages: None,
         }
@@ -1027,9 +1031,41 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             finished: Arc::new(FinishedSubagents::new()),
             fork_source: self.fork_source.clone(),
             hooks: ExternalHooks::of_observer(binding.observer()).or_else(|| self.hooks.clone()),
+            task_events: self.task_events.clone(),
             #[cfg(feature = "languages")]
             languages: self.languages.clone(),
         }
+    }
+
+    /// Records each subagent's start and finish on `events`, the inbox of
+    /// the main agent's `tasks.md`, so a row waiting on a subagent follows
+    /// it.
+    #[must_use]
+    pub fn with_task_events(mut self, events: crate::tasks::TaskEvents) -> Self {
+        self.task_events = Some(events);
+        self
+    }
+
+    /// Records `event` on the main agent's tasks inbox, when there is one.
+    fn record(&self, event: crate::tasks::TaskEvent) {
+        if let Some(events) = &self.task_events {
+            events.record(event);
+        }
+    }
+
+    /// Tells the hooks and the tasks inbox that `subagent` starts on `prompt`.
+    async fn announce_start(&self, subagent: &str, prompt: &str) {
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .fire(&external_hook::SubagentStart {
+                    subagent: subagent.to_string(),
+                    prompt: prompt.to_string(),
+                })
+                .await;
+        }
+        self.record(crate::tasks::TaskEvent::SubagentStarted(
+            subagent.to_string(),
+        ));
     }
 
     /// Refuses a prompt file whose prose is not in the working language
@@ -1863,17 +1899,13 @@ where
             },
             commit_mark,
         ) = self.mark_commits(finished, resumed).await?;
-        if let Some(hooks) = &self.hooks {
-            hooks
-                .fire(&external_hook::SubagentStart {
-                    subagent: subagent_id.clone(),
-                    prompt: prompt.clone(),
-                })
-                .await;
-        }
+        self.announce_start(&subagent_id, &prompt).await;
         let cancel_rx = hold.begin(&subagent_id, &prompt, self.hooks.clone(), body);
         let outcome = hold.run(&prompt, cancel_rx).await;
         let body = hold.finish();
+        self.record(crate::tasks::TaskEvent::SubagentFinished(
+            subagent_id.clone(),
+        ));
         if let Some(hooks) = &self.hooks {
             hooks
                 .fire(&subagent_stop_input(&subagent_id, &outcome))
@@ -2651,22 +2683,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Runs `git` with a fixed identity in `dir` and returns what it printed.
-    fn git(dir: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
-            .args(["-c", "commit.gpgSign=false"])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git runs");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
+    use aither_sandbox::test_git::git;
 
     /// A main agent's terminal whose space holds a repository and a linked
     /// worktree on `subagent/work/main`, the worktree a subagent is granted
@@ -5659,7 +5676,12 @@ mod tests {
 
     /// Writes a finished item: an unchecked one would rightly hold the
     /// probe's final turn open.
-    const TASKS_PROBE: &str = "printf '%s\\n' '- [x] SUBAGENT-TASK' > tasks.md && echo written";
+    /// Writes a well-formed `tasks.md` whose only content holds no turn open,
+    /// so the subagent ends after its two requests.
+    const TASKS_PROBE: &str =
+        "printf '%s\\n' '## Notes' 'SUBAGENT-TASK' > tasks.md && echo written";
+    const SUBAGENT_TASKS: &str = "## Notes\nSUBAGENT-TASK\n";
+    const PARENT_TASKS: &str = "## Notes\nPARENT-TASK\n";
 
     /// The `tasks.md` the subagents under `workspace` wrote in their spaces.
     fn subagent_tasks(workspace: &Path) -> Vec<String> {
@@ -5677,7 +5699,7 @@ mod tests {
         let fixture = ForkFixture::new().await;
         let workspace = std::fs::canonicalize(fixture.terminal.working_dir()).unwrap();
         let parent_tasks = workspace.join("tasks.md");
-        std::fs::write(&parent_tasks, "- [x] PARENT-TASK\n").unwrap();
+        std::fs::write(&parent_tasks, PARENT_TASKS).unwrap();
         let (seen_tx, seen_rx) = async_channel::unbounded();
         let llm = ProbingLlm {
             script: TASKS_PROBE,
@@ -5717,12 +5739,12 @@ mod tests {
             );
             assert_eq!(
                 std::fs::read_to_string(&parent_tasks).unwrap(),
-                "- [x] PARENT-TASK\n",
+                PARENT_TASKS,
                 "{subagent} left its parent's tasks.md alone"
             );
             assert_eq!(
                 subagent_tasks(&workspace),
-                vec!["- [x] SUBAGENT-TASK\n".to_string(); run],
+                vec![SUBAGENT_TASKS.to_string(); run],
                 "{subagent} wrote tasks.md in its own space"
             );
         }

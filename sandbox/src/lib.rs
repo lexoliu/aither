@@ -94,6 +94,10 @@ pub mod network_policy;
 /// Permission handling for terminal modes.
 pub mod permission;
 
+/// Isolated git for tests, shared with dependent crates through the `test-git` feature.
+#[cfg(any(test, feature = "test-git"))]
+pub mod test_git;
+
 pub use bollard_exec::BollardContainerExec;
 pub use command::{
     AnyCommandGate, AnyCommandObserver, CommandCall, CommandEnvelope, CommandGate, CommandObserver,

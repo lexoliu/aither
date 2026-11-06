@@ -90,6 +90,8 @@ pub mod provider;
 pub mod reasoning;
 /// Deep research workflows and agent capabilities.
 pub mod researcher;
+/// How a failed model request is retried.
+pub mod retry;
 /// Tool system for function calling.
 pub mod tool;
 
@@ -113,6 +115,7 @@ pub use researcher::{
     ResearchCitation, ResearchEvent, ResearchFinding, ResearchOptions, ResearchReport,
     ResearchRequest, ResearchSource, ResearchStage, Researcher, ResearcherProfile,
 };
+pub use retry::RetryPolicy;
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 pub use tool::{
@@ -385,6 +388,17 @@ pub trait LanguageModel: Sized + Send + Sync {
     /// when neither the provider nor the model registry knows the model's
     /// context window. Implementations must not substitute a guessed value.
     fn profile(&self) -> impl Future<Output = Result<Profile, Self::Error>> + Send;
+
+    /// How a request to this model that failed with a retryable failure is
+    /// sent again.
+    ///
+    /// A provider that retries establishing its response stream returns the
+    /// policy it retries under; callers reuse it for a stream that breaks
+    /// after it opened, which the provider cannot retry because the events
+    /// before the break already reached them.
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::default()
+    }
 }
 
 macro_rules! impl_language_model {
@@ -438,6 +452,10 @@ macro_rules! impl_language_model {
                 fn profile(&self) -> impl Future<Output = Result<Profile, Self::Error>> + Send {
                     T::profile(self)
                 }
+
+                fn retry_policy(&self) -> RetryPolicy {
+                    T::retry_policy(self)
+                }
             }
         )*
     };
@@ -484,6 +502,10 @@ impl<T: LanguageModel> LanguageModel for &T {
 
     fn profile(&self) -> impl Future<Output = Result<Profile, Self::Error>> + Send {
         T::profile(self)
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        T::retry_policy(self)
     }
 }
 

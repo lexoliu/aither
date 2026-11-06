@@ -357,7 +357,7 @@ impl<M> TieredModels<M> {
 
 use aither_core::{
     LanguageModel,
-    llm::{Event, LLMRequest, model::Profile},
+    llm::{Event, LLMRequest, RetryPolicy, model::Profile},
 };
 use futures_core::Stream;
 
@@ -422,6 +422,13 @@ where
         request: LLMRequest,
     ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         ModelGroupStream::new(self, request)
+    }
+
+    /// The policy of the model the next request goes to; with every model
+    /// exhausted there is nothing to retry against.
+    fn retry_policy(&self) -> RetryPolicy {
+        self.current()
+            .map_or_else(RetryPolicy::none, |model| model.inner().retry_policy())
     }
 
     async fn profile(&self) -> Result<Profile, Self::Error> {
