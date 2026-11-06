@@ -12,6 +12,10 @@
 
 use crate::foreground_wait::ForegroundWait;
 use crate::grants::{GrantSet, TerminalGrants};
+use crate::memory::{
+    AnyFootprintReader, AnyFootprintRegistry, FootprintReader, FootprintRegistry, JobMemory,
+    ResponseWindow, SystemFootprints,
+};
 use crate::outage::Outages;
 use std::{
     borrow::Cow,
@@ -566,6 +570,8 @@ const MAX_LINES_CEILING: u32 = 800;
 /// How long a `terminal` call waits in the foreground before a still-running
 /// command promotes to a background task.
 pub const DEFAULT_FOREGROUND_WAIT: Duration = Duration::from_secs(10);
+/// How long the agent has to act on a final memory warning by default.
+pub const DEFAULT_RESPONSE_WINDOW: Duration = Duration::from_secs(120);
 /// The default of the most bytes a subagent's sandbox may send the host while
 /// its commits are imported into the main repository.
 pub const DEFAULT_SUBAGENT_IMPORT_LIMIT: u64 = 1024 * 1024 * 1024;
@@ -588,11 +594,22 @@ struct TerminalLimits {
     /// imported; shared with every terminal derived from this one, and
     /// adjustable at runtime.
     subagent_import: ImportBudget,
+    /// How long the agent has to act on a final memory warning; adjustable
+    /// at runtime and shared with every terminal derived from this one.
+    response_window: ResponseWindow,
+    /// Reads what the terminal's jobs hold of the machine's memory.
+    footprints: AnyFootprintReader,
+    /// Shares the total the agent's jobs hold with the machine's other
+    /// agents; `None` when the embedder configured no registry.
+    footprint_registry: Option<AnyFootprintRegistry>,
 }
 
 impl Default for TerminalLimits {
     fn default() -> Self {
         Self {
+            response_window: ResponseWindow::new(DEFAULT_RESPONSE_WINDOW),
+            footprints: AnyFootprintReader::new(SystemFootprints),
+            footprint_registry: None,
             foreground_wait: ForegroundWait::new(DEFAULT_FOREGROUND_WAIT),
             timeout_cap: DEFAULT_TIMEOUT_CAP,
             long_job_alert: DEFAULT_LONG_JOB_ALERT_AFTER,
@@ -809,9 +826,9 @@ pub struct CompletedTask {
     pub script: String,
     /// The result of execution.
     pub result: Result<CompletedCommand, TerminalError>,
-    /// Whether the job was killed — its `timeout` bound or `terminal_kill`
-    /// — rather than exiting on its own.
-    pub killed: bool,
+    /// Why the job was killed — its `timeout` bound, `terminal_kill` or a
+    /// memory runaway — or `None` when it exited on its own.
+    pub kill: Option<crate::KillCause>,
     /// Set when the kill was the `timeout` bound passing.
     pub timeout_kill: Option<TimeoutKill>,
     /// Keeps the job reading [`Delivery::Pending`](crate::Delivery) in its
@@ -2046,6 +2063,51 @@ where
     #[must_use]
     pub fn foreground_wait(&self) -> ForegroundWait {
         self.limits.foreground_wait.clone()
+    }
+
+    /// Sets how long the agent has to act on a final memory warning before
+    /// the job it names is killed. Defaults to [`DEFAULT_RESPONSE_WINDOW`].
+    #[must_use]
+    pub fn with_response_window(self, window: Duration) -> Self {
+        self.limits.response_window.set(window);
+        self
+    }
+
+    /// A handle on the response window, shared with every terminal derived
+    /// from this one: a window set through it applies to the next final
+    /// warning of each of them.
+    #[must_use]
+    pub fn response_window(&self) -> ResponseWindow {
+        self.limits.response_window.clone()
+    }
+
+    /// Reads job footprints and the machine's physical memory through
+    /// `reader` instead of the platform's own.
+    #[must_use]
+    pub fn with_footprint_reader(mut self, reader: impl FootprintReader) -> Self {
+        self.limits.footprints = AnyFootprintReader::new(reader);
+        self
+    }
+
+    /// Shares the memory this terminal's jobs hold with the machine's other
+    /// agents through `registry`, so a final warning can name the agent that
+    /// contributes the most when all agents together exceed physical memory.
+    #[must_use]
+    pub fn with_footprint_registry(mut self, registry: impl FootprintRegistry) -> Self {
+        self.limits.footprint_registry = Some(AnyFootprintRegistry::new(registry));
+        self
+    }
+
+    /// The memory the terminal's jobs hold, for a guard that warns about and
+    /// kills a runaway job.
+    #[must_use]
+    pub fn job_memory(&self) -> JobMemory {
+        JobMemory::new(
+            self.job_registry(),
+            self.limits.footprints.clone(),
+            self.limits.footprint_registry.clone(),
+            self.limits.response_window.clone(),
+        )
     }
 
     /// Sets the largest `timeout` a command accepts.
@@ -3784,7 +3846,7 @@ where
         Err(error) => Err(error.to_string()),
     };
     let owed = status_registry.owe_completion(&task_id, ending).await;
-    let killed = owed.as_ref().is_some_and(|owed| owed.killed);
+    let kill = owed.as_ref().and_then(|owed| owed.kill);
     // Every job reports completion; the agent reinjects the result only for
     // tasks it saw promoted or detached (`take_started`), so a plain
     // foreground result is not delivered twice.
@@ -3793,8 +3855,8 @@ where
             task_id,
             script,
             result,
-            killed,
-            timeout_kill: timeout_watch.kill().filter(|_| killed),
+            kill,
+            timeout_kill: timeout_watch.kill().filter(|_| kill.is_some()),
             pending: owed.map(|owed| owed.pending),
         })
         .await;
@@ -8546,6 +8608,7 @@ mod tests {
         assert_eq!(
             info.status,
             JobStatus::Killed {
+                cause: crate::KillCause::User,
                 delivery: crate::Delivery::Pending
             },
             "the promoted job should be killed at its timeout: {completed:?}"
@@ -9012,6 +9075,7 @@ mod tests {
         assert_eq!(
             info.status,
             JobStatus::Killed {
+                cause: crate::KillCause::User,
                 delivery: crate::Delivery::Pending
             },
             "{completed:?}"
@@ -9091,6 +9155,7 @@ mod tests {
         assert_eq!(
             info.status,
             JobStatus::Killed {
+                cause: crate::KillCause::User,
                 delivery: crate::Delivery::Pending
             },
             "the job should have been killed at its timeout: {completed:?}"
@@ -9152,7 +9217,7 @@ mod tests {
         let task_id = started_task_id(&background_receiver);
         let completed = wait_for_completed_task(&background_receiver, &task_id).await;
 
-        assert!(completed.killed);
+        assert_eq!(completed.kill, Some(crate::KillCause::User));
         let kill = completed
             .timeout_kill
             .expect("a job killed at its timeout carries the times");
@@ -9189,7 +9254,7 @@ mod tests {
         let task_id = started_task_id(&background_receiver);
         assert!(tool.job_registry().kill_by_task_id(&task_id).await);
         let completed = wait_for_completed_task(&background_receiver, &task_id).await;
-        assert!(completed.killed);
+        assert_eq!(completed.kill, Some(crate::KillCause::User));
         assert_eq!(completed.timeout_kill, None);
     }
 

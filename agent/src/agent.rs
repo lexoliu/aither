@@ -639,13 +639,23 @@ fn job_alert_text(alert: &JobAlertText<'_>) -> String {
         .expect("job alert template must render")
 }
 
+/// What a killed memory runaway held, as the text reports it.
+struct RunawayText {
+    footprint: aither_sandbox::MemorySize,
+    physical: aither_sandbox::MemorySize,
+}
+
 /// How a finished background task ended.
 enum BackgroundOutcome<'a> {
     /// The script ran to completion.
     Finished { code: i32 },
     /// The job was killed — its `timeout` bound or `terminal_kill` — and
     /// whatever `code` the harness saw means nothing.
-    Killed { timeout: Option<&'a str> },
+    Killed {
+        timeout: Option<&'a str>,
+        /// Set when a memory runaway was the cause.
+        runaway: Option<RunawayText>,
+    },
     /// The task could not be run or tracked to completion.
     Failed { error: &'a str },
 }
@@ -3526,9 +3536,19 @@ fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String
         .as_ref()
         .map(aither_sandbox::TimeoutKill::notice);
     let (outcome, output, stderr) = match &task.result {
-        Ok(command) if task.killed => (
+        Ok(command) if task.kill.is_some() => (
             BackgroundOutcome::Killed {
                 timeout: timeout_notice.as_deref(),
+                runaway: match task.kill {
+                    Some(aither_sandbox::KillCause::MemoryRunaway {
+                        footprint_bytes,
+                        physical_bytes,
+                    }) => Some(RunawayText {
+                        footprint: aither_sandbox::MemorySize(footprint_bytes),
+                        physical: aither_sandbox::MemorySize(physical_bytes),
+                    }),
+                    Some(aither_sandbox::KillCause::User) | None => None,
+                },
             },
             output_block(&command.stdout),
             command.stderr.as_ref().and_then(output_block),
@@ -3677,7 +3697,7 @@ mod tests {
             task_id: "amber-forest-thunder-pearl".to_string(),
             script: "make test".to_string(),
             result,
-            killed: false,
+            kill: None,
             timeout_kill: None,
             pending: None,
         }
@@ -3738,7 +3758,7 @@ mod tests {
             exit_code: -1,
             interruptions: Vec::new(),
         }));
-        task.killed = true;
+        task.kill = Some(aither_sandbox::KillCause::User);
         assert_eq!(
             format_background_task_result(&task),
             "Background task 'amber-forest-thunder-pearl' (`make test`) was killed.\npartial output\n"
@@ -3753,7 +3773,7 @@ mod tests {
             exit_code: -1,
             interruptions: Vec::new(),
         }));
-        task.killed = true;
+        task.kill = Some(aither_sandbox::KillCause::User);
         task.timeout_kill = Some(aither_sandbox::TimeoutKill {
             timeout: Duration::from_secs(90),
             started: "2026-11-04T12:00:00Z".parse().expect("timestamp"),
@@ -5253,7 +5273,7 @@ mod tests {
                             .send_completed(aither_sandbox::CompletedTask {
                                 task_id: "task-test".to_string(),
                                 script: "cat".to_string(),
-                                killed: false,
+                                kill: None,
                                 timeout_kill: None,
                                 pending: None,
                                 result: Err(aither_sandbox::TerminalError::Execution(
@@ -7024,7 +7044,7 @@ mod tests {
         aither_sandbox::CompletedTask {
             task_id: task_id.to_string(),
             script: "make".to_string(),
-            killed: false,
+            kill: None,
             timeout_kill: None,
             result: Err(aither_sandbox::TerminalError::Execution(output.to_string())),
             pending: None,
