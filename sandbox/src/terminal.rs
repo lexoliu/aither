@@ -6195,6 +6195,61 @@ mod tests {
     #[cfg(all(unix, feature = "connectivity"))]
     mod outage;
 
+    /// A stdin whose drop reports that the writer thread holding it ended.
+    struct DropSignal(async_channel::Sender<()>);
+
+    impl Write for DropSignal {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send_blocking(());
+        }
+    }
+
+    /// A finished job's stdin writer thread exits instead of blocking on its
+    /// channel forever.
+    #[tokio::test]
+    async fn finished_job_ends_its_stdin_writer_thread() {
+        use executor_core::{Executor as _, Task as _};
+        let (registry, service) = crate::job_registry::job_registry_channel();
+        executor_core::tokio::TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
+        registry
+            .register(
+                9001,
+                "task-writer",
+                "exec-writer",
+                "cat",
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+        let (ended_tx, ended_rx) = async_channel::bounded::<()>(1);
+        let input_tx = spawn_terminal_stdin_writer(DropSignal(ended_tx), FeedCounter::default());
+        registry.attach_terminal_input(9001, input_tx).await;
+        registry
+            .terminal_input("task-writer", b"hi\n".to_vec())
+            .await
+            .expect("a running job takes input");
+        assert!(ended_rx.is_empty(), "the writer lives while the job runs");
+
+        registry.complete(9001, 0, None).await;
+
+        tokio::time::timeout(Duration::from_secs(10), ended_rx.recv())
+            .await
+            .expect("the writer thread must end once the job finishes")
+            .expect("the writer reports its end");
+    }
+
     /// Toolchain directories named by `*_HOME` variables become rwx grants;
     /// ones that do not exist are skipped.
     #[test]
