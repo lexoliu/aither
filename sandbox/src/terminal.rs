@@ -13,6 +13,10 @@
 use crate::foreground_wait::ForegroundWait;
 use crate::grants::{GrantSet, TerminalGrants};
 use crate::heel_binary::SharedHeelBinary;
+use crate::memory::{
+    AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, FootprintReader,
+    FootprintRegistry, JobMemory, ProbedContainerMemory, ResponseWindow, SystemFootprints,
+};
 use crate::outage::Outages;
 use std::{
     borrow::Cow,
@@ -567,6 +571,8 @@ const MAX_LINES_CEILING: u32 = 800;
 /// How long a `terminal` call waits in the foreground before a still-running
 /// command promotes to a background task.
 pub const DEFAULT_FOREGROUND_WAIT: Duration = Duration::from_secs(10);
+/// How long the agent has to act on a final memory warning by default.
+pub const DEFAULT_RESPONSE_WINDOW: Duration = Duration::from_secs(120);
 /// The default of the most bytes a subagent's sandbox may send the host while
 /// its commits are imported into the main repository.
 pub const DEFAULT_SUBAGENT_IMPORT_LIMIT: u64 = 1024 * 1024 * 1024;
@@ -589,11 +595,22 @@ struct TerminalLimits {
     /// imported; shared with every terminal derived from this one, and
     /// adjustable at runtime.
     subagent_import: ImportBudget,
+    /// How long the agent has to act on a final memory warning; adjustable
+    /// at runtime and shared with every terminal derived from this one.
+    response_window: ResponseWindow,
+    /// Reads what the terminal's jobs hold of the machine's memory.
+    footprints: AnyFootprintReader,
+    /// Shares the total the agent's jobs hold with the machine's other
+    /// agents; `None` when the embedder configured no registry.
+    footprint_registry: Option<AnyFootprintRegistry>,
 }
 
 impl Default for TerminalLimits {
     fn default() -> Self {
         Self {
+            response_window: ResponseWindow::new(DEFAULT_RESPONSE_WINDOW),
+            footprints: AnyFootprintReader::new(SystemFootprints),
+            footprint_registry: None,
             foreground_wait: ForegroundWait::new(DEFAULT_FOREGROUND_WAIT),
             timeout_cap: DEFAULT_TIMEOUT_CAP,
             long_job_alert: DEFAULT_LONG_JOB_ALERT_AFTER,
@@ -810,9 +827,9 @@ pub struct CompletedTask {
     pub script: String,
     /// The result of execution.
     pub result: Result<CompletedCommand, TerminalError>,
-    /// Whether the job was killed — its `timeout` bound or `terminal_kill`
-    /// — rather than exiting on its own.
-    pub killed: bool,
+    /// Why the job was killed — its `timeout` bound, `terminal_kill` or a
+    /// memory runaway — or `None` when it exited on its own.
+    pub kill: Option<crate::KillCause>,
     /// Set when the kill was the `timeout` bound passing.
     pub timeout_kill: Option<TimeoutKill>,
     /// Keeps the job reading [`Delivery::Pending`](crate::Delivery) in its
@@ -2054,6 +2071,75 @@ where
     #[must_use]
     pub fn foreground_wait(&self) -> ForegroundWait {
         self.limits.foreground_wait.clone()
+    }
+
+    /// Sets how long the agent has to act on a final memory warning before
+    /// the job it names is killed. Defaults to [`DEFAULT_RESPONSE_WINDOW`].
+    #[must_use]
+    pub fn with_response_window(self, window: Duration) -> Self {
+        self.limits.response_window.set(window);
+        self
+    }
+
+    /// A handle on the response window, shared with every terminal derived
+    /// from this one: a window set through it applies to the next final
+    /// warning of each of them.
+    #[must_use]
+    pub fn response_window(&self) -> ResponseWindow {
+        self.limits.response_window.clone()
+    }
+
+    /// Reads job footprints and the machine's physical memory through
+    /// `reader` instead of the platform's own.
+    #[must_use]
+    pub fn with_footprint_reader(mut self, reader: impl FootprintReader) -> Self {
+        self.limits.footprints = AnyFootprintReader::new(reader);
+        self
+    }
+
+    /// Shares the memory this terminal's jobs hold with the machine's other
+    /// agents through `registry`, so a final warning can name the agent that
+    /// contributes the most when all agents together exceed physical memory.
+    #[must_use]
+    pub fn with_footprint_registry(mut self, registry: impl FootprintRegistry) -> Self {
+        self.limits.footprint_registry = Some(AnyFootprintRegistry::new(registry));
+        self
+    }
+
+    /// The memory the terminal's jobs hold, for a guard that warns about and
+    /// kills a runaway job.
+    #[must_use]
+    ///
+    /// The machine the embedder runs on is always judged. When the terminal
+    /// runs in a container, the container's own memory limit is judged too,
+    /// read inside the container. Jobs of a remote execution environment are
+    /// never judged.
+    pub fn job_memory(&self) -> JobMemory {
+        let memory = JobMemory::new(
+            self.job_registry(),
+            self.limits.footprints.clone(),
+            self.limits.footprint_registry.clone(),
+            self.limits.response_window.clone(),
+        );
+        match self.container_probe() {
+            Some(probe) => {
+                memory.with_container(AnyContainerMemory::new(ProbedContainerMemory::new(probe)))
+            }
+            None => memory,
+        }
+    }
+
+    /// A reader of the container the agent works in, when the terminal's
+    /// home environment is a container; `None` when it is the local
+    /// machine. A remote execution environment is never a home environment.
+    #[must_use]
+    pub fn container_probe(&self) -> Option<crate::ContainerProbe> {
+        if self.shell_sessions.resolve_local_backend() != Ok(ShellBackend::Container) {
+            return None;
+        }
+        self.shell_sessions
+            .container_runtime()
+            .map(ContainerShellRuntime::probe)
     }
 
     /// Sets the largest `timeout` a command accepts.
@@ -3826,7 +3912,7 @@ where
         Err(error) => Err(error.to_string()),
     };
     let owed = status_registry.owe_completion(&task_id, ending).await;
-    let killed = owed.as_ref().is_some_and(|owed| owed.killed);
+    let kill = owed.as_ref().and_then(|owed| owed.kill);
     // Every job reports completion; the agent reinjects the result only for
     // tasks it saw promoted or detached (`take_started`), so a plain
     // foreground result is not delivered twice.
@@ -3835,8 +3921,8 @@ where
             task_id,
             script,
             result,
-            killed,
-            timeout_kill: timeout_watch.kill().filter(|_| killed),
+            kill,
+            timeout_kill: timeout_watch.kill().filter(|_| kill.is_some()),
             pending: owed.map(|owed| owed.pending),
         })
         .await;
@@ -4473,22 +4559,52 @@ fn host_toolchain_homes() -> impl Iterator<Item = (&'static str, PathBuf)> {
     .filter(|(_, path)| path.is_dir())
 }
 
+/// The grants that let a command run what the session's `PATH` lists: each
+/// existing absolute directory of the `PATH` in `environment`, read and
+/// execute, never write. They come from the `PATH` itself, so a tool in any
+/// directory the user put there runs without a list of known toolchains.
+pub fn path_directory_grants(environment: &[(String, String)]) -> heel::Result<Vec<Grant>> {
+    let Some((_, path)) = environment.iter().find(|(name, _)| name == "PATH") else {
+        return Ok(Vec::new());
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut grants = Vec::new();
+    for directory in std::env::split_paths(path) {
+        if !directory.is_absolute() || !directory.is_dir() {
+            continue;
+        }
+        let resolved = resolved(&directory)?;
+        if seen.insert(resolved.as_path().to_path_buf()) {
+            grants.push(Grant::new(resolved, Access::READ | Access::EXEC));
+        }
+    }
+    Ok(grants)
+}
+
 /// The paths a session sandbox must not write: heel's persistence table
 /// (git hooks and config, shell startup files, `PATH` directories and the
 /// rest), where a write runs as code outside the sandbox later.
 ///
-/// Two places are exempt, because the table forbids creating a `.git` at all
+/// Three places are exempt, because the table forbids creating a `.git` at all
 /// and the commands that need to would otherwise be impossible: cargo's git
 /// cache, `$CARGO_HOME/git`, where cargo clones git dependencies and keeps
 /// their `.git/hooks`, which it creates and removes itself and no user runs;
-/// and the session directory `working_dir`, where `git clone` and `git init`
-/// make the session's own repositories. Nothing else of a toolchain home is
-/// exempt.
-pub fn session_write_denylist(working_dir: &Path) -> heel::WriteDenylist {
+/// the session directory `working_dir`, where `git clone` and `git init`
+/// make the session's own repositories; and the prepared runtime's `uv`
+/// cache (`UV_CACHE_DIR`), whose buckets `uv` marks with a `.git` entry and
+/// where no user runs git. Nothing else of a toolchain home is exempt.
+pub fn session_write_denylist(
+    working_dir: &Path,
+    tools: &PreparedTools<PathBuf>,
+) -> heel::WriteDenylist {
     let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let denylist = heel::WriteDenylist::persistence().except(resolved(working_dir));
-    match host_toolchain_homes().find(|(name, _)| *name == "CARGO_HOME") {
+    let denylist = match host_toolchain_homes().find(|(name, _)| *name == "CARGO_HOME") {
         Some((_, cargo_home)) => denylist.except(resolved(&cargo_home).join("git")),
+        None => denylist,
+    };
+    match tools.uv_environment() {
+        Some(uv) => denylist.except(resolved(&uv.cache)),
         None => denylist,
     }
 }
@@ -4591,6 +4707,7 @@ where
             context.mode,
             None,
             Some(tree.clone()),
+            crate::JobPlace::Host,
         )
         .await;
     context.background_startup.report_ready().await;
@@ -4688,6 +4805,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
             context.mode,
             None,
             Some(tree.clone()),
+            crate::JobPlace::Host,
         )
         .await;
     context.background_startup.report_ready().await;
@@ -5180,6 +5298,7 @@ fn container_exec_script(
     Ok(prepared_tools.shell_command(&script)?)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_container_background<E: Executor + Clone + 'static>(
     context: ContainerBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
@@ -5196,13 +5315,13 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
     let (input_tx, input_rx) = async_channel::unbounded::<Vec<u8>>();
     context
         .job_registry
-        .register(
+        .register_at(
+            crate::JobPlace::Container,
             pid,
             context.task_id,
             context.execution_id,
             context.script,
             context.mode,
-            None,
         )
         .await;
     let script = container_exec_script(
@@ -5213,6 +5332,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         context.script,
     )?;
     let script = inject_env_exports(script, context.env_source.as_ref())?;
+    let script = mark_container_job(script, context.task_id)?;
     // A foreground command gets no input channel: the dropped sender is the
     // EOF its stdin reads. StdinAlerts may ride along either way; they are
     // the background job's blocked-reader wiring.
@@ -5405,15 +5525,17 @@ async fn execute_ssh_background(
         .map_err(|e| TerminalError::Execution(e.to_string()))?;
 
     let pid = child.id();
+    // The local `ssh` process stands for a job that runs on the remote host,
+    // whose memory is never judged.
     context
         .job_registry
-        .register(
+        .register_at(
+            crate::JobPlace::Remote,
             pid,
             context.task_id,
             context.execution_id,
             context.script,
             context.mode,
-            None,
         )
         .await;
     context.background_startup.report_ready().await;
@@ -5472,6 +5594,17 @@ fn inject_env_exports(
     }
     rendered.push_str(&script);
     Ok(rendered)
+}
+
+/// Marks every process of a container job with its task ID, the marker the
+/// container's memory reader finds the job's processes by: each process the
+/// job starts inherits it.
+fn mark_container_job(script: String, task_id: &str) -> Result<String, TerminalError> {
+    let marker: Arc<dyn TerminalEnvSource> = Arc::new(vec![(
+        crate::memory::JOB_MARKER_ENV.to_string(),
+        task_id.to_string(),
+    )]);
+    inject_env_exports(script, Some(&marker))
 }
 
 fn shell_escape(value: &str) -> String {
@@ -6582,6 +6715,57 @@ mod tests {
         let stdout = render_terminal_result(&result);
         assert!(!stdout.contains("Exit code:"), "{stdout}");
         assert!(stdout.contains("managed=1.0.0 bash"), "{stdout}");
+    }
+
+    /// A command run on an SSH server is a remote job: its local `ssh`
+    /// process stands for work whose memory is never judged here.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_run_over_ssh_is_a_remote_job() {
+        let authorizer = Arc::new(CountingSshAuthorizer::default());
+        let tools_cache = tempfile::tempdir().unwrap();
+        let tools = crate::tool_runtime::tests::bundle()
+            .prepare_local(tools_cache.path())
+            .await
+            .unwrap();
+        let prepared = local_and_ssh_registry(&authorizer)
+            .with_test_tools(tools.clone())
+            .with_test_ssh(build_server(), tools);
+        let directory = tempfile::tempdir().unwrap();
+        let terminal = fresh_terminal(directory.path())
+            .await
+            .adopt_prepared_tools(prepared)
+            .await
+            .expect("a prepared registry should be adopted");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+        let terminal = terminal.with_registry(registry);
+        let _ = terminal
+            .call(
+                TerminalArgs {
+                    description: "run remotely".to_string(),
+                    script: "echo remote-job".to_string(),
+                    mode: TerminalExecutionMode::Ssh,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    max_lines: 50,
+                    raw: true,
+                    timeout: 30,
+                    background: true,
+                },
+                ToolContext::new(),
+            )
+            .await;
+
+        let jobs = terminal.job_registry().list().await;
+        let job = jobs
+            .iter()
+            .find(|job| job.script == "echo remote-job")
+            .expect("the remote job is registered");
+        assert_eq!(job.place, crate::JobPlace::Remote);
+        let machine = terminal.job_memory().snapshot().await.unwrap();
+        assert_eq!(machine.jobs, []);
+        terminal.job_registry().kill_running().await;
     }
 
     #[cfg(unix)]
@@ -7835,6 +8019,59 @@ mod tests {
         );
     }
 
+    /// Under strict isolation a command in a `PATH` directory runs, the
+    /// directory is not writable, and a directory off `PATH` stays unreadable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn path_directories_are_readable_and_executable_but_not_writable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let on_path = root.join("on-path");
+        let off_path = root.join("off-path");
+        let missing = root.join("missing");
+        for dir in [&on_path, &off_path] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let tool = on_path.join("hello-tool");
+        std::fs::write(&tool, "#!/bin/sh\necho hello-from-path\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(off_path.join("secret"), "secret\n").unwrap();
+
+        let path = std::env::join_paths([&on_path, &missing, Path::new("relative")]).unwrap();
+        let environment = vec![("PATH".to_string(), path.into_string().unwrap())];
+        let grants = path_directory_grants(&environment).unwrap();
+        assert_eq!(grants.len(), 1, "only the existing absolute directory");
+        assert_eq!(grants[0].access(), Access::READ | Access::EXEC);
+
+        let session = tempfile::tempdir().unwrap();
+        let config = SandboxConfig::builder()
+            .network(DenyAll)
+            .working_dir(std::fs::canonicalize(session.path()).unwrap())
+            .grants(grants)
+            .security(SecurityConfig::interactive())
+            .build();
+        let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("sandbox should initialize");
+        let script = format!(
+            "{tool}; echo x > {on}/planted 2>/dev/null && echo planted; cat {off}/secret 2>/dev/null; true",
+            tool = tool.display(),
+            on = on_path.display(),
+            off = off_path.display(),
+        );
+        let output = sandbox
+            .command("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .await
+            .expect("the sandboxed script runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "hello-from-path", "{stdout}");
+        assert!(!on_path.join("planted").exists());
+    }
+
     // These four drive a real sandbox running `/bin/pwd`. `heel` reports
     // `UnsupportedPlatform` off Unix, and the binary they run does not exist
     // there either, so there is nothing for them to exercise on Windows.
@@ -8198,14 +8435,43 @@ mod tests {
         }
     }
 
+    /// `uv` marks its cache buckets with a `.git` entry: the prepared
+    /// runtime's cache takes that, while a granted repository still refuses
+    /// git's config. Judged by outcome, since platforms differ on whether the
+    /// bare `.git` directory itself is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uv_cache_may_hold_git_entries_and_a_granted_repository_may_not() {
+        let base = tempfile::tempdir().unwrap();
+        let granted = std::fs::canonicalize(base.path()).unwrap().join("repo");
+        std::fs::create_dir(&granted).unwrap();
+        let script = format!(
+            "mkdir -p \"$UV_CACHE_DIR/x\" && mkdir \"$UV_CACHE_DIR/x/.git\" 2>&1 && echo cache-written; \
+             mkdir -p {repo}/.git 2>/dev/null; touch {repo}/.git/config 2>/dev/null && echo repo-written; true",
+            repo = granted.display(),
+        );
+        let stdout = sandboxed_stdout(vec![granted.clone()], Vec::new(), script).await;
+        assert!(
+            stdout.lines().any(|line| line == "cache-written"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("repo-written"), "{stdout}");
+        assert!(!granted.join(".git/config").exists(), "{stdout}");
+    }
+
     /// Cargo's git cache keeps the `.git/hooks` rule off, and nothing else of
     /// a toolchain home is exempt.
     #[cfg(unix)]
     #[tokio::test]
-    async fn cargo_git_cache_is_the_only_denylist_exception() {
+    async fn cargo_git_cache_is_the_only_toolchain_home_denylist_exception() {
         let (_base, main, _linked) = repository_with_linked_worktree();
         let session = tempfile::tempdir().unwrap();
-        let denylist = session_write_denylist(session.path());
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tools = shell_sessions.local_tools().unwrap().clone();
+        let denylist = session_write_denylist(session.path(), &tools);
+        // The cache directory appears with the first `uv` run; its parent
+        // is canonical from preparation.
+        let uv_cache = tools.uv_environment().unwrap().cache;
         let cargo_git = host_toolchain_homes()
             .find(|(name, _)| *name == "CARGO_HOME")
             .map(|(_, home)| std::fs::canonicalize(home).unwrap().join("git"))
@@ -8214,7 +8480,8 @@ mod tests {
             denylist.exempt(),
             [
                 std::fs::canonicalize(session.path()).unwrap(),
-                cargo_git.clone()
+                cargo_git.clone(),
+                uv_cache
             ]
         );
 
@@ -8986,6 +9253,7 @@ mod tests {
         assert_eq!(
             info.status,
             JobStatus::Killed {
+                cause: crate::KillCause::User,
                 delivery: crate::Delivery::Pending
             },
             "the promoted job should be killed at its timeout: {completed:?}"
@@ -9452,6 +9720,7 @@ mod tests {
         assert_eq!(
             info.status,
             JobStatus::Killed {
+                cause: crate::KillCause::User,
                 delivery: crate::Delivery::Pending
             },
             "{completed:?}"
@@ -9531,6 +9800,7 @@ mod tests {
         assert_eq!(
             info.status,
             JobStatus::Killed {
+                cause: crate::KillCause::User,
                 delivery: crate::Delivery::Pending
             },
             "the job should have been killed at its timeout: {completed:?}"
@@ -9592,7 +9862,7 @@ mod tests {
         let task_id = started_task_id(&background_receiver);
         let completed = wait_for_completed_task(&background_receiver, &task_id).await;
 
-        assert!(completed.killed);
+        assert_eq!(completed.kill, Some(crate::KillCause::User));
         let kill = completed
             .timeout_kill
             .expect("a job killed at its timeout carries the times");
@@ -9629,7 +9899,7 @@ mod tests {
         let task_id = started_task_id(&background_receiver);
         assert!(tool.job_registry().kill_by_task_id(&task_id).await);
         let completed = wait_for_completed_task(&background_receiver, &task_id).await;
-        assert!(completed.killed);
+        assert_eq!(completed.kill, Some(crate::KillCause::User));
         assert_eq!(completed.timeout_kill, None);
     }
 
@@ -12596,6 +12866,55 @@ mod tests {
         .expect("prepared tools should be adopted");
         let parent = tool.with_registry(Arc::new(ToolRegistryBuilder::new().build(dir)));
         (scripts, parent)
+    }
+
+    /// A container terminal's jobs are the container's: they carry the
+    /// marker its memory reader finds them by, are registered as running
+    /// there, and the terminal judges the container's memory too.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn container_jobs_are_marked_and_placed_in_the_container() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (scripts, parent) = recording_container_terminal(dir.path(), None).await;
+        assert!(parent.container_probe().is_some());
+        assert!(parent.job_memory().has_container());
+
+        assert_eq!(exit_code_of(&parent, "echo marked-command").await, 0);
+
+        let scripts = scripts.lock().unwrap().clone();
+        let script = scripts
+            .iter()
+            .find(|script| script.contains("marked-command"))
+            .expect("the command ran");
+        let jobs = parent.job_registry().list().await;
+        let job = jobs
+            .iter()
+            .find(|job| job.script == "echo marked-command")
+            .expect("the job is registered");
+        assert_eq!(job.place, crate::JobPlace::Container);
+        assert!(
+            script.contains(&format!(
+                "export {}='{}'",
+                crate::memory::JOB_MARKER_ENV,
+                job.task_id
+            )),
+            "{script}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_local_terminal_judges_no_container() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        assert!(tool.container_probe().is_none());
+        assert!(!tool.job_memory().has_container());
     }
 
     #[cfg(unix)]
