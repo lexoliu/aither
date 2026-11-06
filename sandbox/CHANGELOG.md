@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0](https://github.com/May-Agent/aither/compare/sandbox-v0.19.0...sandbox-v0.20.0) - 2026-11-06
+
+### Added
+
+- *(sandbox)* [**breaking**] let the embedder prepare each subagent run's space
+- *(sandbox)* [**breaking**] judge the home environment's memory, a container's included, and never a remote host's
+- *(sandbox)* [**breaking**] report why a job was killed and read job memory footprints
+
+### Fixed
+
+- *(sandbox)* exempt the managed uv cache from the persistence denylist
+- *(sandbox)* depend on heel 0.9.0 and verify its binary once per terminal
+- gate a unix-only test and take ok_or for an eager error
+- *(sandbox)* grant the session PATH directories read and execute
+- *(sandbox)* apply the persistence write denylist to session policies
+- *(sandbox)* grant a linked worktree's common git directory
+- *(sandbox)* end a finished job's stdin writer thread
+- *(sandbox)* record a file read for the unchanged-file guard only after the command exits 0
+- *(agent)* park a turn whose every call re-read unchanged output
+
+### Other
+
+- Merge pull request #563 from May-Agent/feat/subagent-run-space
+- Merge remote-tracking branch 'origin/dev' into fix/558-heel-0.9
+- Merge remote-tracking branch 'origin/dev' into feat/subagent-run-space
+- Merge pull request #565 from May-Agent/fix/uv-cache-denylist
+- *(sandbox)* judge the uv cache denylist test by outcome on every platform
+- Merge pull request #553 from May-Agent/feat/171-runaway-guard
+- Merge remote-tracking branch 'origin/dev' into fix/558-heel-0.9
+- Merge pull request #556 from May-Agent/fix/551-path-grants
+- Merge pull request #555 from May-Agent/fix/550-git-persistence-denylist
+- Merge pull request #561 from May-Agent/fix/560-test-git-isolation
+- Merge remote-tracking branch 'origin/dev' into feat/171-runaway-guard
+- run every test's git through one isolated helper
+- Merge pull request #554 from May-Agent/fix/549-worktree-commondir
+- Merge branch 'fix/550-git-persistence-denylist' into fix/551-path-grants
+- *(sandbox)* check a refused git init by its outcome on every platform
+
 ## [0.18.0](https://github.com/May-Agent/aither/compare/sandbox-v0.17.0...sandbox-v0.18.0) - 2026-11-05
 
 ### Added

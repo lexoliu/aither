@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0](https://github.com/May-Agent/aither/compare/acp-v0.19.0...acp-v0.20.0) - 2026-11-06
+
+### Fixed
+
+- *(agent)* [**breaking**] retry a model response whose stream breaks mid-response
+
 ## [0.19.0](https://github.com/May-Agent/aither/compare/acp-v0.18.0...acp-v0.19.0) - 2026-11-05
 
 ### Added
