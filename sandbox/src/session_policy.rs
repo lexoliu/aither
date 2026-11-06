@@ -75,7 +75,7 @@ impl SessionSandboxPolicy {
         Ok(Self {
             grants,
             environment,
-            write_denylist: session_write_denylist(working_dir),
+            write_denylist: session_write_denylist(working_dir, tools),
         })
     }
 
@@ -104,7 +104,7 @@ impl SessionSandboxPolicy {
     }
 
     /// The paths the sandbox must not write, however they are granted: heel's
-    /// persistence table, less cargo's git cache and the session directory.
+    /// persistence table, less cargo's git cache, the session directory and the `uv` cache.
     /// A host building its own
     /// [`heel::SandboxConfig`] passes it to `write_denylist` (not on
     /// Windows, whose backend refuses one).

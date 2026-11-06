@@ -4471,18 +4471,26 @@ pub fn path_directory_grants(environment: &[(String, String)]) -> heel::Result<V
 /// (git hooks and config, shell startup files, `PATH` directories and the
 /// rest), where a write runs as code outside the sandbox later.
 ///
-/// Two places are exempt, because the table forbids creating a `.git` at all
+/// Three places are exempt, because the table forbids creating a `.git` at all
 /// and the commands that need to would otherwise be impossible: cargo's git
 /// cache, `$CARGO_HOME/git`, where cargo clones git dependencies and keeps
 /// their `.git/hooks`, which it creates and removes itself and no user runs;
-/// and the session directory `working_dir`, where `git clone` and `git init`
-/// make the session's own repositories. Nothing else of a toolchain home is
-/// exempt.
-pub fn session_write_denylist(working_dir: &Path) -> heel::WriteDenylist {
+/// the session directory `working_dir`, where `git clone` and `git init`
+/// make the session's own repositories; and the prepared runtime's `uv`
+/// cache (`UV_CACHE_DIR`), whose buckets `uv` marks with a `.git` entry and
+/// where no user runs git. Nothing else of a toolchain home is exempt.
+pub fn session_write_denylist(
+    working_dir: &Path,
+    tools: &PreparedTools<PathBuf>,
+) -> heel::WriteDenylist {
     let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let denylist = heel::WriteDenylist::persistence().except(resolved(working_dir));
-    match host_toolchain_homes().find(|(name, _)| *name == "CARGO_HOME") {
+    let denylist = match host_toolchain_homes().find(|(name, _)| *name == "CARGO_HOME") {
         Some((_, cargo_home)) => denylist.except(resolved(&cargo_home).join("git")),
+        None => denylist,
+    };
+    match tools.uv_environment() {
+        Some(uv) => denylist.except(resolved(&uv.cache)),
         None => denylist,
     }
 }
@@ -8227,14 +8235,38 @@ mod tests {
         }
     }
 
+    /// `uv` marks its cache buckets with a `.git` entry: the prepared
+    /// runtime's cache takes that, a granted repository still refuses one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uv_cache_may_hold_git_entries_and_a_granted_repository_may_not() {
+        let base = tempfile::tempdir().unwrap();
+        let granted = std::fs::canonicalize(base.path()).unwrap().join("repo");
+        std::fs::create_dir(&granted).unwrap();
+        let script = format!(
+            "mkdir -p \"$UV_CACHE_DIR/x\" && mkdir \"$UV_CACHE_DIR/x/.git\" 2>&1 && echo cache-written; \
+             mkdir {repo}/.git 2>/dev/null && echo repo-written; true",
+            repo = granted.display(),
+        );
+        let stdout = sandboxed_stdout(vec![granted.clone()], Vec::new(), script).await;
+        assert_eq!(stdout.lines().last(), Some("cache-written"), "{stdout}");
+        assert!(!stdout.contains("repo-written"), "{stdout}");
+        assert!(!granted.join(".git").exists(), "{stdout}");
+    }
+
     /// Cargo's git cache keeps the `.git/hooks` rule off, and nothing else of
     /// a toolchain home is exempt.
     #[cfg(unix)]
     #[tokio::test]
-    async fn cargo_git_cache_is_the_only_denylist_exception() {
+    async fn cargo_git_cache_is_the_only_toolchain_home_denylist_exception() {
         let (_base, main, _linked) = repository_with_linked_worktree();
         let session = tempfile::tempdir().unwrap();
-        let denylist = session_write_denylist(session.path());
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tools = shell_sessions.local_tools().unwrap().clone();
+        let denylist = session_write_denylist(session.path(), &tools);
+        // The cache directory appears with the first `uv` run; its parent
+        // is canonical from preparation.
+        let uv_cache = tools.uv_environment().unwrap().cache;
         let cargo_git = host_toolchain_homes()
             .find(|(name, _)| *name == "CARGO_HOME")
             .map(|(_, home)| std::fs::canonicalize(home).unwrap().join("git"))
@@ -8243,7 +8275,8 @@ mod tests {
             denylist.exempt(),
             [
                 std::fs::canonicalize(session.path()).unwrap(),
-                cargo_git.clone()
+                cargo_git.clone(),
+                uv_cache
             ]
         );
 
