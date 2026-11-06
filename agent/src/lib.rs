@@ -68,6 +68,7 @@ mod poll_park_tests;
 mod pressure;
 mod request_parameters;
 mod runaway;
+pub mod secret_guard;
 mod subagent_file;
 pub mod tasks;
 mod terminal_agent;
@@ -140,6 +141,9 @@ pub use host_load::{
 pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
 pub use runaway::RunawayGuard;
+pub use secret_guard::{
+    Guarded, SecretFinding, SecretGuard, SecretKind, SecretRefusal, SecretShape,
+};
 pub use tasks::{
     AnyWorkTracker, TaskEvent, TaskEvents, WorkItem, WorkRef, WorkState, WorkTracker,
     WorkTrackerError,
