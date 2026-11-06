@@ -4445,6 +4445,28 @@ fn host_toolchain_homes() -> impl Iterator<Item = (&'static str, PathBuf)> {
     .filter(|(_, path)| path.is_dir())
 }
 
+/// The grants that let a command run what the session's `PATH` lists: each
+/// existing absolute directory of the `PATH` in `environment`, read and
+/// execute, never write. They come from the `PATH` itself, so a tool in any
+/// directory the user put there runs without a list of known toolchains.
+pub fn path_directory_grants(environment: &[(String, String)]) -> heel::Result<Vec<Grant>> {
+    let Some((_, path)) = environment.iter().find(|(name, _)| name == "PATH") else {
+        return Ok(Vec::new());
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut grants = Vec::new();
+    for directory in std::env::split_paths(path) {
+        if !directory.is_absolute() || !directory.is_dir() {
+            continue;
+        }
+        let resolved = resolved(&directory)?;
+        if seen.insert(resolved.as_path().to_path_buf()) {
+            grants.push(Grant::new(resolved, Access::READ | Access::EXEC));
+        }
+    }
+    Ok(grants)
+}
+
 /// The paths a session sandbox must not write: heel's persistence table
 /// (git hooks and config, shell startup files, `PATH` directories and the
 /// rest), where a write runs as code outside the sandbox later.
@@ -7790,6 +7812,59 @@ mod tests {
             stopped.to_string().contains("was killed"),
             "child task should be reported killed: {stopped}"
         );
+    }
+
+    /// Under strict isolation a command in a `PATH` directory runs, the
+    /// directory is not writable, and a directory off `PATH` stays unreadable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn path_directories_are_readable_and_executable_but_not_writable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let on_path = root.join("on-path");
+        let off_path = root.join("off-path");
+        let missing = root.join("missing");
+        for dir in [&on_path, &off_path] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let tool = on_path.join("hello-tool");
+        std::fs::write(&tool, "#!/bin/sh\necho hello-from-path\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(off_path.join("secret"), "secret\n").unwrap();
+
+        let path = std::env::join_paths([&on_path, &missing, Path::new("relative")]).unwrap();
+        let environment = vec![("PATH".to_string(), path.into_string().unwrap())];
+        let grants = path_directory_grants(&environment).unwrap();
+        assert_eq!(grants.len(), 1, "only the existing absolute directory");
+        assert_eq!(grants[0].access(), Access::READ | Access::EXEC);
+
+        let session = tempfile::tempdir().unwrap();
+        let config = SandboxConfig::builder()
+            .network(DenyAll)
+            .working_dir(std::fs::canonicalize(session.path()).unwrap())
+            .grants(grants)
+            .security(SecurityConfig::interactive())
+            .build();
+        let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("sandbox should initialize");
+        let script = format!(
+            "{tool}; echo x > {on}/planted 2>/dev/null && echo planted; cat {off}/secret 2>/dev/null; true",
+            tool = tool.display(),
+            on = on_path.display(),
+            off = off_path.display(),
+        );
+        let output = sandbox
+            .command("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .await
+            .expect("the sandboxed script runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "hello-from-path", "{stdout}");
+        assert!(!on_path.join("planted").exists());
     }
 
     // These four drive a real sandbox running `/bin/pwd`. `heel` reports
