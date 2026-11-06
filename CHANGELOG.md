@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0](https://github.com/May-Agent/aither/compare/v0.20.0...v0.21.0) - 2026-11-06
+
+### Other
+
+- release v0.21.0
+
 ## [0.18.0](https://github.com/May-Agent/aither/compare/v0.17.0...v0.18.0) - 2026-11-05
 
 ### Fixed
