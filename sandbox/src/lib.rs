@@ -58,6 +58,7 @@ mod command_set;
 mod container;
 mod foreground_wait;
 mod grants;
+mod heel_binary;
 mod kill_guard;
 pub mod monitor;
 mod naming;

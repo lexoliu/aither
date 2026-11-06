@@ -12,6 +12,7 @@
 
 use crate::foreground_wait::ForegroundWait;
 use crate::grants::{GrantSet, TerminalGrants};
+use crate::heel_binary::SharedHeelBinary;
 use crate::outage::Outages;
 use std::{
     borrow::Cow,
@@ -1576,6 +1577,9 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     /// Shared jobserver token broker, when configured.
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
+    /// The verified `heel` binary every sandbox this tool creates carries,
+    /// shared by its clones and its subagents' tools.
+    heel: SharedHeelBinary,
     /// Records the outages commands run through.
     outages: Outages,
     /// Tool registry state.
@@ -1610,6 +1614,7 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver.clone(),
+            heel: self.heel.clone(),
             outages: self.outages.clone(),
             registry: self.registry.clone(),
         }
@@ -1730,6 +1735,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
+            heel: SharedHeelBinary::default(),
             outages: Outages::none(),
             registry: Unconfigured,
         })
@@ -1799,6 +1805,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
+            heel: SharedHeelBinary::default(),
             outages: Outages::none(),
             registry: Unconfigured,
         })
@@ -1833,6 +1840,7 @@ impl<P, E, State> TerminalTool<P, E, State> {
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver,
+            heel: self.heel,
             outages: self.outages,
             registry: state(self.registry),
         }
@@ -2118,7 +2126,14 @@ where
             .await?;
         if let Some(tools) = self.local_home_tools()? {
             tools.ensure_readonly(self.writable_grants().iter()).await?;
-            tools.verify_local_versions(self.executor.clone()).await?;
+            let heel = self
+                .heel
+                .get()
+                .await
+                .map_err(|error| ToolRuntimeError::SshBootstrap(error.to_string()))?;
+            tools
+                .verify_local_versions(self.executor.clone(), heel)
+                .await?;
         }
         Ok(self)
     }
@@ -2363,6 +2378,7 @@ where
                 readable: readable_paths,
                 committing: granted.committing.clone(),
                 priority: self.priority,
+                heel: self.heel.clone(),
             })),
         };
         let registry = Arc::new(
@@ -2403,6 +2419,7 @@ where
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver.clone(),
+            heel: self.heel.clone(),
             outages: self.outages.clone(),
             registry: Launching { registry },
         };
@@ -2757,6 +2774,7 @@ where
                 priority: self.priority,
                 #[cfg(all(unix, feature = "jobserver"))]
                 jobserver: self.jobserver.clone(),
+                heel: self.heel.clone(),
                 outages,
             }))
             .detach();
@@ -3521,6 +3539,7 @@ struct StandaloneExecution<P, E> {
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
+    heel: SharedHeelBinary,
     expect: OutputFormat,
     resolution: MediaResolution,
     store_dir: PathBuf,
@@ -3550,6 +3569,7 @@ struct StandaloneStart<'a, P, E> {
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: &'a Option<JobBroker>,
+    heel: &'a SharedHeelBinary,
 }
 
 struct LocalBackgroundExecution<'a, E> {
@@ -3572,6 +3592,7 @@ struct LocalBackgroundExecution<'a, E> {
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     job_fifo: Option<crate::jobserver::CommandFifo>,
+    heel: &'a SharedHeelBinary,
 }
 
 struct ContainerBackgroundExecution<'a, E> {
@@ -3703,9 +3724,11 @@ struct SpawnedTerminalTask<P, E> {
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
+    heel: SharedHeelBinary,
     outages: Outages,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_terminal_task<P, E>(task: SpawnedTerminalTask<P, E>)
 where
     P: PermissionHandler + 'static,
@@ -3746,6 +3769,7 @@ where
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
+        heel,
         outages,
     } = task;
     let status_registry = job_registry.clone();
@@ -3775,6 +3799,7 @@ where
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
+        heel,
         expect,
         resolution,
         store_dir,
@@ -3853,6 +3878,7 @@ where
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
+        heel,
         expect,
         resolution,
         store_dir,
@@ -3888,6 +3914,7 @@ where
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver: &jobserver,
+        heel: &heel,
     })
     .await;
     let (pid, output) = match start_result {
@@ -4046,6 +4073,7 @@ where
         priority: request.priority,
         #[cfg(all(unix, feature = "jobserver"))]
         job_fifo,
+        heel: request.heel,
     };
     match request.mode {
         TerminalMode::Sandboxed => {
@@ -4444,6 +4472,11 @@ where
     let (grants, mut runtime_environment) = local_launch_policy(&context).await?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
+    let heel_binary = context
+        .heel
+        .get()
+        .await
+        .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(policy)
         .working_dir(
@@ -4454,6 +4487,7 @@ where
                 .unwrap_or_else(|_| context.working_dir.to_path_buf()),
         )
         .grants(grants)
+        .heel_binary(heel_binary)
         .security(SecurityConfig::interactive())
         // The session's own commands run their build outputs — anything
         // written here could already run through an interpreter.
@@ -4537,6 +4571,11 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     let (grants, mut runtime_environment) = local_launch_policy(&context).await?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
+    let heel_binary = context
+        .heel
+        .get()
+        .await
+        .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(AllowAll)
         .working_dir(
@@ -4544,6 +4583,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
                 .unwrap_or_else(|_| context.working_dir.to_path_buf()),
         )
         .grants(grants)
+        .heel_binary(heel_binary)
         // Unsafe is approved host execution — the user runs the script
         // themselves in every respect except IPC plumbing, so no
         // credential or filesystem protection may apply.
@@ -6526,7 +6566,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             tools
-                .verify_local_versions(executor_core::tokio::TokioGlobal)
+                .verify_local_versions(
+                    executor_core::tokio::TokioGlobal,
+                    heel::HeelBinary::locate().unwrap(),
+                )
                 .await,
             Err(ToolRuntimeError::VersionMismatch(_))
         ));
@@ -7821,6 +7864,7 @@ mod tests {
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
+            heel: SharedHeelBinary::default(),
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             store_dir: tool.outputs_dir(),
@@ -7936,6 +7980,7 @@ mod tests {
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
+            heel: SharedHeelBinary::default(),
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             store_dir: tool.outputs_dir(),
