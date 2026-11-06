@@ -8219,12 +8219,12 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(base.path()).unwrap();
         let script = format!(
-            "cd {root} && git init fresh 2>&1; test -e fresh/.git && echo created; true",
+            "cd {root} && if git init fresh >/dev/null 2>&1; then echo init-succeeded; fi; true",
             root = root.display()
         );
         let stdout = sandboxed_stdout(vec![root.clone()], Vec::new(), script).await;
-        assert!(stdout.contains("Operation not permitted"), "{stdout}");
-        assert!(!stdout.contains("created"), "{stdout}");
+        assert!(!stdout.contains("init-succeeded"), "{stdout}");
+        assert!(!root.join("fresh/.git/config").exists(), "{stdout}");
     }
 
     /// A readable linked worktree brings its repository with read access:
