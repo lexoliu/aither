@@ -11,6 +11,8 @@ use std::future::Future;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::script_language::ScriptLanguage;
+
 /// Permission mode for terminal execution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +62,8 @@ pub enum PermissionRequest<'a> {
         mode: TerminalMode,
         /// The script to run.
         script: &'a str,
+        /// The language the script is written in.
+        language: ScriptLanguage,
     },
     /// A sandboxed command's connection to a network domain that is not
     /// already allowed.
@@ -89,11 +93,13 @@ pub trait PermissionHandler: Send + Sync {
     /// Checks if the given mode and script are allowed.
     ///
     /// For `Sandboxed` mode, this should always return `Ok(true)`.
-    /// For `Unsafe` mode, this should prompt for each script.
+    /// For `Unsafe` mode, this should prompt for each script, which is
+    /// source in `language`.
     fn check(
         &self,
         mode: TerminalMode,
         script: &str,
+        language: ScriptLanguage,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send;
 
     /// Returns whether `check` will suspend waiting for an external approval.
@@ -104,8 +110,9 @@ pub trait PermissionHandler: Send + Sync {
         &self,
         mode: TerminalMode,
         script: &str,
+        language: ScriptLanguage,
     ) -> impl Future<Output = bool> + Send {
-        let _ = (mode, script);
+        let _ = (mode, script, language);
         async { false }
     }
 
@@ -222,6 +229,7 @@ impl PermissionHandler for DenyUnsafe {
         &self,
         mode: TerminalMode,
         _script: &str,
+        _language: ScriptLanguage,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(match mode {
             TerminalMode::Sandboxed => Ok(true),
@@ -236,6 +244,7 @@ impl PermissionHandler for DenyUnsafe {
         &self,
         _mode: TerminalMode,
         _script: &str,
+        _language: ScriptLanguage,
     ) -> impl Future<Output = bool> + Send {
         std::future::ready(false)
     }
@@ -250,6 +259,7 @@ impl PermissionHandler for NoopPermissionHandler {
         &self,
         _mode: TerminalMode,
         _script: &str,
+        _language: ScriptLanguage,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(Ok(true))
     }
@@ -258,6 +268,7 @@ impl PermissionHandler for NoopPermissionHandler {
         &self,
         _mode: TerminalMode,
         _script: &str,
+        _language: ScriptLanguage,
     ) -> impl Future<Output = bool> + Send {
         std::future::ready(false)
     }
@@ -276,12 +287,17 @@ mod tests {
         let handler = DenyUnsafe;
 
         // Sandboxed should be allowed
-        assert!(handler.check(TerminalMode::Sandboxed, "ls").await.unwrap());
+        assert!(
+            handler
+                .check(TerminalMode::Sandboxed, "ls", ScriptLanguage::Shell)
+                .await
+                .unwrap()
+        );
 
         // Unsafe should be denied
         assert!(
             handler
-                .check(TerminalMode::Unsafe, "rm -rf /")
+                .check(TerminalMode::Unsafe, "rm -rf /", ScriptLanguage::Shell)
                 .await
                 .is_err()
         );
@@ -291,10 +307,15 @@ mod tests {
     async fn test_noop_permission_handler() {
         let handler = NoopPermissionHandler;
 
-        assert!(handler.check(TerminalMode::Sandboxed, "ls").await.unwrap());
         assert!(
             handler
-                .check(TerminalMode::Unsafe, "rm -rf /")
+                .check(TerminalMode::Sandboxed, "ls", ScriptLanguage::Shell)
+                .await
+                .unwrap()
+        );
+        assert!(
+            handler
+                .check(TerminalMode::Unsafe, "rm -rf /", ScriptLanguage::Shell)
                 .await
                 .unwrap()
         );

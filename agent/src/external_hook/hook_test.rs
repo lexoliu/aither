@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::tool::{Tool, ToolResult};
-use aither_sandbox::TerminalMode;
 use aither_sandbox::permission::PermissionRequest;
+use aither_sandbox::{ScriptLanguage, TerminalMode};
 use askama::Template;
 use futures::StreamExt as _;
 use schemars::JsonSchema;
@@ -371,6 +371,7 @@ async fn run_sample(
                 PermissionRequest::Command {
                     mode: TerminalMode::Unsafe,
                     script,
+                    language: ScriptLanguage::Shell,
                 },
             )
             .await

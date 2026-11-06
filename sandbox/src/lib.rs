@@ -68,6 +68,7 @@ mod output;
 mod output_compress;
 pub(crate) mod poll_guard;
 mod process_tree;
+mod script_language;
 mod session_policy;
 mod shell_session;
 mod stdin_watch;
@@ -135,8 +136,8 @@ pub use memory::{
     ProbedContainerMemory, ResponseWindow, SystemFootprints,
 };
 pub use monitor::{
-    MonitorArgs, MonitorEnd, MonitorEnded, MonitorIncrement, MonitorLanguage, MonitorRefusal,
-    MonitorSource, MonitorStalled, MonitorTool,
+    MonitorArgs, MonitorEnd, MonitorEnded, MonitorIncrement, MonitorRefusal, MonitorSource,
+    MonitorStalled, MonitorTool,
 };
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
@@ -147,6 +148,7 @@ pub use poll_guard::PollRefusal;
 pub use process_tree::{
     JOB_MARKER_VAR, JobProcess, KillTreeError, ProcessTableError, kill_process_tree,
 };
+pub use script_language::ScriptLanguage;
 pub use session_policy::SessionSandboxPolicy;
 pub use shell_session::{
     AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,

@@ -4802,6 +4802,7 @@ mod tests {
         let default_args = serde_json::to_value(TerminalArgs {
             description: "list the working directory".to_string(),
             script: "ls".to_string(),
+            language: aither_sandbox::ScriptLanguage::Shell,
             mode: TerminalExecutionMode::Default,
             ssh_server_id: None,
             expect: aither_sandbox::OutputFormat::Text,
@@ -4815,6 +4816,7 @@ mod tests {
         let unsafe_args = serde_json::to_value(TerminalArgs {
             description: "remove the demo directory".to_string(),
             script: "rm -rf /tmp/demo".to_string(),
+            language: aither_sandbox::ScriptLanguage::Shell,
             mode: TerminalExecutionMode::Unsafe,
             ssh_server_id: None,
             expect: aither_sandbox::OutputFormat::Text,
@@ -4828,6 +4830,7 @@ mod tests {
         let sandboxed_args = serde_json::to_value(TerminalArgs {
             description: "print the current working directory".to_string(),
             script: "pwd".to_string(),
+            language: aither_sandbox::ScriptLanguage::Shell,
             mode: TerminalExecutionMode::Sandboxed,
             ssh_server_id: None,
             expect: aither_sandbox::OutputFormat::Text,
@@ -4858,6 +4861,7 @@ mod tests {
             serde_json::to_value(TerminalArgs {
                 description: "remove the demo directory".to_string(),
                 script: "rm -rf /tmp/demo".to_string(),
+                language: aither_sandbox::ScriptLanguage::Shell,
                 mode: TerminalExecutionMode::Unsafe,
                 ssh_server_id: None,
                 expect: aither_sandbox::OutputFormat::Text,
@@ -4875,6 +4879,7 @@ mod tests {
             .event_for(PermissionEvent {
                 mode: TerminalMode::Unsafe,
                 script: "rm -rf /tmp/demo".to_string(),
+                language: aither_sandbox::ScriptLanguage::Shell,
                 stage: PermissionEventStage::Waiting,
             })
             .expect("waiting event should map to tool call");
@@ -4882,6 +4887,7 @@ mod tests {
             .event_for(PermissionEvent {
                 mode: TerminalMode::Unsafe,
                 script: "rm -rf /tmp/demo".to_string(),
+                language: aither_sandbox::ScriptLanguage::Shell,
                 stage: PermissionEventStage::Resolved,
             })
             .expect("resolved event should map to tool call");
