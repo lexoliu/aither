@@ -12307,6 +12307,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_local_terminal_judges_no_container() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
