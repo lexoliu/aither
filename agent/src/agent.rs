@@ -1452,6 +1452,20 @@ where
         }
         events.emit(AgentEvent::turn_complete(turn, false));
         if self.push_final_turn_alerts().await {
+            // The alerts stay in the conversation either way; a host that has
+            // a message waiting ends the run here so the message travels with
+            // them in the next request instead of one request later.
+            let boundary_ctx = TurnBoundaryContext {
+                assistant_text: &response_text,
+                turn,
+                message_count: self.context.len_recent(),
+            };
+            if self.hooks.on_turn_boundary(&boundary_ctx).await == TurnBoundaryAction::EndTurn {
+                return Ok(TurnControl::Break {
+                    final_text: response_text,
+                    stop_reason: StopReason::EndTurn,
+                });
+            }
             return Ok(TurnControl::Continue);
         }
         Ok(TurnControl::Break {
@@ -5245,6 +5259,58 @@ mod tests {
         assert!(
             agent.push_final_turn_alerts().await,
             "an actionable row must object to the model stopping"
+        );
+    }
+
+    /// A host with a message waiting ends the run a stop-gate alert would
+    /// keep going, so the message reaches the next request together with the
+    /// alert, which stays in the conversation.
+    #[tokio::test]
+    async fn a_waiting_message_ends_the_run_a_final_turn_alert_keeps_going() {
+        use tempfile::tempdir;
+
+        struct MessageWaiting;
+        impl Hook for MessageWaiting {
+            fn on_turn_boundary(
+                &self,
+                _ctx: &TurnBoundaryContext<'_>,
+            ) -> impl std::future::Future<Output = TurnBoundaryAction> + Send {
+                std::future::ready(TurnBoundaryAction::EndTurn)
+            }
+        }
+
+        let dir = tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- pending\n")
+            .expect("write tasks.md");
+        let mut agent = Agent::builder(MockLlm {
+            context_length: 1_000_000,
+        })
+        .sandbox_dir(dir.path())
+        .hook(MessageWaiting)
+        .build();
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        let control = agent
+            .finish_no_tool_turn("done".to_string(), 1, &EventSink::discarding())
+            .await
+            .expect("the turn finishes");
+
+        assert!(
+            matches!(
+                control,
+                TurnControl::Break {
+                    stop_reason: StopReason::EndTurn,
+                    ..
+                }
+            ),
+            "a waiting message must end the run"
+        );
+        let messages = agent.context().conversation_messages();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content().contains("tasks.md still has rows")),
+            "the alert stays for the next request: {messages:?}"
         );
     }
 
