@@ -8236,7 +8236,9 @@ mod tests {
     }
 
     /// `uv` marks its cache buckets with a `.git` entry: the prepared
-    /// runtime's cache takes that, a granted repository still refuses one.
+    /// runtime's cache takes that, while a granted repository still refuses
+    /// git's config. Judged by outcome, since platforms differ on whether the
+    /// bare `.git` directory itself is refused.
     #[cfg(unix)]
     #[tokio::test]
     async fn uv_cache_may_hold_git_entries_and_a_granted_repository_may_not() {
@@ -8245,13 +8247,16 @@ mod tests {
         std::fs::create_dir(&granted).unwrap();
         let script = format!(
             "mkdir -p \"$UV_CACHE_DIR/x\" && mkdir \"$UV_CACHE_DIR/x/.git\" 2>&1 && echo cache-written; \
-             mkdir {repo}/.git 2>/dev/null && echo repo-written; true",
+             mkdir -p {repo}/.git 2>/dev/null; touch {repo}/.git/config 2>/dev/null && echo repo-written; true",
             repo = granted.display(),
         );
         let stdout = sandboxed_stdout(vec![granted.clone()], Vec::new(), script).await;
-        assert_eq!(stdout.lines().last(), Some("cache-written"), "{stdout}");
+        assert!(
+            stdout.lines().any(|line| line == "cache-written"),
+            "{stdout}"
+        );
         assert!(!stdout.contains("repo-written"), "{stdout}");
-        assert!(!granted.join(".git").exists(), "{stdout}");
+        assert!(!granted.join(".git/config").exists(), "{stdout}");
     }
 
     /// Cargo's git cache keeps the `.git/hooks` rule off, and nothing else of
