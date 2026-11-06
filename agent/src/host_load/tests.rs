@@ -54,7 +54,6 @@ impl Harness {
         let clock = ManualClock::new();
         let wait = ForegroundWait::new(NORMAL_WAIT);
         let config = HostLoadConfig::new()
-            .memory_threshold(MemoryPressure::Warning)
             .load_threshold(MachineLoad(1.0))
             .start_after(Duration::from_secs(30))
             .end_after(Duration::from_secs(60))
@@ -79,29 +78,6 @@ impl Harness {
         }
         events
     }
-}
-
-#[test]
-fn sustained_memory_pressure_yields_one_start_and_one_end() {
-    let mut host = Harness::new();
-    host.host.set_memory(MemoryPressure::Warning);
-
-    let started = host.pass(30);
-    assert_eq!(
-        started,
-        [HostLoadEvent::MemoryPressureHigh {
-            level: MemoryPressure::Warning
-        }]
-    );
-
-    host.host.set_memory(MemoryPressure::Normal);
-    let ended = host.pass(60);
-    assert_eq!(
-        ended,
-        [HostLoadEvent::MemoryPressureEnded {
-            level: MemoryPressure::Normal
-        }]
-    );
 }
 
 #[test]
@@ -130,12 +106,12 @@ fn sustained_machine_load_yields_one_start_and_one_end() {
 }
 
 #[test]
-fn memory_pressure_and_load_are_independent() {
+fn memory_pressure_never_raises_a_load_event() {
     let mut host = Harness::new();
     host.host.set_memory(MemoryPressure::Critical);
-    assert_eq!(host.pass(30).len(), 1);
+    assert_eq!(host.pass(30), Vec::new());
 
-    // Load starts later and ends while the memory pressure persists.
+    // Load alerts still come and go while the memory pressure persists.
     host.host.set_load(2.0);
     let events = host.pass(30);
     assert!(
@@ -146,16 +122,6 @@ fn memory_pressure_and_load_are_independent() {
     let events = host.pass(60);
     assert!(
         matches!(events.as_slice(), [HostLoadEvent::LoadEnded { .. }]),
-        "{events:?}"
-    );
-
-    host.host.set_memory(MemoryPressure::Normal);
-    let events = host.pass(60);
-    assert!(
-        matches!(
-            events.as_slice(),
-            [HostLoadEvent::MemoryPressureEnded { .. }]
-        ),
         "{events:?}"
     );
 }
@@ -194,7 +160,7 @@ fn nothing_is_raised_while_a_condition_persists() {
     let mut host = Harness::new();
     host.host.set_memory(MemoryPressure::Warning);
     host.host.set_load(2.0);
-    assert_eq!(host.pass(30).len(), 2);
+    assert_eq!(host.pass(30).len(), 1);
     assert_eq!(host.pass(3_600), Vec::new());
 }
 
@@ -246,8 +212,8 @@ fn a_failed_reading_leaves_the_condition_as_it_was() {
 #[tokio::test]
 async fn the_task_delivers_events_once_and_stops_with_the_receiver() {
     let host = ScriptedHost {
-        memory: Arc::new(Mutex::new(MemoryPressure::Critical)),
-        load: Arc::new(Mutex::new(0.0)),
+        memory: Arc::new(Mutex::new(MemoryPressure::Normal)),
+        load: Arc::new(Mutex::new(2.0)),
     };
     // Sustained from the first reading.
     let config = HostLoadConfig::new()
@@ -257,6 +223,7 @@ async fn the_task_delivers_events_once_and_stops_with_the_receiver() {
     let events = spawn(
         &executor_core::tokio::TokioGlobal,
         monitor,
+        None,
         AnyClock::default(),
     );
 
@@ -266,8 +233,9 @@ async fn the_task_delivers_events_once_and_stops_with_the_receiver() {
         .expect("the task is running");
     assert_eq!(
         first,
-        HostLoadEvent::MemoryPressureHigh {
-            level: MemoryPressure::Critical
+        HostLoadEvent::LoadHigh {
+            load: MachineLoad(2.0),
+            foreground_wait: Duration::from_secs(60)
         }
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -284,15 +252,6 @@ fn the_alerts_name_the_condition_and_the_window() {
     assert!(high.contains("load is high (184%"), "{high}");
     assert!(high.contains("up to 90s"), "{high}");
 
-    let memory = HostLoadEvent::MemoryPressureHigh {
-        level: MemoryPressure::Critical,
-    }
-    .alert_text();
-    assert!(
-        memory.contains("high memory pressure (critical)"),
-        "{memory}"
-    );
-
     let ended = HostLoadEvent::LoadEnded {
         load: MachineLoad(0.2),
         foreground_wait: Duration::from_secs(10),
@@ -302,4 +261,20 @@ fn the_alerts_name_the_condition_and_the_window() {
         ended.contains("has ended") && ended.contains("10s"),
         "{ended}"
     );
+}
+
+#[test]
+fn a_host_without_sources_states_nothing_and_never_raises_load_events() {
+    let clock = ManualClock::new();
+    let any_clock = AnyClock::new(clock.clone());
+    let mut monitor = HostLoadMonitor::new(
+        UnwatchedHost,
+        HostLoadConfig::new(),
+        ForegroundWait::new(NORMAL_WAIT),
+    );
+    assert_eq!(monitor.read(), HostSample::new(None, None));
+    for _ in 0..3 {
+        clock.advance(Duration::from_secs(600));
+        assert_eq!(monitor.tick(&any_clock), []);
+    }
 }

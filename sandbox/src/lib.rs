@@ -58,7 +58,9 @@ mod command_set;
 mod container;
 mod foreground_wait;
 mod grants;
+mod heel_binary;
 mod kill_guard;
+mod memory;
 pub mod monitor;
 mod naming;
 mod outage;
@@ -93,6 +95,10 @@ pub mod network_policy;
 /// Permission handling for terminal modes.
 pub mod permission;
 
+/// Isolated git for tests, shared with dependent crates through the `test-git` feature.
+#[cfg(any(test, feature = "test-git"))]
+pub mod test_git;
+
 pub use bollard_exec::BollardContainerExec;
 pub use command::{
     AnyCommandGate, AnyCommandObserver, CommandCall, CommandEnvelope, CommandGate, CommandObserver,
@@ -114,14 +120,20 @@ pub use heel::NetworkAuditLog;
 /// Re-export of heel's scheduling priority types for terminal-tool configuration.
 pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use job_registry::{
-    Delivery, JobInfo, JobRegistry, JobRegistryService, JobStatus, OwedCompletion,
-    PendingCompletion, TerminalDelta, job_registry_channel,
+    Delivery, JobInfo, JobPlace, JobRegistry, JobRegistryService, JobStatus, KillCause,
+    OwedCompletion, PendingCompletion, TerminalDelta, TerminalReadError, job_registry_channel,
 };
 #[cfg(all(unix, feature = "jobserver"))]
 pub use jobserver::{
     CommandFifo, JobBroker, JobBrokerService, JobPool, JobserverError, job_broker_channel,
 };
 pub use kill_guard::CommandRefusal;
+pub use memory::{
+    AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, CgroupMemory, ContainerMemory,
+    ContainerSnapshot, FileFootprintRegistry, FootprintError, FootprintReader, FootprintRegistry,
+    JOB_MARKER_ENV, JobFootprint, JobMemory, MemoryDomain, MemorySize, MemorySnapshot,
+    ProbedContainerMemory, ResponseWindow, SystemFootprints,
+};
 pub use monitor::{
     MonitorArgs, MonitorEnd, MonitorEnded, MonitorIncrement, MonitorLanguage, MonitorRefusal,
     MonitorSource, MonitorStalled, MonitorTool,
@@ -131,31 +143,34 @@ pub use network_policy::{
 };
 pub use output::{MediaResolution, OutputFormat, OutputStore};
 pub use permission::{PermissionHandler, PermissionRequest, Review, TerminalMode};
+pub use poll_guard::PollRefusal;
 pub use process_tree::{
     JOB_MARKER_VAR, JobProcess, KillTreeError, ProcessTableError, kill_process_tree,
 };
 pub use session_policy::SessionSandboxPolicy;
 pub use shell_session::{
     AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
-    ContainerExecOutcome, ContainerIpcRoute, ContainerShellRuntime, ExecLifetime, ShellBackend,
-    ShellRuntimeAvailability, ShellSessionRegistry, SshAuthorizationError, SshRuntimeProfile,
-    SshServer, SshSessionAuthorizer, bootstrap_ssh_runtime,
+    ContainerExecOutcome, ContainerIpcRoute, ContainerProbe, ContainerProbeError,
+    ContainerShellRuntime, ExecLifetime, ShellBackend, ShellRuntimeAvailability,
+    ShellSessionRegistry, SshAuthorizationError, SshRuntimeProfile, SshServer,
+    SshSessionAuthorizer, bootstrap_ssh_runtime,
 };
 pub use stdin_watch::StdinWatchSignal;
 pub use subagent::{
-    CommitLedger, CommitLedgerError, CommitMark, ImportBudget, SubagentCommit, SubagentGrant,
-    SubagentGrantError,
+    AnySubagentSpaces, CommitLedger, CommitLedgerError, CommitMark, ImportBudget, PreparedSpace,
+    RunSpace, SpacePreparationError, SubagentCommit, SubagentGrant, SubagentGrantError,
+    SubagentSpaces,
 };
 pub use terminal::{
     BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand,
     CompletedTask, Configured, DEFAULT_FOREGROUND_WAIT, DEFAULT_LONG_JOB_ALERT_AFTER,
-    DEFAULT_SUBAGENT_IMPORT_LIMIT, DEFAULT_TIMEOUT_CAP, DescendantsKilled, DirectoryReset,
-    DirectoryResetReason, JobAlert, LongRunningJob, PermissionEvent, PermissionEventReceiver,
-    PermissionEventStage, StartedBackgroundTask, StdinBlockedJob, StdinProbeFailedJob,
-    TerminalArgs, TerminalBinding, TerminalEnvSource, TerminalError, TerminalExecutionMode,
-    TerminalRunError, TerminalRunner, TerminalScript, TerminalTool, TerminalToolFactory,
-    TerminalToolFactoryError, TimeoutKill, Unconfigured, background_task_channel,
-    open_network_audit_log,
+    DEFAULT_RESPONSE_WINDOW, DEFAULT_SUBAGENT_IMPORT_LIMIT, DEFAULT_TIMEOUT_CAP, DescendantsKilled,
+    DirectoryReset, DirectoryResetReason, JobAlert, LongRunningJob, PermissionEvent,
+    PermissionEventReceiver, PermissionEventStage, StartedBackgroundTask, StdinBlockedJob,
+    StdinProbeFailedJob, TerminalArgs, TerminalBinding, TerminalEnvSource, TerminalError,
+    TerminalExecutionMode, TerminalRunError, TerminalRunner, TerminalScript, TerminalTool,
+    TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
+    background_task_channel, open_network_audit_log,
 };
 pub use tool_distribution::{
     HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,

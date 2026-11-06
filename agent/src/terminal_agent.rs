@@ -795,12 +795,12 @@ where
         self
     }
 
-    /// Sets when host memory pressure and machine load count as high, how
-    /// long they must hold to start and to end, how often the host is read,
+    /// Sets when machine load counts as high, how long it must hold to
+    /// start and to end, how often the host is read,
     /// and the terminal's foreground window while high load lasts.
     ///
-    /// The built agent is told once when each condition starts and once when
-    /// it ends; see [`HostLoadMonitor`](crate::HostLoadMonitor).
+    /// The built agent is told once when high load starts and once when it
+    /// ends; see [`HostLoadMonitor`](crate::HostLoadMonitor).
     #[must_use]
     pub const fn host_load(mut self, config: crate::HostLoadConfig) -> Self {
         self.host_load.config = config;
@@ -930,11 +930,16 @@ where
             .flatten()
             .or_else(|| {
                 host_load.enabled.then(|| {
-                    crate::SystemReader::new()
-                        .inspect_err(|error| tracing::warn!(%error, "host load is not watched"))
-                        .ok()
-                        .map(crate::AnyHostReader::new)
-                })?
+                    // A host without a source is still watched where the
+                    // watch does not need it: a container's memory limit.
+                    match crate::SystemReader::new() {
+                        Ok(reader) => crate::AnyHostReader::new(reader),
+                        Err(error) => {
+                            tracing::warn!(%error, "host pressure and load are not watched");
+                            crate::AnyHostReader::new(crate::UnwatchedHost)
+                        }
+                    }
+                })
             });
         let inner = match reader {
             Some(reader) => inner.host_load(
@@ -942,6 +947,7 @@ where
                 reader,
                 host_load.config,
                 terminal_tool.foreground_wait(),
+                Some(terminal_tool.job_memory()),
             ),
             None => inner,
         };
@@ -1246,8 +1252,21 @@ mod tests {
         }
         .render()
         .unwrap();
-        assert!(prompt.contains("<continuation>\nIf work is blocked by a missing user decision, use `ask_user`. An item waiting on an open question — or on anything else the run cannot resolve — is marked `BLOCKING <request_id or reason>` in tasks.md; blocked items wait instead of holding the turn. A mark naming a request that is no longer open does not hold.\nDo not stop while unblocked checklist items remain incomplete.\n</continuation>"));
+        assert!(prompt.contains("<continuation>\nIf work is blocked by a missing user decision, use `ask_user`. A row waiting on an open question — or on anything else the run cannot resolve — is marked `BLOCKING <request_id or reason>` in tasks.md; blocked rows wait instead of holding the turn. A mark naming a request that is no longer open does not hold.\nDo not stop while a row under Doing or Queued that nothing blocks remains.\n</continuation>"));
         assert!(!prompt.contains("use `ask_user` and continue"));
+        // The format names its sections and requires the document current
+        // before a compaction.
+        for needle in [
+            "## Roots — ",
+            "## Doing — ",
+            "## Queued — ",
+            "## Notes — ",
+            "## Decisions — ",
+            "rows are not checkboxes",
+            "before calling `compact`",
+        ] {
+            assert!(prompt.contains(needle), "missing {needle:?}");
+        }
     }
 
     use std::borrow::Cow;

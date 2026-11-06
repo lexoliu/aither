@@ -111,6 +111,9 @@ pub struct CheckpointContext<'a> {
     pub has_background_tasks: bool,
     /// Structured snapshot of the currently assembled context window.
     pub window: &'a ContextWindowSnapshot,
+    /// What the conversation holds of `tasks.md`, for
+    /// [`AgentCheckpoint::tasks`](crate::AgentCheckpoint::tasks).
+    pub tasks: Option<&'a crate::tasks::TasksCheckpoint>,
 }
 
 /// Reason why the agent stopped.
@@ -127,6 +130,10 @@ pub enum StopReason {
     MaxIterations,
     /// Model signaled end of turn.
     EndTurn,
+    /// Every call of the model's last turn was refused for re-reading output
+    /// that had not changed while background work runs: another request
+    /// would only poll again, so the run waits for that work to report.
+    AwaitingBackground,
 }
 
 /// Action to take before a tool is executed.

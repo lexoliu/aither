@@ -59,6 +59,8 @@ pub(super) struct LocalGit<E> {
     /// repository answers to.
     pub committing: Vec<CommittingWorktree>,
     pub priority: ProcessPriority,
+    /// The parent terminal's verified `heel` binary.
+    pub heel: crate::heel_binary::SharedHeelBinary,
 }
 
 /// The host's own `git` as an absolute path, so a sandboxed git does not
@@ -207,7 +209,13 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
                 )
                 .collect::<heel::Result<_>>()
                 .map_err(|error| ExportError::Launch(error.to_string()))?;
+        let heel_binary = self
+            .heel
+            .get()
+            .await
+            .map_err(|error| ExportError::Launch(error.to_string()))?;
         let config = SandboxConfig::builder()
+            .heel_binary(heel_binary)
             .network(DenyAll)
             .working_dir(canonical(&working_dir))
             .grants(grants)

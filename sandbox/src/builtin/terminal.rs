@@ -8,7 +8,7 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::job_registry::{JobRegistry, JobStatus};
+use crate::job_registry::{JobRegistry, JobStatus, TerminalReadError};
 
 /// Tool for terminating a background terminal task.
 #[derive(Debug, Clone)]
@@ -231,7 +231,11 @@ impl Tool for ReadTerminalDeltaTool {
             .registry
             .terminal_read(task_id, args.cursor, args.max_bytes)
             .await
-            .map_err(anyhow::Error::msg)?;
+            .map_err(|error| match error {
+                // Kept typed, so the agent loop recognises the refused poll.
+                TerminalReadError::Refused(refusal) => anyhow::Error::from(refusal),
+                TerminalReadError::Failed(message) => anyhow::Error::msg(message),
+            })?;
 
         let text = render_terminal_delta(&delta);
         Ok(ToolResult::text(text))

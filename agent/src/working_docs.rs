@@ -15,21 +15,36 @@ use similar::{ChangeTag, TextDiff};
 /// The host resolves the mark's payload token: `true` while it names
 /// something still open — an unanswered `ask_user` request id, or a
 /// free-text reason the host cannot check. `false` means the mark is dead —
-/// its question was answered or withdrawn — and the item counts as runnable
-/// work again.
+/// its question was answered or withdrawn — and its row is stale. An error
+/// says nothing either way: the mark keeps holding its row.
 pub trait TaskBlockerResolver: Send + Sync + 'static {
     /// Whether `mark` still names something the run waits on.
-    fn is_open(&self, mark: &str) -> impl Future<Output = bool> + Send;
+    fn is_open(&self, mark: &str) -> impl Future<Output = Result<bool, TaskBlockerError>> + Send;
 }
+
+/// Why a `BLOCKING` mark could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TaskBlockerError {
+    /// The host's record of what the mark names could not be read.
+    #[error("the mark {mark} cannot be resolved: {reason}")]
+    Unavailable {
+        /// The mark's payload.
+        mark: String,
+        /// What went wrong.
+        reason: String,
+    },
+}
+
+type IsOpen<'a> = Pin<Box<dyn Future<Output = Result<bool, TaskBlockerError>> + Send + 'a>>;
 
 /// Object-safe twin of [`TaskBlockerResolver`]; boxing lives inside
 /// [`AnyTaskBlockerResolver`].
 trait TaskBlockerResolverImpl: Send + Sync {
-    fn is_open<'a>(&'a self, mark: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+    fn is_open<'a>(&'a self, mark: &'a str) -> IsOpen<'a>;
 }
 
 impl<T: TaskBlockerResolver> TaskBlockerResolverImpl for T {
-    fn is_open<'a>(&'a self, mark: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+    fn is_open<'a>(&'a self, mark: &'a str) -> IsOpen<'a> {
         Box::pin(TaskBlockerResolver::is_open(self, mark))
     }
 }
@@ -46,7 +61,10 @@ impl AnyTaskBlockerResolver {
     }
 
     /// Whether `mark` still names something the run waits on.
-    pub fn is_open<'a>(&'a self, mark: &'a str) -> impl Future<Output = bool> + Send + 'a {
+    pub fn is_open<'a>(
+        &'a self,
+        mark: &'a str,
+    ) -> impl Future<Output = Result<bool, TaskBlockerError>> + Send + 'a {
         self.0.is_open(mark)
     }
 }
@@ -63,18 +81,6 @@ impl std::fmt::Debug for AnyTaskBlockerResolver {
 pub struct WorkingDocsSnapshot {
     /// Contents of `tasks.md`, when present.
     pub tasks_md: Option<String>,
-}
-
-impl WorkingDocsSnapshot {
-    /// Returns true when `tasks.md` holds unchecked items the run can still
-    /// progress on: not marked `BLOCKING <what>` with a mark that still
-    /// holds under `resolver`. A `None` resolver trusts every mark.
-    pub async fn has_unblocked_items(&self, resolver: Option<&AnyTaskBlockerResolver>) -> bool {
-        match self.tasks_md.as_deref() {
-            Some(content) => has_unblocked_markdown_tasks(content, resolver).await,
-            None => false,
-        }
-    }
 }
 
 /// Reads `tasks.md` from the given sandbox directory.
@@ -148,48 +154,6 @@ pub fn tasks_md_added(
         .map(|change| change.value())
         .collect();
     (!added.trim().is_empty()).then_some(added)
-}
-
-/// Detects unchecked markdown checklist items (`- [ ]`) a run can still
-/// progress on.
-///
-/// An item whose text carries a `BLOCKING` mark followed by what it waits
-/// on — `BLOCKING <request_id>` while it waits on an open `ask_user`
-/// question, or free text while it waits on anything the run cannot
-/// resolve — is unfinished but not runnable, so it holds no turn open.
-/// `resolver` reports whether the mark's payload still names something
-/// live: a mark it reports dead does not hold. With no resolver, every
-/// mark is trusted.
-pub async fn has_unblocked_markdown_tasks(
-    content: &str,
-    resolver: Option<&AnyTaskBlockerResolver>,
-) -> bool {
-    for line in content.lines().filter(|line| is_unchecked_todo_line(line)) {
-        let Some(mark) = blocking_mark(line) else {
-            return true;
-        };
-        match resolver {
-            None => {}
-            Some(resolver) if resolver.is_open(mark).await => {}
-            _ => return true,
-        }
-    }
-    false
-}
-
-fn is_unchecked_todo_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    (trimmed.starts_with("- [ ]") || trimmed.starts_with("* [ ]"))
-        || (trimmed.starts_with("- [	]") || trimmed.starts_with("* [	]"))
-}
-
-/// The payload of a task line's `BLOCKING` mark: the token right after
-/// `BLOCKING`, a request id or the first word of a free-text reason. A
-/// trailing `BLOCKING` alone is not a mark.
-fn blocking_mark(line: &str) -> Option<&str> {
-    let mut tokens = line.split_whitespace();
-    tokens.find(|token| *token == "BLOCKING")?;
-    tokens.next()
 }
 
 async fn read_file_if_exists(path: &Path) -> Option<String> {

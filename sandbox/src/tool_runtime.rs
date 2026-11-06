@@ -1104,10 +1104,12 @@ impl PreparedTools<PathBuf> {
     pub(crate) async fn verify_local_versions<E: executor_core::Executor + Clone + 'static>(
         &self,
         executor: E,
+        heel_binary: heel::HeelBinary,
     ) -> Result<(), ToolRuntimeError> {
         use futures::{StreamExt, TryStreamExt};
         let scratch = blocking::unblock(tempfile::tempdir).await?;
         let config = heel::SandboxConfig::builder()
+            .heel_binary(heel_binary)
             .working_dir(
                 std::fs::canonicalize(scratch.path())
                     .unwrap_or_else(|_| scratch.path().to_path_buf()),

@@ -25,43 +25,8 @@ use std::sync::{Arc, Mutex};
 use super::sandboxed::within;
 use super::*;
 
-/// A fixed moment for every commit, so that commits made in the same second
-/// are still the same commits on every run.
-const MOMENT: &str = "1700000000 +0000";
-
-/// Runs git in `dir` with a fixed identity and no user configuration.
-pub fn git_in(dir: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
-        .env("GIT_AUTHOR_DATE", MOMENT)
-        .env("GIT_COMMITTER_DATE", MOMENT)
-        .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
-        .args(["-c", "commit.gpgSign=false"])
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("git runs");
-    assert!(
-        output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-/// Whether git, run in `dir`, exits successfully.
-fn git_succeeds(dir: &Path, args: &[&str]) -> bool {
-    std::process::Command::new("git")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("git runs")
-        .status
-        .success()
-}
+pub use crate::test_git::git as git_in;
+use crate::test_git::succeeds as git_succeeds;
 
 /// A repository with one commit and a linked worktree on the branch
 /// `subagent/<namespace>/work`, both inside `root`; returns the worktree.
@@ -222,8 +187,7 @@ impl SandboxedGitImpl for TestGit {
 
             let mut command = async_process::Command::new("git");
             command
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
+                .envs(crate::test_git::ISOLATION)
                 .arg("--git-dir")
                 .arg(run.repository)
                 .args(&args)
@@ -720,7 +684,7 @@ fn unrelated_pack(directory: &Path) -> Vec<u8> {
     let blob = directory.join("blob.txt");
     std::fs::write(&blob, "unrelated\n").unwrap();
     let id = git_in(directory, &["hash-object", "-w", blob.to_str().unwrap()]);
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::test_git::command()
         .args(["pack-objects", "--stdout"])
         .current_dir(directory)
         .stdin(std::process::Stdio::piped())
@@ -1077,7 +1041,7 @@ async fn one_rejected_repository_does_not_stop_the_others_and_is_named() {
     let missing_blob = "b".repeat(40);
     let tree = {
         use std::io::Write as _;
-        let mut child = std::process::Command::new("git")
+        let mut child = crate::test_git::command()
             .args(["mktree", "--missing"])
             .current_dir(&second)
             .stdin(std::process::Stdio::piped())

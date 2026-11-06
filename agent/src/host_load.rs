@@ -1,7 +1,7 @@
-//! Alerts for high host memory pressure and high machine load.
+//! Alerts for high machine load.
 //!
 //! A [`HostLoadMonitor`] reads the host through a [`HostReader`] and turns
-//! each of the two conditions into events: a condition *starts* when it stays
+//! sustained machine load into events: the load *starts* when it stays
 //! above its threshold for the start window, and *ends* when it stays below
 //! for the end window, so a brief spike does not flap. The agent hears each
 //! event once; nothing is injected while a condition persists.
@@ -14,16 +14,18 @@
 
 mod system;
 
+use crate::runaway::RunawayGuard;
+
 use std::fmt;
 use std::time::Duration;
 
-use aither_sandbox::ForegroundWait;
+use aither_sandbox::{ForegroundWait, JobFootprint, MemoryDomain, MemorySize};
 use askama::Template;
 use async_channel::{Receiver, Sender};
 
 use crate::clock::{AnyClock, Instant};
 
-pub use system::SystemReader;
+pub use system::{SystemReader, psi_memory_pressure};
 
 /// How hard the host's memory is pressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -115,6 +117,37 @@ pub trait HostReader: Send + 'static {
     fn machine_load(&mut self) -> Result<MachineLoad, ReadError>;
 }
 
+fn log_failed_read(error: &ReadError, what: &str) {
+    if matches!(error, ReadError::Unsupported { .. }) {
+        tracing::trace!(%error, "{what} is not available on this host");
+    } else {
+        tracing::warn!(%error, "{what} could not be read");
+    }
+}
+
+/// A host that offers neither memory pressure nor machine load, such as a
+/// Linux kernel built without PSI.
+///
+/// The monitor over it states nothing about the machine, yet still watches
+/// what does not need the host's sources: a container's memory and the free
+/// space of a volume.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnwatchedHost;
+
+impl HostReader for UnwatchedHost {
+    fn memory_pressure(&mut self) -> Result<MemoryPressure, ReadError> {
+        Err(ReadError::Unsupported {
+            what: "host memory pressure",
+        })
+    }
+
+    fn machine_load(&mut self) -> Result<MachineLoad, ReadError> {
+        Err(ReadError::Unsupported {
+            what: "host machine load",
+        })
+    }
+}
+
 /// A type-erased [`HostReader`], what the builders store.
 pub struct AnyHostReader(Box<dyn HostReader>);
 
@@ -145,8 +178,6 @@ impl fmt::Debug for AnyHostReader {
 /// When the monitor calls a condition high, and how long it must hold.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostLoadConfig {
-    /// Memory pressure at or above this level is high.
-    pub memory_threshold: MemoryPressure,
     /// Machine load at or above this is high; see [`MachineLoad`] for what
     /// the platform measures.
     pub load_threshold: MachineLoad,
@@ -165,20 +196,12 @@ impl HostLoadConfig {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            memory_threshold: MemoryPressure::Warning,
             load_threshold: MachineLoad(SystemReader::DEFAULT_LOAD_THRESHOLD),
             start_after: Duration::from_secs(30),
             end_after: Duration::from_secs(60),
             poll_interval: Duration::from_secs(5),
             high_load_foreground_wait: Duration::from_secs(60),
         }
-    }
-
-    /// Sets the memory pressure at which the condition is high.
-    #[must_use]
-    pub const fn memory_threshold(mut self, threshold: MemoryPressure) -> Self {
-        self.memory_threshold = threshold;
-        self
     }
 
     /// Sets the machine load at which the condition is high.
@@ -226,16 +249,6 @@ impl Default for HostLoadConfig {
 /// A condition starting or ending, as the agent is told.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostLoadEvent {
-    /// Memory pressure stayed high for the start window.
-    MemoryPressureHigh {
-        /// The pressure when the window passed.
-        level: MemoryPressure,
-    },
-    /// Memory pressure stayed below the threshold for the end window.
-    MemoryPressureEnded {
-        /// The pressure when the window passed.
-        level: MemoryPressure,
-    },
     /// Machine load stayed high for the start window.
     LoadHigh {
         /// The load when the window passed.
@@ -249,6 +262,55 @@ pub enum HostLoadEvent {
         load: MachineLoad,
         /// The terminal's foreground window again.
         foreground_wait: Duration,
+    },
+    /// Memory pressure turned warning in the machine or the container.
+    MemoryYellow {
+        /// Whose memory it is.
+        domain: MemoryDomain,
+        /// The agent's running jobs in the domain, the largest first.
+        jobs: Vec<JobFootprint>,
+    },
+    /// Memory pressure turned critical in the machine or the container.
+    MemoryRed {
+        /// Whose memory it is.
+        domain: MemoryDomain,
+        /// The agent's running jobs in the domain, the largest first.
+        jobs: Vec<JobFootprint>,
+    },
+    /// A job is killed unless the agent acts within the window.
+    MemoryFinalWarning {
+        /// Whose memory it is.
+        domain: MemoryDomain,
+        /// The job that goes.
+        job: JobFootprint,
+        /// How long the agent has.
+        window: Duration,
+        /// The domain's memory: the machine's physical memory, or the
+        /// container's limit.
+        capacity: MemorySize,
+    },
+    /// Memory pressure fell from critical to warning, or to normal.
+    MemoryDroppedBack {
+        /// Whose memory it is.
+        domain: MemoryDomain,
+        /// The level it fell to.
+        level: MemoryPressure,
+        /// The agent's running jobs in the domain, the largest first.
+        jobs: Vec<JobFootprint>,
+    },
+    /// A job was killed for the memory it held.
+    JobKilledForMemory {
+        /// Whose memory it is.
+        domain: MemoryDomain,
+        /// The job's task ID.
+        task_id: String,
+        /// The script the job ran.
+        command: String,
+        /// What its processes held.
+        footprint: MemorySize,
+        /// The domain's memory: the machine's physical memory, or the
+        /// container's limit.
+        capacity: MemorySize,
     },
 }
 
@@ -326,14 +388,12 @@ impl HostSample {
     }
 }
 
-/// Watches the host and turns sustained memory pressure and machine load
-/// into [`HostLoadEvent`]s.
+/// Watches the host and turns sustained machine load into [`HostLoadEvent`]s.
 #[derive(Debug)]
 pub struct HostLoadMonitor<R> {
     reader: R,
     config: HostLoadConfig,
     foreground_wait: ForegroundWait,
-    memory: Condition,
     load: Condition,
 }
 
@@ -346,23 +406,25 @@ impl<R: HostReader> HostLoadMonitor<R> {
             reader,
             config,
             foreground_wait,
-            memory: Condition::default(),
             load: Condition::default(),
         }
     }
 
     /// Reads the host. A source that fails is logged and left out of the
     /// sample, which leaves its condition as it was.
+    ///
+    /// A host that has no such source at all ([`UnwatchedHost`]) is not an
+    /// error each time it is read; the embedder was told once.
     pub fn read(&mut self) -> HostSample {
         let memory = self
             .reader
             .memory_pressure()
-            .inspect_err(|error| tracing::warn!(%error, "memory pressure could not be read"))
+            .inspect_err(|error| log_failed_read(error, "memory pressure"))
             .ok();
         let load = self
             .reader
             .machine_load()
-            .inspect_err(|error| tracing::warn!(%error, "machine load could not be read"))
+            .inspect_err(|error| log_failed_read(error, "machine load"))
             .ok();
         HostSample { memory, load }
     }
@@ -374,21 +436,6 @@ impl<R: HostReader> HostLoadMonitor<R> {
     pub fn observe(&mut self, now: Instant, sample: HostSample) -> Vec<HostLoadEvent> {
         let config = &self.config;
         let mut events = Vec::new();
-        if let Some(level) = sample.memory {
-            let high = level >= config.memory_threshold;
-            match self
-                .memory
-                .observe(now, high, config.start_after, config.end_after)
-            {
-                Some(Transition::Started) => {
-                    events.push(HostLoadEvent::MemoryPressureHigh { level });
-                }
-                Some(Transition::Ended) => {
-                    events.push(HostLoadEvent::MemoryPressureEnded { level });
-                }
-                None => {}
-            }
-        }
         if let Some(load) = sample.load {
             let high = load >= config.load_threshold;
             match self
@@ -427,9 +474,12 @@ impl<R: HostReader> HostLoadMonitor<R> {
 ///
 /// The reads run on the blocking pool, so a slow host source never stalls
 /// the agent loop or the executor.
+///
+/// With a `guard`, the same readings also drive the agent's memory guard.
 pub fn spawn<R, E>(
     executor: &E,
     monitor: HostLoadMonitor<R>,
+    guard: Option<RunawayGuard>,
     clock: AnyClock,
 ) -> Receiver<HostLoadEvent>
 where
@@ -439,12 +489,13 @@ where
     use executor_core::Task;
 
     let (sender, receiver) = async_channel::unbounded();
-    executor.spawn(run(monitor, clock, sender)).detach();
+    executor.spawn(run(monitor, guard, clock, sender)).detach();
     receiver
 }
 
 async fn run<R: HostReader>(
     mut monitor: HostLoadMonitor<R>,
+    mut guard: Option<RunawayGuard>,
     clock: AnyClock,
     events: Sender<HostLoadEvent>,
 ) {
@@ -456,7 +507,12 @@ async fn run<R: HostReader>(
         })
         .await;
         monitor = back;
-        for event in monitor.observe(clock.now(), sample) {
+        let now = clock.now();
+        let mut raised = monitor.observe(now, sample);
+        if let Some(guard) = guard.as_mut() {
+            raised.extend(guard.observe(now, sample.memory).await);
+        }
+        for event in raised {
             tracing::info!(?event, "host load condition changed");
             if events.send(event).await.is_err() {
                 return;

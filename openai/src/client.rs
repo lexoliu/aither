@@ -18,7 +18,7 @@ use aither_core::time::sleep;
 use aither_core::{
     LanguageModel,
     llm::{
-        Classify, Event, LLMRequest, ReasoningState, ToolCall, Usage,
+        Classify, Event, LLMRequest, ReasoningState, RetryPolicy, ToolCall, Usage,
         model::{Ability, Profile as ModelProfile, ToolChoice},
         oneshot,
     },
@@ -27,70 +27,6 @@ use futures_core::Stream;
 use futures_lite::StreamExt;
 use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use zenwave::{Client, client, header};
-
-/// Configuration for request retry behavior.
-#[derive(Debug, Clone)]
-pub struct RetryConfig {
-    /// Maximum number of retry attempts (0 = no retries).
-    pub max_retries: u32,
-    /// Initial delay before first retry.
-    pub initial_delay: Duration,
-    /// Maximum delay between retries.
-    pub max_delay: Duration,
-    /// Multiplier for exponential backoff.
-    pub backoff_multiplier: f64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 3,
-            initial_delay: Duration::from_millis(500),
-            max_delay: Duration::from_secs(30),
-            backoff_multiplier: 2.0,
-        }
-    }
-}
-
-impl RetryConfig {
-    /// Create a config with no retries.
-    #[must_use]
-    pub fn none() -> Self {
-        Self {
-            max_retries: 0,
-            ..Default::default()
-        }
-    }
-
-    /// Calculate delay for a given attempt number (0-indexed).
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_precision_loss,
-        clippy::cast_sign_loss
-    )]
-    fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let delay_ms =
-            self.initial_delay.as_millis() as f64 * self.backoff_multiplier.powi(attempt as i32);
-        let delay = Duration::from_millis(delay_ms as u64);
-        delay.min(self.max_delay)
-    }
-}
-
-/// Whether a failed request is worth sending again: the network dropped it or
-/// the upstream answered with a temporary fault.
-fn is_retryable_error(err: &OpenAIError) -> bool {
-    err.failure().is_retryable()
-}
-
-/// Get retry delay for an error, respecting Retry-After header for rate limits.
-fn get_retry_delay(err: &OpenAIError, attempt: u32, config: &RetryConfig) -> Duration {
-    if let Some(delay) = err.failure().retry_after {
-        // Respect Retry-After header, but cap at max_delay
-        return delay.min(config.max_delay);
-    }
-    config.delay_for_attempt(attempt)
-}
 
 fn map_zenwave_error(error: zenwave::Error) -> OpenAIError {
     if matches!(error, zenwave::Error::Timeout) {
@@ -125,19 +61,19 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = SseStreamResult>,
 {
-    let retry_config = &cfg.retry;
+    let policy = &cfg.retry;
     let mut attempt = 0;
 
     loop {
         match make_request().await {
             Ok(stream) => return Ok(stream),
             Err(err) => {
-                // Check if we should retry
-                if attempt < retry_config.max_retries && is_retryable_error(&err) {
-                    let delay = get_retry_delay(&err, attempt, retry_config);
+                let failure = err.failure();
+                if policy.allows(attempt, &failure) {
+                    let delay = policy.delay(attempt, &failure);
                     tracing::warn!(
                         attempt = attempt + 1,
-                        max_retries = retry_config.max_retries,
+                        max_retries = policy.max_retries,
                         delay_ms = delay.as_millis(),
                         error = %err,
                         "Request failed, retrying"
@@ -434,6 +370,10 @@ impl LanguageModel for OpenAI {
             "Continue the user provided text without additional commentary.",
             prefix,
         ))
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        self.inner.retry
     }
 
     fn profile(&self) -> impl Future<Output = Result<ModelProfile, Self::Error>> + Send {
@@ -1661,7 +1601,7 @@ pub struct Builder {
     legacy_max_tokens: bool,
     organization: Option<String>,
     native_abilities: Vec<Ability>,
-    retry: RetryConfig,
+    retry: RetryPolicy,
     request_timeout: Duration,
     extra_headers: Vec<(String, String)>,
     store: Option<bool>,
@@ -1688,7 +1628,7 @@ impl Builder {
             legacy_max_tokens: false,
             organization: None,
             native_abilities: Vec::new(),
-            retry: RetryConfig::default(),
+            retry: RetryPolicy::default(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             extra_headers: Vec::new(),
             store: None,
@@ -1848,9 +1788,11 @@ impl Builder {
     ///
     /// By default, requests are retried up to 3 times with exponential backoff.
     /// Retries happen on network errors and certain HTTP status codes (429, 500, 502, 503, 504).
+    /// The model reports this policy as its [`LanguageModel::retry_policy`],
+    /// so an agent retries a response stream that breaks mid-response under it.
     #[must_use]
-    pub const fn retry(mut self, config: RetryConfig) -> Self {
-        self.retry = config;
+    pub const fn retry(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
         self
     }
 
@@ -1864,7 +1806,7 @@ impl Builder {
     /// Disable retries entirely.
     #[must_use]
     pub fn no_retry(mut self) -> Self {
-        self.retry = RetryConfig::none();
+        self.retry = RetryPolicy::none();
         self
     }
 
@@ -1924,7 +1866,7 @@ pub struct Config {
     pub(crate) legacy_max_tokens: bool,
     pub(crate) organization: Option<String>,
     pub(crate) native_abilities: Vec<Ability>,
-    pub(crate) retry: RetryConfig,
+    pub(crate) retry: RetryPolicy,
     pub(crate) request_timeout: Duration,
     pub(crate) extra_headers: Vec<(String, String)>,
     pub(crate) store: Option<bool>,

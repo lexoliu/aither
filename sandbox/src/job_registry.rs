@@ -10,7 +10,9 @@ use std::time::Instant;
 use async_channel::{Receiver, Sender, WeakSender};
 use futures_lite::io::AsyncWriteExt;
 
+use crate::memory::MemoryDomain;
 use crate::permission::TerminalMode;
+use crate::poll_guard::PollRefusal;
 use crate::process_tree::{JobMarker, JobTree, KillTreeError, ProcessScanner};
 
 /// Information about a running or completed background job.
@@ -32,6 +34,8 @@ pub struct JobInfo {
     pub status: JobStatus,
     /// Path to output file.
     pub output_path: Option<PathBuf>,
+    /// Where the job runs.
+    pub place: JobPlace,
 }
 
 /// Status of a background job.
@@ -56,11 +60,49 @@ pub enum JobStatus {
         /// Whether the agent has taken the job's completion.
         delivery: Delivery,
     },
-    /// Job was killed by user.
+    /// Job was killed.
     Killed {
+        /// Why it was killed.
+        cause: KillCause,
         /// Whether the agent has taken the job's completion.
         delivery: Delivery,
     },
+}
+
+/// Why a job was killed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillCause {
+    /// A request ended it: `terminal_kill`, its `timeout` bound, or the
+    /// shutdown of its terminal.
+    User,
+    /// Its home environment's memory ran out of room for the agent's jobs
+    /// (see [`MemoryDomain`]), and the agent left it running past the
+    /// response window that followed the final warning.
+    MemoryRunaway {
+        /// The tree's physical footprint when it was killed.
+        footprint_bytes: u64,
+        /// The memory of the domain it ran in: the machine's physical memory,
+        /// or the container's limit.
+        capacity_bytes: u64,
+        /// The domain it ran in.
+        domain: MemoryDomain,
+    },
+}
+
+/// Where a job runs, which decides what is watched of it.
+///
+/// Only the home environment is watched: the machine the embedder runs on,
+/// and the container the agent works in when it has one. The memory and the
+/// disk of a remote execution environment are never judged and its jobs are
+/// never killed for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobPlace {
+    /// A process of the machine the embedder runs on.
+    Host,
+    /// A process inside the container the agent works in.
+    Container,
+    /// A process on a remote host over SSH.
+    Remote,
 }
 
 impl JobStatus {
@@ -71,7 +113,16 @@ impl JobStatus {
             Self::Running => None,
             Self::Completed { delivery, .. }
             | Self::Failed { delivery, .. }
-            | Self::Killed { delivery } => Some(*delivery),
+            | Self::Killed { delivery, .. } => Some(*delivery),
+        }
+    }
+
+    /// Why a killed job was killed; `None` for a job that was not.
+    #[must_use]
+    pub const fn kill_cause(&self) -> Option<KillCause> {
+        match self {
+            Self::Killed { cause, .. } => Some(*cause),
+            Self::Running | Self::Completed { .. } | Self::Failed { .. } => None,
         }
     }
 
@@ -127,8 +178,8 @@ impl Drop for PendingCompletion {
 /// What [`JobRegistry::owe_completion`] settled for a job.
 #[derive(Debug)]
 pub struct OwedCompletion {
-    /// Whether the job ended by a kill rather than on its own.
-    pub killed: bool,
+    /// Why the job was killed; `None` when it ended on its own.
+    pub kill: Option<KillCause>,
     /// Keeps the completion pending until the agent takes it.
     pub pending: PendingCompletion,
 }
@@ -146,6 +197,17 @@ pub struct TerminalDelta {
     pub bytes: Vec<u8>,
     /// Current task status at the time of the read.
     pub status: JobStatus,
+}
+
+/// Why [`JobRegistry::terminal_read`] returned no delta.
+#[derive(Debug, thiserror::Error)]
+pub enum TerminalReadError {
+    /// The read would return what the task's last read returned.
+    #[error(transparent)]
+    Refused(PollRefusal),
+    /// The read could not be served, such as an unknown task id.
+    #[error("{0}")]
+    Failed(String),
 }
 
 /// Sender used by the registry to push bytes into a running process stdin.
@@ -173,6 +235,8 @@ struct JobState {
     input_tx: Option<TerminalInputSender>,
     kill_switch: Option<Sender<()>>,
     process_tree: Option<JobTree>,
+    /// Why the kill in flight was asked for: the first of overlapping kills.
+    kill_cause: Option<KillCause>,
     /// How many kills of the job run outside the registry; an ending the
     /// job's own flow reports meanwhile waits in `deferred_end`.
     kills_in_flight: usize,
@@ -207,6 +271,7 @@ enum StateCommand {
         mode: TerminalMode,
         output_path: Option<PathBuf>,
         process_tree: Option<JobTree>,
+        place: JobPlace,
     },
     AttachTerminalInput {
         pid: u32,
@@ -268,14 +333,17 @@ enum JobRequest {
     },
     BeginKill {
         pid: u32,
+        cause: KillCause,
         reply: Sender<KillPlan>,
     },
     BeginKillByTaskId {
         task_id: String,
+        cause: KillCause,
         reply: Sender<Option<(u32, KillPlan)>>,
     },
     BeginKillByExecutionKey {
         execution_key: String,
+        cause: KillCause,
         reply: Sender<Vec<(u32, KillPlan)>>,
     },
     EndKill {
@@ -305,7 +373,7 @@ enum JobRequest {
         /// tracked by the unchanged-read refusal; a monitor pump's reads are
         /// not, and read the complete-line buffer instead.
         tracked: bool,
-        reply: Sender<Result<TerminalDelta, String>>,
+        reply: Sender<Result<TerminalDelta, TerminalReadError>>,
     },
     FileReadsUnchanged {
         reads: Vec<(PathBuf, FileFingerprint)>,
@@ -430,7 +498,31 @@ impl JobRegistry {
         mode: TerminalMode,
         output_path: Option<PathBuf>,
     ) {
-        self.register_with_tree(pid, task_id, execution_key, script, mode, output_path, None)
+        self.register_with_tree(
+            pid,
+            task_id,
+            execution_key,
+            script,
+            mode,
+            output_path,
+            None,
+            JobPlace::Host,
+        )
+        .await;
+    }
+
+    /// Registers a new running job like [`Self::register`], for a job that
+    /// runs at `place` instead of on this machine.
+    pub async fn register_at(
+        &self,
+        place: JobPlace,
+        pid: u32,
+        task_id: &str,
+        execution_key: &str,
+        script: &str,
+        mode: TerminalMode,
+    ) {
+        self.register_with_tree(pid, task_id, execution_key, script, mode, None, None, place)
             .await;
     }
 
@@ -447,8 +539,10 @@ impl JobRegistry {
         mode: TerminalMode,
         output_path: Option<PathBuf>,
         process_tree: Option<JobTree>,
+        place: JobPlace,
     ) {
         self.send_command(StateCommand::Register {
+            place,
             pid,
             task_id: task_id.to_string(),
             execution_key: execution_key.to_string(),
@@ -584,13 +678,15 @@ impl JobRegistry {
     /// Returns terminal output added since the provided cursor.
     ///
     /// # Errors
-    /// Returns an error when the task id is unknown.
+    /// [`TerminalReadError::Refused`] when the read would return what the
+    /// task's last read returned; [`TerminalReadError::Failed`] when the
+    /// task id is unknown.
     pub async fn terminal_read(
         &self,
         task_id: &str,
         cursor: usize,
         max_bytes: usize,
-    ) -> Result<TerminalDelta, String> {
+    ) -> Result<TerminalDelta, TerminalReadError> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::ReadTerminalDelta {
             task_id: task_id.to_string(),
@@ -624,7 +720,13 @@ impl JobRegistry {
             reply: reply_tx,
         })
         .await;
-        Self::recv_reply(reply_rx).await
+        match Self::recv_reply(reply_rx).await {
+            Ok(delta) => Ok(delta),
+            Err(TerminalReadError::Failed(error)) => Err(error),
+            Err(TerminalReadError::Refused(refusal)) => {
+                unreachable!("an untracked read is never refused: {refusal:?}")
+            }
+        }
     }
 
     /// Whether every `reads` entry matches what the last read of that path
@@ -741,9 +843,35 @@ impl JobRegistry {
 
     /// Kills a running job by its PID.
     pub async fn kill(&self, pid: u32) -> bool {
+        self.kill_for(pid, KillCause::User).await
+    }
+
+    /// Kills a running job whose process tree holds `footprint_bytes` of a
+    /// `domain` with `capacity_bytes`; the job reads
+    /// [`KillCause::MemoryRunaway`].
+    pub async fn kill_runaway(
+        &self,
+        pid: u32,
+        footprint_bytes: u64,
+        capacity_bytes: u64,
+        domain: MemoryDomain,
+    ) -> bool {
+        self.kill_for(
+            pid,
+            KillCause::MemoryRunaway {
+                footprint_bytes,
+                capacity_bytes,
+                domain,
+            },
+        )
+        .await
+    }
+
+    async fn kill_for(&self, pid: u32, cause: KillCause) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::BeginKill {
             pid,
+            cause,
             reply: reply_tx,
         })
         .await;
@@ -756,6 +884,7 @@ impl JobRegistry {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::BeginKillByTaskId {
             task_id: task_id.to_string(),
+            cause: KillCause::User,
             reply: reply_tx,
         })
         .await;
@@ -784,6 +913,7 @@ impl JobRegistry {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::BeginKillByExecutionKey {
             execution_key: execution_key.to_string(),
+            cause: KillCause::User,
             reply: reply_tx,
         })
         .await;
@@ -905,14 +1035,28 @@ async fn handle_state_command(
             mode,
             output_path,
             process_tree,
+            place,
         } => {
-            register_job(jobs, pid, task_id, execution_key, script, mode, output_path);
+            register_job(
+                jobs,
+                pid,
+                task_id,
+                execution_key,
+                script,
+                mode,
+                output_path,
+                place,
+            );
             if let Some(job) = jobs.get_mut(&pid) {
                 job.process_tree = process_tree;
             }
         }
         StateCommand::AttachTerminalInput { pid, input_tx } => {
-            if let Some(job) = jobs.get_mut(&pid) {
+            // A job that already finished takes no input: the sender drops here.
+            if let Some(job) = jobs
+                .get_mut(&pid)
+                .filter(|job| matches!(job.info.status, JobStatus::Running))
+            {
                 job.input_tx = Some(input_tx);
             }
         }
@@ -952,6 +1096,7 @@ async fn handle_state_command(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_job_request(
     jobs: &mut HashMap<u32, JobState>,
     reads: &mut ReadTracker,
@@ -981,22 +1126,27 @@ async fn handle_job_request(
             ending,
             reply,
         } => owe_settled_completion(jobs, &task_id, ending, reply, tx).await,
-        JobRequest::BeginKill { pid, reply } => {
-            let plan = begin_kill(jobs, pid).await;
+        JobRequest::BeginKill { pid, cause, reply } => {
+            let plan = begin_kill(jobs, pid, cause).await;
             let _ = reply.send(plan).await;
         }
-        JobRequest::BeginKillByTaskId { task_id, reply } => {
+        JobRequest::BeginKillByTaskId {
+            task_id,
+            cause,
+            reply,
+        } => {
             let plan = match find_pid_by_task_id(jobs, &task_id) {
-                Some(pid) => Some((pid, begin_kill(jobs, pid).await)),
+                Some(pid) => Some((pid, begin_kill(jobs, pid, cause).await)),
                 None => None,
             };
             let _ = reply.send(plan).await;
         }
         JobRequest::BeginKillByExecutionKey {
             execution_key,
+            cause,
             reply,
         } => {
-            let plans = begin_kill_by_execution_key(jobs, &execution_key).await;
+            let plans = begin_kill_by_execution_key(jobs, &execution_key, cause).await;
             let _ = reply.send(plans).await;
         }
         JobRequest::EndKill { pid, killed, reply } => {
@@ -1031,6 +1181,7 @@ async fn handle_job_request(
             reply,
         } => {
             let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes, !tracked)
+                .map_err(TerminalReadError::Failed)
                 .and_then(|delta| tracked_delta(reads, &task_id, delta, tracked));
             let _ = reply.send(result).await;
         }
@@ -1071,6 +1222,7 @@ fn has_running_job(jobs: &HashMap<u32, JobState>) -> bool {
         .any(|job| matches!(job.info.status, JobStatus::Running))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_job(
     jobs: &mut HashMap<u32, JobState>,
     pid: u32,
@@ -1079,8 +1231,10 @@ fn register_job(
     script: String,
     mode: TerminalMode,
     output_path: Option<PathBuf>,
+    place: JobPlace,
 ) {
     let info = JobInfo {
+        place,
         pid,
         task_id,
         execution_key,
@@ -1109,6 +1263,7 @@ impl JobState {
             input_tx: None,
             kill_switch: None,
             process_tree: None,
+            kill_cause: None,
             kills_in_flight: 0,
             deferred_end: None,
             settled_waiters: Vec::new(),
@@ -1123,7 +1278,7 @@ impl JobState {
 enum JobEnd {
     Completed { exit_code: i32 },
     Failed { error: String },
-    Killed,
+    Killed(KillCause),
 }
 
 /// Records how `job` ended: the one transition out of
@@ -1144,10 +1299,12 @@ fn finish(job: &mut JobState, end: JobEnd) {
             delivery,
         },
         JobEnd::Failed { error } => JobStatus::Failed { error, delivery },
-        JobEnd::Killed => JobStatus::Killed { delivery },
+        JobEnd::Killed(cause) => JobStatus::Killed { cause, delivery },
     };
     job.finished_at = Some(Instant::now());
     job.kill_switch = None;
+    // Dropping the last sender ends the stdin writer thread blocked on it.
+    job.input_tx = None;
 }
 
 /// Marks the completion of `job` taken: the agent dropped its
@@ -1158,7 +1315,7 @@ fn take_completion(job: &mut JobState) {
         JobStatus::Running => panic!("job {pid}'s completion was taken while it runs"),
         JobStatus::Completed { delivery, .. }
         | JobStatus::Failed { delivery, .. }
-        | JobStatus::Killed { delivery } => delivery,
+        | JobStatus::Killed { delivery, .. } => delivery,
     };
     assert_eq!(
         *delivery,
@@ -1217,7 +1374,7 @@ async fn owe_completion(
     );
     job.completion_owed = true;
     OwedCompletion {
-        killed: matches!(job.info.status, JobStatus::Killed { .. }),
+        kill: job.info.status.kill_cause(),
         pending: PendingCompletion {
             tx: tx
                 .upgrade()
@@ -1355,6 +1512,7 @@ async fn fail_job(
 async fn begin_kill_by_execution_key(
     jobs: &mut HashMap<u32, JobState>,
     execution_key: &str,
+    cause: KillCause,
 ) -> Vec<(u32, KillPlan)> {
     let pids: Vec<u32> = jobs
         .iter()
@@ -1367,7 +1525,7 @@ async fn begin_kill_by_execution_key(
 
     let mut plans = Vec::with_capacity(pids.len());
     for pid in pids {
-        plans.push((pid, begin_kill(jobs, pid).await));
+        plans.push((pid, begin_kill(jobs, pid, cause).await));
     }
     plans
 }
@@ -1422,13 +1580,15 @@ fn tracked_delta(
     task_id: &str,
     delta: TerminalDelta,
     tracked: bool,
-) -> Result<TerminalDelta, String> {
+) -> Result<TerminalDelta, TerminalReadError> {
     let returned = (delta.cursor, delta.total_bytes, delta.status.clone());
     if !tracked {
         return Ok(delta);
     }
     if reads.delta_reads.get(task_id) == Some(&returned) {
-        Err(crate::poll_guard::unchanged_task_read(task_id))
+        Err(TerminalReadError::Refused(PollRefusal::UnchangedTaskRead {
+            task_id: task_id.to_string(),
+        }))
     } else {
         reads.delta_reads.insert(task_id.to_string(), returned);
         Ok(delta)
@@ -1529,7 +1689,7 @@ fn find_pid_by_task_id(jobs: &HashMap<u32, JobState>, task_id: &str) -> Option<u
 
 /// Starts killing a job: decides at once what needs no process signal, and
 /// otherwise hands back what the caller must kill outside the registry.
-async fn begin_kill(jobs: &mut HashMap<u32, JobState>, pid: u32) -> KillPlan {
+async fn begin_kill(jobs: &mut HashMap<u32, JobState>, pid: u32, cause: KillCause) -> KillPlan {
     let Some(job) = jobs.get_mut(&pid) else {
         return KillPlan::Done(false);
     };
@@ -1550,13 +1710,16 @@ async fn begin_kill(jobs: &mut HashMap<u32, JobState>, pid: u32) -> KillPlan {
                 "failed to flush redirected output after kill switch signal"
             );
         }
-        finish(job, JobEnd::Killed);
+        finish(job, JobEnd::Killed(cause));
         job.stdout_closed = true;
         job.stderr_closed = true;
         tracing::info!(pid = %pid, "killed job via runtime kill switch");
         return KillPlan::Done(true);
     }
 
+    if job.kills_in_flight == 0 {
+        job.kill_cause = Some(cause);
+    }
     job.kills_in_flight += 1;
     job.process_tree
         .as_ref()
@@ -1580,10 +1743,13 @@ async fn end_kill(jobs: &mut HashMap<u32, JobState>, pid: u32, killed: bool) -> 
                     "failed to flush redirected output after kill"
                 );
             }
-            finish(job, JobEnd::Killed);
+            let cause = job
+                .kill_cause
+                .expect("a kill in flight was asked for with a cause");
+            finish(job, JobEnd::Killed(cause));
             job.stdout_closed = true;
             job.stderr_closed = true;
-            tracing::info!(pid = %pid, "killed job");
+            tracing::info!(pid = %pid, ?cause, "killed job");
         }
         return true;
     }
@@ -1750,8 +1916,12 @@ mod tests {
             .expect("first read succeeds");
         let second = registry.terminal_read("task-a", first.cursor, 1024).await;
         assert!(
-            second.is_err(),
-            "an unchanged repeat read must be refused: {second:?}"
+            matches!(
+                &second,
+                Err(TerminalReadError::Refused(refusal @ PollRefusal::UnchangedTaskRead { task_id }))
+                    if task_id == "task-a" && refusal.is_unchanged_read()
+            ),
+            "an unchanged repeat read must be refused as a poll: {second:?}"
         );
 
         registry.append_stdout(7, b"two".to_vec()).await;
@@ -2026,6 +2196,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_finished_job_releases_its_input_sender_and_refuses_input() {
+        let registry = spawn_registry();
+        registry
+            .register(
+                557,
+                "task-input",
+                "exec-input",
+                "cat",
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+        let (input_tx, input_rx) = async_channel::unbounded::<Vec<u8>>();
+        registry.attach_terminal_input(557, input_tx).await;
+        registry
+            .terminal_input("task-input", b"x".to_vec())
+            .await
+            .expect("a running job takes input");
+        assert_eq!(input_rx.recv().await.expect("input arrives"), b"x");
+
+        registry.complete(557, 0, None).await;
+
+        // The registry handles commands in order, so this reply follows the
+        // completion.
+        let error = registry
+            .terminal_input("task-input", b"y".to_vec())
+            .await
+            .expect_err("a finished job refuses input");
+        assert!(error.contains("is not running"), "{error}");
+        assert!(input_rx.is_closed(), "the registry must drop its sender");
+    }
+
+    #[tokio::test]
     async fn test_complete_does_not_override_killed_status() {
         let (registry, service) = job_registry_channel();
         TokioGlobal
@@ -2097,6 +2300,7 @@ mod tests {
             "true".to_string(),
             TerminalMode::Sandboxed,
             None,
+            JobPlace::Host,
         );
         jobs
     }
@@ -2106,8 +2310,15 @@ mod tests {
     #[tokio::test]
     async fn overlapping_kills_hold_the_deferred_ending_until_the_last_ends() {
         let mut jobs = running_job(7);
-        assert!(matches!(begin_kill(&mut jobs, 7).await, KillPlan::Group(7)));
-        assert!(matches!(begin_kill(&mut jobs, 7).await, KillPlan::Group(7)));
+        let user = KillCause::User;
+        assert!(matches!(
+            begin_kill(&mut jobs, 7, user).await,
+            KillPlan::Group(7)
+        ));
+        assert!(matches!(
+            begin_kill(&mut jobs, 7, user).await,
+            KillPlan::Group(7)
+        ));
         complete_job(&mut jobs, 7, 0, None).await;
         assert_eq!(jobs[&7].info.status, JobStatus::Running, "the ending waits");
 
@@ -2132,12 +2343,16 @@ mod tests {
     #[tokio::test]
     async fn a_successful_kill_wins_over_a_deferred_ending() {
         let mut jobs = running_job(8);
-        assert!(matches!(begin_kill(&mut jobs, 8).await, KillPlan::Group(8)));
+        assert!(matches!(
+            begin_kill(&mut jobs, 8, KillCause::User).await,
+            KillPlan::Group(8)
+        ));
         complete_job(&mut jobs, 8, 0, None).await;
         assert!(end_kill(&mut jobs, 8, true).await);
         assert_eq!(
             jobs[&8].info.status,
             JobStatus::Killed {
+                cause: KillCause::User,
                 delivery: Delivery::Pending
             }
         );
@@ -2165,6 +2380,7 @@ mod tests {
         registry
             .send_command(JobRequest::BeginKill {
                 pid: 557,
+                cause: KillCause::User,
                 reply: reply_tx,
             })
             .await;
@@ -2226,7 +2442,7 @@ mod tests {
             .owe_completion("task-owed", Ok(0))
             .await
             .expect("the job is registered");
-        assert!(!owed.killed);
+        assert_eq!(owed.kill, None);
         let jobs = registry.list().await;
         assert!(host_sees_owed_turn(&jobs), "{jobs:?}");
 
@@ -2261,7 +2477,7 @@ mod tests {
             .owe_completion("task-lost", Err("output could not be saved".to_string()))
             .await
             .expect("the job is registered");
-        assert!(!owed.killed);
+        assert_eq!(owed.kill, None);
         let job = registry.get(10).await.expect("job should exist");
         assert_eq!(
             job.status,
@@ -2295,6 +2511,7 @@ mod tests {
         registry
             .send_command(JobRequest::BeginKill {
                 pid: 11,
+                cause: KillCause::User,
                 reply: reply_tx,
             })
             .await;
@@ -2329,10 +2546,11 @@ mod tests {
         let owed = JobRegistry::recv_reply(owed)
             .await
             .expect("the job is registered");
-        assert!(owed.killed);
+        assert_eq!(owed.kill, Some(KillCause::User));
         assert_eq!(
             registry.get(11).await.expect("job should exist").status,
             JobStatus::Killed {
+                cause: KillCause::User,
                 delivery: Delivery::Pending
             }
         );
@@ -2352,6 +2570,7 @@ mod tests {
             "run".to_string(),
             TerminalMode::Sandboxed,
             None,
+            JobPlace::Host,
         );
         let _first = owe_completion(&mut jobs, 12, Ok(0), &weak).await;
         let _second = owe_completion(&mut jobs, 12, Ok(0), &weak).await;

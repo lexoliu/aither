@@ -1,0 +1,4 @@
+Your working copies, prepared for this run; commit your work in them, since only commits reach the agent that launched you:{% for path in working_copies %}
+- {{ path.display() }}{% endfor %}
+
+{{ brief }}

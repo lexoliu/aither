@@ -19,8 +19,11 @@ use askama::Template;
 
 use crate::kill_guard::{file_name, walk_invocations};
 
-/// A command refused because it waits or re-reads instead of using the
+/// A call refused because it waits or re-reads instead of using the
 /// mechanism that reports the change.
+///
+/// Tools return it as their error, so an agent loop can tell a refused poll
+/// from any other failure by downcasting.
 #[derive(Debug)]
 pub enum PollRefusal {
     /// The command invokes `sleep` in a foreground call.
@@ -30,6 +33,25 @@ pub enum PollRefusal {
         /// The file paths the command re-reads, as written in the command.
         paths: Vec<PathBuf>,
     },
+    /// A `terminal_read` would return what the task's last read returned.
+    UnchangedTaskRead {
+        /// The background task whose output did not change.
+        task_id: String,
+    },
+}
+
+impl PollRefusal {
+    /// Whether the refused call re-read output that has not changed: it
+    /// learned nothing, so only a background event can give the model
+    /// something new. A refused `sleep` is not one — the model has not yet
+    /// looked at anything.
+    #[must_use]
+    pub const fn is_unchanged_read(&self) -> bool {
+        matches!(
+            self,
+            Self::UnchangedFileRead { .. } | Self::UnchangedTaskRead { .. }
+        )
+    }
 }
 
 #[derive(Template)]
@@ -47,21 +69,13 @@ impl Display for PollRefusal {
         let rendered = match self {
             Self::Sleep => SleepRefusedTemplate.render(),
             Self::UnchangedFileRead { paths } => UnchangedFileReadTemplate { paths }.render(),
+            Self::UnchangedTaskRead { task_id } => UnchangedTaskReadTemplate { task_id }.render(),
         };
         f.write_str(&rendered.map_err(|_| fmt::Error)?)
     }
 }
 
 impl std::error::Error for PollRefusal {}
-
-/// The text a repeated `terminal_read` is refused with: the task's
-/// completion is delivered instead of being polled.
-#[must_use]
-pub fn unchanged_task_read(task_id: &str) -> String {
-    UnchangedTaskReadTemplate { task_id }
-        .render()
-        .expect("unchanged task read template must render")
-}
 
 #[derive(Template)]
 #[template(path = "unchanged_task_read.txt")]

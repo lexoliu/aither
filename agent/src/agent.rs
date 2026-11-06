@@ -20,7 +20,7 @@ use crate::{
     context::{
         AnyContextSource, BackgroundJobs, Block, CacheLifetime, CompactionFork,
         CompletedCompaction, Context, ContextBudget, HandoffDocument, InstructionSlot,
-        PendingCompaction, PrefixChain, PrefixRewrites, PromptCache, PromptPrefix, TasksDocument,
+        PendingCompaction, PrefixChain, PrefixRewrites, PromptCache, PromptPrefix,
         recovery::{SpillLimits, clean_for_recovery},
         restore_context,
     },
@@ -39,8 +39,8 @@ use crate::{
 use aither_core::{
     LanguageModel,
     llm::{
-        Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, StoredFile,
-        ToolCall,
+        Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, RetryPolicy,
+        StoredFile, ToolCall,
         model::{Parameters, Profile as ModelProfile},
     },
 };
@@ -303,6 +303,17 @@ struct RunLoopOutcome {
     iteration: usize,
 }
 
+/// What a tool turn's results gave the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolTurn {
+    /// Some call returned something, or a background event arrived with the
+    /// results.
+    Progress,
+    /// Every call was refused for re-reading unchanged output, and no
+    /// background event arrived with them.
+    OnlyUnchangedReads,
+}
+
 enum TurnControl {
     Continue,
     Break {
@@ -317,7 +328,25 @@ enum ModelEventAction {
     RetryMalformed,
 }
 
-type ToolExecutionResult = Result<(String, String, aither_core::llm::ToolResult), AgentError>;
+/// A response stream that ended with an error instead of finishing.
+struct BrokenStream {
+    error: AgentError,
+    /// Whether an event arrived before the error: the stream had opened.
+    opened: bool,
+}
+
+/// A finished tool call, waiting to be paired with its call in the context.
+#[derive(Debug)]
+pub struct FinishedToolCall {
+    id: String,
+    name: String,
+    result: aither_core::llm::ToolResult,
+    /// The call was refused for re-reading output that had not changed
+    /// ([`aither_sandbox::PollRefusal::is_unchanged_read`]).
+    unchanged_read: bool,
+}
+
+type ToolExecutionResult = Result<FinishedToolCall, AgentError>;
 type ToolExecutionSignal = ExecutionSignal<ToolExecutionResult>;
 
 async fn handle_model_event<H: Hook>(
@@ -617,13 +646,24 @@ fn job_alert_text(alert: &JobAlertText<'_>) -> String {
         .expect("job alert template must render")
 }
 
+/// What a killed memory runaway held, as the text reports it.
+struct RunawayText {
+    footprint: aither_sandbox::MemorySize,
+    capacity: aither_sandbox::MemorySize,
+    domain: aither_sandbox::MemoryDomain,
+}
+
 /// How a finished background task ended.
 enum BackgroundOutcome<'a> {
     /// The script ran to completion.
     Finished { code: i32 },
     /// The job was killed — its `timeout` bound or `terminal_kill` — and
     /// whatever `code` the harness saw means nothing.
-    Killed { timeout: Option<&'a str> },
+    Killed {
+        timeout: Option<&'a str>,
+        /// Set when a memory runaway was the cause.
+        runaway: Option<RunawayText>,
+    },
     /// The task could not be run or tracked to completion.
     Failed { error: &'a str },
 }
@@ -844,9 +884,14 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Optional sandbox directory for working-doc supervision (`tasks.md`).
     pub(crate) sandbox_dir: Option<PathBuf>,
 
-    /// Resolves `BLOCKING` marks in `tasks.md`; a mark it reports dead no
-    /// longer holds the item.
-    pub(crate) blocker_resolver: Option<crate::working_docs::AnyTaskBlockerResolver>,
+    /// What the host gives the `tasks.md` supervision; the agent records its
+    /// finished background jobs on its events.
+    pub(crate) tasks: crate::tasks::TasksWiring,
+
+    /// The source supervising `tasks.md` in the sandbox, owned apart from
+    /// [`context_sources`](Self::context_sources) because what it showed
+    /// travels in the agent's checkpoint.
+    pub(crate) tasks_document: Option<crate::tasks::TasksDocument>,
 
     /// Directory files are restored from after a forked compaction.
     pub(crate) restore_dir: Option<PathBuf>,
@@ -955,7 +1000,8 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             job_registry: None,
             detached_task_ids: HashSet::new(),
             sandbox_dir: None,
-            blocker_resolver: None,
+            tasks: crate::tasks::TasksWiring::default(),
+            tasks_document: None,
             restore_dir: None,
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
@@ -1022,15 +1068,80 @@ where
         connectivity.guard(stream)
     }
 
+    /// The retry policy of the active tier's model.
+    fn retry_policy(&self) -> RetryPolicy {
+        match self.tier {
+            ModelTier::Advanced => self.advanced.retry_policy(),
+            ModelTier::Balanced => self.balanced.retry_policy(),
+            ModelTier::Fast => self.fast.retry_policy(),
+        }
+    }
+
+    /// Streams the model's response to `request`, sending the request again
+    /// when the stream breaks after it opened.
+    ///
+    /// A failure before the first event is the provider's to retry, since it
+    /// retries establishing the stream itself; a break after it is retried
+    /// here, under the model's [`RetryPolicy`], unless the machine is
+    /// offline. The broken attempt's text, calls and reasoning are dropped
+    /// with it, and the request sent again is the one recorded as the last
+    /// request, so the provider reads the same cached prefix.
     async fn collect_model_turn(
+        &mut self,
+        mut request: LLMRequest,
+        events: &EventSink,
+    ) -> Result<ModelTurn, AgentError> {
+        let policy = self.retry_policy();
+        let mut retries = 0;
+        loop {
+            let broken = match self.stream_model_turn(request, events).await {
+                Ok(turn) => return Ok(turn),
+                Err(broken) => broken,
+            };
+            let failure = match broken.error.failure() {
+                Some(failure)
+                    if broken.opened
+                        && policy.allows(retries, failure)
+                        && !self.connectivity.is_offline() =>
+                {
+                    *failure
+                }
+                _ => return Err(broken.error),
+            };
+            let delay = policy.delay(retries, &failure);
+            retries += 1;
+            tracing::warn!(
+                retry = retries,
+                max_retries = policy.max_retries,
+                delay_ms = delay.as_millis(),
+                error = %broken.error,
+                "model response stream broke mid-response; sending the request again"
+            );
+            events.emit(AgentEvent::ResponseRetry {
+                error: broken.error,
+                retry: retries,
+                max_retries: policy.max_retries,
+                delay,
+            });
+            async_io::Timer::after(delay).await;
+            request = self
+                .last_request
+                .clone()
+                .expect("a request that reached the model is recorded as the last request");
+        }
+    }
+
+    /// One attempt at streaming the model's response to `request`.
+    async fn stream_model_turn(
         &mut self,
         request: LLMRequest,
         events: &EventSink,
-    ) -> Result<ModelTurn, AgentError> {
+    ) -> Result<ModelTurn, BrokenStream> {
         let mut text_chunks = Vec::new();
         let mut tool_calls = Vec::new();
         let mut reasoning = Vec::new();
         let mut malformed_function_call = false;
+        let mut opened = false;
 
         let stream = Self::respond_stream(
             self.tier,
@@ -1042,7 +1153,8 @@ where
         );
         futures_lite::pin!(stream);
         while let Some(event) = stream.next().await {
-            match handle_model_event(
+            let received = event.is_ok();
+            let action = handle_model_event(
                 &self.hooks,
                 &mut self.cache_stats,
                 &mut self.budget,
@@ -1051,8 +1163,10 @@ where
                 &mut tool_calls,
                 &mut reasoning,
             )
-            .await?
-            {
+            .await
+            .map_err(|error| BrokenStream { error, opened })?;
+            opened |= received;
+            match action {
                 ModelEventAction::Emit(event) => events.emit(event),
                 ModelEventAction::Continue => {}
                 ModelEventAction::RetryMalformed => {
@@ -1226,10 +1340,31 @@ where
 
         Self::push_tool_start_events(&tool_calls, events);
         self.execute_tool_calls(&tool_calls, turn, events).await;
-        self.apply_tool_results(events)?;
+        let polled = self.apply_tool_results(events)?;
         self.push_tool_turn_alerts().await;
-        self.push_turn_boundary_events(run_id, turn, &response_text, events)
-            .await
+        let control = self
+            .push_turn_boundary_events(run_id, turn, &response_text, events)
+            .await?;
+        // Another request would only re-read the same output: park until the
+        // background work reports instead. Every call already has its result,
+        // so the transcript stays valid while the run waits.
+        if polled == ToolTurn::OnlyUnchangedReads
+            && matches!(control, TurnControl::Continue)
+            && self
+                .background_receiver
+                .as_ref()
+                .is_some_and(BackgroundTaskReceiver::has_running)
+        {
+            tracing::info!(
+                turn,
+                "every call re-read unchanged output; parking the run until background work reports"
+            );
+            return Ok(TurnControl::Break {
+                final_text: response_text,
+                stop_reason: StopReason::AwaitingBackground,
+            });
+        }
+        Ok(control)
     }
 
     /// Runs one model turn while a forked compaction keeps running.
@@ -1391,10 +1526,10 @@ where
         for call in unresolved {
             let finished = parked
                 .iter()
-                .position(|result| matches!(result, Ok((id, _, _)) if *id == call.id))
+                .position(|result| matches!(result, Ok(finished) if finished.id == call.id))
                 .and_then(|index| parked.remove(index));
             let content = match finished {
-                Some(Ok((_, _, result))) => result.render_for_model(),
+                Some(Ok(finished)) => finished.result.render_for_model(),
                 _ => ToolCallCancelledTemplate { tool: &call.name }
                     .render()
                     .expect("tool call cancelled template must render"),
@@ -1455,7 +1590,7 @@ where
                     turn,
                     message_count,
                 };
-                let (result, duration) =
+                let (result, duration, unchanged_read) =
                     Self::call_tool_with_hooks(hooks, tools, call, &args_json, &tool_ctx).await?;
                 let result_ctx = ToolResultContext {
                     tool_name: &call.name,
@@ -1473,7 +1608,12 @@ where
                     PostToolAction::Replace(replacement) => replacement,
                     PostToolAction::Keep => result,
                 };
-                Ok((call.id.clone(), call.name.clone(), tool_result))
+                Ok(FinishedToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    result: tool_result,
+                    unchanged_read,
+                })
             }
         });
 
@@ -1504,29 +1644,34 @@ where
         call: &ToolCall,
         args_json: &str,
         tool_ctx: &ToolUseContext<'_>,
-    ) -> Result<(aither_core::llm::ToolResult, Duration), AgentError> {
+    ) -> Result<(aither_core::llm::ToolResult, Duration, bool), AgentError> {
         match hooks.pre_tool_use(tool_ctx).await {
             PreToolAction::Abort(reason) => Err(AgentError::HookRejected {
                 hook: "pre_tool_use",
                 reason,
             }),
-            PreToolAction::Deny(reason) => {
-                Ok((aither_core::llm::ToolResult::error(reason), Duration::ZERO))
-            }
+            PreToolAction::Deny(reason) => Ok((
+                aither_core::llm::ToolResult::error(reason),
+                Duration::ZERO,
+                false,
+            )),
             PreToolAction::Allow => {
                 let start = Instant::now();
                 // The agent loop has nowhere to show a tool's progress, but
                 // the tool learns which call, of which agent, it serves.
                 let cx = aither_core::llm::ToolContext::new().with_identity(tool_ctx.call.clone());
-                let result = tools
-                    .call(&call.name, args_json, cx)
-                    .await
-                    .unwrap_or_else(|error| {
+                let (result, unchanged_read) = match tools.call(&call.name, args_json, cx).await {
+                    Ok(result) => (result, false),
+                    Err(error) => {
+                        let unchanged_read = error
+                            .downcast_ref::<aither_sandbox::PollRefusal>()
+                            .is_some_and(aither_sandbox::PollRefusal::is_unchanged_read);
                         let mut message = String::from("Error: ");
                         message.push_str(error.to_string().as_str());
-                        aither_core::llm::ToolResult::error(message)
-                    });
-                Ok((result, start.elapsed()))
+                        (aither_core::llm::ToolResult::error(message), unchanged_read)
+                    }
+                };
+                Ok((result, start.elapsed(), unchanged_read))
             }
         }
     }
@@ -1549,8 +1694,9 @@ where
     /// Moves the parked tool results into the context.
     ///
     /// Results not reached because one failed stay parked for
-    /// [`Self::settle_interrupted_tool_calls`].
-    fn apply_tool_results(&mut self, events: &EventSink) -> Result<(), AgentError> {
+    /// [`Self::settle_interrupted_tool_calls`]. Returns whether the turn gave
+    /// the model anything new.
+    fn apply_tool_results(&mut self, events: &EventSink) -> Result<ToolTurn, AgentError> {
         if let Some(receiver) = &self.kept_receiver {
             self.kept_exchanges.extend(
                 receiver
@@ -1567,8 +1713,15 @@ where
             .into_iter()
             .map(|definition| definition.name().to_string())
             .collect();
+        let mut only_unchanged_reads = !self.tool_results.is_empty();
         while let Some(result) = self.tool_results.pop_front() {
-            let (call_id, call_name, tool_result) = result?;
+            let FinishedToolCall {
+                id: call_id,
+                name: call_name,
+                result: tool_result,
+                unchanged_read,
+            } = result?;
+            only_unchanged_reads &= unchanged_read;
             let is_terminal_call = call_name == "terminal";
             if !known_tools.contains(&call_name) && !unknown_tools.contains(&call_name) {
                 unknown_tools.push(call_name.clone());
@@ -1582,7 +1735,9 @@ where
                 events.emit(AgentEvent::run_resumed(reason, call_id.clone()));
             }
             let content = tool_result.render_for_model();
-            has_tool_error |= tool_result_is_error(&tool_result, &content);
+            // A refused re-read is no failure to re-assess: its refusal
+            // already says how to wait.
+            has_tool_error |= !unchanged_read && tool_result_is_error(&tool_result, &content);
             self.push_terminal_followup_events(is_terminal_call, &tool_result, events);
             let message = Message::tool(&call_id, content);
             if call_name == crate::ask_user::TOOL_NAME || self.kept_exchanges.remove(&call_id) {
@@ -1607,8 +1762,12 @@ where
                 "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain terminal, terminal_kill, terminal_input, and terminal_read.",
             );
         }
-        self.push_completed_background_events(events);
-        Ok(())
+        let background_news = self.push_completed_background_events(events);
+        Ok(if only_unchanged_reads && !background_news {
+            ToolTurn::OnlyUnchangedReads
+        } else {
+            ToolTurn::Progress
+        })
     }
 
     fn push_terminal_followup_events(
@@ -1641,14 +1800,19 @@ where
         }
     }
 
-    fn push_completed_background_events(&mut self, events: &EventSink) {
-        if let Some(receiver) = self.background_receiver.clone() {
-            self.push_job_alerts();
-            for task in receiver.take_completed() {
-                tracing::info!(task_id = %task.task_id, "background task completed");
-                self.push_completed_task_event(task, events);
-            }
+    /// Records queued background completions and alerts; returns whether
+    /// any of them is news the model must act on — an announced completion
+    /// or an alert that would wake a parked wait.
+    fn push_completed_background_events(&mut self, events: &EventSink) -> bool {
+        let Some(receiver) = self.background_receiver.clone() else {
+            return false;
+        };
+        let mut news = self.push_job_alerts();
+        for task in receiver.take_completed() {
+            tracing::info!(task_id = %task.task_id, "background task completed");
+            news |= self.push_completed_task_event(task, events);
         }
+        news
     }
 
     async fn push_turn_boundary_events(
@@ -2044,6 +2208,9 @@ where
         }
         let result_msg = format_background_task_result(&task);
         self.context.push(Message::system(&result_msg));
+        self.tasks
+            .events
+            .record(crate::tasks::TaskEvent::JobFinished(task.task_id.clone()));
         events.emit(AgentEvent::background_task_completed(
             task.task_id,
             result_msg,
@@ -2760,10 +2927,21 @@ where
         let reassembled = std::mem::take(&mut self.reassembled);
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_request(reassembled).await {
-                self.budget.append(block.len());
-                self.context.push_block_alert(&block);
+                self.push_source_alert(&block);
             }
         }
+        if let Some(document) = self.tasks_document.as_mut()
+            && let Some(block) =
+                crate::context::ContextSource::on_request(document, reassembled).await
+        {
+            self.push_source_alert(&block);
+        }
+    }
+
+    /// Appends a source's durable alert to the conversation.
+    fn push_source_alert(&mut self, block: &Block) {
+        self.budget.append(block.len());
+        self.context.push_block_alert(block);
     }
 
     /// Collects the durable alerts sources raise after a tool turn.
@@ -2771,9 +2949,13 @@ where
         self.push_injected_context();
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_tool_turn_end().await {
-                self.budget.append(block.len());
-                self.context.push_block_alert(&block);
+                self.push_source_alert(&block);
             }
+        }
+        if let Some(document) = self.tasks_document.as_mut()
+            && let Some(block) = crate::context::ContextSource::on_tool_turn_end(document).await
+        {
+            self.push_source_alert(&block);
         }
     }
 
@@ -2785,10 +2967,15 @@ where
         let mut pushed = false;
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_final_turn().await {
-                self.budget.append(block.len());
-                self.context.push_block_alert(&block);
+                self.push_source_alert(&block);
                 pushed = true;
             }
+        }
+        if let Some(document) = self.tasks_document.as_mut()
+            && let Some(block) = crate::context::ContextSource::on_final_turn(document).await
+        {
+            self.push_source_alert(&block);
+            pushed = true;
         }
         pushed
     }
@@ -2831,6 +3018,10 @@ where
                 .background_receiver
                 .as_ref()
                 .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running),
+            tasks: self
+                .tasks_document
+                .as_ref()
+                .and_then(crate::tasks::TasksDocument::checkpoint),
         })
     }
 
@@ -2841,6 +3032,10 @@ where
     /// Returns an error when the checkpoint cannot be restored into this agent.
     pub fn restore_checkpoint(&mut self, checkpoint: AgentCheckpoint) -> Result<(), AgentError> {
         self.context.restore(checkpoint.context);
+        // The restored conversation holds what its tasks document showed.
+        if let Some(document) = self.tasks_document.as_mut() {
+            document.restore(checkpoint.tasks);
+        }
         // Everything below belongs to the window just replaced: its fork
         // point, its failure, its parked tool results and its last request
         // mean nothing in the restored one.
@@ -3011,13 +3206,6 @@ where
                     guard,
                     self.sandbox_dir.clone(),
                 )));
-        }
-        if let Some(sandbox_dir) = self.sandbox_dir.clone() {
-            let mut source = TasksDocument::new(sandbox_dir, self.config.tasks_stale_after_turns);
-            if let Some(resolver) = self.blocker_resolver.clone() {
-                source = source.with_blocker_resolver(resolver);
-            }
-            self.context_sources.push(AnyContextSource::new(source));
         }
         if let Some(job_registry) = self.job_registry.clone() {
             self.context_sources
@@ -3420,6 +3608,10 @@ where
         let tool_surface_hash = self.tool_surface_hash();
         let tail = self.render_tail().await;
         let window = self.context_window_snapshot(&tail);
+        let tasks = self
+            .tasks_document
+            .as_ref()
+            .and_then(crate::tasks::TasksDocument::checkpoint);
         let checkpoint_ctx = CheckpointContext {
             reason,
             assistant_text,
@@ -3432,6 +3624,7 @@ where
                 .as_ref()
                 .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running),
             window: &window,
+            tasks: tasks.as_ref(),
         };
         if let Some(reason) = self.hooks.on_checkpoint(&checkpoint_ctx).await {
             return Err(AgentError::HookRejected {
@@ -3454,9 +3647,21 @@ fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String
         .as_ref()
         .map(aither_sandbox::TimeoutKill::notice);
     let (outcome, output, stderr) = match &task.result {
-        Ok(command) if task.killed => (
+        Ok(command) if task.kill.is_some() => (
             BackgroundOutcome::Killed {
                 timeout: timeout_notice.as_deref(),
+                runaway: match task.kill {
+                    Some(aither_sandbox::KillCause::MemoryRunaway {
+                        footprint_bytes,
+                        capacity_bytes,
+                        domain,
+                    }) => Some(RunawayText {
+                        footprint: aither_sandbox::MemorySize(footprint_bytes),
+                        capacity: aither_sandbox::MemorySize(capacity_bytes),
+                        domain,
+                    }),
+                    Some(aither_sandbox::KillCause::User) | None => None,
+                },
             },
             output_block(&command.stdout),
             command.stderr.as_ref().and_then(output_block),
@@ -3605,7 +3810,7 @@ mod tests {
             task_id: "amber-forest-thunder-pearl".to_string(),
             script: "make test".to_string(),
             result,
-            killed: false,
+            kill: None,
             timeout_kill: None,
             pending: None,
         }
@@ -3666,7 +3871,7 @@ mod tests {
             exit_code: -1,
             interruptions: Vec::new(),
         }));
-        task.killed = true;
+        task.kill = Some(aither_sandbox::KillCause::User);
         assert_eq!(
             format_background_task_result(&task),
             "Background task 'amber-forest-thunder-pearl' (`make test`) was killed.\npartial output\n"
@@ -3681,7 +3886,7 @@ mod tests {
             exit_code: -1,
             interruptions: Vec::new(),
         }));
-        task.killed = true;
+        task.kill = Some(aither_sandbox::KillCause::User);
         task.timeout_kill = Some(aither_sandbox::TimeoutKill {
             timeout: Duration::from_secs(90),
             started: "2026-11-04T12:00:00Z".parse().expect("timestamp"),
@@ -4699,6 +4904,7 @@ mod tests {
                 messages: Vec::new(),
             },
             has_background_tasks: false,
+            tasks: None,
         }
     }
 
@@ -4950,16 +5156,18 @@ mod tests {
                 call("native", "ask_user"),
             ],
         ));
-        for id in ["kept", "plain"] {
-            agent
-                .tool_results
-                .push_back(Ok((id.into(), "terminal".into(), ToolResult::text(id))));
+        for (id, name) in [
+            ("kept", "terminal"),
+            ("plain", "terminal"),
+            ("native", "ask_user"),
+        ] {
+            agent.tool_results.push_back(Ok(FinishedToolCall {
+                id: id.into(),
+                name: name.into(),
+                result: ToolResult::text(id),
+                unchanged_read: false,
+            }));
         }
-        agent.tool_results.push_back(Ok((
-            "native".into(),
-            "ask_user".into(),
-            ToolResult::text("native"),
-        )));
         let (sender, _events) = async_channel::unbounded();
         agent
             .apply_tool_results(&EventSink { sender })
@@ -4978,37 +5186,50 @@ mod tests {
     }
 
     fn tasks_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+        tasks_agent_on(dir, crate::tasks::TaskEvents::new())
+    }
+
+    fn tasks_agent_on(
+        dir: &std::path::Path,
+        events: crate::tasks::TaskEvents,
+    ) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
         Agent::builder(MockLlm {
             context_length: 1_000_000,
         })
         .sandbox_dir(dir)
-        .config(AgentConfig {
-            tasks_stale_after_turns: 2,
-            ..AgentConfig::default()
-        })
+        .task_events(events)
         .build()
     }
 
+    /// An event the host records on the inbox it gave the builder reaches
+    /// the agent's tasks document, and its alert the conversation, once.
     #[tokio::test]
     async fn tool_turn_alerts_from_sources_reach_the_conversation() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir should exist");
-        std::fs::write(dir.path().join("tasks.md"), "- [ ] pending\n").expect("write tasks.md");
-        let mut agent = tasks_agent(dir.path());
+        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- #3 PR #12 open\n")
+            .expect("write tasks.md");
+        let events = crate::tasks::TaskEvents::new();
+        let mut agent = tasks_agent_on(dir.path(), events.clone());
         agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_request_alerts().await;
 
-        agent.push_tool_turn_alerts().await; // baseline
-        agent.push_tool_turn_alerts().await; // stale turn 1
-        agent.push_tool_turn_alerts().await; // stale turn 2 -> alert
+        events.record(crate::tasks::TaskEvent::PullRequestMerged(
+            crate::tasks::WorkRef::pull_request(12),
+        ));
+        for _ in 0..3 {
+            agent.push_request_alerts().await;
+            agent.push_tool_turn_alerts().await;
+        }
 
         let alerts = agent
             .context()
             .conversation_messages()
             .iter()
-            .filter(|message| message.content().contains("<tasks_stale>"))
+            .filter(|message| message.content().contains("PR #12 was merged"))
             .count();
-        assert_eq!(alerts, 1, "a stale episode must alert exactly once");
+        assert_eq!(alerts, 1, "an unrecorded event alerts exactly once");
     }
 
     #[tokio::test]
@@ -5016,13 +5237,14 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir should exist");
-        std::fs::write(dir.path().join("tasks.md"), "- [ ] pending\n").expect("write tasks.md");
+        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- pending\n")
+            .expect("write tasks.md");
         let mut agent = tasks_agent(dir.path());
         agent.ensure_initialized().await.expect("agent initializes");
 
         assert!(
             agent.push_final_turn_alerts().await,
-            "unchecked tasks must object to the model stopping"
+            "an actionable row must object to the model stopping"
         );
     }
 
@@ -5179,7 +5401,7 @@ mod tests {
                             .send_completed(aither_sandbox::CompletedTask {
                                 task_id: "task-test".to_string(),
                                 script: "cat".to_string(),
-                                killed: false,
+                                kill: None,
                                 timeout_kill: None,
                                 pending: None,
                                 result: Err(aither_sandbox::TerminalError::Execution(
@@ -6950,7 +7172,7 @@ mod tests {
         aither_sandbox::CompletedTask {
             task_id: task_id.to_string(),
             script: "make".to_string(),
-            killed: false,
+            kill: None,
             timeout_kill: None,
             result: Err(aither_sandbox::TerminalError::Execution(output.to_string())),
             pending: None,
@@ -7151,6 +7373,13 @@ mod tests {
                 .any(|timed| matches!(timed.event, AgentEvent::BackgroundTaskCompleted { .. })),
             "the host should see the completion: {:?}",
             wake.events
+        );
+        assert_eq!(
+            agent.tasks.events.take(),
+            vec![crate::tasks::TaskEvent::JobFinished(
+                "task-build".to_string()
+            )],
+            "the finished job reaches the tasks inbox"
         );
 
         let events = drain_run(agent.resume()).await;

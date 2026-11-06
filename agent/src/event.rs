@@ -4,6 +4,7 @@ use crate::context_window::ContextWindowPhase;
 use crate::error::AgentError;
 use crate::hook::CheckpointReason;
 use aither_core::llm::ToolResult;
+use core::time::Duration;
 use jiff::Timestamp;
 
 /// An [`AgentEvent`] together with the UTC time it was emitted.
@@ -120,6 +121,26 @@ pub enum AgentEvent {
         tool: String,
         /// Result summary.
         result: String,
+    },
+
+    /// The model's response stream broke after it opened, and the same
+    /// request is sent again after `delay`.
+    ///
+    /// Everything streamed since the request was sent — text, reasoning,
+    /// tool-call deltas and hosted tool calls — belonged to the broken
+    /// attempt: none of it enters the conversation and none of its tool calls
+    /// run. A client drops what it rendered of that attempt; the replacement
+    /// streams after this event.
+    ResponseRetry {
+        /// Why the stream broke.
+        error: AgentError,
+        /// Which retry this is, counting from 1.
+        retry: u32,
+        /// The most retries the model's
+        /// [`RetryPolicy`](aither_core::llm::RetryPolicy) allows.
+        max_retries: u32,
+        /// How long the agent waits before sending the request again.
+        delay: Duration,
     },
 
     /// Agent turn completed (may have more turns if tools were called).

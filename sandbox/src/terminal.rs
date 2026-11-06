@@ -12,6 +12,11 @@
 
 use crate::foreground_wait::ForegroundWait;
 use crate::grants::{GrantSet, TerminalGrants};
+use crate::heel_binary::SharedHeelBinary;
+use crate::memory::{
+    AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, FootprintReader,
+    FootprintRegistry, JobMemory, ProbedContainerMemory, ResponseWindow, SystemFootprints,
+};
 use crate::outage::Outages;
 use std::{
     borrow::Cow,
@@ -76,8 +81,9 @@ use crate::{
         EpisodeDetector, FeedCounter, LocalStdinProbe, STDIN_WATCH_INTERVAL, StdinWatchSignal,
     },
     subagent::{
-        CommitLedger, CommittingWorktree, ImportBudget, ImportLimits, LaunchHistory, Launcher,
-        Spelling, SubagentGit, SubagentGrant, SubagentGrantError, canonical as canonical_path,
+        AnySubagentSpaces, CommitLedger, CommittingWorktree, ImportBudget, ImportLimits,
+        LaunchHistory, Launcher, PreparedSpace, ResolvedGrant, RunSpace, Spelling, SubagentGit,
+        SubagentGrant, SubagentGrantError, SubagentSpaces, canonical as canonical_path,
     },
 };
 
@@ -566,6 +572,8 @@ const MAX_LINES_CEILING: u32 = 800;
 /// How long a `terminal` call waits in the foreground before a still-running
 /// command promotes to a background task.
 pub const DEFAULT_FOREGROUND_WAIT: Duration = Duration::from_secs(10);
+/// How long the agent has to act on a final memory warning by default.
+pub const DEFAULT_RESPONSE_WINDOW: Duration = Duration::from_secs(120);
 /// The default of the most bytes a subagent's sandbox may send the host while
 /// its commits are imported into the main repository.
 pub const DEFAULT_SUBAGENT_IMPORT_LIMIT: u64 = 1024 * 1024 * 1024;
@@ -588,11 +596,22 @@ struct TerminalLimits {
     /// imported; shared with every terminal derived from this one, and
     /// adjustable at runtime.
     subagent_import: ImportBudget,
+    /// How long the agent has to act on a final memory warning; adjustable
+    /// at runtime and shared with every terminal derived from this one.
+    response_window: ResponseWindow,
+    /// Reads what the terminal's jobs hold of the machine's memory.
+    footprints: AnyFootprintReader,
+    /// Shares the total the agent's jobs hold with the machine's other
+    /// agents; `None` when the embedder configured no registry.
+    footprint_registry: Option<AnyFootprintRegistry>,
 }
 
 impl Default for TerminalLimits {
     fn default() -> Self {
         Self {
+            response_window: ResponseWindow::new(DEFAULT_RESPONSE_WINDOW),
+            footprints: AnyFootprintReader::new(SystemFootprints),
+            footprint_registry: None,
             foreground_wait: ForegroundWait::new(DEFAULT_FOREGROUND_WAIT),
             timeout_cap: DEFAULT_TIMEOUT_CAP,
             long_job_alert: DEFAULT_LONG_JOB_ALERT_AFTER,
@@ -809,9 +828,9 @@ pub struct CompletedTask {
     pub script: String,
     /// The result of execution.
     pub result: Result<CompletedCommand, TerminalError>,
-    /// Whether the job was killed — its `timeout` bound or `terminal_kill`
-    /// — rather than exiting on its own.
-    pub killed: bool,
+    /// Why the job was killed — its `timeout` bound, `terminal_kill` or a
+    /// memory runaway — or `None` when it exited on its own.
+    pub kill: Option<crate::KillCause>,
     /// Set when the kill was the `timeout` bound passing.
     pub timeout_kill: Option<TimeoutKill>,
     /// Keeps the job reading [`Delivery::Pending`](crate::Delivery) in its
@@ -1128,6 +1147,7 @@ struct TerminalToolRequest {
     grant: SubagentGrant,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
+    caller: Option<PathBuf>,
     reply: Sender<Result<crate::command::DynTerminalTool, SubagentGrantError>>,
 }
 
@@ -1153,16 +1173,21 @@ impl TerminalToolFactory {
     /// inside the launching terminal's working directory; `grant` is
     /// everything it may write beyond that space, and must lie inside what the
     /// launching terminal can write. The commands it calls are told to
-    /// `observer`, and every shell command it runs is put to `gate`.
+    /// `observer`, and every shell command it runs is put to `gate`. When the
+    /// launching terminal has [`SubagentSpaces`], they prepare the space
+    /// first and are told `caller`, the directory the launch is asked for
+    /// from (the launching terminal's working directory when `None`).
     ///
     /// # Errors
     /// Returns an error when the launching terminal is gone or does not
-    /// respond, or when the grant cannot be given.
+    /// respond, when the grant cannot be given, or when the space cannot be
+    /// prepared.
     pub async fn create(
         &self,
         grant: SubagentGrant,
         observer: Option<AnyCommandObserver>,
         gate: Option<AnyCommandGate>,
+        caller: Option<&Path>,
     ) -> Result<crate::command::DynTerminalTool, TerminalToolFactoryError> {
         let (reply, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -1170,6 +1195,7 @@ impl TerminalToolFactory {
                 grant,
                 observer,
                 gate,
+                caller: caller.map(Path::to_path_buf),
                 reply,
             })
             .await
@@ -1181,8 +1207,9 @@ impl TerminalToolFactory {
     }
 }
 
-/// Serves a terminal's launch requests one at a time, so the grants handed
-/// out from it are recorded in one place.
+/// Serves a terminal's launch requests: their grants are resolved one at a
+/// time, so the grants handed out from it are recorded in one place, and
+/// each launch then goes on, its space prepared, beside the others.
 ///
 /// `source` is the terminal with its registry not yet bound: it holds no
 /// handle to its own launcher, so the loop ends once every terminal-bound
@@ -1199,16 +1226,33 @@ async fn serve_launches<P, E>(
         grant,
         observer,
         gate,
+        caller,
         reply,
     }) = requests.recv().await
     {
-        let tool = source
-            .subagent(&mut history, grant, observer, gate)
-            .await
-            .map(TerminalTool::to_dyn);
-        if reply.send(tool).await.is_err() {
-            warn!("terminal tool factory response channel dropped");
-        }
+        let resolved = match source.resolve_launch(&mut history, grant).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                if reply.send(Err(error)).await.is_err() {
+                    warn!("terminal tool factory response channel dropped");
+                }
+                continue;
+            }
+        };
+        let source = source.clone();
+        source
+            .executor
+            .clone()
+            .spawn(async move {
+                let tool = source
+                    .launch_resolved(resolved, observer, gate, caller.as_deref())
+                    .await
+                    .map(TerminalTool::to_dyn);
+                if reply.send(tool).await.is_err() {
+                    warn!("terminal tool factory response channel dropped");
+                }
+            })
+            .detach();
     }
 }
 
@@ -1482,6 +1526,21 @@ struct SubagentAuthority {
     /// space and granted paths, mapped through the container's workspace
     /// mount when it was launched.
     container: Option<ContainerConfinement>,
+    /// What the launcher's [`SubagentSpaces`] made in its space; `None` when
+    /// the launcher has none.
+    prepared: Option<PreparedSpace>,
+}
+
+/// A subagent launch whose grant is resolved: everything the launch still
+/// needs from what the launching terminal handed out.
+struct ResolvedLaunch {
+    /// The launching terminal's working directory and grants, canonical.
+    authority: Vec<PathBuf>,
+    /// Where the subagent's space goes.
+    spaces_root: PathBuf,
+    /// The container workspace mount, for a container terminal.
+    mount: Option<MountRoot>,
+    granted: ResolvedGrant,
 }
 
 /// The main agent's working directory, carried from one foreground command
@@ -1576,8 +1635,14 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     /// Shared jobserver token broker, when configured.
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
+    /// The verified `heel` binary every sandbox this tool creates carries,
+    /// shared by its clones and its subagents' tools.
+    heel: SharedHeelBinary,
     /// Records the outages commands run through.
     outages: Outages,
+    /// Prepares the space of every subagent launched from this terminal and,
+    /// at any depth, from theirs.
+    subagent_spaces: Option<AnySubagentSpaces>,
     /// Tool registry state.
     registry: State,
 }
@@ -1610,7 +1675,9 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver.clone(),
+            heel: self.heel.clone(),
             outages: self.outages.clone(),
+            subagent_spaces: self.subagent_spaces.clone(),
             registry: self.registry.clone(),
         }
     }
@@ -1657,6 +1724,16 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
     #[must_use]
     pub fn with_network_audit_log(mut self, log: NetworkAuditLog) -> Self {
         self.network_audit = Some(log);
+        self
+    }
+
+    /// Has `spaces` prepare the space of every subagent launched from this
+    /// terminal and, at any depth, from theirs, before the subagent's
+    /// terminal exists. A launch whose space cannot be prepared fails with
+    /// the error `spaces` gives.
+    #[must_use]
+    pub fn with_subagent_spaces(mut self, spaces: impl SubagentSpaces) -> Self {
+        self.subagent_spaces = Some(AnySubagentSpaces::new(spaces));
         self
     }
 
@@ -1730,7 +1807,9 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
+            heel: SharedHeelBinary::default(),
             outages: Outages::none(),
+            subagent_spaces: None,
             registry: Unconfigured,
         })
     }
@@ -1799,7 +1878,9 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
+            heel: SharedHeelBinary::default(),
             outages: Outages::none(),
+            subagent_spaces: None,
             registry: Unconfigured,
         })
     }
@@ -1833,7 +1914,9 @@ impl<P, E, State> TerminalTool<P, E, State> {
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver,
+            heel: self.heel,
             outages: self.outages,
+            subagent_spaces: self.subagent_spaces,
             registry: state(self.registry),
         }
     }
@@ -1868,13 +1951,8 @@ where
 {
     /// A subagent terminal with an empty grant, told to no observer or gate.
     async fn subagent_without_grant(&self) -> Result<Self, SubagentGrantError> {
-        self.subagent(
-            &mut LaunchHistory::default(),
-            SubagentGrant::new(),
-            None,
-            None,
-        )
-        .await
+        self.subagent(&mut LaunchHistory::default(), SubagentGrant::new(), None)
+            .await
     }
 }
 
@@ -2048,6 +2126,75 @@ where
         self.limits.foreground_wait.clone()
     }
 
+    /// Sets how long the agent has to act on a final memory warning before
+    /// the job it names is killed. Defaults to [`DEFAULT_RESPONSE_WINDOW`].
+    #[must_use]
+    pub fn with_response_window(self, window: Duration) -> Self {
+        self.limits.response_window.set(window);
+        self
+    }
+
+    /// A handle on the response window, shared with every terminal derived
+    /// from this one: a window set through it applies to the next final
+    /// warning of each of them.
+    #[must_use]
+    pub fn response_window(&self) -> ResponseWindow {
+        self.limits.response_window.clone()
+    }
+
+    /// Reads job footprints and the machine's physical memory through
+    /// `reader` instead of the platform's own.
+    #[must_use]
+    pub fn with_footprint_reader(mut self, reader: impl FootprintReader) -> Self {
+        self.limits.footprints = AnyFootprintReader::new(reader);
+        self
+    }
+
+    /// Shares the memory this terminal's jobs hold with the machine's other
+    /// agents through `registry`, so a final warning can name the agent that
+    /// contributes the most when all agents together exceed physical memory.
+    #[must_use]
+    pub fn with_footprint_registry(mut self, registry: impl FootprintRegistry) -> Self {
+        self.limits.footprint_registry = Some(AnyFootprintRegistry::new(registry));
+        self
+    }
+
+    /// The memory the terminal's jobs hold, for a guard that warns about and
+    /// kills a runaway job.
+    #[must_use]
+    ///
+    /// The machine the embedder runs on is always judged. When the terminal
+    /// runs in a container, the container's own memory limit is judged too,
+    /// read inside the container. Jobs of a remote execution environment are
+    /// never judged.
+    pub fn job_memory(&self) -> JobMemory {
+        let memory = JobMemory::new(
+            self.job_registry(),
+            self.limits.footprints.clone(),
+            self.limits.footprint_registry.clone(),
+            self.limits.response_window.clone(),
+        );
+        match self.container_probe() {
+            Some(probe) => {
+                memory.with_container(AnyContainerMemory::new(ProbedContainerMemory::new(probe)))
+            }
+            None => memory,
+        }
+    }
+
+    /// A reader of the container the agent works in, when the terminal's
+    /// home environment is a container; `None` when it is the local
+    /// machine. A remote execution environment is never a home environment.
+    #[must_use]
+    pub fn container_probe(&self) -> Option<crate::ContainerProbe> {
+        if self.shell_sessions.resolve_local_backend() != Ok(ShellBackend::Container) {
+            return None;
+        }
+        self.shell_sessions
+            .container_runtime()
+            .map(ContainerShellRuntime::probe)
+    }
+
     /// Sets the largest `timeout` a command accepts.
     /// Defaults to [`DEFAULT_TIMEOUT_CAP`].
     #[must_use]
@@ -2118,7 +2265,14 @@ where
             .await?;
         if let Some(tools) = self.local_home_tools()? {
             tools.ensure_readonly(self.writable_grants().iter()).await?;
-            tools.verify_local_versions(self.executor.clone()).await?;
+            let heel = self
+                .heel
+                .get()
+                .await
+                .map_err(|error| ToolRuntimeError::SshBootstrap(error.to_string()))?;
+            tools
+                .verify_local_versions(self.executor.clone(), heel)
+                .await?;
         }
         Ok(self)
     }
@@ -2269,31 +2423,33 @@ where
     E: Executor + Clone + 'static,
     State: RegistryState,
 {
-    /// Creates the terminal tool of a subagent this terminal launches.
-    ///
-    /// The subagent shares the permission handler, output store and prepared
-    /// tools, serves the subagent registry (so nothing reserved for the main
-    /// agent is reachable, however deep subagents nest) with its
-    /// terminal-bound commands built for it, and has its own launcher and
-    /// background task tracking. It works in a space of its own inside this
-    /// terminal's working directory; everything this terminal can write is
-    /// read-only to it, apart from what `grant` hands over, which never
+    /// Creates the terminal tool of a subagent this terminal launches, as
+    /// [`Self::resolve_launch`] and [`Self::launch_resolved`] do one after
+    /// the other.
+    #[cfg(test)]
+    pub(crate) async fn subagent(
+        &self,
+        history: &mut LaunchHistory,
+        grant: SubagentGrant,
+        caller: Option<&Path>,
+    ) -> Result<TerminalTool<P, E, Configured>, SubagentGrantError> {
+        let resolved = self.resolve_launch(history, grant).await?;
+        self.launch_resolved(resolved, None, None, caller).await
+    }
+
+    /// Resolves the grant of a subagent this terminal launches: it never
     /// exceeds what this terminal can write or commit. `history` records what
     /// the main agent's terminal handed out.
     ///
     /// # Errors
     /// Returns an error when `grant` names a path this terminal cannot write
-    /// or a commit it cannot grant, when the grant cannot be resolved, when a
-    /// container session cannot express the subagent's paths, or when the
-    /// subagent's space cannot be created.
-    #[allow(clippy::too_many_lines)]
-    pub(crate) async fn subagent(
+    /// or a commit it cannot grant, when the grant cannot be resolved, or when
+    /// a container session has no workspace mount.
+    async fn resolve_launch(
         &self,
         history: &mut LaunchHistory,
         grant: SubagentGrant,
-        observer: Option<AnyCommandObserver>,
-        gate: Option<AnyCommandGate>,
-    ) -> Result<TerminalTool<P, E, Configured>, SubagentGrantError> {
+    ) -> Result<ResolvedLaunch, SubagentGrantError> {
         // Grants are compared by real path, so every path of the subagent's
         // view is canonical.
         let working_dir = canonical_path(&self.working_dir).await?;
@@ -2322,7 +2478,45 @@ where
         self.registry
             .registry()
             .record_committed(&granted.committing);
+        Ok(ResolvedLaunch {
+            authority,
+            spaces_root,
+            mount,
+            granted,
+        })
+    }
 
+    /// Creates the terminal tool of a subagent this terminal launches with
+    /// the grant `resolved` holds.
+    ///
+    /// The subagent shares the permission handler, output store and prepared
+    /// tools, serves the subagent registry (so nothing reserved for the main
+    /// agent is reachable, however deep subagents nest) with its
+    /// terminal-bound commands built for it, and has its own launcher and
+    /// background task tracking. It works in a space of its own inside this
+    /// terminal's working directory, which this terminal's
+    /// [`SubagentSpaces`] fill first; everything this terminal can write is
+    /// read-only to it, apart from what the grant hands over. The commands
+    /// it calls are told to `observer`, and every shell command it runs is
+    /// put to `gate`.
+    ///
+    /// # Errors
+    /// Returns an error when a container session cannot express the
+    /// subagent's paths, or when the subagent's space cannot be created or
+    /// prepared.
+    #[allow(clippy::too_many_lines)]
+    async fn launch_resolved(
+        &self,
+        ResolvedLaunch {
+            authority,
+            spaces_root,
+            mount,
+            granted,
+        }: ResolvedLaunch,
+        observer: Option<AnyCommandObserver>,
+        gate: Option<AnyCommandGate>,
+        caller: Option<&Path>,
+    ) -> Result<TerminalTool<P, E, Configured>, SubagentGrantError> {
         let space = spaces_root.join(crate::naming::random_word_slug(4));
         let container = mount
             .as_ref()
@@ -2334,6 +2528,32 @@ where
                 path: space.clone(),
                 source,
             })?;
+        let prepared = match &self.subagent_spaces {
+            Some(spaces) => {
+                let launcher = &authority[0];
+                let run = RunSpace {
+                    space: &space,
+                    launcher,
+                    caller: caller.unwrap_or(launcher),
+                };
+                match prepare_space(spaces, run).await {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        // No run ever worked in the space, so it is no one's
+                        // to keep.
+                        if let Err(removal) = async_fs::remove_dir_all(&space).await {
+                            warn!(
+                                space = %space.display(),
+                                %removal,
+                                "cannot remove a subagent space whose preparation failed"
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            None => None,
+        };
 
         let (completed_tx, completed_rx) = async_channel::unbounded();
         let (alert_tx, alert_rx) = async_channel::unbounded();
@@ -2363,6 +2583,7 @@ where
                 readable: readable_paths,
                 committing: granted.committing.clone(),
                 priority: self.priority,
+                heel: self.heel.clone(),
             })),
         };
         let registry = Arc::new(
@@ -2396,6 +2617,7 @@ where
                 committing: granted.committing,
                 git,
                 container,
+                prepared,
             }),
             carried_dir: None,
             env_source: self.env_source.clone(),
@@ -2403,10 +2625,21 @@ where
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver.clone(),
+            heel: self.heel.clone(),
             outages: self.outages.clone(),
+            subagent_spaces: self.subagent_spaces.clone(),
             registry: Launching { registry },
         };
         Ok(launching.into_served())
+    }
+
+    /// What this terminal's launcher prepared in its space; `None` for the
+    /// main agent's terminal and when the launcher has no
+    /// [`SubagentSpaces`].
+    fn prepared_space(&self) -> Option<PreparedSpace> {
+        self.subagent
+            .as_ref()
+            .and_then(|subagent| subagent.prepared.clone())
     }
 
     /// The workspace mount of this terminal's home container, with its host
@@ -2427,6 +2660,22 @@ where
             mount.container_root.clone(),
         )))
     }
+}
+
+/// Has `spaces` prepare `run`'s space and confines what they name to it.
+async fn prepare_space(
+    spaces: &AnySubagentSpaces,
+    run: RunSpace<'_>,
+) -> Result<PreparedSpace, SubagentGrantError> {
+    spaces
+        .prepare(run)
+        .await
+        .map_err(|source| SubagentGrantError::Preparation {
+            space: run.space.to_path_buf(),
+            source,
+        })?
+        .confine(run.space)
+        .await
 }
 
 /// The sandbox a subagent's commands run in inside a container: its space and
@@ -2506,6 +2755,7 @@ where
         let working_dir = self.working_dir().clone();
         let command_names = self.registry().available_tool_names();
         let commit_ledger = self.commit_ledger();
+        let prepared_space = self.prepared_space();
         let role = self.registry().role();
         let prepared_tools = self
             .shell_sessions
@@ -2524,6 +2774,7 @@ where
             command_names,
             prepared_tools,
             commit_ledger,
+            prepared_space,
             role,
         }
     }
@@ -2680,6 +2931,7 @@ where
             raw,
             background,
             timeout,
+            file_reads,
             carry,
             call,
         } = request;
@@ -2734,6 +2986,7 @@ where
                 execution_id,
                 background,
                 timeout_watch: timeout_watch.clone(),
+                file_reads,
                 carry,
                 carried_dir: self.carried_dir.clone(),
                 alert_tx: self.alert_tx.clone(),
@@ -2755,6 +3008,7 @@ where
                 priority: self.priority,
                 #[cfg(all(unix, feature = "jobserver"))]
                 jobserver: self.jobserver.clone(),
+                heel: self.heel.clone(),
                 outages,
             }))
             .detach();
@@ -2809,6 +3063,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             raw: arguments.raw,
             background: arguments.background,
             timeout,
+            file_reads: prepared.file_reads,
             carry: carry.clone(),
             call: cx.identity().cloned(),
         });
@@ -3153,10 +3408,10 @@ where
                 arguments.max_lines,
             )
             .await?;
-        if !file_reads.is_empty() {
-            self.job_registry.record_file_reads(file_reads).await;
-        }
-        Ok(prepared)
+        Ok(ExecutionPreparation {
+            file_reads,
+            ..prepared
+        })
     }
 
     /// The terminal's policy for a command, whoever runs it: the command
@@ -3189,6 +3444,7 @@ where
         self.ensure_permission_allowed(target.mode, script).await?;
         let task_id = random_task_id();
         Ok(ExecutionPreparation {
+            file_reads: Vec::new(),
             target,
             execution_id: format!("exec-{task_id}"),
             task_id,
@@ -3225,6 +3481,7 @@ where
             raw: false,
             background: false,
             timeout: run.timeout,
+            file_reads: Vec::new(),
             carry: Some(start),
             call: None,
         });
@@ -3341,7 +3598,12 @@ where
     }
 }
 
+/// A command's file reads with the fingerprints taken at admission.
+type FileReads = Vec<(std::path::PathBuf, crate::job_registry::FileFingerprint)>;
+
 struct ExecutionPreparation {
+    /// Fingerprinted at admission, recorded once the command exits 0.
+    file_reads: FileReads,
     target: ExecutionTarget,
     task_id: String,
     execution_id: String,
@@ -3497,6 +3759,7 @@ struct StandaloneExecution<P, E> {
     task_id: String,
     execution_id: String,
     background: bool,
+    file_reads: FileReads,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     alert_tx: Sender<JobAlert>,
@@ -3510,6 +3773,7 @@ struct StandaloneExecution<P, E> {
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
+    heel: SharedHeelBinary,
     expect: OutputFormat,
     resolution: MediaResolution,
     store_dir: PathBuf,
@@ -3539,6 +3803,7 @@ struct StandaloneStart<'a, P, E> {
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: &'a Option<JobBroker>,
+    heel: &'a SharedHeelBinary,
 }
 
 struct LocalBackgroundExecution<'a, E> {
@@ -3561,6 +3826,7 @@ struct LocalBackgroundExecution<'a, E> {
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     job_fifo: Option<crate::jobserver::CommandFifo>,
+    heel: &'a SharedHeelBinary,
 }
 
 struct ContainerBackgroundExecution<'a, E> {
@@ -3643,6 +3909,9 @@ struct TerminalSpawnRequest {
     raw: bool,
     background: bool,
     timeout: Duration,
+    /// Files the command reads, recorded for the unchanged-file guard once
+    /// it exits 0.
+    file_reads: FileReads,
     carry: Option<CwdCarry>,
     /// The `terminal` call this execution belongs to.
     call: Option<CallIdentity>,
@@ -3666,6 +3935,7 @@ struct SpawnedTerminalTask<P, E> {
     execution_id: String,
     background: bool,
     timeout_watch: Arc<TimeoutWatch>,
+    file_reads: FileReads,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     alert_tx: Sender<JobAlert>,
@@ -3688,9 +3958,11 @@ struct SpawnedTerminalTask<P, E> {
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
+    heel: SharedHeelBinary,
     outages: Outages,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_terminal_task<P, E>(task: SpawnedTerminalTask<P, E>)
 where
     P: PermissionHandler + 'static,
@@ -3709,6 +3981,7 @@ where
         execution_id,
         background,
         timeout_watch,
+        file_reads,
         carry,
         carried_dir,
         alert_tx,
@@ -3730,6 +4003,7 @@ where
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
+        heel,
         outages,
     } = task;
     let status_registry = job_registry.clone();
@@ -3745,6 +4019,7 @@ where
         task_id: task_id.clone(),
         execution_id,
         background,
+        file_reads,
         carry,
         carried_dir,
         alert_tx,
@@ -3758,6 +4033,7 @@ where
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
+        heel,
         expect,
         resolution,
         store_dir,
@@ -3784,7 +4060,7 @@ where
         Err(error) => Err(error.to_string()),
     };
     let owed = status_registry.owe_completion(&task_id, ending).await;
-    let killed = owed.as_ref().is_some_and(|owed| owed.killed);
+    let kill = owed.as_ref().and_then(|owed| owed.kill);
     // Every job reports completion; the agent reinjects the result only for
     // tasks it saw promoted or detached (`take_started`), so a plain
     // foreground result is not delivered twice.
@@ -3793,8 +4069,8 @@ where
             task_id,
             script,
             result,
-            killed,
-            timeout_kill: timeout_watch.kill().filter(|_| killed),
+            kill,
+            timeout_kill: timeout_watch.kill().filter(|_| kill.is_some()),
             pending: owed.map(|owed| owed.pending),
         })
         .await;
@@ -3822,6 +4098,7 @@ where
         task_id,
         execution_id,
         background,
+        file_reads,
         carry,
         carried_dir,
         alert_tx,
@@ -3835,6 +4112,7 @@ where
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
+        heel,
         expect,
         resolution,
         store_dir,
@@ -3870,6 +4148,7 @@ where
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver: &jobserver,
+        heel: &heel,
     })
     .await;
     let (pid, output) = match start_result {
@@ -3898,6 +4177,11 @@ where
 
     let output_path = stored_path(&result.stdout);
     job_registry.complete(pid, exit_code, output_path).await;
+    // Only a read that succeeded counts for the unchanged-file guard: a
+    // denied or failed read must run again and show its failure.
+    if exit_code == 0 && !file_reads.is_empty() {
+        job_registry.record_file_reads(file_reads).await;
+    }
 
     // The command's directory report arrives with its end, whether the call
     // answered in the foreground window or the command promoted: the task
@@ -4023,6 +4307,7 @@ where
         priority: request.priority,
         #[cfg(all(unix, feature = "jobserver"))]
         job_fifo,
+        heel: request.heel,
     };
     match request.mode {
         TerminalMode::Sandboxed => {
@@ -4378,6 +4663,29 @@ pub fn local_path_grants(
         .collect()
 }
 
+/// The grants that let git work in a granted linked worktree: its common git
+/// directory, with the worktree's own access. The directory is the
+/// repository's, outside the worktree, and a strict sandbox reads only what
+/// is granted. Only a pointer git's back-links confirm
+/// ([`crate::subagent::confirmed_common_dir`]) grants anything, because the
+/// `.git` file sits in a directory the session can write.
+pub async fn linked_worktree_grants(
+    writable: &[PathBuf],
+    readable: &[PathBuf],
+) -> heel::Result<Vec<Grant>> {
+    let mut grants = Vec::new();
+    for (path, access) in writable
+        .iter()
+        .map(|path| (path, Access::WRITE | Access::EXEC))
+        .chain(readable.iter().map(|path| (path, Access::READ)))
+    {
+        if let Some(common) = crate::subagent::confirmed_common_dir(path).await {
+            grants.push(Grant::new(resolved(&common)?, access));
+        }
+    }
+    Ok(grants)
+}
+
 /// Host toolchain homes a local sandbox reaches: (env var, resolved
 /// existing dir). `CARGO_HOME` and `RUSTUP_HOME` fall back to their
 /// `~/.cargo` / `~/.rustup` defaults; only directories that exist yield, so
@@ -4399,6 +4707,56 @@ fn host_toolchain_homes() -> impl Iterator<Item = (&'static str, PathBuf)> {
     .filter(|(_, path)| path.is_dir())
 }
 
+/// The grants that let a command run what the session's `PATH` lists: each
+/// existing absolute directory of the `PATH` in `environment`, read and
+/// execute, never write. They come from the `PATH` itself, so a tool in any
+/// directory the user put there runs without a list of known toolchains.
+pub fn path_directory_grants(environment: &[(String, String)]) -> heel::Result<Vec<Grant>> {
+    let Some((_, path)) = environment.iter().find(|(name, _)| name == "PATH") else {
+        return Ok(Vec::new());
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut grants = Vec::new();
+    for directory in std::env::split_paths(path) {
+        if !directory.is_absolute() || !directory.is_dir() {
+            continue;
+        }
+        let resolved = resolved(&directory)?;
+        if seen.insert(resolved.as_path().to_path_buf()) {
+            grants.push(Grant::new(resolved, Access::READ | Access::EXEC));
+        }
+    }
+    Ok(grants)
+}
+
+/// The paths a session sandbox must not write: heel's persistence table
+/// (git hooks and config, shell startup files, `PATH` directories and the
+/// rest), where a write runs as code outside the sandbox later.
+///
+/// Three places are exempt, because the table forbids creating a `.git` at all
+/// and the commands that need to would otherwise be impossible: cargo's git
+/// cache, `$CARGO_HOME/git`, where cargo clones git dependencies and keeps
+/// their `.git/hooks`, which it creates and removes itself and no user runs;
+/// the session directory `working_dir`, where `git clone` and `git init`
+/// make the session's own repositories; and the prepared runtime's `uv`
+/// cache (`UV_CACHE_DIR`), whose buckets `uv` marks with a `.git` entry and
+/// where no user runs git. Nothing else of a toolchain home is exempt.
+pub fn session_write_denylist(
+    working_dir: &Path,
+    tools: &PreparedTools<PathBuf>,
+) -> heel::WriteDenylist {
+    let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let denylist = heel::WriteDenylist::persistence().except(resolved(working_dir));
+    let denylist = match host_toolchain_homes().find(|(name, _)| *name == "CARGO_HOME") {
+        Some((_, cargo_home)) => denylist.except(resolved(&cargo_home).join("git")),
+        None => denylist,
+    };
+    match tools.uv_environment() {
+        Some(uv) => denylist.except(resolved(&uv.cache)),
+        None => denylist,
+    }
+}
+
 /// The toolchain directories a sandboxed build needs: package-manager
 /// installs, compilers, and their caches, each rwx since builds both run
 /// the binaries and write the caches. Credential files inside them stay
@@ -4418,11 +4776,21 @@ where
     E: Executor + Clone + 'static,
     N: NetworkPolicy + 'static,
 {
-    let (grants, mut runtime_environment) = local_launch_policy(&context).await?;
+    let (grants, mut runtime_environment, write_denylist) = local_launch_policy(&context).await?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
-    let config_builder = SandboxConfig::builder()
-        .network(policy)
+    let heel_binary = context
+        .heel
+        .get()
+        .await
+        .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
+    let config_builder = SandboxConfig::builder().network(policy);
+    // The Windows backend refuses a write denylist rather than run weaker.
+    #[cfg(not(windows))]
+    let config_builder = config_builder.write_denylist(write_denylist);
+    #[cfg(windows)]
+    drop(write_denylist);
+    let config_builder = config_builder
         .working_dir(
             // A symlink in the working directory's spelling fails the
             // sandbox's own resolution — it does not follow a link a
@@ -4431,6 +4799,7 @@ where
                 .unwrap_or_else(|_| context.working_dir.to_path_buf()),
         )
         .grants(grants)
+        .heel_binary(heel_binary)
         .security(SecurityConfig::interactive())
         // The session's own commands run their build outputs — anything
         // written here could already run through an interpreter.
@@ -4486,6 +4855,7 @@ where
             context.mode,
             None,
             Some(tree.clone()),
+            crate::JobPlace::Host,
         )
         .await;
     context.background_startup.report_ready().await;
@@ -4511,9 +4881,14 @@ where
 async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let (grants, mut runtime_environment) = local_launch_policy(&context).await?;
+    let (grants, mut runtime_environment, _) = local_launch_policy(&context).await?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
+    let heel_binary = context
+        .heel
+        .get()
+        .await
+        .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
     let config_builder = SandboxConfig::builder()
         .network(AllowAll)
         .working_dir(
@@ -4521,6 +4896,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
                 .unwrap_or_else(|_| context.working_dir.to_path_buf()),
         )
         .grants(grants)
+        .heel_binary(heel_binary)
         // Unsafe is approved host execution — the user runs the script
         // themselves in every respect except IPC plumbing, so no
         // credential or filesystem protection may apply.
@@ -4577,6 +4953,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
             context.mode,
             None,
             Some(tree.clone()),
+            crate::JobPlace::Host,
         )
         .await;
     context.background_startup.report_ready().await;
@@ -5069,6 +5446,7 @@ fn container_exec_script(
     Ok(prepared_tools.shell_command(&script)?)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_container_background<E: Executor + Clone + 'static>(
     context: ContainerBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
@@ -5085,13 +5463,13 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
     let (input_tx, input_rx) = async_channel::unbounded::<Vec<u8>>();
     context
         .job_registry
-        .register(
+        .register_at(
+            crate::JobPlace::Container,
             pid,
             context.task_id,
             context.execution_id,
             context.script,
             context.mode,
-            None,
         )
         .await;
     let script = container_exec_script(
@@ -5102,6 +5480,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         context.script,
     )?;
     let script = inject_env_exports(script, context.env_source.as_ref())?;
+    let script = mark_container_job(script, context.task_id)?;
     // A foreground command gets no input channel: the dropped sender is the
     // EOF its stdin reads. StdinAlerts may ride along either way; they are
     // the background job's blocked-reader wiring.
@@ -5294,15 +5673,17 @@ async fn execute_ssh_background(
         .map_err(|e| TerminalError::Execution(e.to_string()))?;
 
     let pid = child.id();
+    // The local `ssh` process stands for a job that runs on the remote host,
+    // whose memory is never judged.
     context
         .job_registry
-        .register(
+        .register_at(
+            crate::JobPlace::Remote,
             pid,
             context.task_id,
             context.execution_id,
             context.script,
             context.mode,
-            None,
         )
         .await;
     context.background_startup.report_ready().await;
@@ -5363,6 +5744,17 @@ fn inject_env_exports(
     Ok(rendered)
 }
 
+/// Marks every process of a container job with its task ID, the marker the
+/// container's memory reader finds the job's processes by: each process the
+/// job starts inherits it.
+fn mark_container_job(script: String, task_id: &str) -> Result<String, TerminalError> {
+    let marker: Arc<dyn TerminalEnvSource> = Arc::new(vec![(
+        crate::memory::JOB_MARKER_ENV.to_string(),
+        task_id.to_string(),
+    )]);
+    inject_env_exports(script, Some(&marker))
+}
+
 fn shell_escape(value: &str) -> String {
     let escaped = value.replace('\'', "'\"'\"'");
     let mut output = String::with_capacity(escaped.len() + 2);
@@ -5378,7 +5770,7 @@ fn shell_escape(value: &str) -> String {
 /// embedder's extra envs (which override).
 async fn local_launch_policy<E: Executor>(
     context: &LocalBackgroundExecution<'_, E>,
-) -> Result<(Vec<Grant>, Vec<(String, String)>), TerminalError> {
+) -> Result<(Vec<Grant>, Vec<(String, String)>, heel::WriteDenylist), TerminalError> {
     write_git_shim(context.prepared_tools).await?;
     let policy = crate::SessionSandboxPolicy::new(
         context.working_dir,
@@ -5392,12 +5784,13 @@ async fn local_launch_policy<E: Executor>(
         Some(fifo) => policy.with_job_fifo(fifo)?,
         None => policy,
     };
+    let write_denylist = policy.write_denylist().clone();
     let (grants, mut env) = policy.into_parts();
     committed_git_environment(context.registry, &mut env, |path| {
         Ok(path.display().to_string())
     })?;
     env.extend(context.env_source.iter().flat_map(|s| s.env()));
-    Ok((grants, env))
+    Ok((grants, env, write_denylist))
 }
 
 pub async fn prepare_session_runtime_environment(
@@ -6172,6 +6565,61 @@ mod tests {
     #[cfg(all(unix, feature = "connectivity"))]
     mod outage;
 
+    /// A stdin whose drop reports that the writer thread holding it ended.
+    struct DropSignal(async_channel::Sender<()>);
+
+    impl Write for DropSignal {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send_blocking(());
+        }
+    }
+
+    /// A finished job's stdin writer thread exits instead of blocking on its
+    /// channel forever.
+    #[tokio::test]
+    async fn finished_job_ends_its_stdin_writer_thread() {
+        use executor_core::{Executor as _, Task as _};
+        let (registry, service) = crate::job_registry::job_registry_channel();
+        executor_core::tokio::TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
+        registry
+            .register(
+                9001,
+                "task-writer",
+                "exec-writer",
+                "cat",
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+        let (ended_tx, ended_rx) = async_channel::bounded::<()>(1);
+        let input_tx = spawn_terminal_stdin_writer(DropSignal(ended_tx), FeedCounter::default());
+        registry.attach_terminal_input(9001, input_tx).await;
+        registry
+            .terminal_input("task-writer", b"hi\n".to_vec())
+            .await
+            .expect("a running job takes input");
+        assert!(ended_rx.is_empty(), "the writer lives while the job runs");
+
+        registry.complete(9001, 0, None).await;
+
+        tokio::time::timeout(Duration::from_secs(10), ended_rx.recv())
+            .await
+            .expect("the writer thread must end once the job finishes")
+            .expect("the writer reports its end");
+    }
+
     /// Toolchain directories named by `*_HOME` variables become rwx grants;
     /// ones that do not exist are skipped.
     #[test]
@@ -6417,6 +6865,57 @@ mod tests {
         assert!(stdout.contains("managed=1.0.0 bash"), "{stdout}");
     }
 
+    /// A command run on an SSH server is a remote job: its local `ssh`
+    /// process stands for work whose memory is never judged here.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_run_over_ssh_is_a_remote_job() {
+        let authorizer = Arc::new(CountingSshAuthorizer::default());
+        let tools_cache = tempfile::tempdir().unwrap();
+        let tools = crate::tool_runtime::tests::bundle()
+            .prepare_local(tools_cache.path())
+            .await
+            .unwrap();
+        let prepared = local_and_ssh_registry(&authorizer)
+            .with_test_tools(tools.clone())
+            .with_test_ssh(build_server(), tools);
+        let directory = tempfile::tempdir().unwrap();
+        let terminal = fresh_terminal(directory.path())
+            .await
+            .adopt_prepared_tools(prepared)
+            .await
+            .expect("a prepared registry should be adopted");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+        let terminal = terminal.with_registry(registry);
+        let _ = terminal
+            .call(
+                TerminalArgs {
+                    description: "run remotely".to_string(),
+                    script: "echo remote-job".to_string(),
+                    mode: TerminalExecutionMode::Ssh,
+                    ssh_server_id: None,
+                    expect: OutputFormat::Text,
+                    resolution: MediaResolution::Auto,
+                    max_lines: 50,
+                    raw: true,
+                    timeout: 30,
+                    background: true,
+                },
+                ToolContext::new(),
+            )
+            .await;
+
+        let jobs = terminal.job_registry().list().await;
+        let job = jobs
+            .iter()
+            .find(|job| job.script == "echo remote-job")
+            .expect("the remote job is registered");
+        assert_eq!(job.place, crate::JobPlace::Remote);
+        let machine = terminal.job_memory().snapshot().await.unwrap();
+        assert_eq!(machine.jobs, []);
+        terminal.job_registry().kill_running().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn adopted_registry_runs_baseline_tools_without_ssh_consent_or_version_probes() {
@@ -6448,7 +6947,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             tools
-                .verify_local_versions(executor_core::tokio::TokioGlobal)
+                .verify_local_versions(
+                    executor_core::tokio::TokioGlobal,
+                    heel::HeelBinary::locate().unwrap(),
+                )
                 .await,
             Err(ToolRuntimeError::VersionMismatch(_))
         ));
@@ -7665,6 +8167,59 @@ mod tests {
         );
     }
 
+    /// Under strict isolation a command in a `PATH` directory runs, the
+    /// directory is not writable, and a directory off `PATH` stays unreadable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn path_directories_are_readable_and_executable_but_not_writable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let on_path = root.join("on-path");
+        let off_path = root.join("off-path");
+        let missing = root.join("missing");
+        for dir in [&on_path, &off_path] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let tool = on_path.join("hello-tool");
+        std::fs::write(&tool, "#!/bin/sh\necho hello-from-path\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(off_path.join("secret"), "secret\n").unwrap();
+
+        let path = std::env::join_paths([&on_path, &missing, Path::new("relative")]).unwrap();
+        let environment = vec![("PATH".to_string(), path.into_string().unwrap())];
+        let grants = path_directory_grants(&environment).unwrap();
+        assert_eq!(grants.len(), 1, "only the existing absolute directory");
+        assert_eq!(grants[0].access(), Access::READ | Access::EXEC);
+
+        let session = tempfile::tempdir().unwrap();
+        let config = SandboxConfig::builder()
+            .network(DenyAll)
+            .working_dir(std::fs::canonicalize(session.path()).unwrap())
+            .grants(grants)
+            .security(SecurityConfig::interactive())
+            .build();
+        let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("sandbox should initialize");
+        let script = format!(
+            "{tool}; echo x > {on}/planted 2>/dev/null && echo planted; cat {off}/secret 2>/dev/null; true",
+            tool = tool.display(),
+            on = on_path.display(),
+            off = off_path.display(),
+        );
+        let output = sandbox
+            .command("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .await
+            .expect("the sandboxed script runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "hello-from-path", "{stdout}");
+        assert!(!on_path.join("planted").exists());
+    }
+
     // These four drive a real sandbox running `/bin/pwd`. `heel` reports
     // `UnsupportedPlatform` off Unix, and the binary they run does not exist
     // there either, so there is nothing for them to exercise on Windows.
@@ -7727,6 +8282,7 @@ mod tests {
             task_id: "task-test".to_string(),
             execution_id: "exec-test".to_string(),
             background: false,
+            file_reads: Vec::new(),
             carry: None,
             carried_dir: None,
             alert_tx: async_channel::unbounded().0,
@@ -7742,6 +8298,7 @@ mod tests {
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
+            heel: SharedHeelBinary::default(),
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             store_dir: tool.outputs_dir(),
@@ -7841,6 +8398,7 @@ mod tests {
             task_id: "task-policy".to_string(),
             execution_id: "exec-policy".to_string(),
             background: false,
+            file_reads: Vec::new(),
             carry: None,
             carried_dir: None,
             alert_tx: async_channel::unbounded().0,
@@ -7856,6 +8414,7 @@ mod tests {
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
+            heel: SharedHeelBinary::default(),
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             store_dir: tool.outputs_dir(),
@@ -7878,6 +8437,302 @@ mod tests {
         assert_eq!(lines.next(), Some("write-ok"));
         assert_eq!(lines.next(), None, "a readable-only path stays read-only");
         assert!(written.exists() && !refused.exists());
+    }
+
+    /// Runs `script` in a sandboxed session with the given grants and returns
+    /// its standard output. Needs a real `HEEL_BIN`.
+    #[cfg(unix)]
+    async fn sandboxed_stdout(
+        writable_paths: Vec<PathBuf>,
+        readable_paths: Vec<PathBuf>,
+        script: String,
+    ) -> String {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tools = shell_sessions.local_tools().unwrap().clone();
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let (startup_tx, _startup_rx) = async_channel::bounded(1);
+        let result = execute_script_standalone(StandaloneExecution {
+            working_dir: tool.working_dir().clone(),
+            writable_paths,
+            readable_paths,
+            env_source: None,
+            executor: executor_core::tokio::TokioGlobal,
+            registry,
+            permission_handler: Arc::new(TestPermissionHandler::default()),
+            job_registry: tool.job_registry(),
+            task_id: "task-grants".to_string(),
+            execution_id: "exec-grants".to_string(),
+            background: false,
+            file_reads: Vec::new(),
+            carry: None,
+            carried_dir: None,
+            alert_tx: async_channel::unbounded().0,
+            script,
+            mode: TerminalMode::Sandboxed,
+            backend: ExecutionBackend::Local(tools),
+            stdin_alerts: None,
+            lifetime: JobLifetime::Foreground {
+                alerts: async_channel::unbounded().0,
+            },
+            background_startup: BackgroundStartup::new(startup_tx),
+            network_audit: None,
+            priority: ProcessPriority::default(),
+            #[cfg(all(unix, feature = "jobserver"))]
+            jobserver: None,
+            heel: SharedHeelBinary::default(),
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            store_dir: tool.outputs_dir(),
+            max_lines: 200,
+            raw: false,
+        })
+        .await
+        .expect("the sandboxed script runs");
+        output_text(&result.stdout)
+            .expect("inline stdout")
+            .to_string()
+    }
+
+    /// Runs the host's `git` in `dir`; the caller's environment keeps the
+    /// user's configuration out.
+    #[cfg(unix)]
+    fn host_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} in {}", dir.display());
+    }
+
+    /// A repository `main` with a linked worktree `linked`, under a fresh
+    /// canonical temporary directory.
+    #[cfg(unix)]
+    fn repository_with_linked_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let main = root.join("main");
+        let linked = root.join("linked");
+        std::fs::create_dir(&main).unwrap();
+        host_git(&main, &["init", "-q", "-b", "main"]);
+        host_git(&main, &["commit", "-q", "--allow-empty", "-m", "root"]);
+        host_git(&main, &["worktree", "add", "-q", "../linked"]);
+        (base, main, linked)
+    }
+
+    /// Under strict isolation git works in a granted linked worktree: its
+    /// repository is outside the worktree, and the session grants it after
+    /// git's back-links confirm the pointer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_commits_in_a_granted_linked_worktree() {
+        let (_base, main, linked) = repository_with_linked_worktree();
+        let script = format!(
+            "cd {linked} && git status --short 2>&1 && echo changed > file && git add file 2>&1 \
+             && git -c user.name=t -c user.email=t@t commit -q -m inside 2>&1 && echo committed; true",
+            linked = linked.display(),
+        );
+        let stdout = sandboxed_stdout(vec![linked.clone()], Vec::new(), script).await;
+        assert_eq!(stdout.lines().last(), Some("committed"), "{stdout}");
+        let subject = std::process::Command::new("git")
+            .current_dir(&main)
+            .args(["log", "-1", "--format=%s", "linked"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&subject.stdout).trim(), "inside");
+    }
+
+    /// In a read-write repository the persistence paths stay unwritable, in a
+    /// linked worktree's common git directory too, while git still commits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_persistence_paths_are_unwritable_in_granted_repositories() {
+        let (_base, main, linked) = repository_with_linked_worktree();
+        let attempt = |repository: &Path, work: &Path| {
+            format!(
+                "cd {work} && echo '#!/bin/sh' > {hook} 2>/dev/null && echo hook-written; \
+                 echo '[alias]' >> {config} 2>/dev/null && echo config-written; \
+                 echo changed > file && git add file 2>&1 \
+                 && git -c user.name=t -c user.email=t@t commit -q -m inside 2>&1 && echo committed; true",
+                work = work.display(),
+                hook = repository.join(".git/hooks/pre-commit").display(),
+                config = repository.join(".git/config").display(),
+            )
+        };
+        for (repository, work, writable) in [
+            (&main, &main, vec![main.clone()]),
+            (&main, &linked, vec![linked.clone()]),
+        ] {
+            let stdout = sandboxed_stdout(writable, Vec::new(), attempt(repository, work)).await;
+            assert_eq!(stdout.lines().last(), Some("committed"), "{stdout}");
+            assert!(!stdout.contains("written"), "{stdout}");
+            assert!(!main.join(".git/hooks/pre-commit").exists());
+        }
+    }
+
+    /// `uv` marks its cache buckets with a `.git` entry: the prepared
+    /// runtime's cache takes that, while a granted repository still refuses
+    /// git's config. Judged by outcome, since platforms differ on whether the
+    /// bare `.git` directory itself is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uv_cache_may_hold_git_entries_and_a_granted_repository_may_not() {
+        let base = tempfile::tempdir().unwrap();
+        let granted = std::fs::canonicalize(base.path()).unwrap().join("repo");
+        std::fs::create_dir(&granted).unwrap();
+        let script = format!(
+            "mkdir -p \"$UV_CACHE_DIR/x\" && mkdir \"$UV_CACHE_DIR/x/.git\" 2>&1 && echo cache-written; \
+             mkdir -p {repo}/.git 2>/dev/null; touch {repo}/.git/config 2>/dev/null && echo repo-written; true",
+            repo = granted.display(),
+        );
+        let stdout = sandboxed_stdout(vec![granted.clone()], Vec::new(), script).await;
+        assert!(
+            stdout.lines().any(|line| line == "cache-written"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("repo-written"), "{stdout}");
+        assert!(!granted.join(".git/config").exists(), "{stdout}");
+    }
+
+    /// Cargo's git cache keeps the `.git/hooks` rule off, and nothing else of
+    /// a toolchain home is exempt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_git_cache_is_the_only_toolchain_home_denylist_exception() {
+        let (_base, main, _linked) = repository_with_linked_worktree();
+        let session = tempfile::tempdir().unwrap();
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tools = shell_sessions.local_tools().unwrap().clone();
+        let denylist = session_write_denylist(session.path(), &tools);
+        // The cache directory appears with the first `uv` run; its parent
+        // is canonical from preparation.
+        let uv_cache = tools.uv_environment().unwrap().cache;
+        let cargo_git = host_toolchain_homes()
+            .find(|(name, _)| *name == "CARGO_HOME")
+            .map(|(_, home)| std::fs::canonicalize(home).unwrap().join("git"))
+            .expect("the test host has a cargo home");
+        assert_eq!(
+            denylist.exempt(),
+            [
+                std::fs::canonicalize(session.path()).unwrap(),
+                cargo_git.clone(),
+                uv_cache
+            ]
+        );
+
+        let checkout = cargo_git.join(format!(
+            "checkouts/aither-denylist-test-{}/rev",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&checkout).unwrap();
+        host_git(&checkout, &["init", "-q"]);
+        let script = format!(
+            "echo x > {cache}/hooks/update 2>&1 && echo cache-written; \
+             echo x > {repo}/.git/hooks/update 2>/dev/null && echo repo-written; true",
+            cache = checkout.join(".git").display(),
+            repo = main.display(),
+        );
+        let stdout = sandboxed_stdout(vec![main.clone()], Vec::new(), script).await;
+        std::fs::remove_dir_all(checkout.parent().unwrap()).unwrap();
+        assert_eq!(stdout.lines().last(), Some("cache-written"), "{stdout}");
+        assert!(!stdout.contains("repo-written"), "{stdout}");
+    }
+
+    /// The persistence table forbids creating a `.git` in a granted
+    /// directory: a new repository there is refused, one in the session
+    /// directory (see the committing subagent's clone test) is not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_repository_in_a_granted_workdir_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let script = format!(
+            "cd {root} && if git init fresh >/dev/null 2>&1; then echo init-succeeded; fi; true",
+            root = root.display()
+        );
+        let stdout = sandboxed_stdout(vec![root.clone()], Vec::new(), script).await;
+        assert!(!stdout.contains("init-succeeded"), "{stdout}");
+        assert!(!root.join("fresh/.git/config").exists(), "{stdout}");
+    }
+
+    /// A readable linked worktree brings its repository with read access:
+    /// git reads, and nothing is written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_readable_linked_worktree_reads_its_repository() {
+        let (_base, _main, linked) = repository_with_linked_worktree();
+        let script = format!(
+            "cd {linked} && git log -1 --format=%s 2>&1; true",
+            linked = linked.display(),
+        );
+        let stdout = sandboxed_stdout(Vec::new(), vec![linked.clone()], script).await;
+        assert_eq!(stdout.lines().last(), Some("root"), "{stdout}");
+    }
+
+    /// A `.git` file anyone can write names whatever it likes: without
+    /// matching back-links it adds no grant, and git there gets nothing of
+    /// the repository it points at.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_forged_git_pointer_adds_no_grant() {
+        let (base, main, linked) = repository_with_linked_worktree();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let entry = main.join(".git/worktrees/linked");
+        let forged = root.join("forged");
+        std::fs::create_dir(&forged).unwrap();
+        // The real entry of another worktree: its `gitdir` names `linked`,
+        // not `forged`.
+        std::fs::write(
+            forged.join(".git"),
+            format!("gitdir: {}\n", entry.display()),
+        )
+        .unwrap();
+        // A pointer straight at the repository, and one at nothing.
+        let direct = root.join("direct");
+        std::fs::create_dir(&direct).unwrap();
+        std::fs::write(
+            direct.join(".git"),
+            format!("gitdir: {}\n", main.join(".git").display()),
+        )
+        .unwrap();
+        let writable = vec![forged.clone(), direct.clone()];
+        for path in &writable {
+            assert!(
+                crate::subagent::confirmed_common_dir(path).await.is_none(),
+                "{} confirmed",
+                path.display()
+            );
+        }
+        assert_eq!(
+            crate::subagent::confirmed_common_dir(&linked).await,
+            Some(main.join(".git")),
+        );
+        assert_eq!(
+            linked_worktree_grants(&writable, &[]).await.unwrap().len(),
+            0
+        );
+
+        let script = format!(
+            "cat {head} 2>&1 | head -c 200; git -C {forged} log -1 --format=%s 2>&1; true",
+            head = main.join(".git/HEAD").display(),
+            forged = forged.display(),
+        );
+        let stdout = sandboxed_stdout(writable, Vec::new(), script).await;
+        assert!(!stdout.contains("ref: refs/heads"), "{stdout}");
+        assert!(!stdout.lines().any(|line| line == "root"), "{stdout}");
     }
 
     #[cfg(unix)]
@@ -8458,6 +9313,22 @@ mod tests {
         crate::tool_runtime::tests::UnlockingTempDir,
         TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
     ) {
+        let (cache, tool) =
+            unconfigured_test_terminal(dir, foreground_wait, timeout_cap, alert_after).await;
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        (cache, tool.with_registry(registry))
+    }
+
+    /// [`configured_test_terminal`] before its registry is bound.
+    async fn unconfigured_test_terminal(
+        dir: &Path,
+        foreground_wait: Duration,
+        timeout_cap: Duration,
+        alert_after: Duration,
+    ) -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Unconfigured>,
+    ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
         let tool = TerminalTool::new_exact(
             dir,
@@ -8472,8 +9343,7 @@ mod tests {
         .with_foreground_wait(foreground_wait)
         .with_timeout_cap(timeout_cap)
         .with_long_job_alert_after(alert_after);
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
-        (cache, tool.with_registry(registry))
+        (cache, tool)
     }
 
     /// A foreground command still running at the window promotes to a
@@ -8546,6 +9416,7 @@ mod tests {
         assert_eq!(
             info.status,
             JobStatus::Killed {
+                cause: crate::KillCause::User,
                 delivery: crate::Delivery::Pending
             },
             "the promoted job should be killed at its timeout: {completed:?}"
@@ -9012,6 +9883,7 @@ mod tests {
         assert_eq!(
             info.status,
             JobStatus::Killed {
+                cause: crate::KillCause::User,
                 delivery: crate::Delivery::Pending
             },
             "{completed:?}"
@@ -9091,6 +9963,7 @@ mod tests {
         assert_eq!(
             info.status,
             JobStatus::Killed {
+                cause: crate::KillCause::User,
                 delivery: crate::Delivery::Pending
             },
             "the job should have been killed at its timeout: {completed:?}"
@@ -9152,7 +10025,7 @@ mod tests {
         let task_id = started_task_id(&background_receiver);
         let completed = wait_for_completed_task(&background_receiver, &task_id).await;
 
-        assert!(completed.killed);
+        assert_eq!(completed.kill, Some(crate::KillCause::User));
         let kill = completed
             .timeout_kill
             .expect("a job killed at its timeout carries the times");
@@ -9189,7 +10062,7 @@ mod tests {
         let task_id = started_task_id(&background_receiver);
         assert!(tool.job_registry().kill_by_task_id(&task_id).await);
         let completed = wait_for_completed_task(&background_receiver, &task_id).await;
-        assert!(completed.killed);
+        assert_eq!(completed.kill, Some(crate::KillCause::User));
         assert_eq!(completed.timeout_kill, None);
     }
 
@@ -10116,6 +10989,48 @@ mod tests {
         .await
     }
 
+    /// A read that failed is not recorded by the unchanged-file guard, so a
+    /// plain retry runs and shows the failure again; a read that succeeded
+    /// is, so its unchanged re-read is refused.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_successful_read_arms_the_unchanged_file_guard() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let denied = tool.working_dir().join("denied.txt");
+        std::fs::write(&denied, "secret").expect("fixture should be written");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))
+            .expect("fixture should be locked");
+        let readable = tool.working_dir().join("readable.txt");
+        std::fs::write(&readable, "content").expect("fixture should be written");
+
+        let first = exit_code_of(&tool, "cat denied.txt").await;
+        if first == 0 {
+            // Running as a user the mode does not bind: nothing is denied.
+            return;
+        }
+        assert_eq!(
+            exit_code_of(&tool, "cat denied.txt").await,
+            first,
+            "a plain retry of a failed read runs and fails again"
+        );
+
+        assert_eq!(exit_code_of(&tool, "cat readable.txt").await, 0);
+        let refusal = tool
+            .call(
+                terminal_args("re-read", "cat readable.txt"),
+                ToolContext::new(),
+            )
+            .await
+            .expect_err("an unchanged re-read of a successful read is refused");
+        assert!(
+            refusal.to_string().contains("unchanged"),
+            "unexpected refusal: {refusal}"
+        );
+    }
+
     /// A script the sandboxed command writes into its working directory and
     /// chmods executes — writable space also carries EXEC.
     #[cfg(unix)]
@@ -10199,8 +11114,253 @@ mod tests {
         grant: SubagentGrant,
     ) -> Result<ConfiguredTestTool, SubagentGrantError> {
         parent
-            .subagent(&mut LaunchHistory::default(), grant, None, None)
+            .subagent(&mut LaunchHistory::default(), grant, None)
             .await
+    }
+
+    /// What a [`CloneSpaces`] was asked to prepare, as `(space, launcher,
+    /// caller)`.
+    type SeenSpace = (PathBuf, PathBuf, PathBuf);
+
+    /// How a test's [`SubagentSpaces`] fills a space.
+    #[derive(Clone, Copy)]
+    enum Filling {
+        /// Clones the source repository into `repo` and names it.
+        Clone,
+        /// Writes a file into the space, then fails.
+        Fail,
+        /// Names the launcher's working directory as the working copy.
+        Outside,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the session has no clone to give")]
+    struct NoClone;
+
+    /// Prepares each space from `source`, the launcher's repository, and
+    /// records what it was asked.
+    struct CloneSpaces {
+        source: PathBuf,
+        filling: Filling,
+        seen: async_channel::Sender<SeenSpace>,
+    }
+
+    impl SubagentSpaces for CloneSpaces {
+        type Error = NoClone;
+
+        async fn prepare(&self, run: RunSpace<'_>) -> Result<PreparedSpace, NoClone> {
+            self.seen
+                .send((
+                    run.space.to_path_buf(),
+                    run.launcher.to_path_buf(),
+                    run.caller.to_path_buf(),
+                ))
+                .await
+                .expect("the test records each space");
+            let clone = run.space.join("repo");
+            match self.filling {
+                Filling::Clone => {
+                    let (source, target) = (self.source.clone(), clone.clone());
+                    blocking::unblock(move || {
+                        crate::test_git::git(
+                            &source,
+                            &["clone", "-q", "--local", ".", target.to_str().unwrap()],
+                        )
+                    })
+                    .await;
+                    Ok(PreparedSpace::new().with_working_copy(clone))
+                }
+                Filling::Fail => {
+                    async_fs::write(run.space.join("half-done"), "x")
+                        .await
+                        .unwrap();
+                    Err(NoClone)
+                }
+                Filling::Outside => Ok(PreparedSpace::new().with_working_copy(run.launcher)),
+            }
+        }
+    }
+
+    /// A terminal in `dir` whose subagents' spaces `filling` prepares from
+    /// the repository `dir/repo`, with the receiver of what it is asked.
+    async fn spaced_terminal(
+        dir: &Path,
+        filling: Filling,
+    ) -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        ConfiguredTestTool,
+        async_channel::Receiver<SeenSpace>,
+    ) {
+        let source = dir.join("repo");
+        std::fs::create_dir_all(&source).unwrap();
+        crate::test_git::git(&source, &["init", "-q", "--initial-branch=main"]);
+        crate::test_git::git(&source, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let (seen, seen_rx) = async_channel::unbounded();
+        let (cache, tool) = unconfigured_test_terminal(
+            dir,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        let tool = tool.with_subagent_spaces(CloneSpaces {
+            source,
+            filling,
+            seen,
+        });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        (cache, tool.with_registry(registry), seen_rx)
+    }
+
+    /// A subagent works in the clone its launcher's spaces prepared: it
+    /// commits there, cannot push into the launcher's repository, and its
+    /// work reaches the launcher only when the launcher fetches it. The space
+    /// outlives the subagent's terminal for that, and the launcher can
+    /// remove it; a subagent's own launches are prepared by the same spaces.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_works_in_the_clone_its_launchers_spaces_prepared() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let (_cache, parent, seen) = spaced_terminal(dir.path(), Filling::Clone).await;
+        let caller = dir.path().join("repo");
+        let child = parent
+            .subagent(
+                &mut LaunchHistory::default(),
+                SubagentGrant::new(),
+                Some(&caller),
+            )
+            .await
+            .expect("the space is prepared");
+
+        let (space, launcher, asked_from) = seen.try_recv().expect("the spaces were asked");
+        assert_eq!(&space, child.working_dir(), "the run works in the space");
+        assert!(space.starts_with(root.join(SUBAGENT_SPACES_DIR)));
+        assert_eq!(launcher, root, "the launcher is the main agent's terminal");
+        assert_eq!(asked_from, caller, "the caller's directory is passed on");
+        let clone = space.join("repo");
+        assert_eq!(
+            child.prepared_space().unwrap().working_copies(),
+            std::slice::from_ref(&clone)
+        );
+        let dyn_child = child.clone().to_dyn();
+        assert_eq!(
+            dyn_child.prepared_space().unwrap().working_copies(),
+            std::slice::from_ref(&clone),
+            "the bundle a subagent's agent gets names its working copies"
+        );
+        assert!(parent.prepared_space().is_none());
+
+        let git = "git -c user.name=t -c user.email=t@t -c commit.gpgSign=false";
+        assert_eq!(
+            exit_code_of(
+                &child,
+                &format!(
+                    "cd '{}' && echo work > file && {git} add file && {git} commit -q -m work",
+                    clone.display()
+                ),
+            )
+            .await,
+            0,
+            "the subagent commits in its clone"
+        );
+        assert_ne!(
+            exit_code_of(
+                &child,
+                &format!(
+                    "cd '{}' && {git} push -q origin HEAD:refs/heads/pushed",
+                    clone.display()
+                ),
+            )
+            .await,
+            0,
+            "the launcher's repository is read-only to the subagent"
+        );
+        assert!(!crate::test_git::succeeds(
+            &caller,
+            &["rev-parse", "--verify", "-q", "refs/heads/pushed"]
+        ));
+
+        let nested = child
+            .subagent(&mut LaunchHistory::default(), SubagentGrant::new(), None)
+            .await
+            .expect("a nested space is prepared");
+        let (nested_space, nested_launcher, nested_caller) = seen.try_recv().unwrap();
+        assert_eq!(&nested_space, nested.working_dir());
+        assert_eq!(nested_launcher, space, "a subagent launches from its space");
+        assert_eq!(nested_caller, space, "the caller defaults to the launcher");
+        drop((nested, dyn_child, child));
+
+        assert!(clone.join(".git").is_dir(), "the space outlives the run");
+        assert_eq!(
+            exit_code_of(
+                &parent,
+                &format!(
+                    "cd repo && {git} fetch -q '{}' HEAD && {git} merge -q --ff-only FETCH_HEAD",
+                    clone.display()
+                ),
+            )
+            .await,
+            0,
+            "the launcher merges the run's work"
+        );
+        assert_eq!(
+            crate::test_git::git(&caller, &["log", "-1", "--format=%s"]),
+            "work"
+        );
+        assert_eq!(
+            exit_code_of(&parent, &format!("rm -rf '{}'", space.display())).await,
+            0,
+            "the launcher owns the space"
+        );
+        assert!(!space.exists());
+    }
+
+    /// A space the launcher's spaces cannot prepare fails the launch with
+    /// their error, and is removed with what they left in it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_that_cannot_be_prepared_fails_the_launch_and_is_removed() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, parent, seen) = spaced_terminal(dir.path(), Filling::Fail).await;
+        let error = parent
+            .binding()
+            .launcher()
+            .create(SubagentGrant::new(), None, None, None)
+            .await
+            .expect_err("the launch fails");
+        let (asked, _, _) = seen.try_recv().unwrap();
+        let TerminalToolFactoryError::Grant(SubagentGrantError::Preparation { space, source }) =
+            &error
+        else {
+            panic!("the launch fails with the preparation error: {error}");
+        };
+        assert_eq!(space, &asked);
+        assert!(source.downcast_ref::<NoClone>().is_some(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("the session has no clone to give")
+        );
+        assert!(!space.exists(), "the failed space is removed");
+    }
+
+    /// A working copy named outside the space fails the launch, and the space
+    /// is removed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_working_copy_outside_the_space_fails_the_launch() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, parent, seen) = spaced_terminal(dir.path(), Filling::Outside).await;
+        let error = launch(&parent, SubagentGrant::new())
+            .await
+            .expect_err("the launch fails");
+        let (asked, launcher, _) = seen.try_recv().unwrap();
+        let SubagentGrantError::PreparedOutsideSpace { path, space } = &error else {
+            panic!("the launch fails on the working copy: {error}");
+        };
+        assert_eq!((path, space), (&launcher, &asked));
+        assert!(!asked.exists(), "the refused space is removed");
     }
 
     #[cfg(unix)]
@@ -10679,7 +11839,7 @@ mod tests {
         }
 
         fn main_has(&self, id: &str) -> bool {
-            std::process::Command::new("git")
+            crate::test_git::command()
                 .args(["cat-file", "-e", id])
                 .current_dir(&self.common)
                 .output()
@@ -11422,7 +12582,11 @@ mod tests {
                 .worktree
                 .into_iter()
                 .fold(SubagentGrant::new(), SubagentGrant::with_worktree);
-            let launched = self.binding.launcher().create(grant, None, None).await?;
+            let launched = self
+                .binding
+                .launcher()
+                .create(grant, None, None, None)
+                .await?;
             Ok(ToolResult::Text {
                 text: launched.working_dir().display().to_string(),
             })
@@ -12114,6 +13278,55 @@ mod tests {
         .expect("prepared tools should be adopted");
         let parent = tool.with_registry(Arc::new(ToolRegistryBuilder::new().build(dir)));
         (scripts, parent)
+    }
+
+    /// A container terminal's jobs are the container's: they carry the
+    /// marker its memory reader finds them by, are registered as running
+    /// there, and the terminal judges the container's memory too.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn container_jobs_are_marked_and_placed_in_the_container() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (scripts, parent) = recording_container_terminal(dir.path(), None).await;
+        assert!(parent.container_probe().is_some());
+        assert!(parent.job_memory().has_container());
+
+        assert_eq!(exit_code_of(&parent, "echo marked-command").await, 0);
+
+        let scripts = scripts.lock().unwrap().clone();
+        let script = scripts
+            .iter()
+            .find(|script| script.contains("marked-command"))
+            .expect("the command ran");
+        let jobs = parent.job_registry().list().await;
+        let job = jobs
+            .iter()
+            .find(|job| job.script == "echo marked-command")
+            .expect("the job is registered");
+        assert_eq!(job.place, crate::JobPlace::Container);
+        assert!(
+            script.contains(&format!(
+                "export {}='{}'",
+                crate::memory::JOB_MARKER_ENV,
+                job.task_id
+            )),
+            "{script}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_local_terminal_judges_no_container() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        assert!(tool.container_probe().is_none());
+        assert!(!tool.job_memory().has_container());
     }
 
     #[cfg(unix)]

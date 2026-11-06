@@ -49,7 +49,9 @@
 
 pub mod guard;
 #[cfg(feature = "headless")]
-pub mod intercept;
+mod navigation;
+#[cfg(feature = "headless")]
+pub mod proxy;
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -498,7 +500,7 @@ pub async fn fetch_with_browser(url: &str) -> Result<FetchResult> {
 #[cfg(feature = "headless")]
 pub async fn fetch_html_raw(url: &str) -> Result<String> {
     guard::guard_url(url).await?;
-    fetch_html_headless(url, intercept::PublicOnly).await
+    fetch_html_headless(url, guard::SystemResolver, guard::PublicOnly).await
 }
 
 /// Smart fetch with strict fallback order:
@@ -1134,7 +1136,7 @@ impl WebFetcher for HeadlessFetcher {
             ));
         }
 
-        let html = fetch_html_headless(&req.url, intercept::PublicOnly)
+        let html = fetch_html_headless(&req.url, guard::SystemResolver, guard::PublicOnly)
             .await
             .map_err(|err| ProviderError::http(self.name(), err))?;
         let mut result = html_to_result_with_metadata(&req.url, &html, None, None)
@@ -1147,10 +1149,16 @@ impl WebFetcher for HeadlessFetcher {
 
 /// Fetches raw HTML using a headless Chrome browser with anti-detection measures.
 ///
-/// Every request the browser makes, redirects and subresources included, is
-/// judged by `policy` before it is sent. A refused navigation fails the fetch.
+/// The browser reaches the network only through a [`proxy::Proxy`] of its own,
+/// which resolves every host with `resolver` and connects only to addresses
+/// `policy` approves; redirects and subresources included. A refused
+/// navigation fails the fetch.
 #[cfg(feature = "headless")]
-async fn fetch_html_headless<P: intercept::RequestPolicy>(url: &str, policy: P) -> Result<String> {
+async fn fetch_html_headless<R: guard::Resolver, P: guard::AddressPolicy>(
+    url: &str,
+    resolver: R,
+    policy: P,
+) -> Result<String> {
     use chromiumoxide::browser::{Browser, BrowserConfig};
     use chromiumoxide::handler::viewport::Viewport;
     use futures_lite::StreamExt;
@@ -1158,26 +1166,59 @@ async fn fetch_html_headless<P: intercept::RequestPolicy>(url: &str, policy: P) 
 
     debug!("Launching headless browser for {}", url);
 
-    // Anti-detection browser arguments
-    let args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-infobars",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--no-sandbox",
-        "--window-size=1920,1080",
-        "--start-maximized",
-        "--disable-extensions",
-        // Frames stay in the page's process, where its interception sees
-        // their requests; a popup is blocked rather than opened unchecked.
-        "--disable-features=IsolateOrigins,site-per-process",
-        "--disable-background-networking",
-        "--disable-sync",
-        "--disable-translate",
-        "--metrics-recording-only",
-        "--no-first-run",
-        "--safebrowsing-disable-auto-update",
-        "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    // Every other scheme the browser could open (`file:`, `chrome:`) reads
+    // without a network request, so the proxy would never see it.
+    let scheme = url::Url::parse(url)?.scheme().to_owned();
+    if scheme != "http" && scheme != "https" {
+        return Err(guard::UrlPolicyError::UnsupportedScheme(scheme).into());
+    }
+
+    let mut proxy = proxy::Proxy::start(resolver, policy)
+        .await
+        .map_err(|e| anyhow!("Failed to start the browser's proxy: {e}"))?;
+    // Every destination goes through the proxy, and nothing else gives the
+    // browser a network path:
+    // - Chrome sends loopback hosts direct even with a proxy; `<-loopback>`
+    //   removes that implicit bypass, and the list has no other entry.
+    // - Every host lookup Chrome would make itself resolves to nothing, so
+    //   DNS prefetch and anything else that resolves outside the proxied
+    //   request path finds no address; only the proxy's own literal address
+    //   is left alone. Proxied requests are resolved by the proxy, not here.
+    // - QUIC is off, so nothing tries HTTP/3 directly over UDP.
+    // - WebRTC may not send UDP outside the proxy, which it cannot do at all.
+    let proxy_server = format!("http://{}", proxy.addr());
+    let resolver_rules = format!("MAP * ~NOTFOUND , EXCLUDE {}", proxy.addr().ip());
+
+    // chromiumoxide adds the leading `--` itself and keys switches by name,
+    // so each is given as its bare name, or as a name and its value.
+    let switches = [
+        "disable-infobars",
+        "disable-dev-shm-usage",
+        "disable-gpu",
+        "no-sandbox",
+        "start-maximized",
+        "disable-extensions",
+        "disable-background-networking",
+        "disable-sync",
+        "disable-translate",
+        "metrics-recording-only",
+        "no-first-run",
+        "safebrowsing-disable-auto-update",
+        "disable-quic",
+    ];
+    let valued = [
+        // Anti-detection.
+        ("disable-blink-features", "AutomationControlled"),
+        ("window-size", "1920,1080"),
+        (
+            "user-agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ),
+        // The network path described above.
+        ("proxy-server", proxy_server.as_str()),
+        ("proxy-bypass-list", "<-loopback>"),
+        ("host-resolver-rules", resolver_rules.as_str()),
+        ("force-webrtc-ip-handling-policy", "disable_non_proxied_udp"),
     ];
 
     // A profile of its own: Chrome holds a singleton lock on its profile, so
@@ -1196,7 +1237,8 @@ async fn fetch_html_headless<P: intercept::RequestPolicy>(url: &str, policy: P) 
             device_scale_factor: Some(1.0),
             ..Default::default()
         }))
-        .args(args)
+        .args(switches)
+        .args(valued)
         .build()
         .map_err(|e| anyhow!("Browser config error: {e}"))?;
 
@@ -1227,14 +1269,18 @@ async fn fetch_html_headless<P: intercept::RequestPolicy>(url: &str, policy: P) 
         .await
         .ok();
 
-    // From here on the browser sends nothing the policy has not approved.
-    let interception = intercept::Interception::start(&page, policy).await?;
+    let mut navigation = navigation::Navigation::watch(&page).await?;
 
     // Now navigate to the actual URL
     let navigated = page.goto(url).await;
-    if let Some(refusal) = interception.blocked_navigation() {
+    let requested = navigation.requested().await;
+    if let Some(refusal) = proxy
+        .refusals()
+        .into_iter()
+        .find(|refusal| requested.contains(&refusal.authority))
+    {
         handle.abort();
-        return Err(anyhow!("Navigation refused: {refusal}"));
+        return Err(anyhow!("Navigation refused: {}", refusal.reason));
     }
     navigated.map_err(|e| anyhow!("Failed to navigate: {e}"))?;
 
@@ -1742,42 +1788,94 @@ mod headless_tests {
         )
     }
 
-    /// Stands in for the public-only policy on loopback servers: it allows
-    /// one port and refuses every other destination.
-    #[derive(Clone)]
-    struct OnlyPort(u16);
+    use guard::testing::{Only, Table};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::Ordering;
 
-    impl intercept::RequestPolicy for OnlyPort {
-        async fn check(&self, url: &str) -> std::result::Result<(), guard::UrlPolicyError> {
-            let parsed = url::Url::parse(url)?;
-            if parsed.port() == Some(self.0) {
-                Ok(())
-            } else {
-                Err(guard::UrlPolicyError::BlockedAddress {
-                    host: parsed.host_str().unwrap_or_default().to_string(),
-                    addr: std::net::Ipv4Addr::LOCALHOST.into(),
-                })
-            }
-        }
+    fn loopback(port: u16) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
     }
 
     #[tokio::test]
-    async fn an_allowed_page_still_loads_through_the_interception() {
+    async fn an_allowed_page_loads_through_the_proxy() {
         let (port, requests) =
             serve(|_| http_ok("<html><body><p>hello there</p></body></html>")).await;
+        let resolver = Table::new(&[("allowed.test", loopback(port))]);
 
-        let html = fetch_html_headless(&format!("http://127.0.0.1:{port}/"), OnlyPort(port))
-            .await
-            .expect("an approved page loads");
+        for url in [
+            format!("http://127.0.0.1:{port}/"),
+            format!("http://allowed.test:{port}/"),
+        ] {
+            let html = fetch_html_headless(&url, resolver.clone(), Only(loopback(port)))
+                .await
+                .unwrap_or_else(|e| panic!("{url} loads: {e}"));
+            assert!(html.contains("hello there"), "{url}: {html}");
+        }
+        assert!(requests.load(Ordering::SeqCst) >= 2);
+        // Chrome resolves nothing itself, so the hostname loaded only because
+        // the proxy resolved it.
+        assert!(
+            resolver.lookups("allowed.test") >= 1,
+            "{:?}",
+            resolver.asked()
+        );
+    }
 
-        assert!(html.contains("hello there"), "{html}");
-        assert!(requests.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    /// The property the proxy exists for: a host whose resolution, the only
+    /// one anything makes, is private never receives a request, whether over
+    /// `http` or `https`.
+    #[tokio::test]
+    async fn a_host_resolving_to_a_private_address_is_refused() {
+        let (port, requests) = serve(|_| http_ok("<p>secret</p>")).await;
+        let resolver = Table::new(&[("rebind.test", loopback(port))]);
+
+        for url in [
+            format!("http://rebind.test:{port}/"),
+            format!("https://rebind.test:{port}/"),
+        ] {
+            let error = fetch_html_headless(&url, resolver.clone(), guard::PublicOnly)
+                .await
+                .expect_err("the private address is refused");
+            assert!(
+                error.to_string().contains("Navigation refused"),
+                "{url}: {error}"
+            );
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    /// Nothing gets the browser to a private server: not its address, not a
+    /// name for it, not a redirect from a page that is allowed.
+    #[tokio::test]
+    async fn no_url_reaches_a_private_server() {
+        let (private_port, private_requests) = serve(|_| http_ok("<p>secret</p>")).await;
+        let (allowed_port, _) = serve(move |_| {
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://localhost:{private_port}/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        })
+        .await;
+        let resolver = Table::new(&[
+            ("localhost", loopback(private_port)),
+            ("private.test", loopback(private_port)),
+        ]);
+
+        for url in [
+            format!("http://127.0.0.1:{private_port}/"),
+            format!("https://127.0.0.1:{private_port}/"),
+            format!("http://localhost:{private_port}/"),
+            format!("http://private.test:{private_port}/"),
+            format!("http://127.0.0.1:{allowed_port}/"),
+        ] {
+            let fetched =
+                fetch_html_headless(&url, resolver.clone(), Only(loopback(allowed_port))).await;
+            assert!(fetched.is_err(), "{url} must not load: {fetched:?}");
+        }
+        assert_eq!(private_requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn a_redirect_to_a_refused_address_is_never_requested() {
-        use std::sync::atomic::Ordering;
-
         let (refused_port, refused_requests) = serve(|_| http_ok("<p>secret</p>")).await;
         let (public_port, public_requests) = serve(move |_| {
             format!(
@@ -1788,7 +1886,8 @@ mod headless_tests {
 
         let fetched = fetch_html_headless(
             &format!("http://127.0.0.1:{public_port}/"),
-            OnlyPort(public_port),
+            Table::default(),
+            Only(loopback(public_port)),
         )
         .await;
 
