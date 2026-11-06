@@ -22,6 +22,35 @@ pub struct GrantSet {
     pub readable: Vec<PathBuf>,
     /// Paths sandboxed commands may write to (and therefore also read).
     pub writable: Vec<PathBuf>,
+    /// The access to the common git directory of a writable linked worktree.
+    pub git_dir: GitDirAccess,
+}
+
+/// The access a terminal has to the common git directory of a linked
+/// worktree it may write.
+///
+/// That directory is the main repository's, so only the session's own
+/// terminal writes it; a subagent's terminal reads it, and commits only
+/// through a commit grant's repository of its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GitDirAccess {
+    /// Read, write and execute: the session's own terminal.
+    #[default]
+    ReadWrite,
+    /// Read only: a subagent's terminal.
+    ReadOnly,
+}
+
+impl GitDirAccess {
+    /// The access to the common git directory of a worktree the terminal
+    /// can write.
+    #[must_use]
+    pub fn writable_worktree_access(self) -> heel::Access {
+        match self {
+            Self::ReadWrite => heel::Access::WRITE | heel::Access::EXEC,
+            Self::ReadOnly => heel::Access::READ,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +108,7 @@ impl TerminalGrants {
                 grants: Arc::new(ArcSwap::from_pointee(GrantSet {
                     readable: extra_readable,
                     writable: own_writable,
+                    git_dir: GitDirAccess::ReadOnly,
                 })),
             },
         }
@@ -148,6 +178,7 @@ impl TerminalGrants {
                         .chain(own_set.readable.iter().cloned())
                         .collect(),
                     writable: own_set.writable.clone(),
+                    git_dir: GitDirAccess::ReadOnly,
                 })
             }
         }

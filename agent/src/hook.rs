@@ -70,12 +70,12 @@ pub struct StopContext<'a> {
 
 /// Context provided to hooks at a safe iteration boundary.
 ///
-/// This boundary happens after the agent has fully processed the last batch of
-/// tool results and updated its internal context, but before it starts the next
-/// model request.
+/// This boundary happens after the agent has fully processed the turn (its
+/// tool results, or the alerts that object to it stopping) and updated its
+/// internal context, but before it starts the next model request.
 #[derive(Debug)]
 pub struct TurnBoundaryContext<'a> {
-    /// Assistant text produced before the last tool batch.
+    /// Assistant text the turn produced.
     pub assistant_text: &'a str,
     /// Current turn number (1-indexed within the agent loop).
     pub turn: usize,
@@ -214,8 +214,9 @@ pub trait Hook: Send + Sync {
         async {}
     }
 
-    /// Called after a full tool/result cycle is committed into agent memory,
-    /// before the next model request begins.
+    /// Called before the run goes on to another model request: after a full
+    /// tool/result cycle is committed into agent memory, and after a turn
+    /// without tool calls that a context source's alert keeps running.
     fn on_turn_boundary(
         &self,
         _ctx: &TurnBoundaryContext<'_>,

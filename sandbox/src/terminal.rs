@@ -11,7 +11,7 @@
 //! directory, but each execution gets a fresh sandbox (new TTY/process).
 
 use crate::foreground_wait::ForegroundWait;
-use crate::grants::{GrantSet, TerminalGrants};
+use crate::grants::{GitDirAccess, GrantSet, TerminalGrants};
 use crate::heel_binary::SharedHeelBinary;
 use crate::memory::{
     AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, FootprintReader,
@@ -2977,6 +2977,7 @@ where
                 working_dir: self.working_dir.clone(),
                 writable_paths: self.grants.snapshot().writable.clone(),
                 readable_paths: self.grants.snapshot().readable.clone(),
+                git_dir: self.grants.snapshot().git_dir,
                 env_source: self.env_source.clone(),
                 executor: self.executor.clone(),
                 registry,
@@ -3751,6 +3752,7 @@ struct StandaloneExecution<P, E> {
     working_dir: PathBuf,
     writable_paths: Vec<PathBuf>,
     readable_paths: Vec<PathBuf>,
+    git_dir: GitDirAccess,
     env_source: Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
     registry: Arc<ToolRegistry>,
@@ -3785,6 +3787,7 @@ struct StandaloneStart<'a, P, E> {
     working_dir: &'a Path,
     writable_paths: &'a [PathBuf],
     readable_paths: &'a [PathBuf],
+    git_dir: GitDirAccess,
     env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
     registry: &'a Arc<ToolRegistry>,
@@ -3811,6 +3814,7 @@ struct LocalBackgroundExecution<'a, E> {
     working_dir: &'a Path,
     writable_paths: &'a [PathBuf],
     readable_paths: &'a [PathBuf],
+    git_dir: GitDirAccess,
     env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
     registry: &'a Arc<ToolRegistry>,
@@ -3927,6 +3931,7 @@ struct SpawnedTerminalTask<P, E> {
     working_dir: PathBuf,
     writable_paths: Vec<PathBuf>,
     readable_paths: Vec<PathBuf>,
+    git_dir: GitDirAccess,
     executor: E,
     registry: Arc<ToolRegistry>,
     permission_handler: Arc<P>,
@@ -3972,6 +3977,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        git_dir,
         env_source,
         executor,
         registry,
@@ -4011,6 +4017,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        git_dir,
         env_source,
         executor,
         registry,
@@ -4090,6 +4097,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        git_dir,
         env_source,
         executor,
         registry,
@@ -4130,6 +4138,7 @@ where
         working_dir: &working_dir,
         writable_paths: &writable_paths,
         readable_paths: &readable_paths,
+        git_dir,
         env_source: &env_source,
         executor,
         registry: &registry,
@@ -4195,6 +4204,7 @@ where
             grants: std::sync::Arc::new(GrantSet {
                 readable: readable_paths.clone(),
                 writable: writable_paths.clone(),
+                git_dir,
             }),
         };
         if let Some(reported) = take_cwd_report(carry).await {
@@ -4292,6 +4302,7 @@ where
         working_dir: request.working_dir,
         writable_paths: request.writable_paths,
         readable_paths: request.readable_paths,
+        git_dir: request.git_dir,
         env_source: request.env_source,
         executor: request.executor,
         registry: request.registry,
@@ -4664,7 +4675,8 @@ pub fn local_path_grants(
 }
 
 /// The grants that let git work in a granted linked worktree: its common git
-/// directory, with the worktree's own access. The directory is the
+/// directory, with the access `git_dir` gives a writable worktree's (the
+/// worktree's own for a session's terminal, read for a subagent's). The directory is the
 /// repository's, outside the worktree, and a strict sandbox reads only what
 /// is granted. Only a pointer git's back-links confirm
 /// ([`crate::subagent::confirmed_common_dir`]) grants anything, because the
@@ -4672,11 +4684,12 @@ pub fn local_path_grants(
 pub async fn linked_worktree_grants(
     writable: &[PathBuf],
     readable: &[PathBuf],
+    git_dir: GitDirAccess,
 ) -> heel::Result<Vec<Grant>> {
     let mut grants = Vec::new();
     for (path, access) in writable
         .iter()
-        .map(|path| (path, Access::WRITE | Access::EXEC))
+        .map(|path| (path, git_dir.writable_worktree_access()))
         .chain(readable.iter().map(|path| (path, Access::READ)))
     {
         if let Some(common) = crate::subagent::confirmed_common_dir(path).await {
@@ -5776,6 +5789,7 @@ async fn local_launch_policy<E: Executor>(
         context.working_dir,
         context.writable_paths,
         context.readable_paths,
+        context.git_dir,
         context.prepared_tools,
     )
     .await?;
@@ -8274,6 +8288,7 @@ mod tests {
             working_dir: tool.working_dir().clone(),
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
+            git_dir: GitDirAccess::ReadWrite,
             env_source: None,
             executor: executor_core::tokio::TokioGlobal,
             registry,
@@ -8348,6 +8363,7 @@ mod tests {
             &working_dir,
             &writable_paths,
             &readable_paths,
+            GitDirAccess::ReadWrite,
             &tools,
         )
         .await
@@ -8390,6 +8406,7 @@ mod tests {
             working_dir,
             writable_paths,
             readable_paths,
+            git_dir: GitDirAccess::ReadWrite,
             env_source: None,
             executor: executor_core::tokio::TokioGlobal,
             registry,
@@ -8447,6 +8464,24 @@ mod tests {
         readable_paths: Vec<PathBuf>,
         script: String,
     ) -> String {
+        sandboxed_stdout_with(
+            GitDirAccess::ReadWrite,
+            writable_paths,
+            readable_paths,
+            script,
+        )
+        .await
+    }
+
+    /// [`sandboxed_stdout`] for a terminal whose grants give a writable
+    /// worktree's git directory `git_dir` access.
+    #[cfg(unix)]
+    async fn sandboxed_stdout_with(
+        git_dir: GitDirAccess,
+        writable_paths: Vec<PathBuf>,
+        readable_paths: Vec<PathBuf>,
+        script: String,
+    ) -> String {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
         let tools = shell_sessions.local_tools().unwrap().clone();
@@ -8467,6 +8502,7 @@ mod tests {
             working_dir: tool.working_dir().clone(),
             writable_paths,
             readable_paths,
+            git_dir,
             env_source: None,
             executor: executor_core::tokio::TokioGlobal,
             registry,
@@ -8553,6 +8589,52 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&subject.stdout).trim(), "inside");
+    }
+
+    /// A subagent's terminal holding a plain worktree grant reads the main
+    /// repository's git data and cannot write it: `git commit` fails and the
+    /// branch stays where it was. The session's own terminal commits (above).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_derived_terminal_reads_but_cannot_commit_in_a_plain_worktree_grant() {
+        let (_base, main, linked) = repository_with_linked_worktree();
+        let tip = |branch: &str| {
+            let output = std::process::Command::new("git")
+                .current_dir(&main)
+                .args(["rev-parse", branch])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let before = tip("linked");
+        let script = format!(
+            "cd {linked} && git status --short >/dev/null 2>&1 && echo status-ok; \
+             git log -1 --format=%s 2>&1 | head -n 1; \
+             echo changed > file; git add file 2>&1; \
+             git -c user.name=t -c user.email=t@t commit -q -m inside 2>&1 && echo committed; true",
+            linked = linked.display(),
+        );
+        let stdout = sandboxed_stdout_with(
+            GitDirAccess::ReadOnly,
+            vec![linked.clone()],
+            Vec::new(),
+            script,
+        )
+        .await;
+        assert!(stdout.lines().any(|line| line == "status-ok"), "{stdout}");
+        assert!(stdout.lines().any(|line| line == "root"), "{stdout}");
+        assert!(!stdout.contains("committed"), "{stdout}");
+        assert_eq!(tip("linked"), before, "{stdout}");
+    }
+
+    /// The grants a subagent's terminal derives give worktree git data read
+    /// access; the session's own give it write access.
+    #[test]
+    fn only_derived_grants_read_worktree_git_data() {
+        let parent = TerminalGrants::new();
+        assert_eq!(parent.snapshot().git_dir, GitDirAccess::ReadWrite);
+        let derived = TerminalGrants::derived(&parent, Vec::new(), vec![PathBuf::from("/w")]);
+        assert_eq!(derived.snapshot().git_dir, GitDirAccess::ReadOnly);
     }
 
     /// In a read-write repository the persistence paths stay unwritable, in a
@@ -8721,7 +8803,10 @@ mod tests {
             Some(main.join(".git")),
         );
         assert_eq!(
-            linked_worktree_grants(&writable, &[]).await.unwrap().len(),
+            linked_worktree_grants(&writable, &[], GitDirAccess::ReadWrite)
+                .await
+                .unwrap()
+                .len(),
             0
         );
 
