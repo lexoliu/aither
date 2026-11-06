@@ -932,7 +932,11 @@ async fn handle_state_command(
             }
         }
         StateCommand::AttachTerminalInput { pid, input_tx } => {
-            if let Some(job) = jobs.get_mut(&pid) {
+            // A job that already finished takes no input: the sender drops here.
+            if let Some(job) = jobs
+                .get_mut(&pid)
+                .filter(|job| matches!(job.info.status, JobStatus::Running))
+            {
                 job.input_tx = Some(input_tx);
             }
         }
@@ -1169,6 +1173,8 @@ fn finish(job: &mut JobState, end: JobEnd) {
     };
     job.finished_at = Some(Instant::now());
     job.kill_switch = None;
+    // Dropping the last sender ends the stdin writer thread blocked on it.
+    job.input_tx = None;
 }
 
 /// Marks the completion of `job` taken: the agent dropped its
@@ -2050,6 +2056,39 @@ mod tests {
         assert!(kill_rx.recv().await.is_ok());
         let job = registry.get(555).await.expect("job should exist");
         assert!(matches!(job.status, JobStatus::Killed { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_finished_job_releases_its_input_sender_and_refuses_input() {
+        let registry = spawn_registry();
+        registry
+            .register(
+                557,
+                "task-input",
+                "exec-input",
+                "cat",
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+        let (input_tx, input_rx) = async_channel::unbounded::<Vec<u8>>();
+        registry.attach_terminal_input(557, input_tx).await;
+        registry
+            .terminal_input("task-input", b"x".to_vec())
+            .await
+            .expect("a running job takes input");
+        assert_eq!(input_rx.recv().await.expect("input arrives"), b"x");
+
+        registry.complete(557, 0, None).await;
+
+        // The registry handles commands in order, so this reply follows the
+        // completion.
+        let error = registry
+            .terminal_input("task-input", b"y".to_vec())
+            .await
+            .expect_err("a finished job refuses input");
+        assert!(error.contains("is not running"), "{error}");
+        assert!(input_rx.is_closed(), "the registry must drop its sender");
     }
 
     #[tokio::test]
