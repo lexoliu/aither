@@ -224,6 +224,34 @@ pub async fn kill_process_tree(pid: u32) -> Result<(), KillTreeError> {
     }
 }
 
+/// The processes of each job rooted at `roots`, the root included, from one
+/// read of the process table: those of the root's process group and
+/// everything descending from them. A root that has exited yields no pids.
+///
+/// # Errors
+///
+/// Returns the error of reading the process table.
+#[cfg(unix)]
+pub fn tree_pids(roots: &[u32]) -> std::io::Result<Vec<Vec<u32>>> {
+    let (mode, _) = platform::identity_mode();
+    let table = platform::snapshot(mode, false)?;
+    let host = std::process::id();
+    let none = std::collections::HashSet::new();
+    let no_lineage = std::collections::HashSet::new();
+    Ok(roots
+        .iter()
+        .map(|&root| {
+            let alive = table.procs.iter().any(|process| process.pid() == root);
+            let members = unix::members(&table.procs, root, host, "", &none, &no_lineage);
+            alive
+                .then_some(root)
+                .into_iter()
+                .chain(members.into_iter().map(unix::Proc::pid))
+                .collect()
+        })
+        .collect())
+}
+
 /// Sends `SIGKILL` to the process group `pid` leads.
 #[cfg(unix)]
 fn kill_group(pid: u32) -> Result<(), KillTreeError> {

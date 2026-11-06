@@ -3610,7 +3610,7 @@ mod tests {
             .send_completed(aither_sandbox::CompletedTask {
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
-                killed: false,
+                kill: None,
                 timeout_kill: None,
                 pending: None,
                 result: Ok(aither_sandbox::CompletedCommand {
@@ -3690,7 +3690,7 @@ mod tests {
             .send_completed(aither_sandbox::CompletedTask {
                 task_id: "amber-test-task".to_string(),
                 script: "sleep 2".to_string(),
-                killed: false,
+                kill: None,
                 timeout_kill: None,
                 pending: None,
                 result: Ok(aither_sandbox::CompletedCommand {
