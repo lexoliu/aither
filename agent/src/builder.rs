@@ -1003,6 +1003,11 @@ where
             compact_signal,
             inherited,
         } = self.wiring;
+        // Every agent with a sandbox, a fork included, keeps its own
+        // `tasks.md` there.
+        let tasks_document = sandbox_dir
+            .clone()
+            .map(|dir| tasks.document(dir, config.tasks_line_limit));
         Agent {
             warmth: crate::CacheWarmth::new(prompt_cache.lifetime(), clock),
             advanced: std::sync::Arc::new(self.advanced),
@@ -1044,6 +1049,7 @@ where
             detached_task_ids: std::collections::HashSet::new(),
             sandbox_dir,
             tasks,
+            tasks_document,
             restore_dir,
             fork_source,
             compact_signal,

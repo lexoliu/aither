@@ -1,9 +1,10 @@
 //! References to tracked work as `tasks.md` writes them.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 /// What a [`WorkRef`] names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum WorkKind {
     /// An issue.
     Issue,
@@ -17,11 +18,44 @@ pub enum WorkKind {
 /// `PR #12` or `PR owner/repo#12` for a pull request. An unqualified
 /// reference means the session's own repository; what that is, and where
 /// the item lives, is the [`WorkTracker`](super::WorkTracker)'s business.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Repository names compare without regard to ASCII case, as forges treat
+/// them; the written spelling is kept for display.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkRef {
     kind: WorkKind,
     repository: Option<String>,
     number: u64,
+}
+
+impl PartialEq for WorkRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.number == other.number
+            && match (&self.repository, &other.repository) {
+                (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for WorkRef {}
+
+impl Hash for WorkRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.kind.hash(state);
+        self.number.hash(state);
+        match &self.repository {
+            Some(repository) => {
+                state.write_u8(1);
+                for byte in repository.bytes() {
+                    state.write_u8(byte.to_ascii_lowercase());
+                }
+            }
+            None => state.write_u8(0),
+        }
+    }
 }
 
 impl WorkRef {
@@ -77,7 +111,7 @@ impl WorkRef {
         self.kind == other.kind
             && self.number == other.number
             && match (&self.repository, &other.repository) {
-                (Some(left), Some(right)) => left == right,
+                (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
                 _ => true,
             }
     }
@@ -223,5 +257,17 @@ mod tests {
         assert!(WorkRef::issue(4).matches(&qualified));
         assert!(!WorkRef::issue(4).in_repository("x/y").matches(&qualified));
         assert!(!WorkRef::pull_request(4).matches(&qualified));
+    }
+
+    #[test]
+    fn repository_names_compare_without_case() {
+        let written = WorkRef::issue(4).in_repository("May-Agent/may");
+        let canonical = WorkRef::issue(4).in_repository("may-agent/MAY");
+        assert!(written.matches(&canonical));
+        assert_eq!(written, canonical);
+        let set: std::collections::HashSet<_> = [written.clone(), canonical].into();
+        assert_eq!(set.len(), 1, "equal references hash alike");
+        assert_ne!(written, WorkRef::issue(4), "qualified is not unqualified");
+        assert_eq!(written.to_string(), "May-Agent/may#4");
     }
 }

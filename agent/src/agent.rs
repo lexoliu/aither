@@ -870,6 +870,11 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// finished background jobs on its events.
     pub(crate) tasks: crate::tasks::TasksWiring,
 
+    /// The source supervising `tasks.md` in the sandbox, owned apart from
+    /// [`context_sources`](Self::context_sources) because what it showed
+    /// travels in the agent's checkpoint.
+    pub(crate) tasks_document: Option<crate::tasks::TasksDocument>,
+
     /// Directory files are restored from after a forked compaction.
     pub(crate) restore_dir: Option<PathBuf>,
 
@@ -978,6 +983,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             detached_task_ids: HashSet::new(),
             sandbox_dir: None,
             tasks: crate::tasks::TasksWiring::default(),
+            tasks_document: None,
             restore_dir: None,
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
@@ -2835,10 +2841,21 @@ where
         let reassembled = std::mem::take(&mut self.reassembled);
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_request(reassembled).await {
-                self.budget.append(block.len());
-                self.context.push_block_alert(&block);
+                self.push_source_alert(&block);
             }
         }
+        if let Some(document) = self.tasks_document.as_mut()
+            && let Some(block) =
+                crate::context::ContextSource::on_request(document, reassembled).await
+        {
+            self.push_source_alert(&block);
+        }
+    }
+
+    /// Appends a source's durable alert to the conversation.
+    fn push_source_alert(&mut self, block: &Block) {
+        self.budget.append(block.len());
+        self.context.push_block_alert(block);
     }
 
     /// Collects the durable alerts sources raise after a tool turn.
@@ -2846,9 +2863,13 @@ where
         self.push_injected_context();
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_tool_turn_end().await {
-                self.budget.append(block.len());
-                self.context.push_block_alert(&block);
+                self.push_source_alert(&block);
             }
+        }
+        if let Some(document) = self.tasks_document.as_mut()
+            && let Some(block) = crate::context::ContextSource::on_tool_turn_end(document).await
+        {
+            self.push_source_alert(&block);
         }
     }
 
@@ -2860,10 +2881,15 @@ where
         let mut pushed = false;
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_final_turn().await {
-                self.budget.append(block.len());
-                self.context.push_block_alert(&block);
+                self.push_source_alert(&block);
                 pushed = true;
             }
+        }
+        if let Some(document) = self.tasks_document.as_mut()
+            && let Some(block) = crate::context::ContextSource::on_final_turn(document).await
+        {
+            self.push_source_alert(&block);
+            pushed = true;
         }
         pushed
     }
@@ -2906,6 +2932,10 @@ where
                 .background_receiver
                 .as_ref()
                 .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running),
+            tasks: self
+                .tasks_document
+                .as_ref()
+                .and_then(crate::tasks::TasksDocument::checkpoint),
         })
     }
 
@@ -2916,6 +2946,10 @@ where
     /// Returns an error when the checkpoint cannot be restored into this agent.
     pub fn restore_checkpoint(&mut self, checkpoint: AgentCheckpoint) -> Result<(), AgentError> {
         self.context.restore(checkpoint.context);
+        // The restored conversation holds what its tasks document showed.
+        if let Some(document) = self.tasks_document.as_mut() {
+            document.restore(checkpoint.tasks);
+        }
         // Everything below belongs to the window just replaced: its fork
         // point, its failure, its parked tool results and its last request
         // mean nothing in the restored one.
@@ -3086,12 +3120,6 @@ where
                     guard,
                     self.sandbox_dir.clone(),
                 )));
-        }
-        if let Some(sandbox_dir) = self.sandbox_dir.clone() {
-            let source = self
-                .tasks
-                .document(sandbox_dir, self.config.tasks_line_limit);
-            self.context_sources.push(AnyContextSource::new(source));
         }
         if let Some(job_registry) = self.job_registry.clone() {
             self.context_sources
@@ -3494,6 +3522,10 @@ where
         let tool_surface_hash = self.tool_surface_hash();
         let tail = self.render_tail().await;
         let window = self.context_window_snapshot(&tail);
+        let tasks = self
+            .tasks_document
+            .as_ref()
+            .and_then(crate::tasks::TasksDocument::checkpoint);
         let checkpoint_ctx = CheckpointContext {
             reason,
             assistant_text,
@@ -3506,6 +3538,7 @@ where
                 .as_ref()
                 .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running),
             window: &window,
+            tasks: tasks.as_ref(),
         };
         if let Some(reason) = self.hooks.on_checkpoint(&checkpoint_ctx).await {
             return Err(AgentError::HookRejected {
@@ -4773,6 +4806,7 @@ mod tests {
                 messages: Vec::new(),
             },
             has_background_tasks: false,
+            tasks: None,
         }
     }
 

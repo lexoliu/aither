@@ -142,7 +142,7 @@ pub use tasks::{
 pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};
 pub use tools::AgentTools;
 pub use warmth::{CacheState, CacheWarmth};
-pub use working_docs::{AnyTaskBlockerResolver, TaskBlockerResolver};
+pub use working_docs::{AnyTaskBlockerResolver, TaskBlockerError, TaskBlockerResolver};
 
 // Model groups for budget tracking and fallback
 pub use model_group::{

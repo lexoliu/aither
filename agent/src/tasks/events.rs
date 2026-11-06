@@ -63,11 +63,32 @@ impl TaskEvent {
         }
     }
 
-    /// Whether the event starts work that `tasks.md` should take up even
-    /// when no row names it yet. Every other event concerns only the rows
-    /// that already name its subject.
+    /// Whether the event starts something `tasks.md` must carry: a row naming
+    /// its subject records it, and without one it alerts. Every other event
+    /// concerns only the rows that already name its subject.
     pub(crate) const fn opens_work(&self) -> bool {
-        matches!(self, Self::IssueCreated(_) | Self::PullRequestOpened(_))
+        matches!(
+            self,
+            Self::IssueCreated(_)
+                | Self::PullRequestOpened(_)
+                | Self::QuestionAsked(_)
+                | Self::SubagentStarted(_)
+        )
+    }
+
+    /// Whether this event ends what `start` opened: a subagent that finished
+    /// or a question answered or withdrawn leaves nothing for a row to carry.
+    pub(crate) fn ends(&self, start: &Self) -> bool {
+        match (start, self) {
+            (Self::SubagentStarted(started), Self::SubagentFinished(finished)) => {
+                started == finished
+            }
+            (
+                Self::QuestionAsked(asked),
+                Self::QuestionAnswered(closed) | Self::QuestionWithdrawn(closed),
+            ) => asked == closed,
+            _ => false,
+        }
     }
 }
 
@@ -130,5 +151,16 @@ mod tests {
             ]
         );
         assert_eq!(events.take(), Vec::new());
+    }
+
+    #[test]
+    fn a_finish_ends_only_its_own_start() {
+        let started = TaskEvent::SubagentStarted("reviewer".into());
+        assert!(TaskEvent::SubagentFinished("reviewer".into()).ends(&started));
+        assert!(!TaskEvent::SubagentFinished("other".into()).ends(&started));
+        let asked = TaskEvent::QuestionAsked("req-1".into());
+        assert!(TaskEvent::QuestionAnswered("req-1".into()).ends(&asked));
+        assert!(TaskEvent::QuestionWithdrawn("req-1".into()).ends(&asked));
+        assert!(!TaskEvent::QuestionAnswered("req-1".into()).ends(&started));
     }
 }

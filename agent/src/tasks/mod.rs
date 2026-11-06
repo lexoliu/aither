@@ -13,12 +13,13 @@ pub mod format;
 mod reference;
 mod tracker;
 
-pub use document::TasksDocument;
+pub use document::{TasksCheckpoint, TasksDocument};
 pub use events::{TaskEvent, TaskEvents};
 pub use format::{LineViolation, Row, Section, TasksFile, Violation};
 pub use reference::{WorkKind, WorkRef};
 pub use tracker::{
-    AnyWorkTracker, RelatedWork, WorkComment, WorkItem, WorkState, WorkTracker, WorkTrackerError,
+    AnyWorkTracker, RelatedWork, WorkComment, WorkItem, WorkState, WorkStatus, WorkTracker,
+    WorkTrackerError,
 };
 
 use crate::working_docs::AnyTaskBlockerResolver;

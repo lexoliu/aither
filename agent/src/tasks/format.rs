@@ -4,7 +4,9 @@
 //! `Roots` (the root issues the session serves), `Doing` (work in progress),
 //! `Queued` (work waiting to start), `Notes` and `Decisions`. The first three
 //! hold `- ` rows, one per item, with indented lines continuing the row
-//! above; the last two are free text. A `# ` title may precede them.
+//! above; the last two are free text, which ends only at a `## ` heading
+//! naming a section outside a fenced code block. A `# ` title may precede
+//! them.
 
 use super::reference::{WorkRef, tokens};
 
@@ -103,11 +105,13 @@ impl Row {
     }
 
     /// The payload of its `BLOCKING <what>` mark: the token right after
-    /// `BLOCKING`, a request id or the first word of a free-text reason. A
-    /// trailing `BLOCKING` alone is no mark.
+    /// `BLOCKING`, a request id or the first word of a free-text reason,
+    /// split by the same rules as [`names`](Self::names), so markdown and
+    /// punctuation around either word do not hide it. A trailing `BLOCKING`
+    /// alone is no mark.
     #[must_use]
     pub fn blocking_mark(&self) -> Option<&str> {
-        let mut words = self.text.split_whitespace();
+        let mut words = tokens(&self.text);
         words.find(|word| *word == "BLOCKING")?;
         words.next()
     }
@@ -157,17 +161,39 @@ impl TasksFile {
         // again one by one.
         let mut in_unknown = false;
         let mut titled = false;
+        // The fence a free-text section is inside: its character and length.
+        let mut fence: Option<(char, usize)> = None;
         for (index, line) in content.lines().enumerate() {
             let number = index + 1;
             file.lines = number;
+            let free_text = section.is_some_and(|current| !current.holds_rows());
+            if free_text {
+                match (fence, Fence::of(line)) {
+                    (None, Some(opening)) => {
+                        fence = Some((opening.marker, opening.length));
+                        continue;
+                    }
+                    (Some((marker, length)), Some(closing)) if closing.closes(marker, length) => {
+                        fence = None;
+                        continue;
+                    }
+                    (Some(_), _) => continue,
+                    (None, None) => {}
+                }
+            }
             if line.trim().is_empty() {
                 continue;
             }
             if let Some(heading) = line.strip_prefix("## ") {
                 let heading = heading.trim();
-                section = Section::ALL
+                let named = Section::ALL
                     .into_iter()
                     .find(|candidate| candidate.heading() == heading);
+                // Free text holds any other `## ` line as its own text.
+                if free_text && named.is_none() {
+                    continue;
+                }
+                section = named;
                 in_unknown = section.is_none();
                 if let Some(found) = section {
                     if seen.contains(&found) {
@@ -280,6 +306,41 @@ impl TasksFile {
     }
 }
 
+/// A code fence line: three or more backticks or tildes, indented by at
+/// most three spaces.
+struct Fence<'a> {
+    marker: char,
+    length: usize,
+    /// What follows the marker: an info string on an opening fence; a
+    /// closing fence has none.
+    rest: &'a str,
+}
+
+impl<'a> Fence<'a> {
+    fn of(line: &'a str) -> Option<Self> {
+        let unindented = line.trim_start_matches(' ');
+        if line.len() - unindented.len() > 3 {
+            return None;
+        }
+        let marker = unindented
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '`' | '~'))?;
+        let rest = unindented.trim_start_matches(marker);
+        let length = unindented.len() - rest.len();
+        (length >= 3).then_some(Self {
+            marker,
+            length,
+            rest,
+        })
+    }
+
+    /// Whether this line closes a fence opened with `length` of `marker`.
+    fn closes(&self, marker: char, length: usize) -> bool {
+        self.marker == marker && self.length >= length && self.rest.trim().is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +412,47 @@ mod tests {
         let asking: Vec<_> = file.rows_naming_id("req-7").map(Row::line).collect();
         assert_eq!(asking, vec![9]);
         assert_eq!(file.rows_naming_id("req").count(), 0);
+    }
+
+    #[test]
+    fn a_mark_reads_through_markdown_and_punctuation_like_names() {
+        for text in [
+            "- pick a db `BLOCKING` `req-7`",
+            "- pick a db (BLOCKING: req-7)",
+            "- pick a db **BLOCKING** req-7.",
+        ] {
+            let file = TasksFile::parse(&format!("## Doing\n{text}\n"));
+            let row = &file.rows()[0];
+            assert_eq!(row.blocking_mark(), Some("req-7"), "{text}");
+            assert!(row.names("req-7"), "{text}");
+        }
+        let trailing = TasksFile::parse("## Doing\n- pick a db `BLOCKING`\n");
+        assert_eq!(trailing.rows()[0].blocking_mark(), None);
+    }
+
+    #[test]
+    fn free_text_holds_headings_and_fences_of_its_own() {
+        let file = TasksFile::parse(
+            "## Notes\n## Findings\n```md\n## Doing\n- not a row\n```\n~~~~\n## Roots\n~~~\n~~~~\n## Decisions\n> \"## Queued is fine\"\n## Doing\n- #4 real row\n",
+        );
+        assert_eq!(file.violations(), &[]);
+        let rows: Vec<_> = file
+            .rows()
+            .iter()
+            .map(|row| (row.section(), row.summary()))
+            .collect();
+        assert_eq!(rows, vec![(Section::Doing, "#4 real row")]);
+    }
+
+    #[test]
+    fn a_known_heading_outside_a_fence_still_ends_free_text() {
+        let file = TasksFile::parse("## Notes\ntext\n## Notes\n");
+        assert_eq!(
+            file.violations(),
+            &[LineViolation {
+                line: 3,
+                violation: Violation::RepeatedSection(Section::Notes),
+            }]
+        );
     }
 }

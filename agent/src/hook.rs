@@ -111,6 +111,9 @@ pub struct CheckpointContext<'a> {
     pub has_background_tasks: bool,
     /// Structured snapshot of the currently assembled context window.
     pub window: &'a ContextWindowSnapshot,
+    /// What the conversation holds of `tasks.md`, for
+    /// [`AgentCheckpoint::tasks`](crate::AgentCheckpoint::tasks).
+    pub tasks: Option<&'a crate::tasks::TasksCheckpoint>,
 }
 
 /// Reason why the agent stopped.

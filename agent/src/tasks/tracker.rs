@@ -88,10 +88,34 @@ impl WorkItem {
     /// Whether an item it is blocked by is still open.
     #[must_use]
     pub fn is_blocked(&self) -> bool {
-        self.blocked_by
-            .iter()
-            .any(|blocker| blocker.state == WorkState::Open)
+        is_blocked_by(&self.blocked_by)
     }
+}
+
+/// What the end of a turn needs of an item: its state and what blocks it,
+/// without its body, comments or sub-issues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkStatus {
+    /// The item.
+    pub reference: WorkRef,
+    /// Its state.
+    pub state: WorkState,
+    /// The items it is blocked by.
+    pub blocked_by: Vec<RelatedWork>,
+}
+
+impl WorkStatus {
+    /// Whether an item it is blocked by is still open.
+    #[must_use]
+    pub fn is_blocked(&self) -> bool {
+        is_blocked_by(&self.blocked_by)
+    }
+}
+
+fn is_blocked_by(blockers: &[RelatedWork]) -> bool {
+    blockers
+        .iter()
+        .any(|blocker| blocker.state == WorkState::Open)
 }
 
 /// Why an item could not be read.
@@ -113,28 +137,36 @@ pub enum WorkTrackerError {
 
 /// Reads the issues and pull requests `tasks.md` names.
 pub trait WorkTracker: Send + Sync + 'static {
-    /// The item `reference` names, with its relations.
+    /// The item `reference` names in full, with its relations.
     fn item(
         &self,
         reference: &WorkRef,
     ) -> impl Future<Output = Result<WorkItem, WorkTrackerError>> + Send;
+
+    /// The state of the item `reference` names and what blocks it: what
+    /// every end of a turn reads, so it fetches no more than that.
+    fn status(
+        &self,
+        reference: &WorkRef,
+    ) -> impl Future<Output = Result<WorkStatus, WorkTrackerError>> + Send;
 }
+
+type Fetch<'a, T> = Pin<Box<dyn Future<Output = Result<T, WorkTrackerError>> + Send + 'a>>;
 
 /// Object-safe twin of [`WorkTracker`]; boxing lives inside
 /// [`AnyWorkTracker`].
 trait WorkTrackerImpl: Send + Sync {
-    fn item<'a>(
-        &'a self,
-        reference: &'a WorkRef,
-    ) -> Pin<Box<dyn Future<Output = Result<WorkItem, WorkTrackerError>> + Send + 'a>>;
+    fn item<'a>(&'a self, reference: &'a WorkRef) -> Fetch<'a, WorkItem>;
+    fn status<'a>(&'a self, reference: &'a WorkRef) -> Fetch<'a, WorkStatus>;
 }
 
 impl<T: WorkTracker> WorkTrackerImpl for T {
-    fn item<'a>(
-        &'a self,
-        reference: &'a WorkRef,
-    ) -> Pin<Box<dyn Future<Output = Result<WorkItem, WorkTrackerError>> + Send + 'a>> {
+    fn item<'a>(&'a self, reference: &'a WorkRef) -> Fetch<'a, WorkItem> {
         Box::pin(WorkTracker::item(self, reference))
+    }
+
+    fn status<'a>(&'a self, reference: &'a WorkRef) -> Fetch<'a, WorkStatus> {
+        Box::pin(WorkTracker::status(self, reference))
     }
 }
 
@@ -173,26 +205,29 @@ impl AnyWorkTracker {
             .await
     }
 
-    /// Fetches each of `references` once, keyed by reference.
-    pub(crate) async fn lookup(
+    /// Reads the status of each of `references` once, at most
+    /// [`FETCH_CONCURRENCY`] at a time, keyed by reference.
+    pub(crate) async fn statuses(
         &self,
         references: impl IntoIterator<Item = WorkRef>,
-    ) -> HashMap<WorkRef, Result<WorkItem, WorkTrackerError>> {
-        let mut unique = Vec::new();
-        for reference in references {
-            if !unique.contains(&reference) {
-                unique.push(reference);
-            }
-        }
-        self.items(unique).await.into_iter().collect()
+    ) -> HashMap<WorkRef, Result<WorkStatus, WorkTrackerError>> {
+        let unique: HashSet<WorkRef> = references.into_iter().collect();
+        futures::stream::iter(unique)
+            .map(|reference| async move {
+                let status = self.0.status(&reference).await;
+                (reference, status)
+            })
+            .buffer_unordered(FETCH_CONCURRENCY)
+            .collect()
+            .await
     }
 
-    /// Resolves each of `roots` into itself, its sub-issues and the items it
-    /// is blocked by, recursively, each item once.
-    pub(crate) async fn trees(&self, roots: Vec<WorkRef>) -> IssueTrees {
-        let mut trees = IssueTrees::default();
-        let mut visited: HashSet<WorkRef> = roots.iter().cloned().collect();
-        let mut frontier = roots;
+    /// Resolves `root` into itself, its sub-issues and the items it is
+    /// blocked by, recursively, each item once.
+    pub(crate) async fn tree(&self, root: WorkRef) -> IssueTree {
+        let mut tree = IssueTree::default();
+        let mut visited: HashSet<WorkRef> = HashSet::from([root.clone()]);
+        let mut frontier = vec![root];
         while !frontier.is_empty() {
             let mut next = Vec::new();
             for (reference, item) in self.items(std::mem::take(&mut frontier)).await {
@@ -203,17 +238,43 @@ impl AnyWorkTracker {
                                 next.push(related.reference.clone());
                             }
                         }
-                        trees.items.push(item);
+                        tree.items.push(item);
                     }
                     Err(error) => {
                         tracing::warn!(%reference, %error, "an issue tree item could not be read");
-                        trees.unresolved.push(error);
+                        tree.unresolved.push(error);
                     }
                 }
             }
             frontier = next;
         }
-        trees
+        tree
+    }
+
+    /// The tree of each of `roots`, in the order given; the roots are
+    /// resolved concurrently, being few.
+    pub(crate) async fn trees(&self, roots: Vec<WorkRef>) -> Vec<(WorkRef, IssueTree)> {
+        futures::future::join_all(roots.into_iter().map(|root| async move {
+            let tree = self.tree(root.clone()).await;
+            (root, tree)
+        }))
+        .await
+    }
+
+    /// Every item the trees of `roots` reach, the roots included.
+    pub(crate) async fn reached(&self, roots: Vec<WorkRef>) -> HashSet<WorkRef> {
+        let mut reached: HashSet<WorkRef> = roots.iter().cloned().collect();
+        for (_, tree) in self.trees(roots).await {
+            for item in tree.items {
+                reached.extend(
+                    item.sub_issues
+                        .into_iter()
+                        .chain(item.blocked_by)
+                        .map(|related| related.reference),
+                );
+            }
+        }
+        reached
     }
 }
 
@@ -223,18 +284,22 @@ impl fmt::Debug for AnyWorkTracker {
     }
 }
 
-/// The items under some roots, in the order they were reached.
+/// The items under a root, in the order they were reached.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct IssueTrees {
+pub struct IssueTree {
     /// Every item read.
     pub items: Vec<WorkItem>,
     /// Every item that could not be read, with the reason.
     pub unresolved: Vec<WorkTrackerError>,
 }
 
-impl IssueTrees {
-    pub const fn is_empty(&self) -> bool {
-        self.items.is_empty() && self.unresolved.is_empty()
+impl IssueTree {
+    /// Whether every item could be read, or found not to exist: a tree the
+    /// backend failed to read in part is fetched again later.
+    pub fn is_complete(&self) -> bool {
+        self.unresolved
+            .iter()
+            .all(|error| matches!(error, WorkTrackerError::NotFound(_)))
     }
 }
 
@@ -253,10 +318,12 @@ pub mod test_tracker {
 
     use super::*;
 
-    /// A tracker over a fixed set of items, whose states a test can change.
+    /// A tracker over a fixed set of items, whose states a test can change
+    /// and whose backend a test can make fail for an item.
     #[derive(Clone, Default)]
     pub struct FixedTracker {
         items: Arc<Mutex<HashMap<WorkRef, WorkItem>>>,
+        failing: Arc<Mutex<HashSet<WorkRef>>>,
     }
 
     impl FixedTracker {
@@ -278,19 +345,58 @@ pub mod test_tracker {
         }
     }
 
+    impl FixedTracker {
+        /// Makes reading `reference` fail as an unreachable backend does.
+        pub fn fail(&self, reference: &WorkRef) {
+            self.failing
+                .lock()
+                .expect("tracker lock")
+                .insert(reference.clone());
+        }
+
+        /// Makes reading `reference` succeed again.
+        pub fn heal(&self, reference: &WorkRef) {
+            self.failing.lock().expect("tracker lock").remove(reference);
+        }
+
+        fn find(&self, reference: &WorkRef) -> Result<WorkItem, WorkTrackerError> {
+            if self
+                .failing
+                .lock()
+                .expect("tracker lock")
+                .contains(reference)
+            {
+                return Err(WorkTrackerError::Unavailable {
+                    reference: reference.clone(),
+                    reason: "the backend is unreachable".to_string(),
+                });
+            }
+            self.items
+                .lock()
+                .expect("tracker lock")
+                .get(reference)
+                .cloned()
+                .ok_or_else(|| WorkTrackerError::NotFound(reference.clone()))
+        }
+    }
+
     impl WorkTracker for FixedTracker {
         fn item(
             &self,
             reference: &WorkRef,
         ) -> impl Future<Output = Result<WorkItem, WorkTrackerError>> + Send {
-            let found = self
-                .items
-                .lock()
-                .expect("tracker lock")
-                .get(reference)
-                .cloned()
-                .ok_or_else(|| WorkTrackerError::NotFound(reference.clone()));
-            std::future::ready(found)
+            std::future::ready(self.find(reference))
+        }
+
+        fn status(
+            &self,
+            reference: &WorkRef,
+        ) -> impl Future<Output = Result<WorkStatus, WorkTrackerError>> + Send {
+            std::future::ready(self.find(reference).map(|item| WorkStatus {
+                reference: item.reference,
+                state: item.state,
+                blocked_by: item.blocked_by,
+            }))
         }
     }
 
@@ -338,23 +444,26 @@ mod tests {
                 .with(item(WorkRef::issue(4), WorkState::Closed)),
         );
 
-        let trees = tracker.trees(vec![WorkRef::issue(1)]).await;
-        let reached: Vec<_> = trees
+        let tree = tracker.tree(WorkRef::issue(1)).await;
+        let reached: Vec<_> = tree
             .items
             .iter()
             .map(|item| item.reference.number())
             .collect();
         assert_eq!(reached, vec![1, 2, 3, 4]);
-        assert_eq!(trees.unresolved, Vec::new());
+        assert_eq!(tree.unresolved, Vec::new());
+        let reached = tracker.reached(vec![WorkRef::issue(1)]).await;
+        assert!((1..=4).all(|number| reached.contains(&WorkRef::issue(number))));
+        assert!(!reached.contains(&WorkRef::issue(5)));
     }
 
     #[tokio::test]
     async fn an_unreadable_item_is_listed_with_its_reason() {
         let tracker = AnyWorkTracker::new(FixedTracker::default());
-        let trees = tracker.trees(vec![WorkRef::issue(9)]).await;
-        assert_eq!(trees.items, Vec::new());
+        let tree = tracker.tree(WorkRef::issue(9)).await;
+        assert_eq!(tree.items, Vec::new());
         assert_eq!(
-            trees.unresolved,
+            tree.unresolved,
             vec![WorkTrackerError::NotFound(WorkRef::issue(9))]
         );
     }

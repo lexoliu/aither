@@ -1,6 +1,7 @@
 use super::*;
 use crate::tasks::WorkComment;
 use crate::tasks::tracker::test_tracker::{FixedTracker, item, related};
+use crate::working_docs::TaskBlockerError;
 
 async fn write_tasks(root: &std::path::Path, content: &str) {
     async_fs::write(root.join("tasks.md"), content)
@@ -21,10 +22,21 @@ async fn tool_turn(source: &mut TasksDocument) -> Option<Block> {
 
 struct Answered;
 impl crate::working_docs::TaskBlockerResolver for Answered {
-    fn is_open(&self, mark: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn is_open(
+        &self,
+        mark: &str,
+    ) -> impl std::future::Future<Output = Result<bool, TaskBlockerError>> + Send {
         // Mirrors a host resolver: only issued-and-still-open marks hold;
-        // unknown payloads are free text and trusted.
-        std::future::ready(!matches!(mark, "req-answered" | "req-withdrawn"))
+        // unknown payloads are free text and trusted; a mark its store
+        // cannot read fails.
+        std::future::ready(match mark {
+            "req-answered" | "req-withdrawn" => Ok(false),
+            "req-unreadable" => Err(TaskBlockerError::Unavailable {
+                mark: mark.to_string(),
+                reason: "database is locked".to_string(),
+            }),
+            _ => Ok(true),
+        })
     }
 }
 
@@ -132,16 +144,8 @@ async fn an_event_the_turn_records_raises_nothing() {
 async fn each_tracked_event_left_unrecorded_yields_exactly_one_alert_naming_it() {
     let cases = [
         (
-            TaskEvent::IssueCreated(WorkRef::issue(5)),
-            "Issue #5 was created",
-        ),
-        (
             TaskEvent::IssueClosed(WorkRef::issue(5)),
             "Issue #5 was closed",
-        ),
-        (
-            TaskEvent::PullRequestOpened(WorkRef::pull_request(7)),
-            "PR #7 was opened",
         ),
         (
             TaskEvent::PullRequestMerged(WorkRef::pull_request(7)),
@@ -156,20 +160,12 @@ async fn each_tracked_event_left_unrecorded_yields_exactly_one_alert_naming_it()
             "PR #7 was closed",
         ),
         (
-            TaskEvent::QuestionAsked("req-1".into()),
-            "Question req-1 was asked",
-        ),
-        (
             TaskEvent::QuestionAnswered("req-1".into()),
             "Question req-1 was answered",
         ),
         (
             TaskEvent::QuestionWithdrawn("req-1".into()),
             "Question req-1 was withdrawn",
-        ),
-        (
-            TaskEvent::SubagentStarted("reviewer".into()),
-            "Subagent reviewer started",
         ),
         (
             TaskEvent::SubagentFinished("reviewer".into()),
@@ -201,6 +197,277 @@ async fn each_tracked_event_left_unrecorded_yields_exactly_one_alert_naming_it()
             "{phrase} alerts once"
         );
     }
+}
+
+/// An event that opens work is recorded by a row naming it, and alerts
+/// once, naming no row, when none does.
+#[tokio::test]
+async fn each_opening_event_left_without_a_row_yields_exactly_one_alert() {
+    let cases = [
+        (
+            TaskEvent::IssueCreated(WorkRef::issue(5)),
+            "Issue #5 was created; no row of tasks.md names it.",
+        ),
+        (
+            TaskEvent::PullRequestOpened(WorkRef::pull_request(7)),
+            "PR #7 was opened; no row of tasks.md names it.",
+        ),
+        (
+            TaskEvent::QuestionAsked("req-1".into()),
+            "Question req-1 was asked; no row of tasks.md names it. Mark the row that waits on its answer `BLOCKING req-1`.",
+        ),
+        (
+            TaskEvent::SubagentStarted("reviewer".into()),
+            "Subagent reviewer started; no row of tasks.md names it.",
+        ),
+    ];
+    let row = "#5 land PR #7 after the reviewer subagent BLOCKING req-1";
+    for (event, phrase) in cases {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(root.path(), "## Doing\n- #1 search\n").await;
+        let (mut source, events) = document(root.path());
+        source.on_request(false).await.expect("session start");
+        events.record(event.clone());
+        let alert = tool_turn(&mut source).await.expect("alert");
+        assert_eq!(
+            alert.content().matches(phrase).count(),
+            1,
+            "{}",
+            alert.content()
+        );
+        assert!(
+            tool_turn(&mut source).await.is_none(),
+            "{phrase} alerts once"
+        );
+
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tasks(root.path(), &format!("## Doing\n- {row}\n")).await;
+        let (mut source, events) = document(root.path());
+        source.on_request(false).await.expect("session start");
+        events.record(event);
+        assert!(
+            tool_turn(&mut source).await.is_none(),
+            "a row naming it records {phrase}"
+        );
+    }
+}
+
+/// A question asked as the turn ends holds the end until a row carries it,
+/// and the carrying row then holds nothing open.
+#[tokio::test]
+async fn an_unrecorded_question_holds_the_end_once_and_its_mark_then_blocks() {
+    let root = tempfile::tempdir().expect("tempdir");
+    write_tasks(root.path(), "## Doing\n- #1 pick a db\n").await;
+    let (source, events) = document(root.path());
+    let mut source = source.with_blocker_resolver(AnyTaskBlockerResolver::new(Answered));
+    source.on_request(false).await.expect("session start");
+
+    events.record(TaskEvent::QuestionAsked("req-open".into()));
+    source.on_request(false).await;
+    let alert = source.on_final_turn().await.expect("the gate holds");
+    assert!(
+        alert.content().contains("Question req-open was asked"),
+        "{}",
+        alert.content()
+    );
+
+    write_tasks(root.path(), "## Doing\n- #1 pick a db BLOCKING req-open\n").await;
+    source.on_request(false).await;
+    assert!(
+        source.on_final_turn().await.is_none(),
+        "the marked row waits for the answer instead of being pushed on"
+    );
+}
+
+/// A subagent that finished before the model saw it start, or a question
+/// withdrawn in the same batch, leaves nothing to track.
+#[tokio::test]
+async fn an_opening_event_ended_in_the_same_batch_raises_nothing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    write_tasks(root.path(), "## Doing\n- #1 search\n").await;
+    let (mut source, events) = document(root.path());
+    source.on_request(false).await.expect("session start");
+    events.record(TaskEvent::SubagentStarted("explore-1".into()));
+    events.record(TaskEvent::SubagentFinished("explore-1".into()));
+    events.record(TaskEvent::QuestionAsked("req-2".into()));
+    events.record(TaskEvent::QuestionWithdrawn("req-2".into()));
+    assert!(tool_turn(&mut source).await.is_none());
+}
+
+/// An event whose own tool turn already wrote it down needs no alert: the
+/// edit made alongside it counts.
+#[tokio::test]
+async fn an_event_recorded_in_its_own_tool_turn_raises_nothing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    write_tasks(root.path(), "## Doing\n- #5 fix login\n").await;
+    let (mut source, events) = document(root.path());
+    source.on_request(false).await.expect("session start");
+
+    // One tool turn closes #5 and rewrites its row; the next turn leaves
+    // the document alone.
+    events.record(TaskEvent::IssueClosed(WorkRef::issue(5)));
+    write_tasks(root.path(), "## Doing\n- #5 closed, follow-up review\n").await;
+    assert!(tool_turn(&mut source).await.is_none());
+    assert!(tool_turn(&mut source).await.is_none());
+}
+
+/// An issue created under a root — a sub-issue, or a blocker of an issue in
+/// the tree — needs no row of its own; one outside every tree does.
+#[tokio::test]
+async fn an_issue_created_inside_a_root_tree_needs_no_row() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut epic = item(WorkRef::issue(1), WorkState::Open);
+    epic.sub_issues = vec![related(WorkRef::issue(2), WorkState::Open)];
+    let mut child = item(WorkRef::issue(2), WorkState::Open);
+    child.blocked_by = vec![related(
+        WorkRef::issue(3).in_repository("Owner/Repo"),
+        WorkState::Open,
+    )];
+    let tracker = FixedTracker::default().with(epic).with(child).with(item(
+        WorkRef::issue(3).in_repository("Owner/Repo"),
+        WorkState::Open,
+    ));
+    write_tasks(root.path(), "## Roots\n- #1 search\n").await;
+    let (source, events) = document(root.path());
+    let mut source = source.with_work_tracker(AnyWorkTracker::new(tracker));
+    source.on_request(false).await.expect("session start");
+
+    events.record(TaskEvent::IssueCreated(WorkRef::issue(2)));
+    events.record(TaskEvent::IssueCreated(WorkRef::issue(3)));
+    assert!(tool_turn(&mut source).await.is_none());
+
+    events.record(TaskEvent::IssueCreated(WorkRef::issue(9)));
+    let alert = tool_turn(&mut source).await.expect("outside every tree");
+    assert!(
+        alert.content().contains("Issue #9 was created"),
+        "{}",
+        alert.content()
+    );
+}
+
+/// An answered question whose row still waits on it is named once, as the
+/// event, not again as a dead mark.
+#[tokio::test]
+async fn an_answer_and_the_dead_mark_it_explains_are_named_once() {
+    let root = tempfile::tempdir().expect("tempdir");
+    write_tasks(root.path(), "## Doing\n- pick a db BLOCKING req-answered\n").await;
+    let (source, events) = document(root.path());
+    let mut source = source.with_blocker_resolver(AnyTaskBlockerResolver::new(Answered));
+    source.on_request(false).await.expect("session start");
+
+    events.record(TaskEvent::QuestionAnswered("req-answered".into()));
+    source.on_request(false).await;
+    let alert = source.on_final_turn().await.expect("the gate holds");
+    assert!(
+        alert
+            .content()
+            .contains("Question req-answered was answered")
+    );
+    assert!(
+        !alert.content().contains("no longer waits"),
+        "{}",
+        alert.content()
+    );
+}
+
+/// A mark the host cannot resolve keeps holding its row: it is neither
+/// stale nor taken for answered, and the turn may end on it.
+#[tokio::test]
+async fn an_unresolvable_mark_keeps_holding_its_row() {
+    let root = tempfile::tempdir().expect("tempdir");
+    write_tasks(
+        root.path(),
+        "## Doing\n- pick a db BLOCKING req-unreadable\n",
+    )
+    .await;
+    let (source, _events) = document(root.path());
+    let mut source = source.with_blocker_resolver(AnyTaskBlockerResolver::new(Answered));
+    source.on_request(false).await.expect("session start");
+    assert!(source.on_final_turn().await.is_none());
+}
+
+/// An issue that cannot be read is not taken for unblocked: the turn is
+/// not pushed on to it, nor is its row called stale.
+#[tokio::test]
+async fn an_unreadable_issue_is_not_taken_for_unblocked() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let tracker = FixedTracker::default().with(item(WorkRef::issue(3), WorkState::Open));
+    tracker.fail(&WorkRef::issue(3));
+    write_tasks(root.path(), "## Doing\n- #3 index\n").await;
+    let (source, _events) = document(root.path());
+    let mut source = source.with_work_tracker(AnyWorkTracker::new(tracker.clone()));
+    source.on_request(false).await.expect("session start");
+    assert!(source.on_final_turn().await.is_none());
+
+    tracker.heal(&WorkRef::issue(3));
+    assert!(
+        source.on_final_turn().await.is_some(),
+        "readable again, the row is actionable"
+    );
+}
+
+/// A root whose tree the backend failed to read is said once and fetched
+/// again at the next request, which brings its tree once it reads.
+#[tokio::test]
+async fn a_root_that_failed_to_read_is_fetched_again() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let tracker = FixedTracker::default().with(item(WorkRef::issue(1), WorkState::Open));
+    tracker.fail(&WorkRef::issue(1));
+    write_tasks(root.path(), "## Roots\n- #1 search\n").await;
+    let (source, _events) = document(root.path());
+    let mut source = source.with_work_tracker(AnyWorkTracker::new(tracker.clone()));
+
+    let block = source.on_request(false).await.expect("session start");
+    assert!(
+        block.content().contains("Not loaded: #1 cannot be read"),
+        "{}",
+        block.content()
+    );
+    assert!(
+        source.on_request(false).await.is_none(),
+        "a failure still failing is not said again"
+    );
+
+    tracker.heal(&WorkRef::issue(1));
+    let block = source.on_request(false).await.expect("the retry reads");
+    assert!(
+        block.content().contains("Issue #1 (open): title of #1"),
+        "{}",
+        block.content()
+    );
+    assert!(source.on_request(false).await.is_none(), "then it is shown");
+}
+
+/// An agent rebuilt on a restored conversation takes what that
+/// conversation holds of the document: it shows only what changed since,
+/// and no root tree again.
+#[tokio::test]
+async fn a_restored_checkpoint_shows_only_what_changed_since() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let tracker = FixedTracker::default().with(item(WorkRef::issue(1), WorkState::Open));
+    write_tasks(root.path(), "## Roots\n- #1 search\n").await;
+    let (source, _events) = document(root.path());
+    let mut source = source.with_work_tracker(AnyWorkTracker::new(tracker.clone()));
+    source.on_request(false).await.expect("session start");
+    let checkpoint = source.checkpoint();
+    assert!(checkpoint.is_some());
+
+    let (rebuilt, _events) = document(root.path());
+    let mut rebuilt = rebuilt.with_work_tracker(AnyWorkTracker::new(tracker.clone()));
+    rebuilt.restore(checkpoint.clone());
+    assert!(
+        rebuilt.on_request(false).await.is_none(),
+        "the restored conversation already holds it all"
+    );
+
+    let (rebuilt, _events) = document(root.path());
+    let mut rebuilt = rebuilt.with_work_tracker(AnyWorkTracker::new(tracker));
+    rebuilt.restore(checkpoint);
+    write_tasks(root.path(), "## Roots\n- #1 search\n## Notes\nnew\n").await;
+    let block = rebuilt.on_request(false).await.expect("the change");
+    assert!(block.content().contains("Changes to tasks.md"));
+    assert!(!block.content().contains("Contents of tasks.md"));
+    assert!(!block.content().contains("title of #1"));
 }
 
 #[tokio::test]

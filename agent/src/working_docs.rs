@@ -15,20 +15,36 @@ use similar::{ChangeTag, TextDiff};
 /// The host resolves the mark's payload token: `true` while it names
 /// something still open — an unanswered `ask_user` request id, or a
 /// free-text reason the host cannot check. `false` means the mark is dead —
-/// its question was answered or withdrawn — and its row is stale.
+/// its question was answered or withdrawn — and its row is stale. An error
+/// says nothing either way: the mark keeps holding its row.
 pub trait TaskBlockerResolver: Send + Sync + 'static {
     /// Whether `mark` still names something the run waits on.
-    fn is_open(&self, mark: &str) -> impl Future<Output = bool> + Send;
+    fn is_open(&self, mark: &str) -> impl Future<Output = Result<bool, TaskBlockerError>> + Send;
 }
+
+/// Why a `BLOCKING` mark could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TaskBlockerError {
+    /// The host's record of what the mark names could not be read.
+    #[error("the mark {mark} cannot be resolved: {reason}")]
+    Unavailable {
+        /// The mark's payload.
+        mark: String,
+        /// What went wrong.
+        reason: String,
+    },
+}
+
+type IsOpen<'a> = Pin<Box<dyn Future<Output = Result<bool, TaskBlockerError>> + Send + 'a>>;
 
 /// Object-safe twin of [`TaskBlockerResolver`]; boxing lives inside
 /// [`AnyTaskBlockerResolver`].
 trait TaskBlockerResolverImpl: Send + Sync {
-    fn is_open<'a>(&'a self, mark: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+    fn is_open<'a>(&'a self, mark: &'a str) -> IsOpen<'a>;
 }
 
 impl<T: TaskBlockerResolver> TaskBlockerResolverImpl for T {
-    fn is_open<'a>(&'a self, mark: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+    fn is_open<'a>(&'a self, mark: &'a str) -> IsOpen<'a> {
         Box::pin(TaskBlockerResolver::is_open(self, mark))
     }
 }
@@ -45,7 +61,10 @@ impl AnyTaskBlockerResolver {
     }
 
     /// Whether `mark` still names something the run waits on.
-    pub fn is_open<'a>(&'a self, mark: &'a str) -> impl Future<Output = bool> + Send + 'a {
+    pub fn is_open<'a>(
+        &'a self,
+        mark: &'a str,
+    ) -> impl Future<Output = Result<bool, TaskBlockerError>> + Send + 'a {
         self.0.is_open(mark)
     }
 }
