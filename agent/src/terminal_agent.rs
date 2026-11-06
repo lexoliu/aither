@@ -964,11 +964,16 @@ where
             .flatten()
             .or_else(|| {
                 host_load.enabled.then(|| {
-                    crate::SystemReader::new()
-                        .inspect_err(|error| tracing::warn!(%error, "host load is not watched"))
-                        .ok()
-                        .map(crate::AnyHostReader::new)
-                })?
+                    // A host without a source is still watched where the
+                    // watch does not need it: a container's memory limit.
+                    match crate::SystemReader::new() {
+                        Ok(reader) => crate::AnyHostReader::new(reader),
+                        Err(error) => {
+                            tracing::warn!(%error, "host pressure and load are not watched");
+                            crate::AnyHostReader::new(crate::UnwatchedHost)
+                        }
+                    }
+                })
             });
         let inner = match reader {
             Some(reader) => {

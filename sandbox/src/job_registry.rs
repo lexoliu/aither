@@ -10,6 +10,7 @@ use std::time::Instant;
 use async_channel::{Receiver, Sender, WeakSender};
 use futures_lite::io::AsyncWriteExt;
 
+use crate::memory::MemoryDomain;
 use crate::permission::TerminalMode;
 use crate::poll_guard::PollRefusal;
 use crate::process_tree::{JobMarker, JobTree, KillTreeError, ProcessScanner};
@@ -33,6 +34,8 @@ pub struct JobInfo {
     pub status: JobStatus,
     /// Path to output file.
     pub output_path: Option<PathBuf>,
+    /// Where the job runs.
+    pub place: JobPlace,
 }
 
 /// Status of a background job.
@@ -72,15 +75,34 @@ pub enum KillCause {
     /// A request ended it: `terminal_kill`, its `timeout` bound, or the
     /// shutdown of its terminal.
     User,
-    /// Its process tree held more memory than the machine has, the host's
-    /// memory pressure was critical, and the agent left it running past the
+    /// Its home environment's memory ran out of room for the agent's jobs
+    /// (see [`MemoryDomain`]), and the agent left it running past the
     /// response window that followed the final warning.
     MemoryRunaway {
         /// The tree's physical footprint when it was killed.
         footprint_bytes: u64,
-        /// The machine's physical memory.
-        physical_bytes: u64,
+        /// The memory of the domain it ran in: the machine's physical memory,
+        /// or the container's limit.
+        capacity_bytes: u64,
+        /// The domain it ran in.
+        domain: MemoryDomain,
     },
+}
+
+/// Where a job runs, which decides what is watched of it.
+///
+/// Only the home environment is watched: the machine the embedder runs on,
+/// and the container the agent works in when it has one. The memory and the
+/// disk of a remote execution environment are never judged and its jobs are
+/// never killed for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobPlace {
+    /// A process of the machine the embedder runs on.
+    Host,
+    /// A process inside the container the agent works in.
+    Container,
+    /// A process on a remote host over SSH.
+    Remote,
 }
 
 impl JobStatus {
@@ -249,6 +271,7 @@ enum StateCommand {
         mode: TerminalMode,
         output_path: Option<PathBuf>,
         process_tree: Option<JobTree>,
+        place: JobPlace,
     },
     AttachTerminalInput {
         pid: u32,
@@ -475,7 +498,31 @@ impl JobRegistry {
         mode: TerminalMode,
         output_path: Option<PathBuf>,
     ) {
-        self.register_with_tree(pid, task_id, execution_key, script, mode, output_path, None)
+        self.register_with_tree(
+            pid,
+            task_id,
+            execution_key,
+            script,
+            mode,
+            output_path,
+            None,
+            JobPlace::Host,
+        )
+        .await;
+    }
+
+    /// Registers a new running job like [`Self::register`], for a job that
+    /// runs at `place` instead of on this machine.
+    pub async fn register_at(
+        &self,
+        place: JobPlace,
+        pid: u32,
+        task_id: &str,
+        execution_key: &str,
+        script: &str,
+        mode: TerminalMode,
+    ) {
+        self.register_with_tree(pid, task_id, execution_key, script, mode, None, None, place)
             .await;
     }
 
@@ -492,8 +539,10 @@ impl JobRegistry {
         mode: TerminalMode,
         output_path: Option<PathBuf>,
         process_tree: Option<JobTree>,
+        place: JobPlace,
     ) {
         self.send_command(StateCommand::Register {
+            place,
             pid,
             task_id: task_id.to_string(),
             execution_key: execution_key.to_string(),
@@ -798,14 +847,21 @@ impl JobRegistry {
     }
 
     /// Kills a running job whose process tree holds `footprint_bytes` of a
-    /// machine with `physical_bytes`; the job reads
+    /// `domain` with `capacity_bytes`; the job reads
     /// [`KillCause::MemoryRunaway`].
-    pub async fn kill_runaway(&self, pid: u32, footprint_bytes: u64, physical_bytes: u64) -> bool {
+    pub async fn kill_runaway(
+        &self,
+        pid: u32,
+        footprint_bytes: u64,
+        capacity_bytes: u64,
+        domain: MemoryDomain,
+    ) -> bool {
         self.kill_for(
             pid,
             KillCause::MemoryRunaway {
                 footprint_bytes,
-                physical_bytes,
+                capacity_bytes,
+                domain,
             },
         )
         .await
@@ -979,8 +1035,18 @@ async fn handle_state_command(
             mode,
             output_path,
             process_tree,
+            place,
         } => {
-            register_job(jobs, pid, task_id, execution_key, script, mode, output_path);
+            register_job(
+                jobs,
+                pid,
+                task_id,
+                execution_key,
+                script,
+                mode,
+                output_path,
+                place,
+            );
             if let Some(job) = jobs.get_mut(&pid) {
                 job.process_tree = process_tree;
             }
@@ -1152,6 +1218,7 @@ fn has_running_job(jobs: &HashMap<u32, JobState>) -> bool {
         .any(|job| matches!(job.info.status, JobStatus::Running))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_job(
     jobs: &mut HashMap<u32, JobState>,
     pid: u32,
@@ -1160,8 +1227,10 @@ fn register_job(
     script: String,
     mode: TerminalMode,
     output_path: Option<PathBuf>,
+    place: JobPlace,
 ) {
     let info = JobInfo {
+        place,
         pid,
         task_id,
         execution_key,
@@ -2192,6 +2261,7 @@ mod tests {
             "true".to_string(),
             TerminalMode::Sandboxed,
             None,
+            JobPlace::Host,
         );
         jobs
     }
@@ -2461,6 +2531,7 @@ mod tests {
             "run".to_string(),
             TerminalMode::Sandboxed,
             None,
+            JobPlace::Host,
         );
         let _first = owe_completion(&mut jobs, 12, Ok(0), &weak).await;
         let _second = owe_completion(&mut jobs, 12, Ok(0), &weak).await;

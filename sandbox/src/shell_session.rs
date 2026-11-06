@@ -361,6 +361,103 @@ impl ContainerShellRuntime {
     pub(crate) fn exec(&self) -> Arc<dyn ContainerExecImpl> {
         Arc::clone(&self.exec)
     }
+
+    /// A reader of the container's own state: what a harness that watches
+    /// the container's memory and disk asks it.
+    #[must_use]
+    pub fn probe(&self) -> ContainerProbe {
+        ContainerProbe {
+            exec: self.exec(),
+            container_id: self.container_id.clone(),
+        }
+    }
+}
+
+/// Why a probe of a container failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ContainerProbeError {
+    /// The container could not run the script.
+    #[error("the container could not run the probe: {0}")]
+    Exec(String),
+    /// The script ran and failed.
+    #[error("the probe exited with {status}: {stderr}")]
+    Failed {
+        /// The exit status it returned.
+        status: std::process::ExitStatus,
+        /// What it wrote to its standard error.
+        stderr: String,
+    },
+    /// The container killed the probe before it finished.
+    #[error("the container killed the probe")]
+    Killed,
+    /// The script answered bytes that are not text.
+    #[error("the probe answered bytes that are not UTF-8")]
+    NotText,
+}
+
+/// Runs short read-only scripts inside a container and returns what they
+/// print, through the same exec path commands use.
+#[derive(Clone)]
+pub struct ContainerProbe {
+    exec: Arc<dyn ContainerExecImpl>,
+    container_id: String,
+}
+
+impl std::fmt::Debug for ContainerProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContainerProbe")
+            .field("container_id", &self.container_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ContainerProbe {
+    /// A probe of container `container_id` through `exec`.
+    #[must_use]
+    pub fn new(exec: &AnyContainerExec, container_id: impl Into<String>) -> Self {
+        Self {
+            exec: Arc::clone(&exec.inner),
+            container_id: container_id.into(),
+        }
+    }
+
+    /// Runs `script` in the container's root directory and returns its
+    /// standard output.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the container cannot run the script, the script exits
+    /// non-zero or its output is not text.
+    pub async fn read(&self, script: &str) -> Result<String, ContainerProbeError> {
+        // Dropping the kill sender would kill the exec, so it lives to the
+        // end of the call; the dropped stdin sender is the EOF the script
+        // reads.
+        let (_kill, kill_rx) = async_channel::bounded::<()>(1);
+        let (stdin, stdin_rx) = async_channel::unbounded::<Vec<u8>>();
+        drop(stdin);
+        let outcome = self
+            .exec
+            .exec_boxed(
+                &self.container_id,
+                script,
+                "/",
+                kill_rx,
+                stdin_rx,
+                ExecLifetime::Foreground,
+            )
+            .await
+            .map_err(ContainerProbeError::Exec)?;
+        match outcome {
+            ContainerExecOutcome::Completed { output, .. } if output.status.success() => {
+                String::from_utf8(output.stdout).map_err(|_| ContainerProbeError::NotText)
+            }
+            ContainerExecOutcome::Completed { output, .. } => Err(ContainerProbeError::Failed {
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+            ContainerExecOutcome::Killed => Err(ContainerProbeError::Killed),
+        }
+    }
 }
 
 impl<T: ContainerExec> ContainerExecImpl for T {
