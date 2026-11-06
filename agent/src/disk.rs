@@ -1,24 +1,34 @@
-//! Disk pressure: how little free space the volume that hosts the agent has.
+//! Disk pressure: how little free space the agent's home environment has.
 //!
 //! The levels mirror memory pressure's and are judged by free space against
-//! three thresholds. Each agent watches its own volume through its own
-//! [`DiskReader`]; agents of one process can live on different volumes, so
-//! nothing here is shared between them. Disk pressure never kills anything.
+//! three thresholds. Only the home environment is watched, the place the
+//! agent works in: the volume the embedder names on the machine it runs on
+//! (the one holding the working directory unless told otherwise) and, when
+//! the agent works in a container, the filesystem of that container, which
+//! has its own size limit when the container is given one. A remote
+//! execution environment is never watched. Each volume has its own
+//! [`DiskReader`] and level; agents of one process can live on different
+//! volumes, so nothing here is shared between them. Disk pressure never
+//! kills anything.
 
 use std::fmt;
-use std::path::Path;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::host_load::ReadError;
-use crate::pressure::LevelTracker;
+use aither_sandbox::ContainerProbe;
+
+use crate::host_load::{HostLoadEvent, ReadError};
+use crate::pressure::{LevelTracker, Shift};
 
 #[cfg(test)]
 mod tests;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// How little free space the agent's volume has.
+/// How little free space a volume has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiskPressure {
     /// Space is plentiful.
@@ -100,9 +110,8 @@ impl Default for DiskThresholds {
 
 /// Reads the free space of one volume.
 ///
-/// Reads may block; the monitor runs them off the agent loop. A host
-/// implements this for the platform it reads; tests inject their own.
-pub trait DiskReader: Send + 'static {
+/// A host implements this for the volume it reads; tests inject their own.
+pub trait DiskReader: Send + Sync + 'static {
     /// The volume's name as the agent is told it.
     fn volume(&self) -> String;
 
@@ -110,28 +119,51 @@ pub trait DiskReader: Send + 'static {
     ///
     /// # Errors
     ///
-    /// Fails when the host's source cannot be read.
-    fn free_bytes(&mut self) -> Result<u64, ReadError>;
+    /// Fails when the volume's source cannot be read.
+    fn free_bytes(&self) -> impl Future<Output = Result<u64, ReadError>> + Send;
+}
+
+/// Object-safe twin of [`DiskReader`], used only through [`AnyDiskReader`].
+pub trait DiskReaderImpl: Send + Sync {
+    /// [`DiskReader::volume`].
+    fn volume_name(&self) -> String;
+
+    /// [`DiskReader::free_bytes`] through a boxed future.
+    fn free_bytes_boxed(&self)
+    -> Pin<Box<dyn Future<Output = Result<u64, ReadError>> + Send + '_>>;
+}
+
+impl<T: DiskReader> DiskReaderImpl for T {
+    fn volume_name(&self) -> String {
+        self.volume()
+    }
+
+    fn free_bytes_boxed(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, ReadError>> + Send + '_>> {
+        Box::pin(self.free_bytes())
+    }
 }
 
 /// A type-erased [`DiskReader`], what the builders store.
-pub struct AnyDiskReader(Box<dyn DiskReader>);
+#[derive(Clone)]
+pub struct AnyDiskReader(Arc<dyn DiskReaderImpl>);
 
 impl AnyDiskReader {
     /// Erases `reader`.
     #[must_use]
     pub fn new(reader: impl DiskReader) -> Self {
-        Self(Box::new(reader))
+        Self(Arc::new(reader))
     }
 }
 
 impl DiskReader for AnyDiskReader {
     fn volume(&self) -> String {
-        self.0.volume()
+        self.0.volume_name()
     }
 
-    fn free_bytes(&mut self) -> Result<u64, ReadError> {
-        self.0.free_bytes()
+    async fn free_bytes(&self) -> Result<u64, ReadError> {
+        self.0.free_bytes_boxed().await
     }
 }
 
@@ -141,11 +173,12 @@ impl fmt::Debug for AnyDiskReader {
     }
 }
 
-/// Reads the free space of the volume holding a path (`statvfs`; Windows has
-/// no reader yet).
+/// Reads the free space of the volume holding a path on the machine this
+/// process runs on: `statvfs` on Unix, `GetDiskFreeSpaceExW` on Windows (the
+/// space available to the calling user, quotas honored).
 #[derive(Debug, Clone)]
 pub struct SystemDisk {
-    path: std::path::PathBuf,
+    path: PathBuf,
 }
 
 impl SystemDisk {
@@ -163,87 +196,195 @@ impl DiskReader for SystemDisk {
         self.path.display().to_string()
     }
 
-    #[cfg(unix)]
-    fn free_bytes(&mut self) -> Result<u64, ReadError> {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let path = std::ffi::CString::new(self.path.as_os_str().as_bytes()).map_err(|_| {
-            ReadError::Malformed {
-                what: "the volume path",
-                content: self.path.display().to_string(),
-            }
-        })?;
-        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        // SAFETY: `path` is NUL terminated and `stat` is valid for a write of
-        // one `statvfs`, which the call fills on success.
-        let status = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
-        if status != 0 {
-            return Err(ReadError::Io {
-                what: "the free space of the volume",
-                source: std::io::Error::last_os_error(),
-            });
-        }
-        // SAFETY: `statvfs` returned success, so `stat` is initialized.
-        let stat = unsafe { stat.assume_init() };
-        // The widths of the fields differ between platforms.
-        #[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
-        Ok(u64::from(stat.f_bavail) * stat.f_frsize as u64)
-    }
-
-    #[cfg(not(unix))]
-    fn free_bytes(&mut self) -> Result<u64, ReadError> {
-        Err(ReadError::Unsupported {
-            what: "the free space of the volume",
-        })
+    async fn free_bytes(&self) -> Result<u64, ReadError> {
+        let path = self.path.clone();
+        blocking::unblock(move || system_free_bytes(&path)).await
     }
 }
 
-/// An agent's watch over its volume.
+#[cfg(unix)]
+fn system_free_bytes(path: &Path) -> Result<u64, ReadError> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path_c =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| ReadError::Malformed {
+            what: "the volume path",
+            content: path.display().to_string(),
+        })?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path_c` is NUL terminated and `stat` is valid for a write of
+    // one `statvfs`, which the call fills on success.
+    let status = unsafe { libc::statvfs(path_c.as_ptr(), stat.as_mut_ptr()) };
+    if status != 0 {
+        return Err(ReadError::Io {
+            what: "the free space of the volume",
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: `statvfs` returned success, so `stat` is initialized.
+    let stat = unsafe { stat.assume_init() };
+    // The widths of the fields differ between platforms.
+    #[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
+    Ok(u64::from(stat.f_bavail) * stat.f_frsize as u64)
+}
+
+#[cfg(windows)]
+fn system_free_bytes(path: &Path) -> Result<u64, ReadError> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut available = 0_u64;
+    // SAFETY: `wide` is NUL terminated and outlives the call, `available` is
+    // valid for a write of a `u64`, and the two totals the call may also
+    // fill are optional, so null asks for neither.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &raw mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(ReadError::Io {
+            what: "the free space of the volume",
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    Ok(available)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn system_free_bytes(_: &Path) -> Result<u64, ReadError> {
+    Err(ReadError::Unsupported {
+        what: "the free space of the volume",
+    })
+}
+
+/// Reads the free space of the filesystem that holds the agent's home
+/// directory inside the container it works in.
+///
+/// The read goes through the container's exec path. That filesystem's size is
+/// the container's own limit when it has one.
+#[derive(Debug, Clone)]
+pub struct ContainerDisk {
+    probe: ContainerProbe,
+}
+
+impl ContainerDisk {
+    /// A reader of the container `probe` runs scripts in.
+    #[must_use]
+    pub const fn new(probe: ContainerProbe) -> Self {
+        Self { probe }
+    }
+}
+
+impl DiskReader for ContainerDisk {
+    fn volume(&self) -> String {
+        format!("the container's filesystem ({})", self.probe.home())
+    }
+
+    async fn free_bytes(&self) -> Result<u64, ReadError> {
+        Ok(self.probe.free_bytes().await?)
+    }
+}
+
+/// The volumes of the home environment: the machine's `local` volume, and
+/// the container's filesystem when the agent works in a `container`. A
+/// remote execution environment has no volume here.
+#[must_use]
+pub fn home_volumes(local: AnyDiskReader, container: Option<ContainerProbe>) -> Vec<AnyDiskReader> {
+    let mut volumes = vec![local];
+    volumes.extend(container.map(|probe| AnyDiskReader::new(ContainerDisk::new(probe))));
+    volumes
+}
+
+/// The free space of every volume of `readers` now, in order; the volumes
+/// are read together. A failed read is logged and left out as `None`.
+pub async fn read_free_bytes(readers: Vec<AnyDiskReader>) -> Vec<Option<u64>> {
+    futures::future::join_all(readers.iter().map(|reader| async {
+        reader
+            .free_bytes()
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, volume = reader.volume(), "disk free space could not be read");
+            })
+            .ok()
+    }))
+    .await
+}
+
+/// One watched volume and the level it was last at.
 #[derive(Debug)]
-pub struct DiskWatch {
+struct Watched {
     reader: AnyDiskReader,
-    thresholds: DiskThresholds,
     level: LevelTracker<DiskPressure>,
 }
 
+/// An agent's watch over the volumes of its home environment.
+#[derive(Debug)]
+pub struct DiskWatch {
+    thresholds: DiskThresholds,
+    volumes: Vec<Watched>,
+}
+
 impl DiskWatch {
-    pub(crate) const fn new(reader: AnyDiskReader, thresholds: DiskThresholds) -> Self {
+    pub(crate) fn new(
+        thresholds: DiskThresholds,
+        readers: impl IntoIterator<Item = AnyDiskReader>,
+    ) -> Self {
         Self {
-            reader,
             thresholds,
-            level: LevelTracker::new(DiskPressure::Normal),
+            volumes: readers
+                .into_iter()
+                .map(|reader| Watched {
+                    reader,
+                    level: LevelTracker::new(DiskPressure::Normal),
+                })
+                .collect(),
         }
     }
 
-    /// The volume's free space now; a failed read is logged and leaves the
-    /// level as it was.
-    pub(crate) fn read(&mut self) -> Option<u64> {
-        self.reader
-            .free_bytes()
-            .inspect_err(|error| tracing::warn!(%error, "disk free space could not be read"))
-            .ok()
+    /// The readers of the watched volumes, in the order they are watched,
+    /// for a read that borrows nothing of the watch.
+    pub(crate) fn readers(&self) -> Vec<AnyDiskReader> {
+        self.volumes
+            .iter()
+            .map(|volume| volume.reader.clone())
+            .collect()
     }
 
-    /// Takes a reading of `free` bytes; returns the event a change of level
-    /// raises.
-    pub(crate) fn observe(&mut self, free: u64) -> Option<crate::HostLoadEvent> {
-        use crate::host_load::HostLoadEvent;
-        use crate::pressure::Shift;
-
-        let level = self.thresholds.level(free);
-        let volume = self.reader.volume();
-        let free = aither_sandbox::MemorySize(free);
-        match self.level.observe(level)? {
-            Shift::Rose(level) => Some(HostLoadEvent::DiskPressureRose {
-                volume,
-                level,
-                free,
-            }),
-            Shift::Fell(level) => Some(HostLoadEvent::DiskPressureDroppedBack {
-                volume,
-                level,
-                free,
-            }),
-        }
+    /// Takes a reading of each volume's free space (`None` where it could
+    /// not be read); returns the events its changes of level raise.
+    pub(crate) fn observe(&mut self, free: &[Option<u64>]) -> Vec<HostLoadEvent> {
+        let thresholds = &self.thresholds;
+        self.volumes
+            .iter_mut()
+            .zip(free)
+            .filter_map(|(volume, free)| {
+                let free = (*free)?;
+                let level = thresholds.level(free);
+                let volume_name = volume.reader.volume();
+                let free = aither_sandbox::MemorySize(free);
+                Some(match volume.level.observe(level)? {
+                    Shift::Rose(level) => HostLoadEvent::DiskPressureRose {
+                        volume: volume_name,
+                        level,
+                        free,
+                    },
+                    Shift::Fell(level) => HostLoadEvent::DiskPressureDroppedBack {
+                        volume: volume_name,
+                        level,
+                        free,
+                    },
+                })
+            })
+            .collect()
     }
 }

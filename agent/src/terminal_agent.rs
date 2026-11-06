@@ -197,10 +197,10 @@ struct HostLoadSetup {
     config: crate::HostLoadConfig,
     /// The reader to watch; the host's own when unset.
     reader: Option<crate::AnyHostReader>,
-    /// Whether the agent's volume is watched.
+    /// Whether the volumes of the home environment are watched.
     disk: bool,
     thresholds: crate::DiskThresholds,
-    /// The reader of the agent's volume; the one holding the working
+    /// The reader of the machine's home volume; the one holding the working
     /// directory when unset.
     disk_reader: Option<crate::AnyDiskReader>,
 }
@@ -823,25 +823,38 @@ where
         self
     }
 
-    /// Judges the free space of the agent's volume by `thresholds`, which
-    /// the caller may change at any time through its own clone of the
-    /// handle. Defaults to yellow below 10 GiB, red below 5 and final below
-    /// 3.
+    /// Judges the free space of the home environment's volumes by
+    /// `thresholds`, which the caller may change at any time through its own
+    /// clone of the handle. Defaults to yellow below 10 GiB, red below 5 and
+    /// final below 3.
     #[must_use]
     pub fn disk_thresholds(mut self, thresholds: crate::DiskThresholds) -> Self {
         self.host_load.thresholds = thresholds;
         self
     }
 
-    /// Reads the free space of the agent's volume through `reader` instead
-    /// of the volume holding the working directory.
+    /// Names the volume of the machine the agent's home environment is on:
+    /// the one that holds `path`. Defaults to the volume holding the
+    /// terminal's working directory.
+    ///
+    /// When the agent works in a container, the filesystem of the container
+    /// is watched as well, whatever is named here; a remote execution
+    /// environment is never watched.
+    #[must_use]
+    pub fn home_volume(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        self.host_load.disk_reader = Some(crate::AnyDiskReader::new(crate::SystemDisk::new(path)));
+        self
+    }
+
+    /// Reads the free space of the machine's home volume through `reader`
+    /// instead of the volume holding the working directory.
     #[must_use]
     pub fn disk_reader(mut self, reader: impl crate::DiskReader) -> Self {
         self.host_load.disk_reader = Some(crate::AnyDiskReader::new(reader));
         self
     }
 
-    /// Does not watch the free space of the agent's volume.
+    /// Does not watch the free space of the home environment's volumes.
     #[must_use]
     pub const fn without_disk_pressure(mut self) -> Self {
         self.host_load.disk = false;
@@ -983,12 +996,15 @@ where
                     terminal_tool.foreground_wait(),
                 );
                 let monitor = if host_load.disk {
-                    let disk = host_load.disk_reader.unwrap_or_else(|| {
+                    let local = host_load.disk_reader.unwrap_or_else(|| {
                         crate::AnyDiskReader::new(crate::SystemDisk::new(
                             terminal_tool.working_dir(),
                         ))
                     });
-                    monitor.with_disk(disk, host_load.thresholds)
+                    monitor.with_disk(
+                        host_load.thresholds,
+                        crate::disk::home_volumes(local, terminal_tool.container_probe()),
+                    )
                 } else {
                     monitor
                 };

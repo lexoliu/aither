@@ -119,7 +119,10 @@ pub use context::{
     TasksDocument,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
-pub use disk::{AnyDiskReader, DiskPressure, DiskReader, DiskThresholds, SystemDisk};
+pub use disk::{
+    AnyDiskReader, ContainerDisk, DiskPressure, DiskReader, DiskReaderImpl, DiskThresholds,
+    SystemDisk,
+};
 pub use error::AgentError;
 pub use event::{AgentEvent, TimedEvent};
 pub use external_hook::{

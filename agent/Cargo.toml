@@ -55,13 +55,14 @@ whatlang = { version = "0.18", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", default-features = false, features = ["std", "time"] }
-
-[target.'cfg(target_vendor = "apple")'.dependencies]
+# `statvfs` for the free space of a volume; macOS also reads its memory
+# pressure and load average through it.
 libc = { version = "0.2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Memory",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",

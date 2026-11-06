@@ -5619,7 +5619,7 @@ struct ContainerIpcEndpoint<'a> {
 }
 
 /// Working directory container executions run their scripts in.
-const CONTAINER_EXEC_WORKING_DIR: &str = "/workspace";
+pub const CONTAINER_EXEC_WORKING_DIR: &str = "/workspace";
 
 /// The sandbox a subagent's command runs in inside a container, as container
 /// paths: the main agent's commands run unconfined because the container is its
@@ -6568,6 +6568,8 @@ mod tests {
         assert_eq!(job.place, crate::JobPlace::Remote);
         let machine = terminal.job_memory().snapshot().await.unwrap();
         assert_eq!(machine.jobs, []);
+        // An SSH server is never a home environment: no container to watch.
+        assert!(terminal.container_probe().is_none());
         terminal.job_registry().kill_running().await;
     }
 

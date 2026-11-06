@@ -96,6 +96,9 @@ pub enum ReadError {
         /// The source that is missing.
         what: &'static str,
     },
+    /// The container could not be read.
+    #[error(transparent)]
+    Container(#[from] aither_sandbox::ContainerProbeError),
 }
 
 /// Reads the host's memory pressure and machine load.
@@ -417,25 +420,13 @@ impl Condition {
 pub struct HostSample {
     memory: Option<MemoryPressure>,
     load: Option<MachineLoad>,
-    disk_free: Option<u64>,
 }
 
 impl HostSample {
     /// A sample of the given readings.
     #[must_use]
     pub const fn new(memory: Option<MemoryPressure>, load: Option<MachineLoad>) -> Self {
-        Self {
-            memory,
-            load,
-            disk_free: None,
-        }
-    }
-
-    /// The sample with the free space of the watched volume, in bytes.
-    #[must_use]
-    pub const fn with_disk_free(mut self, free: u64) -> Self {
-        self.disk_free = Some(free);
-        self
+        Self { memory, load }
     }
 }
 
@@ -452,14 +443,35 @@ pub struct HostLoadMonitor<R> {
 }
 
 impl<R: HostReader> HostLoadMonitor<R> {
-    /// Also watches the free space of the volume `reader` reads, judged by
-    /// `thresholds`: the agent hears once of each change of the disk
-    /// pressure level, and nothing is ever killed for it. Each monitor
-    /// watches its own volume.
+    /// Also watches the free space of the volumes `readers` read, judged by
+    /// `thresholds`: the agent hears once of each change of a volume's disk
+    /// pressure level, and nothing is ever killed for it. The volumes are
+    /// those of the agent's home environment alone; each monitor watches its
+    /// own.
     #[must_use]
-    pub fn with_disk(mut self, reader: AnyDiskReader, thresholds: DiskThresholds) -> Self {
-        self.disk = Some(DiskWatch::new(reader, thresholds));
+    pub fn with_disk(
+        mut self,
+        thresholds: DiskThresholds,
+        readers: impl IntoIterator<Item = AnyDiskReader>,
+    ) -> Self {
+        self.disk = Some(DiskWatch::new(thresholds, readers));
         self
+    }
+
+    /// The free space of each watched volume now, in the order they were
+    /// given; empty when no disk is watched. A volume that cannot be read is
+    /// `None`.
+    pub fn read_disks(&self) -> impl Future<Output = Vec<Option<u64>>> + Send + use<R> {
+        let readers = self.disk.as_ref().map(DiskWatch::readers);
+        async move { crate::disk::read_free_bytes(readers.unwrap_or_default()).await }
+    }
+
+    /// Applies readings of the volumes' free space, as [`Self::read_disks`]
+    /// returns them; returns the events their changes of level raise.
+    pub fn observe_disks(&mut self, free: &[Option<u64>]) -> Vec<HostLoadEvent> {
+        self.disk
+            .as_mut()
+            .map_or_else(Vec::new, |disk| disk.observe(free))
     }
 
     /// A monitor reading `reader`, lengthening `foreground_wait` while high
@@ -492,12 +504,7 @@ impl<R: HostReader> HostLoadMonitor<R> {
             .machine_load()
             .inspect_err(|error| log_failed_read(error, "machine load"))
             .ok();
-        let disk_free = self.disk.as_mut().and_then(DiskWatch::read);
-        HostSample {
-            memory,
-            load,
-            disk_free,
-        }
+        HostSample { memory, load }
     }
 
     /// Applies a sample taken at `now`; returns the events it completes.
@@ -546,13 +553,11 @@ impl<R: HostReader> HostLoadMonitor<R> {
                 None => {}
             }
         }
-        if let (Some(disk), Some(free)) = (self.disk.as_mut(), sample.disk_free) {
-            events.extend(disk.observe(free));
-        }
         events
     }
 
-    /// Reads and observes in one step, as the monitor task does.
+    /// Reads and observes the host in one step, as the monitor task does;
+    /// the disks are read apart, with [`Self::read_disks`].
     pub fn tick(&mut self, clock: &AnyClock) -> Vec<HostLoadEvent> {
         let sample = self.read();
         self.observe(clock.now(), sample)
@@ -598,9 +603,15 @@ async fn run<R: HostReader>(
         monitor = back;
         let now = clock.now();
         let mut raised = monitor.observe(now, sample);
-        if let Some(guard) = guard.as_mut() {
-            raised.extend(guard.observe(now, sample.memory).await);
-        }
+        // The volumes and the jobs are read independently of each other.
+        let (disks, guarded) = futures::join!(monitor.read_disks(), async {
+            match guard.as_mut() {
+                Some(guard) => guard.observe(now, sample.memory).await,
+                None => Vec::new(),
+            }
+        });
+        raised.extend(guarded);
+        raised.extend(monitor.observe_disks(&disks));
         for event in raised {
             tracing::info!(?event, "host load condition changed");
             if events.send(event).await.is_err() {
