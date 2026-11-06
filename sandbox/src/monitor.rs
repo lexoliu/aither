@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::job_registry::{JobRegistry, JobStatus};
 use crate::output::{MediaResolution, OutputFormat};
 use crate::permission::PermissionHandler;
+use crate::script_language::ScriptLanguage;
 use crate::terminal::{Configured, JobAlert, TerminalArgs, TerminalExecutionMode, TerminalTool};
 
 /// The longest a monitor may run: two hours, the same cap `terminal` has.
@@ -68,27 +69,15 @@ pub enum MonitorSource {
     Command {
         /// The source to run.
         command: String,
-        /// Its language: `shell` runs it directly, `python` through the
-        /// sandbox's `python3` on stdin. Default `shell`.
+        /// Its language: `shell` or `python`. Default `shell`.
         #[serde(default)]
-        language: MonitorLanguage,
+        language: ScriptLanguage,
     },
     /// A file whose appended lines are followed inside the sandbox.
     File {
         /// The path, resolved against the working directory when relative.
         file: String,
     },
-}
-
-/// The interpreter a monitored command runs under.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum MonitorLanguage {
-    /// The command is shell source.
-    #[default]
-    Shell,
-    /// The command is Python source, fed to `python3` on stdin.
-    Python,
 }
 
 /// New output a monitor collected since the last delivery.
@@ -240,9 +229,12 @@ fn single_quote(text: &str) -> String {
 }
 
 impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<P, E> {
-    /// The script the monitored job runs for `source`; `Ok(None)`'s inner
-    /// error refuses an unreadable file before anything spawns.
-    fn job_script(&self, source: &MonitorSource) -> Result<String, MonitorRefusal> {
+    /// The script the monitored job runs for `source` and its language; an
+    /// unreadable file is refused before anything spawns.
+    fn job_script(
+        &self,
+        source: &MonitorSource,
+    ) -> Result<(String, ScriptLanguage), MonitorRefusal> {
         match source {
             MonitorSource::Command { command, language } => {
                 if command.trim().is_empty() {
@@ -250,12 +242,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<
                         reason: "command must not be empty".to_string(),
                     });
                 }
-                Ok(match language {
-                    MonitorLanguage::Shell => command.clone(),
-                    MonitorLanguage::Python => format!(
-                        "python3 - <<'__AITHER_MONITOR_PY__'\n{command}\n__AITHER_MONITOR_PY__"
-                    ),
-                })
+                Ok((command.clone(), *language))
             }
             MonitorSource::File { file } => {
                 let mut path = std::path::PathBuf::from(file);
@@ -276,9 +263,9 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<
                 }
                 // `tail -F` follows appended lines and survives rotation
                 // (the name is reopened) and truncation.
-                Ok(format!(
-                    "tail -Fn0 {}",
-                    single_quote(&path.to_string_lossy())
+                Ok((
+                    format!("tail -Fn0 {}", single_quote(&path.to_string_lossy())),
+                    ScriptLanguage::Shell,
                 ))
             }
         }
@@ -332,7 +319,7 @@ where
         };
         let filter = compile("filter", &args.filter)?;
         let stop_on = compile("stop_on", &args.stop_on)?;
-        let script = self.job_script(&args.source)?;
+        let (script, language) = self.job_script(&args.source)?;
         let description = match &args.source {
             MonitorSource::Command { .. } => "monitored command".to_string(),
             MonitorSource::File { file } => format!("monitor file {file}"),
@@ -342,6 +329,7 @@ where
             .run_background(TerminalArgs {
                 description,
                 script,
+                language,
                 mode: TerminalExecutionMode::Default,
                 ssh_server_id: None,
                 expect: OutputFormat::Text,
