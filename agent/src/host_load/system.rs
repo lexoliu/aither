@@ -200,7 +200,7 @@ mod linux {
 
     pub fn memory_pressure(_: &State) -> Result<MemoryPressure, ReadError> {
         let content = read(MEMORY)?;
-        psi_memory_pressure(&content).ok_or_else(|| ReadError::Malformed {
+        psi_memory_pressure(&content).ok_or(ReadError::Malformed {
             what: MEMORY,
             content,
         })

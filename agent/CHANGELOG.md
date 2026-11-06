@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0](https://github.com/May-Agent/aither/compare/agent-v0.20.0...agent-v0.21.0) - 2026-11-06
+
+### Fixed
+
+- *(agent)* let a waiting message end a run a stop-gate alert keeps going
+
+## [0.20.0](https://github.com/May-Agent/aither/compare/agent-v0.19.0...agent-v0.20.0) - 2026-11-06
+
+### Added
+
+- *(sandbox)* [**breaking**] let the embedder prepare each subagent run's space
+- *(agent)* [**breaking**] drop the sustained memory pressure alerts
+- *(sandbox)* [**breaking**] judge the home environment's memory, a container's included, and never a remote host's
+- *(agent)* record subagent starts and finishes on the tasks inbox
+- *(agent)* [**breaking**] event-driven tasks.md with a fixed format and a stop gate
+- *(agent)* warn about job memory and kill a runaway job left running
+- *(sandbox)* [**breaking**] report why a job was killed and read job memory footprints
+
+### Fixed
+
+- gate a unix-only test and take ok_or for an eager error
+- *(agent)* [**breaking**] judge tasks.md events at their cause and never read an unknown as unblocked
+- *(agent)* [**breaking**] retry a model response whose stream breaks mid-response
+- *(core)* [**breaking**] report each model's retry policy
+- *(agent)* park a turn whose every call re-read unchanged output
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into feat/subagent-run-space
+- Merge pull request #553 from May-Agent/feat/171-runaway-guard
+- Merge pull request #561 from May-Agent/fix/560-test-git-isolation
+- Merge remote-tracking branch 'origin/dev' into feat/171-runaway-guard
+- run every test's git through one isolated helper
+- Merge pull request #557 from May-Agent/feat/129-event-driven-tasks
+- *(agent)* keep the subagent tasks.md test's documents well formed
+- Merge pull request #541 from May-Agent/fix/540-park-refused-poll
+
 ## [0.19.0](https://github.com/May-Agent/aither/compare/agent-v0.18.0...agent-v0.19.0) - 2026-11-05
 
 ### Added

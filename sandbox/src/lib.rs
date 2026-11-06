@@ -58,6 +58,7 @@ mod command_set;
 mod container;
 mod foreground_wait;
 mod grants;
+mod heel_binary;
 mod kill_guard;
 mod memory;
 pub mod monitor;
@@ -94,6 +95,10 @@ pub mod network_policy;
 /// Permission handling for terminal modes.
 pub mod permission;
 
+/// Isolated git for tests, shared with dependent crates through the `test-git` feature.
+#[cfg(any(test, feature = "test-git"))]
+pub mod test_git;
+
 pub use bollard_exec::BollardContainerExec;
 pub use command::{
     AnyCommandGate, AnyCommandObserver, CommandCall, CommandEnvelope, CommandGate, CommandObserver,
@@ -109,7 +114,7 @@ pub use container::{
     MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,
 };
 pub use foreground_wait::ForegroundWait;
-pub use grants::{GrantSet, TerminalGrants};
+pub use grants::{GitDirAccess, GrantSet, TerminalGrants};
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
 pub use heel::NetworkAuditLog;
 /// Re-export of heel's scheduling priority types for terminal-tool configuration.
@@ -152,8 +157,9 @@ pub use shell_session::{
 };
 pub use stdin_watch::StdinWatchSignal;
 pub use subagent::{
-    CommitLedger, CommitLedgerError, CommitMark, ImportBudget, SubagentCommit, SubagentGrant,
-    SubagentGrantError,
+    AnySubagentSpaces, CommitLedger, CommitLedgerError, CommitMark, ImportBudget, PreparedSpace,
+    RunSpace, SpacePreparationError, SubagentCommit, SubagentGrant, SubagentGrantError,
+    SubagentSpaces,
 };
 pub use terminal::{
     BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand,

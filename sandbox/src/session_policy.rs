@@ -14,8 +14,11 @@ use heel::Grant;
 
 #[cfg(all(unix, feature = "jobserver"))]
 use crate::terminal::job_fifo_grant;
-use crate::terminal::{local_path_grants, prepare_session_runtime_environment};
-use crate::{PreparedTools, TerminalError};
+use crate::terminal::{
+    linked_worktree_grants, local_path_grants, path_directory_grants,
+    prepare_session_runtime_environment, session_write_denylist,
+};
+use crate::{GitDirAccess, PreparedTools, TerminalError};
 
 /// The filesystem grants and process environment a session sandbox gives a
 /// command.
@@ -25,7 +28,11 @@ use crate::{PreparedTools, TerminalError};
 /// access, the shared `uv` directory with write and execute access, the
 /// command's jobserver fifo (see [`Self::with_job_fifo`]) and the host
 /// toolchain homes (`CARGO_HOME`, `RUSTUP_HOME`) that exist, with write and
-/// execute access. The environment is the session's `HOME`, temporary and
+/// execute access. A granted linked git worktree also brings its repository's
+/// common git directory, with the worktree's access, once git's back-links
+/// confirm it. Every existing directory of the session's `PATH` is granted
+/// read and execute access, never write. The policy also carries the write denylist
+/// ([`Self::write_denylist`]). The environment is the session's `HOME`, temporary and
 /// cache directories, `PATH` led by the managed tools directory, `uv` and
 /// toolchain variables, and the jobserver variables.
 ///
@@ -35,11 +42,15 @@ use crate::{PreparedTools, TerminalError};
 pub struct SessionSandboxPolicy {
     grants: Vec<Grant>,
     environment: Vec<(String, String)>,
+    write_denylist: heel::WriteDenylist,
 }
 
 impl SessionSandboxPolicy {
     /// Builds the policy of a session whose directory is `working_dir`, for
     /// the given writable and readable sets and prepared tools.
+    ///
+    /// `git_dir` is the terminal's access to the common git directory of a
+    /// linked worktree it may write.
     ///
     /// Creates the session's `tmp`, `.cache` and `.config` directories,
     /// which its environment points at.
@@ -51,14 +62,24 @@ impl SessionSandboxPolicy {
         working_dir: &Path,
         writable: &[PathBuf],
         readable: &[PathBuf],
+        git_dir: GitDirAccess,
         tools: &PreparedTools<PathBuf>,
     ) -> Result<Self, TerminalError> {
-        let grants = local_path_grants(writable, readable, tools)
-            .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
         let environment = prepare_session_runtime_environment(working_dir, tools).await?;
+        let setup = |error: heel::Error| TerminalError::SandboxSetup(error.to_string());
+        // The `PATH` directories lead, so a writable grant over one of them
+        // is never narrowed by them.
+        let mut grants = path_directory_grants(&environment).map_err(setup)?;
+        grants.extend(local_path_grants(writable, readable, tools).map_err(setup)?);
+        grants.extend(
+            linked_worktree_grants(writable, readable, git_dir)
+                .await
+                .map_err(setup)?,
+        );
         Ok(Self {
             grants,
             environment,
+            write_denylist: session_write_denylist(working_dir, tools),
         })
     }
 
@@ -84,6 +105,16 @@ impl SessionSandboxPolicy {
     #[must_use]
     pub fn grants(&self) -> &[Grant] {
         &self.grants
+    }
+
+    /// The paths the sandbox must not write, however they are granted: heel's
+    /// persistence table, less cargo's git cache, the session directory and the `uv` cache.
+    /// A host building its own
+    /// [`heel::SandboxConfig`] passes it to `write_denylist` (not on
+    /// Windows, whose backend refuses one).
+    #[must_use]
+    pub const fn write_denylist(&self) -> &heel::WriteDenylist {
+        &self.write_denylist
     }
 
     /// The process environment, as name and value pairs.

@@ -20,7 +20,7 @@ use crate::{
     context::{
         AnyContextSource, BackgroundJobs, Block, CacheLifetime, CompactionFork,
         CompletedCompaction, Context, ContextBudget, HandoffDocument, InstructionSlot,
-        PendingCompaction, PrefixChain, PrefixRewrites, PromptCache, PromptPrefix, TasksDocument,
+        PendingCompaction, PrefixChain, PrefixRewrites, PromptCache, PromptPrefix,
         recovery::{SpillLimits, clean_for_recovery},
         restore_context,
     },
@@ -39,8 +39,8 @@ use crate::{
 use aither_core::{
     LanguageModel,
     llm::{
-        Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, StoredFile,
-        ToolCall,
+        Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, RetryPolicy,
+        StoredFile, ToolCall,
         model::{Parameters, Profile as ModelProfile},
     },
 };
@@ -326,6 +326,13 @@ enum ModelEventAction {
     Emit(AgentEvent),
     Continue,
     RetryMalformed,
+}
+
+/// A response stream that ended with an error instead of finishing.
+struct BrokenStream {
+    error: AgentError,
+    /// Whether an event arrived before the error: the stream had opened.
+    opened: bool,
 }
 
 /// A finished tool call, waiting to be paired with its call in the context.
@@ -877,9 +884,14 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Optional sandbox directory for working-doc supervision (`tasks.md`).
     pub(crate) sandbox_dir: Option<PathBuf>,
 
-    /// Resolves `BLOCKING` marks in `tasks.md`; a mark it reports dead no
-    /// longer holds the item.
-    pub(crate) blocker_resolver: Option<crate::working_docs::AnyTaskBlockerResolver>,
+    /// What the host gives the `tasks.md` supervision; the agent records its
+    /// finished background jobs on its events.
+    pub(crate) tasks: crate::tasks::TasksWiring,
+
+    /// The source supervising `tasks.md` in the sandbox, owned apart from
+    /// [`context_sources`](Self::context_sources) because what it showed
+    /// travels in the agent's checkpoint.
+    pub(crate) tasks_document: Option<crate::tasks::TasksDocument>,
 
     /// Directory files are restored from after a forked compaction.
     pub(crate) restore_dir: Option<PathBuf>,
@@ -988,7 +1000,8 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             job_registry: None,
             detached_task_ids: HashSet::new(),
             sandbox_dir: None,
-            blocker_resolver: None,
+            tasks: crate::tasks::TasksWiring::default(),
+            tasks_document: None,
             restore_dir: None,
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
@@ -1055,15 +1068,80 @@ where
         connectivity.guard(stream)
     }
 
+    /// The retry policy of the active tier's model.
+    fn retry_policy(&self) -> RetryPolicy {
+        match self.tier {
+            ModelTier::Advanced => self.advanced.retry_policy(),
+            ModelTier::Balanced => self.balanced.retry_policy(),
+            ModelTier::Fast => self.fast.retry_policy(),
+        }
+    }
+
+    /// Streams the model's response to `request`, sending the request again
+    /// when the stream breaks after it opened.
+    ///
+    /// A failure before the first event is the provider's to retry, since it
+    /// retries establishing the stream itself; a break after it is retried
+    /// here, under the model's [`RetryPolicy`], unless the machine is
+    /// offline. The broken attempt's text, calls and reasoning are dropped
+    /// with it, and the request sent again is the one recorded as the last
+    /// request, so the provider reads the same cached prefix.
     async fn collect_model_turn(
+        &mut self,
+        mut request: LLMRequest,
+        events: &EventSink,
+    ) -> Result<ModelTurn, AgentError> {
+        let policy = self.retry_policy();
+        let mut retries = 0;
+        loop {
+            let broken = match self.stream_model_turn(request, events).await {
+                Ok(turn) => return Ok(turn),
+                Err(broken) => broken,
+            };
+            let failure = match broken.error.failure() {
+                Some(failure)
+                    if broken.opened
+                        && policy.allows(retries, failure)
+                        && !self.connectivity.is_offline() =>
+                {
+                    *failure
+                }
+                _ => return Err(broken.error),
+            };
+            let delay = policy.delay(retries, &failure);
+            retries += 1;
+            tracing::warn!(
+                retry = retries,
+                max_retries = policy.max_retries,
+                delay_ms = delay.as_millis(),
+                error = %broken.error,
+                "model response stream broke mid-response; sending the request again"
+            );
+            events.emit(AgentEvent::ResponseRetry {
+                error: broken.error,
+                retry: retries,
+                max_retries: policy.max_retries,
+                delay,
+            });
+            async_io::Timer::after(delay).await;
+            request = self
+                .last_request
+                .clone()
+                .expect("a request that reached the model is recorded as the last request");
+        }
+    }
+
+    /// One attempt at streaming the model's response to `request`.
+    async fn stream_model_turn(
         &mut self,
         request: LLMRequest,
         events: &EventSink,
-    ) -> Result<ModelTurn, AgentError> {
+    ) -> Result<ModelTurn, BrokenStream> {
         let mut text_chunks = Vec::new();
         let mut tool_calls = Vec::new();
         let mut reasoning = Vec::new();
         let mut malformed_function_call = false;
+        let mut opened = false;
 
         let stream = Self::respond_stream(
             self.tier,
@@ -1075,7 +1153,8 @@ where
         );
         futures_lite::pin!(stream);
         while let Some(event) = stream.next().await {
-            match handle_model_event(
+            let received = event.is_ok();
+            let action = handle_model_event(
                 &self.hooks,
                 &mut self.cache_stats,
                 &mut self.budget,
@@ -1084,8 +1163,10 @@ where
                 &mut tool_calls,
                 &mut reasoning,
             )
-            .await?
-            {
+            .await
+            .map_err(|error| BrokenStream { error, opened })?;
+            opened |= received;
+            match action {
                 ModelEventAction::Emit(event) => events.emit(event),
                 ModelEventAction::Continue => {}
                 ModelEventAction::RetryMalformed => {
@@ -1371,6 +1452,20 @@ where
         }
         events.emit(AgentEvent::turn_complete(turn, false));
         if self.push_final_turn_alerts().await {
+            // The alerts stay in the conversation either way; a host that has
+            // a message waiting ends the run here so the message travels with
+            // them in the next request instead of one request later.
+            let boundary_ctx = TurnBoundaryContext {
+                assistant_text: &response_text,
+                turn,
+                message_count: self.context.len_recent(),
+            };
+            if self.hooks.on_turn_boundary(&boundary_ctx).await == TurnBoundaryAction::EndTurn {
+                return Ok(TurnControl::Break {
+                    final_text: response_text,
+                    stop_reason: StopReason::EndTurn,
+                });
+            }
             return Ok(TurnControl::Continue);
         }
         Ok(TurnControl::Break {
@@ -2127,6 +2222,9 @@ where
         }
         let result_msg = format_background_task_result(&task);
         self.context.push(Message::system(&result_msg));
+        self.tasks
+            .events
+            .record(crate::tasks::TaskEvent::JobFinished(task.task_id.clone()));
         events.emit(AgentEvent::background_task_completed(
             task.task_id,
             result_msg,
@@ -2843,10 +2941,21 @@ where
         let reassembled = std::mem::take(&mut self.reassembled);
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_request(reassembled).await {
-                self.budget.append(block.len());
-                self.context.push_block_alert(&block);
+                self.push_source_alert(&block);
             }
         }
+        if let Some(document) = self.tasks_document.as_mut()
+            && let Some(block) =
+                crate::context::ContextSource::on_request(document, reassembled).await
+        {
+            self.push_source_alert(&block);
+        }
+    }
+
+    /// Appends a source's durable alert to the conversation.
+    fn push_source_alert(&mut self, block: &Block) {
+        self.budget.append(block.len());
+        self.context.push_block_alert(block);
     }
 
     /// Collects the durable alerts sources raise after a tool turn.
@@ -2854,9 +2963,13 @@ where
         self.push_injected_context();
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_tool_turn_end().await {
-                self.budget.append(block.len());
-                self.context.push_block_alert(&block);
+                self.push_source_alert(&block);
             }
+        }
+        if let Some(document) = self.tasks_document.as_mut()
+            && let Some(block) = crate::context::ContextSource::on_tool_turn_end(document).await
+        {
+            self.push_source_alert(&block);
         }
     }
 
@@ -2868,10 +2981,15 @@ where
         let mut pushed = false;
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_final_turn().await {
-                self.budget.append(block.len());
-                self.context.push_block_alert(&block);
+                self.push_source_alert(&block);
                 pushed = true;
             }
+        }
+        if let Some(document) = self.tasks_document.as_mut()
+            && let Some(block) = crate::context::ContextSource::on_final_turn(document).await
+        {
+            self.push_source_alert(&block);
+            pushed = true;
         }
         pushed
     }
@@ -2914,6 +3032,10 @@ where
                 .background_receiver
                 .as_ref()
                 .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running),
+            tasks: self
+                .tasks_document
+                .as_ref()
+                .and_then(crate::tasks::TasksDocument::checkpoint),
         })
     }
 
@@ -2924,6 +3046,10 @@ where
     /// Returns an error when the checkpoint cannot be restored into this agent.
     pub fn restore_checkpoint(&mut self, checkpoint: AgentCheckpoint) -> Result<(), AgentError> {
         self.context.restore(checkpoint.context);
+        // The restored conversation holds what its tasks document showed.
+        if let Some(document) = self.tasks_document.as_mut() {
+            document.restore(checkpoint.tasks);
+        }
         // Everything below belongs to the window just replaced: its fork
         // point, its failure, its parked tool results and its last request
         // mean nothing in the restored one.
@@ -3094,13 +3220,6 @@ where
                     guard,
                     self.sandbox_dir.clone(),
                 )));
-        }
-        if let Some(sandbox_dir) = self.sandbox_dir.clone() {
-            let mut source = TasksDocument::new(sandbox_dir, self.config.tasks_stale_after_turns);
-            if let Some(resolver) = self.blocker_resolver.clone() {
-                source = source.with_blocker_resolver(resolver);
-            }
-            self.context_sources.push(AnyContextSource::new(source));
         }
         if let Some(job_registry) = self.job_registry.clone() {
             self.context_sources
@@ -3503,6 +3622,10 @@ where
         let tool_surface_hash = self.tool_surface_hash();
         let tail = self.render_tail().await;
         let window = self.context_window_snapshot(&tail);
+        let tasks = self
+            .tasks_document
+            .as_ref()
+            .and_then(crate::tasks::TasksDocument::checkpoint);
         let checkpoint_ctx = CheckpointContext {
             reason,
             assistant_text,
@@ -3515,6 +3638,7 @@ where
                 .as_ref()
                 .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running),
             window: &window,
+            tasks: tasks.as_ref(),
         };
         if let Some(reason) = self.hooks.on_checkpoint(&checkpoint_ctx).await {
             return Err(AgentError::HookRejected {
@@ -4794,6 +4918,7 @@ mod tests {
                 messages: Vec::new(),
             },
             has_background_tasks: false,
+            tasks: None,
         }
     }
 
@@ -5075,37 +5200,50 @@ mod tests {
     }
 
     fn tasks_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+        tasks_agent_on(dir, crate::tasks::TaskEvents::new())
+    }
+
+    fn tasks_agent_on(
+        dir: &std::path::Path,
+        events: crate::tasks::TaskEvents,
+    ) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
         Agent::builder(MockLlm {
             context_length: 1_000_000,
         })
         .sandbox_dir(dir)
-        .config(AgentConfig {
-            tasks_stale_after_turns: 2,
-            ..AgentConfig::default()
-        })
+        .task_events(events)
         .build()
     }
 
+    /// An event the host records on the inbox it gave the builder reaches
+    /// the agent's tasks document, and its alert the conversation, once.
     #[tokio::test]
     async fn tool_turn_alerts_from_sources_reach_the_conversation() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir should exist");
-        std::fs::write(dir.path().join("tasks.md"), "- [ ] pending\n").expect("write tasks.md");
-        let mut agent = tasks_agent(dir.path());
+        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- #3 PR #12 open\n")
+            .expect("write tasks.md");
+        let events = crate::tasks::TaskEvents::new();
+        let mut agent = tasks_agent_on(dir.path(), events.clone());
         agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_request_alerts().await;
 
-        agent.push_tool_turn_alerts().await; // baseline
-        agent.push_tool_turn_alerts().await; // stale turn 1
-        agent.push_tool_turn_alerts().await; // stale turn 2 -> alert
+        events.record(crate::tasks::TaskEvent::PullRequestMerged(
+            crate::tasks::WorkRef::pull_request(12),
+        ));
+        for _ in 0..3 {
+            agent.push_request_alerts().await;
+            agent.push_tool_turn_alerts().await;
+        }
 
         let alerts = agent
             .context()
             .conversation_messages()
             .iter()
-            .filter(|message| message.content().contains("<tasks_stale>"))
+            .filter(|message| message.content().contains("PR #12 was merged"))
             .count();
-        assert_eq!(alerts, 1, "a stale episode must alert exactly once");
+        assert_eq!(alerts, 1, "an unrecorded event alerts exactly once");
     }
 
     #[tokio::test]
@@ -5113,13 +5251,66 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir should exist");
-        std::fs::write(dir.path().join("tasks.md"), "- [ ] pending\n").expect("write tasks.md");
+        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- pending\n")
+            .expect("write tasks.md");
         let mut agent = tasks_agent(dir.path());
         agent.ensure_initialized().await.expect("agent initializes");
 
         assert!(
             agent.push_final_turn_alerts().await,
-            "unchecked tasks must object to the model stopping"
+            "an actionable row must object to the model stopping"
+        );
+    }
+
+    /// A host with a message waiting ends the run a stop-gate alert would
+    /// keep going, so the message reaches the next request together with the
+    /// alert, which stays in the conversation.
+    #[tokio::test]
+    async fn a_waiting_message_ends_the_run_a_final_turn_alert_keeps_going() {
+        use tempfile::tempdir;
+
+        struct MessageWaiting;
+        impl Hook for MessageWaiting {
+            fn on_turn_boundary(
+                &self,
+                _ctx: &TurnBoundaryContext<'_>,
+            ) -> impl std::future::Future<Output = TurnBoundaryAction> + Send {
+                std::future::ready(TurnBoundaryAction::EndTurn)
+            }
+        }
+
+        let dir = tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- pending\n")
+            .expect("write tasks.md");
+        let mut agent = Agent::builder(MockLlm {
+            context_length: 1_000_000,
+        })
+        .sandbox_dir(dir.path())
+        .hook(MessageWaiting)
+        .build();
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        let control = agent
+            .finish_no_tool_turn("done".to_string(), 1, &EventSink::discarding())
+            .await
+            .expect("the turn finishes");
+
+        assert!(
+            matches!(
+                control,
+                TurnControl::Break {
+                    stop_reason: StopReason::EndTurn,
+                    ..
+                }
+            ),
+            "a waiting message must end the run"
+        );
+        let messages = agent.context().conversation_messages();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content().contains("tasks.md still has rows")),
+            "the alert stays for the next request: {messages:?}"
         );
     }
 
@@ -7248,6 +7439,13 @@ mod tests {
                 .any(|timed| matches!(timed.event, AgentEvent::BackgroundTaskCompleted { .. })),
             "the host should see the completion: {:?}",
             wake.events
+        );
+        assert_eq!(
+            agent.tasks.events.take(),
+            vec![crate::tasks::TaskEvent::JobFinished(
+                "task-build".to_string()
+            )],
+            "the finished job reaches the tasks inbox"
         );
 
         let events = drain_run(agent.resume()).await;

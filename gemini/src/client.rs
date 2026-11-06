@@ -1,4 +1,4 @@
-use aither_core::llm::Classify;
+use aither_core::llm::{Classify, RetryPolicy};
 use std::time::Duration;
 
 use aither_core::time::sleep;
@@ -36,8 +36,14 @@ pub async fn call_generate(
     post_json(cfg, cfg.model_endpoint(model, "generateContent"), &request).await
 }
 
-/// Maximum retry attempts for transient errors.
-const MAX_RETRIES: u32 = 3;
+/// How a request that failed with a retryable failure is retried: twice,
+/// after 2 s and then 4 s, or after the delay the upstream requested.
+pub const RETRY_POLICY: RetryPolicy = RetryPolicy {
+    max_retries: 2,
+    initial_delay: Duration::from_secs(2),
+    max_delay: Duration::from_secs(60),
+    multiplier: 2,
+};
 
 /// Stream generation responses using SSE with retry logic.
 pub async fn stream_generate(
@@ -54,10 +60,8 @@ pub async fn stream_generate(
     endpoint.push_str("alt=sse");
     let debug = std::env::var("AITHER_GEMINI_DEBUG").as_deref() == Ok("1");
 
-    let mut attempt = 0u32;
+    let mut retries = 0u32;
     let sse_stream = loop {
-        attempt += 1;
-
         let mut backend = client();
         let mut builder = backend
             .post(endpoint.clone())
@@ -80,20 +84,19 @@ pub async fn stream_generate(
             Err(e) => {
                 let err = GeminiError::from_http(e);
                 let failure = err.failure();
-                if failure.is_retryable() && attempt < MAX_RETRIES {
-                    let delay_secs = failure
-                        .retry_after
-                        .map_or_else(|| 2u64.pow(attempt), |delay| delay.as_secs());
+                if RETRY_POLICY.allows(retries, &failure) {
+                    let delay = RETRY_POLICY.delay(retries, &failure);
+                    retries += 1;
                     if debug {
                         tracing::info!(
-                            "Gemini streaming error (attempt {}/{}), retrying in {}s: {}",
-                            attempt,
-                            MAX_RETRIES,
-                            delay_secs,
+                            "Gemini streaming error (retry {}/{}), retrying in {:?}: {}",
+                            retries,
+                            RETRY_POLICY.max_retries,
+                            delay,
                             err
                         );
                     }
-                    sleep(Duration::from_secs(delay_secs)).await;
+                    sleep(delay).await;
                     continue;
                 }
                 return Err(err);
@@ -185,9 +188,8 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
         }
     }
 
-    let mut attempt = 0u32;
+    let mut retries = 0u32;
     loop {
-        attempt += 1;
         let mut backend = client();
         let mut builder = backend
             .post(endpoint.clone())
@@ -211,20 +213,19 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
             Err(e) => {
                 let err = GeminiError::from_http(e);
                 let failure = err.failure();
-                if failure.is_retryable() && attempt < MAX_RETRIES {
-                    let delay_secs = failure
-                        .retry_after
-                        .map_or_else(|| 2u64.pow(attempt), |delay| delay.as_secs());
+                if RETRY_POLICY.allows(retries, &failure) {
+                    let delay = RETRY_POLICY.delay(retries, &failure);
+                    retries += 1;
                     if debug {
                         tracing::info!(
-                            "Gemini POST error (attempt {}/{}), retrying in {}s: {}",
-                            attempt,
-                            MAX_RETRIES,
-                            delay_secs,
+                            "Gemini POST error (retry {}/{}), retrying in {:?}: {}",
+                            retries,
+                            RETRY_POLICY.max_retries,
+                            delay,
                             err
                         );
                     }
-                    sleep(Duration::from_secs(delay_secs)).await;
+                    sleep(delay).await;
                     continue;
                 }
                 return Err(err);

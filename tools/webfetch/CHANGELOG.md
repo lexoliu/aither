@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0](https://github.com/May-Agent/aither/compare/webfetch-v0.19.0...webfetch-v0.20.0) - 2026-11-06
+
+### Fixed
+
+- *(webfetch)* route headless Chrome through a resolving proxy
+
 ## [0.19.0](https://github.com/May-Agent/aither/compare/webfetch-v0.18.0...webfetch-v0.19.0) - 2026-11-05
 
 ### Fixed

@@ -20,7 +20,7 @@ arc-swap.workspace = true
 aither-core.workspace = true
 
 # Sandboxing
-heel = "0.8.0"
+heel = "0.9.0"
 rmp-serde = "1"
 
 # Executor for tokio integration
@@ -32,6 +32,7 @@ async-fs = "2"
 dunce = { version = "1.0.5", default-features = false }
 async-process = "2"
 async-io = "2"
+async-lock = "3.4.2"
 regex = "1"
 bollard = "0.21"
 
@@ -113,6 +114,8 @@ windows-sys = { version = "0.61", default-features = false, features = [
 
 [features]
 default = []
+# Expose `test_git`, git isolated from the host configuration, to dependents' tests.
+test-git = []
 # Detect source code in command output so it can be folded with tree-sitter.
 # Pulls in ONNX Runtime via `magika`.
 code-folding = ["dep:magika", "dep:ort", "dep:tree-sitter", "dep:rs-tree-sitter-languages"]

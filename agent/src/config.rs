@@ -64,13 +64,9 @@ pub struct AgentConfig {
     /// Agent specialization (coding vs chatbot).
     pub agent_kind: AgentKind,
 
-    /// Tool turns tolerated before an unmaintained `tasks.md` earns a
-    /// staleness alert.
-    ///
-    /// A turn counts toward the limit when it ran tool calls but left
-    /// `tasks.md` byte-identical — either still holding unchecked items or
-    /// missing entirely. Set to `usize::MAX` to disable the alert.
-    pub tasks_stale_after_turns: usize,
+    /// Lines `tasks.md` may hold; an edit that takes it past them earns one
+    /// alert asking for a rewrite.
+    pub tasks_line_limit: usize,
 
     /// Prompt-cache keep-alive while the run waits on its own background
     /// commands. `None` disables keep-alive.
@@ -94,7 +90,7 @@ impl Default for AgentConfig {
             system_prompt: None,
             persona_prompt: None,
             agent_kind: AgentKind::default(),
-            tasks_stale_after_turns: 4,
+            tasks_line_limit: 60,
             cache_keep_alive: None,
             background_jobs: BackgroundJobPolicy::default(),
             #[cfg(feature = "languages")]

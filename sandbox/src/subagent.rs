@@ -6,7 +6,9 @@
 //! subagent may write, and the worktrees it may commit in.
 //!
 //! A linked worktree keeps its git data in the main repository, outside the
-//! worktree, so a worktree grant alone leaves `git commit` failing. A commit
+//! worktree, so a worktree grant alone leaves `git commit` failing: the
+//! subagent's terminal reads that data ([`crate::GitDirAccess::ReadOnly`]), so `git
+//! status` and `git log` work, and writes none of it. A commit
 //! grant gives the worktree a repository of its own, created by the host when
 //! the grant is first given, that the worktree's `.git` file names: it holds
 //! the worktree's `HEAD`, index, refs and new objects, reads the main object
@@ -21,6 +23,7 @@ mod host_git;
 mod import;
 mod repository;
 mod sandboxed;
+mod space;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -34,6 +37,9 @@ pub use repository::Spelling;
 use sandboxed::Bounds;
 pub use sandboxed::ExportError;
 pub use sandboxed::{SandboxedExit, SandboxedGitImpl, SandboxedRun, SubagentGit};
+pub use space::{
+    AnySubagentSpaces, PreparedSpace, RunSpace, SpacePreparationError, SubagentSpaces,
+};
 
 /// What a launcher grants a subagent beyond its own space.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -196,6 +202,28 @@ pub enum SubagentGrantError {
         path: PathBuf,
         /// The failure.
         source: io::Error,
+    },
+    /// The embedder's [`SubagentSpaces`] could not prepare the subagent's
+    /// space. The space was removed.
+    #[error("cannot prepare the subagent space {}: {source}", .space.display())]
+    Preparation {
+        /// The space.
+        space: PathBuf,
+        /// The embedder's error.
+        source: SpacePreparationError,
+    },
+    /// The embedder named a working copy outside the space it prepared. The
+    /// space was removed.
+    #[error(
+        "the working copy {} prepared for a subagent is outside its space {}",
+        .path.display(),
+        .space.display()
+    )]
+    PreparedOutsideSpace {
+        /// The working copy.
+        path: PathBuf,
+        /// The space.
+        space: PathBuf,
     },
     /// The repository of a committing worktree could not be created.
     #[error("cannot create the subagent repository at {}: {source}", .path.display())]
@@ -417,21 +445,7 @@ impl CommittingWorktree {
             converted,
         } = git.ok_or_else(|| SubagentGrantError::NotAWorktree(worktree.to_path_buf()))?;
 
-        // The repository must list this worktree back: its git directory is
-        // one of the repository's worktree entries, and that entry names this
-        // worktree's `.git` file.
-        if git_dir.parent() != Some(common_dir.join("worktrees").as_path()) {
-            return Err(malformed(
-                "its git directory is not an entry of the repository's `worktrees`",
-            ));
-        }
-        let back = read_file(&git_dir.join("gitdir")).await?;
-        let back = canonical(&git_dir.join(back.trim())).await?;
-        if back != canonical(&worktree.join(".git")).await? {
-            return Err(malformed(
-                "the repository's worktree entry names another worktree",
-            ));
-        }
+        confirm_back_links(worktree, &git_dir, &common_dir).await?;
         if async_fs::metadata(common_dir.join("reftable"))
             .await
             .is_ok()
@@ -727,6 +741,58 @@ async fn canonical_with_missing_leaf(path: &Path) -> Result<PathBuf, SubagentGra
             }
         }
         other => other,
+    }
+}
+
+/// Confirms through git's own back-links that the repository at `common_dir`
+/// lists `worktree`: its git directory is an entry of the repository's
+/// `worktrees`, and that entry names this worktree's `.git` file. A `.git`
+/// file is text anyone who can write the worktree can forge, so nothing it
+/// names is trusted before this holds.
+async fn confirm_back_links(
+    worktree: &Path,
+    git_dir: &Path,
+    common_dir: &Path,
+) -> Result<(), SubagentGrantError> {
+    let malformed = |reason| SubagentGrantError::MalformedGitData {
+        path: worktree.to_path_buf(),
+        reason,
+    };
+    if git_dir.parent() != Some(common_dir.join("worktrees").as_path()) {
+        return Err(malformed(
+            "its git directory is not an entry of the repository's `worktrees`",
+        ));
+    }
+    let back = read_file(&git_dir.join("gitdir")).await?;
+    let back = canonical(&git_dir.join(back.trim())).await?;
+    if back != canonical(&worktree.join(".git")).await? {
+        return Err(malformed(
+            "the repository's worktree entry names another worktree",
+        ));
+    }
+    Ok(())
+}
+
+/// The shared git directory of `worktree`, when `worktree` is a linked
+/// worktree its repository confirms by git's back-links; `None` when it is
+/// not a linked worktree or when what its `.git` names is unconfirmed or
+/// unreadable. A worktree holding a repository of its own, as a commit grant
+/// leaves it, has no shared git directory to give.
+pub async fn confirmed_common_dir(worktree: &Path) -> Option<PathBuf> {
+    let git = match read_worktree_git(worktree).await {
+        Ok(Some(git)) if !git.converted => git,
+        Ok(_) => return None,
+        Err(error) => {
+            tracing::debug!(%error, "no common git directory granted");
+            return None;
+        }
+    };
+    match confirm_back_links(worktree, &git.git_dir, &git.common_dir).await {
+        Ok(()) => Some(git.common_dir),
+        Err(error) => {
+            tracing::debug!(%error, "unconfirmed worktree pointer grants nothing");
+            None
+        }
     }
 }
 
