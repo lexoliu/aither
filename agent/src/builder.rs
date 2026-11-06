@@ -99,9 +99,8 @@ pub struct AgentSettings {
     pub(crate) prompt_cache: crate::context::PromptCache,
     pub(crate) clock: crate::AnyClock,
     pub(crate) context_sources: Vec<AnyContextSource>,
-    /// Resolves `BLOCKING` marks in `tasks.md`; a mark it reports dead no
-    /// longer holds the item.
-    pub(crate) blocker_resolver: Option<crate::working_docs::AnyTaskBlockerResolver>,
+    /// What the agent's `tasks.md` supervision is given by the host.
+    pub(crate) tasks: crate::tasks::TasksWiring,
     /// Where the built agent publishes each request for a fork to start from.
     pub(crate) fork_source: Option<crate::fork::ForkSource>,
     /// Who the built agent's tool calls are made by.
@@ -129,7 +128,7 @@ impl Default for AgentSettings {
             prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
             clock: crate::AnyClock::default(),
             context_sources: Vec::new(),
-            blocker_resolver: None,
+            tasks: crate::tasks::TasksWiring::default(),
             fork_source: None,
             identity: aither_core::llm::AgentIdentity::Main,
             #[cfg(feature = "skills")]
@@ -309,12 +308,32 @@ pub trait AgentOptions: sealed::Sealed + Sized {
     }
 
     /// Resolves `BLOCKING` mark payloads in `tasks.md`: a mark it reports
-    /// dead no longer holds the item — the work counts as runnable and the
-    /// turn cannot stop on it. Without a resolver every mark is trusted.
+    /// dead no longer holds its row, which is then stale and keeps the turn
+    /// from ending. Without a resolver every mark is trusted.
     #[must_use]
     fn blocker_resolver(mut self, resolver: impl crate::working_docs::TaskBlockerResolver) -> Self {
-        self.settings().blocker_resolver =
+        self.settings().tasks.blocker_resolver =
             Some(crate::working_docs::AnyTaskBlockerResolver::new(resolver));
+        self
+    }
+
+    /// Reads the issues and pull requests `tasks.md` names through
+    /// `tracker`: a row naming a finished one is stale, a row whose issue is
+    /// blocked by an open one holds no turn open, and each root brings its
+    /// issue tree into the context.
+    #[must_use]
+    fn work_tracker(mut self, tracker: impl crate::tasks::WorkTracker) -> Self {
+        self.settings().tasks.tracker = Some(crate::tasks::AnyWorkTracker::new(tracker));
+        self
+    }
+
+    /// Takes the state changes `tasks.md` rows track from `events`, the
+    /// inbox the host records its own on: issues, pull requests and
+    /// questions. The agent records its background jobs there itself.
+    /// Without it the agent keeps an inbox of its own.
+    #[must_use]
+    fn task_events(mut self, events: crate::tasks::TaskEvents) -> Self {
+        self.settings().tasks.events = events;
         self
     }
 
@@ -964,7 +983,7 @@ where
             prompt_cache,
             clock,
             context_sources,
-            blocker_resolver,
+            tasks,
             fork_source,
             identity,
             #[cfg(feature = "skills")]
@@ -1024,7 +1043,7 @@ where
             job_registry,
             detached_task_ids: std::collections::HashSet::new(),
             sandbox_dir,
-            blocker_resolver,
+            tasks,
             restore_dir,
             fork_source,
             compact_signal,

@@ -1,0 +1,9 @@
+{% for entry in entries %}{{ entry.label }} {{ entry.item.reference }} ({{ entry.item.state }}): {{ entry.item.title }}
+{% if !entry.item.sub_issues.is_empty() %}Sub-issues:{% for related in entry.item.sub_issues %} {{ related.reference }} ({{ related.state }}){% endfor %}
+{% endif %}{% if !entry.item.blocked_by.is_empty() %}Blocked by:{% for related in entry.item.blocked_by %} {{ related.reference }} ({{ related.state }}){% endfor %}
+{% endif %}{% if !entry.item.body.is_empty() %}{{ entry.item.body }}
+{% endif %}{% for comment in entry.item.comments %}Comment{% if let Some(author) = comment.author %} by {{ author }}{% endif %}:
+{{ comment.body }}
+{% endfor %}
+{% endfor %}{% for error in unresolved %}Not loaded: {{ error }}
+{% endfor %}

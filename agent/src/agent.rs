@@ -20,7 +20,7 @@ use crate::{
     context::{
         AnyContextSource, BackgroundJobs, Block, CacheLifetime, CompactionFork,
         CompletedCompaction, Context, ContextBudget, HandoffDocument, InstructionSlot,
-        PendingCompaction, PrefixChain, PrefixRewrites, PromptCache, PromptPrefix, TasksDocument,
+        PendingCompaction, PrefixChain, PrefixRewrites, PromptCache, PromptPrefix,
         recovery::{SpillLimits, clean_for_recovery},
         restore_context,
     },
@@ -866,9 +866,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Optional sandbox directory for working-doc supervision (`tasks.md`).
     pub(crate) sandbox_dir: Option<PathBuf>,
 
-    /// Resolves `BLOCKING` marks in `tasks.md`; a mark it reports dead no
-    /// longer holds the item.
-    pub(crate) blocker_resolver: Option<crate::working_docs::AnyTaskBlockerResolver>,
+    /// What the host gives the `tasks.md` supervision; the agent records its
+    /// finished background jobs on its events.
+    pub(crate) tasks: crate::tasks::TasksWiring,
 
     /// Directory files are restored from after a forked compaction.
     pub(crate) restore_dir: Option<PathBuf>,
@@ -977,7 +977,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             job_registry: None,
             detached_task_ids: HashSet::new(),
             sandbox_dir: None,
-            blocker_resolver: None,
+            tasks: crate::tasks::TasksWiring::default(),
             restore_dir: None,
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
@@ -2116,6 +2116,9 @@ where
         }
         let result_msg = format_background_task_result(&task);
         self.context.push(Message::system(&result_msg));
+        self.tasks
+            .events
+            .record(crate::tasks::TaskEvent::JobFinished(task.task_id.clone()));
         events.emit(AgentEvent::background_task_completed(
             task.task_id,
             result_msg,
@@ -3085,10 +3088,9 @@ where
                 )));
         }
         if let Some(sandbox_dir) = self.sandbox_dir.clone() {
-            let mut source = TasksDocument::new(sandbox_dir, self.config.tasks_stale_after_turns);
-            if let Some(resolver) = self.blocker_resolver.clone() {
-                source = source.with_blocker_resolver(resolver);
-            }
+            let source = self
+                .tasks
+                .document(sandbox_dir, self.config.tasks_line_limit);
             self.context_sources.push(AnyContextSource::new(source));
         }
         if let Some(job_registry) = self.job_registry.clone() {
@@ -5052,37 +5054,50 @@ mod tests {
     }
 
     fn tasks_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+        tasks_agent_on(dir, crate::tasks::TaskEvents::new())
+    }
+
+    fn tasks_agent_on(
+        dir: &std::path::Path,
+        events: crate::tasks::TaskEvents,
+    ) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
         Agent::builder(MockLlm {
             context_length: 1_000_000,
         })
         .sandbox_dir(dir)
-        .config(AgentConfig {
-            tasks_stale_after_turns: 2,
-            ..AgentConfig::default()
-        })
+        .task_events(events)
         .build()
     }
 
+    /// An event the host records on the inbox it gave the builder reaches
+    /// the agent's tasks document, and its alert the conversation, once.
     #[tokio::test]
     async fn tool_turn_alerts_from_sources_reach_the_conversation() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir should exist");
-        std::fs::write(dir.path().join("tasks.md"), "- [ ] pending\n").expect("write tasks.md");
-        let mut agent = tasks_agent(dir.path());
+        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- #3 PR #12 open\n")
+            .expect("write tasks.md");
+        let events = crate::tasks::TaskEvents::new();
+        let mut agent = tasks_agent_on(dir.path(), events.clone());
         agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_request_alerts().await;
 
-        agent.push_tool_turn_alerts().await; // baseline
-        agent.push_tool_turn_alerts().await; // stale turn 1
-        agent.push_tool_turn_alerts().await; // stale turn 2 -> alert
+        events.record(crate::tasks::TaskEvent::PullRequestMerged(
+            crate::tasks::WorkRef::pull_request(12),
+        ));
+        for _ in 0..3 {
+            agent.push_request_alerts().await;
+            agent.push_tool_turn_alerts().await;
+        }
 
         let alerts = agent
             .context()
             .conversation_messages()
             .iter()
-            .filter(|message| message.content().contains("<tasks_stale>"))
+            .filter(|message| message.content().contains("PR #12 was merged"))
             .count();
-        assert_eq!(alerts, 1, "a stale episode must alert exactly once");
+        assert_eq!(alerts, 1, "an unrecorded event alerts exactly once");
     }
 
     #[tokio::test]
@@ -5090,13 +5105,14 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir should exist");
-        std::fs::write(dir.path().join("tasks.md"), "- [ ] pending\n").expect("write tasks.md");
+        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- pending\n")
+            .expect("write tasks.md");
         let mut agent = tasks_agent(dir.path());
         agent.ensure_initialized().await.expect("agent initializes");
 
         assert!(
             agent.push_final_turn_alerts().await,
-            "unchecked tasks must object to the model stopping"
+            "an actionable row must object to the model stopping"
         );
     }
 
@@ -7225,6 +7241,13 @@ mod tests {
                 .any(|timed| matches!(timed.event, AgentEvent::BackgroundTaskCompleted { .. })),
             "the host should see the completion: {:?}",
             wake.events
+        );
+        assert_eq!(
+            agent.tasks.events.take(),
+            vec![crate::tasks::TaskEvent::JobFinished(
+                "task-build".to_string()
+            )],
+            "the finished job reaches the tasks inbox"
         );
 
         let events = drain_run(agent.resume()).await;

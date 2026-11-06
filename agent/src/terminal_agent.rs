@@ -1246,8 +1246,21 @@ mod tests {
         }
         .render()
         .unwrap();
-        assert!(prompt.contains("<continuation>\nIf work is blocked by a missing user decision, use `ask_user`. An item waiting on an open question — or on anything else the run cannot resolve — is marked `BLOCKING <request_id or reason>` in tasks.md; blocked items wait instead of holding the turn. A mark naming a request that is no longer open does not hold.\nDo not stop while unblocked checklist items remain incomplete.\n</continuation>"));
+        assert!(prompt.contains("<continuation>\nIf work is blocked by a missing user decision, use `ask_user`. A row waiting on an open question — or on anything else the run cannot resolve — is marked `BLOCKING <request_id or reason>` in tasks.md; blocked rows wait instead of holding the turn. A mark naming a request that is no longer open does not hold.\nDo not stop while a row under Doing or Queued that nothing blocks remains.\n</continuation>"));
         assert!(!prompt.contains("use `ask_user` and continue"));
+        // The format names its sections and requires the document current
+        // before a compaction.
+        for needle in [
+            "## Roots — ",
+            "## Doing — ",
+            "## Queued — ",
+            "## Notes — ",
+            "## Decisions — ",
+            "rows are not checkboxes",
+            "before calling `compact`",
+        ] {
+            assert!(prompt.contains(needle), "missing {needle:?}");
+        }
     }
 
     use std::borrow::Cow;
