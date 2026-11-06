@@ -18,7 +18,7 @@ use crate::terminal::{
     linked_worktree_grants, local_path_grants, path_directory_grants,
     prepare_session_runtime_environment, session_write_denylist,
 };
-use crate::{PreparedTools, TerminalError};
+use crate::{GitDirAccess, PreparedTools, TerminalError};
 
 /// The filesystem grants and process environment a session sandbox gives a
 /// command.
@@ -49,6 +49,9 @@ impl SessionSandboxPolicy {
     /// Builds the policy of a session whose directory is `working_dir`, for
     /// the given writable and readable sets and prepared tools.
     ///
+    /// `git_dir` is the terminal's access to the common git directory of a
+    /// linked worktree it may write.
+    ///
     /// Creates the session's `tmp`, `.cache` and `.config` directories,
     /// which its environment points at.
     ///
@@ -59,6 +62,7 @@ impl SessionSandboxPolicy {
         working_dir: &Path,
         writable: &[PathBuf],
         readable: &[PathBuf],
+        git_dir: GitDirAccess,
         tools: &PreparedTools<PathBuf>,
     ) -> Result<Self, TerminalError> {
         let environment = prepare_session_runtime_environment(working_dir, tools).await?;
@@ -68,7 +72,7 @@ impl SessionSandboxPolicy {
         let mut grants = path_directory_grants(&environment).map_err(setup)?;
         grants.extend(local_path_grants(writable, readable, tools).map_err(setup)?);
         grants.extend(
-            linked_worktree_grants(writable, readable)
+            linked_worktree_grants(writable, readable, git_dir)
                 .await
                 .map_err(setup)?,
         );
