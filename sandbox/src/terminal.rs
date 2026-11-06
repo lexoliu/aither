@@ -1758,7 +1758,9 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
         let working_dir = WorkingDir::random_in(parent_dir).map_err(|e| {
             TerminalError::SandboxSetup(format!("failed to create working dir: {e}"))
         })?;
-        let working_dir_path = working_dir.path().to_path_buf();
+        // Resolved once, as in `new_exact`.
+        let working_dir_path =
+            dunce::simplified(&async_fs::canonicalize(working_dir.path()).await?).to_path_buf();
 
         info!(working_dir = %working_dir_path.display(), "created terminal tool working directory");
 
@@ -1828,10 +1830,12 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
         permission_handler: P,
         executor: E,
     ) -> Result<Self, TerminalError> {
-        let working_dir_path = working_dir.as_ref().to_path_buf();
-
-        // Ensure working directory exists
-        async_fs::create_dir_all(&working_dir_path).await?;
+        // Ensure working directory exists, then resolve it once: heel and the
+        // directory report both use this spelling, and a symlink in the given
+        // one is not necessarily granted inside the sandbox.
+        async_fs::create_dir_all(working_dir.as_ref()).await?;
+        let working_dir_path =
+            dunce::simplified(&async_fs::canonicalize(working_dir.as_ref()).await?).to_path_buf();
 
         // Create outputs directory inside working dir
         let outputs_dir = working_dir_path.join("outputs");
@@ -11602,6 +11606,21 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlinked_working_directory_is_resolved_for_the_report() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let real = dunce::canonicalize(dir.path()).unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let (_cache, tool) = authority_terminal(&link).await;
+        assert_eq!(tool.working_dir(), &real);
+        assert_eq!(exit_code_of(&tool, "mkdir sub && cd sub").await, 0);
+        assert_eq!(pwd_of(&tool).await, real.join("sub"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_subagents_cd_does_not_carry_over() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, parent) = authority_terminal(dir.path()).await;
@@ -11780,7 +11799,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, tool) = authority_terminal(dir.path()).await;
         let mount = MountRoot::new(
-            dir.path(),
+            tool.working_dir(),
             ContainerPath::new("/workspace").expect("absolute"),
         );
         let report = tool.working_dir().join(".cwd-container");
@@ -11818,7 +11837,7 @@ mod tests {
         // A directory inside the mount, spelled as the container sees it.
         std::fs::write(&report, "/workspace/sub/dir\n").unwrap();
         tool.record_carried_dir(&carry, true).await;
-        assert_eq!(carried.get(), Some(dir.path().join("sub/dir")));
+        assert_eq!(carried.get(), Some(tool.working_dir().join("sub/dir")));
         assert!(!report.exists(), "the report is consumed");
 
         assert!(
@@ -11830,7 +11849,7 @@ mod tests {
         // and each raises one alert naming where the next command starts.
         std::fs::write(&report, "/etc\n").unwrap();
         tool.record_carried_dir(&carry, true).await;
-        assert_eq!(carried.get(), Some(dir.path().join("sub/dir")));
+        assert_eq!(carried.get(), Some(tool.working_dir().join("sub/dir")));
         assert_directory_reset(
             &receiver,
             "/workspace",
@@ -11838,7 +11857,7 @@ mod tests {
         );
         std::fs::write(&report, "/workspace/other\n").unwrap();
         tool.record_carried_dir(&carry, false).await;
-        assert_eq!(carried.get(), Some(dir.path().join("sub/dir")));
+        assert_eq!(carried.get(), Some(tool.working_dir().join("sub/dir")));
         assert_directory_reset(&receiver, "/workspace", DirectoryResetReason::Failed);
         tool.record_carried_dir(&carry, true).await;
         assert_directory_reset(&receiver, "/workspace", DirectoryResetReason::Unreported);
@@ -11850,7 +11869,7 @@ mod tests {
         // The mapping back to the container for the next start.
         assert_eq!(
             mount
-                .container_path(&dir.path().join("sub/dir"))
+                .container_path(&tool.working_dir().join("sub/dir"))
                 .unwrap()
                 .as_str(),
             "/workspace/sub/dir"
