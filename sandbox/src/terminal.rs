@@ -4445,6 +4445,26 @@ fn host_toolchain_homes() -> impl Iterator<Item = (&'static str, PathBuf)> {
     .filter(|(_, path)| path.is_dir())
 }
 
+/// The paths a session sandbox must not write: heel's persistence table
+/// (git hooks and config, shell startup files, `PATH` directories and the
+/// rest), where a write runs as code outside the sandbox later.
+///
+/// Two places are exempt, because the table forbids creating a `.git` at all
+/// and the commands that need to would otherwise be impossible: cargo's git
+/// cache, `$CARGO_HOME/git`, where cargo clones git dependencies and keeps
+/// their `.git/hooks`, which it creates and removes itself and no user runs;
+/// and the session directory `working_dir`, where `git clone` and `git init`
+/// make the session's own repositories. Nothing else of a toolchain home is
+/// exempt.
+pub fn session_write_denylist(working_dir: &Path) -> heel::WriteDenylist {
+    let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let denylist = heel::WriteDenylist::persistence().except(resolved(working_dir));
+    match host_toolchain_homes().find(|(name, _)| *name == "CARGO_HOME") {
+        Some((_, cargo_home)) => denylist.except(resolved(&cargo_home).join("git")),
+        None => denylist,
+    }
+}
+
 /// The toolchain directories a sandboxed build needs: package-manager
 /// installs, compilers, and their caches, each rwx since builds both run
 /// the binaries and write the caches. Credential files inside them stay
@@ -4464,11 +4484,16 @@ where
     E: Executor + Clone + 'static,
     N: NetworkPolicy + 'static,
 {
-    let (grants, mut runtime_environment) = local_launch_policy(&context).await?;
+    let (grants, mut runtime_environment, write_denylist) = local_launch_policy(&context).await?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
-    let config_builder = SandboxConfig::builder()
-        .network(policy)
+    let config_builder = SandboxConfig::builder().network(policy);
+    // The Windows backend refuses a write denylist rather than run weaker.
+    #[cfg(not(windows))]
+    let config_builder = config_builder.write_denylist(write_denylist);
+    #[cfg(windows)]
+    drop(write_denylist);
+    let config_builder = config_builder
         .working_dir(
             // A symlink in the working directory's spelling fails the
             // sandbox's own resolution — it does not follow a link a
@@ -4557,7 +4582,7 @@ where
 async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let (grants, mut runtime_environment) = local_launch_policy(&context).await?;
+    let (grants, mut runtime_environment, _) = local_launch_policy(&context).await?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
     let config_builder = SandboxConfig::builder()
@@ -5424,7 +5449,7 @@ fn shell_escape(value: &str) -> String {
 /// embedder's extra envs (which override).
 async fn local_launch_policy<E: Executor>(
     context: &LocalBackgroundExecution<'_, E>,
-) -> Result<(Vec<Grant>, Vec<(String, String)>), TerminalError> {
+) -> Result<(Vec<Grant>, Vec<(String, String)>, heel::WriteDenylist), TerminalError> {
     write_git_shim(context.prepared_tools).await?;
     let policy = crate::SessionSandboxPolicy::new(
         context.working_dir,
@@ -5438,12 +5463,13 @@ async fn local_launch_policy<E: Executor>(
         Some(fifo) => policy.with_job_fifo(fifo)?,
         None => policy,
     };
+    let write_denylist = policy.write_denylist().clone();
     let (grants, mut env) = policy.into_parts();
     committed_git_environment(context.registry, &mut env, |path| {
         Ok(path.display().to_string())
     })?;
     env.extend(context.env_source.iter().flat_map(|s| s.env()));
-    Ok((grants, env))
+    Ok((grants, env, write_denylist))
 }
 
 pub async fn prepare_session_runtime_environment(
@@ -8096,6 +8122,89 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&subject.stdout).trim(), "inside");
+    }
+
+    /// In a read-write repository the persistence paths stay unwritable, in a
+    /// linked worktree's common git directory too, while git still commits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_persistence_paths_are_unwritable_in_granted_repositories() {
+        let (_base, main, linked) = repository_with_linked_worktree();
+        let attempt = |repository: &Path, work: &Path| {
+            format!(
+                "cd {work} && echo '#!/bin/sh' > {hook} 2>/dev/null && echo hook-written; \
+                 echo '[alias]' >> {config} 2>/dev/null && echo config-written; \
+                 echo changed > file && git add file 2>&1 \
+                 && git -c user.name=t -c user.email=t@t commit -q -m inside 2>&1 && echo committed; true",
+                work = work.display(),
+                hook = repository.join(".git/hooks/pre-commit").display(),
+                config = repository.join(".git/config").display(),
+            )
+        };
+        for (repository, work, writable) in [
+            (&main, &main, vec![main.clone()]),
+            (&main, &linked, vec![linked.clone()]),
+        ] {
+            let stdout = sandboxed_stdout(writable, Vec::new(), attempt(repository, work)).await;
+            assert_eq!(stdout.lines().last(), Some("committed"), "{stdout}");
+            assert!(!stdout.contains("written"), "{stdout}");
+            assert!(!main.join(".git/hooks/pre-commit").exists());
+        }
+    }
+
+    /// Cargo's git cache keeps the `.git/hooks` rule off, and nothing else of
+    /// a toolchain home is exempt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_git_cache_is_the_only_denylist_exception() {
+        let (_base, main, _linked) = repository_with_linked_worktree();
+        let session = tempfile::tempdir().unwrap();
+        let denylist = session_write_denylist(session.path());
+        let cargo_git = host_toolchain_homes()
+            .find(|(name, _)| *name == "CARGO_HOME")
+            .map(|(_, home)| std::fs::canonicalize(home).unwrap().join("git"))
+            .expect("the test host has a cargo home");
+        assert_eq!(
+            denylist.exempt(),
+            [
+                std::fs::canonicalize(session.path()).unwrap(),
+                cargo_git.clone()
+            ]
+        );
+
+        let checkout = cargo_git.join(format!(
+            "checkouts/aither-denylist-test-{}/rev",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&checkout).unwrap();
+        host_git(&checkout, &["init", "-q"]);
+        let script = format!(
+            "echo x > {cache}/hooks/update 2>&1 && echo cache-written; \
+             echo x > {repo}/.git/hooks/update 2>/dev/null && echo repo-written; true",
+            cache = checkout.join(".git").display(),
+            repo = main.display(),
+        );
+        let stdout = sandboxed_stdout(vec![main.clone()], Vec::new(), script).await;
+        std::fs::remove_dir_all(checkout.parent().unwrap()).unwrap();
+        assert_eq!(stdout.lines().last(), Some("cache-written"), "{stdout}");
+        assert!(!stdout.contains("repo-written"), "{stdout}");
+    }
+
+    /// The persistence table forbids creating a `.git` in a granted
+    /// directory: a new repository there is refused, one in the session
+    /// directory (see the committing subagent's clone test) is not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_repository_in_a_granted_workdir_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let script = format!(
+            "cd {root} && if git init fresh >/dev/null 2>&1; then echo init-succeeded; fi; true",
+            root = root.display()
+        );
+        let stdout = sandboxed_stdout(vec![root.clone()], Vec::new(), script).await;
+        assert!(!stdout.contains("init-succeeded"), "{stdout}");
+        assert!(!root.join("fresh/.git/config").exists(), "{stdout}");
     }
 
     /// A readable linked worktree brings its repository with read access:
