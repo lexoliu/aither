@@ -63,7 +63,9 @@ mod model_group;
 mod output_urls;
 #[cfg(test)]
 mod poll_park_tests;
+mod pressure;
 mod request_parameters;
+mod runaway;
 mod subagent_file;
 mod terminal_agent;
 #[cfg(test)]
@@ -134,6 +136,7 @@ pub use host_load::{
 #[cfg(feature = "languages")]
 pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
+pub use runaway::RunawayGuard;
 pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};
 pub use tools::AgentTools;
 pub use warmth::{CacheState, CacheWarmth};

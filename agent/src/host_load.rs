@@ -14,10 +14,12 @@
 
 mod system;
 
+use crate::runaway::RunawayGuard;
+
 use std::fmt;
 use std::time::Duration;
 
-use aither_sandbox::ForegroundWait;
+use aither_sandbox::{ForegroundWait, JobFootprint, MemorySize};
 use askama::Template;
 use async_channel::{Receiver, Sender};
 
@@ -250,6 +252,43 @@ pub enum HostLoadEvent {
         /// The terminal's foreground window again.
         foreground_wait: Duration,
     },
+    /// Host memory pressure turned warning.
+    MemoryYellow {
+        /// The agent's running jobs, the largest first.
+        jobs: Vec<JobFootprint>,
+    },
+    /// Host memory pressure turned critical.
+    MemoryRed {
+        /// The agent's running jobs, the largest first.
+        jobs: Vec<JobFootprint>,
+    },
+    /// A job is killed unless the agent acts within the window.
+    MemoryFinalWarning {
+        /// The job that goes.
+        job: JobFootprint,
+        /// How long the agent has.
+        window: Duration,
+        /// The machine's physical memory.
+        physical: MemorySize,
+    },
+    /// Host memory pressure fell from critical to warning, or to normal.
+    MemoryDroppedBack {
+        /// The level it fell to.
+        level: MemoryPressure,
+        /// The agent's running jobs, the largest first.
+        jobs: Vec<JobFootprint>,
+    },
+    /// A job was killed for the memory it held.
+    JobKilledForMemory {
+        /// The job's task ID.
+        task_id: String,
+        /// The script the job ran.
+        command: String,
+        /// What its processes held.
+        footprint: MemorySize,
+        /// The machine's physical memory.
+        physical: MemorySize,
+    },
 }
 
 /// The alert text for a host load event.
@@ -427,9 +466,12 @@ impl<R: HostReader> HostLoadMonitor<R> {
 ///
 /// The reads run on the blocking pool, so a slow host source never stalls
 /// the agent loop or the executor.
+///
+/// With a `guard`, the same readings also drive the agent's memory guard.
 pub fn spawn<R, E>(
     executor: &E,
     monitor: HostLoadMonitor<R>,
+    guard: Option<RunawayGuard>,
     clock: AnyClock,
 ) -> Receiver<HostLoadEvent>
 where
@@ -439,12 +481,13 @@ where
     use executor_core::Task;
 
     let (sender, receiver) = async_channel::unbounded();
-    executor.spawn(run(monitor, clock, sender)).detach();
+    executor.spawn(run(monitor, guard, clock, sender)).detach();
     receiver
 }
 
 async fn run<R: HostReader>(
     mut monitor: HostLoadMonitor<R>,
+    mut guard: Option<RunawayGuard>,
     clock: AnyClock,
     events: Sender<HostLoadEvent>,
 ) {
@@ -456,7 +499,12 @@ async fn run<R: HostReader>(
         })
         .await;
         monitor = back;
-        for event in monitor.observe(clock.now(), sample) {
+        let now = clock.now();
+        let mut raised = monitor.observe(now, sample);
+        if let Some(guard) = guard.as_mut() {
+            raised.extend(guard.observe(now, sample.memory).await);
+        }
+        for event in raised {
             tracing::info!(?event, "host load condition changed");
             if events.send(event).await.is_err() {
                 return;

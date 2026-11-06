@@ -257,6 +257,7 @@ async fn the_task_delivers_events_once_and_stops_with_the_receiver() {
     let events = spawn(
         &executor_core::tokio::TokioGlobal,
         monitor,
+        None,
         AnyClock::default(),
     );
 

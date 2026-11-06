@@ -942,6 +942,7 @@ where
                 reader,
                 host_load.config,
                 terminal_tool.foreground_wait(),
+                Some(terminal_tool.job_memory()),
             ),
             None => inner,
         };
