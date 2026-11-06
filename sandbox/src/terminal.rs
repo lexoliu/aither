@@ -2766,6 +2766,7 @@ where
             raw,
             background,
             timeout,
+            file_reads,
             carry,
             call,
         } = request;
@@ -2820,6 +2821,7 @@ where
                 execution_id,
                 background,
                 timeout_watch: timeout_watch.clone(),
+                file_reads,
                 carry,
                 carried_dir: self.carried_dir.clone(),
                 alert_tx: self.alert_tx.clone(),
@@ -2895,6 +2897,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             raw: arguments.raw,
             background: arguments.background,
             timeout,
+            file_reads: prepared.file_reads,
             carry: carry.clone(),
             call: cx.identity().cloned(),
         });
@@ -3239,10 +3242,10 @@ where
                 arguments.max_lines,
             )
             .await?;
-        if !file_reads.is_empty() {
-            self.job_registry.record_file_reads(file_reads).await;
-        }
-        Ok(prepared)
+        Ok(ExecutionPreparation {
+            file_reads,
+            ..prepared
+        })
     }
 
     /// The terminal's policy for a command, whoever runs it: the command
@@ -3275,6 +3278,7 @@ where
         self.ensure_permission_allowed(target.mode, script).await?;
         let task_id = random_task_id();
         Ok(ExecutionPreparation {
+            file_reads: Vec::new(),
             target,
             execution_id: format!("exec-{task_id}"),
             task_id,
@@ -3311,6 +3315,7 @@ where
             raw: false,
             background: false,
             timeout: run.timeout,
+            file_reads: Vec::new(),
             carry: Some(start),
             call: None,
         });
@@ -3427,7 +3432,12 @@ where
     }
 }
 
+/// A command's file reads with the fingerprints taken at admission.
+type FileReads = Vec<(std::path::PathBuf, crate::job_registry::FileFingerprint)>;
+
 struct ExecutionPreparation {
+    /// Fingerprinted at admission, recorded once the command exits 0.
+    file_reads: FileReads,
     target: ExecutionTarget,
     task_id: String,
     execution_id: String,
@@ -3583,6 +3593,7 @@ struct StandaloneExecution<P, E> {
     task_id: String,
     execution_id: String,
     background: bool,
+    file_reads: FileReads,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     alert_tx: Sender<JobAlert>,
@@ -3729,6 +3740,9 @@ struct TerminalSpawnRequest {
     raw: bool,
     background: bool,
     timeout: Duration,
+    /// Files the command reads, recorded for the unchanged-file guard once
+    /// it exits 0.
+    file_reads: FileReads,
     carry: Option<CwdCarry>,
     /// The `terminal` call this execution belongs to.
     call: Option<CallIdentity>,
@@ -3752,6 +3766,7 @@ struct SpawnedTerminalTask<P, E> {
     execution_id: String,
     background: bool,
     timeout_watch: Arc<TimeoutWatch>,
+    file_reads: FileReads,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     alert_tx: Sender<JobAlert>,
@@ -3795,6 +3810,7 @@ where
         execution_id,
         background,
         timeout_watch,
+        file_reads,
         carry,
         carried_dir,
         alert_tx,
@@ -3831,6 +3847,7 @@ where
         task_id: task_id.clone(),
         execution_id,
         background,
+        file_reads,
         carry,
         carried_dir,
         alert_tx,
@@ -3908,6 +3925,7 @@ where
         task_id,
         execution_id,
         background,
+        file_reads,
         carry,
         carried_dir,
         alert_tx,
@@ -3984,6 +4002,11 @@ where
 
     let output_path = stored_path(&result.stdout);
     job_registry.complete(pid, exit_code, output_path).await;
+    // Only a read that succeeded counts for the unchanged-file guard: a
+    // denied or failed read must run again and show its failure.
+    if exit_code == 0 && !file_reads.is_empty() {
+        job_registry.record_file_reads(file_reads).await;
+    }
 
     // The command's directory report arrives with its end, whether the call
     // answered in the foreground window or the command promoted: the task
@@ -4462,6 +4485,29 @@ pub fn local_path_grants(
         )
         .chain(toolchain_grants(resolved))
         .collect()
+}
+
+/// The grants that let git work in a granted linked worktree: its common git
+/// directory, with the worktree's own access. The directory is the
+/// repository's, outside the worktree, and a strict sandbox reads only what
+/// is granted. Only a pointer git's back-links confirm
+/// ([`crate::subagent::confirmed_common_dir`]) grants anything, because the
+/// `.git` file sits in a directory the session can write.
+pub async fn linked_worktree_grants(
+    writable: &[PathBuf],
+    readable: &[PathBuf],
+) -> heel::Result<Vec<Grant>> {
+    let mut grants = Vec::new();
+    for (path, access) in writable
+        .iter()
+        .map(|path| (path, Access::WRITE | Access::EXEC))
+        .chain(readable.iter().map(|path| (path, Access::READ)))
+    {
+        if let Some(common) = crate::subagent::confirmed_common_dir(path).await {
+            grants.push(Grant::new(resolved(&common)?, access));
+        }
+    }
+    Ok(grants)
 }
 
 /// Host toolchain homes a local sandbox reaches: (env var, resolved
@@ -6275,6 +6321,61 @@ mod tests {
     #[cfg(all(unix, feature = "connectivity"))]
     mod outage;
 
+    /// A stdin whose drop reports that the writer thread holding it ended.
+    struct DropSignal(async_channel::Sender<()>);
+
+    impl Write for DropSignal {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send_blocking(());
+        }
+    }
+
+    /// A finished job's stdin writer thread exits instead of blocking on its
+    /// channel forever.
+    #[tokio::test]
+    async fn finished_job_ends_its_stdin_writer_thread() {
+        use executor_core::{Executor as _, Task as _};
+        let (registry, service) = crate::job_registry::job_registry_channel();
+        executor_core::tokio::TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
+        registry
+            .register(
+                9001,
+                "task-writer",
+                "exec-writer",
+                "cat",
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+        let (ended_tx, ended_rx) = async_channel::bounded::<()>(1);
+        let input_tx = spawn_terminal_stdin_writer(DropSignal(ended_tx), FeedCounter::default());
+        registry.attach_terminal_input(9001, input_tx).await;
+        registry
+            .terminal_input("task-writer", b"hi\n".to_vec())
+            .await
+            .expect("a running job takes input");
+        assert!(ended_rx.is_empty(), "the writer lives while the job runs");
+
+        registry.complete(9001, 0, None).await;
+
+        tokio::time::timeout(Duration::from_secs(10), ended_rx.recv())
+            .await
+            .expect("the writer thread must end once the job finishes")
+            .expect("the writer reports its end");
+    }
+
     /// Toolchain directories named by `*_HOME` variables become rwx grants;
     /// ones that do not exist are skipped.
     #[test]
@@ -7881,6 +7982,7 @@ mod tests {
             task_id: "task-test".to_string(),
             execution_id: "exec-test".to_string(),
             background: false,
+            file_reads: Vec::new(),
             carry: None,
             carried_dir: None,
             alert_tx: async_channel::unbounded().0,
@@ -7995,6 +8097,7 @@ mod tests {
             task_id: "task-policy".to_string(),
             execution_id: "exec-policy".to_string(),
             background: false,
+            file_reads: Vec::new(),
             carry: None,
             carried_dir: None,
             alert_tx: async_channel::unbounded().0,
@@ -8032,6 +8135,188 @@ mod tests {
         assert_eq!(lines.next(), Some("write-ok"));
         assert_eq!(lines.next(), None, "a readable-only path stays read-only");
         assert!(written.exists() && !refused.exists());
+    }
+
+    /// Runs `script` in a sandboxed session with the given grants and returns
+    /// its standard output. Needs a real `HEEL_BIN`.
+    #[cfg(unix)]
+    async fn sandboxed_stdout(
+        writable_paths: Vec<PathBuf>,
+        readable_paths: Vec<PathBuf>,
+        script: String,
+    ) -> String {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tools = shell_sessions.local_tools().unwrap().clone();
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let (startup_tx, _startup_rx) = async_channel::bounded(1);
+        let result = execute_script_standalone(StandaloneExecution {
+            working_dir: tool.working_dir().clone(),
+            writable_paths,
+            readable_paths,
+            env_source: None,
+            executor: executor_core::tokio::TokioGlobal,
+            registry,
+            permission_handler: Arc::new(TestPermissionHandler::default()),
+            job_registry: tool.job_registry(),
+            task_id: "task-grants".to_string(),
+            execution_id: "exec-grants".to_string(),
+            background: false,
+            file_reads: Vec::new(),
+            carry: None,
+            carried_dir: None,
+            alert_tx: async_channel::unbounded().0,
+            script,
+            mode: TerminalMode::Sandboxed,
+            backend: ExecutionBackend::Local(tools),
+            stdin_alerts: None,
+            lifetime: JobLifetime::Foreground {
+                alerts: async_channel::unbounded().0,
+            },
+            background_startup: BackgroundStartup::new(startup_tx),
+            network_audit: None,
+            priority: ProcessPriority::default(),
+            #[cfg(all(unix, feature = "jobserver"))]
+            jobserver: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            store_dir: tool.outputs_dir(),
+            max_lines: 200,
+            raw: false,
+        })
+        .await
+        .expect("the sandboxed script runs");
+        output_text(&result.stdout)
+            .expect("inline stdout")
+            .to_string()
+    }
+
+    /// Runs the host's `git` in `dir`; the caller's environment keeps the
+    /// user's configuration out.
+    #[cfg(unix)]
+    fn host_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} in {}", dir.display());
+    }
+
+    /// A repository `main` with a linked worktree `linked`, under a fresh
+    /// canonical temporary directory.
+    #[cfg(unix)]
+    fn repository_with_linked_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let main = root.join("main");
+        let linked = root.join("linked");
+        std::fs::create_dir(&main).unwrap();
+        host_git(&main, &["init", "-q", "-b", "main"]);
+        host_git(&main, &["commit", "-q", "--allow-empty", "-m", "root"]);
+        host_git(&main, &["worktree", "add", "-q", "../linked"]);
+        (base, main, linked)
+    }
+
+    /// Under strict isolation git works in a granted linked worktree: its
+    /// repository is outside the worktree, and the session grants it after
+    /// git's back-links confirm the pointer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_commits_in_a_granted_linked_worktree() {
+        let (_base, main, linked) = repository_with_linked_worktree();
+        let script = format!(
+            "cd {linked} && git status --short 2>&1 && echo changed > file && git add file 2>&1 \
+             && git -c user.name=t -c user.email=t@t commit -q -m inside 2>&1 && echo committed; true",
+            linked = linked.display(),
+        );
+        let stdout = sandboxed_stdout(vec![linked.clone()], Vec::new(), script).await;
+        assert_eq!(stdout.lines().last(), Some("committed"), "{stdout}");
+        let subject = std::process::Command::new("git")
+            .current_dir(&main)
+            .args(["log", "-1", "--format=%s", "linked"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&subject.stdout).trim(), "inside");
+    }
+
+    /// A readable linked worktree brings its repository with read access:
+    /// git reads, and nothing is written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_readable_linked_worktree_reads_its_repository() {
+        let (_base, _main, linked) = repository_with_linked_worktree();
+        let script = format!(
+            "cd {linked} && git log -1 --format=%s 2>&1; true",
+            linked = linked.display(),
+        );
+        let stdout = sandboxed_stdout(Vec::new(), vec![linked.clone()], script).await;
+        assert_eq!(stdout.lines().last(), Some("root"), "{stdout}");
+    }
+
+    /// A `.git` file anyone can write names whatever it likes: without
+    /// matching back-links it adds no grant, and git there gets nothing of
+    /// the repository it points at.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_forged_git_pointer_adds_no_grant() {
+        let (base, main, linked) = repository_with_linked_worktree();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let entry = main.join(".git/worktrees/linked");
+        let forged = root.join("forged");
+        std::fs::create_dir(&forged).unwrap();
+        // The real entry of another worktree: its `gitdir` names `linked`,
+        // not `forged`.
+        std::fs::write(
+            forged.join(".git"),
+            format!("gitdir: {}\n", entry.display()),
+        )
+        .unwrap();
+        // A pointer straight at the repository, and one at nothing.
+        let direct = root.join("direct");
+        std::fs::create_dir(&direct).unwrap();
+        std::fs::write(
+            direct.join(".git"),
+            format!("gitdir: {}\n", main.join(".git").display()),
+        )
+        .unwrap();
+        let writable = vec![forged.clone(), direct.clone()];
+        for path in &writable {
+            assert!(
+                crate::subagent::confirmed_common_dir(path).await.is_none(),
+                "{} confirmed",
+                path.display()
+            );
+        }
+        assert_eq!(
+            crate::subagent::confirmed_common_dir(&linked).await,
+            Some(main.join(".git")),
+        );
+        assert_eq!(
+            linked_worktree_grants(&writable, &[]).await.unwrap().len(),
+            0
+        );
+
+        let script = format!(
+            "cat {head} 2>&1 | head -c 200; git -C {forged} log -1 --format=%s 2>&1; true",
+            head = main.join(".git/HEAD").display(),
+            forged = forged.display(),
+        );
+        let stdout = sandboxed_stdout(writable, Vec::new(), script).await;
+        assert!(!stdout.contains("ref: refs/heads"), "{stdout}");
+        assert!(!stdout.lines().any(|line| line == "root"), "{stdout}");
     }
 
     #[cfg(unix)]
@@ -10271,6 +10556,48 @@ mod tests {
             Duration::from_secs(600),
         )
         .await
+    }
+
+    /// A read that failed is not recorded by the unchanged-file guard, so a
+    /// plain retry runs and shows the failure again; a read that succeeded
+    /// is, so its unchanged re-read is refused.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_successful_read_arms_the_unchanged_file_guard() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let denied = tool.working_dir().join("denied.txt");
+        std::fs::write(&denied, "secret").expect("fixture should be written");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))
+            .expect("fixture should be locked");
+        let readable = tool.working_dir().join("readable.txt");
+        std::fs::write(&readable, "content").expect("fixture should be written");
+
+        let first = exit_code_of(&tool, "cat denied.txt").await;
+        if first == 0 {
+            // Running as a user the mode does not bind: nothing is denied.
+            return;
+        }
+        assert_eq!(
+            exit_code_of(&tool, "cat denied.txt").await,
+            first,
+            "a plain retry of a failed read runs and fails again"
+        );
+
+        assert_eq!(exit_code_of(&tool, "cat readable.txt").await, 0);
+        let refusal = tool
+            .call(
+                terminal_args("re-read", "cat readable.txt"),
+                ToolContext::new(),
+            )
+            .await
+            .expect_err("an unchanged re-read of a successful read is refused");
+        assert!(
+            refusal.to_string().contains("unchanged"),
+            "unexpected refusal: {refusal}"
+        );
     }
 
     /// A script the sandboxed command writes into its working directory and
