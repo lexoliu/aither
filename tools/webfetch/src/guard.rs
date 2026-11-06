@@ -14,12 +14,13 @@
 //! redirect-following middleware, so a `302` is returned rather than followed;
 //! if that ever changes, each hop must be re-checked through [`guard_url`].
 //! The headless browser does follow redirects and load subresources, so it
-//! checks every request it makes against this same policy through
-//! [`crate::intercept`] instead of trusting the first URL. That interception
-//! cannot see which address the browser itself resolves a host to, so DNS
-//! rebinding against the browser is not covered; see that module.
+//! reaches the network only through a forward proxy of its own (the `proxy`
+//! module, behind the `headless` feature) that resolves each host once,
+//! judges every address it resolved by this same policy, and connects to a
+//! judged address only; the browser never resolves a destination itself.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use url::{Host, Url};
 
@@ -125,52 +126,230 @@ pub async fn guard_url(raw: &str) -> Result<Url, UrlPolicyError> {
     }
 
     let host = url.host().ok_or(UrlPolicyError::MissingHost)?;
-    let host_str = host.to_string();
-
-    match host {
-        Host::Ipv4(addr) => check_addr(&host_str, IpAddr::V4(addr))?,
-        Host::Ipv6(addr) => check_addr(&host_str, IpAddr::V6(addr))?,
-        Host::Domain(domain) => {
-            // Port is irrelevant to the address check but `resolve` needs one.
-            let port = url.port_or_known_default().unwrap_or(80);
-            let addrs = async_net::resolve((domain, port)).await.map_err(|source| {
-                UrlPolicyError::Resolve {
-                    host: host_str.clone(),
-                    source,
-                }
-            })?;
-            if addrs.is_empty() {
-                return Err(UrlPolicyError::Resolve {
-                    host: host_str.clone(),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "host resolved to no addresses",
-                    ),
-                });
-            }
-            for addr in addrs {
-                check_addr(&host_str, addr.ip())?;
-            }
-        }
-    }
+    // Every scheme left has a default port.
+    let port = url.port_or_known_default().unwrap_or(80);
+    resolve_checked(&SystemResolver, &PublicOnly, &host, port).await?;
 
     Ok(url)
 }
 
-fn check_addr(host: &str, addr: IpAddr) -> Result<(), UrlPolicyError> {
-    if is_blocked(addr) {
-        return Err(UrlPolicyError::BlockedAddress {
-            host: host.to_string(),
-            addr,
-        });
+/// Resolves host names to socket addresses.
+pub trait Resolver: Clone + Send + Sync + 'static {
+    /// Every address `host` answers to on `port`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the resolver's error when `host` cannot be resolved.
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> impl Future<Output = std::io::Result<Vec<SocketAddr>>> + Send;
+}
+
+/// The operating system's resolver.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemResolver;
+
+impl Resolver for SystemResolver {
+    async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        async_net::resolve((host, port)).await
     }
-    Ok(())
+}
+
+/// Decides which addresses a fetch may connect to.
+pub trait AddressPolicy: Clone + Send + Sync + 'static {
+    /// Judges `addr`, which `host` resolved to.
+    ///
+    /// # Errors
+    ///
+    /// Returns why nothing may connect to `addr`.
+    fn check(&self, host: &str, addr: SocketAddr) -> Result<(), UrlPolicyError>;
+}
+
+/// The policy of every fetch: only publicly routable addresses, as
+/// [`is_blocked`] decides.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PublicOnly;
+
+impl AddressPolicy for PublicOnly {
+    fn check(&self, host: &str, addr: SocketAddr) -> Result<(), UrlPolicyError> {
+        if is_blocked(addr.ip()) {
+            return Err(UrlPolicyError::BlockedAddress {
+                host: host.to_string(),
+                addr: addr.ip(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Resolves `host` once and returns the addresses to connect to, every one of
+/// them approved by `policy`.
+///
+/// An IP literal is judged as it is, without consulting `resolver`. A host is
+/// refused if *any* address it resolved to is refused, so a split-horizon
+/// answer cannot smuggle one past.
+///
+/// # Errors
+///
+/// Returns [`UrlPolicyError::Resolve`] when `host` resolves to nothing, and
+/// the policy's refusal of the first address it refuses.
+pub async fn resolve_checked<R: Resolver, P: AddressPolicy>(
+    resolver: &R,
+    policy: &P,
+    host: &Host<&str>,
+    port: u16,
+) -> Result<Vec<SocketAddr>, UrlPolicyError> {
+    let host_str = host.to_string();
+    let addrs =
+        match *host {
+            Host::Ipv4(addr) => vec![SocketAddr::new(IpAddr::V4(addr), port)],
+            Host::Ipv6(addr) => vec![SocketAddr::new(IpAddr::V6(addr), port)],
+            Host::Domain(domain) => {
+                let addrs = resolver.resolve(domain, port).await.map_err(|source| {
+                    UrlPolicyError::Resolve {
+                        host: host_str.clone(),
+                        source,
+                    }
+                })?;
+                if addrs.is_empty() {
+                    return Err(UrlPolicyError::Resolve {
+                        host: host_str,
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "host resolved to no addresses",
+                        ),
+                    });
+                }
+                addrs
+            }
+        };
+    for addr in &addrs {
+        policy.check(&host_str, *addr)?;
+    }
+    Ok(addrs)
+}
+
+/// A resolver and a policy tests control.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{AddressPolicy, Resolver, UrlPolicyError};
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    /// Answers lookups from a fixed table and records them; a host listed
+    /// several times answers with every address listed for it.
+    #[derive(Clone, Default)]
+    pub(crate) struct Table {
+        hosts: Arc<HashMap<String, Vec<SocketAddr>>>,
+        asked: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Table {
+        pub(crate) fn new(entries: &[(&str, SocketAddr)]) -> Self {
+            let mut hosts: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+            for (host, addr) in entries {
+                hosts.entry((*host).to_string()).or_default().push(*addr);
+            }
+            Self {
+                hosts: Arc::new(hosts),
+                asked: Arc::default(),
+            }
+        }
+
+        /// Every host the table was asked for, in order.
+        pub(crate) fn asked(&self) -> Vec<String> {
+            self.asked.lock().expect("lookup log poisoned").clone()
+        }
+
+        /// How many times the table was asked for `host`.
+        pub(crate) fn lookups(&self, host: &str) -> usize {
+            self.asked().iter().filter(|asked| *asked == host).count()
+        }
+    }
+
+    impl Resolver for Table {
+        async fn resolve(&self, host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            self.asked
+                .lock()
+                .expect("lookup log poisoned")
+                .push(host.to_string());
+            self.hosts.get(host).cloned().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "not in the table")
+            })
+        }
+    }
+
+    /// Allows exactly one address, which stands in for a public one.
+    #[derive(Clone)]
+    pub(crate) struct Only(pub(crate) SocketAddr);
+
+    impl AddressPolicy for Only {
+        fn check(&self, host: &str, addr: SocketAddr) -> Result<(), UrlPolicyError> {
+            if addr == self.0 {
+                Ok(())
+            } else {
+                Err(UrlPolicyError::BlockedAddress {
+                    host: host.to_string(),
+                    addr: addr.ip(),
+                })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{UrlPolicyError, guard_url, is_blocked};
-    use std::net::IpAddr;
+    use super::testing::Table;
+    use super::{
+        AddressPolicy, PublicOnly, UrlPolicyError, guard_url, is_blocked, resolve_checked,
+    };
+    use std::net::{IpAddr, SocketAddr};
+    use url::Host;
+
+    fn sock(s: &str) -> SocketAddr {
+        s.parse().expect("test socket address should parse")
+    }
+
+    #[tokio::test]
+    async fn a_host_is_refused_when_any_of_its_addresses_is() {
+        let resolver = Table::new(&[
+            ("split.test", sock("93.184.216.34:80")),
+            ("split.test", sock("10.0.0.5:80")),
+        ]);
+        let err = resolve_checked(&resolver, &PublicOnly, &Host::Domain("split.test"), 80)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UrlPolicyError::BlockedAddress { addr, .. } if addr == ip("10.0.0.5"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_checked_addresses_are_the_ones_returned() {
+        let resolver = Table::new(&[("ok.test", sock("93.184.216.34:443"))]);
+        let addrs = resolve_checked(&resolver, &PublicOnly, &Host::Domain("ok.test"), 443)
+            .await
+            .unwrap();
+        assert_eq!(addrs, vec![sock("93.184.216.34:443")]);
+        assert_eq!(resolver.lookups("ok.test"), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_host_is_a_resolve_error() {
+        let err = resolve_checked(&Table::default(), &PublicOnly, &Host::Domain("x.test"), 80)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UrlPolicyError::Resolve { .. }));
+    }
+
+    #[test]
+    fn the_public_policy_judges_by_ip() {
+        assert!(PublicOnly.check("a", sock("127.0.0.1:443")).is_err());
+        assert!(PublicOnly.check("a", sock("1.1.1.1:443")).is_ok());
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().expect("test address should parse")
