@@ -14,7 +14,9 @@ use heel::Grant;
 
 #[cfg(all(unix, feature = "jobserver"))]
 use crate::terminal::job_fifo_grant;
-use crate::terminal::{local_path_grants, prepare_session_runtime_environment};
+use crate::terminal::{
+    linked_worktree_grants, local_path_grants, prepare_session_runtime_environment,
+};
 use crate::{PreparedTools, TerminalError};
 
 /// The filesystem grants and process environment a session sandbox gives a
@@ -25,7 +27,9 @@ use crate::{PreparedTools, TerminalError};
 /// access, the shared `uv` directory with write and execute access, the
 /// command's jobserver fifo (see [`Self::with_job_fifo`]) and the host
 /// toolchain homes (`CARGO_HOME`, `RUSTUP_HOME`) that exist, with write and
-/// execute access. The environment is the session's `HOME`, temporary and
+/// execute access. A granted linked git worktree also brings its repository's
+/// common git directory, with the worktree's access, once git's back-links
+/// confirm it. The environment is the session's `HOME`, temporary and
 /// cache directories, `PATH` led by the managed tools directory, `uv` and
 /// toolchain variables, and the jobserver variables.
 ///
@@ -53,8 +57,13 @@ impl SessionSandboxPolicy {
         readable: &[PathBuf],
         tools: &PreparedTools<PathBuf>,
     ) -> Result<Self, TerminalError> {
-        let grants = local_path_grants(writable, readable, tools)
+        let mut grants = local_path_grants(writable, readable, tools)
             .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
+        grants.extend(
+            linked_worktree_grants(writable, readable)
+                .await
+                .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?,
+        );
         let environment = prepare_session_runtime_environment(working_dir, tools).await?;
         Ok(Self {
             grants,

@@ -4401,6 +4401,29 @@ pub fn local_path_grants(
         .collect()
 }
 
+/// The grants that let git work in a granted linked worktree: its common git
+/// directory, with the worktree's own access. The directory is the
+/// repository's, outside the worktree, and a strict sandbox reads only what
+/// is granted. Only a pointer git's back-links confirm
+/// ([`crate::subagent::confirmed_common_dir`]) grants anything, because the
+/// `.git` file sits in a directory the session can write.
+pub async fn linked_worktree_grants(
+    writable: &[PathBuf],
+    readable: &[PathBuf],
+) -> heel::Result<Vec<Grant>> {
+    let mut grants = Vec::new();
+    for (path, access) in writable
+        .iter()
+        .map(|path| (path, Access::WRITE | Access::EXEC))
+        .chain(readable.iter().map(|path| (path, Access::READ)))
+    {
+        if let Some(common) = crate::subagent::confirmed_common_dir(path).await {
+            grants.push(Grant::new(resolved(&common)?, access));
+        }
+    }
+    Ok(grants)
+}
+
 /// Host toolchain homes a local sandbox reaches: (env var, resolved
 /// existing dir). `CARGO_HOME` and `RUSTUP_HOME` fall back to their
 /// `~/.cargo` / `~/.rustup` defaults; only directories that exist yield, so
@@ -7958,6 +7981,188 @@ mod tests {
         assert_eq!(lines.next(), Some("write-ok"));
         assert_eq!(lines.next(), None, "a readable-only path stays read-only");
         assert!(written.exists() && !refused.exists());
+    }
+
+    /// Runs `script` in a sandboxed session with the given grants and returns
+    /// its standard output. Needs a real `HEEL_BIN`.
+    #[cfg(unix)]
+    async fn sandboxed_stdout(
+        writable_paths: Vec<PathBuf>,
+        readable_paths: Vec<PathBuf>,
+        script: String,
+    ) -> String {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tools = shell_sessions.local_tools().unwrap().clone();
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let (startup_tx, _startup_rx) = async_channel::bounded(1);
+        let result = execute_script_standalone(StandaloneExecution {
+            working_dir: tool.working_dir().clone(),
+            writable_paths,
+            readable_paths,
+            env_source: None,
+            executor: executor_core::tokio::TokioGlobal,
+            registry,
+            permission_handler: Arc::new(TestPermissionHandler::default()),
+            job_registry: tool.job_registry(),
+            task_id: "task-grants".to_string(),
+            execution_id: "exec-grants".to_string(),
+            background: false,
+            file_reads: Vec::new(),
+            carry: None,
+            carried_dir: None,
+            alert_tx: async_channel::unbounded().0,
+            script,
+            mode: TerminalMode::Sandboxed,
+            backend: ExecutionBackend::Local(tools),
+            stdin_alerts: None,
+            lifetime: JobLifetime::Foreground {
+                alerts: async_channel::unbounded().0,
+            },
+            background_startup: BackgroundStartup::new(startup_tx),
+            network_audit: None,
+            priority: ProcessPriority::default(),
+            #[cfg(all(unix, feature = "jobserver"))]
+            jobserver: None,
+            expect: OutputFormat::Text,
+            resolution: MediaResolution::Auto,
+            store_dir: tool.outputs_dir(),
+            max_lines: 200,
+            raw: false,
+        })
+        .await
+        .expect("the sandboxed script runs");
+        output_text(&result.stdout)
+            .expect("inline stdout")
+            .to_string()
+    }
+
+    /// Runs the host's `git` in `dir`; the caller's environment keeps the
+    /// user's configuration out.
+    #[cfg(unix)]
+    fn host_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} in {}", dir.display());
+    }
+
+    /// A repository `main` with a linked worktree `linked`, under a fresh
+    /// canonical temporary directory.
+    #[cfg(unix)]
+    fn repository_with_linked_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let main = root.join("main");
+        let linked = root.join("linked");
+        std::fs::create_dir(&main).unwrap();
+        host_git(&main, &["init", "-q", "-b", "main"]);
+        host_git(&main, &["commit", "-q", "--allow-empty", "-m", "root"]);
+        host_git(&main, &["worktree", "add", "-q", "../linked"]);
+        (base, main, linked)
+    }
+
+    /// Under strict isolation git works in a granted linked worktree: its
+    /// repository is outside the worktree, and the session grants it after
+    /// git's back-links confirm the pointer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_commits_in_a_granted_linked_worktree() {
+        let (_base, main, linked) = repository_with_linked_worktree();
+        let script = format!(
+            "cd {linked} && git status --short 2>&1 && echo changed > file && git add file 2>&1 \
+             && git -c user.name=t -c user.email=t@t commit -q -m inside 2>&1 && echo committed; true",
+            linked = linked.display(),
+        );
+        let stdout = sandboxed_stdout(vec![linked.clone()], Vec::new(), script).await;
+        assert_eq!(stdout.lines().last(), Some("committed"), "{stdout}");
+        let subject = std::process::Command::new("git")
+            .current_dir(&main)
+            .args(["log", "-1", "--format=%s", "linked"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&subject.stdout).trim(), "inside");
+    }
+
+    /// A readable linked worktree brings its repository with read access:
+    /// git reads, and nothing is written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_readable_linked_worktree_reads_its_repository() {
+        let (_base, _main, linked) = repository_with_linked_worktree();
+        let script = format!(
+            "cd {linked} && git log -1 --format=%s 2>&1; true",
+            linked = linked.display(),
+        );
+        let stdout = sandboxed_stdout(Vec::new(), vec![linked.clone()], script).await;
+        assert_eq!(stdout.lines().last(), Some("root"), "{stdout}");
+    }
+
+    /// A `.git` file anyone can write names whatever it likes: without
+    /// matching back-links it adds no grant, and git there gets nothing of
+    /// the repository it points at.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_forged_git_pointer_adds_no_grant() {
+        let (base, main, linked) = repository_with_linked_worktree();
+        let root = std::fs::canonicalize(base.path()).unwrap();
+        let entry = main.join(".git/worktrees/linked");
+        let forged = root.join("forged");
+        std::fs::create_dir(&forged).unwrap();
+        // The real entry of another worktree: its `gitdir` names `linked`,
+        // not `forged`.
+        std::fs::write(
+            forged.join(".git"),
+            format!("gitdir: {}\n", entry.display()),
+        )
+        .unwrap();
+        // A pointer straight at the repository, and one at nothing.
+        let direct = root.join("direct");
+        std::fs::create_dir(&direct).unwrap();
+        std::fs::write(
+            direct.join(".git"),
+            format!("gitdir: {}\n", main.join(".git").display()),
+        )
+        .unwrap();
+        let writable = vec![forged.clone(), direct.clone()];
+        for path in &writable {
+            assert!(
+                crate::subagent::confirmed_common_dir(path).await.is_none(),
+                "{} confirmed",
+                path.display()
+            );
+        }
+        assert_eq!(
+            crate::subagent::confirmed_common_dir(&linked).await,
+            Some(main.join(".git")),
+        );
+        assert_eq!(
+            linked_worktree_grants(&writable, &[]).await.unwrap().len(),
+            0
+        );
+
+        let script = format!(
+            "cat {head} 2>&1 | head -c 200; git -C {forged} log -1 --format=%s 2>&1; true",
+            head = main.join(".git/HEAD").display(),
+            forged = forged.display(),
+        );
+        let stdout = sandboxed_stdout(writable, Vec::new(), script).await;
+        assert!(!stdout.contains("ref: refs/heads"), "{stdout}");
+        assert!(!stdout.lines().any(|line| line == "root"), "{stdout}");
     }
 
     #[cfg(unix)]
