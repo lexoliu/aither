@@ -57,6 +57,7 @@ mod hook;
 mod host_load;
 #[cfg(test)]
 mod idle_compaction_tests;
+mod judgment;
 #[cfg(feature = "languages")]
 pub mod language;
 #[cfg(test)]
@@ -136,6 +137,7 @@ pub use host_load::{
     AnyHostReader, HostLoadConfig, HostLoadEvent, HostLoadMonitor, HostReader, HostSample,
     MachineLoad, MemoryPressure, ReadError, SystemReader, UnwatchedHost,
 };
+pub use judgment::{JudgmentError, judge};
 #[cfg(feature = "languages")]
 pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
