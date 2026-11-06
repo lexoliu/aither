@@ -795,12 +795,12 @@ where
         self
     }
 
-    /// Sets when host memory pressure and machine load count as high, how
-    /// long they must hold to start and to end, how often the host is read,
+    /// Sets when machine load counts as high, how long it must hold to
+    /// start and to end, how often the host is read,
     /// and the terminal's foreground window while high load lasts.
     ///
-    /// The built agent is told once when each condition starts and once when
-    /// it ends; see [`HostLoadMonitor`](crate::HostLoadMonitor).
+    /// The built agent is told once when high load starts and once when it
+    /// ends; see [`HostLoadMonitor`](crate::HostLoadMonitor).
     #[must_use]
     pub const fn host_load(mut self, config: crate::HostLoadConfig) -> Self {
         self.host_load.config = config;
