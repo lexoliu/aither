@@ -10801,7 +10801,7 @@ mod tests {
         }
 
         fn main_has(&self, id: &str) -> bool {
-            std::process::Command::new("git")
+            crate::test_git::command()
                 .args(["cat-file", "-e", id])
                 .current_dir(&self.common)
                 .output()

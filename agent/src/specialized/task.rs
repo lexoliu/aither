@@ -2651,22 +2651,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Runs `git` with a fixed identity in `dir` and returns what it printed.
-    fn git(dir: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
-            .args(["-c", "commit.gpgSign=false"])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git runs");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
+    use aither_sandbox::test_git::git;
 
     /// A main agent's terminal whose space holds a repository and a linked
     /// worktree on `subagent/work/main`, the worktree a subagent is granted
