@@ -1728,7 +1728,10 @@ impl ToolRegistry {
         };
         let outcome = match handler(caller, args.to_vec()).await {
             Ok(output) => handle_large_output(output, &self.output_dir).await,
-            Err(error) => CommandEnvelope::failure(error),
+            Err(error) => {
+                tracing::warn!(tool = %tool_name, %error, "command failed");
+                CommandEnvelope::failure(error)
+            }
         };
         if outcome.ok
             && self.kept.contains(tool_name)
@@ -4131,6 +4134,68 @@ mod tests {
 
     async fn run_command(registry: &ToolRegistry, name: &str) -> CommandEnvelope {
         registry.query_tool_handler(name, &[]).await
+    }
+
+    struct FailingTool;
+
+    impl aither_core::llm::Tool for FailingTool {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "broken".into()
+        }
+        type Arguments = RoleArgs;
+        type Res = aither_core::llm::ToolResult;
+
+        fn call(
+            &self,
+            _args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Err(anyhow::anyhow!("authentication rejected")))
+        }
+    }
+
+    /// Collects formatted log lines written while it is installed.
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_handler_is_logged_at_warn_with_command_and_error() {
+        let log = LogBuffer::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(FailingTool);
+        let registry = builder.build(tmp.path());
+
+        let envelope = run_command(&registry, "broken").await;
+
+        assert!(!envelope.ok);
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("WARN"), "{logged}");
+        assert!(logged.contains("tool=broken"), "{logged}");
+        assert!(logged.contains("authentication rejected"), "{logged}");
     }
 
     #[tokio::test]

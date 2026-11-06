@@ -127,6 +127,7 @@ connectivity = ["dep:aither-connectivity", "jiff/tz-system"]
 [dev-dependencies]
 magika = { version = "1", features = ["_test"] }
 tempfile = "3"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 lzma-rust2 = { version = "0.24.0", default-features = false, features = ["std", "xz", "encoder"] }
 tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
 
