@@ -5691,7 +5691,12 @@ mod tests {
 
     /// Writes a finished item: an unchecked one would rightly hold the
     /// probe's final turn open.
-    const TASKS_PROBE: &str = "printf '%s\\n' '- [x] SUBAGENT-TASK' > tasks.md && echo written";
+    /// Writes a well-formed `tasks.md` whose only content holds no turn open,
+    /// so the subagent ends after its two requests.
+    const TASKS_PROBE: &str =
+        "printf '%s\\n' '## Notes' 'SUBAGENT-TASK' > tasks.md && echo written";
+    const SUBAGENT_TASKS: &str = "## Notes\nSUBAGENT-TASK\n";
+    const PARENT_TASKS: &str = "## Notes\nPARENT-TASK\n";
 
     /// The `tasks.md` the subagents under `workspace` wrote in their spaces.
     fn subagent_tasks(workspace: &Path) -> Vec<String> {
@@ -5709,7 +5714,7 @@ mod tests {
         let fixture = ForkFixture::new().await;
         let workspace = std::fs::canonicalize(fixture.terminal.working_dir()).unwrap();
         let parent_tasks = workspace.join("tasks.md");
-        std::fs::write(&parent_tasks, "- [x] PARENT-TASK\n").unwrap();
+        std::fs::write(&parent_tasks, PARENT_TASKS).unwrap();
         let (seen_tx, seen_rx) = async_channel::unbounded();
         let llm = ProbingLlm {
             script: TASKS_PROBE,
@@ -5749,12 +5754,12 @@ mod tests {
             );
             assert_eq!(
                 std::fs::read_to_string(&parent_tasks).unwrap(),
-                "- [x] PARENT-TASK\n",
+                PARENT_TASKS,
                 "{subagent} left its parent's tasks.md alone"
             );
             assert_eq!(
                 subagent_tasks(&workspace),
-                vec!["- [x] SUBAGENT-TASK\n".to_string(); run],
+                vec![SUBAGENT_TASKS.to_string(); run],
                 "{subagent} wrote tasks.md in its own space"
             );
         }
