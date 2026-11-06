@@ -252,7 +252,7 @@ mod tests {
         // Restore the original, then check the cleaned patch still applies.
         run_git(repo, &["checkout", "--", "main.rs"]);
         std::fs::write(repo.join("cleaned.patch"), &cleaned).expect("write patch");
-        let check = std::process::Command::new("git")
+        let check = crate::test_git::command()
             .current_dir(repo)
             .args(["apply", "--check", "cleaned.patch"])
             .output()
@@ -264,26 +264,12 @@ mod tests {
         );
     }
 
-    /// Runs `git` in `repo` with identity and signing pinned, so the test does
-    /// not depend on the developer's global configuration.
-    fn git(repo: &Path, args: &[&str]) -> std::process::Output {
-        std::process::Command::new("git")
-            .current_dir(repo)
-            .args([
-                "-c",
-                "user.name=aither test",
-                "-c",
-                "user.email=test@aither.invalid",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .output()
-            .expect("run git")
-    }
-
     fn run_git(repo: &Path, args: &[&str]) {
-        let output = git(repo, args);
+        let output = crate::test_git::command()
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run git");
         assert!(
             output.status.success(),
             "git {args:?} failed: {}",
@@ -292,7 +278,11 @@ mod tests {
     }
 
     fn git_output(repo: &Path, args: &[&str]) -> String {
-        let output = git(repo, args);
+        let output = crate::test_git::command()
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run git");
         assert!(
             output.status.success(),
             "git {args:?} failed: {}",
