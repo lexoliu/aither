@@ -197,6 +197,12 @@ struct HostLoadSetup {
     config: crate::HostLoadConfig,
     /// The reader to watch; the host's own when unset.
     reader: Option<crate::AnyHostReader>,
+    /// Whether the agent's volume is watched.
+    disk: bool,
+    thresholds: crate::DiskThresholds,
+    /// The reader of the agent's volume; the one holding the working
+    /// directory when unset.
+    disk_reader: Option<crate::AnyDiskReader>,
 }
 
 impl Default for HostLoadSetup {
@@ -205,6 +211,9 @@ impl Default for HostLoadSetup {
             enabled: true,
             config: crate::HostLoadConfig::default(),
             reader: None,
+            disk: true,
+            thresholds: crate::DiskThresholds::default(),
+            disk_reader: None,
         }
     }
 }
@@ -814,6 +823,31 @@ where
         self
     }
 
+    /// Judges the free space of the agent's volume by `thresholds`, which
+    /// the caller may change at any time through its own clone of the
+    /// handle. Defaults to yellow below 10 GiB, red below 5 and final below
+    /// 3.
+    #[must_use]
+    pub fn disk_thresholds(mut self, thresholds: crate::DiskThresholds) -> Self {
+        self.host_load.thresholds = thresholds;
+        self
+    }
+
+    /// Reads the free space of the agent's volume through `reader` instead
+    /// of the volume holding the working directory.
+    #[must_use]
+    pub fn disk_reader(mut self, reader: impl crate::DiskReader) -> Self {
+        self.host_load.disk_reader = Some(crate::AnyDiskReader::new(reader));
+        self
+    }
+
+    /// Does not watch the free space of the agent's volume.
+    #[must_use]
+    pub const fn without_disk_pressure(mut self) -> Self {
+        self.host_load.disk = false;
+        self
+    }
+
     /// Does not watch the host's memory pressure or machine load.
     #[must_use]
     pub const fn without_host_load(mut self) -> Self {
@@ -937,13 +971,28 @@ where
                 })?
             });
         let inner = match reader {
-            Some(reader) => inner.host_load(
-                terminal_tool.executor(),
-                reader,
-                host_load.config,
-                terminal_tool.foreground_wait(),
-                Some(terminal_tool.job_memory()),
-            ),
+            Some(reader) => {
+                let monitor = crate::HostLoadMonitor::new(
+                    reader,
+                    host_load.config,
+                    terminal_tool.foreground_wait(),
+                );
+                let monitor = if host_load.disk {
+                    let disk = host_load.disk_reader.unwrap_or_else(|| {
+                        crate::AnyDiskReader::new(crate::SystemDisk::new(
+                            terminal_tool.working_dir(),
+                        ))
+                    });
+                    monitor.with_disk(disk, host_load.thresholds)
+                } else {
+                    monitor
+                };
+                inner.host_load(
+                    terminal_tool.executor(),
+                    monitor,
+                    Some(terminal_tool.job_memory()),
+                )
+            }
             None => inner,
         };
         inner

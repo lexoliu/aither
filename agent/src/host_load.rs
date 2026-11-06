@@ -14,6 +14,7 @@
 
 mod system;
 
+use crate::disk::{AnyDiskReader, DiskPressure, DiskThresholds, DiskWatch};
 use crate::runaway::RunawayGuard;
 
 use std::fmt;
@@ -289,6 +290,24 @@ pub enum HostLoadEvent {
         /// The machine's physical memory.
         physical: MemorySize,
     },
+    /// The free space of the agent's volume fell to a lower level.
+    DiskPressureRose {
+        /// The volume.
+        volume: String,
+        /// The level it reached.
+        level: DiskPressure,
+        /// The free space.
+        free: MemorySize,
+    },
+    /// The free space of the agent's volume rose to a higher level.
+    DiskPressureDroppedBack {
+        /// The volume.
+        volume: String,
+        /// The level it fell to.
+        level: DiskPressure,
+        /// The free space.
+        free: MemorySize,
+    },
 }
 
 /// The alert text for a host load event.
@@ -355,13 +374,25 @@ impl Condition {
 pub struct HostSample {
     memory: Option<MemoryPressure>,
     load: Option<MachineLoad>,
+    disk_free: Option<u64>,
 }
 
 impl HostSample {
     /// A sample of the given readings.
     #[must_use]
     pub const fn new(memory: Option<MemoryPressure>, load: Option<MachineLoad>) -> Self {
-        Self { memory, load }
+        Self {
+            memory,
+            load,
+            disk_free: None,
+        }
+    }
+
+    /// The sample with the free space of the watched volume, in bytes.
+    #[must_use]
+    pub const fn with_disk_free(mut self, free: u64) -> Self {
+        self.disk_free = Some(free);
+        self
     }
 }
 
@@ -374,9 +405,20 @@ pub struct HostLoadMonitor<R> {
     foreground_wait: ForegroundWait,
     memory: Condition,
     load: Condition,
+    disk: Option<DiskWatch>,
 }
 
 impl<R: HostReader> HostLoadMonitor<R> {
+    /// Also watches the free space of the volume `reader` reads, judged by
+    /// `thresholds`: the agent hears once of each change of the disk
+    /// pressure level, and nothing is ever killed for it. Each monitor
+    /// watches its own volume.
+    #[must_use]
+    pub fn with_disk(mut self, reader: AnyDiskReader, thresholds: DiskThresholds) -> Self {
+        self.disk = Some(DiskWatch::new(reader, thresholds));
+        self
+    }
+
     /// A monitor reading `reader`, lengthening `foreground_wait` while high
     /// load lasts.
     #[must_use]
@@ -387,6 +429,7 @@ impl<R: HostReader> HostLoadMonitor<R> {
             foreground_wait,
             memory: Condition::default(),
             load: Condition::default(),
+            disk: None,
         }
     }
 
@@ -403,7 +446,12 @@ impl<R: HostReader> HostLoadMonitor<R> {
             .machine_load()
             .inspect_err(|error| tracing::warn!(%error, "machine load could not be read"))
             .ok();
-        HostSample { memory, load }
+        let disk_free = self.disk.as_mut().and_then(DiskWatch::read);
+        HostSample {
+            memory,
+            load,
+            disk_free,
+        }
     }
 
     /// Applies a sample taken at `now`; returns the events it completes.
@@ -451,6 +499,9 @@ impl<R: HostReader> HostLoadMonitor<R> {
                 }
                 None => {}
             }
+        }
+        if let (Some(disk), Some(free)) = (self.disk.as_mut(), sample.disk_free) {
+            events.extend(disk.observe(free));
         }
         events
     }

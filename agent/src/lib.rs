@@ -48,6 +48,7 @@ mod config;
 mod connectivity;
 pub mod context;
 mod context_window;
+mod disk;
 mod error;
 mod event;
 pub mod external_hook;
@@ -118,6 +119,7 @@ pub use context::{
     TasksDocument,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
+pub use disk::{AnyDiskReader, DiskPressure, DiskReader, DiskThresholds, SystemDisk};
 pub use error::AgentError;
 pub use event::{AgentEvent, TimedEvent};
 pub use external_hook::{
