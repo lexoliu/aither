@@ -922,8 +922,12 @@ where
     }
 
     /// Starts a [`HostLoadMonitor`](crate::HostLoadMonitor) on `executor` and
-    /// tells the agent, once per event, when host memory pressure or machine
-    /// load becomes high and when it ends.
+    /// tells the agent, once per event, when machine load becomes high and when
+    /// it ends.
+    ///
+    /// With `memory`, the same readings drive the agent's
+    /// [`RunawayGuard`](crate::RunawayGuard): memory warnings listing its
+    /// jobs, a final warning before a runaway job is killed, and the kill.
     ///
     /// The monitor lengthens `foreground_wait` while high load lasts and runs
     /// until the agent is dropped. It reads the builder's
@@ -934,6 +938,7 @@ where
         reader: R,
         config: crate::HostLoadConfig,
         foreground_wait: aither_sandbox::ForegroundWait,
+        memory: Option<aither_sandbox::JobMemory>,
     ) -> Self
     where
         R: crate::HostReader,
@@ -943,6 +948,7 @@ where
         self.wiring.host_load_events = Some(crate::host_load::spawn(
             executor,
             monitor,
+            memory.map(crate::RunawayGuard::new),
             self.settings.clock.clone(),
         ));
         self

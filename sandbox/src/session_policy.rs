@@ -15,8 +15,8 @@ use heel::Grant;
 #[cfg(all(unix, feature = "jobserver"))]
 use crate::terminal::job_fifo_grant;
 use crate::terminal::{
-    linked_worktree_grants, local_path_grants, prepare_session_runtime_environment,
-    session_write_denylist,
+    linked_worktree_grants, local_path_grants, path_directory_grants,
+    prepare_session_runtime_environment, session_write_denylist,
 };
 use crate::{PreparedTools, TerminalError};
 
@@ -30,7 +30,8 @@ use crate::{PreparedTools, TerminalError};
 /// toolchain homes (`CARGO_HOME`, `RUSTUP_HOME`) that exist, with write and
 /// execute access. A granted linked git worktree also brings its repository's
 /// common git directory, with the worktree's access, once git's back-links
-/// confirm it. The policy also carries the write denylist
+/// confirm it. Every existing directory of the session's `PATH` is granted
+/// read and execute access, never write. The policy also carries the write denylist
 /// ([`Self::write_denylist`]). The environment is the session's `HOME`, temporary and
 /// cache directories, `PATH` led by the managed tools directory, `uv` and
 /// toolchain variables, and the jobserver variables.
@@ -60,18 +61,21 @@ impl SessionSandboxPolicy {
         readable: &[PathBuf],
         tools: &PreparedTools<PathBuf>,
     ) -> Result<Self, TerminalError> {
-        let mut grants = local_path_grants(writable, readable, tools)
-            .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?;
+        let environment = prepare_session_runtime_environment(working_dir, tools).await?;
+        let setup = |error: heel::Error| TerminalError::SandboxSetup(error.to_string());
+        // The `PATH` directories lead, so a writable grant over one of them
+        // is never narrowed by them.
+        let mut grants = path_directory_grants(&environment).map_err(setup)?;
+        grants.extend(local_path_grants(writable, readable, tools).map_err(setup)?);
         grants.extend(
             linked_worktree_grants(writable, readable)
                 .await
-                .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?,
+                .map_err(setup)?,
         );
-        let environment = prepare_session_runtime_environment(working_dir, tools).await?;
         Ok(Self {
             grants,
             environment,
-            write_denylist: session_write_denylist(working_dir),
+            write_denylist: session_write_denylist(working_dir, tools),
         })
     }
 
@@ -100,7 +104,7 @@ impl SessionSandboxPolicy {
     }
 
     /// The paths the sandbox must not write, however they are granted: heel's
-    /// persistence table, less cargo's git cache and the session directory.
+    /// persistence table, less cargo's git cache, the session directory and the `uv` cache.
     /// A host building its own
     /// [`heel::SandboxConfig`] passes it to `write_denylist` (not on
     /// Windows, whose backend refuses one).

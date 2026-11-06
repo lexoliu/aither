@@ -65,7 +65,9 @@ mod model_group;
 mod output_urls;
 #[cfg(test)]
 mod poll_park_tests;
+mod pressure;
 mod request_parameters;
+mod runaway;
 mod subagent_file;
 pub mod tasks;
 mod terminal_agent;
@@ -132,11 +134,12 @@ pub use hook::{
 };
 pub use host_load::{
     AnyHostReader, HostLoadConfig, HostLoadEvent, HostLoadMonitor, HostReader, HostSample,
-    MachineLoad, MemoryPressure, ReadError, SystemReader,
+    MachineLoad, MemoryPressure, ReadError, SystemReader, UnwatchedHost,
 };
 #[cfg(feature = "languages")]
 pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
+pub use runaway::RunawayGuard;
 pub use tasks::{
     AnyWorkTracker, TaskEvent, TaskEvents, WorkItem, WorkRef, WorkState, WorkTracker,
     WorkTrackerError,

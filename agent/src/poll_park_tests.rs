@@ -144,7 +144,7 @@ async fn finish_build(sender: &BackgroundTaskSender) {
             task_id: TASK.to_string(),
             script: "cargo check".to_string(),
             result: Err(TerminalError::Execution(FINISHED.to_string())),
-            killed: false,
+            kill: None,
             timeout_kill: None,
             pending: None,
         })

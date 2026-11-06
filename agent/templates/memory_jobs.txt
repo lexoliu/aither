@@ -1,0 +1,2 @@
+{% if jobs.is_empty() %} You have no running jobs.{% else %} Your running jobs by memory, largest first:{% for job in jobs %}
+- '{{ job.task_id }}' (`{{ job.command }}`): {{ job.footprint() }}{% endfor %}{% endif %}
