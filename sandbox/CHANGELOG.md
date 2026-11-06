@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0](https://github.com/May-Agent/aither/compare/sandbox-v0.20.0...sandbox-v0.21.0) - 2026-11-06
+
+### Fixed
+
+- *(sandbox)* give a subagent terminal read-only access to a worktree's git directory
+
 ## [0.20.0](https://github.com/May-Agent/aither/compare/sandbox-v0.19.0...sandbox-v0.20.0) - 2026-11-06
 
 ### Added
