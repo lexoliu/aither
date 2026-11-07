@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0](https://github.com/May-Agent/aither/compare/core-v0.21.0...core-v0.22.0) - 2026-11-07
+
+### Added
+
+- change a running agent's model, effort and grants in place
+- *(core)* let a request carrying a tool registry be modified in place
+
+### Fixed
+
+- clear the reasoning effort to the model's default on per-message models
+
 ## [0.20.0](https://github.com/May-Agent/aither/compare/core-v0.19.0...core-v0.20.0) - 2026-11-06
 
 ### Fixed
