@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0](https://github.com/May-Agent/aither/compare/apple-v0.21.0...apple-v0.22.0) - 2026-11-07
+
+### Added
+
+- change a running agent's model, effort and grants in place
+
 ## [0.13.0](https://github.com/May-Agent/aither/compare/apple-v0.12.0...apple-v0.13.0) - 2026-11-03
 
 ### Added
