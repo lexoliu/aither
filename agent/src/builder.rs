@@ -99,8 +99,11 @@ pub struct AgentSettings {
     pub(crate) prompt_cache: crate::context::PromptCache,
     pub(crate) clock: crate::AnyClock,
     pub(crate) context_sources: Vec<AnyContextSource>,
-    /// What the agent's `tasks.md` supervision is given by the host.
-    pub(crate) tasks: crate::tasks::TasksWiring,
+    /// The agent's working document and what the host gives it.
+    pub(crate) document: crate::working_document::DocumentWiring,
+    /// The embedder's stop rule; without one a run ends whenever the model
+    /// ends its turn and no context source objects.
+    pub(crate) stop_hook: Option<crate::AnyStopHook>,
     /// Where the built agent publishes each request for a fork to start from.
     pub(crate) fork_source: Option<crate::fork::ForkSource>,
     /// Who the built agent's tool calls are made by.
@@ -130,7 +133,8 @@ impl Default for AgentSettings {
             prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
             clock: crate::AnyClock::default(),
             context_sources: Vec::new(),
-            tasks: crate::tasks::TasksWiring::default(),
+            document: crate::working_document::DocumentWiring::default(),
+            stop_hook: None,
             fork_source: None,
             identity: aither_core::llm::AgentIdentity::Main,
             notices: crate::AnyNotices::default(),
@@ -154,8 +158,8 @@ struct Wiring {
     commands: Option<crate::command_catalog::CommandCatalog>,
     host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
     job_registry: Option<JobRegistry>,
-    /// Directory whose working documents (`tasks.md`) the agent supervises:
-    /// the main agent's sandbox.
+    /// Directory the agent's working document is kept in: the directory its
+    /// terminal works in.
     sandbox_dir: Option<std::path::PathBuf>,
     /// Directory files are restored from after a forked compaction: the
     /// directory the agent's terminal works in.
@@ -315,7 +319,7 @@ pub trait AgentOptions: sealed::Sealed + Sized {
     }
 
     /// Enforces the communication and working languages `guard` holds on the
-    /// agent's replies and on `tasks.md`, and states them in the system
+    /// agent's replies and on its working document, and states them in the system
     /// prompt. Give the same guard (a clone) to the tools and harness
     /// commands that take text from the agent, so their refusals reach it as
     /// alerts. Nothing happens while the communication language is unset or
@@ -370,33 +374,55 @@ pub trait AgentOptions: sealed::Sealed + Sized {
         self
     }
 
-    /// Resolves `BLOCKING` mark payloads in `tasks.md`: a mark it reports
-    /// dead no longer holds its row, which is then stale and keeps the turn
-    /// from ending. Without a resolver every mark is trusted.
+    /// Keeps the working document `spec` describes in the agent's sandbox:
+    /// it enters the conversation, its rows are held to the events and
+    /// items they track, and each agent with a sandbox, a subagent in its
+    /// own space, keeps its own. Without it the agent keeps none.
     #[must_use]
-    fn blocker_resolver(mut self, resolver: impl crate::working_docs::TaskBlockerResolver) -> Self {
-        self.settings().tasks.blocker_resolver =
-            Some(crate::working_docs::AnyTaskBlockerResolver::new(resolver));
+    fn working_document(mut self, spec: crate::working_document::DocumentSpec) -> Self {
+        self.settings().document.spec = Some(spec);
         self
     }
 
-    /// Reads the issues and pull requests `tasks.md` names through
-    /// `tracker`: a row naming a finished one is stale, a row whose issue is
-    /// blocked by an open one holds no turn open, and each root brings its
-    /// issue tree into the context.
+    /// Resolves the blockers the working document's rows wait on: a blocker
+    /// it reports dead no longer holds its row, which is then stale. Without
+    /// a resolver every blocker holds.
     #[must_use]
-    fn work_tracker(mut self, tracker: impl crate::tasks::WorkTracker) -> Self {
-        self.settings().tasks.tracker = Some(crate::tasks::AnyWorkTracker::new(tracker));
+    fn blocker_resolver(mut self, resolver: impl crate::working_document::BlockerResolver) -> Self {
+        self.settings().document.blocker_resolver =
+            Some(crate::working_document::AnyBlockerResolver::new(resolver));
         self
     }
 
-    /// Takes the state changes `tasks.md` rows track from `events`, the
-    /// inbox the host records its own on: issues, pull requests and
-    /// questions. The agent records its background jobs there itself.
-    /// Without it the agent keeps an inbox of its own.
+    /// Reads the issues and pull requests the working document names
+    /// through `tracker`: a row naming a finished one is stale, a row whose
+    /// issue is blocked by an open one waits, and each root brings its issue
+    /// tree into the context.
     #[must_use]
-    fn task_events(mut self, events: crate::tasks::TaskEvents) -> Self {
-        self.settings().tasks.events = events;
+    fn work_tracker(mut self, tracker: impl crate::working_document::WorkTracker) -> Self {
+        self.settings().document.tracker =
+            Some(crate::working_document::AnyWorkTracker::new(tracker));
+        self
+    }
+
+    /// Takes the state changes the working document's rows track from
+    /// `events`, the inbox the host records its own on: issues, pull
+    /// requests and questions. The agent records its background jobs there
+    /// itself. Without it the agent keeps an inbox of its own.
+    #[must_use]
+    fn work_events(mut self, events: crate::working_document::WorkEvents) -> Self {
+        self.settings().document.events = events;
+        self
+    }
+
+    /// Decides through `hook` whether the run ends each time the model ends
+    /// its turn. Without one, the run ends unless a context source objects,
+    /// whatever the working document holds. On a
+    /// [`TerminalAgentBuilder`](crate::TerminalAgentBuilder) its subagents
+    /// follow the same hook.
+    #[must_use]
+    fn stop_hook(mut self, hook: crate::AnyStopHook) -> Self {
+        self.settings().stop_hook = Some(hook);
         self
     }
 
@@ -752,7 +778,7 @@ where
         wiring.permission_receiver = Some(dyn_tool.permission_receiver());
         wiring.kept_receiver = Some(dyn_tool.kept_receiver());
         wiring.job_registry = Some(dyn_tool.job_registry());
-        // Files are restored after compaction, and `tasks.md` is kept, in
+        // Files are restored after compaction, and the working document is kept, in
         // wherever the terminal works: a subagent's are in its own space,
         // never its parent's.
         wiring.restore_dir = Some(dyn_tool.working_dir().clone());
@@ -767,8 +793,8 @@ where
     /// next request boundary, through the same fork and apply path as
     /// automatic compaction; the call returns at once. When usage comes
     /// within [`ContextPolicy::warn_distance`](crate::ContextPolicy::warn_distance)
-    /// of the auto-compact point, one alert tells the model to save its work,
-    /// bring its `tasks.md` up to date and call `compact` itself.
+    /// of the auto-compact point, one alert tells the model to save its work
+    /// and call `compact` itself.
     ///
     /// # Panics
     ///
@@ -823,7 +849,7 @@ where
         wiring.permission_receiver = Some(terminal.permission_receiver());
         wiring.kept_receiver = Some(terminal.kept_receiver());
         wiring.job_registry = Some(terminal.job_registry());
-        // A fork keeps its own `tasks.md` in its own space, like any
+        // A fork keeps its own working document in its own space, like any
         // subagent, not the main agent's it inherited the context of.
         wiring.restore_dir = Some(terminal.working_dir().clone());
         wiring.sandbox_dir = Some(terminal.working_dir().clone());
@@ -853,6 +879,17 @@ where
     /// What renders the built agent's notices, as the options set it so far.
     pub(crate) const fn chosen_notices(&self) -> &crate::AnyNotices {
         &self.settings.notices
+    }
+
+    /// The working document the options settled on, which the subagents
+    /// keep too.
+    pub(crate) const fn chosen_document(&self) -> Option<&crate::working_document::DocumentSpec> {
+        self.settings.document.spec.as_ref()
+    }
+
+    /// The stop rule the options settled on, which the subagents follow too.
+    pub(crate) const fn chosen_stop_hook(&self) -> Option<&crate::AnyStopHook> {
+        self.settings.stop_hook.as_ref()
     }
 
     /// Whether the instruction block in `slot` is already set.
@@ -1078,7 +1115,8 @@ where
             prompt_cache,
             clock,
             context_sources,
-            tasks,
+            document,
+            stop_hook,
             fork_source,
             identity,
             notices,
@@ -1101,11 +1139,6 @@ where
             fork_tools,
         } = self.wiring;
         let tools = assemble_tools(tools, fork_tools, compact_signal.as_ref(), &notices);
-        // Every agent with a sandbox, a fork included, keeps its own
-        // `tasks.md` there.
-        let tasks_document = sandbox_dir
-            .clone()
-            .map(|dir| tasks.document(dir, config.tasks_line_limit, notices.clone()));
         Agent {
             warmth: crate::CacheWarmth::new(prompt_cache.lifetime(), clock),
             advanced: std::sync::Arc::new(self.advanced),
@@ -1151,9 +1184,12 @@ where
             host_load_events,
             job_registry,
             detached_task_ids: std::collections::HashSet::new(),
+            // Every agent with a sandbox, a fork included, keeps its own
+            // working document there.
+            working_document: document.document(sandbox_dir.as_deref(), notices.clone()),
             sandbox_dir,
-            tasks,
-            tasks_document,
+            work_events: document.events,
+            stop_hook,
             restore_dir,
             fork_source,
             compact_signal,
@@ -1425,7 +1461,7 @@ mod tests {
         assert_eq!(
             child.wiring.sandbox_dir.as_ref(),
             Some(&space),
-            "a subagent's tasks.md is in its own space, not its parent's"
+            "a subagent's working document is in its own space, not its parent's"
         );
         assert_eq!(
             child.wiring.restore_dir,

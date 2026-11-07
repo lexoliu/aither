@@ -39,7 +39,6 @@ pub mod sources;
 pub mod system;
 pub mod window;
 
-pub use crate::tasks::TasksDocument;
 pub use budget::ContextBudget;
 pub use cache::{CacheLifetime, PromptCache};
 pub use compaction::{

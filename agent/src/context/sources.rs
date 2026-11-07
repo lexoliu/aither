@@ -2,7 +2,8 @@
 //!
 //! These cover the ambient state every terminal-first agent has: the
 //! terminals still running behind it and the skills activated for the run.
-//! `tasks.md` has a source of its own, [`TasksDocument`](crate::tasks::TasksDocument).
+//! The working document has a source of its own,
+//! [`WorkingDocument`](crate::WorkingDocument).
 //! Each one used to be a special case inside the agent loop, with its own
 //! field on `Agent`, its own repopulation call and its own alert path. As
 //! [`ContextSource`] implementations they are ordinary registrations with

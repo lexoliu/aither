@@ -81,6 +81,78 @@ pub struct TurnBoundaryContext<'a> {
     pub turn: usize,
     /// Number of recent conversation messages after processing the tool batch.
     pub message_count: usize,
+    /// The working document as the model ends its turn; `None` after a
+    /// turn that ran tools, and for an agent that keeps no document.
+    pub document: Option<&'a crate::working_document::DocumentReview>,
+}
+
+/// What a [`StopHook`] decides as the model ends its turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopDecision {
+    /// The run ends, unless a context source's alert keeps it going.
+    End,
+    /// The run goes on to another model request.
+    Hold {
+        /// What the model is told, as a system reminder; `None` when the
+        /// alerts already raised say enough, such as the working document's.
+        reminder: Option<String>,
+    },
+}
+
+/// Decides whether the run ends when the model ends its turn: the
+/// embedder's stop rule.
+///
+/// It is asked at every turn the model ends without tool calls, after the
+/// context sources raised their alerts and the working document was
+/// reviewed ([`TurnBoundaryContext::document`]). Without one, a run ends
+/// whenever the model ends its turn and no source objects, whatever the
+/// working document holds.
+pub trait StopHook: Send + Sync + 'static {
+    /// Decides for the turn `ctx` describes.
+    fn on_turn_end(
+        &self,
+        ctx: &TurnBoundaryContext<'_>,
+    ) -> impl std::future::Future<Output = StopDecision> + Send;
+}
+
+type Decide<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = StopDecision> + Send + 'a>>;
+
+/// Object-safe twin of [`StopHook`]; boxing lives inside [`AnyStopHook`].
+trait StopHookImpl: Send + Sync {
+    fn on_turn_end<'a>(&'a self, ctx: &'a TurnBoundaryContext<'a>) -> Decide<'a>;
+}
+
+impl<T: StopHook> StopHookImpl for T {
+    fn on_turn_end<'a>(&'a self, ctx: &'a TurnBoundaryContext<'a>) -> Decide<'a> {
+        Box::pin(StopHook::on_turn_end(self, ctx))
+    }
+}
+
+/// A shared [`StopHook`], carried by the agent and handed to the subagents
+/// it builds.
+#[derive(Clone)]
+pub struct AnyStopHook(std::sync::Arc<dyn StopHookImpl>);
+
+impl AnyStopHook {
+    /// Shares `hook`.
+    #[must_use]
+    pub fn new(hook: impl StopHook) -> Self {
+        Self(std::sync::Arc::new(hook))
+    }
+
+    /// See [`StopHook::on_turn_end`].
+    pub fn on_turn_end<'a>(
+        &'a self,
+        ctx: &'a TurnBoundaryContext<'a>,
+    ) -> impl std::future::Future<Output = StopDecision> + Send + 'a {
+        self.0.on_turn_end(ctx)
+    }
+}
+
+impl std::fmt::Debug for AnyStopHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnyStopHook").finish_non_exhaustive()
+    }
 }
 
 /// Reason why a checkpoint is being emitted.
@@ -111,9 +183,9 @@ pub struct CheckpointContext<'a> {
     pub has_background_tasks: bool,
     /// Structured snapshot of the currently assembled context window.
     pub window: &'a ContextWindowSnapshot,
-    /// What the conversation holds of `tasks.md`, for
-    /// [`AgentCheckpoint::tasks`](crate::AgentCheckpoint::tasks).
-    pub tasks: Option<&'a crate::tasks::TasksCheckpoint>,
+    /// What the conversation holds of the working document, for
+    /// [`AgentCheckpoint::document`](crate::AgentCheckpoint::document).
+    pub document: Option<&'a crate::working_document::DocumentCheckpoint>,
 }
 
 /// Reason why the agent stopped.
@@ -216,7 +288,8 @@ pub trait Hook: Send + Sync {
 
     /// Called before the run goes on to another model request: after a full
     /// tool/result cycle is committed into agent memory, and after a turn
-    /// without tool calls that a context source's alert keeps running.
+    /// without tool calls that a context source's alert or the
+    /// [`StopHook`] keeps running.
     fn on_turn_boundary(
         &self,
         _ctx: &TurnBoundaryContext<'_>,

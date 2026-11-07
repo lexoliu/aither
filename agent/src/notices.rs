@@ -25,7 +25,7 @@ use crate::external_hook::InjectedContext;
 use crate::host_load::HostLoadEvent;
 use crate::secret_guard::{SecretFinding, SecretRefusal};
 use crate::specialized::ForkRefusal;
-use crate::tasks::TasksAlertItem;
+use crate::working_document::DocumentAlertItem;
 
 /// The context is close to automatic compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,14 +42,33 @@ pub struct CancelledToolCall<'a> {
     pub tool: &'a str,
 }
 
-/// What the turn's checks of `tasks.md` found.
+/// The working document entering the conversation: whole, as the diff of a
+/// change, or with the issue trees of roots it newly lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentShown<'a> {
+    /// The document's name, its file as the embedder named it.
+    pub document: &'a str,
+    /// The whole document, at session start and after a reassembly.
+    pub content: Option<&'a str>,
+    /// The changed lines since the document was last shown, each prefixed
+    /// `- ` or `+ `; empty when only blank lines changed.
+    pub changes: Option<&'a str>,
+    /// The issue trees of the roots the conversation has not seen yet,
+    /// rendered inside their external-content boundary.
+    pub trees: Option<&'a str>,
+}
+
+/// What the turn's checks of the working document found.
 #[derive(Debug, Clone, Copy)]
-pub struct TasksAlert<'a> {
+pub struct DocumentAlert<'a> {
+    /// The document's name, its file as the embedder named it.
+    pub document: &'a str,
     /// Everything the alert says, in order; never empty.
-    pub items: &'a [TasksAlertItem],
-    /// Whether the alert holds the run open at its end, so the model must
-    /// bring `tasks.md` up to date before ending the turn.
-    pub gate: bool,
+    pub items: &'a [DocumentAlertItem],
+    /// Whether it is raised as the model ends its turn and the run goes on
+    /// after it, so the model must bring the document up to date before
+    /// ending the turn.
+    pub held: bool,
 }
 
 /// A shell command a command hook refused.
@@ -116,10 +135,6 @@ struct CompactSettled;
 struct CompactBelowFloor {
     floor: usize,
 }
-
-#[derive(Template)]
-#[template(path = "tasks_continue.txt", escape = "none")]
-struct TasksContinue;
 
 #[derive(Template)]
 #[template(path = "lifecycle_context.txt", escape = "none")]
@@ -231,15 +246,14 @@ pub trait Notices: SandboxNotices {
         }
     }
 
-    /// What the turn's checks of `tasks.md` found.
-    fn tasks_alert(&self, alert: &TasksAlert<'_>) -> String {
-        crate::tasks::default_alert(alert)
+    /// The working document entering the conversation.
+    fn working_document(&self, shown: &DocumentShown<'_>) -> String {
+        crate::working_document::default_shown(shown)
     }
 
-    /// The reminder that keeps a run going while `tasks.md` has rows nothing
-    /// blocks.
-    fn tasks_continue(&self) -> String {
-        rendered(&TasksContinue)
+    /// What the turn's checks of the working document found.
+    fn document_alert(&self, alert: &DocumentAlert<'_>) -> String {
+        crate::working_document::default_alert(alert)
     }
 
     /// Context a lifecycle hook added.
