@@ -368,34 +368,9 @@ pub(crate) fn default_fork_refusal(refusal: &ForkRefusal) -> String {
     crate::notices::rendered(&ForkRefusedTemplate { reason: refusal })
 }
 
-/// Structured response the fast model returns when routing a prompt.
-#[derive(Debug, JsonSchema, Deserialize)]
-struct SubagentRouting {
-    /// The configured model tier that best fits the task.
-    model: ModelTier,
-}
-
-/// One configured model offered to the router.
-struct RouterModel<'a> {
-    tier: &'static str,
-    name: &'a str,
-    description: &'a str,
-}
-
-/// Router prompt listing the configured models by tier.
-#[derive(Template)]
-#[template(path = "subagent_router.txt", escape = "none")]
-struct SubagentRouter<'a> {
-    models: [RouterModel<'a>; 3],
-}
-
-const fn tier_label(tier: ModelTier) -> &'static str {
-    match tier {
-        ModelTier::Advanced => "advanced",
-        ModelTier::Balanced => "balanced",
-        ModelTier::Fast => "fast",
-    }
-}
+use super::router::{
+    AnySubagentRouter, JudgmentRouter, RouteRequest, SubagentRouter, TierOffer, tier_label,
+};
 
 /// How a start call makes its subagent's agent.
 enum Source<'a, LLM> {
@@ -945,6 +920,9 @@ pub struct SubagentTool<LLM, Schema = HandoffDocument> {
     /// Renders the tool's refusals and every notice of the subagents it
     /// builds.
     notices: crate::AnyNotices,
+    /// Chooses the tier of a subagent whose definition states none; `None`
+    /// asks the fast model with [`JudgmentRouter`].
+    router: Option<AnySubagentRouter>,
 }
 
 impl<LLM, Schema> std::fmt::Debug for SubagentTool<LLM, Schema> {
@@ -994,6 +972,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             #[cfg(feature = "languages")]
             languages: None,
             notices: crate::AnyNotices::default(),
+            router: None,
         }
     }
 }
@@ -1030,7 +1009,17 @@ impl<LLM: Clone + Sync, Schema> SubagentTool<LLM, Schema> {
             #[cfg(feature = "languages")]
             languages: self.languages,
             notices: self.notices,
+            router: self.router,
         }
+    }
+
+    /// Routes subagents whose definition states no tier through `router`
+    /// instead of the default [`JudgmentRouter`] on the fast model. A
+    /// definition that states a tier never consults it.
+    #[must_use]
+    pub fn with_router(mut self, router: impl SubagentRouter) -> Self {
+        self.router = Some(AnySubagentRouter::new(router));
+        self
     }
 
     /// Renders the tool's refusals, and every alert, notice and refusal of
@@ -1136,6 +1125,7 @@ impl<LLM: Clone + Sync, Schema> SubagentTool<LLM, Schema> {
             #[cfg(feature = "languages")]
             languages: self.languages.clone(),
             notices: self.notices.clone(),
+            router: self.router.clone(),
             document: self.document.clone(),
             stop_hook: self.stop_hook.clone(),
         }
@@ -1939,42 +1929,45 @@ impl<LLM: LanguageModel + Clone + Sync + 'static, Schema: HandoffSchema> Subagen
         let [advanced, balanced, fast] = profiles;
         let (advanced, balanced, fast) = (advanced?, balanced?, fast?);
 
-        let system = SubagentRouter {
-            models: [
-                RouterModel {
-                    tier: tier_label(ModelTier::Advanced),
-                    name: &advanced.name,
-                    description: &advanced.description,
-                },
-                RouterModel {
-                    tier: tier_label(ModelTier::Balanced),
-                    name: &balanced.name,
-                    description: &balanced.description,
-                },
-                RouterModel {
-                    tier: tier_label(ModelTier::Fast),
-                    name: &fast.name,
-                    description: &fast.description,
-                },
-            ],
+        let tiers = [
+            TierOffer {
+                tier: ModelTier::Advanced,
+                name: &advanced.name,
+                description: &advanced.description,
+            },
+            TierOffer {
+                tier: ModelTier::Balanced,
+                name: &balanced.name,
+                description: &balanced.description,
+            },
+            TierOffer {
+                tier: ModelTier::Fast,
+                name: &fast.name,
+                description: &fast.description,
+            },
+        ];
+        let request = RouteRequest {
+            brief: prompt,
+            tiers: &tiers,
         };
-        let routing: SubagentRouting = crate::judge(
-            &self.fast,
-            self.parameters.get(ModelTier::Fast).clone(),
-            &system,
-            prompt,
-        )
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!("the fast model failed to route the subagent prompt: {error}")
-        })?;
+        let tier = match &self.router {
+            Some(router) => router.route(&request).await,
+            None => {
+                JudgmentRouter::new(
+                    self.fast.clone(),
+                    self.parameters.get(ModelTier::Fast).clone(),
+                )
+                .route(&request)
+                .await
+            }
+        }?;
 
-        let name = match routing.model {
+        let name = match tier {
             ModelTier::Advanced => advanced.name,
             ModelTier::Balanced => balanced.name,
             ModelTier::Fast => fast.name,
         };
-        Ok((routing.model, name))
+        Ok((tier, name))
     }
 }
 
@@ -2285,6 +2278,7 @@ fn idle_alert(subagent: &str, keep_alive: &crate::agent::CacheKeepAliveState) ->
 mod tests {
     use std::path::PathBuf;
 
+    use crate::specialized::SubagentRouteError;
     use aither_core::llm::{Event, LLMRequest, model::Profile as ModelProfile};
     use futures_core::Stream;
 
@@ -3524,6 +3518,92 @@ mod tests {
             );
         }
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A router that answers `tier` and counts how often it was asked.
+    struct FixedRouter {
+        tier: ModelTier,
+        asked: Arc<AtomicU64>,
+    }
+
+    impl SubagentRouter for FixedRouter {
+        fn route(
+            &self,
+            request: &RouteRequest<'_>,
+        ) -> impl Future<Output = Result<ModelTier, SubagentRouteError>> + Send {
+            assert_eq!(request.brief, "do the task");
+            let offered: Vec<_> = request.tiers.iter().map(|offer| offer.tier).collect();
+            assert_eq!(
+                offered,
+                [ModelTier::Advanced, ModelTier::Balanced, ModelTier::Fast]
+            );
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(self.tier))
+        }
+    }
+
+    /// A router that fails.
+    struct FailingRouter;
+
+    impl SubagentRouter for FailingRouter {
+        fn route(
+            &self,
+            _: &RouteRequest<'_>,
+        ) -> impl Future<Output = Result<ModelTier, SubagentRouteError>> + Send {
+            std::future::ready(Err(SubagentRouteError::new("no rule applies")))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_custom_router_picks_the_tier_of_an_untiered_definition() {
+        let bundled = Bundled::new().await;
+        let (dir, prompt_file) = write_prompt_file("custom-router", "do the task");
+        let asked = Arc::new(AtomicU64::new(0));
+        // The default router would pick the balanced tier.
+        let tool = tiered_tool(&bundled, r#"{"model":"balanced"}"#).with_router(FixedRouter {
+            tier: ModelTier::Advanced,
+            asked: asked.clone(),
+        });
+
+        let text = completed_text(&tool, named("general", &prompt_file)).await;
+
+        assert!(
+            text.contains("(advanced tier, model: advanced-model)"),
+            "{text}"
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_tiered_definition_does_not_consult_the_router() {
+        let bundled = Bundled::new().await;
+        let (dir, prompt_file) = write_prompt_file("tiered-router", "do the task");
+        let asked = Arc::new(AtomicU64::new(0));
+        let tool = tiered_tool(&bundled, r#"{"model":"balanced"}"#).with_router(FixedRouter {
+            tier: ModelTier::Advanced,
+            asked: asked.clone(),
+        });
+
+        let text = completed_text(&tool, named("explore", &prompt_file)).await;
+
+        assert!(text.contains("(fast tier, model: fast-model)"), "{text}");
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_router_failure_stops_the_start() {
+        let bundled = Bundled::new().await;
+        let (dir, prompt_file) = write_prompt_file("failing-router", "do the task");
+        let tool = tiered_tool(&bundled, r#"{"model":"balanced"}"#).with_router(FailingRouter);
+
+        let error = Tool::call(&tool, named("general", &prompt_file), ToolContext::new())
+            .await
+            .expect_err("the router failed");
+
+        assert!(error.to_string().contains("no rule applies"), "{error}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
