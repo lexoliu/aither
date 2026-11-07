@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/May-Agent/aither/compare/agent-v0.22.0...agent-v0.23.0) - 2026-11-07
+
+### Added
+
+- *(agent)* [**breaking**] serialize the working-document checkpoint under its own names
+- *(sandbox)* [**breaking**] command refusals become embedder policies behind CommandPolicy
+- *(agent)* [**breaking**] replace the tasks.md protocol with a general working-document mechanism
+- *(agent)* [**breaking**] compact subagents into the main agent's handoff schema
+- *(agent)* [**breaking**] compact into the embedder's handoff schema
+- *(agent)* [**breaking**] render every alert, notice and refusal through embedder-supplied Notices
+
+### Fixed
+
+- *(sandbox)* [**breaking**] pin each tool artifact's byte size instead of capping at 64 MiB
+- *(agent)* return a refused compact request as a typed tool error
+- *(agent)* gate the working document's file accessor on languages
+- *(agent)* import PhantomData whether or not skills is enabled
+- *(claude)* index the sent message list and keep the live tail out of system
+
+### Other
+
+- Merge pull request #624 from May-Agent/fix/623-artifact-size
+- Merge remote-tracking branch 'origin/dev' into feat/596-tasks-protocol
+- Merge pull request #614 from May-Agent/feat/602-handoff
+- Merge pull request #615 from May-Agent/feat/598-command-policy
+- merge main into dev after v0.22.0
+- Merge pull request #612 from May-Agent/feat/595-notices
+
 ## [0.22.0](https://github.com/May-Agent/aither/compare/agent-v0.21.0...agent-v0.22.0) - 2026-11-07
 
 ### Added
