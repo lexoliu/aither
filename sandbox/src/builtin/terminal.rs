@@ -126,13 +126,15 @@ impl Tool for InputTerminalTool {
 #[derive(Debug, Clone)]
 pub struct ReadTerminalDeltaTool {
     registry: JobRegistry,
+    notices: crate::AnySandboxNotices,
 }
 
 impl ReadTerminalDeltaTool {
-    /// Creates a terminal delta reader tool.
+    /// Creates a terminal delta reader tool whose refused reads render
+    /// through `notices`.
     #[must_use]
-    pub const fn new(registry: JobRegistry) -> Self {
-        Self { registry }
+    pub const fn new(registry: JobRegistry, notices: crate::AnySandboxNotices) -> Self {
+        Self { registry, notices }
     }
 }
 
@@ -233,7 +235,11 @@ impl Tool for ReadTerminalDeltaTool {
             .await
             .map_err(|error| match error {
                 // Kept typed, so the agent loop recognises the refused poll.
-                TerminalReadError::Refused(refusal) => anyhow::Error::from(refusal),
+                TerminalReadError::Refused(refusal) => {
+                    anyhow::Error::from(crate::Refused::rendered(refusal, |refusal| {
+                        self.notices.unchanged_task_read(refusal)
+                    }))
+                }
                 TerminalReadError::Failed(message) => anyhow::Error::msg(message),
             })?;
 

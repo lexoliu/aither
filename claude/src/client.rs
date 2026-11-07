@@ -134,7 +134,7 @@ impl LanguageModel for Claude {
 
         async_stream::stream! {
             let (mut system_prompt, mut claude_messages) =
-                match to_claude_messages(&core_messages).await {
+                match to_claude_messages(&core_messages, takes_mid_conversation_system(&cfg)).await {
                     Ok(payload) => payload,
                     Err(error) => {
                         yield Err(ClaudeError::Api(error));
@@ -349,6 +349,9 @@ impl LanguageModel for Claude {
             if takes_per_message_effort(&cfg) {
                 profile.abilities.push(Ability::PerMessageEffort);
             }
+            if takes_mid_conversation_system(&cfg) {
+                profile.abilities.push(Ability::MidConversationSystem);
+            }
             profile.default_reasoning_effort = aither_models::default_reasoning_effort(&cfg.model);
 
             for ability in &cfg.native_abilities {
@@ -369,6 +372,15 @@ fn takes_per_message_effort(cfg: &Config) -> bool {
     cfg.base_url.trim_end_matches('/') == CLAUDE_BASE_URL
         && aither_models::lookup(&cfg.model)
             .is_some_and(|entry| entry.has_ability(Ability::PerMessageEffort))
+}
+
+/// Whether this client's model takes a system message inside `messages`: the
+/// registry lists the model for it and the client talks to the Claude API
+/// itself.
+fn takes_mid_conversation_system(cfg: &Config) -> bool {
+    cfg.base_url.trim_end_matches('/') == CLAUDE_BASE_URL
+        && aither_models::lookup(&cfg.model)
+            .is_some_and(|entry| entry.has_ability(Ability::MidConversationSystem))
 }
 
 fn native_tool_name_enabled(snapshot: &ParameterSnapshot, name: &str) -> bool {

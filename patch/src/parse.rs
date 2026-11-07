@@ -20,13 +20,26 @@ const END_OF_FILE: &str = "*** End of File";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Create `path` holding `lines`.
-    Add { path: String, lines: Vec<String> },
+    Add {
+        /// The file to create, literal relative to the patch base.
+        path: String,
+        /// The new file's lines, without line endings.
+        lines: Vec<String>,
+    },
     /// Remove `path`; `expected`, when non-empty, must equal the file's lines.
-    Delete { path: String, expected: Vec<String> },
+    Delete {
+        /// The file to remove.
+        path: String,
+        /// The lines the file must hold, or empty to delete unconditionally.
+        expected: Vec<String>,
+    },
     /// Apply `hunks` to `path`, optionally moving the result to `new_path`.
     Update {
+        /// The file to change.
         path: String,
+        /// The destination when the update also moves the file.
         new_path: Option<String>,
+        /// The changes, in file order.
         hunks: Vec<Hunk>,
     },
 }
@@ -37,6 +50,7 @@ pub struct Hunk {
     /// Text of the `@@ anchor` line: the hunk must match after the first line
     /// equal to it.
     pub anchor: Option<String>,
+    /// The hunk's body lines, in order.
     pub lines: Vec<HunkLine>,
     /// The hunk's old side must end at the last line of the file.
     pub at_end_of_file: bool,
@@ -45,13 +59,17 @@ pub struct Hunk {
 /// One body line of a hunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HunkLine {
+    /// A line that must be present and is kept.
     Context(String),
+    /// A line that must be present and is removed.
     Delete(String),
+    /// A line added at this position.
     Insert(String),
 }
 
 impl HunkLine {
     /// The line as it must appear in the file, or `None` for an insertion.
+    #[must_use]
     pub fn old_side(&self) -> Option<&str> {
         match self {
             Self::Context(text) | Self::Delete(text) => Some(text),
@@ -74,6 +92,10 @@ impl Hunk {
 }
 
 /// Parses `text` into the file operations it describes.
+///
+/// # Errors
+///
+/// Returns [`PatchError`] when the text is not a well-formed patch.
 pub fn parse(text: &str) -> Result<Vec<Action>, PatchError> {
     let text = unwrap_fence(text.trim());
     let wrapped;

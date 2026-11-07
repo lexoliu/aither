@@ -147,15 +147,17 @@ impl PromptCache {
 
     /// Applies cache controls to `parameters` for a request.
     ///
-    /// `messages` is the assembled request and `has_tools` says whether tool
-    /// definitions are attached, because both decide where a Claude
-    /// breakpoint can legally be placed.
+    /// `messages` is the assembled request, `has_tools` says whether tool
+    /// definitions are attached, and `mid_conversation_system` whether the
+    /// model keeps later system messages in the conversation; all three decide
+    /// where a Claude breakpoint can legally be placed.
     #[must_use]
     pub fn apply(
         &self,
         mut parameters: Parameters,
         messages: &[Message],
         has_tools: bool,
+        mid_conversation_system: bool,
     ) -> Parameters {
         parameters.cache = CacheOptions {
             openai: Some(aither_core::llm::model::OpenAIPromptCache {
@@ -164,7 +166,7 @@ impl PromptCache {
             }),
             claude: Some(ClaudePromptCache::explicit(
                 self.ttl,
-                Self::breakpoints(messages, has_tools),
+                Self::breakpoints(messages, has_tools, mid_conversation_system),
             )),
             gemini: None,
         };
@@ -178,7 +180,11 @@ impl PromptCache {
     /// new entry each turn and read none of them back. The breakpoint goes on
     /// the message before it — the newest byte that will still be there next
     /// time.
-    const fn breakpoints(messages: &[Message], has_tools: bool) -> ClaudeExplicitCacheBreakpoints {
+    fn breakpoints(
+        messages: &[Message],
+        has_tools: bool,
+        mid_conversation_system: bool,
+    ) -> ClaudeExplicitCacheBreakpoints {
         // Tool definitions precede the system prompt in Claude's cacheable
         // order, so a breakpoint there protects the whole tool surface.
         let breakpoints = if has_tools {
@@ -193,7 +199,9 @@ impl PromptCache {
                 ClaudeCacheBreakpointTarget::LastSystem,
             ))
         };
-        let Some(index) = stable_conversation_end(messages) else {
+        let Some(index) = stable_conversation_end(messages)
+            .and_then(|end| claude_message_index(messages, end, mid_conversation_system))
+        else {
             return breakpoints;
         };
         let breakpoint = ClaudeExplicitCacheBreakpoint::new(ClaudeCacheBreakpointTarget::Message {
@@ -216,6 +224,35 @@ pub(crate) const fn stable_conversation_end(messages: &[Message]) -> Option<usiz
     // The final message is the live tail; the one before it is the newest
     // append-only item.
     messages.len().checked_sub(2)
+}
+
+/// Position, in the message list Claude is sent, of `messages[index]`.
+///
+/// Claude lifts the leading system messages into the top-level `system`. A
+/// model that takes mid-conversation system messages keeps every later one in
+/// place; any other folds all of them into `system`, so none counts. Returns
+/// `None` when the message itself is lifted out.
+fn claude_message_index(
+    messages: &[Message],
+    index: usize,
+    mid_conversation_system: bool,
+) -> Option<usize> {
+    let is_system = |message: &Message| message.role() == aither_core::llm::Role::System;
+    let lifted = if mid_conversation_system {
+        messages
+            .iter()
+            .take_while(|message| is_system(message))
+            .count()
+    } else {
+        if is_system(&messages[index]) {
+            return None;
+        }
+        messages[..index]
+            .iter()
+            .filter(|message| is_system(message))
+            .count()
+    };
+    index.checked_sub(lifted)
 }
 
 #[cfg(test)]
@@ -263,7 +300,7 @@ mod tests {
             Message::user("hello"),
             Message::system("live tail"),
         ];
-        let parameters = cache.apply(Parameters::default(), &messages, true);
+        let parameters = cache.apply(Parameters::default(), &messages, true, true);
 
         assert!(!parameters.cache.is_empty());
         assert_eq!(
@@ -298,18 +335,80 @@ mod tests {
             Message::assistant("hi"),
             Message::system("live tail"),
         ];
-        let parameters = cache.apply(Parameters::default(), &messages, false);
+        let parameters = cache.apply(Parameters::default(), &messages, false, true);
         let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
             panic!("expected explicit claude breakpoints");
         };
         assert_eq!(
             breakpoints.second.map(|point| point.target),
             Some(ClaudeCacheBreakpointTarget::Message {
-                message_index: 2,
+                message_index: 1,
                 block_index: 0,
             }),
             "breakpoint must land on the last stable message, not the tail"
         );
+    }
+
+    /// The index is into the list Claude is sent, which lacks the leading
+    /// system prefix.
+    #[test]
+    fn the_message_breakpoint_indexes_the_claude_message_list() {
+        let cache = PromptCache::new("session-1");
+        let messages = vec![
+            Message::system("prefix"),
+            Message::user("hello"),
+            Message::system("live tail"),
+        ];
+        let parameters = cache.apply(Parameters::default(), &messages, false, true);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.second.map(|point| point.target),
+            Some(ClaudeCacheBreakpointTarget::Message {
+                message_index: 0,
+                block_index: 0,
+            })
+        );
+    }
+
+    /// A model without mid-conversation system messages folds the tail into
+    /// `system`, so the Claude list holds only the conversation.
+    #[test]
+    fn without_the_ability_no_system_message_counts() {
+        let cache = PromptCache::new("session-1");
+        let messages = vec![
+            Message::system("prefix"),
+            Message::user("hello"),
+            Message::assistant("hi"),
+            Message::system("live tail"),
+        ];
+        let parameters = cache.apply(Parameters::default(), &messages, false, false);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.second.map(|point| point.target),
+            Some(ClaudeCacheBreakpointTarget::Message {
+                message_index: 1,
+                block_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn a_stable_system_prefix_gets_no_message_breakpoint() {
+        let cache = PromptCache::new("session-1");
+        let messages = vec![
+            Message::system("prefix"),
+            Message::system("more prefix"),
+            Message::system("live tail"),
+        ];
+        let parameters = cache.apply(Parameters::default(), &messages, false, true);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert!(breakpoints.second.is_none());
     }
 
     #[test]
@@ -325,7 +424,7 @@ mod tests {
     fn a_prefix_only_request_gets_no_message_breakpoint() {
         let cache = PromptCache::new("session-1");
         let messages = vec![Message::system("prefix")];
-        let parameters = cache.apply(Parameters::default(), &messages, false);
+        let parameters = cache.apply(Parameters::default(), &messages, false, true);
         let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
             panic!("expected explicit claude breakpoints");
         };

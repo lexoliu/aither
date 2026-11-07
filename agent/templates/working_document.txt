@@ -1,0 +1,9 @@
+<working_document>
+{% if let Some(content) = content %}Contents of {{ document }}:
+{{ content }}
+{% endif %}{% if let Some(changes) = changes %}{% if changes.is_empty() %}{{ document }} changed in blank lines only.
+{% else %}Changes to {{ document }} since it was last shown:
+{{ changes }}
+{% endif %}{% endif %}{% if let Some(trees) = trees %}The issues under the roots of {{ document }}, with their sub-issues and the issues they are blocked by:
+{{ trees }}
+{% endif %}</working_document>

@@ -14,12 +14,19 @@
 //! document, and every item numbered at or above the fork point is kept
 //! verbatim because the document cannot possibly describe it.
 //!
-//! The result is a *typed* document rather than prose. Structured output is
-//! tried first; a model that ignores the schema gets exactly one corrective
-//! retry quoting its own failure, and then the compaction is reported as
-//! failed instead of silently storing something unusable.
+//! The result is a *typed* document rather than prose, and the type is the
+//! embedder's: a [`HandoffSchema`] gives the schema the model fills, the
+//! instruction that asks for it, and the text it renders back into the
+//! conversation. aither reads from it only what restoration needs, the
+//! [`Restoration`]. [`HandoffDocument`] is the schema aither ships.
+//!
+//! Structured output is tried first; a model that ignores the schema gets
+//! exactly one corrective retry quoting its own failure, and then the
+//! compaction is reported as failed instead of silently storing something
+//! unusable.
 
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 
 use aither_core::llm::{Classify, Event, Failure, LLMRequest, Message, Role};
@@ -27,10 +34,99 @@ use aither_core::{LanguageModel, llm::GenerateError};
 use askama::Template;
 use futures_lite::StreamExt as _;
 use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sync_wrapper::SyncWrapper;
 
-/// Structured handoff document used to recover work after compaction.
+/// A handoff document type a compaction asks the model to fill.
+///
+/// The type's JSON schema is the structured output the compaction requests,
+/// so its fields are what the model writes. The rest is what the embedder
+/// decides about its handoff: the instruction that asks for it, the
+/// corrective prompt after an unusable answer, what makes a document
+/// unusable, and the text the conversation reads in place of everything the
+/// handoff replaced.
+///
+/// aither needs only the [`Restoration`] from it — the file ranges and
+/// skills to put back in view — and builds the index of on-disk materials
+/// itself, passing it to [`render`](Self::render).
+pub trait HandoffSchema: JsonSchema + DeserializeOwned + Send + 'static {
+    /// The instruction appended to the conversation to ask for this
+    /// document.
+    fn instruction(prompt: &HandoffPrompt<'_>) -> String;
+
+    /// The corrective prompt sent once after a response that did not parse
+    /// or validate; `reason` says what was wrong with it.
+    fn retry(reason: &str) -> String;
+
+    /// Checks a parsed document before it is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidHandoff`] when the document is unusable; its reason
+    /// is quoted to the model in the retry.
+    fn validate(&self) -> Result<(), InvalidHandoff> {
+        Ok(())
+    }
+
+    /// Renders the document as the text the conversation reads from now on.
+    ///
+    /// `file_index` is the mechanical index of on-disk materials the
+    /// compacted conversation produced (`path — description` entries); the
+    /// model does not write it, because a missing entry means redone work.
+    fn render(&self, file_index: &[String]) -> String;
+
+    /// Takes out what restoration puts back in view.
+    fn into_restoration(self) -> Restoration;
+}
+
+/// What the instruction of a compaction is rendered from.
+#[derive(Debug, Clone, Copy)]
+pub struct HandoffPrompt<'a> {
+    /// What the handoff should focus on, when a caller said; trimmed and
+    /// never empty.
+    pub focus: Option<&'a str>,
+    /// The session's skills the handoff may name for restoration.
+    pub skills: &'a [SkillCatalogEntry],
+}
+
+/// What a handoff asks to be put back in view after compaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Restoration {
+    /// File ranges restored verbatim, in order.
+    pub context_files: Vec<ContextFile>,
+    /// Names of catalog skills whose instructions are restored; a name not
+    /// in the catalog is reported instead.
+    pub skills: Vec<String>,
+}
+
+/// Why a parsed handoff document is unusable.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{reason}")]
+pub struct InvalidHandoff {
+    /// What is wrong with the document, as the retry quotes it.
+    pub reason: String,
+}
+
+impl InvalidHandoff {
+    /// An invalid handoff for `reason`.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl From<InvalidHandoff> for CompactionError {
+    fn from(error: InvalidHandoff) -> Self {
+        Self::Invalid {
+            reason: error.reason,
+        }
+    }
+}
+
+/// The handoff schema aither ships: the task, decisions, errors, pending
+/// work and recovery hints, plus the files and skills to restore.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HandoffDocument {
     /// What the user asked for, and how far it has got.
@@ -50,14 +146,6 @@ pub struct HandoffDocument {
     /// chosen from the catalog the instruction lists.
     #[serde(default)]
     pub skills: Vec<String>,
-    /// Mechanical index of on-disk materials produced during the compacted
-    /// conversation (`outputs/`, `artifacts/`), each annotated with the
-    /// originating command's description.
-    ///
-    /// Built by the framework, not the model: asking the model for it is
-    /// unreliable, and a missing entry directly causes work to be redone.
-    #[serde(default)]
-    pub file_index: Vec<String>,
 }
 
 /// A file range the next turns need in view, named by the handoff.
@@ -100,6 +188,7 @@ pub struct SkillCatalogEntry {
 #[template(path = "handoff_document.md", escape = "none")]
 struct HandoffDocumentTemplate<'a> {
     handoff: &'a HandoffDocument,
+    file_index: &'a [String],
 }
 
 #[derive(Template)]
@@ -115,34 +204,62 @@ struct CompactionRetry<'a> {
     reason: &'a str,
 }
 
-impl HandoffDocument {
-    /// Validates required handoff fields.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompactionError::Invalid`] when `current_task` is empty: a
-    /// handoff without it tells the next instance nothing about what it is
-    /// supposed to be doing, and is worse than no handoff at all.
-    pub fn validate(self) -> Result<Self, CompactionError> {
-        if self.current_task.trim().is_empty() {
-            return Err(CompactionError::Invalid {
-                reason: "current_task must not be empty".to_string(),
-            });
-        }
-        Ok(self)
-    }
-
-    /// Renders this handoff as Markdown.
+impl HandoffSchema for HandoffDocument {
+    /// Asks for every field, offering the skill catalog by name.
     ///
     /// # Panics
     ///
-    /// Panics if the bundled handoff template cannot be rendered, which is a
-    /// build-time error in the template rather than a runtime condition.
-    #[must_use]
-    pub fn render_markdown(&self) -> String {
-        HandoffDocumentTemplate { handoff: self }
+    /// Panics if the bundled instruction template cannot be rendered, which
+    /// is a build-time error in the template rather than a runtime condition.
+    fn instruction(prompt: &HandoffPrompt<'_>) -> String {
+        CompactionInstruction {
+            focus: prompt.focus,
+            skills: prompt.skills,
+        }
+        .render()
+        .expect("compaction instruction template must render")
+    }
+
+    /// Quotes `reason` and restates the keys.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bundled retry template cannot be rendered.
+    fn retry(reason: &str) -> String {
+        CompactionRetry { reason }
             .render()
-            .expect("handoff document template must render")
+            .expect("compaction retry template must render")
+    }
+
+    /// Rejects an empty `current_task`: a handoff without it tells the next
+    /// instance nothing about what it is supposed to be doing, and is worse
+    /// than no handoff at all.
+    fn validate(&self) -> Result<(), InvalidHandoff> {
+        if self.current_task.trim().is_empty() {
+            return Err(InvalidHandoff::new("current_task must not be empty"));
+        }
+        Ok(())
+    }
+
+    /// Renders the document as Markdown, one section per field.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bundled handoff template cannot be rendered.
+    fn render(&self, file_index: &[String]) -> String {
+        HandoffDocumentTemplate {
+            handoff: self,
+            file_index,
+        }
+        .render()
+        .expect("handoff document template must render")
+    }
+
+    fn into_restoration(self) -> Restoration {
+        Restoration {
+            context_files: self.context_files,
+            skills: self.skills,
+        }
     }
 }
 
@@ -174,24 +291,43 @@ pub enum CompactionError {
 const INDEX_SEPARATOR: &str = " — ";
 
 /// The handoff a [`Context`](crate::context::Context) carries between
-/// compactions: the structured document a compaction produced, or the plain
-/// text a host set directly.
+/// compactions: the text the conversation reads in place of what it
+/// replaced, and the file index the next compaction extends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Handoff {
-    /// Free text set by the host; it has no file index.
-    Text(String),
-    /// A document produced by a compaction.
-    Document(HandoffDocument),
+pub struct Handoff {
+    /// The rendered handoff, as the conversation reads it.
+    text: String,
+    /// The mechanical index of on-disk materials, carried into the next
+    /// compaction so a file indexed once stays indexed.
+    file_index: Vec<String>,
 }
 
 impl Handoff {
+    /// A handoff of plain `text`, with no file index.
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            file_index: Vec::new(),
+        }
+    }
+
+    /// A handoff of `text` that carries `file_index`.
+    #[must_use]
+    pub const fn with_file_index(text: String, file_index: Vec<String>) -> Self {
+        Self { text, file_index }
+    }
+
+    /// The handoff text, as the conversation reads it.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
     /// The file index entries this handoff carries.
     #[must_use]
     pub fn file_index(&self) -> &[String] {
-        match self {
-            Self::Text(_) => &[],
-            Self::Document(document) => &document.file_index,
-        }
+        &self.file_index
     }
 }
 
@@ -264,9 +400,8 @@ pub fn build_file_index(
         .collect()
 }
 
-/// A compaction snapshot taken at a request boundary.
-#[derive(Debug, Clone)]
-pub struct CompactionFork {
+/// A compaction snapshot taken at a request boundary, asking for a `D`.
+pub struct CompactionFork<D> {
     /// Sequence number of the first item the handoff will *not* describe.
     fork_point: u64,
     /// The file index of the handoff this compaction replaces.
@@ -278,27 +413,36 @@ pub struct CompactionFork {
     /// what lets the provider serve the compaction from the same prefix
     /// cache the run just paid for.
     request: LLMRequest,
+    /// The schema the model fills; no `D` is held.
+    schema: PhantomData<fn() -> D>,
 }
 
-impl CompactionFork {
+impl<D> std::fmt::Debug for CompactionFork<D> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompactionFork")
+            .field("fork_point", &self.fork_point)
+            .field("schema", &std::any::type_name::<D>())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<D: HandoffSchema> CompactionFork<D> {
     /// Forks `request` — the exact request the run is about to send — into a
-    /// compaction request, optionally focused by `focus`. `previous_file_index`
-    /// is the file index of the handoff the result will replace.
+    /// compaction request for a `D`, optionally focused by `focus`.
+    /// `previous_file_index` is the file index of the handoff the result
+    /// will replace.
     ///
-    /// The instruction is *appended* and the tool definitions and parameters
-    /// are reused untouched: everything up to the instruction is byte-for-
-    /// byte what the main request sent, so the provider's prefix cache still
+    /// The instruction [`D::instruction`](HandoffSchema::instruction)
+    /// renders is *appended* and the tool definitions and parameters are
+    /// reused untouched: everything up to the instruction is byte-for-byte
+    /// what the main request sent, so the provider's prefix cache still
     /// applies.
     ///
     /// # Errors
     ///
     /// Returns [`CompactionError::Empty`] when the request carries no
     /// conversation to summarize.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the compiled-in instruction template fails to render, which
-    /// would mean the binary was built against a broken template.
     pub fn new(
         request: &LLMRequest,
         fork_point: u64,
@@ -314,9 +458,7 @@ impl CompactionFork {
             return Err(CompactionError::Empty);
         }
         let focus = focus.map(str::trim).filter(|focus| !focus.is_empty());
-        let instruction = CompactionInstruction { focus, skills }
-            .render()
-            .expect("compaction instruction template must render");
+        let instruction = D::instruction(&HandoffPrompt { focus, skills });
         let mut messages = request.messages().to_vec();
         messages.push(Message::user(instruction));
         Ok(Self {
@@ -326,6 +468,7 @@ impl CompactionFork {
             request: LLMRequest::new(messages)
                 .with_parameters(request.parameters().clone())
                 .with_tool_definitions(request.tool_definitions().to_vec()),
+            schema: PhantomData,
         })
     }
 
@@ -352,37 +495,36 @@ impl CompactionFork {
     /// Runs the compaction against `model`.
     ///
     /// Structured output is attempted first. A schema mismatch — the common
-    /// failure for models without native structured output — earns one
-    /// corrective retry that quotes the parse failure back to the model.
+    /// failure for models without native structured output — or a document
+    /// [`D::validate`](HandoffSchema::validate) rejects earns one corrective
+    /// retry, [`D::retry`](HandoffSchema::retry), that quotes the failure
+    /// back to the model. The accepted document is rendered with the file
+    /// index and split into the handoff and its restoration.
     ///
     /// # Errors
     ///
     /// Returns [`CompactionError`] when the provider fails, or when the
     /// retry also fails to produce a valid document.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the compiled-in retry template fails to render, which would
-    /// mean the binary was built against a broken template.
-    pub async fn run<M: LanguageModel>(self, model: M) -> Result<HandoffDocument, CompactionError> {
+    pub async fn run<M: LanguageModel>(
+        self,
+        model: M,
+    ) -> Result<CompletedCompaction, CompactionError> {
         let Self {
+            fork_point,
             request,
             previous_file_index,
             outputs_dir,
             ..
         } = self;
-        let conversation = request.messages().to_vec();
-        let reason = match model.generate::<HandoffDocument>(request.clone()).await {
+        let file_index = build_file_index(
+            &previous_file_index,
+            request.messages(),
+            outputs_dir.as_deref(),
+        );
+        let reason = match model.generate::<D>(request.clone()).await {
             Ok(document) => match document.validate() {
-                Ok(mut document) => {
-                    document.file_index = build_file_index(
-                        &previous_file_index,
-                        &conversation,
-                        outputs_dir.as_deref(),
-                    );
-                    return Ok(document);
-                }
-                Err(error) => error.to_string(),
+                Ok(()) => return Ok(CompletedCompaction::new(fork_point, document, file_index)),
+                Err(error) => error.reason,
             },
             Err(GenerateError::Provider(error)) => {
                 return Err(CompactionError::Provider {
@@ -394,21 +536,32 @@ impl CompactionFork {
         };
 
         tracing::warn!(reason = %reason, "retrying compaction with a corrective prompt");
-        let retry = CompactionRetry {
-            reason: reason.as_str(),
-        }
-        .render()
-        .expect("compaction retry template must render");
         let (mut messages, parameters, definitions) = request.into_parts();
-        messages.push(Message::user(retry));
+        messages.push(Message::user(D::retry(&reason)));
         let retry_request = LLMRequest::new(messages)
             .with_parameters(parameters)
             .with_tool_definitions(definitions);
         let response = collect_text(&model, retry_request).await?;
-        let mut document = parse_handoff(&response)?.validate()?;
-        document.file_index =
-            build_file_index(&previous_file_index, &conversation, outputs_dir.as_deref());
-        Ok(document)
+        let document = parse_handoff::<D>(&response)?;
+        document.validate()?;
+        Ok(CompletedCompaction::new(fork_point, document, file_index))
+    }
+}
+
+impl CompletedCompaction {
+    /// Splits an accepted `document` into the handoff it renders to, with
+    /// `file_index`, and its restoration.
+    pub(crate) fn new<D: HandoffSchema>(
+        fork_point: u64,
+        document: D,
+        file_index: Vec<String>,
+    ) -> Self {
+        let text = document.render(&file_index);
+        Self {
+            fork_point,
+            handoff: Handoff::with_file_index(text, file_index),
+            restoration: document.into_restoration(),
+        }
     }
 }
 
@@ -421,13 +574,15 @@ impl CompactionFork {
 pub struct CompletedCompaction {
     /// Sequence number items must reach to survive the handoff.
     pub fork_point: u64,
-    /// The document that replaces everything older than the fork point.
-    pub handoff: HandoffDocument,
+    /// The handoff that replaces everything older than the fork point.
+    pub handoff: Handoff,
+    /// What the handoff asked to put back in view.
+    pub restoration: Restoration,
 }
 
 /// The owned, `'static` future a forked compaction runs as.
 type CompactionFuture =
-    Pin<Box<dyn Future<Output = Result<HandoffDocument, CompactionError>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<CompletedCompaction, CompactionError>> + Send>>;
 
 /// A compaction that is in flight while the run continues.
 ///
@@ -458,7 +613,10 @@ impl std::fmt::Debug for PendingCompaction {
 impl PendingCompaction {
     /// Starts `fork` against an owned `model`.
     #[must_use]
-    pub fn start<M: LanguageModel + 'static>(fork: CompactionFork, model: M) -> Self {
+    pub fn start<D: HandoffSchema, M: LanguageModel + 'static>(
+        fork: CompactionFork<D>,
+        model: M,
+    ) -> Self {
         let fork_point = fork.fork_point();
         Self {
             fork_point,
@@ -472,8 +630,10 @@ impl PendingCompaction {
         self.fork_point
     }
 
-    /// Awaits the handoff document.
-    pub fn wait(&mut self) -> impl Future<Output = Result<HandoffDocument, CompactionError>> + '_ {
+    /// Awaits the completed compaction.
+    pub fn wait(
+        &mut self,
+    ) -> impl Future<Output = Result<CompletedCompaction, CompactionError>> + '_ {
         self.future.get_mut()
     }
 }
@@ -482,7 +642,7 @@ impl PendingCompaction {
 ///
 /// Models wrap JSON in prose and code fences no matter what the prompt says,
 /// so the outermost braces are located rather than trusting the whole body.
-fn parse_handoff(response: &str) -> Result<HandoffDocument, CompactionError> {
+fn parse_handoff<D: DeserializeOwned>(response: &str) -> Result<D, CompactionError> {
     let trimmed = response.trim();
     if trimmed.is_empty() {
         return Err(CompactionError::Invalid {
@@ -635,18 +795,18 @@ mod tests {
 
     /// Compacts `context` the way a run does: indexes the conversation seeded
     /// with the current handoff's index, then folds the result into the window.
-    fn compact(context: &mut crate::context::Context) -> HandoffDocument {
-        let handoff = HandoffDocument {
-            current_task: "task".to_string(),
-            file_index: build_file_index(
-                context.handoff_file_index(),
-                &context.build_request(&[]),
-                None,
-            ),
-            ..HandoffDocument::default()
-        };
-        context.apply_handoff(&handoff, u64::MAX, 0);
-        handoff
+    fn compact(context: &mut crate::context::Context) -> Vec<String> {
+        let file_index = build_file_index(
+            context.handoff_file_index(),
+            &context.build_request(&[]),
+            None,
+        );
+        context.apply_handoff(
+            Handoff::with_file_index("task".to_string(), file_index.clone()),
+            u64::MAX,
+            0,
+        );
+        file_index
     }
 
     #[test]
@@ -656,14 +816,14 @@ mod tests {
             context.push(message);
         }
         let first = compact(&mut context);
-        assert_eq!(first.file_index, ["artifacts/notes.md — Fetch notes"]);
+        assert_eq!(first, ["artifacts/notes.md — Fetch notes"]);
 
         for message in read_file_messages("call_2", "Write deck", "artifacts/slides.md") {
             context.push(message);
         }
         let second = compact(&mut context);
         assert_eq!(
-            second.file_index,
+            second,
             [
                 "artifacts/notes.md — Fetch notes",
                 "artifacts/slides.md — Write deck"
@@ -675,7 +835,7 @@ mod tests {
         }
         let third = compact(&mut context);
         assert_eq!(
-            third.file_index,
+            third,
             [
                 "artifacts/notes.md — Revised notes",
                 "artifacts/slides.md — Write deck"
@@ -687,10 +847,9 @@ mod tests {
     fn handoff_markdown_renders_file_index_section() {
         let handoff = HandoffDocument {
             current_task: "task".to_string(),
-            file_index: vec!["outputs/a-b-c-d.txt — research notes".to_string()],
             ..HandoffDocument::default()
         };
-        let markdown = handoff.render_markdown();
+        let markdown = handoff.render(&["outputs/a-b-c-d.txt — research notes".to_string()]);
         assert!(markdown.contains("Materials Already On Disk"));
         assert!(markdown.contains("outputs/a-b-c-d.txt — research notes"));
         assert!(markdown.contains("Read the file instead of redoing the work"));
@@ -701,7 +860,7 @@ mod tests {
         let error = HandoffDocument::default()
             .validate()
             .expect_err("empty current_task must not validate");
-        assert!(matches!(error, CompactionError::Invalid { .. }));
+        assert!(error.reason.contains("current_task"));
     }
 
     #[test]
@@ -709,13 +868,14 @@ mod tests {
         let response = "Sure! Here you go:\n```json\n{\"current_task\": \"ship it\", \
             \"key_decisions\": [], \"files_paths\": [], \"errors_fixes\": [], \
             \"pending_work\": [], \"recovery_hints\": []}\n```\nHope that helps.";
-        let document = parse_handoff(response).expect("handoff parses");
+        let document = parse_handoff::<HandoffDocument>(response).expect("handoff parses");
         assert_eq!(document.current_task, "ship it");
     }
 
     #[test]
     fn empty_responses_are_reported_as_invalid() {
-        let error = parse_handoff("   ").expect_err("empty response must not parse");
+        let error =
+            parse_handoff::<HandoffDocument>("   ").expect_err("empty response must not parse");
         assert!(matches!(error, CompactionError::Invalid { .. }));
     }
 
@@ -723,7 +883,7 @@ mod tests {
     fn forking_an_empty_context_is_an_error() {
         let request = LLMRequest::new(vec![Message::system("only the prefix")]);
         assert!(matches!(
-            CompactionFork::new(&request, 0, &[], None, &[]),
+            CompactionFork::<HandoffDocument>::new(&request, 0, &[], None, &[]),
             Err(CompactionError::Empty)
         ));
     }
@@ -748,8 +908,14 @@ mod tests {
             description: "read PDFs".to_string(),
             instructions: "how to read PDFs".to_string(),
         }];
-        let fork =
-            CompactionFork::new(&main, 7, &[], Some("the failing test"), &skills).expect("fork");
+        let fork = CompactionFork::<HandoffDocument>::new(
+            &main,
+            7,
+            &[],
+            Some("the failing test"),
+            &skills,
+        )
+        .expect("fork");
 
         assert_eq!(fork.fork_point(), 7);
         assert_eq!(
@@ -850,9 +1016,10 @@ mod tests {
             Parameters::default(),
             &messages,
             false,
+            false,
         );
         let main = LLMRequest::new(messages).with_parameters(parameters);
-        let fork = CompactionFork::new(&main, 0, &[], None, &[]).expect("fork");
+        let fork = CompactionFork::<HandoffDocument>::new(&main, 0, &[], None, &[]).expect("fork");
         let model = CapturingModel {
             seen: std::sync::Mutex::default(),
         };

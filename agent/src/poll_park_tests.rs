@@ -130,7 +130,10 @@ async fn polling_agent(
     let mut agent = AgentBuilder::new(llm)
         .agent_kind(crate::AgentKind::Chatbot)
         .background_jobs(policy)
-        .tool(ReadTerminalDeltaTool::new(registry.clone()))
+        .tool(ReadTerminalDeltaTool::new(
+            registry.clone(),
+            aither_sandbox::AnySandboxNotices::default(),
+        ))
         .build();
     agent.background_receiver = Some(receiver);
     // `terminal` detached the task earlier, so the model knows it.
@@ -261,4 +264,55 @@ async fn a_refused_reread_with_nothing_running_returns_the_refusal() {
         "with nothing running, the refusal goes straight back to the model"
     );
     assert!(mentions(&requests[2], REFUSED));
+}
+
+/// A read a command policy refuses as unchanged, in the policy's words.
+struct PolicyRefusedRead;
+
+/// Reads a background task's new output.
+#[derive(Debug, schemars::JsonSchema, serde::Deserialize)]
+struct AnyArgs {}
+
+impl aither_core::llm::Tool for PolicyRefusedRead {
+    fn name(&self) -> std::borrow::Cow<'static, str> {
+        "terminal_read".into()
+    }
+
+    type Arguments = AnyArgs;
+    type Res = aither_core::llm::ToolResult;
+
+    fn call(
+        &self,
+        _args: Self::Arguments,
+        _cx: aither_core::llm::ToolContext,
+    ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+        std::future::ready(Err(aither_sandbox::PolicyRefusal::unchanged_read(
+            "Nothing changed since you last looked.",
+        )
+        .into()))
+    }
+}
+
+#[tokio::test]
+async fn a_policy_refusal_of_an_unchanged_read_parks_the_turn_too() {
+    let llm = PollingLlm::new(FINISHED);
+    let (sender, receiver) = background_task_channel();
+    let mut agent = AgentBuilder::new(llm.clone())
+        .agent_kind(crate::AgentKind::Chatbot)
+        .background_jobs(BackgroundJobPolicy::Detach)
+        .tool(PolicyRefusedRead)
+        .build();
+    agent.background_receiver = Some(receiver);
+    agent.detached_task_ids.insert(TASK.to_string());
+    sender.task_started();
+
+    tokio::time::timeout(Duration::from_secs(20), agent.query("Check the build"))
+        .await
+        .expect("a parked detached run ends")
+        .expect("the run succeeds");
+    assert_eq!(
+        llm.requests().len(),
+        1,
+        "the run ends at the first refused re-read"
+    );
 }

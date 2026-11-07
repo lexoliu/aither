@@ -13,8 +13,8 @@ mod watch;
 use std::fmt;
 use std::str::FromStr;
 
-pub(crate) use guard::{LanguageAlert, LanguageAlertsTemplate, translate};
-pub use guard::{LanguageGuard, LanguageRefusal, WorkingText};
+pub use guard::{LanguageAlert, LanguageGuard, LanguageRefusal, WorkingText};
+pub(crate) use guard::{default_alerts, default_refusal, translate};
 pub(crate) use watch::LanguageAlerts;
 use whatlang::Lang;
 
@@ -88,7 +88,7 @@ impl FromStr for Language {
 ///
 /// The communication language is the one the agent talks to the user in:
 /// replies and the questions it asks. The working language, English by
-/// default, is the one it writes in for others to read: `tasks.md`, prompts
+/// default, is the one it writes in for others to read: its working document, prompts
 /// and messages to subagents and other agents, issue and pull request text.
 /// Both are inactive while the communication language is unset or English,
 /// and the working language is enforced only once the communication language

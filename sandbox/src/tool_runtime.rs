@@ -383,7 +383,7 @@ impl ToolBinary {
     /// Verifies executable bytes before they can enter a prepared environment.
     ///
     /// # Errors
-    /// Rejects an invalid version, oversized artifact or mismatched SHA-256.
+    /// Rejects an invalid version or mismatched SHA-256.
     pub fn verify(
         tool: ManagedTool,
         version: &str,
@@ -400,7 +400,7 @@ impl ToolBinary {
     }
 }
 
-/// Checks the version, size and digest every distributed executable must satisfy.
+/// Checks the version and digest every distributed executable must satisfy.
 fn verify_executable(
     tool: DistributedTool,
     version: &str,
@@ -408,9 +408,6 @@ fn verify_executable(
     bytes: Vec<u8>,
 ) -> Result<(semver::Version, Arc<[u8]>), ToolRuntimeError> {
     let version = semver::Version::parse(version)?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err(ToolRuntimeError::ArtifactTooLarge(tool));
-    }
     if digest(&bytes) != *expected {
         return Err(ToolRuntimeError::Integrity { tool });
     }
@@ -1296,82 +1293,12 @@ impl PreparedTools<ContainerPath> {
     }
 }
 
-/// Host commands a script must not call, each with what to use instead.
-const BLOCKED_COMMANDS: [(&str, &str); 3] = [
-    ("grep", "`rg`"),
-    ("awk", "`python3` or `jq`"),
-    ("find", "`fd`"),
-];
-
-/// The host command the managed shell replaces with a function running
-/// [`ManagedTool::Sed`], which prints line ranges and refuses the rest.
-const SED_FUNCTION: &str = "sed";
-
-/// Whether `command` is one the managed shell refuses or replaces in a
-/// script, so only a shell can run it.
-pub fn is_blocked_command(command: &str) -> bool {
-    command == SED_FUNCTION || BLOCKED_COMMANDS.iter().any(|(name, _)| *name == command)
-}
-
-#[derive(Template)]
-#[template(path = "blocked_command.txt", escape = "none")]
-struct BlockedCommandTemplate<'a> {
-    name: &'a str,
-    replacement: &'a str,
-}
-
-struct BlockedCommandFunction {
-    name: &'static str,
-    message: String,
-}
-
-#[derive(Template)]
-#[template(path = "blocked_commands.sh", escape = "none")]
-struct BlockedCommandsTemplate<'a> {
-    commands: Vec<BlockedCommandFunction>,
-    sed: &'a str,
-    sed_tool: &'a str,
-    script: &'a str,
-}
-
-/// `script` behind shell functions that make the blocked commands fail with a
-/// message naming their replacement, and a `sed` that runs the managed
-/// `aither-sed`. They are not exported, so only the script's own shell sees
-/// them: child processes still reach the host programs.
-fn with_blocked_commands(script: &str) -> String {
-    BlockedCommandsTemplate {
-        script,
-        sed: SED_FUNCTION,
-        sed_tool: ManagedTool::Sed.command(),
-        commands: BLOCKED_COMMANDS
-            .iter()
-            .map(|&(name, replacement)| {
-                let message = BlockedCommandTemplate { name, replacement }
-                    .render()
-                    .expect("the blocked command message is a static template");
-                BlockedCommandFunction {
-                    name,
-                    message: shell_words::quote(&message).into_owned(),
-                }
-            })
-            .collect(),
-    }
-    .render()
-    .expect("the blocked commands preamble is a static template")
-}
-
 /// The arguments with which the managed bash runs `script`: no startup file
-/// is read, so a script behaves the same on every host, and the blocked
-/// commands are defined ahead of it.
+/// is read, so a script behaves the same on every host.
 pub fn shell_arguments(script: &str) -> Vec<String> {
-    [
-        "--noprofile",
-        "--norc",
-        "-c",
-        &with_blocked_commands(script),
-    ]
-    .map(Into::into)
-    .into()
+    ["--noprofile", "--norc", "-c", script]
+        .map(Into::into)
+        .into()
 }
 
 /// Prepends `bin_dir` to a POSIX shell script's `PATH`.
@@ -1646,9 +1573,18 @@ pub enum ToolRuntimeError {
         /// Program whose artifact failed verification.
         tool: DistributedTool,
     },
-    /// An artifact exceeds the executable-size limit.
-    #[error("tool artifact exceeds the size limit: {0:?}")]
-    ArtifactTooLarge(DistributedTool),
+    /// An artifact's length differs from the size the manifest pins. A
+    /// download or file read is bounded one byte past `expected`, so a longer
+    /// artifact reports `expected + 1`.
+    #[error("tool artifact {tool:?} is {actual} bytes; the manifest pins {expected}")]
+    ArtifactSize {
+        /// Program whose artifact has the wrong length.
+        tool: DistributedTool,
+        /// Size the manifest pins.
+        expected: u64,
+        /// Length read, at most `expected + 1`.
+        actual: u64,
+    },
     /// A cached command is not a regular read-only executable.
     #[error("invalid prepared tool cache entry: {0}")]
     InvalidCache(PathBuf),
@@ -1679,7 +1615,7 @@ pub enum ToolRuntimeError {
     /// Artifact checksum is not a SHA-256 hexadecimal value.
     #[error(transparent)]
     Digest(#[from] hex::FromHexError),
-    /// Executable archive entry is missing, ambiguous, oversized or not regular.
+    /// Executable archive entry is missing, ambiguous or not regular.
     #[error("invalid executable archive member")]
     InvalidArchive,
     /// ZIP decoding failed.
@@ -1731,53 +1667,16 @@ pub mod tests {
             .expect("bash should run")
     }
 
+    /// The managed shell runs a script as written: no host program is
+    /// shadowed or refused.
     #[cfg(unix)]
     #[test]
-    fn blocked_commands_fail_with_their_replacement() {
-        for (name, replacement) in [("grep", "`rg`"), ("awk", "`jq`"), ("find", "`fd`")] {
-            let output = run_in_shell(&format!("{name} x"));
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(!output.status.success(), "{name} should fail");
-            assert!(output.stdout.is_empty(), "{name} should print to stderr");
-            assert!(
-                stderr.contains(&format!("`{name}` is not available")),
-                "{name}: {stderr}"
-            );
-            assert!(stderr.contains(replacement), "{name}: {stderr}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sed_runs_the_managed_aither_sed_with_its_arguments() {
-        use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().expect("tempdir");
-        let managed = directory.path().join(ManagedTool::Sed.command());
-        std::fs::write(&managed, "#!/bin/sh\nprintf 'managed:%s\\n' \"$*\"\n").expect("write");
-        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let path = format!(
-            "{}:{}",
-            directory.path().display(),
-            std::env::var("PATH").expect("PATH")
+    fn the_managed_shell_runs_host_programs_as_written() {
+        let output = run_in_shell(
+            "printf 'a\\n' | grep a | sed 's/a/b/' | awk '{ print $1 }'; find /dev/null -prune",
         );
-        let output = std::process::Command::new("bash")
-            .args(shell_arguments("sed -n '2,3p' file"))
-            .env("PATH", path)
-            .output()
-            .expect("bash should run");
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            "managed:-n 2,3p file\n"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn blocked_commands_stay_out_of_child_processes() {
-        let output = run_in_shell("bash -c \"printf 'a\\n' | sed 's/a/b/'\"");
-        assert!(output.status.success(), "{output:?}");
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "b\n");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "b\n/dev/null\n");
     }
 
     #[cfg(unix)]

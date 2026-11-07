@@ -23,11 +23,21 @@ tag="$(gh release list -R "$repo" --limit 200 --json tagName \
     --jq '.[].tagName | select(startswith("patch-v"))' | sort -V | tail -n 1)"
 [ -n "$tag" ] || { echo "no patch-v* release in $repo" >&2; exit 1; }
 gh release download "$tag" -R "$repo" -p 'tool-distribution-*.json' -O "$work/release.json"
+# Every asset's byte size as GitHub stores it, keyed by download URL.
+gh release view "$tag" -R "$repo" --json assets --jq '.assets | map({(.url): .size}) | add' \
+    > "$work/sizes.json"
 
 # This checkout's artifacts, plus the release's entries of every tool this
-# checkout does not pin itself.
-jq --slurpfile release "$work/release.json" '
+# checkout does not pin itself. Each taken entry carries the size of the
+# release asset it names; one whose pinned size disagrees with the asset
+# stops the composition.
+jq --slurpfile release "$work/release.json" --slurpfile sizes "$work/sizes.json" '
     (.artifacts | map(.tool)) as $pinned
-    | .artifacts += ($release[0].artifacts | map(select(.tool as $tool | $pinned | index($tool) | not)))
+    | .artifacts += ($release[0].artifacts
+        | map(select(.tool as $tool | $pinned | index($tool) | not))
+        | map(. as $a
+            | ($sizes[0][$a.url] // error("\($a.url) is not an asset of the release"))
+            | if ($a.size // .) == . then $a + {size: .}
+              else error("\($a.url): pinned size \($a.size) but the asset is \(.) bytes") end))
 ' "$root/patch/third-party-tools.json" > "$out"
 echo "composed $out from $tag" >&2

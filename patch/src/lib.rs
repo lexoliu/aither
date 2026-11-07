@@ -20,10 +20,11 @@ use std::{
     path::Path,
 };
 
-use matcher::{Whitespace, apply_hunks};
-use parse::{Action, parse};
+use matcher::apply_tolerant;
 
 pub use error::PatchError;
+pub use matcher::{Located, Whitespace, locate_hunks};
+pub use parse::{Action, Hunk, HunkLine, parse};
 
 /// One file-level change a successfully applied patch made on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,12 +219,7 @@ fn apply_actions(
                     .ok_or_else(|| PatchError::FileNotFound(path.clone()))?
                     .clone();
                 let lines: Vec<String> = original.lines().map(String::from).collect();
-                let applied = match apply_hunks(path, &lines, hunks, Whitespace::Strict) {
-                    Err(PatchError::Conflict { .. } | PatchError::Ambiguous { .. }) => {
-                        apply_hunks(path, &lines, hunks, Whitespace::Lenient)?
-                    }
-                    other => other?,
-                };
+                let applied = apply_tolerant(path, &lines, hunks)?;
                 let updated = rejoin(&original, &applied);
                 if let Some(new_path) = new_path {
                     if out.contains_key(new_path) {
@@ -680,5 +676,75 @@ mod tests {
         let patch = "*** Begin Patch\n*** Update File: ws.txt\n@@\n-line\n+LINE\n*** End Patch";
         apply_patch_text(patch, dir.path()).expect("patch applies");
         assert_eq!(read(dir.path(), "ws.txt"), "LINE\nnext\n");
+    }
+
+    /// Parses `patch` and locates the hunks of its first update in `content`.
+    fn locate(patch: &str, content: &str) -> super::Located {
+        let super::Action::Update { hunks, .. } = super::parse(patch).expect("parses").remove(0)
+        else {
+            panic!("expected an update");
+        };
+        let lines: Vec<String> = content.lines().map(String::from).collect();
+        super::locate_hunks(&lines, &hunks)
+    }
+
+    /// The lines of `content` inside the located ranges.
+    fn located_lines(content: &str, located: &super::Located) -> Vec<Vec<String>> {
+        let lines: Vec<&str> = content.lines().collect();
+        located
+            .ranges
+            .iter()
+            .map(|range| {
+                lines[range.clone().expect("located")]
+                    .iter()
+                    .map(|line| (*line).to_owned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn located_ranges_are_the_lines_apply_changes() {
+        let dir = tempdir().expect("tempdir");
+        let content = "one\ntwo\nthree\nfour\nfive\nsix\n";
+        write(dir.path(), "a.txt", content);
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n two\n-three\n+THREE\n@@\n-five\n+FIVE\n*** End Patch";
+        let located = locate(patch, content);
+        assert_eq!(located.whitespace, super::Whitespace::Strict);
+        assert_eq!(located.ranges, [Some(1..3), Some(4..5)]);
+        assert_eq!(
+            located_lines(content, &located),
+            [vec!["two", "three"], vec!["five"]]
+        );
+
+        apply_patch_text(patch, dir.path()).expect("patch applies");
+        // Everything outside the located ranges is untouched; inside, the
+        // deleted lines are gone.
+        assert_eq!(
+            read(dir.path(), "a.txt"),
+            "one\ntwo\nTHREE\nfour\nFIVE\nsix\n"
+        );
+    }
+
+    #[test]
+    fn a_hunk_with_absent_context_is_unlocated() {
+        let content = "one\ntwo\nthree\n";
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-two\n+TWO\n@@\n-missing\n+x\n*** End Patch";
+        let located = locate(patch, content);
+        assert_eq!(located.ranges, [Some(1..2), None]);
+    }
+
+    #[test]
+    fn whitespace_tolerant_locate_matches_apply() {
+        let dir = tempdir().expect("tempdir");
+        let content = "keep\nline   \nnext\n";
+        write(dir.path(), "ws.txt", content);
+        let patch = "*** Begin Patch\n*** Update File: ws.txt\n@@\n-line\n+LINE\n*** End Patch";
+        let located = locate(patch, content);
+        assert_eq!(located.whitespace, super::Whitespace::Lenient);
+        assert_eq!(located.ranges, [Some(1..2)]);
+
+        apply_patch_text(patch, dir.path()).expect("patch applies");
+        assert_eq!(read(dir.path(), "ws.txt"), "keep\nLINE\nnext\n");
     }
 }

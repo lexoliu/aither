@@ -65,6 +65,7 @@ pub mod language;
 #[cfg(test)]
 mod midstream_retry_tests;
 mod model_group;
+pub mod notices;
 mod output_urls;
 #[cfg(test)]
 mod poll_park_tests;
@@ -73,14 +74,13 @@ mod request_parameters;
 mod runaway;
 pub mod secret_guard;
 mod subagent_file;
-pub mod tasks;
 mod terminal_agent;
 #[cfg(test)]
 mod test_support;
 pub mod tool_request;
 mod tools;
 mod warmth;
-pub mod working_docs;
+pub mod working_document;
 pub mod workspace_request;
 
 // Specialized agents
@@ -113,16 +113,17 @@ pub use builder::{AgentBuilder, AgentOptions, AgentSettings};
 pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
 pub use clock::{AnyClock, Clock, Instant, ManualClock, SystemClock};
-pub use compact_tool::{CompactArgs, CompactSignal, CompactTool};
+pub use compact_tool::{CompactArgs, CompactRequest, CompactSignal, CompactTool};
 pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy};
 #[cfg(feature = "skills")]
 pub use context::ActiveSkills;
 pub use context::{
     AnyContextSource, BackgroundJobs, Block, CompactionError, CompletedCompaction, Context,
-    ContextBudget, ContextCheckpoint, ContextItem, ContextPolicy, ContextSource, ExternalContent,
-    ExternalSlot, Handoff, HandoffDocument, InstructionSlot, LiveContent, LiveUpdate, PrefixBlock,
-    PrefixChain, PrefixRewrites, PromptCache, PromptPrefix, ReassemblyReport, SystemLayout,
-    TasksDocument,
+    ContextBudget, ContextCheckpoint, ContextFile, ContextItem, ContextPolicy, ContextSource,
+    ExternalContent, ExternalSlot, Handoff, HandoffDocument, HandoffPrompt, HandoffSchema,
+    InstructionSlot, InvalidHandoff, LineRange, LiveContent, LiveUpdate, PrefixBlock, PrefixChain,
+    PrefixRewrites, PromptCache, PromptPrefix, ReassemblyReport, Restoration, SkillCatalogEntry,
+    SystemLayout,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use disk::{
@@ -132,13 +133,14 @@ pub use disk::{
 pub use error::AgentError;
 pub use event::{AgentEvent, TimedEvent};
 pub use external_hook::{
-    ExternalHooks, HookTestTool, HooksConfig, LifecycleHookConfig, LiveHooks, ReviewedPermission,
-    ReviewerConfig,
+    ExternalHooks, HookTestTool, HooksConfig, InjectedContext, LifecycleHookConfig, LiveHooks,
+    ReviewedPermission, ReviewerConfig,
 };
 pub use fork::{ForkSnapshot, ForkSource};
 pub use hook::{
-    CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction, StopContext,
-    StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
+    AnyStopHook, CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction,
+    StopContext, StopDecision, StopHook, StopReason, ToolResultContext, ToolUseContext,
+    TurnBoundaryAction, TurnBoundaryContext,
 };
 pub use host_load::{
     AnyHostReader, HostLoadConfig, HostLoadEvent, HostLoadMonitor, HostReader, HostSample,
@@ -146,20 +148,27 @@ pub use host_load::{
 };
 pub use judgment::{JudgmentError, judge};
 #[cfg(feature = "languages")]
-pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
+pub use language::{
+    Language, LanguageAlert, LanguageGuard, LanguageRefusal, Languages, WorkingText,
+};
+pub use notices::{
+    AnyNotices, CancelledToolCall, CommandHookRefusal, DefaultNotices, DocumentAlert,
+    DocumentShown, ForkToolRefusal, Notices, PreCompaction, ReviewerDenial,
+};
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
 pub use runaway::RunawayGuard;
 pub use secret_guard::{
     Guarded, SecretFinding, SecretGuard, SecretKind, SecretRefusal, SecretShape,
 };
-pub use tasks::{
-    AnyWorkTracker, TaskEvent, TaskEvents, WorkItem, WorkRef, WorkState, WorkTracker,
-    WorkTrackerError,
-};
 pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};
 pub use tools::AgentTools;
 pub use warmth::{CacheState, CacheWarmth};
-pub use working_docs::{AnyTaskBlockerResolver, TaskBlockerError, TaskBlockerResolver};
+pub use working_document::{
+    AnyBlockerResolver, AnyDocumentSchema, AnyWorkTracker, BlockerError, BlockerResolver,
+    DocumentAlertItem, DocumentCheckpoint, DocumentReview, DocumentRow, DocumentSchema,
+    DocumentSpec, ParsedDocument, WorkEvent, WorkEvents, WorkItem, WorkRef, WorkState, WorkTracker,
+    WorkTrackerError, WorkingDocument,
+};
 
 // Model groups for budget tracking and fallback
 pub use model_group::{

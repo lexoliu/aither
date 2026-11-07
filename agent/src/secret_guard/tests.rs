@@ -377,7 +377,7 @@ fn check_refuses_text_carrying_a_secret_without_quoting_it() {
             SecretKind::Shaped(SecretShape::ProviderKey),
         ]
     );
-    let message = refusal.to_string();
+    let message = crate::Notices::secret_refusal(&crate::DefaultNotices, &refusal);
     assert_eq!(
         message,
         "Refused: the text carries secrets (secret DEPLOY_KEY, provider API key). \

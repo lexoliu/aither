@@ -29,7 +29,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::external::{AnyExternalSession, AnyExternalSubagent, ExternalStart, ExternalSubagent};
-use crate::context::CacheLifetime;
+use crate::context::{CacheLifetime, HandoffDocument, HandoffSchema};
 use crate::external_hook::{self, ExternalHooks};
 use crate::fork::{ForkSnapshot, ForkSource};
 use crate::fs_util::path_exists;
@@ -338,8 +338,10 @@ struct ForkRefusedTemplate<'a> {
     reason: &'a ForkRefusal,
 }
 
-/// Why a fork was not started.
-enum ForkRefusal {
+/// Why a fork was not started, rendered by
+/// [`Notices::fork_refusal`](crate::Notices::fork_refusal).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForkRefusal {
     /// The tool is not bound to a terminal to launch from.
     NoTerminal,
     /// The main agent has published no request.
@@ -361,14 +363,9 @@ enum ForkRefusal {
     },
 }
 
-impl ForkRefusal {
-    fn into_error(self) -> anyhow::Error {
-        anyhow::anyhow!(
-            ForkRefusedTemplate { reason: &self }
-                .render()
-                .expect("fork refusal template must render")
-        )
-    }
+/// aither's wording of a fork refusal.
+pub(crate) fn default_fork_refusal(refusal: &ForkRefusal) -> String {
+    crate::notices::rendered(&ForkRefusedTemplate { reason: refusal })
 }
 
 /// Structured response the fast model returns when routing a prompt.
@@ -550,7 +547,7 @@ where
 }
 
 /// A finished subagent kept so the parent can continue it.
-struct FinishedSubagent<LLM> {
+struct FinishedSubagent<LLM, Schema> {
     subagent: String,
     /// The tier it runs on; `None` for an external agent.
     tier: Option<ModelTier>,
@@ -560,7 +557,7 @@ struct FinishedSubagent<LLM> {
     commit_ledger: Option<CommitLedger>,
     /// The working copies the launching terminal's spaces prepared for it.
     working_copies: Vec<PathBuf>,
-    body: SubagentBody<LLM>,
+    body: SubagentBody<LLM, Schema>,
 }
 
 /// What a run is prompted with: a fresh subagent with working copies learns
@@ -592,11 +589,11 @@ fn prepared_working_copies(terminal: &DynTerminalTool) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// What runs a subagent's turns.
-enum SubagentBody<LLM> {
+/// What runs a subagent's turns; an aither agent compacts into `Schema`.
+enum SubagentBody<LLM, Schema> {
     /// An aither agent.
     Agent {
-        agent: Box<crate::Agent<LLM, LLM, LLM, SubagentHooks>>,
+        agent: Box<crate::Agent<LLM, LLM, LLM, SubagentHooks, LLM, Schema>>,
         child_job_registry: Option<aither_sandbox::JobRegistry>,
         /// How long the provider keeps this subagent's prompt cache warm — the
         /// [`PromptCache`](crate::context::PromptCache) lifetime the subagent
@@ -611,7 +608,7 @@ enum SubagentBody<LLM> {
     },
 }
 
-impl<LLM: LanguageModel + 'static> FinishedSubagent<LLM> {
+impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> FinishedSubagent<LLM, Schema> {
     /// The cache lifetime this subagent outlived, when it did: its cache is
     /// cold (never started, or past its lifetime). An
     /// external session never expires.
@@ -626,9 +623,9 @@ impl<LLM: LanguageModel + 'static> FinishedSubagent<LLM> {
     }
 }
 
-enum FinishedSlot<LLM> {
+enum FinishedSlot<LLM, Schema> {
     /// Waiting to be continued.
-    Idle(Box<FinishedSubagent<LLM>>),
+    Idle(Box<FinishedSubagent<LLM, Schema>>),
     /// Checked out by a continuation in flight.
     Running,
     /// Its cache lifetime passed; the context was dropped. The lifetime
@@ -636,17 +633,17 @@ enum FinishedSlot<LLM> {
     Expired(CacheLifetime),
 }
 
-struct FinishedInner<LLM> {
+struct FinishedInner<LLM, Schema> {
     next_id: u64,
-    slots: HashMap<u64, FinishedSlot<LLM>>,
+    slots: HashMap<u64, FinishedSlot<LLM, Schema>>,
 }
 
 /// Finished subagents the parent may continue until their cache expires.
-struct FinishedSubagents<LLM> {
-    inner: Mutex<FinishedInner<LLM>>,
+struct FinishedSubagents<LLM, Schema> {
+    inner: Mutex<FinishedInner<LLM, Schema>>,
 }
 
-impl<LLM> FinishedSubagents<LLM> {
+impl<LLM, Schema> FinishedSubagents<LLM, Schema> {
     fn new() -> Self {
         Self {
             inner: Mutex::new(FinishedInner {
@@ -657,9 +654,9 @@ impl<LLM> FinishedSubagents<LLM> {
     }
 }
 
-impl<LLM: LanguageModel + 'static> FinishedSubagents<LLM> {
+impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> FinishedSubagents<LLM, Schema> {
     /// Drops the context of every subagent whose cache lifetime passed.
-    fn expire(inner: &mut FinishedInner<LLM>) {
+    fn expire(inner: &mut FinishedInner<LLM, Schema>) {
         for slot in inner.slots.values_mut() {
             if let FinishedSlot::Idle(finished) = slot
                 && let Some(lifetime) = finished.expired()
@@ -670,7 +667,7 @@ impl<LLM: LanguageModel + 'static> FinishedSubagents<LLM> {
     }
 
     /// Takes the subagent out for a continuation.
-    fn checkout(&self, id: u64) -> anyhow::Result<Box<FinishedSubagent<LLM>>> {
+    fn checkout(&self, id: u64) -> anyhow::Result<Box<FinishedSubagent<LLM, Schema>>> {
         let mut inner = self.inner.lock().expect("finished subagents lock poisoned");
         Self::expire(&mut inner);
         match inner.slots.get_mut(&id) {
@@ -698,7 +695,7 @@ impl<LLM: LanguageModel + 'static> FinishedSubagents<LLM> {
 
     /// Keeps a finished subagent; `id` is the continued one's id, or `None`
     /// for a first run. Returns the id the result names.
-    fn store(&self, id: Option<u64>, finished: FinishedSubagent<LLM>) -> u64 {
+    fn store(&self, id: Option<u64>, finished: FinishedSubagent<LLM, Schema>) -> u64 {
         let mut inner = self.inner.lock().expect("finished subagents lock poisoned");
         Self::expire(&mut inner);
         let id = id.unwrap_or_else(|| {
@@ -746,15 +743,15 @@ async fn stop_jobs(job_registry: Option<aither_sandbox::JobRegistry>, subagent: 
 }
 
 /// A subagent's run as it is listed and owned while it executes.
-struct LiveRun<LLM> {
+struct LiveRun<LLM, Schema> {
     id: u64,
     subagent: String,
     /// The hooks told when the run stops.
     hooks: Option<ExternalHooks>,
-    body: SubagentBody<LLM>,
+    body: SubagentBody<LLM, Schema>,
 }
 
-impl<LLM: LanguageModel + 'static> LiveRun<LLM> {
+impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> LiveRun<LLM, Schema> {
     /// Ends a run whose call was dropped the way a cancelled run ends: the
     /// hooks hear it was cancelled, its background jobs are stopped and its
     /// session is closed.
@@ -785,22 +782,22 @@ impl<LLM: LanguageModel + 'static> LiveRun<LLM> {
 /// Dropping the hold, which is what dropping the call's future does, releases
 /// all of it, so no exit from the call leaves a run listed or an id checked
 /// out.
-struct CallHold<LLM: LanguageModel + 'static> {
+struct CallHold<LLM: LanguageModel + 'static, Schema: HandoffSchema> {
     runs: SubagentRuns,
-    finished: Arc<FinishedSubagents<LLM>>,
+    finished: Arc<FinishedSubagents<LLM, Schema>>,
     /// The terminal the tool serves, whose executor finishes an abandoned
     /// run's cleanup. A tool bound to none launches no terminal jobs, so
     /// there is none to stop.
     binding: Option<TerminalBinding>,
     /// The continued id, while it is checked out.
     resumed: Option<u64>,
-    run: Option<LiveRun<LLM>>,
+    run: Option<LiveRun<LLM, Schema>>,
 }
 
-impl<LLM: LanguageModel + 'static> CallHold<LLM> {
+impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> CallHold<LLM, Schema> {
     const fn new(
         runs: SubagentRuns,
-        finished: Arc<FinishedSubagents<LLM>>,
+        finished: Arc<FinishedSubagents<LLM, Schema>>,
         binding: Option<TerminalBinding>,
         resumed: Option<u64>,
     ) -> Self {
@@ -820,7 +817,7 @@ impl<LLM: LanguageModel + 'static> CallHold<LLM> {
         subagent: &str,
         prompt: &str,
         hooks: Option<ExternalHooks>,
-        body: SubagentBody<LLM>,
+        body: SubagentBody<LLM, Schema>,
     ) -> async_channel::Receiver<()> {
         let (id, cancel_rx) = self.runs.begin(subagent, prompt);
         self.run = Some(LiveRun {
@@ -847,14 +844,14 @@ impl<LLM: LanguageModel + 'static> CallHold<LLM> {
     }
 
     /// Unlists the run and gives its subagent back.
-    fn finish(&mut self) -> SubagentBody<LLM> {
+    fn finish(&mut self) -> SubagentBody<LLM, Schema> {
         let run = self.run.take().expect("a run is begun before it finishes");
         self.runs.finish(run.id);
         run.body
     }
 }
 
-impl<LLM: LanguageModel + 'static> Drop for CallHold<LLM> {
+impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> Drop for CallHold<LLM, Schema> {
     fn drop(&mut self) {
         if let Some(id) = self.resumed {
             self.finished.release_checked_out(id);
@@ -890,7 +887,11 @@ impl<LLM: LanguageModel + 'static> Drop for CallHold<LLM> {
 ///     .subagents(subagents, "Run a subagent")
 ///     .build();
 /// ```
-pub struct SubagentTool<LLM> {
+///
+/// Every aither subagent it builds, a fork included, compacts into `Schema`;
+/// [`TerminalAgentBuilder::subagents`](crate::TerminalAgentBuilder::subagents)
+/// sets the main agent's.
+pub struct SubagentTool<LLM, Schema = HandoffDocument> {
     /// Model a subagent runs on when the advanced tier is selected.
     advanced: LLM,
     /// Model a subagent runs on when the balanced tier is selected.
@@ -925,21 +926,28 @@ pub struct SubagentTool<LLM> {
     cache_keep_alive: Option<crate::config::CacheKeepAlive>,
     /// Finished subagents the parent can continue; each lives until its
     /// own prompt-cache lifetime passes.
-    finished: Arc<FinishedSubagents<LLM>>,
+    finished: Arc<FinishedSubagents<LLM, Schema>>,
     /// The main agent's latest request, which a fork starts from.
     fork_source: ForkSource,
     /// The external hooks of the agent this tool serves: told when a
     /// subagent starts and stops, and the parent of each subagent's own scope.
     hooks: Option<ExternalHooks>,
-    /// The main agent's tasks inbox, told when a subagent starts and
-    /// finishes.
-    task_events: Option<crate::tasks::TaskEvents>,
+    /// The main agent's working-document inbox, told when a subagent starts
+    /// and finishes.
+    work_events: Option<crate::working_document::WorkEvents>,
+    /// The working document every subagent keeps in its own space.
+    document: Option<crate::working_document::DocumentSpec>,
+    /// The stop rule every subagent's run follows.
+    stop_hook: Option<crate::AnyStopHook>,
     /// Holds subagent prompts to the working language.
     #[cfg(feature = "languages")]
     languages: Option<crate::LanguageGuard>,
+    /// Renders the tool's refusals and every notice of the subagents it
+    /// builds.
+    notices: crate::AnyNotices,
 }
 
-impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
+impl<LLM, Schema> std::fmt::Debug for SubagentTool<LLM, Schema> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let setups: Vec<_> = self.setups.keys().collect();
         let externals: Vec<_> = self.externals.keys().collect();
@@ -980,10 +988,59 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             finished: Arc::new(FinishedSubagents::new()),
             fork_source: ForkSource::default(),
             hooks: None,
-            task_events: None,
+            work_events: None,
+            document: None,
+            stop_hook: None,
             #[cfg(feature = "languages")]
             languages: None,
+            notices: crate::AnyNotices::default(),
         }
+    }
+}
+
+impl<LLM: Clone + Sync, Schema> SubagentTool<LLM, Schema> {
+    /// This tool with its aither subagents compacting into `S2`.
+    /// [`TerminalAgentBuilder::subagents`](crate::TerminalAgentBuilder::subagents)
+    /// sets the main agent's schema.
+    ///
+    /// Finished subagents are typed by the schema they compact into, so the
+    /// tool starts with none to continue, as an instance from
+    /// [`for_terminal`](Self::for_terminal) does.
+    #[must_use]
+    pub fn with_handoff<S2: HandoffSchema>(self) -> SubagentTool<LLM, S2> {
+        SubagentTool {
+            advanced: self.advanced,
+            balanced: self.balanced,
+            fast: self.fast,
+            parameters: self.parameters,
+            global_dir: self.global_dir,
+            setups: self.setups,
+            externals: self.externals,
+            base_dir: self.base_dir,
+            mounts: self.mounts,
+            binding: self.binding,
+            runs: self.runs,
+            cache_keep_alive: self.cache_keep_alive,
+            finished: Arc::new(FinishedSubagents::new()),
+            fork_source: self.fork_source,
+            hooks: self.hooks,
+            work_events: self.work_events,
+            document: self.document,
+            stop_hook: self.stop_hook,
+            #[cfg(feature = "languages")]
+            languages: self.languages,
+            notices: self.notices,
+        }
+    }
+
+    /// Renders the tool's refusals, and every alert, notice and refusal of
+    /// the subagents it builds, through `notices`.
+    /// [`TerminalAgentBuilder::subagents`](crate::TerminalAgentBuilder::subagents)
+    /// sets the main agent's.
+    #[must_use]
+    pub fn with_notices(mut self, notices: crate::AnyNotices) -> Self {
+        self.notices = notices;
+        self
     }
 
     /// Sets the directory relative prompt paths resolve against, and whose
@@ -1075,29 +1132,47 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             finished: Arc::new(FinishedSubagents::new()),
             fork_source: self.fork_source.clone(),
             hooks: ExternalHooks::of_observer(binding.observer()).or_else(|| self.hooks.clone()),
-            task_events: self.task_events.clone(),
+            work_events: self.work_events.clone(),
             #[cfg(feature = "languages")]
             languages: self.languages.clone(),
+            notices: self.notices.clone(),
+            document: self.document.clone(),
+            stop_hook: self.stop_hook.clone(),
         }
     }
 
     /// Records each subagent's start and finish on `events`, the inbox of
-    /// the main agent's `tasks.md`, so a row waiting on a subagent follows
-    /// it.
+    /// the main agent's working document, so a row waiting on a subagent
+    /// follows it.
     #[must_use]
-    pub fn with_task_events(mut self, events: crate::tasks::TaskEvents) -> Self {
-        self.task_events = Some(events);
+    pub fn with_work_events(mut self, events: crate::working_document::WorkEvents) -> Self {
+        self.work_events = Some(events);
         self
     }
 
-    /// Records `event` on the main agent's tasks inbox, when there is one.
-    fn record(&self, event: crate::tasks::TaskEvent) {
-        if let Some(events) = &self.task_events {
+    /// Has every subagent keep the working document `spec` describes, in
+    /// its own space, and decide through `stop_hook` whether its run ends.
+    /// [`TerminalAgentBuilder::subagents`](crate::TerminalAgentBuilder::subagents)
+    /// sets the main agent's.
+    #[must_use]
+    pub fn with_working_document(
+        mut self,
+        spec: Option<crate::working_document::DocumentSpec>,
+        stop_hook: Option<crate::AnyStopHook>,
+    ) -> Self {
+        self.document = spec;
+        self.stop_hook = stop_hook;
+        self
+    }
+
+    /// Records `event` on the main agent's inbox, when there is one.
+    fn record(&self, event: crate::working_document::WorkEvent) {
+        if let Some(events) = &self.work_events {
             events.record(event);
         }
     }
 
-    /// Tells the hooks and the tasks inbox that `subagent` starts on `prompt`.
+    /// Tells the hooks and the main agent's inbox that `subagent` starts on `prompt`.
     async fn announce_start(&self, subagent: &str, prompt: &str) {
         if let Some(hooks) = &self.hooks {
             hooks
@@ -1107,7 +1182,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
                 })
                 .await;
         }
-        self.record(crate::tasks::TaskEvent::SubagentStarted(
+        self.record(crate::working_document::WorkEvent::SubagentStarted(
             subagent.to_string(),
         ));
     }
@@ -1480,7 +1555,13 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         }
         #[cfg(feature = "languages")]
         if let Some(guard) = &self.languages {
-            guard.check_working(prompt, crate::WorkingText::Internal)?;
+            guard
+                .check_working(prompt, crate::WorkingText::Internal)
+                .map_err(|refusal| {
+                    aither_sandbox::Refused::rendered(refusal, |refusal| {
+                        self.notices.language_refusal(refusal)
+                    })
+                })?;
         }
         Ok(prompt.to_string())
     }
@@ -1510,7 +1591,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
     }
 }
 
-impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
+impl<LLM: LanguageModel + Clone + Sync + 'static, Schema: HandoffSchema> SubagentTool<LLM, Schema> {
     /// The main agent's request a fork starts from.
     ///
     /// # Errors
@@ -1520,20 +1601,25 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
     /// within 10% of its compaction point.
     fn fork_snapshot(&self) -> anyhow::Result<Arc<ForkSnapshot>> {
         if self.binding.is_none() {
-            return Err(ForkRefusal::NoTerminal.into_error());
+            return Err(self.refuse_fork(ForkRefusal::NoTerminal));
         }
         let snapshot = self
             .fork_source
             .latest()
-            .ok_or_else(|| ForkRefusal::NothingSent.into_error())?;
+            .ok_or_else(|| self.refuse_fork(ForkRefusal::NothingSent))?;
         if !snapshot.allows_fork() {
-            return Err(ForkRefusal::NearCompaction {
+            return Err(self.refuse_fork(ForkRefusal::NearCompaction {
                 usage: snapshot.usage() * 100.0,
                 compaction: snapshot.compaction_usage() * 100.0,
-            }
-            .into_error());
+            }));
         }
         Ok(snapshot)
+    }
+
+    /// The error refusing a fork for `refusal`, rendered for the model.
+    fn refuse_fork(&self, refusal: ForkRefusal) -> anyhow::Error {
+        aither_sandbox::Refused::rendered(refusal, |refusal| self.notices.fork_refusal(refusal))
+            .into()
     }
 
     /// Launches the terminal a subagent holding `grant` works from, within the
@@ -1570,7 +1656,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         subagent_id: &str,
         requested: Requested<'_>,
         caller: Option<&Path>,
-    ) -> anyhow::Result<FinishedSubagent<LLM>> {
+    ) -> anyhow::Result<FinishedSubagent<LLM, Schema>> {
         let backend = &self
             .externals
             .get(subagent_id)
@@ -1642,7 +1728,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         prompt: &str,
         started_by: Option<&CallIdentity>,
         caller: Option<&Path>,
-    ) -> anyhow::Result<FinishedSubagent<LLM>> {
+    ) -> anyhow::Result<FinishedSubagent<LLM, Schema>> {
         // A fork is checked before anything is started, and runs on the
         // main agent's model.
         let fork = match &source {
@@ -1656,11 +1742,10 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             Some(fork) => {
                 let resolved = self.select_model(prompt, Some(fork.tier())).await?;
                 if resolved.1 != fork.model() {
-                    return Err(ForkRefusal::OtherModel {
+                    return Err(self.refuse_fork(ForkRefusal::OtherModel {
                         main: fork.model().to_string(),
                         fork: resolved.1,
-                    }
-                    .into_error());
+                    }));
                 }
                 resolved
             }
@@ -1668,8 +1753,15 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         };
         // A fork's builder takes the main agent's parameters over these when
         // it is made a fork of it.
-        let selected = crate::AgentBuilder::new(self.model_for(tier).clone())
-            .request_parameters(self.parameters.get(tier).clone());
+        let mut selected = crate::AgentBuilder::new(self.model_for(tier).clone())
+            .request_parameters(self.parameters.get(tier).clone())
+            .notices(self.notices.clone());
+        if let Some(spec) = &self.document {
+            selected = selected.working_document(spec.clone());
+        }
+        if let Some(hook) = &self.stop_hook {
+            selected = selected.stop_hook(hook.clone());
+        }
 
         let agent_builder = match source {
             Source::Definition { definition, setup } => {
@@ -1746,10 +1838,13 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
     /// run on the five-minute cache: in-run waits are covered by the
     /// keep-alive and a finished subagent is continuable until that entry
     /// expires. A fork gets it over the cache it inherits from the main agent.
+    /// Every subagent compacts into the tool's handoff schema, the main
+    /// agent's.
     fn subagent_harness(
         &self,
         agent_builder: AgentBuilder<LLM, LLM, LLM, ()>,
-    ) -> AgentBuilder<LLM, LLM, LLM, ()> {
+    ) -> AgentBuilder<LLM, LLM, LLM, (), LLM, Schema> {
+        let agent_builder = agent_builder.handoff::<Schema>();
         match &self.cache_keep_alive {
             Some(keep_alive) => agent_builder
                 .cache_keep_alive(keep_alive.clone())
@@ -1767,7 +1862,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         prompt: &str,
         started_by: Option<&CallIdentity>,
         caller: Option<&Path>,
-    ) -> anyhow::Result<(FinishedSubagent<LLM>, Option<u64>)> {
+    ) -> anyhow::Result<(FinishedSubagent<LLM, Schema>, Option<u64>)> {
         let (resolved, grant) = match call {
             Call::Resume { id } => {
                 let finished = self.finished.checkout(id)?;
@@ -1883,15 +1978,15 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
     }
 }
 
-impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
+impl<LLM: LanguageModel + Clone + Sync + 'static, Schema: HandoffSchema> SubagentTool<LLM, Schema> {
     /// Records where the subagent's committing worktrees stand before its run,
     /// since commits are listed per run. Nothing has run yet when that fails,
     /// so a continued subagent goes back to where it came from.
     async fn mark_commits(
         &self,
-        finished: FinishedSubagent<LLM>,
+        finished: FinishedSubagent<LLM, Schema>,
         resumed: Option<u64>,
-    ) -> anyhow::Result<(FinishedSubagent<LLM>, Option<CommitMark>)> {
+    ) -> anyhow::Result<(FinishedSubagent<LLM, Schema>, Option<CommitMark>)> {
         let Some(ledger) = &finished.commit_ledger else {
             return Ok((finished, None));
         };
@@ -1930,9 +2025,10 @@ fn subagent_stop_input<E: std::fmt::Display>(
     }
 }
 
-impl<LLM> Tool for SubagentTool<LLM>
+impl<LLM, Schema> Tool for SubagentTool<LLM, Schema>
 where
     LLM: LanguageModel + Clone + Sync + 'static,
+    Schema: HandoffSchema,
 {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("subagent")
@@ -1973,7 +2069,7 @@ where
             .run(&run_prompt(&prompt, resumed, &working_copies), cancel_rx)
             .await;
         let body = hold.finish();
-        self.record(crate::tasks::TaskEvent::SubagentFinished(
+        self.record(crate::working_document::WorkEvent::SubagentFinished(
             subagent_id.clone(),
         ));
         if let Some(hooks) = &self.hooks {
@@ -2064,9 +2160,10 @@ where
     }
 }
 
-impl<LLM> CommandUsage for SubagentTool<LLM>
+impl<LLM, Schema> CommandUsage for SubagentTool<LLM, Schema>
 where
     LLM: LanguageModel + Clone + Sync + 'static,
+    Schema: HandoffSchema,
 {
     /// The names a call can run at the moment of the call.
     fn usage(&self) -> impl std::future::Future<Output = String> + Send {
@@ -2085,7 +2182,7 @@ struct SubagentUsageTemplate<'a> {
     externals: Vec<(&'a str, &'a str)>,
 }
 
-impl<LLM: LanguageModel + 'static> SubagentBody<LLM> {
+impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> SubagentBody<LLM, Schema> {
     /// Runs one turn on `prompt` until it ends or `cancel_rx` fires.
     async fn run(
         &mut self,
@@ -4628,13 +4725,17 @@ mod tests {
                         .with_context_policy(policy),
                 )
                 .agent_kind(crate::AgentKind::Chatbot)
+                .working_document(tasks_document())
                 .dyn_terminal(self.terminal.clone().to_dyn())
                 .compact_tool()
                 .tool(aither_sandbox::builtin::KillTerminalTool::new(jobs.clone()))
                 .tool(aither_sandbox::builtin::InputTerminalTool::new(
                     jobs.clone(),
                 ))
-                .tool(aither_sandbox::builtin::ReadTerminalDeltaTool::new(jobs))
+                .tool(aither_sandbox::builtin::ReadTerminalDeltaTool::new(
+                    jobs,
+                    aither_sandbox::AnySandboxNotices::default(),
+                ))
                 .fork_source(source)
                 .build()
         }
@@ -4827,6 +4928,97 @@ mod tests {
             signal.request(),
             CompactRequest::Started,
             "the main agent's compaction state is untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An embedder's handoff, filled from the fixture's compaction answer.
+    #[derive(Deserialize, JsonSchema)]
+    struct TaskOnlyHandoff {
+        current_task: String,
+    }
+
+    impl HandoffSchema for TaskOnlyHandoff {
+        fn instruction(_: &crate::HandoffPrompt<'_>) -> String {
+            "Write the task-only handoff.".to_string()
+        }
+
+        fn retry(reason: &str) -> String {
+            reason.to_owned()
+        }
+
+        fn render(&self, _: &[String]) -> String {
+            self.current_task.clone()
+        }
+
+        fn into_restoration(self) -> crate::Restoration {
+            crate::Restoration::default()
+        }
+    }
+
+    /// A subagent compacts into its tool's handoff schema: the compaction a
+    /// fork starts asks with that schema's instruction, not aither's default.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forks_compaction_uses_the_tools_handoff_schema() {
+        let fixture = ForkFixture::new().await;
+        let (seen_tx, seen_rx) = async_channel::unbounded();
+        let main = ScriptedLlm::new("main", &seen_tx);
+        main.then([vec![Event::Text("main answer".to_string())]]);
+        let tool = fixture
+            .tool(&main, &seen_tx)
+            .with_handoff::<TaskOnlyHandoff>();
+        let mut agent = fixture.main_agent(
+            main.clone(),
+            tool.fork_source(),
+            crate::ContextPolicy {
+                compaction_floor: 0,
+                ..crate::ContextPolicy::default()
+            },
+        );
+        agent.query("look into it").await.expect("main run");
+        drain(&seen_rx);
+
+        main.then([vec![Event::Text("fork answer".to_string())]]);
+        let (dir, args) = start_fork("fork-custom-handoff");
+        let result = Tool::call(&tool, args, ToolContext::new())
+            .await
+            .expect("fork call");
+        let id = continuation_id(&result.render_for_model());
+        drain(&seen_rx);
+
+        // The fork's own agent compacts, as its auto-compaction or `compact`
+        // call would.
+        let mut finished = tool.finished.checkout(id).expect("the fork is kept");
+        let SubagentBody::Agent { agent, .. } = &mut finished.body else {
+            panic!("a fork is an aither agent");
+        };
+        let compacted = agent
+            .compact(None)
+            .await
+            .expect("the fork compacts")
+            .expect("the fork has a conversation");
+        assert_eq!(compacted.summary, "keep going", "rendered by the schema");
+
+        let requests = drain(&seen_rx);
+        let compactions: Vec<_> = requests
+            .iter()
+            .filter(|(_, request)| request.parameters().structured_outputs)
+            .collect();
+        let [(_, compaction)] = compactions.as_slice() else {
+            panic!("the fork compacted once, got {}", compactions.len());
+        };
+        let asked: Vec<&str> = compaction
+            .messages()
+            .iter()
+            .map(aither_core::llm::Message::content)
+            .collect();
+        assert!(asked.contains(&"Write the task-only handoff."), "{asked:?}");
+        assert!(
+            !asked
+                .iter()
+                .any(|content| content.contains("Your context window is being compacted")),
+            "aither's default instruction is not sent: {asked:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -5862,10 +6054,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Writes a finished item: an unchecked one would rightly hold the
-    /// probe's final turn open.
-    /// Writes a well-formed `tasks.md` whose only content holds no turn open,
-    /// so the subagent ends after its two requests.
+    /// The working document the fixture's agents keep: `tasks.md`, read by
+    /// the test schema.
+    fn tasks_document() -> crate::DocumentSpec {
+        crate::DocumentSpec::new("tasks.md", crate::working_document::test_schema::ListSchema)
+    }
+
+    /// Writes a `tasks.md` with no open row, so the subagent ends after its
+    /// two requests.
     const TASKS_PROBE: &str =
         "printf '%s\\n' '## Notes' 'SUBAGENT-TASK' > tasks.md && echo written";
     const SUBAGENT_TASKS: &str = "## Notes\nSUBAGENT-TASK\n";
@@ -5894,6 +6090,7 @@ mod tests {
             seen: seen_tx,
         };
         let tool = SubagentTool::new(llm.clone(), fixture.bundled.global())
+            .with_working_document(Some(tasks_document()), None)
             .for_terminal(fixture.terminal.binding());
         let mut main = fixture.main_agent(llm, tool.fork_source(), crate::ContextPolicy::default());
         main.query("look around").await.expect("main run");

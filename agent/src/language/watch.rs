@@ -1,45 +1,48 @@
 //! The context source that delivers language alerts.
 
-use std::path::PathBuf;
-
-use askama::Template;
-
-use super::guard::{LanguageAlert, LanguageAlertsTemplate};
+use super::guard::LanguageAlert;
 use super::{LanguageGuard, WorkingText};
 use crate::context::{Block, ContextSource};
-use crate::working_docs;
+use crate::working_document::file::{self, DocumentFile, Snapshot};
 
-/// Delivers the alerts the guard's checks raised, and watches `tasks.md` for
-/// text that is not in the working language.
+/// Delivers the alerts the guard's checks raised, and watches the working
+/// document for text that is not in the working language.
 ///
-/// `tasks.md` is edited through the agent's ordinary file tools, where a
+/// The document is edited through the agent's ordinary file tools, where a
 /// write cannot be intercepted, so a change is judged after it was made: the
 /// lines it added are checked once, and a violation raises one alert.
 #[derive(Debug)]
 pub struct LanguageAlerts {
     guard: LanguageGuard,
-    /// Sandbox root holding `tasks.md`.
-    sandbox_dir: Option<PathBuf>,
-    /// `tasks.md` as last observed; `None` until the session start has.
-    seen: Option<working_docs::WorkingDocsSnapshot>,
+    /// The working document, when the agent keeps one.
+    document: Option<DocumentFile>,
+    /// The document as last observed; `None` until the session start has.
+    seen: Option<Snapshot>,
+    /// Renders the alerts.
+    notices: crate::AnyNotices,
 }
 
 impl LanguageAlerts {
-    pub(crate) const fn new(guard: LanguageGuard, sandbox_dir: Option<PathBuf>) -> Self {
+    pub(crate) const fn new(
+        guard: LanguageGuard,
+        document: Option<DocumentFile>,
+        notices: crate::AnyNotices,
+    ) -> Self {
         Self {
             guard,
-            sandbox_dir,
+            document,
             seen: None,
+            notices,
         }
     }
 
-    async fn observe_tasks(&mut self) {
-        let Some(sandbox_dir) = &self.sandbox_dir else {
+    async fn observe_document(&mut self) {
+        let Some(document) = &self.document else {
             return;
         };
-        let current = working_docs::read_snapshot(sandbox_dir).await;
+        let current = document.read().await;
         if let Some(previous) = &self.seen
-            && let Some(added) = working_docs::tasks_md_added(previous, &current)
+            && let Some(added) = file::added(previous, &current)
             && self
                 .guard
                 .check_working(&added, WorkingText::Internal)
@@ -47,7 +50,7 @@ impl LanguageAlerts {
         {
             self.guard.raise(LanguageAlert::Record {
                 language: self.guard.languages().working(),
-                document: "tasks.md".to_string(),
+                document: document.name().to_string(),
             });
         }
         self.seen = Some(current);
@@ -57,23 +60,23 @@ impl LanguageAlerts {
 impl ContextSource for LanguageAlerts {
     async fn on_request(&mut self, _reassembled: bool) -> Option<Block> {
         if self.seen.is_none()
-            && let Some(sandbox_dir) = &self.sandbox_dir
+            && let Some(document) = &self.document
         {
-            self.seen = Some(working_docs::read_snapshot(sandbox_dir).await);
+            self.seen = Some(document.read().await);
         }
         None
     }
 
     async fn on_tool_turn_end(&mut self) -> Option<Block> {
-        self.observe_tasks().await;
+        self.observe_document().await;
         let alerts = self.guard.take_alerts();
         if alerts.is_empty() {
             return None;
         }
-        let content = LanguageAlertsTemplate { alerts: &alerts }
-            .render()
-            .expect("language alert template must render");
-        Some(Block::new("system-reminder", content))
+        Some(Block::new(
+            "system-reminder",
+            self.notices.language_alerts(&alerts),
+        ))
     }
 }
 
@@ -85,7 +88,11 @@ mod tests {
     fn source(dir: &std::path::Path) -> (LanguageAlerts, LanguageGuard) {
         let guard = LanguageGuard::new(Languages::new("Chinese".parse().unwrap()));
         (
-            LanguageAlerts::new(guard.clone(), Some(dir.to_path_buf())),
+            LanguageAlerts::new(
+                guard.clone(),
+                Some(DocumentFile::new(dir, "tasks.md")),
+                crate::AnyNotices::default(),
+            ),
             guard,
         )
     }

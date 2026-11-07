@@ -12,7 +12,6 @@ use futures_lite::io::AsyncWriteExt;
 
 use crate::memory::MemoryDomain;
 use crate::permission::TerminalMode;
-use crate::poll_guard::PollRefusal;
 use crate::process_tree::{JobMarker, JobTree, KillTreeError, ProcessScanner};
 use crate::script_language::ScriptLanguage;
 
@@ -202,12 +201,26 @@ pub struct TerminalDelta {
     pub status: JobStatus,
 }
 
+/// A `terminal_read` refused because it would return what the task's last
+/// read returned: only more output, or the task's end, can tell the model
+/// something new.
+///
+/// [`SandboxNotices::unchanged_task_read`](crate::SandboxNotices::unchanged_task_read)
+/// renders its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnchangedTaskRead {
+    /// The background task whose output did not change.
+    pub task_id: String,
+}
+
 /// Why [`JobRegistry::terminal_read`] returned no delta.
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalReadError {
-    /// The read would return what the task's last read returned.
-    #[error(transparent)]
-    Refused(PollRefusal),
+    /// The read would return what the task's last read returned; the
+    /// caller renders it through its
+    /// [`SandboxNotices`](crate::SandboxNotices).
+    #[error("refused as a poll: {0:?}")]
+    Refused(UnchangedTaskRead),
     /// The read could not be served, such as an unknown task id.
     #[error("{0}")]
     Failed(String),
@@ -304,9 +317,6 @@ enum StateCommand {
         error: String,
         output_path: Option<PathBuf>,
     },
-    RecordFileReads {
-        reads: Vec<(PathBuf, FileFingerprint)>,
-    },
     /// The agent took the completion of task `task_id`.
     TakeCompletion {
         task_id: String,
@@ -379,10 +389,6 @@ enum JobRequest {
         tracked: bool,
         reply: Sender<Result<TerminalDelta, TerminalReadError>>,
     },
-    FileReadsUnchanged {
-        reads: Vec<(PathBuf, FileFingerprint)>,
-        reply: Sender<bool>,
-    },
     TerminalStreamsClosed {
         pid: u32,
         reply: Sender<bool>,
@@ -394,10 +400,6 @@ enum JobRequest {
         reply: Sender<bool>,
     },
 }
-
-/// A file's `(len, modified)` stamp a script read returned with: two reads
-/// whose fingerprints match deliver the same bytes.
-pub type FileFingerprint = (u64, Option<std::time::SystemTime>);
 
 /// How the registry's caller kills a job: the kill itself runs outside the
 /// registry's state actor, which would otherwise stall every other job's
@@ -749,26 +751,6 @@ impl JobRegistry {
         }
     }
 
-    /// Whether every `reads` entry matches what the last read of that path
-    /// returned — the fingerprint recorded by [`Self::record_file_reads`].
-    /// `false` for an empty list or a path never recorded.
-    pub async fn file_reads_unchanged(&self, reads: Vec<(PathBuf, FileFingerprint)>) -> bool {
-        let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::FileReadsUnchanged {
-            reads,
-            reply: reply_tx,
-        })
-        .await;
-        Self::recv_reply(reply_rx).await
-    }
-
-    /// Records what a just-run script's file reads returned with; the next
-    /// [`Self::file_reads_unchanged`] compares against these.
-    pub async fn record_file_reads(&self, reads: Vec<(PathBuf, FileFingerprint)>) {
-        self.send_command(StateCommand::RecordFileReads { reads })
-            .await;
-    }
-
     /// Marks a job as completed.
     pub async fn complete(&self, pid: u32, exit_code: i32, output_path: Option<PathBuf>) {
         self.send_command(StateCommand::Complete {
@@ -1001,25 +983,11 @@ impl JobRegistry {
 }
 
 /// Per-session read tracking behind the unchanged-read refusal: what each
-/// task's last `terminal_read` returned with, and each file's fingerprint
-/// from its last read.
+/// task's last `terminal_read` returned with.
 #[derive(Default)]
 struct ReadTracker {
     /// Task id → the `(cursor, total_bytes, status)` its last read returned.
     delta_reads: HashMap<String, (usize, usize, JobStatus)>,
-    /// Path → the fingerprint its last script read carried.
-    file_reads: HashMap<PathBuf, FileFingerprint>,
-}
-
-impl ReadTracker {
-    /// Whether every one of `paths` matches the fingerprint its last read
-    /// recorded; `false` for an empty list.
-    fn file_reads_unchanged(&self, paths: &[(PathBuf, FileFingerprint)]) -> bool {
-        !paths.is_empty()
-            && paths
-                .iter()
-                .all(|(path, stamp)| self.file_reads.get(path) == Some(stamp))
-    }
 }
 
 impl JobRegistryService {
@@ -1031,7 +999,7 @@ impl JobRegistryService {
         while let Ok(command) = self.rx.recv().await {
             match command {
                 JobCommand::State(command) => {
-                    handle_state_command(&mut jobs, &mut reads, command).await;
+                    handle_state_command(&mut jobs, command).await;
                 }
                 JobCommand::Request(request) => {
                     handle_job_request(&mut jobs, &mut reads, &self.tx, request).await;
@@ -1041,11 +1009,7 @@ impl JobRegistryService {
     }
 }
 
-async fn handle_state_command(
-    jobs: &mut HashMap<u32, JobState>,
-    reads: &mut ReadTracker,
-    command: StateCommand,
-) {
+async fn handle_state_command(jobs: &mut HashMap<u32, JobState>, command: StateCommand) {
     match command {
         StateCommand::Register {
             pid,
@@ -1103,9 +1067,6 @@ async fn handle_state_command(
             error,
             output_path,
         } => fail_job(jobs, pid, error, output_path).await,
-        StateCommand::RecordFileReads { reads: new_reads } => {
-            reads.file_reads.extend(new_reads);
-        }
         StateCommand::TakeCompletion { task_id } => {
             // A job whose pid a later job reused left the registry with it;
             // nothing reads its completion any more.
@@ -1206,12 +1167,6 @@ async fn handle_job_request(
                 .map_err(TerminalReadError::Failed)
                 .and_then(|delta| tracked_delta(reads, &task_id, delta, tracked));
             let _ = reply.send(result).await;
-        }
-        JobRequest::FileReadsUnchanged {
-            reads: paths,
-            reply,
-        } => {
-            let _ = reply.send(reads.file_reads_unchanged(&paths)).await;
         }
         JobRequest::TerminalStreamsClosed { pid, reply } => {
             let closed = jobs
@@ -1610,7 +1565,7 @@ fn tracked_delta(
         return Ok(delta);
     }
     if reads.delta_reads.get(task_id) == Some(&returned) {
-        Err(TerminalReadError::Refused(PollRefusal::UnchangedTaskRead {
+        Err(TerminalReadError::Refused(UnchangedTaskRead {
             task_id: task_id.to_string(),
         }))
     } else {
@@ -1942,8 +1897,8 @@ mod tests {
         assert!(
             matches!(
                 &second,
-                Err(TerminalReadError::Refused(refusal @ PollRefusal::UnchangedTaskRead { task_id }))
-                    if task_id == "task-a" && refusal.is_unchanged_read()
+                Err(TerminalReadError::Refused(UnchangedTaskRead { task_id }))
+                    if task_id == "task-a"
             ),
             "an unchanged repeat read must be refused as a poll: {second:?}"
         );
@@ -1954,25 +1909,6 @@ mod tests {
             .await
             .expect("read succeeds once output changed");
         assert_eq!(third.bytes, b"two");
-    }
-
-    #[tokio::test]
-    async fn file_reads_track_unchanged_fingerprints() {
-        let registry = spawn_registry();
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("log.txt");
-        std::fs::write(&path, "v1").expect("write");
-        let meta = std::fs::metadata(&path).expect("metadata");
-        let reads = vec![(path.clone(), (meta.len(), meta.modified().ok()))];
-
-        assert!(!registry.file_reads_unchanged(reads.clone()).await);
-        registry.record_file_reads(reads.clone()).await;
-        assert!(registry.file_reads_unchanged(reads).await);
-
-        std::fs::write(&path, "v1-longer").expect("rewrite");
-        let meta = std::fs::metadata(&path).expect("metadata");
-        let changed = vec![(path, (meta.len(), meta.modified().ok()))];
-        assert!(!registry.file_reads_unchanged(changed).await);
     }
 
     #[tokio::test]

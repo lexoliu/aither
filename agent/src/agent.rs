@@ -63,7 +63,7 @@ enum TurnStep {
     /// The model turn completed.
     Turn(Result<ModelTurn, AgentError>),
     /// The forked compaction landed while the turn was still running.
-    Compacted(Result<HandoffDocument, crate::context::CompactionError>),
+    Compacted(Result<CompletedCompaction, crate::context::CompactionError>),
 }
 
 /// The number of characters an assembled request renders to, tool calls
@@ -341,8 +341,10 @@ pub struct FinishedToolCall {
     id: String,
     name: String,
     result: aither_core::llm::ToolResult,
-    /// The call was refused for re-reading output that had not changed
-    /// ([`aither_sandbox::PollRefusal::is_unchanged_read`]).
+    /// The call was refused for re-reading output that had not changed: a
+    /// `terminal_read` of a task with no new output
+    /// ([`aither_sandbox::UnchangedTaskRead`]) or a script a command policy
+    /// refused as one ([`aither_sandbox::PolicyRefusal::is_unchanged_read`]).
     unchanged_read: bool,
 }
 
@@ -518,10 +520,11 @@ struct EmittedCheckpoint {
     message_count: usize,
 }
 
+/// A stop hook's reminder, as the model reads it.
 #[derive(Template)]
-#[template(path = "precompaction_alert.txt", escape = "none")]
-struct PreCompactionAlertTemplate {
-    remaining_tokens: usize,
+#[template(path = "system_reminder.txt", escape = "none")]
+struct SystemReminderTemplate {
+    content: String,
 }
 
 #[derive(Template)]
@@ -556,13 +559,6 @@ struct UserMessageTimeTemplate<'a> {
 struct LanguagesTemplate {
     communication: crate::Language,
     working: crate::Language,
-}
-
-/// The result given to a tool call whose run was cancelled before it finished.
-#[derive(Template)]
-#[template(path = "tool_call_cancelled.txt", escape = "none")]
-struct ToolCallCancelledTemplate<'a> {
-    tool: &'a str,
 }
 
 #[derive(Template)]
@@ -641,9 +637,64 @@ enum MonitorEndText<'a> {
 }
 
 fn job_alert_text(alert: &JobAlertText<'_>) -> String {
-    JobAlertTemplate { alert }
-        .render()
-        .expect("job alert template must render")
+    crate::notices::rendered(&JobAlertTemplate { alert })
+}
+
+/// aither's wording of a background job alert.
+pub fn default_job_alert(alert: &JobAlert) -> String {
+    let text = match alert {
+        JobAlert::DescendantsKilled(killed) => JobAlertText::DescendantsKilled {
+            processes: &killed.processes,
+            omitted: killed.omitted,
+        },
+        JobAlert::DirectoryReset(reset) => JobAlertText::DirectoryReset {
+            dir: reset.dir.display().to_string(),
+            reason: reset.reason,
+        },
+        JobAlert::LongRunning(job) => JobAlertText::LongRunning {
+            task_id: &job.task_id,
+            elapsed: format_job_elapsed(job.elapsed),
+        },
+        JobAlert::StdinBlocked(job) => JobAlertText::StdinBlocked {
+            task_id: &job.task_id,
+        },
+        JobAlert::StdinProbeFailed(job) => JobAlertText::StdinProbeFailed {
+            task_id: &job.task_id,
+            error: &job.error,
+        },
+        JobAlert::MonitorIncrement(increment) => JobAlertText::MonitorIncrement {
+            task_id: &increment.task_id,
+            lines: &increment.lines,
+        },
+        JobAlert::MonitorStalled(stalled) => JobAlertText::MonitorStalled {
+            task_id: &stalled.task_id,
+            stall_secs: stalled.stall_secs,
+        },
+        JobAlert::MonitorEnded(ended) => JobAlertText::MonitorEnded {
+            task_id: &ended.task_id,
+            end: match &ended.end {
+                MonitorEnd::Exited { exit_code } => MonitorEndText::Exited {
+                    exit_code: *exit_code,
+                },
+                MonitorEnd::StopMatched { line } => MonitorEndText::StopMatched { line },
+                MonitorEnd::TimedOut => MonitorEndText::TimedOut,
+                MonitorEnd::Killed => MonitorEndText::Killed,
+                MonitorEnd::Failed { error } => MonitorEndText::Failed { error },
+                MonitorEnd::Lost => MonitorEndText::Lost,
+            },
+        },
+    };
+    job_alert_text(&text)
+}
+
+/// aither's wording of the reminder after a command moved to the
+/// background.
+pub fn default_background_started(task: &aither_sandbox::StartedBackgroundTask) -> String {
+    crate::notices::rendered(&BackgroundStartedReminderTemplate {
+        task_id: &task.task_id,
+        output_preview: &task.output_preview,
+        output_file: &task.output_file,
+    })
 }
 
 /// What a killed memory runaway held, as the text reports it.
@@ -767,8 +818,19 @@ impl PermissionPauseTracker {
 ///     .tier(ModelTier::Balanced)  // Use sonnet for reasoning
 ///     .build();
 /// ```
+///
+/// `Schema` is the [`HandoffSchema`](crate::HandoffSchema) every compaction
+/// asks the model for; [`HandoffDocument`] unless the builder's
+/// [`handoff`](crate::AgentBuilder::handoff) sets another.
 #[derive(Debug)]
-pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compactor = Advanced> {
+pub struct Agent<
+    Advanced,
+    Balanced = Advanced,
+    Fast = Balanced,
+    H = (),
+    Compactor = Advanced,
+    Schema = HandoffDocument,
+> {
     /// Primary LLM for main reasoning (most capable).
     /// The advanced reasoning model, behind an Arc so a forked compaction
     /// can own it while the run continues.
@@ -852,6 +914,11 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Cached model profile (for the selected tier).
     pub(crate) profile: Option<ModelProfile>,
 
+    /// The compaction model's profile, when one is set. It tells the cache
+    /// controls of a compaction request what that model's client will do with
+    /// the messages.
+    pub(crate) compaction_profile: Option<ModelProfile>,
+
     /// Whether tools have been bootstrapped.
     pub(crate) initialized: bool,
 
@@ -884,17 +951,22 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// and is dropped.
     pub(crate) detached_task_ids: HashSet<String>,
 
-    /// Optional sandbox directory for working-doc supervision (`tasks.md`).
+    /// The directory the agent's terminal works in, which holds its working
+    /// document.
     pub(crate) sandbox_dir: Option<PathBuf>,
 
-    /// What the host gives the `tasks.md` supervision; the agent records its
-    /// finished background jobs on its events.
-    pub(crate) tasks: crate::tasks::TasksWiring,
+    /// The inbox of the working document's events; the agent records its
+    /// finished background jobs there.
+    pub(crate) work_events: crate::working_document::WorkEvents,
 
-    /// The source supervising `tasks.md` in the sandbox, owned apart from
+    /// The source watching the working document, owned apart from
     /// [`context_sources`](Self::context_sources) because what it showed
-    /// travels in the agent's checkpoint.
-    pub(crate) tasks_document: Option<crate::tasks::TasksDocument>,
+    /// travels in the agent's checkpoint and its review reaches the stop
+    /// hook; `None` when the host keeps none.
+    pub(crate) working_document: Option<crate::working_document::WorkingDocument>,
+
+    /// The embedder's stop rule, asked each time the model ends its turn.
+    pub(crate) stop_hook: Option<crate::AnyStopHook>,
 
     /// Directory files are restored from after a forked compaction.
     pub(crate) restore_dir: Option<PathBuf>,
@@ -929,6 +1001,8 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
 
     /// The agent every tool call of this loop is made by.
     pub(crate) identity: aither_core::llm::AgentIdentity,
+    /// Renders every alert, notice, reminder and refusal the model reads.
+    pub(crate) notices: crate::AnyNotices,
 
     /// Rolling KV-cache statistics accumulated from emitted `Usage` events.
     ///
@@ -951,6 +1025,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Exact tool-name allowlist derived from activated skills.
     #[cfg(feature = "skills")]
     pub(crate) active_allowed_tools: Option<HashSet<String>>,
+
+    /// The schema compactions ask for; no value is held.
+    pub(crate) handoff_schema: std::marker::PhantomData<fn() -> Schema>,
 }
 
 impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
@@ -992,6 +1069,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             compaction_failure: None,
             tool_results: VecDeque::new(),
             profile: None,
+            compaction_profile: None,
             initialized: false,
             session: SessionPhase::NotStarted,
             connectivity: crate::connectivity::Watch::default(),
@@ -1004,8 +1082,9 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             job_registry: None,
             detached_task_ids: HashSet::new(),
             sandbox_dir: None,
-            tasks: crate::tasks::TasksWiring::default(),
-            tasks_document: None,
+            work_events: crate::working_document::WorkEvents::default(),
+            working_document: None,
+            stop_hook: None,
             restore_dir: None,
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
@@ -1013,6 +1092,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             compact_signal: None,
             compaction_warning: CompactionWarning::Armed,
             identity: aither_core::llm::AgentIdentity::Main,
+            notices: crate::AnyNotices::default(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -1020,6 +1100,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             active_skills: ActiveSkills::new(),
             #[cfg(feature = "skills")]
             active_allowed_tools: None,
+            handoff_schema: std::marker::PhantomData,
         }
     }
 }
@@ -1031,8 +1112,10 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
     }
 }
 
-impl<Advanced, Balanced, Fast, H, Compactor> Agent<Advanced, Balanced, Fast, H, Compactor>
+impl<Advanced, Balanced, Fast, H, Compactor, Schema>
+    Agent<Advanced, Balanced, Fast, H, Compactor, Schema>
 where
+    Schema: crate::HandoffSchema,
     Advanced: LanguageModel + 'static,
     Balanced: LanguageModel + 'static,
     // Compaction runs as an owned future that outlives the turn it races
@@ -1386,7 +1469,6 @@ where
         events: &EventSink,
     ) -> Result<ModelTurn, AgentError> {
         let mut pending = self.compaction.take_running();
-        let fork_point = pending.as_ref().map(PendingCompaction::fork_point);
         let mut landed = None;
 
         let turn = {
@@ -1413,13 +1495,13 @@ where
             }
         };
 
-        match (landed, fork_point) {
-            (Some(Ok(handoff)), Some(fork_point)) => self.compaction.land(fork_point, handoff),
-            (Some(Err(error)), _) => {
+        match landed {
+            Some(Ok(completed)) => self.compaction.land(completed),
+            Some(Err(error)) => {
                 tracing::warn!(%error, "forked compaction failed");
                 self.compaction_failure = Some(error);
             }
-            (Some(Ok(_)), None) | (None, _) => {}
+            None => {}
         }
         self.compaction.resume(pending);
         turn
@@ -1457,7 +1539,9 @@ where
             self.enforce_reply_language(&response_text, events).await;
         }
         events.emit(AgentEvent::turn_complete(turn, false));
-        if self.push_final_turn_alerts().await {
+        let objected = self.push_final_turn_alerts().await;
+        let (review, held) = self.decide_stop(&response_text, turn).await;
+        if objected || held {
             // The alerts stay in the conversation either way; a host that has
             // a message waiting ends the run here so the message travels with
             // them in the next request instead of one request later.
@@ -1465,6 +1549,7 @@ where
                 assistant_text: &response_text,
                 turn,
                 message_count: self.context.len_recent(),
+                document: review.as_ref(),
             };
             if self.hooks.on_turn_boundary(&boundary_ctx).await == TurnBoundaryAction::EndTurn {
                 return Ok(TurnControl::Break {
@@ -1500,13 +1585,10 @@ where
         else {
             return;
         };
-        self.push_system_alert(
-            crate::language::LanguageAlertsTemplate {
-                alerts: &[crate::language::LanguageAlert::Reply { language }],
-            }
-            .render()
-            .expect("language alert template must render"),
-        );
+        let alert = self
+            .notices
+            .language_alerts(&[crate::language::LanguageAlert::Reply { language }]);
+        self.push_system_alert(alert);
         match crate::language::translate(
             self.fast.as_ref(),
             self.parameters.get(ModelTier::Fast),
@@ -1550,9 +1632,9 @@ where
                 .and_then(|index| parked.remove(index));
             let content = match finished {
                 Some(Ok(finished)) => finished.result.render_for_model(),
-                _ => ToolCallCancelledTemplate { tool: &call.name }
-                    .render()
-                    .expect("tool call cancelled template must render"),
+                _ => self
+                    .notices
+                    .tool_call_cancelled(&crate::CancelledToolCall { tool: &call.name }),
             };
             self.context.push(Message::tool(&call.id, content));
         }
@@ -1684,8 +1766,11 @@ where
                     Ok(result) => (result, false),
                     Err(error) => {
                         let unchanged_read = error
-                            .downcast_ref::<aither_sandbox::PollRefusal>()
-                            .is_some_and(aither_sandbox::PollRefusal::is_unchanged_read);
+                            .downcast_ref::<aither_sandbox::Refused<aither_sandbox::UnchangedTaskRead>>()
+                            .is_some()
+                            || error
+                                .downcast_ref::<aither_sandbox::PolicyRefusal>()
+                                .is_some_and(aither_sandbox::PolicyRefusal::is_unchanged_read);
                         let mut message = String::from("Error: ");
                         message.push_str(error.to_string().as_str());
                         (aither_core::llm::ToolResult::error(message), unchanged_read)
@@ -1804,13 +1889,7 @@ where
         };
         for started in receiver.take_started() {
             self.detached_task_ids.insert(started.task_id.clone());
-            let reminder = BackgroundStartedReminderTemplate {
-                task_id: &started.task_id,
-                output_preview: &started.output_preview,
-                output_file: &started.output_file,
-            }
-            .render()
-            .expect("background started reminder template must render");
+            let reminder = self.notices.background_started(&started);
             self.context.push(Message::system(&reminder));
             events.emit(AgentEvent::background_task_started(
                 started.task_id,
@@ -1846,6 +1925,7 @@ where
             assistant_text: response_text,
             turn,
             message_count: self.context.len_recent(),
+            document: None,
         };
         let checkpoint = self
             .emit_checkpoint(CheckpointReason::TurnBoundary, response_text, turn)
@@ -1939,7 +2019,7 @@ where
                     needs_model |= self.push_completed_task_event(*task, events);
                 }
                 Some(BackgroundTaskEvent::Alert(alert)) => {
-                    if self.push_job_alert(alert) {
+                    if self.push_job_alert(&alert) {
                         return Ok(true);
                     }
                 }
@@ -2094,7 +2174,7 @@ where
         };
         let mut wake = false;
         for alert in receiver.take_job_alerts() {
-            wake |= self.push_job_alert(alert);
+            wake |= self.push_job_alert(&alert);
         }
         wake
     }
@@ -2107,91 +2187,54 @@ where
             return;
         };
         while let Ok(event) = receiver.try_recv() {
-            self.push_system_alert(event.alert_text());
+            let alert = self.notices.host_load(&event);
+            self.push_system_alert(alert);
         }
     }
 
     /// Pushes one durable alert for a background job alert; returns whether
     /// it is a job blocked on stdin, which wakes a parked wait.
-    fn push_job_alert(&mut self, alert: JobAlert) -> bool {
-        match alert {
+    fn push_job_alert(&mut self, alert: &JobAlert) -> bool {
+        let wakes = match alert {
             JobAlert::DescendantsKilled(killed) => {
                 tracing::info!(
                     killed = killed.processes.len() + killed.omitted,
                     "foreground command left processes running; killed"
                 );
-                self.push_system_alert(job_alert_text(&JobAlertText::DescendantsKilled {
-                    processes: &killed.processes,
-                    omitted: killed.omitted,
-                }));
                 false
             }
             JobAlert::DirectoryReset(reset) => {
                 tracing::info!(dir = %reset.dir.display(), reason = ?reset.reason, "carried working directory reset");
-                self.push_system_alert(job_alert_text(&JobAlertText::DirectoryReset {
-                    dir: reset.dir.display().to_string(),
-                    reason: reset.reason,
-                }));
                 false
             }
             JobAlert::LongRunning(job) => {
                 tracing::info!(task_id = %job.task_id, "background job crossed long-running threshold");
-                self.push_system_alert(job_alert_text(&JobAlertText::LongRunning {
-                    task_id: &job.task_id,
-                    elapsed: format_job_elapsed(job.elapsed),
-                }));
                 false
             }
             JobAlert::StdinBlocked(job) => {
                 tracing::info!(task_id = %job.task_id, "background job is blocked on stdin");
-                self.push_system_alert(job_alert_text(&JobAlertText::StdinBlocked {
-                    task_id: &job.task_id,
-                }));
                 true
             }
             JobAlert::StdinProbeFailed(job) => {
                 tracing::warn!(task_id = %job.task_id, error = %job.error, "stdin watch failed");
-                self.push_system_alert(job_alert_text(&JobAlertText::StdinProbeFailed {
-                    task_id: &job.task_id,
-                    error: &job.error,
-                }));
                 false
             }
             JobAlert::MonitorIncrement(increment) => {
                 tracing::info!(task_id = %increment.task_id, lines = increment.lines.len(), "monitor increment delivered");
-                self.push_system_alert(job_alert_text(&JobAlertText::MonitorIncrement {
-                    task_id: &increment.task_id,
-                    lines: &increment.lines,
-                }));
                 true
             }
             JobAlert::MonitorStalled(stalled) => {
                 tracing::info!(task_id = %stalled.task_id, "monitor reports a stall");
-                self.push_system_alert(job_alert_text(&JobAlertText::MonitorStalled {
-                    task_id: &stalled.task_id,
-                    stall_secs: stalled.stall_secs,
-                }));
                 true
             }
             JobAlert::MonitorEnded(ended) => {
                 tracing::info!(task_id = %ended.task_id, "monitor ended");
-                let end = match &ended.end {
-                    MonitorEnd::Exited { exit_code } => MonitorEndText::Exited {
-                        exit_code: *exit_code,
-                    },
-                    MonitorEnd::StopMatched { line } => MonitorEndText::StopMatched { line },
-                    MonitorEnd::TimedOut => MonitorEndText::TimedOut,
-                    MonitorEnd::Killed => MonitorEndText::Killed,
-                    MonitorEnd::Failed { error } => MonitorEndText::Failed { error },
-                    MonitorEnd::Lost => MonitorEndText::Lost,
-                };
-                self.push_system_alert(job_alert_text(&JobAlertText::MonitorEnded {
-                    task_id: &ended.task_id,
-                    end,
-                }));
                 true
             }
-        }
+        };
+        let text = self.notices.job_alert(alert);
+        self.push_system_alert(text);
+        wakes
     }
 
     /// Records every queued completion; returns whether any was announced,
@@ -2226,11 +2269,12 @@ where
         if !self.detached_task_ids.contains(&task.task_id) {
             return false;
         }
-        let result_msg = format_background_task_result(&task);
+        let result_msg = self.notices.background_finished(&task);
         self.context.push(Message::system(&result_msg));
-        self.tasks
-            .events
-            .record(crate::tasks::TaskEvent::JobFinished(task.task_id.clone()));
+        self.work_events
+            .record(crate::working_document::WorkEvent::JobFinished(
+                task.task_id.clone(),
+            ));
         events.emit(AgentEvent::background_task_completed(
             task.task_id,
             result_msg,
@@ -2381,7 +2425,7 @@ where
                 pending.extend(task.pending.take());
                 self.push_completed_task_event(*task, &sink)
             }
-            BackgroundTaskEvent::Alert(alert) => self.push_job_alert(alert),
+            BackgroundTaskEvent::Alert(alert) => self.push_job_alert(&alert),
         };
         let (announced, drained) = self.drain_background_receiver(&receiver, &sink);
         needs_model |= announced;
@@ -2503,7 +2547,7 @@ where
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
         let skills = Vec::new();
-        let fork = CompactionFork::new(
+        let fork = CompactionFork::<Schema>::new(
             &request,
             self.context.fork_point(),
             self.context.handoff_file_index(),
@@ -2512,14 +2556,13 @@ where
         )
         .map_err(AgentError::from)?
         .with_outputs_dir(self.outputs_dir());
-        let fork_point = fork.fork_point();
-        let handoff = self
+        let completed = self
             .compaction_future(fork)
             .await
             .map_err(AgentError::from)?;
-        let summary = handoff.render_markdown();
+        let summary = completed.handoff.text().to_string();
 
-        self.compaction.land(fork_point, handoff);
+        self.compaction.land(completed);
         self.apply_completed_compaction().await;
 
         Ok(Some(CompactResult {
@@ -2611,6 +2654,39 @@ where
         self.profile
             .as_ref()
             .is_some_and(|profile| profile.abilities.contains(&Ability::PerMessageEffort))
+    }
+
+    /// Whether the agent's own model takes a system message inside the
+    /// conversation, which decides whether a provider that cannot keeps the
+    /// live tail out of its system prompt.
+    fn takes_mid_conversation_system(&self) -> bool {
+        Self::profile_takes_mid_conversation_system(self.profile.as_ref())
+    }
+
+    /// Whether the model a compaction request goes to takes a system message
+    /// inside the conversation: the compaction model when one is set, else the
+    /// agent's own.
+    ///
+    /// A model's client decides this from the same ability its profile
+    /// reports, so the cache controls and the client cannot disagree.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a compaction model is set and its profile is not loaded,
+    /// which initialization does before any request.
+    fn compaction_takes_mid_conversation_system(&self) -> bool {
+        if self.compaction_model.is_none() {
+            return self.takes_mid_conversation_system();
+        }
+        let profile = self
+            .compaction_profile
+            .as_ref()
+            .expect("an initialized agent has its compaction model's profile");
+        Self::profile_takes_mid_conversation_system(Some(profile))
+    }
+
+    fn profile_takes_mid_conversation_system(profile: Option<&ModelProfile>) -> bool {
+        profile.is_some_and(|profile| profile.abilities.contains(&Ability::MidConversationSystem))
     }
 
     /// Brings the effort in force to the one the agent's own tier wants:
@@ -2708,9 +2784,12 @@ where
             || self.request_parameters(),
             |compactor| (*compactor.parameters).clone(),
         );
-        let parameters = self
-            .prompt_cache
-            .apply(parameters, &messages, !definitions.is_empty());
+        let parameters = self.prompt_cache.apply(
+            parameters,
+            &messages,
+            !definitions.is_empty(),
+            self.compaction_takes_mid_conversation_system(),
+        );
         LLMRequest::new(messages)
             .with_parameters(parameters)
             .with_tool_definitions(definitions)
@@ -2720,8 +2799,8 @@ where
     /// or else the session's own tier.
     async fn compaction_future(
         &self,
-        fork: CompactionFork,
-    ) -> Result<HandoffDocument, crate::context::CompactionError> {
+        fork: CompactionFork<Schema>,
+    ) -> Result<CompletedCompaction, crate::context::CompactionError> {
         if let Some(compactor) = &self.compaction_model {
             return fork.run(Arc::clone(&compactor.model)).await;
         }
@@ -2734,7 +2813,7 @@ where
 
     /// Starts `fork` in the background on the compaction model: the
     /// configured one, or else the session's own tier.
-    fn start_pending_compaction(&self, fork: CompactionFork) -> PendingCompaction {
+    fn start_pending_compaction(&self, fork: CompactionFork<Schema>) -> PendingCompaction {
         if let Some(compactor) = &self.compaction_model {
             return PendingCompaction::start(fork, Arc::clone(&compactor.model));
         }
@@ -2824,7 +2903,7 @@ where
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
         let skills = Vec::new();
-        match CompactionFork::new(
+        match CompactionFork::<Schema>::new(
             request,
             self.context.fork_point(),
             self.context.handoff_file_index(),
@@ -2878,6 +2957,7 @@ where
             return;
         };
         let handoff = completed.handoff.clone();
+        let restoration = completed.restoration.clone();
         let restored = match self.restore_dir.clone() {
             Some(restore_dir) => {
                 let tokens = self
@@ -2888,7 +2968,14 @@ where
                 let skills = self.skill_catalog();
                 #[cfg(not(feature = "skills"))]
                 let skills = Vec::new();
-                restore_context(&handoff, &[restore_dir], &skills, budget_chars).await
+                restore_context(
+                    &restoration,
+                    handoff.file_index(),
+                    &[restore_dir],
+                    &skills,
+                    budget_chars,
+                )
+                .await
             }
             None => None,
         };
@@ -2905,7 +2992,7 @@ where
             .budget
             .chars_for_tokens(self.config.context_policy.user_message_budget);
         self.context
-            .apply_handoff(&handoff, fork_point, user_message_chars);
+            .apply_handoff(handoff, fork_point, user_message_chars);
         if let Some(block) = restored {
             self.context.push_block_alert(&block);
         }
@@ -2946,10 +3033,9 @@ where
     async fn make_room(&mut self, events: &EventSink) -> Result<bool, AgentError> {
         let mut failure = self.compaction_failure.take().map(AgentError::from);
         if let Some(mut pending) = self.compaction.take_running() {
-            let fork_point = pending.fork_point();
             match pending.wait().await {
-                Ok(handoff) => {
-                    self.compaction.land(fork_point, handoff);
+                Ok(completed) => {
+                    self.compaction.land(completed);
                     self.apply_completed_compaction().await;
                     return Ok(true);
                 }
@@ -3086,7 +3172,8 @@ where
     /// delivered, so it reaches the model once.
     fn push_injected_context(&mut self) {
         for injected in self.hooks.take_injected_context() {
-            self.push_system_alert(injected.alert_text());
+            let alert = self.notices.lifecycle_context(&injected);
+            self.push_system_alert(alert);
         }
     }
 
@@ -3104,7 +3191,7 @@ where
                 self.push_source_alert(&block);
             }
         }
-        if let Some(document) = self.tasks_document.as_mut()
+        if let Some(document) = self.working_document.as_mut()
             && let Some(block) =
                 crate::context::ContextSource::on_request(document, reassembled).await
         {
@@ -3126,7 +3213,7 @@ where
                 self.push_source_alert(&block);
             }
         }
-        if let Some(document) = self.tasks_document.as_mut()
+        if let Some(document) = self.working_document.as_mut()
             && let Some(block) = crate::context::ContextSource::on_tool_turn_end(document).await
         {
             self.push_source_alert(&block);
@@ -3145,13 +3232,55 @@ where
                 pushed = true;
             }
         }
-        if let Some(document) = self.tasks_document.as_mut()
-            && let Some(block) = crate::context::ContextSource::on_final_turn(document).await
+        pushed
+    }
+
+    /// Reviews the working document as the model ends its turn, asks the
+    /// stop hook whether the run ends, and pushes the document's alert and
+    /// the hook's reminder.
+    ///
+    /// Returns the review, for the turn-boundary hooks, and whether the stop
+    /// hook holds the run.
+    async fn decide_stop(
+        &mut self,
+        response_text: &str,
+        turn: usize,
+    ) -> (Option<crate::working_document::DocumentReview>, bool) {
+        let review = match self.working_document.as_mut() {
+            Some(document) => Some(document.review().await),
+            None => None,
+        };
+        let decision = match &self.stop_hook {
+            Some(hook) => {
+                let ctx = TurnBoundaryContext {
+                    assistant_text: response_text,
+                    turn,
+                    message_count: self.context.len_recent(),
+                    document: review.as_ref(),
+                };
+                hook.on_turn_end(&ctx).await
+            }
+            None => crate::StopDecision::End,
+        };
+        let held = matches!(decision, crate::StopDecision::Hold { .. });
+        if let (Some(document), Some(review)) = (&self.working_document, &review)
+            && let Some(block) = document.alert(review, held)
         {
             self.push_source_alert(&block);
-            pushed = true;
         }
-        pushed
+        if let crate::StopDecision::Hold {
+            reminder: Some(reminder),
+        } = decision
+        {
+            let block = Block::new(
+                "system_reminder",
+                SystemReminderTemplate { content: reminder }
+                    .render()
+                    .expect("system reminder template must render"),
+            );
+            self.push_source_alert(&block);
+        }
+        (review, held)
     }
 
     /// Returns the current conversation history.
@@ -3192,10 +3321,10 @@ where
                 .background_receiver
                 .as_ref()
                 .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running),
-            tasks: self
-                .tasks_document
+            document: self
+                .working_document
                 .as_ref()
-                .and_then(crate::tasks::TasksDocument::checkpoint),
+                .and_then(crate::working_document::WorkingDocument::checkpoint),
         })
     }
 
@@ -3206,9 +3335,9 @@ where
     /// Returns an error when the checkpoint cannot be restored into this agent.
     pub fn restore_checkpoint(&mut self, checkpoint: AgentCheckpoint) -> Result<(), AgentError> {
         self.context.restore(checkpoint.context);
-        // The restored conversation holds what its tasks document showed.
-        if let Some(document) = self.tasks_document.as_mut() {
-            document.restore(checkpoint.tasks);
+        // The restored conversation holds what its working document showed.
+        if let Some(document) = self.working_document.as_mut() {
+            document.restore(checkpoint.document);
         }
         // Everything below belongs to the window just replaced: its fork
         // point, its failure, its parked tool results and its last request
@@ -3255,6 +3384,17 @@ where
     async fn ensure_initialized(&mut self) -> Result<(), AgentError> {
         if self.profile.is_none() {
             self.load_profile().await?;
+        }
+        if self.compaction_profile.is_none()
+            && let Some(compactor) = &self.compaction_model
+        {
+            self.compaction_profile = Some(
+                compactor
+                    .model
+                    .profile()
+                    .await
+                    .map_err(|e| AgentError::from_model_error(&e))?,
+            );
         }
         if self.initialized {
             return Ok(());
@@ -3389,7 +3529,10 @@ where
             self.context_sources
                 .push(AnyContextSource::new(crate::language::LanguageAlerts::new(
                     guard,
-                    self.sandbox_dir.clone(),
+                    self.working_document
+                        .as_ref()
+                        .map(|document| document.file().clone()),
+                    self.notices.clone(),
                 )));
         }
         if let Some(job_registry) = self.job_registry.clone() {
@@ -3508,9 +3651,12 @@ where
         self.requests_sent += 1;
         self.prompt_cache
             .observe_prefix(self.context.stable_prefix_fingerprint());
-        let parameters = self
-            .prompt_cache
-            .apply(self.request_parameters(), &messages, has_tools);
+        let parameters = self.prompt_cache.apply(
+            self.request_parameters(),
+            &messages,
+            has_tools,
+            self.takes_mid_conversation_system(),
+        );
         let request = LLMRequest::new(messages)
             .with_parameters(parameters)
             .with_tool_definitions(definitions);
@@ -3566,11 +3712,9 @@ where
         if self.compaction_in_flight() {
             return false;
         }
-        let alert = PreCompactionAlertTemplate {
+        let alert = self.notices.precompaction(&crate::PreCompaction {
             remaining_tokens: policy.compact_point(window).saturating_sub(tokens),
-        }
-        .render()
-        .expect("pre-compaction alert template must render");
+        });
         self.push_system_alert(alert);
         true
     }
@@ -3795,10 +3939,10 @@ where
         let tool_surface_hash = self.tool_surface_hash();
         let tail = self.render_tail().await;
         let window = self.context_window_snapshot(&tail);
-        let tasks = self
-            .tasks_document
+        let document = self
+            .working_document
             .as_ref()
-            .and_then(crate::tasks::TasksDocument::checkpoint);
+            .and_then(crate::working_document::WorkingDocument::checkpoint);
         let checkpoint_ctx = CheckpointContext {
             reason,
             assistant_text,
@@ -3811,7 +3955,7 @@ where
                 .as_ref()
                 .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running),
             window: &window,
-            tasks: tasks.as_ref(),
+            document: document.as_ref(),
         };
         if let Some(reason) = self.hooks.on_checkpoint(&checkpoint_ctx).await {
             return Err(AgentError::HookRejected {
@@ -3827,16 +3971,17 @@ where
 }
 
 /// Formats a completed background task result as a system message.
-fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String {
+/// aither's wording of a finished background task; `timeout` states the
+/// timeout kill, when there was one.
+pub fn default_background_finished(
+    task: &aither_sandbox::CompletedTask,
+    timeout: Option<&str>,
+) -> String {
     let error_text;
-    let timeout_notice = task
-        .timeout_kill
-        .as_ref()
-        .map(aither_sandbox::TimeoutKill::notice);
     let (outcome, output, stderr) = match &task.result {
         Ok(command) if task.kill.is_some() => (
             BackgroundOutcome::Killed {
-                timeout: timeout_notice.as_deref(),
+                timeout,
                 runaway: match task.kill {
                     Some(aither_sandbox::KillCause::MemoryRunaway {
                         footprint_bytes,
@@ -3985,6 +4130,20 @@ mod tests {
     use crate::Handoff;
     use aither_sandbox::{CompletedCommand, CompletedTask, TerminalError};
     use futures_core::Stream;
+
+    /// Lands `document` as a compaction forked at `fork_point` finished.
+    fn land_document(
+        compaction: &mut crate::compaction_state::CompactionState,
+        fork_point: u64,
+        document: HandoffDocument,
+    ) {
+        compaction.land(CompletedCompaction::new(fork_point, document, Vec::new()));
+    }
+
+    /// aither's wording of a finished background task.
+    fn format_background_task_result(task: &CompletedTask) -> String {
+        crate::Notices::background_finished(&crate::DefaultNotices, task)
+    }
 
     fn inline(text: &str) -> CommandStream {
         CommandStream::Inline {
@@ -4630,7 +4789,7 @@ mod tests {
         let mut agent = Agent::new(MockLlm {
             context_length: 1_000_000,
         });
-        agent.context_mut().set_handoff("resume here");
+        agent.context_mut().set_handoff(Handoff::new("resume here"));
 
         let snapshot = agent
             .snapshot_context_window()
@@ -5097,7 +5256,7 @@ mod tests {
                 messages: Vec::new(),
             },
             has_background_tasks: false,
-            tasks: None,
+            document: None,
         }
     }
 
@@ -5193,7 +5352,8 @@ mod tests {
         agent.push_message(Message::user("before"));
         let checkpoint = agent.export_checkpoint().await.expect("checkpoint");
         agent.push_message(Message::user("after"));
-        agent.compaction.land(
+        land_document(
+            &mut agent.compaction,
             agent.context.fork_point(),
             HandoffDocument {
                 current_task: "stale".to_string(),
@@ -5215,8 +5375,14 @@ mod tests {
         agent.push_message(Message::user("after"));
         let tail = agent.render_tail().await;
         let request = LLMRequest::new(agent.context.build_request(&tail));
-        let fork = CompactionFork::new(&request, agent.context.fork_point(), &[], None, &[])
-            .expect("fork");
+        let fork = CompactionFork::<HandoffDocument>::new(
+            &request,
+            agent.context.fork_point(),
+            &[],
+            None,
+            &[],
+        )
+        .expect("fork");
         agent.compaction.start(PendingCompaction::start(fork, llm));
         agent.compaction_failure = Some(crate::context::CompactionError::Empty);
         agent.idle_compacted = true;
@@ -5367,9 +5533,7 @@ mod tests {
             .expect("results apply");
 
         let fork = agent.context.fork_point();
-        agent
-            .context
-            .apply_handoff(&crate::context::HandoffDocument::default(), fork, 0);
+        agent.context.apply_handoff(Handoff::new("task"), fork, 0);
 
         let kept = agent.context.recent();
         let ids: Vec<&str> = kept[0].tool_calls().iter().map(|c| c.id.as_str()).collect();
@@ -5378,38 +5542,58 @@ mod tests {
         assert_eq!(results, ["kept", "native"]);
     }
 
-    fn tasks_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
-        tasks_agent_on(dir, crate::tasks::TaskEvents::new())
-    }
-
-    fn tasks_agent_on(
-        dir: &std::path::Path,
-        events: crate::tasks::TaskEvents,
-    ) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+    fn plan_builder(dir: &std::path::Path) -> crate::AgentBuilder<MockLlm, MockLlm, MockLlm, ()> {
         Agent::builder(MockLlm {
             context_length: 1_000_000,
         })
         .sandbox_dir(dir)
-        .task_events(events)
+        .working_document(crate::DocumentSpec::new(
+            "plan.md",
+            crate::working_document::test_schema::ListSchema,
+        ))
+    }
+
+    fn plan_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+        plan_builder(dir).build()
+    }
+
+    /// An agent keeping a working document named `tasks.md`, read by the
+    /// test schema.
+    fn tasks_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+        Agent::builder(MockLlm {
+            context_length: 1_000_000,
+        })
+        .sandbox_dir(dir)
+        .working_document(crate::DocumentSpec::new(
+            "tasks.md",
+            crate::working_document::test_schema::ListSchema,
+        ))
         .build()
     }
 
+    fn holding_plan_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+        plan_builder(dir)
+            .stop_hook(crate::AnyStopHook::new(
+                crate::working_document::test_schema::HoldOpenRows,
+            ))
+            .build()
+    }
+
     /// An event the host records on the inbox it gave the builder reaches
-    /// the agent's tasks document, and its alert the conversation, once.
+    /// the agent's working document, and its alert the conversation, once.
     #[tokio::test]
     async fn tool_turn_alerts_from_sources_reach_the_conversation() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir should exist");
-        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- #3 PR #12 open\n")
-            .expect("write tasks.md");
-        let events = crate::tasks::TaskEvents::new();
-        let mut agent = tasks_agent_on(dir.path(), events.clone());
+        std::fs::write(dir.path().join("plan.md"), "* #3 PR #12 open\n").expect("write plan.md");
+        let events = crate::WorkEvents::new();
+        let mut agent = plan_builder(dir.path()).work_events(events.clone()).build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_request_alerts().await;
 
-        events.record(crate::tasks::TaskEvent::PullRequestMerged(
-            crate::tasks::WorkRef::pull_request(12),
+        events.record(crate::WorkEvent::PullRequestMerged(
+            crate::WorkRef::pull_request(12),
         ));
         for _ in 0..3 {
             agent.push_request_alerts().await;
@@ -5425,25 +5609,84 @@ mod tests {
         assert_eq!(alerts, 1, "an unrecorded event alerts exactly once");
     }
 
+    /// Without a stop hook, the working document holds no run: the turn the
+    /// model ends ends the run, whatever rows are open.
     #[tokio::test]
-    async fn final_turn_alerts_keep_the_loop_running() {
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("tempdir should exist");
-        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- pending\n")
-            .expect("write tasks.md");
-        let mut agent = tasks_agent(dir.path());
+    async fn without_a_stop_hook_a_turn_ends_regardless_of_open_rows() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("plan.md"), "* pending\n[ ] broken\n")
+            .expect("write plan.md");
+        let mut agent = plan_agent(dir.path());
         agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_request_alerts().await;
 
+        let control = agent
+            .finish_no_tool_turn("done".to_string(), 1, &EventSink::discarding())
+            .await
+            .expect("the turn finishes");
         assert!(
-            agent.push_final_turn_alerts().await,
-            "an actionable row must object to the model stopping"
+            matches!(
+                control,
+                TurnControl::Break {
+                    stop_reason: StopReason::NoToolCalls,
+                    ..
+                }
+            ),
+            "the run ends"
+        );
+        let messages = agent.context().conversation_messages();
+        let alert = messages
+            .iter()
+            .find(|message| message.content().contains("<document_alert>"))
+            .expect("the document's finding still reaches the conversation");
+        assert!(
+            !alert.content().contains("before ending the turn"),
+            "{}",
+            alert.content()
         );
     }
 
-    /// A host with a message waiting ends the run a stop-gate alert would
-    /// keep going, so the message reaches the next request together with the
-    /// alert, which stays in the conversation.
+    /// A stop hook that holds keeps the run going, with its reminder.
+    #[tokio::test]
+    async fn a_stop_hook_holds_the_run_with_its_reminder() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("plan.md"), "* pending\n").expect("write plan.md");
+        let mut agent = holding_plan_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_request_alerts().await;
+
+        let control = agent
+            .finish_no_tool_turn("done".to_string(), 1, &EventSink::discarding())
+            .await
+            .expect("the turn finishes");
+        assert!(matches!(control, TurnControl::Continue), "the run goes on");
+        let reminder = format!(
+            "<system_reminder>{}</system_reminder>",
+            crate::working_document::test_schema::CONTINUE
+        );
+        assert!(
+            agent
+                .context()
+                .conversation_messages()
+                .iter()
+                .any(|message| message.content() == reminder),
+            "the reminder reaches the conversation"
+        );
+
+        std::fs::write(dir.path().join("plan.md"), "~ done\n").expect("write plan.md");
+        let control = agent
+            .finish_no_tool_turn("done".to_string(), 2, &EventSink::discarding())
+            .await
+            .expect("the turn finishes");
+        assert!(
+            matches!(control, TurnControl::Break { .. }),
+            "nothing open, the run ends"
+        );
+    }
+
+    /// A host with a message waiting ends the run a stop hook would keep
+    /// going, so the message reaches the next request together with the
+    /// reminder, which stays in the conversation.
     #[tokio::test]
     async fn a_waiting_message_ends_the_run_a_final_turn_alert_keeps_going() {
         use tempfile::tempdir;
@@ -5459,14 +5702,13 @@ mod tests {
         }
 
         let dir = tempdir().expect("tempdir should exist");
-        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- pending\n")
-            .expect("write tasks.md");
-        let mut agent = Agent::builder(MockLlm {
-            context_length: 1_000_000,
-        })
-        .sandbox_dir(dir.path())
-        .hook(MessageWaiting)
-        .build();
+        std::fs::write(dir.path().join("plan.md"), "* pending\n").expect("write plan.md");
+        let mut agent = plan_builder(dir.path())
+            .stop_hook(crate::AnyStopHook::new(
+                crate::working_document::test_schema::HoldOpenRows,
+            ))
+            .hook(MessageWaiting)
+            .build();
         agent.ensure_initialized().await.expect("agent initializes");
 
         let control = agent
@@ -5486,10 +5728,10 @@ mod tests {
         );
         let messages = agent.context().conversation_messages();
         assert!(
-            messages
-                .iter()
-                .any(|message| message.content().contains("tasks.md still has rows")),
-            "the alert stays for the next request: {messages:?}"
+            messages.iter().any(|message| message
+                .content()
+                .contains(crate::working_document::test_schema::CONTINUE)),
+            "the reminder stays for the next request: {messages:?}"
         );
     }
 
@@ -5568,6 +5810,100 @@ mod tests {
         assert_eq!(mentions(&mut agent, "load has ended").await, 1);
         assert_eq!(mentions(&mut agent, "load has ended").await, 1);
         assert_eq!(mentions(&mut agent, "load is high").await, 1);
+    }
+
+    /// Notices that reword the host load and job alert families and keep
+    /// aither's wording for the rest.
+    struct Reworded;
+
+    impl aither_sandbox::SandboxNotices for Reworded {}
+
+    impl crate::Notices for Reworded {
+        fn host_load(&self, event: &crate::HostLoadEvent) -> String {
+            match event {
+                crate::HostLoadEvent::LoadHigh { load, .. } => {
+                    format!("Reworded: the host runs at {}%.", load.percent())
+                }
+                _ => crate::DefaultNotices.host_load(event),
+            }
+        }
+
+        fn job_alert(&self, alert: &JobAlert) -> String {
+            match alert {
+                JobAlert::StdinBlocked(job) => format!("Reworded: {} waits on stdin.", job.task_id),
+                _ => crate::DefaultNotices.job_alert(alert),
+            }
+        }
+    }
+
+    /// The system messages of the next request that contain `text`.
+    async fn system_mentions(agent: &mut Agent<MockLlm>, text: &str) -> usize {
+        let request = agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary")
+            .expect("a fresh window must accept a request");
+        request
+            .messages()
+            .iter()
+            .filter(|message| {
+                message.role() == aither_core::llm::Role::System && message.content().contains(text)
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_host_load_alert_reaches_the_conversation_in_the_embedders_words() {
+        let (events, receiver) = async_channel::unbounded();
+        let mut agent = Agent::builder(MockLlm {
+            context_length: 200_000,
+        })
+        .notices(crate::AnyNotices::new(Reworded))
+        .build();
+        agent.host_load_events = Some(receiver);
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        events
+            .send(crate::HostLoadEvent::LoadHigh {
+                load: crate::MachineLoad(1.8),
+                foreground_wait: Duration::from_secs(90),
+            })
+            .await
+            .expect("agent listens");
+        assert_eq!(
+            system_mentions(&mut agent, "Reworded: the host runs at 180%.").await,
+            1
+        );
+        assert_eq!(system_mentions(&mut agent, "load is high").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_job_alert_reaches_the_conversation_in_the_embedders_words() {
+        let (sender, receiver) = aither_sandbox::background_task_channel();
+        let mut agent = Agent::builder(MockLlm {
+            context_length: 200_000,
+        })
+        .notices(crate::AnyNotices::new(Reworded))
+        .build();
+        agent.background_receiver = Some(receiver);
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        sender
+            .send_alert(JobAlert::StdinBlocked(aither_sandbox::StdinBlockedJob {
+                task_id: "amber-forest-thunder-pearl".to_string(),
+                script: "cat".to_string(),
+            }))
+            .await;
+        agent.push_completed_background_events(&EventSink::discarding());
+        assert_eq!(
+            system_mentions(
+                &mut agent,
+                "Reworded: amber-forest-thunder-pearl waits on stdin."
+            )
+            .await,
+            1
+        );
+        assert_eq!(system_mentions(&mut agent, "terminal_input").await, 0);
     }
 
     /// A job blocked on stdin can never complete, so its alert must end the
@@ -6084,6 +6420,139 @@ mod tests {
         assert_eq!(updates, [ReasoningEffort::Low], "the update survives once");
     }
 
+    /// An embedder's handoff: decisions quoted verbatim, files named by path.
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct QuotedHandoff {
+        goal: String,
+        quoted_decisions: Vec<String>,
+        files: Vec<String>,
+    }
+
+    impl crate::HandoffSchema for QuotedHandoff {
+        fn instruction(prompt: &crate::HandoffPrompt<'_>) -> String {
+            assert!(prompt.focus.is_none(), "no focus was given");
+            "Write the quoted handoff.".to_string()
+        }
+
+        fn retry(reason: &str) -> String {
+            reason.to_owned()
+        }
+
+        fn validate(&self) -> Result<(), crate::InvalidHandoff> {
+            if self.quoted_decisions.is_empty() {
+                return Err(crate::InvalidHandoff::new("no decision was quoted"));
+            }
+            Ok(())
+        }
+
+        fn render(&self, file_index: &[String]) -> String {
+            std::iter::once(self.goal.as_str())
+                .chain(self.quoted_decisions.iter().map(String::as_str))
+                .chain(file_index.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        fn into_restoration(self) -> crate::Restoration {
+            crate::Restoration {
+                context_files: self
+                    .files
+                    .into_iter()
+                    .map(|path| crate::ContextFile {
+                        path,
+                        lines: None,
+                        why: "named by the handoff".to_string(),
+                    })
+                    .collect(),
+                skills: Vec::new(),
+            }
+        }
+    }
+
+    /// A compaction with the embedder's own handoff asks with its schema and
+    /// instruction, retries with its prompt after its validation fails,
+    /// renders its text into the window, restores the files it named, and
+    /// survives a checkpoint.
+    #[tokio::test]
+    async fn a_custom_handoff_round_trips_through_compaction_and_restore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "restored marker text").expect("write");
+        let llm = ScriptedLlm::new(
+            1_000_000,
+            [
+                r#"{"goal":"ship the parser","quoted_decisions":[],"files":[]}"#.to_string(),
+                r#"{"goal":"ship the parser","quoted_decisions":["\"use the PEG grammar\""],"files":["notes.txt"]}"#
+                    .to_string(),
+            ],
+        );
+        let mut agent = Agent::builder(llm.clone())
+            .handoff::<QuotedHandoff>()
+            .build();
+        agent.restore_dir = Some(dir.path().to_path_buf());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("build the parser"));
+
+        let result = agent
+            .compact(None)
+            .await
+            .expect("compaction succeeds")
+            .expect("there was a conversation to compact");
+
+        let requests = llm.recorded();
+        assert_eq!(requests.len(), 2, "one attempt and one retry");
+        let asked: Vec<&str> = requests[0]
+            .messages()
+            .iter()
+            .map(Message::content)
+            .collect();
+        assert!(asked.contains(&"Write the quoted handoff."), "{asked:?}");
+        assert!(
+            asked
+                .iter()
+                .any(|content| content.contains("quoted_decisions")),
+            "the structured output carries the embedder's schema: {asked:?}"
+        );
+        assert_eq!(
+            requests[1].messages().last().map(Message::content),
+            Some("no decision was quoted"),
+            "the retry is the embedder's, quoting its validation"
+        );
+
+        assert_eq!(result.summary, "ship the parser\n\"use the PEG grammar\"");
+        let handoff = agent
+            .context()
+            .handoff()
+            .cloned()
+            .expect("the handoff is in the window");
+        assert_eq!(handoff.text(), result.summary);
+        let request = agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary")
+            .expect("request after compaction");
+        let sent: Vec<&str> = request.messages().iter().map(Message::content).collect();
+        assert!(
+            sent.iter()
+                .any(|content| content.contains("\"use the PEG grammar\"")),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|content| content.contains("restored marker text")),
+            "the file the handoff named is restored: {sent:?}"
+        );
+
+        let checkpoint = agent.export_checkpoint().await.expect("checkpoint");
+        let json = serde_json::to_string(&checkpoint).expect("checkpoint serializes");
+        let checkpoint: crate::AgentCheckpoint =
+            serde_json::from_str(&json).expect("checkpoint deserializes");
+        let mut restored = Agent::builder(llm).handoff::<QuotedHandoff>().build();
+        restored
+            .restore_checkpoint(checkpoint)
+            .expect("checkpoint restores");
+        assert_eq!(restored.context().handoff(), Some(&handoff));
+    }
+
     /// A replaced model takes the next request, with the history the old one
     /// built; a model that reads no updates gets the effort at the request
     /// level and no update.
@@ -6271,7 +6740,7 @@ mod tests {
         let config = scaled_config();
         let (mut agent, _window) = window_for_usage(&config, &[Message::user("hello")], 75).await;
         agent.ensure_initialized().await.expect("agent initializes");
-        agent.context_mut().set_handoff("resume here");
+        agent.context_mut().set_handoff(Handoff::new("resume here"));
         agent.push_message(Message::user("hello"));
 
         let request = agent
@@ -6354,8 +6823,14 @@ mod tests {
         // Seed an in-flight compaction the way prepare_request would.
         let tail = agent.render_tail().await;
         let request = LLMRequest::new(agent.context.build_request(&tail));
-        let fork = CompactionFork::new(&request, agent.context.fork_point(), &[], None, &[])
-            .expect("fork");
+        let fork = CompactionFork::<HandoffDocument>::new(
+            &request,
+            agent.context.fork_point(),
+            &[],
+            None,
+            &[],
+        )
+        .expect("fork");
         agent
             .compaction
             .start(PendingCompaction::start(fork, llm.clone()));
@@ -6399,7 +6874,8 @@ mod tests {
         let mut agent = tasks_agent(dir.path());
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
-        agent.compaction.land(
+        land_document(
+            &mut agent.compaction,
             agent.context.fork_point(),
             HandoffDocument {
                 current_task: "keep going".to_string(),
@@ -6435,7 +6911,8 @@ mod tests {
         // Two more items land while the hypothetical compaction runs.
         agent.push_message(Message::assistant("during one"));
         agent.push_message(Message::user("during two"));
-        agent.compaction.land(
+        land_document(
+            &mut agent.compaction,
             fork_point,
             HandoffDocument {
                 current_task: "keep going".to_string(),
@@ -6477,7 +6954,8 @@ mod tests {
         agent.push_system_alert("background job 7 completed");
         agent.push_message(Message::user("during"));
         agent.push_system_alert("hook context injected mid-turn");
-        agent.compaction.land(
+        land_document(
+            &mut agent.compaction,
             fork_point,
             HandoffDocument {
                 current_task: "keep going".to_string(),
@@ -6516,7 +6994,8 @@ mod tests {
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("before the fork"));
         let fork_point = agent.context.fork_point();
-        agent.compaction.land(
+        land_document(
+            &mut agent.compaction,
             fork_point,
             HandoffDocument {
                 current_task: "keep going".to_string(),
@@ -6565,8 +7044,14 @@ mod tests {
         // Fork the way prepare_request does, around a real assembled request.
         let tail = agent.render_tail().await;
         let main = LLMRequest::new(agent.context.build_request(&tail));
-        let fork =
-            CompactionFork::new(&main, agent.context.fork_point(), &[], None, &[]).expect("fork");
+        let fork = CompactionFork::<HandoffDocument>::new(
+            &main,
+            agent.context.fork_point(),
+            &[],
+            None,
+            &[],
+        )
+        .expect("fork");
         agent
             .compaction
             .start(PendingCompaction::start(fork, llm.clone()));
@@ -6879,8 +7364,14 @@ mod tests {
 
         let tail = agent.render_tail().await;
         let request = LLMRequest::new(agent.context.build_request(&tail));
-        let fork = CompactionFork::new(&request, agent.context.fork_point(), &[], None, &[])
-            .expect("fork");
+        let fork = CompactionFork::<HandoffDocument>::new(
+            &request,
+            agent.context.fork_point(),
+            &[],
+            None,
+            &[],
+        )
+        .expect("fork");
         agent
             .compaction
             .start(PendingCompaction::start(fork, stale.clone()));
@@ -6898,10 +7389,12 @@ mod tests {
         for prompt in ["go on", "and again"] {
             let _ = crate::test_support::finish_run(agent.run(prompt, std::iter::empty())).await;
         }
-        let Some(Handoff::Document(document)) = agent.context().handoff() else {
-            panic!("the manual handoff stays in the window");
-        };
-        assert_eq!(document.current_task, "manual");
+        let handoff = agent
+            .context()
+            .handoff()
+            .expect("the manual handoff stays in the window");
+        assert!(handoff.text().contains("manual"), "{}", handoff.text());
+        assert!(!handoff.text().contains("stale"), "{}", handoff.text());
         assert!(stale.recorded().is_empty(), "the stale fork never ran");
     }
 
@@ -6973,6 +7466,65 @@ mod tests {
                 .expect("compaction lands")
         );
         assert_eq!(compactor.recorded().len(), 1);
+    }
+
+    /// The Claude message breakpoint of a compaction request lands on the
+    /// message the Claude request marks, from the ability of the model the
+    /// request goes to: the compaction model's, not the agent's.
+    #[tokio::test]
+    async fn a_compaction_request_places_its_breakpoint_by_the_compaction_models_ability() {
+        use aither_core::llm::model::{ClaudeCacheBreakpointTarget, ClaudePromptCacheStrategy};
+
+        for (main_takes, compactor_takes) in [(false, true), (true, false)] {
+            let model = |takes: bool| {
+                let llm = ScriptedLlm::new(1_000_000, []);
+                if takes {
+                    llm.with_ability(Ability::MidConversationSystem)
+                } else {
+                    llm
+                }
+            };
+            let mut agent = Agent::builder(model(main_takes))
+                .compaction_model(model(compactor_takes), Parameters::default())
+                .build();
+            agent.ensure_initialized().await.expect("agent initializes");
+            let messages = vec![
+                Message::system("prefix"),
+                Message::user("hello"),
+                Message::assistant("hi"),
+                Message::system("live tail"),
+            ];
+            let request = agent.compaction_request(messages.clone(), Vec::new());
+            let Some(claude) = request.parameters().cache.claude else {
+                panic!("the request carries Claude cache controls");
+            };
+            let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude.strategy else {
+                panic!("expected explicit breakpoints");
+            };
+            let Some(ClaudeCacheBreakpointTarget::Message { message_index, .. }) =
+                breakpoints.second.map(|point| point.target)
+            else {
+                panic!("expected a message breakpoint");
+            };
+
+            // The list the compaction model's client sends: the leading
+            // system message always leaves it, a later one only when the
+            // model cannot take it in place.
+            let sent: Vec<&Message> = messages
+                .iter()
+                .enumerate()
+                .filter(|(position, message)| {
+                    message.role() != Role::System || (compactor_takes && *position > 0)
+                })
+                .map(|(_, message)| message)
+                .collect();
+            assert_eq!(
+                sent[message_index].content(),
+                "hi",
+                "the breakpoint marks the newest message before the live tail \
+                 (agent {main_takes}, compaction model {compactor_takes})"
+            );
+        }
     }
 
     /// The host's parameters reach the provider on the turns and the
@@ -7345,7 +7897,7 @@ mod tests {
         );
         let tail = agent.render_tail().await;
         assert!(
-            tail.iter().all(|block| block.tag() != "tasks_document"),
+            tail.iter().all(|block| block.tag() != "working_document"),
             "the tail must never carry the document"
         );
     }
@@ -7427,7 +7979,8 @@ mod tests {
             .expect("first request");
 
         agent.push_message(Message::assistant("done"));
-        agent.compaction.land(
+        land_document(
+            &mut agent.compaction,
             agent.context.fork_point(),
             HandoffDocument {
                 current_task: "keep going".to_string(),
@@ -7890,11 +8443,9 @@ mod tests {
             wake.events
         );
         assert_eq!(
-            agent.tasks.events.take(),
-            vec![crate::tasks::TaskEvent::JobFinished(
-                "task-build".to_string()
-            )],
-            "the finished job reaches the tasks inbox"
+            agent.work_events.take(),
+            vec![crate::WorkEvent::JobFinished("task-build".to_string())],
+            "the finished job reaches the working document's inbox"
         );
 
         let events = drain_run(agent.resume()).await;
@@ -8027,7 +8578,11 @@ mod tests {
                 .as_ref()
                 .expect("compact_tool arms the signal"),
         );
-        (agent, crate::compact_tool::CompactTool::new(signal))
+        let notices = agent.notices.clone();
+        (
+            agent,
+            crate::compact_tool::CompactTool::new(signal, notices),
+        )
     }
 
     async fn call_compact(tool: &crate::compact_tool::CompactTool) -> String {
@@ -8038,10 +8593,23 @@ mod tests {
         )
         .await
         .expect("compact returns at once");
-        let aither_core::llm::ToolResult::Text { text } = result else {
-            panic!("compact answers in text: {result:?}");
-        };
-        text
+        match result {
+            aither_core::llm::ToolResult::Text { text } => {
+                assert!(
+                    text.contains("Compaction started"),
+                    "only a started compaction answers in plain text: {text}"
+                );
+                text
+            }
+            aither_core::llm::ToolResult::Error { message } => {
+                assert!(
+                    !message.contains("Compaction started"),
+                    "a started compaction is not an error: {message}"
+                );
+                message
+            }
+            other => panic!("compact answers in text or a typed error: {other:?}"),
+        }
     }
 
     /// Calling `compact` starts the compaction at the next request boundary
@@ -8070,9 +8638,8 @@ mod tests {
 
         // The compaction lands while turns run; the next boundary applies it.
         let mut pending = agent.compaction.take_running().expect("in flight");
-        let fork_point = pending.fork_point();
-        let handoff = pending.wait().await.expect("handoff");
-        agent.compaction.land(fork_point, handoff);
+        let completed = pending.wait().await.expect("handoff");
+        agent.compaction.land(completed);
         assert!(agent.context().handoff().is_none());
         agent
             .prepare_request(&EventSink::discarding())
@@ -8095,9 +8662,8 @@ mod tests {
             .await
             .expect("request boundary");
         let mut pending = agent.compaction.take_running().expect("in flight");
-        let fork_point = pending.fork_point();
-        let handoff = pending.wait().await.expect("handoff");
-        agent.compaction.land(fork_point, handoff);
+        let completed = pending.wait().await.expect("handoff");
+        agent.compaction.land(completed);
         agent
             .prepare_request(&EventSink::discarding())
             .await
@@ -8227,14 +8793,14 @@ mod tests {
             .filter(|message| {
                 message.role() == aither_core::llm::Role::System
                     && message.content().contains("`compact`")
-                    && message.content().contains("`tasks.md`")
+                    && message.content().contains("records you keep")
                     && message.content().contains("notes")
             })
             .count()
     }
 
     /// Crossing the warning distance yields exactly one alert naming
-    /// `compact` and `tasks.md`; crossing again after a compaction brought
+    /// `compact` and the records to save; crossing again after a compaction brought
     /// usage back down yields one more.
     #[tokio::test]
     async fn crossing_the_warning_distance_raises_one_alert() {

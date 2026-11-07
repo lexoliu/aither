@@ -1,7 +1,6 @@
 //! Command hooks: external hooks that gate every shell command.
 
 use aither_sandbox::{AnyCommandGate, CommandGate, GateDecision};
-use askama::Template;
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::ExternalHooks;
@@ -59,45 +58,28 @@ pub enum CommandHookOutput {
     },
 }
 
-#[derive(Template)]
-#[template(path = "command_hook_blocked.txt", escape = "none")]
-struct BlockedTemplate<'a> {
-    hook: &'a str,
-    reason: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "command_hook_failed.txt", escape = "none")]
-struct FailedTemplate<'a> {
-    hook: &'a str,
-    failure: &'a str,
-}
-
 impl CommandHookConfig {
-    /// The gate's decision for this hook's answer.
-    fn decide(&self, answer: Run<CommandHookOutput>) -> GateDecision {
-        let blocked = |reason: askama::Result<String>| GateDecision::Block {
-            reason: reason.expect("command hook templates must render"),
-        };
-        match answer {
-            Run::Answered(CommandHookOutput::Allow {}) | Run::Gone => GateDecision::Allow,
-            Run::Answered(CommandHookOutput::Block { reason }) => blocked(
-                BlockedTemplate {
+    /// The gate's decision for this hook's answer, its refusal rendered
+    /// through `notices`.
+    fn decide(&self, answer: &Run<CommandHookOutput>, notices: &crate::AnyNotices) -> GateDecision {
+        let refusal = match answer {
+            Run::Answered(CommandHookOutput::Allow {}) | Run::Gone => return GateDecision::Allow,
+            Run::Answered(CommandHookOutput::Block { reason }) => {
+                crate::CommandHookRefusal::Blocked {
                     hook: &self.name,
-                    reason: &reason,
+                    reason,
                 }
-                .render(),
-            ),
+            }
             Run::Failed(failure) => {
                 tracing::warn!(hook = %self.name, %failure, "command hook failed; the command is blocked");
-                blocked(
-                    FailedTemplate {
-                        hook: &self.name,
-                        failure: &failure,
-                    }
-                    .render(),
-                )
+                crate::CommandHookRefusal::Failed {
+                    hook: &self.name,
+                    failure,
+                }
             }
+        };
+        GateDecision::Block {
+            reason: notices.command_hook(&refusal),
         }
     }
 }
@@ -134,7 +116,7 @@ impl ExternalHooks {
                         },
                     )
                     .await;
-                hook.config.decide(answer)
+                hook.config.decide(&answer, self.notices())
             }
         });
         futures::future::join_all(runs)

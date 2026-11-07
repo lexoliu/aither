@@ -64,10 +64,6 @@ pub struct AgentConfig {
     /// Agent specialization (coding vs chatbot).
     pub agent_kind: AgentKind,
 
-    /// Lines `tasks.md` may hold; an edit that takes it past them earns one
-    /// alert asking for a rewrite.
-    pub tasks_line_limit: usize,
-
     /// Prompt-cache keep-alive while the run waits on its own background
     /// commands. `None` disables keep-alive.
     pub cache_keep_alive: Option<CacheKeepAlive>,
@@ -90,7 +86,6 @@ impl Default for AgentConfig {
             system_prompt: None,
             persona_prompt: None,
             agent_kind: AgentKind::default(),
-            tasks_line_limit: 60,
             cache_keep_alive: None,
             background_jobs: BackgroundJobPolicy::default(),
             #[cfg(feature = "languages")]

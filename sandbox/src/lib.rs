@@ -61,18 +61,19 @@ mod container_jobserver;
 mod foreground_wait;
 mod grants;
 mod heel_binary;
-mod kill_guard;
 mod memory;
 pub mod monitor;
 mod naming;
+mod notices;
 mod outage;
 mod output;
 mod output_compress;
-pub(crate) mod poll_guard;
+mod policy;
 mod process_tree;
 mod script_language;
 mod session_policy;
 mod shell_session;
+mod shell_syntax;
 mod stdin_watch;
 mod subagent;
 mod terminal;
@@ -106,10 +107,10 @@ pub use bollard_exec::BollardContainerExec;
 pub use command::{
     AnyCommandGate, AnyCommandObserver, CommandCall, CommandEnvelope, CommandGate, CommandObserver,
     CommandPayload, CommandRole, CommandUsage, DynTerminalTool, DynToolHandler, GateDecision,
-    IpcToolCommand, KeptExchangeReceiver, POSITIONAL_KEYWORD, ToolCallCommand, ToolCommand,
-    ToolRegistry, ToolRegistryBuilder, cli_to_json, output_saved_text,
-    register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
-    tool_output_to_payload,
+    IpcToolCommand, KeptExchangeReceiver, POSITIONAL_KEYWORD, PositionalLayoutError,
+    ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
+    output_saved_text, register_ipc_gateway_command, register_tool_command, register_tool_direct,
+    schema_to_help, tool_output_to_payload, validate_positional_layout,
 };
 pub use command_set::{AnyCommandSet, CommandSet};
 pub use container::{
@@ -124,13 +125,13 @@ pub use heel::NetworkAuditLog;
 pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use job_registry::{
     Delivery, JobInfo, JobPlace, JobRegistry, JobRegistryService, JobStatus, KillCause,
-    OwedCompletion, PendingCompletion, TerminalDelta, TerminalReadError, job_registry_channel,
+    OwedCompletion, PendingCompletion, TerminalDelta, TerminalReadError, UnchangedTaskRead,
+    job_registry_channel,
 };
 #[cfg(all(unix, feature = "jobserver"))]
 pub use jobserver::{
     CommandFifo, JobBroker, JobBrokerService, JobPool, JobserverError, job_broker_channel,
 };
-pub use kill_guard::CommandRefusal;
 pub use memory::{
     AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, CgroupMemory, ContainerMemory,
     ContainerSnapshot, FileFootprintRegistry, FootprintError, FootprintReader, FootprintRegistry,
@@ -144,9 +145,16 @@ pub use monitor::{
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
 };
+pub use notices::{
+    AnySandboxNotices, CommandKilled, DefaultSandboxNotices, MonitorStarted, Refused,
+    ReservedForMain, SandboxNotices,
+};
 pub use output::{MediaResolution, OutputFormat, OutputStore};
 pub use permission::{PermissionHandler, PermissionRequest, Review, TerminalMode};
-pub use poll_guard::PollRefusal;
+pub use policy::{
+    AnyCommandPolicy, CommandPolicy, PolicyDecision, PolicyRefusal, ScriptCheck, ScriptEnd,
+    ScriptOrigin, ScriptOutcome,
+};
 pub use process_tree::{
     JOB_MARKER_VAR, JobProcess, KillTreeError, ProcessTableError, kill_process_tree,
 };
@@ -158,6 +166,9 @@ pub use shell_session::{
     ContainerShellRuntime, ExecLifetime, ShellBackend, ShellRuntimeAvailability,
     ShellSessionRegistry, SshAuthorizationError, SshRuntimeProfile, SshServer,
     SshSessionAuthorizer, bootstrap_ssh_runtime,
+};
+pub use shell_syntax::{
+    CommandId, LineId, PipelineId, PipelineStage, ShellCommand, ShellParseError, ShellScript,
 };
 pub use stdin_watch::StdinWatchSignal;
 pub use subagent::{

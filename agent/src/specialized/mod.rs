@@ -9,7 +9,8 @@ pub mod task;
 
 pub use external::{ExternalSession, ExternalStart, ExternalSubagent};
 pub use subagent::{IntoSubAgent, SubAgentQuery, SubAgentTool};
+pub(crate) use task::default_fork_refusal;
 pub use task::{
-    FORK_DESCRIPTION, SubagentArgs, SubagentFileMount, SubagentRunInfo, SubagentRuns,
+    FORK_DESCRIPTION, ForkRefusal, SubagentArgs, SubagentFileMount, SubagentRunInfo, SubagentRuns,
     SubagentSetup, SubagentTool,
 };

@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use askama::Template;
 use futures::StreamExt as _;
 
-use super::compaction::{HandoffDocument, LineRange, SkillCatalogEntry};
+use super::compaction::{LineRange, Restoration, SkillCatalogEntry};
 use super::source::Block;
 
 /// How many files are read from disk at once.
@@ -86,7 +86,8 @@ struct RestoredContextTemplate<'a> {
     unavailable: &'a [UnavailableEntry],
 }
 
-/// Re-reads the file ranges and skills a handoff named, capped at `budget_chars`.
+/// Re-reads the file ranges and skills a handoff named, and the files of its
+/// `file_index`, capped at `budget_chars`.
 ///
 /// `roots` are the session's readable roots: a candidate resolves relative to
 /// the first root when it is not absolute, and is restored only when its
@@ -103,7 +104,8 @@ struct RestoredContextTemplate<'a> {
 /// Panics if the compiled-in restoration template fails to render, which
 /// would mean the binary was built against a broken template.
 pub async fn restore_context(
-    handoff: &HandoffDocument,
+    restoration: &Restoration,
+    file_index: &[String],
     roots: &[PathBuf],
     skills: &[SkillCatalogEntry],
     budget_chars: usize,
@@ -112,8 +114,8 @@ pub async fn restore_context(
         return None;
     }
 
-    let candidates = restoration_candidates(handoff);
-    if candidates.is_empty() && handoff.skills.is_empty() {
+    let candidates = restoration_candidates(restoration, file_index);
+    if candidates.is_empty() && restoration.skills.is_empty() {
         return None;
     }
 
@@ -129,8 +131,13 @@ pub async fn restore_context(
     .len();
 
     let contents = read_all(roots, &candidates).await;
-    let (files, restored_skills, unavailable) =
-        place_restorations(contents, &handoff.skills, skills, overhead, budget_chars);
+    let (files, restored_skills, unavailable) = place_restorations(
+        contents,
+        &restoration.skills,
+        skills,
+        overhead,
+        budget_chars,
+    );
 
     let rendered = RestoredContextTemplate {
         files: &files,
@@ -261,11 +268,11 @@ struct FileCandidate {
 /// entries are rendered as `path — description`, so only the path part is
 /// usable, and they restore whole. Two entries differ only when both their
 /// path and their range differ.
-fn restoration_candidates(handoff: &HandoffDocument) -> Vec<FileCandidate> {
+fn restoration_candidates(restoration: &Restoration, file_index: &[String]) -> Vec<FileCandidate> {
     let mut seen = std::collections::HashSet::new();
     let mut named = std::collections::HashSet::new();
     let mut candidates = Vec::new();
-    for file in &handoff.context_files {
+    for file in &restoration.context_files {
         let path = file.path.trim();
         if path.is_empty() || path.ends_with('/') {
             continue;
@@ -281,7 +288,7 @@ fn restoration_candidates(handoff: &HandoffDocument) -> Vec<FileCandidate> {
             why: (!file.why.trim().is_empty()).then(|| file.why.trim().to_string()),
         });
     }
-    for entry in &handoff.file_index {
+    for entry in file_index {
         let Some(path) = entry.split(" — ").next() else {
             continue;
         };
@@ -455,9 +462,8 @@ mod tests {
     use super::super::compaction::ContextFile;
     use super::*;
 
-    fn handoff(paths: &[&str]) -> HandoffDocument {
-        HandoffDocument {
-            current_task: "task".to_string(),
+    fn handoff(paths: &[&str]) -> Restoration {
+        Restoration {
             context_files: paths
                 .iter()
                 .map(|path| ContextFile {
@@ -466,7 +472,7 @@ mod tests {
                     why: String::new(),
                 })
                 .collect(),
-            ..HandoffDocument::default()
+            ..Restoration::default()
         }
     }
 
@@ -484,7 +490,7 @@ mod tests {
             .await
             .expect("write b");
 
-        let block = restore_context(&handoff(&["a.rs", "b.rs"]), &roots(&root), &[], 10_000)
+        let block = restore_context(&handoff(&["a.rs", "b.rs"]), &[], &roots(&root), &[], 10_000)
             .await
             .expect("restoration produces a block");
 
@@ -501,16 +507,15 @@ mod tests {
             .await
             .expect("write main");
 
-        let document = HandoffDocument {
-            current_task: "task".to_string(),
+        let document = Restoration {
             context_files: vec![ContextFile {
                 path: "main.rs".to_string(),
                 lines: Some(LineRange { start: 2, end: 3 }),
                 why: "the failing lines".to_string(),
             }],
-            ..HandoffDocument::default()
+            ..Restoration::default()
         };
-        let block = restore_context(&document, &roots(&root), &[], 10_000)
+        let block = restore_context(&document, &[], &roots(&root), &[], 10_000)
             .await
             .expect("restoration produces a block");
 
@@ -528,12 +533,11 @@ mod tests {
             description: "read PDFs".to_string(),
             instructions: "use the pdf tool first".to_string(),
         }];
-        let document = HandoffDocument {
-            current_task: "task".to_string(),
+        let document = Restoration {
             skills: vec!["pdf".to_string(), "nonsense".to_string()],
-            ..HandoffDocument::default()
+            ..Restoration::default()
         };
-        let block = restore_context(&document, &roots(&root), &catalog, 10_000)
+        let block = restore_context(&document, &[], &roots(&root), &catalog, 10_000)
             .await
             .expect("restoration produces a block");
 
@@ -554,8 +558,7 @@ mod tests {
             .await
             .expect("write outside");
 
-        let document = HandoffDocument {
-            current_task: "task".to_string(),
+        let document = Restoration {
             context_files: vec![
                 ContextFile {
                     path: "../outside.txt".to_string(),
@@ -572,9 +575,9 @@ mod tests {
                     why: String::new(),
                 },
             ],
-            ..HandoffDocument::default()
+            ..Restoration::default()
         };
-        let block = restore_context(&document, &roots(&root), &[], 10_000)
+        let block = restore_context(&document, &[], &roots(&root), &[], 10_000)
             .await
             .expect("a block still lists what it could not restore");
 
@@ -597,7 +600,7 @@ mod tests {
         )
         .expect("symlink");
 
-        let block = restore_context(&handoff(&["link.txt"]), &roots(&root), &[], 10_000)
+        let block = restore_context(&handoff(&["link.txt"]), &[], &roots(&root), &[], 10_000)
             .await
             .expect("a block still lists what it could not restore");
 
@@ -619,9 +622,15 @@ mod tests {
             .await
             .expect("write next");
 
-        let block = restore_context(&handoff(&["big.rs", "next.rs"]), &roots(&root), &[], 300)
-            .await
-            .expect("restoration produces a block");
+        let block = restore_context(
+            &handoff(&["big.rs", "next.rs"]),
+            &[],
+            &roots(&root),
+            &[],
+            300,
+        )
+        .await
+        .expect("restoration produces a block");
 
         assert!(block.content().contains("(truncated)"));
         assert!(block.content().contains("next.rs"));
@@ -641,6 +650,7 @@ mod tests {
 
         let block = restore_context(
             &handoff(&["gone.rs", "present.rs"]),
+            &[],
             &roots(&root),
             &[],
             10_000,
@@ -657,7 +667,7 @@ mod tests {
     async fn nothing_named_yields_no_block() {
         let root = tempfile::tempdir().expect("tempdir");
         assert!(
-            restore_context(&handoff(&[]), &roots(&root), &[], 10_000)
+            restore_context(&handoff(&[]), &[], &roots(&root), &[], 10_000)
                 .await
                 .is_none()
         );
@@ -670,7 +680,7 @@ mod tests {
             .await
             .expect("write a");
         assert!(
-            restore_context(&handoff(&["a.rs"]), &roots(&root), &[], 0)
+            restore_context(&handoff(&["a.rs"]), &[], &roots(&root), &[], 0)
                 .await
                 .is_none()
         );
@@ -678,8 +688,7 @@ mod tests {
 
     #[test]
     fn candidates_merge_named_ranges_and_the_file_index() {
-        let document = HandoffDocument {
-            current_task: "task".to_string(),
+        let document = Restoration {
             context_files: vec![
                 ContextFile {
                     path: "src/lib.rs".to_string(),
@@ -692,14 +701,14 @@ mod tests {
                     why: "duplicate".to_string(),
                 },
             ],
-            file_index: vec![
-                "src/lib.rs — edited".to_string(),
-                "artifacts/report.md — written".to_string(),
-                "outputs/".to_string(),
-            ],
-            ..HandoffDocument::default()
+            ..Restoration::default()
         };
-        let candidates = restoration_candidates(&document);
+        let file_index = [
+            "src/lib.rs — edited".to_string(),
+            "artifacts/report.md — written".to_string(),
+            "outputs/".to_string(),
+        ];
+        let candidates = restoration_candidates(&document, &file_index);
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].path, "src/lib.rs");
         assert_eq!(candidates[1].path, "artifacts/report.md");
