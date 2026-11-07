@@ -786,7 +786,14 @@ mod tests {
                 Ok(stat) => stat
                     .rsplit_once(") ")
                     .is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X')),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                // A process reaped between the open and the read fails the
+                // read with ESRCH; it is gone just as when the entry is.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(libc::ESRCH) =>
+                {
+                    true
+                }
                 Err(error) => panic!("cannot read /proc/{pid}/stat: {error}"),
             };
             if dead {
