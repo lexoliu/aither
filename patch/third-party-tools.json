@@ -9,6 +9,7 @@
       },
       "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-apple-darwin.tar.gz",
       "sha256": "3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4",
+      "size": 1764284,
       "encoding": {
         "format": "tar_gzip",
         "executable": "ripgrep-15.2.0-aarch64-apple-darwin/rg"
@@ -23,6 +24,7 @@
       },
       "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-aarch64-apple-darwin.zip",
       "sha256": "6d2279dea5bea2ad79c66ea93f5fe54ba926e398a8a26de76c56db68fe59eac6",
+      "size": 7984727,
       "encoding": {
         "format": "zip",
         "executable": "ast-grep"
@@ -37,6 +39,7 @@
       },
       "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-macos-arm64",
       "sha256": "2d75340ba57a4b4b4c8708a21c2dc8e958a48aaa8bba13b27f77f6e4c0eca07e",
+      "size": 841504,
       "encoding": {
         "format": "executable"
       }
@@ -50,6 +53,7 @@
       },
       "url": "https://github.com/uutils/coreutils/releases/download/0.12.0/coreutils-0.12.0-aarch64-apple-darwin.tar.gz",
       "sha256": "7caea447564405b3eb50cce2a89d314df07d1b7a67090dc4cc7c82eba7014052",
+      "size": 6564958,
       "encoding": {
         "format": "tar_gzip",
         "executable": "coreutils-0.12.0-aarch64-apple-darwin/coreutils"
@@ -64,6 +68,7 @@
       },
       "url": "https://github.com/uutils/findutils/releases/download/0.11.0/findutils-aarch64-apple-darwin.tar.xz",
       "sha256": "e42773942fba2f0cd115b9f4a3c9637c0cfc54a30279d6a58819d0e51f27f327",
+      "size": 1288876,
       "encoding": {
         "format": "tar_xz",
         "executable": "findutils-aarch64-apple-darwin/xargs"
@@ -78,6 +83,7 @@
       },
       "url": "https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-aarch64-apple-darwin.tar.gz",
       "sha256": "b67e1836c468e42e411984b56e52fa7abec08c2bd22c867398e7cc134aac5e12",
+      "size": 1334374,
       "encoding": {
         "format": "tar_gzip",
         "executable": "fd-v10.5.0-aarch64-apple-darwin/fd"
@@ -92,6 +98,7 @@
       },
       "url": "https://github.com/astral-sh/uv/releases/download/0.13.7/uv-aarch64-apple-darwin.tar.gz",
       "sha256": "81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731",
+      "size": 14347867,
       "encoding": {
         "format": "tar_gzip",
         "executable": "uv-aarch64-apple-darwin/uv"
@@ -106,6 +113,7 @@
       },
       "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz",
       "sha256": "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915",
+      "size": 1982561,
       "encoding": {
         "format": "tar_gzip",
         "executable": "ripgrep-15.2.0-aarch64-unknown-linux-musl/rg"
@@ -120,6 +128,7 @@
       },
       "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-aarch64-unknown-linux-gnu.zip",
       "sha256": "b39cfbc58da4b869a88b8a4bc57bd5deb0d24541e704cf7c257da7b53ec81c8f",
+      "size": 7870318,
       "encoding": {
         "format": "zip",
         "executable": "ast-grep"
@@ -134,6 +143,7 @@
       },
       "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-arm64",
       "sha256": "8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309",
+      "size": 1797688,
       "encoding": {
         "format": "executable"
       }
@@ -147,6 +157,7 @@
       },
       "url": "https://github.com/uutils/coreutils/releases/download/0.12.0/coreutils-0.12.0-aarch64-unknown-linux-musl.tar.gz",
       "sha256": "614a0224ea49f85020cfc30ca980599965fa8501131f9588db4fa41c125a7805",
+      "size": 5373367,
       "encoding": {
         "format": "tar_gzip",
         "executable": "coreutils-0.12.0-aarch64-unknown-linux-musl/coreutils"
@@ -161,6 +172,7 @@
       },
       "url": "https://github.com/uutils/findutils/releases/download/0.11.0/findutils-aarch64-unknown-linux-musl.tar.xz",
       "sha256": "667554a89d7961ebfa46325bb68795e4107b1a3bc4552657ef51408ae056acea",
+      "size": 1482232,
       "encoding": {
         "format": "tar_xz",
         "executable": "findutils-aarch64-unknown-linux-musl/xargs"
@@ -175,6 +187,7 @@
       },
       "url": "https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-aarch64-unknown-linux-musl.tar.gz",
       "sha256": "d76c4317f7d5dba69f8a2a15856c90c777e7f0dd4e85f0de8c76de6992c374d4",
+      "size": 1429078,
       "encoding": {
         "format": "tar_gzip",
         "executable": "fd-v10.5.0-aarch64-unknown-linux-musl/fd"
@@ -189,6 +202,7 @@
       },
       "url": "https://github.com/astral-sh/uv/releases/download/0.13.7/uv-aarch64-unknown-linux-musl.tar.gz",
       "sha256": "2d3ec076a0c4c0e8250bb6418c44080828b544f1a3be0b6e46adf9fb6923de45",
+      "size": 16888574,
       "encoding": {
         "format": "tar_gzip",
         "executable": "uv-aarch64-unknown-linux-musl/uv"
@@ -203,6 +217,7 @@
       },
       "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz",
       "sha256": "33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c",
+      "size": 2265718,
       "encoding": {
         "format": "tar_gzip",
         "executable": "ripgrep-15.2.0-x86_64-unknown-linux-musl/rg"
@@ -217,6 +232,7 @@
       },
       "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-unknown-linux-gnu.zip",
       "sha256": "f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8",
+      "size": 8126910,
       "encoding": {
         "format": "zip",
         "executable": "ast-grep"
@@ -231,6 +247,7 @@
       },
       "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64",
       "sha256": "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f",
+      "size": 2267912,
       "encoding": {
         "format": "executable"
       }
@@ -244,6 +261,7 @@
       },
       "url": "https://github.com/uutils/coreutils/releases/download/0.12.0/coreutils-0.12.0-x86_64-unknown-linux-musl.tar.gz",
       "sha256": "9b555b01457279bcc3e46753f0ef324fd3d02a0535111200a4632d1297263b54",
+      "size": 5859740,
       "encoding": {
         "format": "tar_gzip",
         "executable": "coreutils-0.12.0-x86_64-unknown-linux-musl/coreutils"
@@ -258,6 +276,7 @@
       },
       "url": "https://github.com/uutils/findutils/releases/download/0.11.0/findutils-x86_64-unknown-linux-musl.tar.xz",
       "sha256": "e27232099ede5166efe22c5c84a3880ac7278a56ce46a51a732d647eae846bdb",
+      "size": 1689104,
       "encoding": {
         "format": "tar_xz",
         "executable": "findutils-x86_64-unknown-linux-musl/xargs"
@@ -272,6 +291,7 @@
       },
       "url": "https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-x86_64-unknown-linux-musl.tar.gz",
       "sha256": "761c72dc8e120d85b22292063be8a796e2eeb20eb3e4f38b8fa2343ccf3514a7",
+      "size": 1573549,
       "encoding": {
         "format": "tar_gzip",
         "executable": "fd-v10.5.0-x86_64-unknown-linux-musl/fd"
@@ -286,6 +306,7 @@
       },
       "url": "https://github.com/astral-sh/uv/releases/download/0.13.7/uv-x86_64-unknown-linux-musl.tar.gz",
       "sha256": "287491da03f2a785c70fa75b13e1f849918c2f2b5415fe84876b8214eeb792f9",
+      "size": 18396915,
       "encoding": {
         "format": "tar_gzip",
         "executable": "uv-x86_64-unknown-linux-musl/uv"
@@ -300,6 +321,7 @@
       },
       "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-pc-windows-msvc.zip",
       "sha256": "e4abca10c3a64ebea742667dd7009449d49403db5460dd6873e389fa2945360f",
+      "size": 1640124,
       "encoding": {
         "format": "zip",
         "executable": "ripgrep-15.2.0-aarch64-pc-windows-msvc/rg.exe"
@@ -314,6 +336,7 @@
       },
       "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-aarch64-pc-windows-msvc.zip",
       "sha256": "5da748848c4cad2a1e7f41e27b58871714dd2c0908632f9874cc2833b92a21ca",
+      "size": 14166958,
       "encoding": {
         "format": "zip",
         "executable": "ast-grep.exe"
@@ -328,6 +351,7 @@
       },
       "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-arm64.exe",
       "sha256": "083b5377392bc57cf27052b6d20a2d927770683bca844632901ff38b4b7b0ac7",
+      "size": 973312,
       "encoding": {
         "format": "executable"
       }
@@ -341,6 +365,7 @@
       },
       "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip",
       "sha256": "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5",
+      "size": 1789611,
       "encoding": {
         "format": "zip",
         "executable": "ripgrep-15.2.0-x86_64-pc-windows-msvc/rg.exe"
@@ -355,6 +380,7 @@
       },
       "url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-pc-windows-msvc.zip",
       "sha256": "3751b7d6be7fd39a80df1180ffe7e053903dcf92d3190e5a8336ff1746af9059",
+      "size": 14771046,
       "encoding": {
         "format": "zip",
         "executable": "ast-grep.exe"
@@ -369,6 +395,7 @@
       },
       "url": "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-amd64.exe",
       "sha256": "a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627",
+      "size": 1035264,
       "encoding": {
         "format": "executable"
       }
@@ -384,6 +411,7 @@
       },
       "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.3/repo-search-aarch64-apple-darwin.tar.xz",
       "sha256": "1914358c615573d9636061c0c5ac0e726f3ddd2bcbb2400ec747e9caea3e8de0",
+  "size": 5472984,
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-apple-darwin/search"
@@ -399,6 +427,7 @@
       },
       "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.3/repo-search-aarch64-unknown-linux-gnu.tar.xz",
       "sha256": "3013da4eb463f687951745b28d9a4df541b6f81e8bf7c2f6f26f9de56abceaa2",
+  "size": 6474948,
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-unknown-linux-gnu/search"
@@ -414,6 +443,7 @@
       },
       "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.3/repo-search-x86_64-unknown-linux-gnu.tar.xz",
       "sha256": "f1c61cd30ab4dd17b0a36a6e4354acf1493e3024bf92a86890da845362578b8b",
+  "size": 7158228,
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-x86_64-unknown-linux-gnu/search"

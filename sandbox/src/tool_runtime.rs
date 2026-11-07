@@ -383,7 +383,7 @@ impl ToolBinary {
     /// Verifies executable bytes before they can enter a prepared environment.
     ///
     /// # Errors
-    /// Rejects an invalid version, oversized artifact or mismatched SHA-256.
+    /// Rejects an invalid version or mismatched SHA-256.
     pub fn verify(
         tool: ManagedTool,
         version: &str,
@@ -400,7 +400,7 @@ impl ToolBinary {
     }
 }
 
-/// Checks the version, size and digest every distributed executable must satisfy.
+/// Checks the version and digest every distributed executable must satisfy.
 fn verify_executable(
     tool: DistributedTool,
     version: &str,
@@ -408,9 +408,6 @@ fn verify_executable(
     bytes: Vec<u8>,
 ) -> Result<(semver::Version, Arc<[u8]>), ToolRuntimeError> {
     let version = semver::Version::parse(version)?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err(ToolRuntimeError::ArtifactTooLarge(tool));
-    }
     if digest(&bytes) != *expected {
         return Err(ToolRuntimeError::Integrity { tool });
     }
@@ -1576,9 +1573,18 @@ pub enum ToolRuntimeError {
         /// Program whose artifact failed verification.
         tool: DistributedTool,
     },
-    /// An artifact exceeds the executable-size limit.
-    #[error("tool artifact exceeds the size limit: {0:?}")]
-    ArtifactTooLarge(DistributedTool),
+    /// An artifact's length differs from the size the manifest pins. A
+    /// download or file read is bounded one byte past `expected`, so a longer
+    /// artifact reports `expected + 1`.
+    #[error("tool artifact {tool:?} is {actual} bytes; the manifest pins {expected}")]
+    ArtifactSize {
+        /// Program whose artifact has the wrong length.
+        tool: DistributedTool,
+        /// Size the manifest pins.
+        expected: u64,
+        /// Length read, at most `expected + 1`.
+        actual: u64,
+    },
     /// A cached command is not a regular read-only executable.
     #[error("invalid prepared tool cache entry: {0}")]
     InvalidCache(PathBuf),
@@ -1609,7 +1615,7 @@ pub enum ToolRuntimeError {
     /// Artifact checksum is not a SHA-256 hexadecimal value.
     #[error(transparent)]
     Digest(#[from] hex::FromHexError),
-    /// Executable archive entry is missing, ambiguous, oversized or not regular.
+    /// Executable archive entry is missing, ambiguous or not regular.
     #[error("invalid executable archive member")]
     InvalidArchive,
     /// ZIP decoding failed.
