@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use aither_core::llm::model::ReasoningEffort;
 use aither_core::llm::{Message, Role, ToolCall};
 
-use super::compaction::{Handoff, HandoffDocument};
+use super::compaction::Handoff;
 use super::live::{LiveContent, LiveUpdate};
 use super::source::Block;
 use super::system::{
@@ -313,17 +313,12 @@ impl Context {
 
     // ── Handoff ───────────────────────────────────────────────────────
 
-    /// Sets or replaces the compaction handoff document.
-    pub fn set_handoff(&mut self, handoff: impl Into<String>) {
-        self.handoff = Some(Handoff::Text(handoff.into()));
+    /// Sets or replaces the compaction handoff.
+    pub fn set_handoff(&mut self, handoff: Handoff) {
+        self.handoff = Some(handoff);
     }
 
-    /// Sets the compaction handoff document from a structured artifact.
-    pub fn set_handoff_document(&mut self, handoff: &HandoffDocument) {
-        self.handoff = Some(Handoff::Document(handoff.clone()));
-    }
-
-    /// Clears the compaction handoff document.
+    /// Clears the compaction handoff.
     pub fn clear_handoff(&mut self) {
         self.handoff = None;
     }
@@ -614,17 +609,12 @@ impl Context {
     ///
     /// The last configuration update below the fork is kept too, in its
     /// place, so the effort it set stays in force: the handoff restates it.
-    pub fn apply_handoff(
-        &mut self,
-        handoff: &HandoffDocument,
-        fork_point: u64,
-        user_message_chars: usize,
-    ) {
+    pub fn apply_handoff(&mut self, handoff: Handoff, fork_point: u64, user_message_chars: usize) {
         let mut kept = self.verbatim_below(fork_point, user_message_chars);
         self.items.retain(|item| item.seq >= fork_point);
         kept.append(&mut self.items);
         self.items = kept;
-        self.set_handoff_document(handoff);
+        self.set_handoff(handoff);
     }
 
     /// The items below `fork_point` that survive a handoff: answered
@@ -971,13 +961,9 @@ impl Handoff {
     /// Renders this handoff as the system message body of a request.
     #[must_use]
     pub fn render(&self) -> String {
-        let content = match self {
-            Self::Text(text) => text.clone(),
-            Self::Document(document) => document.render_markdown(),
-        };
         TaggedBlockTemplate {
             tag: "handoff",
-            content: &content,
+            content: self.text(),
         }
         .into_text()
     }
@@ -1268,7 +1254,7 @@ mod tests {
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
-        context.set_handoff("summary");
+        context.set_handoff(Handoff::new("summary"));
         context.push(Message::user("hello"));
 
         let messages = context.build_request(&[Block::new("tasks", "<tasks>todo</tasks>")]);
@@ -1411,7 +1397,7 @@ mod tests {
         context.push(Message::system("<alert>after the fork</alert>"));
 
         context.reassemble_below(fork_point);
-        context.apply_handoff(&HandoffDocument::default(), fork_point, 0);
+        context.apply_handoff(handoff(), fork_point, 0);
         assert_eq!(
             live_alerts(&context),
             Vec::<String>::new(),
@@ -1567,11 +1553,7 @@ mod tests {
         let fork = context.fork_point();
         context.push(Message::user("new request"));
 
-        let handoff = HandoffDocument {
-            current_task: "task".into(),
-            ..HandoffDocument::default()
-        };
-        context.apply_handoff(&handoff, fork, 0);
+        context.apply_handoff(handoff(), fork, 0);
 
         assert_eq!(context.len_recent(), 1);
         assert_eq!(context.recent()[0].content(), "new request");
@@ -1594,7 +1576,7 @@ mod tests {
         let fork = context.fork_point();
         context.push(Message::user("new request"));
 
-        context.apply_handoff(&handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0);
 
         let recent: Vec<_> = context.recent().into_iter().cloned().collect();
         assert_eq!(
@@ -1607,11 +1589,8 @@ mod tests {
         assert_eq!(context.configured_effort(), Some(ReasoningEffort::Medium));
     }
 
-    fn handoff() -> HandoffDocument {
-        HandoffDocument {
-            current_task: "task".into(),
-            ..HandoffDocument::default()
-        }
+    fn handoff() -> Handoff {
+        Handoff::new("task")
     }
 
     /// Pushes one answered `ask_user` exchange and returns its question.
@@ -1660,7 +1639,7 @@ mod tests {
         push_terminal_call(&mut context, "plain", "ls", false);
         let fork = context.fork_point();
 
-        context.apply_handoff(&handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0);
 
         let recent = context.recent();
         assert_eq!(recent.len(), 2);
@@ -1690,7 +1669,7 @@ mod tests {
             .collect();
         assert_eq!(tags, [false, true, false, false]);
         let fork = restored.fork_point();
-        restored.apply_handoff(&handoff(), fork, 0);
+        restored.apply_handoff(handoff(), fork, 0);
         assert_eq!(restored.len_recent(), 2);
     }
 
@@ -1724,7 +1703,7 @@ mod tests {
         let fork = context.fork_point();
         context.push(Message::user("after the fork"));
 
-        context.apply_handoff(&handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0);
 
         let kept = context.recent();
         // Five exchanges (call and answer each) and the suffix; the turn's
@@ -1764,7 +1743,7 @@ mod tests {
         let fork = context.fork_point();
 
         // "middle" + "newest" fit; "oldest" does not.
-        context.apply_handoff(&handoff(), fork, "middle".len() + "newest".len());
+        context.apply_handoff(handoff(), fork, "middle".len() + "newest".len());
 
         let kept = texts(&context);
         assert_eq!(kept.len(), 4, "{kept:?}");
@@ -1781,7 +1760,7 @@ mod tests {
         context.push(Message::user(message));
         let fork = context.fork_point();
 
-        context.apply_handoff(&handoff(), fork, 1_000);
+        context.apply_handoff(handoff(), fork, 1_000);
 
         assert_eq!(context.recent()[0].content(), message);
     }
@@ -1799,7 +1778,7 @@ mod tests {
         ));
         let fork = context.fork_point();
 
-        context.apply_handoff(&handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0);
 
         assert_eq!(context.len_recent(), 0);
     }
@@ -1895,7 +1874,7 @@ mod tests {
         context.push(Message::user("one"));
         context.push(Message::user("two"));
         let fork = context.fork_point();
-        context.apply_handoff(&HandoffDocument::default(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0);
 
         let checkpoint = context.checkpoint();
 
@@ -1912,7 +1891,7 @@ mod tests {
 
         let mut restored = Context::new();
         restored.push(Message::user("hello"));
-        restored.set_handoff("summary");
+        restored.set_handoff(Handoff::new("summary"));
 
         current.restore_runtime_state(&restored);
 

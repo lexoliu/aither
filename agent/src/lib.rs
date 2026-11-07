@@ -120,10 +120,11 @@ pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy};
 pub use context::ActiveSkills;
 pub use context::{
     AnyContextSource, BackgroundJobs, Block, CompactionError, CompletedCompaction, Context,
-    ContextBudget, ContextCheckpoint, ContextItem, ContextPolicy, ContextSource, ExternalContent,
-    ExternalSlot, Handoff, HandoffDocument, InstructionSlot, LiveContent, LiveUpdate, PrefixBlock,
-    PrefixChain, PrefixRewrites, PromptCache, PromptPrefix, ReassemblyReport, SystemLayout,
-    TasksDocument,
+    ContextBudget, ContextCheckpoint, ContextFile, ContextItem, ContextPolicy, ContextSource,
+    ExternalContent, ExternalSlot, Handoff, HandoffDocument, HandoffPrompt, HandoffSchema,
+    InstructionSlot, InvalidHandoff, LineRange, LiveContent, LiveUpdate, PrefixBlock, PrefixChain,
+    PrefixRewrites, PromptCache, PromptPrefix, ReassemblyReport, Restoration, SkillCatalogEntry,
+    SystemLayout, TasksDocument,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use disk::{
