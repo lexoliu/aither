@@ -507,16 +507,41 @@ impl From<&Parameters> for ParameterSnapshot {
 ///
 /// Returns (`system_prompt`, messages). A single system message is emitted as
 /// plain text, while multiple system messages are preserved as system blocks.
+///
+/// The system messages that lead the conversation form the top-level system
+/// prompt. With `mid_conversation_system`, every later system message keeps its
+/// position as a `system` turn, so a message that changes every request
+/// cannot rewrite the cached system prompt; the returned message list is
+/// what an explicit message breakpoint indexes. Without it, later system
+/// messages are folded into the top-level system prompt.
+///
+/// # Errors
+///
+/// Returns an error for a system turn Claude would reject: one that does not
+/// directly follow a user message, or that is followed by anything but an
+/// assistant turn. Such a placement is a caller bug, so it is refused instead
+/// of being moved or converted.
 pub async fn to_claude_messages(
     messages: &[Message],
+    mid_conversation_system: bool,
 ) -> Result<(Option<SystemPayload>, Vec<MessagePayload>), String> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut claude_messages: Vec<MessagePayload> = Vec::new();
 
     for message in messages {
         match message.role() {
-            Role::System => {
+            Role::System if !mid_conversation_system || claude_messages.is_empty() => {
                 system_parts.push(message.content().to_string());
+            }
+            Role::System => {
+                claude_messages.push(MessagePayload {
+                    role: "system",
+                    output_config: None,
+                    content: ContentPayload::Blocks(vec![ContentBlock::Text {
+                        text: message.content().to_string(),
+                        cache_control: None,
+                    }]),
+                });
             }
             Role::User | Role::Tool => {
                 let content = if matches!(message.role(), Role::Tool) {
@@ -565,7 +590,42 @@ pub async fn to_claude_messages(
         ))
     };
 
+    check_system_turn_placement(&claude_messages)?;
+
     Ok((system, claude_messages))
+}
+
+/// Refuses a text system turn Claude requires to follow a `user` message and
+/// to be last or followed by an `assistant` turn. Effort-only system messages
+/// are exempt and are skipped when looking at a turn's neighbours.
+fn check_system_turn_placement(messages: &[MessagePayload]) -> Result<(), String> {
+    let turns: Vec<(usize, &MessagePayload)> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| !message.is_effort_update())
+        .collect();
+    for (position, (index, message)) in turns.iter().enumerate() {
+        if message.role != "system" {
+            continue;
+        }
+        let follows_user = position
+            .checked_sub(1)
+            .is_some_and(|previous| turns[previous].1.role == "user");
+        if !follows_user {
+            return Err(format!(
+                "Claude takes a system message only directly after a user message, but the system message at index {index} does not follow one"
+            ));
+        }
+        if turns
+            .get(position + 1)
+            .is_some_and(|(_, next)| next.role != "assistant")
+        {
+            return Err(format!(
+                "Claude takes a system message only as the last message or before an assistant message, but the system message at index {index} is followed by another turn"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Build content for a user message, handling image and PDF attachments.
@@ -1424,7 +1484,7 @@ mod tests {
 
     /// The serialized system prompt and messages of a conversation.
     async fn wire(messages: &[Message]) -> (String, Vec<String>) {
-        let (system, encoded) = to_claude_messages(messages)
+        let (system, encoded) = to_claude_messages(messages, true)
             .await
             .expect("encode Claude messages");
         (
@@ -1516,7 +1576,7 @@ mod tests {
                 arguments: serde_json::json!({"q":"rust"}),
             }],
         )];
-        let (_, encoded) = to_claude_messages(&messages)
+        let (_, encoded) = to_claude_messages(&messages, false)
             .await
             .expect("encode Claude messages");
         assert_eq!(encoded.len(), 1);
@@ -1536,7 +1596,7 @@ mod tests {
     #[tokio::test]
     async fn tool_message_is_encoded_as_tool_result_block() {
         let messages = vec![Message::tool("call_9", "{\"ok\":true}")];
-        let (_, encoded) = to_claude_messages(&messages)
+        let (_, encoded) = to_claude_messages(&messages, false)
             .await
             .expect("encode Claude messages");
         assert_eq!(encoded.len(), 1);
@@ -1575,7 +1635,7 @@ mod tests {
             "application/pdf".parse().expect("PDF MIME"),
         );
         let messages = vec![Message::user("inspect").with_attachments([image, pdf])];
-        let (_, encoded) = to_claude_messages(&messages)
+        let (_, encoded) = to_claude_messages(&messages, false)
             .await
             .expect("encode Claude attachments");
         let ContentPayload::Blocks(blocks) = &encoded[0].content else {
@@ -1593,7 +1653,7 @@ mod tests {
             "audio/wav".parse().expect("audio MIME"),
         );
         let messages = vec![Message::user("listen").with_attachment(audio)];
-        let error = to_claude_messages(&messages)
+        let error = to_claude_messages(&messages, false)
             .await
             .expect_err("Claude audio input must fail");
         assert!(error.contains("does not support attachment MIME type"));
@@ -1870,7 +1930,7 @@ mod tests {
             Message::system("Instruction B"),
             Message::user("Hello"),
         ];
-        let (system, encoded) = to_claude_messages(&messages)
+        let (system, encoded) = to_claude_messages(&messages, false)
             .await
             .expect("encode Claude messages");
         assert_eq!(encoded.len(), 1);
@@ -1885,6 +1945,116 @@ mod tests {
                 panic!("expected system blocks payload, got: {other:?}")
             }
         }
+    }
+
+    /// Whether the registry lists `model` for mid-conversation system messages.
+    fn takes_system_in_place(model: &str) -> bool {
+        aither_models::lookup(model)
+            .unwrap_or_else(|| panic!("{model} is in the snapshot"))
+            .has_ability(aither_core::llm::model::Ability::MidConversationSystem)
+    }
+
+    /// The agent's `[system prefix, user, system tail]` layout with a message
+    /// breakpoint on the newest append-only message.
+    #[tokio::test]
+    async fn the_breakpoint_lands_on_the_newest_message_when_a_system_tail_follows() {
+        let messages = vec![
+            Message::system("prefix"),
+            Message::user("hello"),
+            Message::system("live tail"),
+        ];
+        let (mut system, mut encoded) =
+            to_claude_messages(&messages, takes_system_in_place("claude-opus-5-5"))
+                .await
+                .expect("encode Claude messages");
+        assert_eq!(encoded.len(), 2);
+        assert_eq!(encoded[0].role, "user");
+        assert_eq!(encoded[1].role, "system");
+        let cache = ClaudePromptCache::explicit(
+            ClaudePromptCacheTtl::OneHour,
+            ClaudeExplicitCacheBreakpoints::new(ClaudeExplicitCacheBreakpoint::new(
+                ClaudeCacheBreakpointTarget::Message {
+                    message_index: 0,
+                    block_index: 0,
+                },
+            )),
+        );
+        apply_cache_strategy(&mut system, &mut encoded, &mut None, cache)
+            .expect("the breakpoint is in range");
+        let marked = |message: &MessagePayload| {
+            serde_json::to_string(message)
+                .expect("message serializes")
+                .contains("cache_control")
+        };
+        assert!(marked(&encoded[0]));
+        assert!(!marked(&encoded[1]));
+    }
+
+    /// The live tail is rebuilt every request, so it cannot reach `system`.
+    #[tokio::test]
+    async fn different_live_tails_send_identical_system() {
+        let request = |tail: &str| {
+            vec![
+                Message::system("prefix"),
+                Message::user("hello"),
+                Message::system(tail),
+            ]
+        };
+        let (first_system, first) = wire(&request("tail one")).await;
+        let (second_system, second) = wire(&request("tail two")).await;
+        assert_eq!(first_system, second_system);
+        assert!(first_system.contains("prefix"));
+        assert!(!first_system.contains("tail"));
+        assert_eq!(first[0], second[0]);
+        assert_ne!(first[1], second[1]);
+        assert!(first[1].contains("tail one"));
+        assert!(first[1].contains(r#""role":"system""#));
+    }
+
+    #[tokio::test]
+    async fn without_the_ability_the_tail_folds_into_system() {
+        assert!(!takes_system_in_place("claude-sonnet-5"));
+        let messages = vec![
+            Message::system("prefix"),
+            Message::user("hello"),
+            Message::system("live tail"),
+        ];
+        let (system, encoded) =
+            to_claude_messages(&messages, takes_system_in_place("claude-sonnet-5"))
+                .await
+                .expect("encode Claude messages");
+        assert_eq!(encoded.len(), 1);
+        let Some(SystemPayload::Blocks(blocks)) = system else {
+            panic!("expected two system blocks");
+        };
+        assert_eq!(blocks[1].text, "live tail");
+    }
+
+    #[tokio::test]
+    async fn a_misplaced_system_message_is_refused() {
+        // Directly after the assistant turn, not a user message.
+        let after_assistant = vec![
+            Message::system("prefix"),
+            Message::user("hello"),
+            Message::assistant("hi"),
+            Message::system("tail"),
+        ];
+        let error = to_claude_messages(&after_assistant, true)
+            .await
+            .expect_err("a system message after an assistant turn is refused");
+        assert!(error.contains("directly after a user message"), "{error}");
+
+        // Followed by a user turn.
+        let before_user = vec![
+            Message::system("prefix"),
+            Message::user("hello"),
+            Message::system("tail"),
+            Message::user("again"),
+        ];
+        let error = to_claude_messages(&before_user, true)
+            .await
+            .expect_err("a system message before a user turn is refused");
+        assert!(error.contains("followed by another turn"), "{error}");
     }
 
     #[test]

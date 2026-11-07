@@ -852,6 +852,11 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Cached model profile (for the selected tier).
     pub(crate) profile: Option<ModelProfile>,
 
+    /// The compaction model's profile, when one is set. It tells the cache
+    /// controls of a compaction request what that model's client will do with
+    /// the messages.
+    pub(crate) compaction_profile: Option<ModelProfile>,
+
     /// Whether tools have been bootstrapped.
     pub(crate) initialized: bool,
 
@@ -992,6 +997,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             compaction_failure: None,
             tool_results: VecDeque::new(),
             profile: None,
+            compaction_profile: None,
             initialized: false,
             session: SessionPhase::NotStarted,
             connectivity: crate::connectivity::Watch::default(),
@@ -2613,6 +2619,39 @@ where
             .is_some_and(|profile| profile.abilities.contains(&Ability::PerMessageEffort))
     }
 
+    /// Whether the agent's own model takes a system message inside the
+    /// conversation, which decides whether a provider that cannot keeps the
+    /// live tail out of its system prompt.
+    fn takes_mid_conversation_system(&self) -> bool {
+        Self::profile_takes_mid_conversation_system(self.profile.as_ref())
+    }
+
+    /// Whether the model a compaction request goes to takes a system message
+    /// inside the conversation: the compaction model when one is set, else the
+    /// agent's own.
+    ///
+    /// A model's client decides this from the same ability its profile
+    /// reports, so the cache controls and the client cannot disagree.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a compaction model is set and its profile is not loaded,
+    /// which initialization does before any request.
+    fn compaction_takes_mid_conversation_system(&self) -> bool {
+        if self.compaction_model.is_none() {
+            return self.takes_mid_conversation_system();
+        }
+        let profile = self
+            .compaction_profile
+            .as_ref()
+            .expect("an initialized agent has its compaction model's profile");
+        Self::profile_takes_mid_conversation_system(Some(profile))
+    }
+
+    fn profile_takes_mid_conversation_system(profile: Option<&ModelProfile>) -> bool {
+        profile.is_some_and(|profile| profile.abilities.contains(&Ability::MidConversationSystem))
+    }
+
     /// Brings the effort in force to the one the agent's own tier wants:
     /// appends a per-message update when its model takes one, clearing the
     /// effort to the model's default level, and otherwise settles the
@@ -2708,9 +2747,12 @@ where
             || self.request_parameters(),
             |compactor| (*compactor.parameters).clone(),
         );
-        let parameters = self
-            .prompt_cache
-            .apply(parameters, &messages, !definitions.is_empty());
+        let parameters = self.prompt_cache.apply(
+            parameters,
+            &messages,
+            !definitions.is_empty(),
+            self.compaction_takes_mid_conversation_system(),
+        );
         LLMRequest::new(messages)
             .with_parameters(parameters)
             .with_tool_definitions(definitions)
@@ -3256,6 +3298,17 @@ where
         if self.profile.is_none() {
             self.load_profile().await?;
         }
+        if self.compaction_profile.is_none()
+            && let Some(compactor) = &self.compaction_model
+        {
+            self.compaction_profile = Some(
+                compactor
+                    .model
+                    .profile()
+                    .await
+                    .map_err(|e| AgentError::from_model_error(&e))?,
+            );
+        }
         if self.initialized {
             return Ok(());
         }
@@ -3508,9 +3561,12 @@ where
         self.requests_sent += 1;
         self.prompt_cache
             .observe_prefix(self.context.stable_prefix_fingerprint());
-        let parameters = self
-            .prompt_cache
-            .apply(self.request_parameters(), &messages, has_tools);
+        let parameters = self.prompt_cache.apply(
+            self.request_parameters(),
+            &messages,
+            has_tools,
+            self.takes_mid_conversation_system(),
+        );
         let request = LLMRequest::new(messages)
             .with_parameters(parameters)
             .with_tool_definitions(definitions);
@@ -6973,6 +7029,65 @@ mod tests {
                 .expect("compaction lands")
         );
         assert_eq!(compactor.recorded().len(), 1);
+    }
+
+    /// The Claude message breakpoint of a compaction request lands on the
+    /// message the Claude request marks, from the ability of the model the
+    /// request goes to: the compaction model's, not the agent's.
+    #[tokio::test]
+    async fn a_compaction_request_places_its_breakpoint_by_the_compaction_models_ability() {
+        use aither_core::llm::model::{ClaudeCacheBreakpointTarget, ClaudePromptCacheStrategy};
+
+        for (main_takes, compactor_takes) in [(false, true), (true, false)] {
+            let model = |takes: bool| {
+                let llm = ScriptedLlm::new(1_000_000, []);
+                if takes {
+                    llm.with_ability(Ability::MidConversationSystem)
+                } else {
+                    llm
+                }
+            };
+            let mut agent = Agent::builder(model(main_takes))
+                .compaction_model(model(compactor_takes), Parameters::default())
+                .build();
+            agent.ensure_initialized().await.expect("agent initializes");
+            let messages = vec![
+                Message::system("prefix"),
+                Message::user("hello"),
+                Message::assistant("hi"),
+                Message::system("live tail"),
+            ];
+            let request = agent.compaction_request(messages.clone(), Vec::new());
+            let Some(claude) = request.parameters().cache.claude else {
+                panic!("the request carries Claude cache controls");
+            };
+            let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude.strategy else {
+                panic!("expected explicit breakpoints");
+            };
+            let Some(ClaudeCacheBreakpointTarget::Message { message_index, .. }) =
+                breakpoints.second.map(|point| point.target)
+            else {
+                panic!("expected a message breakpoint");
+            };
+
+            // The list the compaction model's client sends: the leading
+            // system message always leaves it, a later one only when the
+            // model cannot take it in place.
+            let sent: Vec<&Message> = messages
+                .iter()
+                .enumerate()
+                .filter(|(position, message)| {
+                    message.role() != Role::System || (compactor_takes && *position > 0)
+                })
+                .map(|(_, message)| message)
+                .collect();
+            assert_eq!(
+                sent[message_index].content(),
+                "hi",
+                "the breakpoint marks the newest message before the live tail \
+                 (agent {main_takes}, compaction model {compactor_takes})"
+            );
+        }
     }
 
     /// The host's parameters reach the provider on the turns and the

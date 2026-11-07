@@ -1608,6 +1608,11 @@ pub enum Ability {
     /// [`Message::Configuration`](crate::llm::Message::Configuration), without
     /// the request-level effort changing — so the prompt cache stays warm.
     PerMessageEffort,
+    /// The model takes a system message inside the conversation, after the
+    /// leading system prompt, as a system turn of its own — so an
+    /// instruction that changes every request can follow the cached prefix
+    /// instead of rewriting the system prompt.
+    MidConversationSystem,
 }
 
 #[cfg(test)]
