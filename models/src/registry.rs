@@ -393,6 +393,7 @@ fn parse_ability(s: &str) -> Option<Ability> {
         "PromptCaching" => Some(Ability::PromptCaching),
         "AssistantPrefill" => Some(Ability::AssistantPrefill),
         "PerMessageEffort" => Some(Ability::PerMessageEffort),
+        "MidConversationSystem" => Some(Ability::MidConversationSystem),
         _ => None,
     }
 }
@@ -412,6 +413,27 @@ pub mod tests {
         registry
             .lookup(query)
             .map(|entry| entry.litellm_id().to_owned())
+    }
+
+    /// Mid-conversation system messages follow Anthropic's documented model
+    /// list.
+    #[test]
+    fn mid_conversation_system_follows_the_documented_models() {
+        for (id, expected) in [
+            ("claude-opus-5-5", true),
+            ("claude-opus-4-8", true),
+            ("claude-sonnet-5-5", true),
+            ("claude-fable-5", true),
+            ("claude-sonnet-5", false),
+            ("gpt-6-sol", false),
+        ] {
+            let entry = crate::lookup(id).unwrap_or_else(|| panic!("{id} is in the snapshot"));
+            assert_eq!(
+                entry.has_ability(Ability::MidConversationSystem),
+                expected,
+                "{id}"
+            );
+        }
     }
 
     /// Per-message effort follows the vendors' documented model lists, on

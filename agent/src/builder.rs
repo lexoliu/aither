@@ -1051,6 +1051,7 @@ where
                     inherited.effort
                 }),
             profile: inherited.and_then(|inherited| inherited.profile),
+            compaction_profile: None,
             background_receiver,
             permission_receiver,
             kept_receiver,

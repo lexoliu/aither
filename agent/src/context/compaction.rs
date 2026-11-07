@@ -850,6 +850,7 @@ mod tests {
             Parameters::default(),
             &messages,
             false,
+            false,
         );
         let main = LLMRequest::new(messages).with_parameters(parameters);
         let fork = CompactionFork::new(&main, 0, &[], None, &[]).expect("fork");

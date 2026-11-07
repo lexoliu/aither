@@ -133,6 +133,27 @@ const ANTHROPIC_PER_MESSAGE_EFFORT_MODELS: &[&str] = &[
     "claude-haiku-5-5",
 ];
 
+/// The Claude models whose Messages API takes a system message inside
+/// `messages`. `LiteLLM` carries no such flag, so it is curated here.
+const ANTHROPIC_MID_CONVERSATION_SYSTEM_MODELS: &[&str] = &[
+    "claude-opus-4-8",
+    "claude-fable-5",
+    "claude-fable-5-1",
+    "claude-mythos-5",
+    "claude-mythos-5-1",
+    "claude-opus-5",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+];
+
+/// Whether the Claude API takes a mid-conversation system message for
+/// `canonical_id` on the platform `provider` names.
+#[must_use]
+pub fn takes_mid_conversation_system(provider: &str, canonical_id: &str) -> bool {
+    provider == "anthropic" && ANTHROPIC_MID_CONVERSATION_SYSTEM_MODELS.contains(&canonical_id)
+}
+
 /// The platforms Anthropic documents the per-message effort change on: the
 /// Claude API and Google Cloud.
 const ANTHROPIC_PER_MESSAGE_EFFORT_PLATFORMS: &[&str] = &["anthropic", "vertex_ai"];
@@ -298,6 +319,9 @@ pub fn convert_litellm_entry(key: &str, raw: &RawLiteLLMEntry) -> Option<Convert
     }
     if takes_per_message_effort(&provider, &canonical_id) {
         abilities.push("PerMessageEffort");
+    }
+    if takes_mid_conversation_system(&provider, &canonical_id) {
+        abilities.push("MidConversationSystem");
     }
 
     Some(ConvertedEntry {
