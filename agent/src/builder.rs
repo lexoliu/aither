@@ -1470,7 +1470,7 @@ mod tests {
             .await
             .unwrap();
         let registry =
-            std::sync::Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+            std::sync::Arc::new(ToolRegistryBuilder::new().build(terminal.output_store().clone()));
         let terminal = terminal.with_registry(registry);
         let subagent = terminal
             .binding()

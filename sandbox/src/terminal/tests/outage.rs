@@ -29,7 +29,7 @@ async fn terminal(
         ssh: false,
     })
     .with_connectivity(connectivity);
-    let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+    let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
     (cache, tool.with_registry(registry))
 }
 

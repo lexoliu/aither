@@ -63,7 +63,6 @@ mod grants;
 mod heel_binary;
 mod memory;
 pub mod monitor;
-mod naming;
 mod notices;
 mod outage;
 mod output;
@@ -102,6 +101,11 @@ pub mod permission;
 /// Isolated git for tests, shared with dependent crates through the `test-git` feature.
 #[cfg(any(test, feature = "test-git"))]
 pub mod test_git;
+
+/// Id allocators for tests, shared with dependent crates through the
+/// `test-ids` feature.
+#[cfg(any(test, feature = "test-ids"))]
+pub mod test_ids;
 
 pub use bollard_exec::BollardContainerExec;
 pub use command::{

@@ -213,15 +213,16 @@ impl CommandPayload {
     }
 }
 
-/// Writes a binary payload into `output_dir` and renders the line that
+/// Writes a binary payload into `outputs` and renders the line that
 /// references the stored file, the way terminal output references stored
 /// images.
 async fn stored_binary_text(
     mime: &str,
     content: &[u8],
-    output_dir: &Path,
+    outputs: &OutputStore,
 ) -> Result<String, String> {
-    let (url, path) = crate::output::save_binary_to_file(output_dir, content, mime)
+    let (url, path) = outputs
+        .save_binary(content, mime)
         .await
         .map_err(|error| prefix_error("failed to store binary tool result: ", &error))?;
     Ok(StoredBinaryPartTemplate {
@@ -649,7 +650,7 @@ struct Resolved<'a> {
     stdin_arg: Option<&'a str>,
 }
 
-use crate::output::{INLINE_OUTPUT_LIMIT, generate_word_filename};
+use crate::output::{INLINE_OUTPUT_LIMIT, OutputStore};
 use crate::permission::TerminalMode;
 use crate::terminal::TerminalBinding;
 
@@ -657,8 +658,8 @@ use crate::terminal::TerminalBinding;
 ///
 /// Returns the output as-is if small enough, or saves to file and returns
 /// a reference message if the output exceeds the limit.
-async fn handle_large_output(output: ToolResult, output_dir: &Path) -> CommandEnvelope {
-    let output = match tool_output_to_payload(output, output_dir).await {
+async fn handle_large_output(output: ToolResult, outputs: &OutputStore) -> CommandEnvelope {
+    let output = match tool_output_to_payload(output, outputs).await {
         Ok(Some(output)) => output,
         Ok(None) => return CommandEnvelope::success_empty(),
         Err(error) => return CommandEnvelope::failure(error),
@@ -674,23 +675,14 @@ async fn handle_large_output(output: ToolResult, output_dir: &Path) -> CommandEn
         return CommandEnvelope::success(output);
     }
 
-    // Generate four-random-words filename (consistent with rest of codebase)
-    let mut filename = generate_word_filename();
-    filename.push_str(".txt");
-    let filepath = output_dir.join(&filename);
-
     let line_count = rendered.lines().count();
 
-    if let Err(error) = async_fs::write(&filepath, &rendered).await {
-        let filepath_text = filepath.display().to_string();
-        let error_text = error.to_string();
-        let mut message = String::with_capacity(filepath_text.len() + error_text.len() + 25);
-        message.push_str("failed to write output to ");
-        message.push_str(filepath_text.as_str());
-        message.push_str(": ");
-        message.push_str(error_text.as_str());
-        return CommandEnvelope::failure(message);
-    }
+    let filepath = match outputs.save_raw(rendered.as_bytes()).await {
+        Ok((_, filepath)) => filepath,
+        Err(error) => {
+            return CommandEnvelope::failure(prefix_error("failed to store output: ", &error));
+        }
+    };
 
     CommandEnvelope::success(CommandPayload::Text {
         content: output_saved_text(
@@ -706,7 +698,7 @@ async fn handle_large_output(output: ToolResult, output_dir: &Path) -> CommandEn
 ///
 /// Everything becomes text for the model: text-like results pass through, a
 /// command result renders its prose, and every binary payload, a lone one
-/// included, is written to `output_dir` and replaced by a line naming the
+/// included, is written to `outputs` and replaced by a line naming the
 /// stored file. A typed tool error becomes the command's error.
 ///
 /// # Errors
@@ -716,7 +708,7 @@ async fn handle_large_output(output: ToolResult, output_dir: &Path) -> CommandEn
 /// error).
 pub async fn tool_output_to_payload(
     output: impl IntoToolResult,
-    output_dir: &Path,
+    outputs: &OutputStore,
 ) -> Result<Option<CommandPayload>, String> {
     let text = match output
         .into_tool_result()
@@ -725,14 +717,14 @@ pub async fn tool_output_to_payload(
         ToolResult::Done => return Ok(None),
         ToolResult::Error { message } => return Err(message),
         ToolResult::Binary { mime, content } => {
-            stored_binary_text(&mime, &content, output_dir).await?
+            stored_binary_text(&mime, &content, outputs).await?
         }
         ToolResult::Parts { parts } => {
             let mut rendered = String::new();
             for part in &parts {
                 let text = match part {
                     ToolResultPart::Binary { mime, content } => {
-                        stored_binary_text(mime, content, output_dir).await?
+                        stored_binary_text(mime, content, outputs).await?
                     }
                     ToolResultPart::Text { .. } | ToolResultPart::Tsv { .. } => {
                         part.render_for_model()
@@ -1235,11 +1227,13 @@ impl ToolRegistryBuilder {
         self.notices = notices;
     }
 
-    /// Builds an immutable main-agent registry with a concrete output
-    /// directory; [`ToolRegistry::for_subagent`] derives the subagent view.
-    /// Terminal-bound commands are built when a terminal serves it.
+    /// Builds an immutable main-agent registry storing large and binary
+    /// command results in `outputs`; [`ToolRegistry::for_subagent`] derives
+    /// the subagent view. Terminal-bound commands are built when a terminal
+    /// serves it, and a terminal serving it stores results in its own
+    /// [`OutputStore`].
     #[must_use]
-    pub fn build(self, output_dir: impl Into<PathBuf>) -> ToolRegistry {
+    pub fn build(self, outputs: OutputStore) -> ToolRegistry {
         let (kept_tx, kept_rx) = async_channel::unbounded();
         ToolRegistry {
             kept: Arc::new(self.kept),
@@ -1249,7 +1243,7 @@ impl ToolRegistryBuilder {
             bound: self.bound,
             sets: self.sets.into(),
             instances: HashMap::new(),
-            output_dir: output_dir.into(),
+            outputs,
             role: CommandRole::Main,
             mode: None,
             observer: self.observer,
@@ -1466,7 +1460,7 @@ pub struct ToolRegistry {
     /// The terminal-bound commands built for the terminal serving this
     /// registry, in its role.
     instances: HashMap<String, Arc<ToolEntry>>,
-    output_dir: PathBuf,
+    outputs: OutputStore,
     role: CommandRole,
     /// The mode of the terminal execution this registry serves, once
     /// [`Self::in_mode`] has scoped it to one; `None` has every command.
@@ -1522,7 +1516,7 @@ impl ToolRegistry {
     pub(crate) fn with_terminal_controls(
         mut self,
         jobs: crate::JobRegistry,
-        output_dir: PathBuf,
+        outputs: OutputStore,
     ) -> Self {
         let mut controls = ToolRegistryBuilder::new();
         controls.configure_tool(crate::builtin::KillTerminalTool::new(jobs.clone()));
@@ -1532,7 +1526,7 @@ impl ToolRegistry {
             self.notices.clone(),
         ));
         self.entries.extend(controls.entries);
-        self.output_dir = output_dir;
+        self.outputs = outputs;
         self
     }
 
@@ -1606,7 +1600,7 @@ impl ToolRegistry {
             bound: self.bound.clone(),
             sets: self.sets.clone(),
             instances: HashMap::new(),
-            output_dir: self.output_dir.clone(),
+            outputs: self.outputs.clone(),
             role: CommandRole::Subagent,
             mode: None,
             observer,
@@ -1766,7 +1760,7 @@ impl ToolRegistry {
             working_dir: working_dir.map(|dir| dir.to_string_lossy().into_owned()),
         };
         let outcome = match handler(caller, args.to_vec()).await {
-            Ok(output) => handle_large_output(output, &self.output_dir).await,
+            Ok(output) => handle_large_output(output, &self.outputs).await,
             Err(error) => {
                 tracing::warn!(tool = %tool_name, %error, "command failed");
                 CommandEnvelope::failure(error)
@@ -2184,7 +2178,7 @@ pub fn register_ipc_gateway_command(
 pub struct ToolCommand<T: Tool> {
     tool: T,
     schema: Value,
-    output_dir: PathBuf,
+    outputs: OutputStore,
 }
 
 impl<T: Tool + std::fmt::Debug> std::fmt::Debug for ToolCommand<T> {
@@ -2200,16 +2194,16 @@ where
     T::Arguments: DeserializeOwned + JsonSchema,
 {
     /// Creates a new command wrapper for the given tool. Binary results are
-    /// stored in `output_dir`.
+    /// stored in `outputs`.
     ///
     /// # Panics
     /// Panics if the tool argument schema cannot be serialized.
-    pub fn new(tool: T, output_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(tool: T, outputs: OutputStore) -> Self {
         let schema = tool_schema::<T::Arguments>();
         Self {
             tool,
             schema,
-            output_dir: output_dir.into(),
+            outputs,
         }
     }
 
@@ -2234,7 +2228,7 @@ where
         let parsed: T::Arguments = serde_json::from_value(json_args)?;
         // A CLI invocation has nowhere to show progress.
         let output = self.tool.call(parsed, ToolContext::new()).await?;
-        let payload = tool_output_to_payload(output, &self.output_dir)
+        let payload = tool_output_to_payload(output, &self.outputs)
             .await
             .map_err(anyhow::Error::msg)?;
         Ok(payload.map_or_else(String::new, |payload| payload.render_for_cli()))
@@ -2251,7 +2245,7 @@ pub struct IpcToolCommand<T: Tool> {
     name: String,
     stdin_arg: Option<String>,
     help: String,
-    output_dir: PathBuf,
+    outputs: OutputStore,
 }
 
 impl<T: Tool + std::fmt::Debug> std::fmt::Debug for IpcToolCommand<T> {
@@ -2271,7 +2265,7 @@ impl<T: Tool + Clone> Clone for IpcToolCommand<T> {
             name: self.name.clone(),
             stdin_arg: self.stdin_arg.clone(),
             help: self.help.clone(),
-            output_dir: self.output_dir.clone(),
+            outputs: self.outputs.clone(),
         }
     }
 }
@@ -2282,11 +2276,11 @@ where
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
     /// Creates a new IPC command wrapper for the given tool. Binary results
-    /// are stored in `output_dir`.
+    /// are stored in `outputs`.
     ///
     /// # Panics
     /// Panics if the tool argument schema cannot be serialized.
-    pub fn new(tool: T, output_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(tool: T, outputs: OutputStore) -> Self {
         let schema = tool_schema::<T::Arguments>();
         let name = tool.name().to_string();
         let stdin_arg = detect_stdin_arg(&schema);
@@ -2298,7 +2292,7 @@ where
             name,
             stdin_arg,
             help,
-            output_dir: output_dir.into(),
+            outputs,
         }
     }
 }
@@ -2359,7 +2353,7 @@ where
         // it ran in is known.
         let cx = ToolContext::new().with_working_dir(context.working_dir().to_string_lossy());
         match self.tool.call(parsed, cx).await {
-            Ok(output) => tool_output_to_payload(output, &self.output_dir)
+            Ok(output) => tool_output_to_payload(output, &self.outputs)
                 .await
                 .map(|payload| payload.map_or_else(String::new, |payload| payload.render_for_cli()))
                 .map_err(IpcError::remote),
@@ -2380,18 +2374,18 @@ where
 /// use heel::IpcRouter;
 ///
 /// let router = IpcRouter::new();
-/// let router = register_tool_direct(router, my_tool, outputs_dir);
+/// let router = register_tool_direct(router, my_tool, outputs);
 /// ```
 pub fn register_tool_direct<T>(
     router: heel::IpcRouter,
     tool: T,
-    output_dir: impl Into<PathBuf>,
+    outputs: OutputStore,
 ) -> heel::IpcRouter
 where
     T: Tool + Send + Sync + Clone + Default + 'static,
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
-    router.register(IpcToolCommand::new(tool, output_dir))
+    router.register(IpcToolCommand::new(tool, outputs))
 }
 
 /// Converts CLI arguments to JSON using schema information.
@@ -3314,6 +3308,11 @@ mod tests {
     use schemars::JsonSchema;
     use serde::Deserialize;
 
+    /// An output store in `dir` leasing from the default allocator.
+    fn test_outputs(dir: &Path) -> OutputStore {
+        OutputStore::at(dir.to_path_buf(), aither_core::AnyIdAllocator::default())
+    }
+
     fn single_stored_file(dir: &Path) -> PathBuf {
         let mut files = std::fs::read_dir(dir)
             .unwrap()
@@ -3332,7 +3331,7 @@ mod tests {
                 ToolResultPart::text("see below"),
                 ToolResultPart::image(png.clone(), "image/png"),
             ]),
-            dir.path(),
+            &test_outputs(dir.path()),
         )
         .await
         .unwrap()
@@ -3356,11 +3355,13 @@ mod tests {
     async fn lone_binary_tool_result_is_stored_and_referenced() {
         let dir = tempfile::tempdir().unwrap();
         let png = vec![0x89, 0x50, 0x4E, 0x47];
-        let payload =
-            tool_output_to_payload(ToolResult::image(png.clone(), "image/png"), dir.path())
-                .await
-                .unwrap()
-                .expect("a lone image produces a payload");
+        let payload = tool_output_to_payload(
+            ToolResult::image(png.clone(), "image/png"),
+            &test_outputs(dir.path()),
+        )
+        .await
+        .unwrap()
+        .expect("a lone image produces a payload");
 
         let CommandPayload::Text { content } = payload;
         let file = single_stored_file(dir.path());
@@ -3613,7 +3614,7 @@ mod tests {
         // Simulate IPC params (key-value pairs from `heel ipc`)
         let json = r#"{"query": "rust async", "max": 5}"#;
         let tmp = tempfile::tempdir().unwrap();
-        let registry = ToolRegistryBuilder::new().build(tmp.path());
+        let registry = ToolRegistryBuilder::new().build(test_outputs(tmp.path()));
         let cmd = ToolCallCommand::new("websearch", Arc::new(registry));
         let args: std::collections::HashMap<String, Value> = serde_json::from_str(json).unwrap();
 
@@ -3631,7 +3632,7 @@ mod tests {
     #[test]
     fn test_tool_call_command_name() {
         let tmp = tempfile::tempdir().unwrap();
-        let registry = ToolRegistryBuilder::new().build(tmp.path());
+        let registry = ToolRegistryBuilder::new().build(test_outputs(tmp.path()));
         let cmd = ToolCallCommand::new("my_tool", Arc::new(registry));
         assert_eq!(cmd.name(), "my_tool");
     }
@@ -4183,7 +4184,7 @@ mod tests {
     #[test]
     fn test_tool_call_command_args_to_cli_with_array() {
         let tmp = tempfile::tempdir().unwrap();
-        let registry = ToolRegistryBuilder::new().build(tmp.path());
+        let registry = ToolRegistryBuilder::new().build(test_outputs(tmp.path()));
         let _cmd = ToolCallCommand::new("ask_user", Arc::new(registry));
         let args: std::collections::HashMap<String, Value> =
             serde_json::from_value(serde_json::json!({
@@ -4204,7 +4205,7 @@ mod tests {
     #[test]
     fn test_tool_call_command_raw_args_passthrough() {
         let tmp = tempfile::tempdir().unwrap();
-        let registry = ToolRegistryBuilder::new().build(tmp.path());
+        let registry = ToolRegistryBuilder::new().build(test_outputs(tmp.path()));
         let _cmd = ToolCallCommand::new("ask_user", Arc::new(registry));
         // Simulates what `heel ipc` sends
         let args: std::collections::HashMap<String, Value> =
@@ -4285,14 +4286,14 @@ mod tests {
         std::fs::write(&output_dir, "occupied").unwrap();
         let output = ToolResult::text("x".repeat(INLINE_OUTPUT_LIMIT + 1));
 
-        let result = handle_large_output(output, &output_dir).await;
+        let result = handle_large_output(output, &test_outputs(&output_dir)).await;
         assert!(!result.ok);
         assert!(
             result
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("failed to write output")
+                .contains("failed to store output")
         );
     }
 
@@ -4349,7 +4350,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(FakeAskUser);
-        let registry = std::sync::Arc::new(builder.build(tmp.path()));
+        let registry = std::sync::Arc::new(builder.build(test_outputs(tmp.path())));
 
         // Simulate what `heel ipc` sends: all args in an "args" array
         let cmd = ToolCallCommand::new("ask_user", registry);
@@ -4410,7 +4411,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(FakeFileOps);
-        let registry = std::sync::Arc::new(builder.build(tmp.path()));
+        let registry = std::sync::Arc::new(builder.build(test_outputs(tmp.path())));
         let cmd = ToolCallCommand::new("file_ops", registry);
 
         // `file_ops read input.txt` — the subcommand word and the variant's
@@ -4486,7 +4487,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(WhereTool);
-        let registry = std::sync::Arc::new(builder.build(tmp.path()));
+        let registry = std::sync::Arc::new(builder.build(test_outputs(tmp.path())));
 
         let none = registry.query_tool_handler("where_am_i", &[]).await;
         assert_eq!(envelope_to_cli(none).unwrap(), "none");
@@ -4584,7 +4585,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(FailingTool);
-        let registry = builder.build(tmp.path());
+        let registry = builder.build(test_outputs(tmp.path()));
 
         let envelope = run_command(&registry, "broken").await;
 
@@ -4613,7 +4614,7 @@ mod tests {
             name: "ordinary",
             answer: "ran",
         });
-        let registry = builder.build(tmp.path());
+        let registry = builder.build(test_outputs(tmp.path()));
         let receiver = registry.kept_receiver();
         let call = |id: &str| {
             registry.for_call(CallIdentity::new(ToolCallId::new(id), AgentIdentity::Main))
@@ -4699,7 +4700,7 @@ mod tests {
             answer: "fixed",
         });
         builder.command_set(set.clone());
-        let main = builder.build(tmp.path());
+        let main = builder.build(test_outputs(tmp.path()));
         let subagent = main.for_subagent(None, None);
         let args = ["hi".to_string()];
 
@@ -4752,7 +4753,7 @@ mod tests {
             name: "shared",
             answer: "anyone ran it",
         });
-        let main = builder.build(tmp.path());
+        let main = builder.build(test_outputs(tmp.path()));
         let subagent = main.for_subagent(None, None);
 
         let ok = run_command(&main, "reserved").await;
@@ -4794,7 +4795,7 @@ mod tests {
             name: "shared",
             answer: "every mode ran it",
         });
-        let main = builder.build(tmp.path());
+        let main = builder.build(test_outputs(tmp.path()));
 
         let sandboxed = main.in_mode(TerminalMode::Sandboxed);
         let answered = run_command(&sandboxed, "gh").await;
@@ -4834,7 +4835,7 @@ mod tests {
                 answer: "subagent handler",
             },
         );
-        let main = builder.build(tmp.path());
+        let main = builder.build(test_outputs(tmp.path()));
         let subagent = main.for_subagent(None, None);
 
         let answer =
@@ -4852,7 +4853,7 @@ mod tests {
     fn a_subagent_registry_delegates_the_subagent_registry() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = ToolRegistryBuilder::new()
-            .build(tmp.path())
+            .build(test_outputs(tmp.path()))
             .for_subagent(None, None)
             .for_subagent(None, None);
         assert_eq!(nested.role(), CommandRole::Subagent);
@@ -4880,7 +4881,7 @@ mod tests {
             answer: "anyone ran it",
         });
         builder.observe_commands(AnyCommandObserver::new(CallLog(Arc::clone(&main_calls))));
-        let main = builder.build(tmp.path());
+        let main = builder.build(test_outputs(tmp.path()));
         let subagent = main.for_subagent(
             Some(AnyCommandObserver::new(CallLog(Arc::clone(
                 &subagent_calls,

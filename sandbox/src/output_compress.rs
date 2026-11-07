@@ -29,9 +29,9 @@ mod json_tsv;
 mod preview;
 mod render;
 
-use std::path::Path;
-
 use askama::Template;
+
+use crate::output::OutputStore;
 
 pub use preview::stored_preview;
 
@@ -71,7 +71,7 @@ pub fn folded_code_content(text: &str) -> Option<String> {
 /// Returns `None` when the text is already what a terminal would show and no
 /// stage applied, so the caller can keep the original bytes.
 ///
-/// `store_dir` receives the original of any lossy stage; the returned text
+/// `store` receives the original of any lossy stage; the returned text
 /// names that file. The returned text is **not** yet split between inline and
 /// stored delivery -- that is [`crate::output`]'s job, and the text handed to
 /// it is what gets stored, so the line numbers in a preview marker refer to
@@ -80,8 +80,8 @@ pub fn folded_code_content(text: &str) -> Option<String> {
 /// # Errors
 ///
 /// Returns an error when a lossy stage applied but its original could not be
-/// written to `store_dir`.
-pub async fn compress_text(store_dir: &Path, text: &str) -> std::io::Result<Option<String>> {
+/// written to `store`.
+pub async fn compress_text(store: &OutputStore, text: &str) -> std::io::Result<Option<String>> {
     if text.is_empty() {
         return Ok(None);
     }
@@ -89,7 +89,7 @@ pub async fn compress_text(store_dir: &Path, text: &str) -> std::io::Result<Opti
     let cleaned = collapse::collapse_blank_runs(&render::render_terminal(text));
 
     if let Some(tsv) = json_tsv::to_tsv(&cleaned) {
-        let (url, path) = crate::output::save_raw_to_file(store_dir, cleaned.as_bytes()).await?;
+        let (url, path) = store.save_raw(cleaned.as_bytes()).await?;
         let path = path.display().to_string();
         let rendered = JsonTsvOutput {
             tsv: tsv.trim_end_matches('\n'),
@@ -106,11 +106,18 @@ pub async fn compress_text(store_dir: &Path, text: &str) -> std::io::Result<Opti
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+
+    /// A store in `dir` leasing from the default allocator.
+    fn store(dir: &Path) -> OutputStore {
+        OutputStore::at(dir.to_path_buf(), aither_core::AnyIdAllocator::default())
+    }
 
     async fn compress(text: &str) -> Option<String> {
         let dir = tempfile::tempdir().expect("tempdir");
-        compress_text(dir.path(), text)
+        compress_text(&store(dir.path()), text)
             .await
             .expect("compression succeeds")
     }
@@ -170,7 +177,7 @@ mod tests {
             {"id": 4, "name": "Diana", "email": "diana@aither.test", "role": "admin"}
         ]"#;
         let dir = tempfile::tempdir().expect("tempdir");
-        let cleaned = compress_text(dir.path(), json)
+        let cleaned = compress_text(&store(dir.path()), json)
             .await
             .expect("compression succeeds")
             .expect("json becomes tsv");
@@ -243,7 +250,7 @@ mod tests {
         let diff = git_output(repo, &["diff", "--color=always", "--", "main.rs"]);
         assert!(diff.contains('\u{1b}'), "git diff should be coloured");
 
-        let cleaned = compress_text(repo, &diff)
+        let cleaned = compress_text(&store(repo), &diff)
             .await
             .expect("compression succeeds")
             .expect("coloured diff is cleaned");

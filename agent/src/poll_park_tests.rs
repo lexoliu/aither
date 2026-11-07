@@ -15,7 +15,7 @@ use futures_core::Stream;
 
 use crate::{Agent, AgentBuilder, AgentOptions, BackgroundJobPolicy};
 
-const TASK: &str = "amber-forest-thunder-pearl";
+const TASK: &str = "amber";
 /// What the background build reports when it finishes.
 const FINISHED: &str = "the build finished";
 /// The start of the text an unchanged `terminal_read` is refused with.
@@ -117,7 +117,7 @@ async fn polling_agent(
     registry
         .register(
             7,
-            TASK,
+            &aither_sandbox::test_ids::lease(TASK),
             "exec-build",
             "cargo check",
             TerminalMode::Sandboxed,

@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use aither_core::IdLease;
 use async_channel::{Receiver, Sender, WeakSender};
 use futures_lite::io::AsyncWriteExt;
 
@@ -238,6 +239,8 @@ enum TerminalStream {
 #[derive(Debug)]
 struct JobState {
     info: JobInfo,
+    /// Keeps the job's task id leased while the registry keeps the job.
+    _task_id: IdLease,
     terminal_buffer: Vec<u8>,
     /// Complete lines only, each from one stream, in the order they
     /// completed: what the `monitor` pump reads.
@@ -281,7 +284,7 @@ enum SettledWaiter {
 enum StateCommand {
     Register {
         pid: u32,
-        task_id: String,
+        task_id: IdLease,
         execution_key: String,
         script: String,
         language: ScriptLanguage,
@@ -494,11 +497,16 @@ impl JobRegistry {
             .expect("job registry response dropped")
     }
 
-    /// Registers a new running job.
+    /// Registers a new running job under `task_id`, the word its model
+    /// addresses it by.
+    ///
+    /// The registry holds the lease for as long as it keeps the job: the word
+    /// stays leased until a job with the same pid replaces it or the registry
+    /// drops.
     pub async fn register(
         &self,
         pid: u32,
-        task_id: &str,
+        task_id: &IdLease,
         execution_key: &str,
         script: &str,
         mode: TerminalMode,
@@ -526,7 +534,7 @@ impl JobRegistry {
         &self,
         place: JobPlace,
         pid: u32,
-        task_id: &str,
+        task_id: &IdLease,
         execution_key: &str,
         script: &str,
         language: ScriptLanguage,
@@ -553,7 +561,7 @@ impl JobRegistry {
     pub(crate) async fn register_with_tree(
         &self,
         pid: u32,
-        task_id: &str,
+        task_id: &IdLease,
         execution_key: &str,
         script: &str,
         language: ScriptLanguage,
@@ -565,7 +573,7 @@ impl JobRegistry {
         self.send_command(StateCommand::Register {
             place,
             pid,
-            task_id: task_id.to_string(),
+            task_id: task_id.clone(),
             execution_key: execution_key.to_string(),
             script: script.to_string(),
             language,
@@ -1203,7 +1211,7 @@ fn has_running_job(jobs: &HashMap<u32, JobState>) -> bool {
 fn register_job(
     jobs: &mut HashMap<u32, JobState>,
     pid: u32,
-    task_id: String,
+    task_id: IdLease,
     execution_key: String,
     script: String,
     language: ScriptLanguage,
@@ -1214,7 +1222,7 @@ fn register_job(
     let info = JobInfo {
         place,
         pid,
-        task_id,
+        task_id: task_id.to_string(),
         execution_key,
         script,
         language,
@@ -1223,14 +1231,15 @@ fn register_job(
         status: JobStatus::Running,
         output_path,
     };
-    jobs.insert(pid, JobState::new(info));
+    jobs.insert(pid, JobState::new(info, task_id));
     tracing::debug!(pid = %pid, "registered background job");
 }
 
 impl JobState {
-    const fn new(info: JobInfo) -> Self {
+    const fn new(info: JobInfo, task_id: IdLease) -> Self {
         Self {
             info,
+            _task_id: task_id,
             terminal_buffer: Vec::new(),
             line_buffer: Vec::new(),
             stdout_partial: Vec::new(),
@@ -1868,6 +1877,7 @@ fn terminal_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_ids::lease;
     use executor_core::Executor;
     use executor_core::Task;
     use executor_core::tokio::TokioGlobal;
@@ -1881,31 +1891,78 @@ mod tests {
         registry
     }
 
+    /// A job's task id stays leased while the registry keeps the job, past
+    /// its end, and is released once the registry forgets it: when a job
+    /// with the same pid replaces it, or with the registry.
+    #[tokio::test]
+    async fn a_job_keeps_its_task_id_leased_until_the_registry_forgets_it() {
+        let ids = crate::test_ids::RecordingIds::default();
+        let allocator = ids.allocator();
+        let (registry, service) = job_registry_channel();
+        let served = tokio::spawn(service.serve());
+
+        let first = allocator.lease().unwrap();
+        registry
+            .register(1, &first, "exec", "run", TerminalMode::Sandboxed, None)
+            .await;
+        let second = allocator.lease().unwrap();
+        registry
+            .register(2, &second, "exec", "run", TerminalMode::Sandboxed, None)
+            .await;
+        drop((first, second));
+        registry.complete(1, 0, None).await;
+        assert!(registry.get_by_task_id("alfa").await.is_some());
+        assert!(ids.released().is_empty(), "the registry holds both");
+
+        let reused_pid = allocator.lease().unwrap();
+        registry
+            .register(1, &reused_pid, "exec", "run", TerminalMode::Sandboxed, None)
+            .await;
+        drop(reused_pid);
+        // The registry serves commands in order, so this list sees the
+        // replacement.
+        assert_eq!(registry.list().await.len(), 2);
+        assert_eq!(ids.released(), ["alfa"]);
+
+        drop(registry);
+        served.await.expect("the service ends with its last handle");
+        let mut released = ids.released();
+        released.sort();
+        assert_eq!(released, ["alfa", "bravo", "charlie"]);
+    }
+
     #[tokio::test]
     async fn unchanged_terminal_read_is_refused_then_succeeds_after_new_output() {
         let registry = spawn_registry();
         registry
-            .register(7, "task-a", "exec-a", "run", TerminalMode::Sandboxed, None)
+            .register(
+                7,
+                &lease("alpha"),
+                "exec-a",
+                "run",
+                TerminalMode::Sandboxed,
+                None,
+            )
             .await;
         registry.append_stdout(7, b"one".to_vec()).await;
 
         let first = registry
-            .terminal_read("task-a", 0, 1024)
+            .terminal_read("alpha", 0, 1024)
             .await
             .expect("first read succeeds");
-        let second = registry.terminal_read("task-a", first.cursor, 1024).await;
+        let second = registry.terminal_read("alpha", first.cursor, 1024).await;
         assert!(
             matches!(
                 &second,
                 Err(TerminalReadError::Refused(UnchangedTaskRead { task_id }))
-                    if task_id == "task-a"
+                    if task_id == "alpha"
             ),
             "an unchanged repeat read must be refused as a poll: {second:?}"
         );
 
         registry.append_stdout(7, b"two".to_vec()).await;
         let third = registry
-            .terminal_read("task-a", first.cursor, 1024)
+            .terminal_read("alpha", first.cursor, 1024)
             .await
             .expect("read succeeds once output changed");
         assert_eq!(third.bytes, b"two");
@@ -1921,7 +1978,7 @@ mod tests {
         registry
             .register(
                 12345,
-                "amber-forest-thunder-pearl",
+                &lease("amber"),
                 "exec-test",
                 "sleep 10",
                 TerminalMode::Sandboxed,
@@ -1932,7 +1989,7 @@ mod tests {
         let jobs = registry.list().await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].pid, 12345);
-        assert_eq!(jobs[0].task_id, "amber-forest-thunder-pearl");
+        assert_eq!(jobs[0].task_id, "amber");
         assert_eq!(jobs[0].execution_key, "exec-test");
         assert!(matches!(jobs[0].status, JobStatus::Running));
 
@@ -1957,7 +2014,7 @@ mod tests {
         registry
             .register(
                 1,
-                "task-a",
+                &lease("alpha"),
                 "exec-a",
                 "echo hello",
                 TerminalMode::Sandboxed,
@@ -1967,7 +2024,7 @@ mod tests {
         registry
             .register(
                 2,
-                "task-b",
+                &lease("beta"),
                 "exec-b",
                 "sleep 5",
                 TerminalMode::Sandboxed,
@@ -1977,8 +2034,8 @@ mod tests {
         registry.complete(2, 0, None).await;
 
         let running = registry.format_running_jobs().await;
-        assert!(running.contains("task task-a"));
-        assert!(!running.contains("task task-b"));
+        assert!(running.contains("task alpha"));
+        assert!(!running.contains("task beta"));
     }
 
     #[tokio::test]
@@ -1989,12 +2046,12 @@ mod tests {
             .detach();
 
         let temp = tempdir().unwrap();
-        let redirect_path = temp.path().join("task-stream.log");
+        let redirect_path = temp.path().join("stream.log");
 
         registry
             .register(
                 101,
-                "task-stream",
+                &lease("stream"),
                 "exec-stream",
                 "printf one",
                 TerminalMode::Sandboxed,
@@ -2006,7 +2063,7 @@ mod tests {
             .append_stdout(101, b"line1\nline2\n".to_vec())
             .await;
         let snapshot = registry
-            .start_output_redirect("task-stream", redirect_path.clone())
+            .start_output_redirect("stream", redirect_path.clone())
             .await
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&snapshot), "line1\nline2\n");
@@ -2036,7 +2093,7 @@ mod tests {
         registry
             .register(
                 202,
-                "task-delta",
+                &lease("delta"),
                 "exec-delta",
                 "tail -f log",
                 TerminalMode::Sandboxed,
@@ -2046,14 +2103,14 @@ mod tests {
         registry.append_stdout(202, b"hello ".to_vec()).await;
         registry.append_stderr(202, b"world".to_vec()).await;
 
-        let first = registry.terminal_read("task-delta", 0, 6).await.unwrap();
+        let first = registry.terminal_read("delta", 0, 6).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&first.bytes), "hello ");
         assert_eq!(first.cursor, 6);
         assert_eq!(first.total_bytes, 11);
         assert!(matches!(first.status, JobStatus::Running));
 
         let second = registry
-            .terminal_read("task-delta", first.cursor, 32)
+            .terminal_read("delta", first.cursor, 32)
             .await
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&second.bytes), "world");
@@ -2074,7 +2131,7 @@ mod tests {
         registry
             .register(
                 203,
-                "task-lines",
+                &lease("lines"),
                 "exec-lines",
                 "tail -F f",
                 TerminalMode::Sandboxed,
@@ -2088,16 +2145,13 @@ mod tests {
             .await;
         registry.append_stdout(203, b"unfinished".to_vec()).await;
 
-        let lines = registry
-            .monitor_read("task-lines", 0, usize::MAX)
-            .await
-            .unwrap();
+        let lines = registry.monitor_read("lines", 0, usize::MAX).await.unwrap();
         assert_eq!(
             String::from_utf8_lossy(&lines.bytes),
             "rotated\ntail: 'f' has been replaced\n"
         );
         let merged = registry
-            .terminal_read("task-lines", 0, usize::MAX)
+            .terminal_read("lines", 0, usize::MAX)
             .await
             .unwrap();
         assert_eq!(
@@ -2116,7 +2170,7 @@ mod tests {
         registry
             .register(
                 1,
-                "task-a",
+                &lease("alpha"),
                 "exec-a",
                 "echo hello",
                 TerminalMode::Sandboxed,
@@ -2139,7 +2193,7 @@ mod tests {
         registry
             .register(
                 555,
-                "task-kill-switch",
+                &lease("switch"),
                 "exec-kill-switch",
                 "sleep 10",
                 TerminalMode::Sandboxed,
@@ -2149,7 +2203,7 @@ mod tests {
         let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
         registry.attach_kill_switch(555, kill_tx).await;
 
-        assert!(registry.kill_by_task_id("task-kill-switch").await);
+        assert!(registry.kill_by_task_id("switch").await);
         assert!(kill_rx.recv().await.is_ok());
         let job = registry.get(555).await.expect("job should exist");
         assert!(matches!(job.status, JobStatus::Killed { .. }));
@@ -2161,7 +2215,7 @@ mod tests {
         registry
             .register(
                 557,
-                "task-input",
+                &lease("input"),
                 "exec-input",
                 "cat",
                 TerminalMode::Sandboxed,
@@ -2171,7 +2225,7 @@ mod tests {
         let (input_tx, input_rx) = async_channel::unbounded::<Vec<u8>>();
         registry.attach_terminal_input(557, input_tx).await;
         registry
-            .terminal_input("task-input", b"x".to_vec())
+            .terminal_input("input", b"x".to_vec())
             .await
             .expect("a running job takes input");
         assert_eq!(input_rx.recv().await.expect("input arrives"), b"x");
@@ -2181,7 +2235,7 @@ mod tests {
         // The registry handles commands in order, so this reply follows the
         // completion.
         let error = registry
-            .terminal_input("task-input", b"y".to_vec())
+            .terminal_input("input", b"y".to_vec())
             .await
             .expect_err("a finished job refuses input");
         assert!(error.contains("is not running"), "{error}");
@@ -2198,7 +2252,7 @@ mod tests {
         registry
             .register(
                 556,
-                "task-killed-complete",
+                &lease("finished"),
                 "exec-killed-complete",
                 "sleep 10",
                 TerminalMode::Sandboxed,
@@ -2207,7 +2261,7 @@ mod tests {
             .await;
         let (kill_tx, _kill_rx) = async_channel::bounded::<()>(1);
         registry.attach_kill_switch(556, kill_tx).await;
-        assert!(registry.kill_by_task_id("task-killed-complete").await);
+        assert!(registry.kill_by_task_id("finished").await);
 
         registry.complete(556, 0, None).await;
         let job = registry.get(556).await.expect("job should exist");
@@ -2229,7 +2283,7 @@ mod tests {
         registry
             .register(
                 1,
-                "task-cjk",
+                &lease("cjk"),
                 "exec-cjk",
                 &script,
                 TerminalMode::Sandboxed,
@@ -2255,7 +2309,7 @@ mod tests {
         register_job(
             &mut jobs,
             pid,
-            "task".to_string(),
+            lease("task"),
             "exec".to_string(),
             "true".to_string(),
             ScriptLanguage::Shell,
@@ -2330,7 +2384,7 @@ mod tests {
         registry
             .register(
                 557,
-                "task-settled",
+                &lease("settled"),
                 "exec-settled",
                 "sleep 10",
                 TerminalMode::Sandboxed,
@@ -2350,7 +2404,7 @@ mod tests {
         // The killed process exits and its flow reports completion while the
         // kill has not returned.
         registry.complete(557, 137, None).await;
-        let running = registry.get_by_task_id("task-settled").await;
+        let running = registry.get_by_task_id("settled").await;
         assert!(matches!(
             running.expect("job should exist").status,
             JobStatus::Running
@@ -2358,7 +2412,7 @@ mod tests {
 
         let waiting = {
             let registry = registry.clone();
-            tokio::spawn(async move { registry.get_by_task_id_settled("task-settled").await })
+            tokio::spawn(async move { registry.get_by_task_id_settled("settled").await })
         };
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!waiting.is_finished(), "the kill is still in flight");
@@ -2387,7 +2441,14 @@ mod tests {
     async fn a_job_reads_its_completion_pending_from_the_transition_that_finishes_it() {
         let registry = spawn_registry();
         registry
-            .register(9, "task-owed", "exec", "run", TerminalMode::Sandboxed, None)
+            .register(
+                9,
+                &lease("owed"),
+                "exec",
+                "run",
+                TerminalMode::Sandboxed,
+                None,
+            )
             .await;
         // The registry serves its commands in order, so this list sees the
         // state the finishing transition left, before anything else runs.
@@ -2400,7 +2461,7 @@ mod tests {
 
         // The job's flow hands the completion out; the agent holds it.
         let owed = registry
-            .owe_completion("task-owed", Ok(0))
+            .owe_completion("owed", Ok(0))
             .await
             .expect("the job is registered");
         assert_eq!(owed.kill, None);
@@ -2426,7 +2487,7 @@ mod tests {
         registry
             .register(
                 10,
-                "task-lost",
+                &lease("lost"),
                 "exec",
                 "run",
                 TerminalMode::Sandboxed,
@@ -2435,7 +2496,7 @@ mod tests {
             .await;
         // The flow failed without the registry recording how.
         let owed = registry
-            .owe_completion("task-lost", Err("output could not be saved".to_string()))
+            .owe_completion("lost", Err("output could not be saved".to_string()))
             .await
             .expect("the job is registered");
         assert_eq!(owed.kill, None);
@@ -2461,7 +2522,7 @@ mod tests {
         registry
             .register(
                 11,
-                "task-kill",
+                &lease("kill"),
                 "exec",
                 "run",
                 TerminalMode::Sandboxed,
@@ -2483,7 +2544,7 @@ mod tests {
         let (reply_tx, owed) = async_channel::bounded(1);
         registry
             .send_command(JobRequest::OweCompletion {
-                task_id: "task-kill".to_string(),
+                task_id: "kill".to_string(),
                 ending: Ok(137),
                 reply: reply_tx,
             })
@@ -2526,7 +2587,7 @@ mod tests {
         register_job(
             &mut jobs,
             12,
-            "task-twice".to_string(),
+            lease("twice"),
             "exec".to_string(),
             "run".to_string(),
             ScriptLanguage::Shell,

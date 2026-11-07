@@ -1193,7 +1193,7 @@ mod tests {
                 jobs.register_at(
                     place,
                     pid,
-                    task,
+                    &crate::test_ids::lease(task),
                     "exec",
                     task,
                     crate::ScriptLanguage::Shell,

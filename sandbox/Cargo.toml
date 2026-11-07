@@ -54,7 +54,6 @@ futures-lite = "2.6"
 async-channel = "2"
 tokio = { version = "1", features = ["io-util", "macros", "rt"] }
 strsim = "0.11.1"
-human-hash = "0.4"
 askama = "0.16"
 shell-words = "1.1"
 # Shell syntax tree for refusing name- and pattern-based kills before a command runs.
@@ -116,6 +115,8 @@ windows-sys = { version = "0.61", default-features = false, features = [
 default = []
 # Expose `test_git`, git isolated from the host configuration, to dependents' tests.
 test-git = []
+# Expose `test_ids`, id allocators for tests, to dependents' tests.
+test-ids = []
 # Detect source code in command output so it can be folded with tree-sitter.
 # Pulls in ONNX Runtime via `magika`.
 code-folding = ["dep:magika", "dep:ort", "dep:tree-sitter", "dep:rs-tree-sitter-languages"]

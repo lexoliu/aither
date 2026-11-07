@@ -5490,7 +5490,7 @@ mod tests {
         let mut builder = ToolRegistryBuilder::new();
         builder.kept_through_compaction(|kept| kept.configure_tool(Command("ask_user")));
         builder.configure_tool(Command("ls"));
-        let registry = builder.build(dir.path());
+        let registry = builder.build(crate::test_support::output_store(dir.path()).await);
         let in_call = |id: &str| {
             registry.for_call(CallIdentity::new(ToolCallId::new(id), AgentIdentity::Main))
         };
@@ -8416,7 +8416,7 @@ mod tests {
             "the build failed".to_string(),
         ]);
         drain_run(agent.run("build it", std::iter::empty())).await;
-        agent.detached_task_ids.insert("task-build".to_string());
+        agent.detached_task_ids.insert("build".to_string());
 
         let waiting = tokio::spawn(async move {
             let wake = agent.wait_background().await;
@@ -8424,7 +8424,7 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         sender
-            .send_completed(finished("task-build", "linker error"))
+            .send_completed(finished("build", "linker error"))
             .await;
         let (mut agent, wake) = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
@@ -8444,7 +8444,7 @@ mod tests {
         );
         assert_eq!(
             agent.work_events.take(),
-            vec![crate::WorkEvent::JobFinished("task-build".to_string())],
+            vec![crate::WorkEvent::JobFinished("build".to_string())],
             "the finished job reaches the working document's inbox"
         );
 
@@ -8496,12 +8496,12 @@ mod tests {
     #[tokio::test]
     async fn a_wake_keeps_its_completions_pending_until_the_host_drops_it() {
         let (mut agent, sender, _llm) = detached_agent(Vec::new());
-        agent.detached_task_ids.insert("task-build".to_string());
+        agent.detached_task_ids.insert("build".to_string());
         let (jobs, service) = aither_sandbox::job_registry_channel();
         tokio::spawn(service.serve());
         jobs.register(
             41,
-            "task-build",
+            &aither_sandbox::test_ids::lease("build"),
             "exec",
             "make",
             aither_sandbox::TerminalMode::Sandboxed,
@@ -8509,10 +8509,10 @@ mod tests {
         )
         .await;
         let owed = jobs
-            .owe_completion("task-build", Err("linker error".to_string()))
+            .owe_completion("build", Err("linker error".to_string()))
             .await
             .expect("the job is registered");
-        let mut task = finished("task-build", "linker error");
+        let mut task = finished("build", "linker error");
         task.pending = Some(owed.pending);
         sender.send_completed(task).await;
 

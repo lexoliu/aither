@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use aither_core::llm::{AgentIdentity, CallIdentity, SubagentIdentity, ToolContext};
 use aither_core::{
-    LanguageModel,
+    AnyIdAllocator, IdLease, LanguageModel,
     llm::{Tool, ToolResult, model::Parameters},
 };
 use aither_sandbox::{
@@ -111,10 +111,10 @@ pub struct SubagentArgs {
     /// Path to a file holding the brief, or for `resume` the follow-up. The
     /// file must exist and be non-empty.
     pub prompt_file: String,
-    /// `resume` only: the id from a finished subagent's result. Ids expire
-    /// with the provider's prompt cache.
+    /// `resume` only: the id from a finished subagent's result, a single
+    /// word. Ids expire with the provider's prompt cache.
     #[serde(default)]
-    pub id: Option<u64>,
+    pub id: Option<String>,
     /// `external` only: the connected agent to run.
     #[serde(default)]
     pub agent: Option<String>,
@@ -144,7 +144,7 @@ enum Call<'a> {
         grant: Requested<'a>,
     },
     /// Continues a finished subagent.
-    Resume { id: u64 },
+    Resume { id: &'a str },
 }
 
 /// The directories a call asks to grant, as written.
@@ -220,7 +220,7 @@ impl SubagentArgs {
         }
         Ok(match name {
             "resume" => {
-                let Some(id) = self.id else {
+                let Some(id) = self.id.as_deref() else {
                     anyhow::bail!(
                         "`subagent resume` takes the `--id` of the finished subagent to continue"
                     );
@@ -302,7 +302,7 @@ enum SubagentReport<'a> {
         model: Option<&'a str>,
         result: &'a str,
         /// Id to continue this subagent with.
-        id: u64,
+        id: &'a str,
         /// Whether the id expires with the subagent's prompt cache; an
         /// external session's never does.
         cache_bound: bool,
@@ -562,12 +562,8 @@ struct FinishedSubagent<LLM, Schema> {
 
 /// What a run is prompted with: a fresh subagent with working copies learns
 /// where they are before its brief; a continued one was told when it started.
-fn run_prompt<'a>(
-    prompt: &'a str,
-    resumed: Option<u64>,
-    working_copies: &[PathBuf],
-) -> Cow<'a, str> {
-    if resumed.is_some() || working_copies.is_empty() {
+fn run_prompt<'a>(prompt: &'a str, resumed: bool, working_copies: &[PathBuf]) -> Cow<'a, str> {
+    if resumed || working_copies.is_empty() {
         return Cow::Borrowed(prompt);
     }
     Cow::Owned(
@@ -624,41 +620,54 @@ impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> FinishedSubagent<LLM, 
 }
 
 enum FinishedSlot<LLM, Schema> {
-    /// Waiting to be continued.
-    Idle(Box<FinishedSubagent<LLM, Schema>>),
-    /// Checked out by a continuation in flight.
+    /// Waiting to be continued, under the lease of its id.
+    Idle(IdLease, Box<FinishedSubagent<LLM, Schema>>),
+    /// Checked out by a continuation in flight, which holds the lease.
     Running,
-    /// Its cache lifetime passed; the context was dropped. The lifetime
-    /// stays so continuing the id names how long it lived.
+    /// Its cache lifetime passed; the context was dropped and its id
+    /// released. The lifetime stays so continuing the id names how long it
+    /// lived, until the word names another subagent.
     Expired(CacheLifetime),
 }
 
-struct FinishedInner<LLM, Schema> {
-    next_id: u64,
-    slots: HashMap<u64, FinishedSlot<LLM, Schema>>,
+/// The id a call's subagent is continued by: leased for a fresh subagent
+/// when its call starts, or the one `resume` checked out.
+struct CallId {
+    lease: IdLease,
+    /// Whether `resume` checked it out.
+    resumed: bool,
 }
 
-/// Finished subagents the parent may continue until their cache expires.
+/// Finished subagents the parent may continue until their cache expires,
+/// each under a word leased from `ids` for as long as it can be continued.
 struct FinishedSubagents<LLM, Schema> {
-    inner: Mutex<FinishedInner<LLM, Schema>>,
+    ids: AnyIdAllocator,
+    slots: Mutex<HashMap<String, FinishedSlot<LLM, Schema>>>,
 }
 
 impl<LLM, Schema> FinishedSubagents<LLM, Schema> {
-    fn new() -> Self {
+    fn new(ids: AnyIdAllocator) -> Self {
         Self {
-            inner: Mutex::new(FinishedInner {
-                next_id: 1,
-                slots: HashMap::new(),
-            }),
+            ids,
+            slots: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Leases the id of a fresh subagent.
+    fn lease(&self) -> anyhow::Result<CallId> {
+        Ok(CallId {
+            lease: self.ids.lease()?,
+            resumed: false,
+        })
     }
 }
 
 impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> FinishedSubagents<LLM, Schema> {
-    /// Drops the context of every subagent whose cache lifetime passed.
-    fn expire(inner: &mut FinishedInner<LLM, Schema>) {
-        for slot in inner.slots.values_mut() {
-            if let FinishedSlot::Idle(finished) = slot
+    /// Drops the context of every subagent whose cache lifetime passed,
+    /// releasing its id.
+    fn expire(slots: &mut HashMap<String, FinishedSlot<LLM, Schema>>) {
+        for slot in slots.values_mut() {
+            if let FinishedSlot::Idle(_, finished) = slot
                 && let Some(lifetime) = finished.expired()
             {
                 *slot = FinishedSlot::Expired(lifetime);
@@ -666,11 +675,11 @@ impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> FinishedSubagents<LLM,
         }
     }
 
-    /// Takes the subagent out for a continuation.
-    fn checkout(&self, id: u64) -> anyhow::Result<Box<FinishedSubagent<LLM, Schema>>> {
-        let mut inner = self.inner.lock().expect("finished subagents lock poisoned");
-        Self::expire(&mut inner);
-        match inner.slots.get_mut(&id) {
+    /// Takes the subagent out for a continuation, with the lease of its id.
+    fn checkout(&self, id: &str) -> anyhow::Result<(CallId, Box<FinishedSubagent<LLM, Schema>>)> {
+        let mut slots = self.slots.lock().expect("finished subagents lock poisoned");
+        Self::expire(&mut slots);
+        match slots.get_mut(id) {
             None => anyhow::bail!("unknown subagent id {id}"),
             Some(FinishedSlot::Expired(lifetime)) => {
                 let CacheLifetime::Limited(lifetime) = lifetime else {
@@ -683,47 +692,44 @@ impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> FinishedSubagents<LLM,
             Some(FinishedSlot::Running) => {
                 anyhow::bail!("subagent {id} is still running a continuation")
             }
-            Some(slot @ FinishedSlot::Idle(_)) => {
-                let FinishedSlot::Idle(finished) = std::mem::replace(slot, FinishedSlot::Running)
+            Some(slot @ FinishedSlot::Idle(..)) => {
+                let FinishedSlot::Idle(lease, finished) =
+                    std::mem::replace(slot, FinishedSlot::Running)
                 else {
                     unreachable!("slot matched as idle");
                 };
-                Ok(finished)
+                Ok((
+                    CallId {
+                        lease,
+                        resumed: true,
+                    },
+                    finished,
+                ))
             }
         }
     }
 
-    /// Keeps a finished subagent; `id` is the continued one's id, or `None`
-    /// for a first run. Returns the id the result names.
-    fn store(&self, id: Option<u64>, finished: FinishedSubagent<LLM, Schema>) -> u64 {
-        let mut inner = self.inner.lock().expect("finished subagents lock poisoned");
-        Self::expire(&mut inner);
-        let id = id.unwrap_or_else(|| {
-            let id = inner.next_id;
-            inner.next_id += 1;
-            id
-        });
-        inner
-            .slots
-            .insert(id, FinishedSlot::Idle(Box::new(finished)));
-        id
+    /// Keeps a finished subagent under `id`, the lease of its call.
+    fn store(&self, id: IdLease, finished: FinishedSubagent<LLM, Schema>) {
+        let mut slots = self.slots.lock().expect("finished subagents lock poisoned");
+        Self::expire(&mut slots);
+        slots.insert(id.to_string(), FinishedSlot::Idle(id, Box::new(finished)));
     }
 
     /// Releases an id whose subagent can no longer be continued.
-    fn release(&self, id: u64) {
-        self.inner
+    fn release(&self, id: &str) {
+        self.slots
             .lock()
             .expect("finished subagents lock poisoned")
-            .slots
-            .remove(&id);
+            .remove(id);
     }
 
     /// Releases `id` only while a continuation holds it checked out: its
     /// subagent went with the call that dropped it.
-    fn release_checked_out(&self, id: u64) {
-        let mut inner = self.inner.lock().expect("finished subagents lock poisoned");
-        if matches!(inner.slots.get(&id), Some(FinishedSlot::Running)) {
-            inner.slots.remove(&id);
+    fn release_checked_out(&self, id: &str) {
+        let mut slots = self.slots.lock().expect("finished subagents lock poisoned");
+        if matches!(slots.get(id), Some(FinishedSlot::Running)) {
+            slots.remove(id);
         }
     }
 }
@@ -776,12 +782,12 @@ impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> LiveRun<LLM, Schema> {
 }
 
 /// What one `subagent` call holds in the tool's shared state: its entry in
-/// the run registry, the continuation id it checked out, and the run it owns
+/// the run registry, the id its subagent is continued by, and the run it owns
 /// while it executes.
 ///
 /// Dropping the hold, which is what dropping the call's future does, releases
 /// all of it, so no exit from the call leaves a run listed or an id checked
-/// out.
+/// out; the id stays leased only once its subagent is stored.
 struct CallHold<LLM: LanguageModel + 'static, Schema: HandoffSchema> {
     runs: SubagentRuns,
     finished: Arc<FinishedSubagents<LLM, Schema>>,
@@ -789,8 +795,7 @@ struct CallHold<LLM: LanguageModel + 'static, Schema: HandoffSchema> {
     /// run's cleanup. A tool bound to none launches no terminal jobs, so
     /// there is none to stop.
     binding: Option<TerminalBinding>,
-    /// The continued id, while it is checked out.
-    resumed: Option<u64>,
+    id: CallId,
     run: Option<LiveRun<LLM, Schema>>,
 }
 
@@ -799,13 +804,13 @@ impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> CallHold<LLM, Schema> 
         runs: SubagentRuns,
         finished: Arc<FinishedSubagents<LLM, Schema>>,
         binding: Option<TerminalBinding>,
-        resumed: Option<u64>,
+        id: CallId,
     ) -> Self {
         Self {
             runs,
             finished,
             binding,
-            resumed,
+            id,
             run: None,
         }
     }
@@ -853,8 +858,8 @@ impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> CallHold<LLM, Schema> 
 
 impl<LLM: LanguageModel + 'static, Schema: HandoffSchema> Drop for CallHold<LLM, Schema> {
     fn drop(&mut self) {
-        if let Some(id) = self.resumed {
-            self.finished.release_checked_out(id);
+        if self.id.resumed {
+            self.finished.release_checked_out(&self.id.lease);
         }
         if let Some(run) = self.run.take() {
             self.runs.finish(run.id);
@@ -985,7 +990,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             binding: None,
             runs: SubagentRuns::default(),
             cache_keep_alive: None,
-            finished: Arc::new(FinishedSubagents::new()),
+            finished: Arc::new(FinishedSubagents::new(AnyIdAllocator::default())),
             fork_source: ForkSource::default(),
             hooks: None,
             work_events: None,
@@ -1021,7 +1026,7 @@ impl<LLM: Clone + Sync, Schema> SubagentTool<LLM, Schema> {
             binding: self.binding,
             runs: self.runs,
             cache_keep_alive: self.cache_keep_alive,
-            finished: Arc::new(FinishedSubagents::new()),
+            finished: Arc::new(FinishedSubagents::new(self.finished.ids.clone())),
             fork_source: self.fork_source,
             hooks: self.hooks,
             work_events: self.work_events,
@@ -1031,6 +1036,19 @@ impl<LLM: Clone + Sync, Schema> SubagentTool<LLM, Schema> {
             languages: self.languages,
             notices: self.notices,
         }
+    }
+
+    /// Leases the ids finished subagents are continued by from `ids`. A tool
+    /// bound to a terminal with [`for_terminal`](Self::for_terminal) leases
+    /// from that terminal's allocator instead, so its ids never share a word
+    /// with the terminal's; one given none leases from its own
+    /// [`AnyIdAllocator::default`].
+    ///
+    /// The tool starts with no finished subagents to continue.
+    #[must_use]
+    pub fn with_id_allocator(mut self, ids: AnyIdAllocator) -> Self {
+        self.finished = Arc::new(FinishedSubagents::new(ids));
+        self
     }
 
     /// Renders the tool's refusals, and every alert, notice and refusal of
@@ -1129,7 +1147,7 @@ impl<LLM: Clone + Sync, Schema> SubagentTool<LLM, Schema> {
             binding: Some(binding.clone()),
             runs: self.runs.clone(),
             cache_keep_alive: self.cache_keep_alive.clone(),
-            finished: Arc::new(FinishedSubagents::new()),
+            finished: Arc::new(FinishedSubagents::new(binding.id_allocator().clone())),
             fork_source: self.fork_source.clone(),
             hooks: ExternalHooks::of_observer(binding.observer()).or_else(|| self.hooks.clone()),
             work_events: self.work_events.clone(),
@@ -1862,15 +1880,18 @@ impl<LLM: LanguageModel + Clone + Sync + 'static, Schema: HandoffSchema> Subagen
         prompt: &str,
         started_by: Option<&CallIdentity>,
         caller: Option<&Path>,
-    ) -> anyhow::Result<(FinishedSubagent<LLM, Schema>, Option<u64>)> {
+    ) -> anyhow::Result<(FinishedSubagent<LLM, Schema>, CallId)> {
         let (resolved, grant) = match call {
             Call::Resume { id } => {
-                let finished = self.finished.checkout(id)?;
-                tracing::info!(subagent = %finished.subagent, id, "Continuing subagent");
-                return Ok((*finished, Some(id)));
+                let (id, finished) = self.finished.checkout(id)?;
+                tracing::info!(subagent = %finished.subagent, id = %id.lease, "Continuing subagent");
+                return Ok((*finished, id));
             }
             Call::External { agent, grant } => {
-                return Ok((self.start_external(agent, grant, caller).await?, None));
+                // Leased before the session starts, so no work is lost to a
+                // missing id.
+                let id = self.finished.lease()?;
+                return Ok((self.start_external(agent, grant, caller).await?, id));
             }
             Call::Fork { grant } => (
                 Resolved {
@@ -1884,10 +1905,13 @@ impl<LLM: LanguageModel + Clone + Sync + 'static, Schema: HandoffSchema> Subagen
         };
         let caller = self.caller_dir(caller);
         let grant = grant.grant(caller);
+        // Leased before the subagent is built, so no work is lost to a
+        // missing id.
+        let id = self.finished.lease()?;
         Ok((
             self.start_agent(resolved, grant, prompt, started_by, caller)
                 .await?,
-            None,
+            id,
         ))
     }
 
@@ -1985,7 +2009,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static, Schema: HandoffSchema> Subagen
     async fn mark_commits(
         &self,
         finished: FinishedSubagent<LLM, Schema>,
-        resumed: Option<u64>,
+        id: &CallId,
     ) -> anyhow::Result<(FinishedSubagent<LLM, Schema>, Option<CommitMark>)> {
         let Some(ledger) = &finished.commit_ledger else {
             return Ok((finished, None));
@@ -1993,8 +2017,8 @@ impl<LLM: LanguageModel + Clone + Sync + 'static, Schema: HandoffSchema> Subagen
         match ledger.mark().await {
             Ok(mark) => Ok((finished, Some(mark))),
             Err(error) => {
-                if let Some(id) = resumed {
-                    self.finished.store(Some(id), finished);
+                if id.resumed {
+                    self.finished.store(id.lease.clone(), finished);
                 }
                 Err(anyhow::anyhow!(
                     "cannot record where the subagent's worktrees stand before its run: {error}"
@@ -2045,12 +2069,14 @@ where
         let caller = cx.working_dir().map(Path::new);
         let prompt = self.read_prompt(args.prompt_file(), caller).await?;
 
-        let (finished, resumed) = self.acquire(call, &prompt, cx.identity(), caller).await?;
+        let (finished, id) = self.acquire(call, &prompt, cx.identity(), caller).await?;
+        let lease = id.lease.clone();
+        let resumed = id.resumed;
         let mut hold = CallHold::new(
             self.runs.clone(),
             Arc::clone(&self.finished),
             self.binding.clone(),
-            resumed,
+            id,
         );
         let (
             FinishedSubagent {
@@ -2062,7 +2088,7 @@ where
                 body,
             },
             commit_mark,
-        ) = self.mark_commits(finished, resumed).await?;
+        ) = self.mark_commits(finished, &hold.id).await?;
         self.announce_start(&subagent_id, &prompt).await;
         let cancel_rx = hold.begin(&subagent_id, &prompt, self.hooks.clone(), body);
         let outcome = hold
@@ -2085,8 +2111,8 @@ where
         let result = match outcome {
             SubagentOutcome::Cancelled => {
                 // The cancelled query left the agent mid-turn; it cannot be continued.
-                if let Some(id) = resumed {
-                    self.finished.release(id);
+                if resumed {
+                    self.finished.release(&lease);
                 }
                 body.end(true).await;
                 tracing::info!(subagent = %subagent_id, "Subagent cancelled");
@@ -2103,8 +2129,8 @@ where
             }
             SubagentOutcome::Finished(Ok(result)) => result,
             SubagentOutcome::Finished(Err(error)) => {
-                if let Some(id) = resumed {
-                    self.finished.release(id);
+                if resumed {
+                    self.finished.release(&lease);
                 }
                 let error_text = SubagentErrorTemplate {
                     subagent: &subagent_id,
@@ -2128,8 +2154,8 @@ where
         // A finished subagent stays continuable on every provider until
         // its prompt-cache lifetime passes; an external session, until the
         // tool is dropped.
-        let id = self.finished.store(
-            resumed,
+        self.finished.store(
+            lease.clone(),
             FinishedSubagent {
                 subagent: subagent_id.clone(),
                 tier,
@@ -2147,7 +2173,7 @@ where
                     tier: tier.map(tier_label),
                     model: model.as_deref(),
                     result: &result,
-                    id,
+                    id: &lease,
                     cache_bound,
                     alert: alert.as_deref(),
                 },
@@ -2345,10 +2371,13 @@ mod tests {
             "a fork keeps its worktree grants"
         );
 
-        let resume =
-            parse_cli(&["resume", "--id", "3", "--prompt-file", "p.md"]).expect("resume parses");
+        let resume = parse_cli(&["resume", "--id", "river", "--prompt-file", "p.md"])
+            .expect("resume parses");
         assert_eq!(resume.subagent(), None);
-        assert!(matches!(resume.call().unwrap(), Call::Resume { id: 3 }));
+        assert!(matches!(
+            resume.call().unwrap(),
+            Call::Resume { id: "river" }
+        ));
 
         let external = parse_cli(&["external", "p.md", "--agent", "codex"]).expect("parses");
         assert_eq!(external.subagent(), Some("codex"));
@@ -2360,7 +2389,7 @@ mod tests {
         for (words, refused) in [
             (&["resume", "p.md"][..], "takes the `--id`"),
             (
-                &["resume", "p.md", "--id", "3", "--worktrees", "wt"],
+                &["resume", "p.md", "--id", "river", "--worktrees", "wt"],
                 "keeps what it was granted",
             ),
             (
@@ -2415,7 +2444,7 @@ mod tests {
                 tier: Some("fast"),
                 model: Some("test-model"),
                 result: "done",
-                id: 7,
+                id: "river",
                 cache_bound: true,
                 alert: None,
             },
@@ -2426,7 +2455,7 @@ mod tests {
         .expect("subagent result should render");
         assert_eq!(
             completed,
-            "Subagent 'research' completed (fast tier, model: test-model).\n\ndone\n\nContinue this subagent with `subagent resume --id 7` while its prompt cache is still warm."
+            "Subagent 'research' completed (fast tier, model: test-model).\n\ndone\n\nContinue this subagent with `subagent resume --id river` while its prompt cache is still warm."
         );
 
         let external = SubagentResultTemplate {
@@ -2435,7 +2464,7 @@ mod tests {
                 tier: None,
                 model: Some("its-model"),
                 result: "done",
-                id: 7,
+                id: "river",
                 cache_bound: false,
                 alert: None,
             },
@@ -2446,7 +2475,7 @@ mod tests {
         .expect("subagent result should render");
         assert_eq!(
             external,
-            "Subagent 'codex' completed (model: its-model).\n\ndone\n\nContinue this subagent with `subagent resume --id 7`."
+            "Subagent 'codex' completed (model: its-model).\n\ndone\n\nContinue this subagent with `subagent resume --id river`."
         );
 
         let without_model = SubagentResultTemplate {
@@ -2455,7 +2484,7 @@ mod tests {
                 tier: None,
                 model: None,
                 result: "done",
-                id: 7,
+                id: "river",
                 cache_bound: true,
                 alert: Some("It idled too often."),
             },
@@ -2466,7 +2495,7 @@ mod tests {
         .expect("subagent result should render");
         assert_eq!(
             without_model,
-            "Subagent 'research' completed.\n\ndone\n\nContinue this subagent with `subagent resume --id 7` while its prompt cache is still warm.\n\nIt idled too often."
+            "Subagent 'research' completed.\n\ndone\n\nContinue this subagent with `subagent resume --id river` while its prompt cache is still warm.\n\nIt idled too often."
         );
 
         let cancelled = SubagentResultTemplate {
@@ -2496,7 +2525,7 @@ mod tests {
                 tier: None,
                 model: None,
                 result: "done",
-                id: 3,
+                id: "river",
                 cache_bound: true,
                 alert: Some("It idled too often."),
             },
@@ -2507,7 +2536,7 @@ mod tests {
         .expect("subagent result should render");
         assert_eq!(
             completed,
-            "Subagent 'worker' completed.\n\ndone\n\nContinue this subagent with `subagent resume --id 3` while its prompt cache is still warm.\n\nIt idled too often.\n\nCommits made in the granted worktrees:\n- abc123 fix the parser (in /work/tree)"
+            "Subagent 'worker' completed.\n\ndone\n\nContinue this subagent with `subagent resume --id river` while its prompt cache is still warm.\n\nIt idled too often.\n\nCommits made in the granted worktrees:\n- abc123 fix the parser (in /work/tree)"
         );
 
         let none = CommitListing {
@@ -2917,7 +2946,8 @@ mod tests {
                 .await
                 .expect("tools should prepare");
             let terminal = configure(terminal);
-            let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+            let registry =
+                Arc::new(ToolRegistryBuilder::new().build(terminal.output_store().clone()));
             let terminal = terminal.with_registry(registry);
             Self {
                 _dirs: [work, source],
@@ -3143,7 +3173,8 @@ mod tests {
 
         let follow_up = dir.join("follow-up.txt");
         std::fs::write(&follow_up, "and the lexer").unwrap();
-        let resumed = completed_text(&tool, resume_args(&follow_up, continuation_id(&first))).await;
+        let resumed =
+            completed_text(&tool, resume_args(&follow_up, &continuation_id(&first))).await;
         assert_eq!(listed_working_copies(&resumed), [clone]);
         let prompt = last_prompt(&seen_rx);
         assert!(
@@ -3215,9 +3246,12 @@ mod tests {
         let text = result.render_for_model();
         assert!(text.starts_with("Subagent 'general' completed"), "{text}");
         assert!(text.contains("\n\ndone\n\n"), "{text}");
-        assert_eq!(
-            continuation_id(&text),
-            1,
+        let id = continuation_id(&text);
+        assert!(
+            matches!(
+                tool.finished.slots.lock().unwrap().get(&id),
+                Some(FinishedSlot::Idle(..))
+            ),
             "the subagent stays continuable: {text}"
         );
         assert!(
@@ -3453,13 +3487,17 @@ mod tests {
             ("review", "advanced"),
             ("plan", "advanced"),
         ];
-        for (id, (subagent, tier)) in (1..).zip(calls) {
+        let mut ids = std::collections::HashSet::new();
+        for (subagent, tier) in calls {
+            let text = completed_text(&tool, named(subagent, &prompt_file)).await;
+            let id = continuation_id(&text);
             assert_eq!(
-                completed_text(&tool, named(subagent, &prompt_file)).await,
+                text,
                 format!(
                     "Subagent '{subagent}' completed ({tier} tier, model: {tier}-model).\n\n{tier}-model\n\nContinue this subagent with `subagent resume --id {id}` while its prompt cache is still warm."
                 )
             );
+            assert!(ids.insert(id), "every finished subagent has its own id");
         }
 
         let _ = std::fs::remove_dir_all(dir);
@@ -3516,10 +3554,11 @@ mod tests {
                 named("general", &prompt_file),
             )
             .await;
+            let id = continuation_id(&text);
             assert_eq!(
                 text,
                 format!(
-                    "Subagent 'general' completed ({tier} tier, model: {tier}-model).\n\n{tier}-model\n\nContinue this subagent with `subagent resume --id 1` while its prompt cache is still warm."
+                    "Subagent 'general' completed ({tier} tier, model: {tier}-model).\n\n{tier}-model\n\nContinue this subagent with `subagent resume --id {id}` while its prompt cache is still warm."
                 )
             );
         }
@@ -3831,7 +3870,7 @@ mod tests {
         job_registry
             .register(
                 pid,
-                "amber-test-task",
+                &aither_sandbox::test_ids::lease("amber"),
                 "exec-key",
                 script,
                 aither_sandbox::TerminalMode::Sandboxed,
@@ -3892,7 +3931,7 @@ mod tests {
         sender.task_finished();
         sender
             .send_completed(aither_sandbox::CompletedTask {
-                task_id: "amber-test-task".to_string(),
+                task_id: "amber".to_string(),
                 script: "sleep 2".to_string(),
                 kill: None,
                 timeout_kill: None,
@@ -3972,7 +4011,7 @@ mod tests {
         sender.task_finished();
         sender
             .send_completed(aither_sandbox::CompletedTask {
-                task_id: "amber-test-task".to_string(),
+                task_id: "amber".to_string(),
                 script: "sleep 2".to_string(),
                 kill: None,
                 timeout_kill: None,
@@ -4135,28 +4174,29 @@ mod tests {
         (tool, request_rx, bundled)
     }
 
-    fn resume_args(prompt_file: &Path, resume: u64) -> SubagentArgs {
+    fn resume_args(prompt_file: &Path, resume: &str) -> SubagentArgs {
         SubagentArgs {
-            id: Some(resume),
+            id: Some(resume.to_string()),
             ..named("resume", prompt_file)
         }
     }
 
-    /// The continuation id a result text names.
-    fn continuation_id(text: &str) -> u64 {
+    /// The continuation id a result text names: a single word.
+    fn continuation_id(text: &str) -> String {
         let tail = text
             .split("subagent resume --id ")
             .nth(1)
             .unwrap_or_else(|| panic!("result names a continuation id: {text}"));
-        tail.chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse()
-            .expect("continuation id is a number")
+        let id = tail.split('`').next().expect("split yields a first part");
+        assert!(
+            !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_lowercase()),
+            "continuation id is one word: {text}"
+        );
+        id.to_string()
     }
 
     /// Runs the first call and returns its result text and continuation id.
-    async fn first_run(tool: &SubagentTool<EchoLlm>, prompt_file: &Path) -> (String, u64) {
+    async fn first_run(tool: &SubagentTool<EchoLlm>, prompt_file: &Path) -> (String, String) {
         let result = Tool::call(tool, explore(prompt_file), ToolContext::new())
             .await
             .expect("subagent call failed");
@@ -4183,7 +4223,7 @@ mod tests {
 
         let follow_up = dir.join("follow-up.txt");
         std::fs::write(&follow_up, "second question marker").expect("write follow-up");
-        let result = Tool::call(&tool, resume_args(&follow_up, id), ToolContext::new())
+        let result = Tool::call(&tool, resume_args(&follow_up, &id), ToolContext::new())
             .await
             .expect("continuing failed");
         let text = result.render_for_model();
@@ -4208,11 +4248,15 @@ mod tests {
     async fn continuing_an_unknown_id_is_an_error() {
         let (tool, _requests, _bundled) = resume_tool(None, None).await;
         let (dir, prompt_file) = write_prompt_file("resume-unknown", "follow-up");
-        let error = Tool::call(&tool, resume_args(&prompt_file, 99), ToolContext::new())
-            .await
-            .expect_err("unknown id must fail");
+        let error = Tool::call(
+            &tool,
+            resume_args(&prompt_file, "zebra"),
+            ToolContext::new(),
+        )
+        .await
+        .expect_err("unknown id must fail");
         assert!(
-            error.to_string().contains("unknown subagent id 99"),
+            error.to_string().contains("unknown subagent id zebra"),
             "{error}"
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -4309,10 +4353,12 @@ mod tests {
 
         let continuing = Arc::clone(&tool);
         let follow_up = prompt_file.clone();
+        let continued = id.clone();
         let call = tokio::spawn(async move {
+            let id = continued;
             Tool::call(
                 &*continuing,
-                resume_args(&follow_up, id),
+                resume_args(&follow_up, &id),
                 ToolContext::new(),
             )
             .await
@@ -4323,7 +4369,7 @@ mod tests {
         assert!(call.await.expect_err("the call was dropped").is_cancelled());
 
         assert!(runs.list().is_empty(), "the dropped run is unregistered");
-        let error = Tool::call(&*tool, resume_args(&prompt_file, id), ToolContext::new())
+        let error = Tool::call(&*tool, resume_args(&prompt_file, &id), ToolContext::new())
             .await
             .expect_err("a dropped continuation cannot be continued");
         assert!(
@@ -4335,20 +4381,20 @@ mod tests {
 
     /// Pretends `age` has passed since the finished subagent's last request,
     /// so expiry runs against its real cache lifetime without sleeping.
-    fn age_finished_subagent(tool: &SubagentTool<EchoLlm>, id: u64, age: std::time::Duration) {
-        let mut inner = tool
+    fn age_finished_subagent(tool: &SubagentTool<EchoLlm>, id: &str, age: std::time::Duration) {
+        let mut slots = tool
             .finished
-            .inner
+            .slots
             .lock()
             .expect("finished subagents lock poisoned");
-        let Some(FinishedSlot::Idle(finished)) = inner.slots.get_mut(&id) else {
+        let Some(FinishedSlot::Idle(_, finished)) = slots.get_mut(id) else {
             panic!("subagent {id} is not idle");
         };
         let SubagentBody::Agent { agent, .. } = &mut finished.body else {
             panic!("subagent {id} is not an aither agent");
         };
         agent.backdate_cache_entry(age);
-        drop(inner);
+        drop(slots);
     }
 
     #[tokio::test]
@@ -4358,8 +4404,8 @@ mod tests {
         let (dir, prompt_file) = write_prompt_file("resume-expired", "first");
         let (_, id) = first_run(&tool, &prompt_file).await;
 
-        age_finished_subagent(&tool, id, std::time::Duration::from_secs(301));
-        let error = Tool::call(&tool, resume_args(&prompt_file, id), ToolContext::new())
+        age_finished_subagent(&tool, &id, std::time::Duration::from_secs(301));
+        let error = Tool::call(&tool, resume_args(&prompt_file, &id), ToolContext::new())
             .await
             .expect_err("expired subagent must fail");
         let message = error.to_string();
@@ -4371,6 +4417,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A finished subagent's continuation id is a word leased from the
+    /// tool's allocator when its call starts. It stays leased while the
+    /// subagent can be continued, a continuation keeping the same word, and
+    /// is released once the subagent expires, or with the tool.
+    #[tokio::test]
+    async fn continuation_ids_are_leased_while_the_subagent_can_be_continued() {
+        let ids = aither_sandbox::test_ids::RecordingIds::default();
+        let (tool, _requests, _bundled) =
+            resume_tool(None, Some(crate::config::CacheKeepAlive::default())).await;
+        let tool = tool.with_id_allocator(ids.allocator());
+        let (dir, prompt_file) = write_prompt_file("resume-leased", "first");
+
+        let (_, first) = first_run(&tool, &prompt_file).await;
+        assert_eq!(first, "alfa");
+        Tool::call(&tool, resume_args(&prompt_file, &first), ToolContext::new())
+            .await
+            .expect("the subagent continues");
+        assert_eq!(ids.leased(), ["alfa"], "a continuation keeps its word");
+        let (_, second) = first_run(&tool, &prompt_file).await;
+        assert_eq!(second, "bravo");
+        assert_eq!(ids.live(), ["alfa", "bravo"]);
+
+        age_finished_subagent(&tool, &first, std::time::Duration::from_secs(301));
+        Tool::call(&tool, resume_args(&prompt_file, &first), ToolContext::new())
+            .await
+            .expect_err("the expired subagent cannot be continued");
+        assert_eq!(ids.released(), ["alfa"], "expiry releases its word");
+
+        drop(tool);
+        assert_eq!(ids.released(), ["alfa", "bravo"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn claude_subagent_continues_just_inside_its_five_minute_lifetime() {
         let (tool, _requests, _bundled) =
@@ -4378,8 +4457,8 @@ mod tests {
         let (dir, prompt_file) = write_prompt_file("resume-inside", "first");
         let (_, id) = first_run(&tool, &prompt_file).await;
 
-        age_finished_subagent(&tool, id, std::time::Duration::from_secs(290));
-        Tool::call(&tool, resume_args(&prompt_file, id), ToolContext::new())
+        age_finished_subagent(&tool, &id, std::time::Duration::from_secs(290));
+        Tool::call(&tool, resume_args(&prompt_file, &id), ToolContext::new())
             .await
             .expect("a subagent inside its lifetime continues");
         let _ = std::fs::remove_dir_all(dir);
@@ -4393,13 +4472,13 @@ mod tests {
         let (dir, prompt_file) = write_prompt_file("resume-default-lifetime", "first");
         let (_, id) = first_run(&tool, &prompt_file).await;
 
-        age_finished_subagent(&tool, id, std::time::Duration::from_secs(301));
-        Tool::call(&tool, resume_args(&prompt_file, id), ToolContext::new())
+        age_finished_subagent(&tool, &id, std::time::Duration::from_secs(301));
+        Tool::call(&tool, resume_args(&prompt_file, &id), ToolContext::new())
             .await
             .expect("past five minutes a non-Claude subagent still continues");
 
-        age_finished_subagent(&tool, id, std::time::Duration::from_secs(3601));
-        let error = Tool::call(&tool, resume_args(&prompt_file, id), ToolContext::new())
+        age_finished_subagent(&tool, &id, std::time::Duration::from_secs(3601));
+        let error = Tool::call(&tool, resume_args(&prompt_file, &id), ToolContext::new())
             .await
             .expect_err("expired subagent must fail");
         assert!(error.to_string().contains("3600s"), "{error}");
@@ -4459,7 +4538,7 @@ mod tests {
         for extra in ["model", "subagent", "command"] {
             let error = serde_json::from_value::<SubagentArgs>(serde_json::json!({
                 "name": "resume",
-                "id": 7,
+                "id": "river",
                 "prompt_file": "prompt.txt",
                 extra: "fast",
             }))
@@ -4484,7 +4563,7 @@ mod tests {
 
         let follow_up = dir.join("follow-up.txt");
         std::fs::write(&follow_up, "second marker").expect("write follow-up");
-        let result = Tool::call(&tool, resume_args(&follow_up, id), ToolContext::new())
+        let result = Tool::call(&tool, resume_args(&follow_up, &id), ToolContext::new())
             .await
             .expect("continuing failed");
         let text = result.render_for_model();
@@ -4507,7 +4586,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let follow_up = dir.join("follow-up.txt");
         std::fs::write(&follow_up, "second").expect("write follow-up");
-        let result = Tool::call(&tool, resume_args(&follow_up, id), ToolContext::new())
+        let result = Tool::call(&tool, resume_args(&follow_up, &id), ToolContext::new())
             .await
             .expect("a permanent lifetime never expires");
         let text = result.render_for_model();
@@ -4681,7 +4760,7 @@ mod tests {
                 .expect("tools should prepare");
             let mut registry = ToolRegistryBuilder::new();
             commands(&mut registry);
-            let registry = Arc::new(registry.build(terminal.outputs_dir()));
+            let registry = Arc::new(registry.build(terminal.output_store().clone()));
             Self {
                 _dirs: [session, source],
                 _cache: cache,
@@ -4989,7 +5068,7 @@ mod tests {
 
         // The fork's own agent compacts, as its auto-compaction or `compact`
         // call would.
-        let mut finished = tool.finished.checkout(id).expect("the fork is kept");
+        let (_, mut finished) = tool.finished.checkout(&id).expect("the fork is kept");
         let SubagentBody::Agent { agent, .. } = &mut finished.body else {
             panic!("a fork is an aither agent");
         };
@@ -5326,7 +5405,7 @@ mod tests {
         main_jobs
             .register(
                 4242,
-                "main-job",
+                &aither_sandbox::test_ids::lease("primary"),
                 "exec-key",
                 "long running main job",
                 aither_sandbox::TerminalMode::Sandboxed,
@@ -5358,7 +5437,7 @@ mod tests {
                 &reported_task_id(request),
             )]
         });
-        main.then([vec![control_call("kill-2", "terminal_kill", "main-job")]]);
+        main.then([vec![control_call("kill-2", "terminal_kill", "primary")]]);
         main.then([vec![Event::Text("finished".to_string())]]);
 
         let (dir, args) = start_fork("fork-controls");
@@ -5387,7 +5466,7 @@ mod tests {
         assert!(
             results
                 .iter()
-                .any(|text| text.contains("No running background task 'main-job'")),
+                .any(|text| text.contains("No running background task 'primary'")),
             "the main agent's job is out of reach: {results:?}"
         );
         assert!(
@@ -5395,7 +5474,7 @@ mod tests {
                 .list()
                 .await
                 .iter()
-                .any(|job| job.task_id == "main-job"
+                .any(|job| job.task_id == "primary"
                     && job.status == aither_sandbox::JobStatus::Running),
             "the main agent's job still runs"
         );
@@ -5631,7 +5710,7 @@ mod tests {
         assert!(runs.list().is_empty());
 
         let id = continuation_id(&text);
-        let text = call_text(&tool, resume_args(&second, id))
+        let text = call_text(&tool, resume_args(&second, &id))
             .await
             .expect("resume succeeds");
         assert!(text.contains("turn 2 of session 0: second"), "{text}");

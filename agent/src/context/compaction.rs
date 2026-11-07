@@ -702,7 +702,7 @@ mod tests {
             ),
             Message::tool(
                 "call_1",
-                "Output saved to outputs/amber-oak-swift-river.txt (100 lines, 5000 bytes)",
+                "Output saved to outputs/river.txt (100 lines, 5000 bytes)",
             ),
             Message::assistant_with_tool_calls(
                 "",
@@ -718,7 +718,7 @@ mod tests {
         let index = build_file_index(&[], &messages, None);
         assert_eq!(index.len(), 2);
         assert!(
-            index[0].contains("outputs/amber-oak-swift-river.txt")
+            index[0].contains("outputs/river.txt")
                 && index[0].contains("Fetch WebGPU status pages"),
             "index entry should pair path with description: {index:?}"
         );
@@ -730,7 +730,7 @@ mod tests {
         let dir = std::path::Path::new("/work/session/outputs");
         // Joined the way the sandbox names the file, so the separator is the
         // platform's.
-        let path = dir.join("amber-oak-swift-river.txt").display().to_string();
+        let path = dir.join("river.txt").display().to_string();
         let path = path.as_str();
         let messages = vec![
             Message::assistant_with_tool_calls(

@@ -146,7 +146,13 @@ async fn a_tool_added_by_list_changed_is_a_terminal_command_at_once() {
     let mut builder = aither_sandbox::ToolRegistryBuilder::new();
     builder.command_set(conn);
     // The fixture's results are empty, so nothing is saved to the directory.
-    let registry = builder.build(std::env::temp_dir());
+    let outputs = aither_sandbox::OutputStore::new(
+        std::env::temp_dir(),
+        aither_core::AnyIdAllocator::default(),
+    )
+    .await
+    .unwrap();
+    let registry = builder.build(outputs);
     let mut names = registry.registered_tool_names();
     names.sort();
     assert_eq!(names, ["alpha", "beta"]);
