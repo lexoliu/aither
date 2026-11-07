@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0](https://github.com/May-Agent/aither/compare/agent-v0.21.0...agent-v0.22.0) - 2026-11-07
+
+### Added
+
+- change a running agent's model, effort and grants in place
+- *(sandbox)* run Python through terminal's language argument
+- *(agent)* replace secrets in every model request before it is sent
+- *(agent)* a typed one-shot judgment that subagent routing and embedders share
+- *(agent)* [**breaking**] watch the disk of the home environment, a container's filesystem included, never a remote host's
+- *(agent)* warn the agent when its volume runs low on disk space
+
+### Fixed
+
+- clear the reasoning effort to the model's default on per-message models
+
+### Other
+
+- Merge pull request #591 from May-Agent/feat/589-in-place-changes
+- Merge pull request #587 from May-Agent/feat/214-python-language
+- Merge pull request #585 from May-Agent/feat/581-secret-guard
+- Merge pull request #579 from May-Agent/feat/545-disk-pressure
+- *(agent)* render the container volume's name from a template
+- Merge remote-tracking branch 'origin/dev' into feat/545-disk-pressure
+- Merge feat/171-runaway-guard into feat/545-disk-pressure
+- Merge branch 'feat/171-runaway-guard' into feat/545-disk-pressure
+
 ## [0.21.0](https://github.com/May-Agent/aither/compare/agent-v0.20.0...agent-v0.21.0) - 2026-11-06
 
 ### Fixed

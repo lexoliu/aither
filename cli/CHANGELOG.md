@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0](https://github.com/May-Agent/aither/compare/cli-v0.21.0...cli-v0.22.0) - 2026-11-07
+
+### Added
+
+- change a running agent's model, effort and grants in place
+- *(sandbox)* run Python through terminal's language argument
+
+### Other
+
+- Merge pull request #591 from May-Agent/feat/589-in-place-changes
+- release v0.21.0
+
 ## [0.21.0](https://github.com/May-Agent/aither/compare/cli-v0.20.0...cli-v0.21.0) - 2026-11-06
 
 ### Other
