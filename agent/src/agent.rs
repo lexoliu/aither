@@ -151,6 +151,8 @@ pub struct BackgroundWake {
     /// [`Delivery::Pending`](aither_sandbox::Delivery) in its registry until
     /// this is dropped, so a host that drops the wake only once the turn it
     /// starts is visible never reads a finished job with nothing owed.
+    /// Dropped, the registry forgets the jobs and their ids go back to the
+    /// allocator.
     pub pending: Vec<aither_sandbox::PendingCompletion>,
 }
 
@@ -2266,7 +2268,9 @@ where
         // included; only a job the model knows as a background task is
         // announced, since a foreground result already returned through the
         // tool call.
-        if !self.detached_task_ids.contains(&task.task_id) {
+        // Its id goes back to the allocator with the completion, so a later
+        // job leasing the word again is not taken for this one.
+        if !self.detached_task_ids.remove(&task.task_id) {
             return false;
         }
         let result_msg = self.notices.background_finished(&task);
@@ -8524,9 +8528,13 @@ mod tests {
         let status = jobs.get(41).await.expect("job should exist").status;
         assert!(status.completion_pending(), "{status:?}");
 
+        // Taken, the job leaves the registry and its id is unknown.
         drop(wake);
-        let status = jobs.get(41).await.expect("job should exist").status;
-        assert_eq!(status.delivery(), Some(aither_sandbox::Delivery::Taken));
+        assert!(jobs.get(41).await.is_none());
+        assert!(
+            !agent.detached_task_ids.contains("build"),
+            "the announced id may name a later job"
+        );
     }
 
     /// The idle wait gives the event up when it is dropped before anything

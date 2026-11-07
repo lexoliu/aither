@@ -6,6 +6,7 @@
 //!   immediately; text keeps a preview in the result
 
 use std::{
+    collections::HashSet,
     io::Cursor,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -16,7 +17,7 @@ use aither_core::{
     llm::{CommandStream, StoredFile},
 };
 use async_fs as fs;
-use futures_lite::AsyncWriteExt as _;
+use futures_lite::{AsyncWriteExt as _, StreamExt as _};
 use image::{GenericImageView, ImageFormat, ImageReader, imageops::FilterType};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -142,7 +143,7 @@ async fn cut_text_output(
     // found, so the allocator hands out another.
     let mut taken = Vec::new();
     let delivered = loop {
-        let name = store.name(ext)?;
+        let name = store.name(ext, &mut taken).await?;
         let stream = CommandStream::Stored {
             file: stored_file(name.url.clone(), &name.path),
             preview: preview.clone(),
@@ -189,8 +190,9 @@ struct OutputName {
 /// leased from the store's [`AnyIdAllocator`].
 ///
 /// A stored output is addressed by its path for as long as the store lives,
-/// so its word stays leased until the last clone of the store drops. A name a
-/// file already holds in the directory, left by an earlier store, is skipped.
+/// so its word stays leased until the last clone of the store drops. A word
+/// naming a file already in the directory, left by an earlier store, is
+/// skipped whatever that file's extension, so one word never names two files.
 #[derive(Clone, Debug)]
 pub struct OutputStore(Arc<StoreInner>);
 
@@ -201,6 +203,9 @@ struct StoreInner {
     ids: AnyIdAllocator,
     /// The words of the files this store wrote.
     names: Mutex<Vec<IdLease>>,
+    /// The words naming the files the directory held when this store first
+    /// named one: what earlier stores left.
+    earlier: async_lock::OnceCell<HashSet<String>>,
 }
 
 impl OutputStore {
@@ -222,6 +227,7 @@ impl OutputStore {
             dir,
             ids,
             names: Mutex::new(Vec::new()),
+            earlier: async_lock::OnceCell::new(),
         }))
     }
 
@@ -407,9 +413,24 @@ impl OutputStore {
         fs::read(&filepath).await
     }
 
-    /// Leases the name of a file with extension `ext`.
-    fn name(&self, ext: &str) -> std::io::Result<OutputName> {
-        let lease = self.0.ids.lease().map_err(std::io::Error::other)?;
+    /// Leases the name of a file with extension `ext`, under a word no file
+    /// an earlier store left is named by. A word skipped goes into `taken`,
+    /// whose leases the caller holds until it found a free name, so the
+    /// allocator hands out another.
+    async fn name(&self, ext: &str, taken: &mut Vec<IdLease>) -> std::io::Result<OutputName> {
+        let earlier = self
+            .0
+            .earlier
+            .get_or_try_init(|| earlier_words(self.dir()))
+            .await?;
+        let lease = loop {
+            let lease = self.0.ids.lease().map_err(std::io::Error::other)?;
+            if earlier.contains(lease.as_str()) {
+                taken.push(lease);
+            } else {
+                break lease;
+            }
+        };
         let filename = format!("{lease}.{ext}");
         Ok(OutputName {
             url: format!("outputs/{filename}"),
@@ -437,7 +458,7 @@ impl OutputStore {
         // Held until a free name is found, as in `cut_text_output`.
         let mut taken = Vec::new();
         let created = loop {
-            let name = self.name(ext)?;
+            let name = self.name(ext, &mut taken).await?;
             match write_new(&name.path, data).await {
                 Ok(()) => {
                     debug!(url = %name.url, size = data.len(), format = ?format, "saved output");
@@ -454,6 +475,20 @@ impl OutputStore {
         drop(taken);
         created
     }
+}
+
+/// The words naming the files in `dir`: each name up to its first `.`.
+async fn earlier_words(dir: &Path) -> std::io::Result<HashSet<String>> {
+    let mut entries = fs::read_dir(dir).await?;
+    let mut words = HashSet::new();
+    while let Some(entry) = entries.try_next().await? {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(word) = name.split('.').next() {
+            words.insert(word.to_owned());
+        }
+    }
+    Ok(words)
 }
 
 /// Writes `data` to a new file at `path`, failing with
@@ -723,18 +758,41 @@ mod tests {
     async fn a_name_a_file_already_holds_is_skipped_and_released() {
         let dir = tempfile::tempdir().unwrap();
         let ids = crate::test_ids::RecordingIds::default();
-        // The recording allocator's first word, taken by an earlier store.
-        std::fs::write(dir.path().join("alfa.txt"), "earlier").unwrap();
+        // The recording allocator's first two words, taken by an earlier
+        // store: one by a file of another extension.
+        std::fs::write(dir.path().join("alfa.png"), "earlier").unwrap();
+        std::fs::write(dir.path().join("bravo.txt"), "earlier").unwrap();
         let store = OutputStore::at(dir.path().to_path_buf(), ids.allocator());
 
         let (url, _) = store.save_raw(b"new").await.unwrap();
-        assert_eq!(url, "outputs/bravo.txt");
+        assert_eq!(url, "outputs/charlie.txt");
+        assert!(!dir.path().join("alfa.txt").exists());
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("alfa.txt")).unwrap(),
+            std::fs::read_to_string(dir.path().join("bravo.txt")).unwrap(),
             "earlier"
         );
-        assert_eq!(ids.released(), ["alfa"]);
-        assert_eq!(ids.live(), ["bravo"]);
+        assert_eq!(ids.released(), ["alfa", "bravo"]);
+        assert_eq!(ids.live(), ["charlie"]);
+    }
+
+    /// A file of the same name that appears after the store looked at its
+    /// directory is not overwritten either.
+    #[tokio::test]
+    async fn a_name_a_file_takes_later_is_skipped_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = crate::test_ids::RecordingIds::default();
+        let store = OutputStore::at(dir.path().to_path_buf(), ids.allocator());
+        let (first, _) = store.save_raw(b"first").await.unwrap();
+        assert_eq!(first, "outputs/alfa.txt");
+
+        std::fs::write(dir.path().join("bravo.txt"), "later").unwrap();
+        let (second, _) = store.save_raw(b"second").await.unwrap();
+        assert_eq!(second, "outputs/charlie.txt");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("bravo.txt")).unwrap(),
+            "later"
+        );
+        assert_eq!(ids.released(), ["bravo"]);
     }
 
     #[tokio::test]

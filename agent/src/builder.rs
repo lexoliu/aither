@@ -1002,8 +1002,9 @@ where
     /// Registers the terminal tool for command execution in a sandbox.
     ///
     /// The terminal tool enables command execution with configurable permission modes
-    /// (sandboxed, network, unsafe). It creates its own working directory with
-    /// four random words and manages output storage internally.
+    /// (sandboxed, network, unsafe). It creates its own working directory,
+    /// which heel names with four random words (not a leased id), and manages
+    /// output storage internally.
     ///
     /// This also captures the background task receiver for polling completed
     /// background tasks during the agent loop.

@@ -8,7 +8,12 @@
 //! model leases their words from the same allocator, so no two live ids share
 //! a word. [`WordAllocator`] is the allocator used when none is supplied.
 
-use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc};
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    string::String,
+    sync::{Arc, Weak},
+};
 use core::{
     fmt,
     ops::Deref,
@@ -122,6 +127,33 @@ impl IdLease {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0.word
+    }
+
+    /// A reference to this lease that does not keep the word leased.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakIdLease {
+        WeakIdLease(Arc::downgrade(&self.0))
+    }
+}
+
+/// A reference to an [`IdLease`] that does not keep its word leased, for
+/// what must still tell whether the word names the same thing later.
+#[derive(Clone)]
+pub struct WeakIdLease(Weak<Held>);
+
+impl WeakIdLease {
+    /// The lease, while a clone of it still holds the word; `None` once the
+    /// word went back to its allocator, after which it may name something
+    /// else.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<IdLease> {
+        self.0.upgrade().map(IdLease)
+    }
+}
+
+impl fmt::Debug for WeakIdLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WeakIdLease")
     }
 }
 
@@ -305,6 +337,21 @@ mod tests {
         assert_eq!(
             &*ids.lease().expect("released with the last clone"),
             "river"
+        );
+    }
+
+    #[test]
+    fn a_weak_lease_upgrades_only_while_the_word_is_held() {
+        let ids = AnyIdAllocator::new(WordAllocator::new(["river"]));
+        let lease = ids.lease().expect("a free word");
+        let weak = lease.downgrade();
+        assert_eq!(weak.upgrade().as_deref(), Some("river"));
+        drop(lease);
+        assert!(weak.upgrade().is_none(), "the word went back");
+        let again = ids.lease().expect("river is free again");
+        assert!(
+            weak.upgrade().is_none(),
+            "a word leased again names something else: {again}"
         );
     }
 

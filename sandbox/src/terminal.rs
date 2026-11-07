@@ -826,9 +826,9 @@ pub struct CompletedTask {
     pub kill: Option<crate::KillCause>,
     /// Set when the kill was the `timeout` bound passing.
     pub timeout_kill: Option<TimeoutKill>,
-    /// Keeps the job reading [`Delivery::Pending`](crate::Delivery) in its
-    /// registry until the agent takes the completion by dropping it; `None`
-    /// for a command the registry never registered.
+    /// Keeps the job in its registry, and its task id leased, until the agent
+    /// takes the completion by dropping it; `None` for a command the registry
+    /// never registered and for one whose call returned its result.
     pub pending: Option<PendingCompletion>,
 }
 
@@ -1473,9 +1473,10 @@ impl RegistryState for Running {
 
 /// The terminal tool for executing scripts in a sandbox.
 ///
-/// Creates a shared working directory with four random words that persists
-/// across all executions. Each execution creates a fresh sandbox but shares
-/// the working directory.
+/// Creates a shared working directory that persists across all executions,
+/// named by heel with four random words; that name is not one of the leased
+/// model-facing ids. Each execution creates a fresh sandbox but shares the
+/// working directory.
 ///
 /// The executor type `E` determines how async tasks are spawned for the IPC server.
 /// Use `TokioExecutor` when running in a tokio runtime.
@@ -1596,7 +1597,8 @@ struct ContainerCarry {
 
 /// The terminal tool for executing scripts in a sandbox.
 pub struct TerminalTool<P, E, State = Unconfigured> {
-    /// Shared working directory (four random words, e.g., `amber-forest-thunder-pearl/`)
+    /// Shared working directory, named by heel with four random words (e.g.,
+    /// `amber-forest-thunder-pearl/`) rather than a leased id.
     working_dir: PathBuf,
     /// Runtime registry for container and ssh execution metadata.
     shell_sessions: ShellSessionRegistry,
@@ -1764,8 +1766,9 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
 
     /// Creates a new terminal tool with permission handler and executor.
     ///
-    /// Creates a random four-word working directory under the specified parent directory.
-    /// The executor is used to spawn async tasks for the IPC server.
+    /// Creates a working directory under the specified parent directory, which
+    /// heel names with four random words (not a leased id). The executor is
+    /// used to spawn async tasks for the IPC server.
     ///
     /// # Errors
     /// Returns an error when the working directory or output store cannot be created.
@@ -1779,7 +1782,8 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
         // Ensure parent directory exists
         async_fs::create_dir_all(parent_dir).await?;
 
-        // Create random four-word working directory
+        // heel names the working directory with four random words; it is
+        // not a leased model-facing id.
         let working_dir = WorkingDir::random_in(parent_dir).map_err(|e| {
             TerminalError::SandboxSetup(format!("failed to create working dir: {e}"))
         })?;
@@ -3012,6 +3016,7 @@ where
             None => registry,
         });
         let (result_tx, result_rx) = async_channel::bounded(1);
+        let (taken_tx, taken_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
         // Every job gets a real stdin pipe: a foreground command that blocks
         // on it promotes to a background task the model can feed through
@@ -3069,6 +3074,7 @@ where
                 max_lines,
                 raw,
                 result_tx,
+                taken: taken_rx,
                 completed_tx,
                 running_tasks,
                 network_audit: self.network_audit.clone(),
@@ -3084,6 +3090,7 @@ where
             result: result_rx,
             startup: startup_rx,
             timeout_watch,
+            taken: taken_tx,
         }
     }
 }
@@ -3174,9 +3181,13 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                 } else {
                     CommandResult::from(result)
                 };
+                spawned.took_result().await;
                 command.into_tool_result()
             }
-            Some(Err(err)) => Err(anyhow::anyhow!(err)),
+            Some(Err(err)) => {
+                spawned.took_result().await;
+                Err(anyhow::anyhow!(err))
+            }
             // The command outlived its foreground window: promote it to a
             // background task.
             None => {
@@ -3643,17 +3654,18 @@ where
         }
         // The run is never announced as a background task, so its end is
         // told to the caller alone, however long it takes.
-        let result = spawned
-            .result
-            .recv()
-            .await
-            .map_err(|_| TerminalError::Execution("the run ended without a result".to_string()))?
-            .map_err(TerminalError::Execution)?;
+        let result =
+            spawned.result.recv().await.map_err(|_| {
+                TerminalError::Execution("the run ended without a result".to_string())
+            });
         let killed = self
             .job_registry
             .get_by_task_id_settled(&prepared.task_id)
             .await
             .is_some_and(|job| matches!(job.status, JobStatus::Killed { .. }));
+        let timeout_kill = spawned.timeout_watch.kill();
+        spawned.took_result().await;
+        let result = result?.map_err(TerminalError::Execution)?;
         if !killed {
             return Ok(CommandResult::from(result));
         }
@@ -3662,7 +3674,7 @@ where
             stderr: result.stderr,
             interruptions: result.interruptions,
             outcome: CommandOutcome::Killed {
-                notice: self.kill_notice(spawned.timeout_watch.kill().as_ref()),
+                notice: self.kill_notice(timeout_kill.as_ref()),
                 task_id: prepared.task_id.to_string(),
             },
         })
@@ -3672,14 +3684,19 @@ where
     ///
     /// The returned watch holds the job's start time and, once the watchdog
     /// issues the kill, the time it did.
-    fn spawn_kill_watchdog(&self, task_id: &str, timeout: Duration) -> Arc<TimeoutWatch> {
+    fn spawn_kill_watchdog(&self, task_id: &IdLease, timeout: Duration) -> Arc<TimeoutWatch> {
         let watch = Arc::new(TimeoutWatch::new(timeout));
         let job_registry = self.job_registry.clone();
-        let task_id = task_id.to_string();
+        // Weak, so a job that ended gives its word back before the timer
+        // fires; a word that went back may name another job by then.
+        let task_id = task_id.downgrade();
         let recorded = watch.clone();
         self.executor
             .spawn(async move {
                 async_io::Timer::after(timeout).await;
+                let Some(task_id) = task_id.upgrade() else {
+                    return;
+                };
                 if let Some(job) = job_registry.get_by_task_id(&task_id).await
                     && matches!(job.status, JobStatus::Running)
                 {
@@ -3695,20 +3712,24 @@ where
 
     /// Emits one [`LongRunningJob`] when the job crosses the configured
     /// long-running threshold.
-    fn spawn_long_job_alert(&self, task_id: &str) {
+    fn spawn_long_job_alert(&self, task_id: &IdLease) {
         let job_registry = self.job_registry.clone();
         let alert_tx = self.alert_tx.clone();
-        let task_id = task_id.to_string();
+        // Weak for the same reason as the watchdog's.
+        let task_id = task_id.downgrade();
         let alert_after = self.limits.long_job_alert;
         self.executor
             .spawn(async move {
                 async_io::Timer::after(alert_after).await;
+                let Some(task_id) = task_id.upgrade() else {
+                    return;
+                };
                 if let Some(job) = job_registry.get_by_task_id(&task_id).await
                     && matches!(job.status, JobStatus::Running)
                 {
                     let _ = alert_tx
                         .send(JobAlert::LongRunning(LongRunningJob {
-                            task_id,
+                            task_id: task_id.to_string(),
                             script: job.script,
                             elapsed: job.started_at.elapsed(),
                         }))
@@ -4057,6 +4078,23 @@ struct SpawnedTerminal {
     result: Receiver<Result<CompletedCommand, String>>,
     startup: Receiver<Result<(), String>>,
     timeout_watch: Arc<TimeoutWatch>,
+    /// Tells the job's flow the call returned its result itself; dropped
+    /// unsent, the job is a background task whose completion the agent takes.
+    taken: Sender<Sender<()>>,
+}
+
+impl SpawnedTerminal {
+    /// The call returns the job's result itself: nothing addresses the job
+    /// once it does, so its flow takes the completion on the agent's behalf.
+    /// Returns once the flow ended and the registry forgot the job, so the
+    /// task id is back with the allocator when the call returns.
+    async fn took_result(self) {
+        let (done_tx, done_rx) = async_channel::bounded(1);
+        // A flow that ended without a result no longer listens.
+        if self.taken.send(done_tx).await.is_ok() {
+            let _ = done_rx.recv().await;
+        }
+    }
 }
 
 struct SpawnedTerminalTask<P, E> {
@@ -4088,6 +4126,8 @@ struct SpawnedTerminalTask<P, E> {
     max_lines: usize,
     raw: bool,
     result_tx: Sender<Result<CompletedCommand, String>>,
+    /// Whether the call took the result: see [`SpawnedTerminal::took_result`].
+    taken: Receiver<Sender<()>>,
     completed_tx: Sender<CompletedTask>,
     running_tasks: Arc<AtomicUsize>,
     env_source: Option<Arc<dyn TerminalEnvSource>>,
@@ -4135,6 +4175,7 @@ where
         max_lines,
         raw,
         result_tx,
+        taken,
         completed_tx,
         running_tasks,
         network_audit,
@@ -4200,15 +4241,25 @@ where
         Err(err) => Err(err.to_string()),
     };
     let _ = result_tx.send(quick_result).await;
+    // The call answers at once, taking the result or leaving it to a
+    // background task.
+    let foreground = taken.recv().await.ok();
     // A kill's signal can end the process before the kill records its
-    // outcome, so the registry settles the ending once no kill is in flight;
-    // the job reads its completion pending from the moment it ended.
+    // outcome, so the registry settles the ending once no kill is in flight.
     let ending = match &result {
         Ok(command) => Ok(command.exit_code),
         Err(error) => Err(error.to_string()),
     };
     let owed = status_registry.owe_completion(&task_id, ending).await;
     let kill = owed.as_ref().and_then(|owed| owed.kill);
+    let mut pending = owed.map(|owed| owed.pending);
+    // A result the call returned leaves nothing for the agent to take: the
+    // completion is taken here, so the registry forgets the job.
+    if foreground.is_some()
+        && let Some(pending) = pending.take()
+    {
+        pending.take().await;
+    }
     // Every job reports completion; the agent reinjects the result only for
     // tasks it saw promoted or detached (`take_started`), so a plain
     // foreground result is not delivered twice.
@@ -4219,10 +4270,15 @@ where
             result,
             kill,
             timeout_kill: timeout_watch.kill().filter(|_| kill.is_some()),
-            pending: owed.map(|owed| owed.pending),
+            pending,
         })
         .await;
     running_tasks.fetch_sub(1, Ordering::AcqRel);
+    // The flow's own hold on the word ends before the call returns.
+    drop(task_id);
+    if let Some(done) = foreground {
+        let _ = done.send(()).await;
+    }
 }
 
 /// Standalone script execution that can be spawned in a background task.
@@ -8390,6 +8446,115 @@ mod tests {
         );
     }
 
+    /// A configured terminal leasing its model-facing names from `ids`.
+    #[cfg(unix)]
+    async fn terminal_leasing_from(
+        dir: &Path,
+        ids: AnyIdAllocator,
+    ) -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+    ) {
+        let (cache, shell_sessions) = prepared_test_registry().await;
+        let tool = TerminalTool::new_exact(
+            dir,
+            TestPermissionHandler::default(),
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .with_id_allocator(ids)
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+            local: true,
+            container: false,
+            ssh: false,
+        });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
+        (cache, tool.with_registry(registry))
+    }
+
+    /// A foreground command gives its task id back by the time its call
+    /// returns, so commands run one after another never exhaust the words.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_commands_one_after_another_never_exhaust_the_ids() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let ids = AnyIdAllocator::new(aither_core::WordAllocator::new(["river"]));
+        let (_cache, terminal) = terminal_leasing_from(dir.path(), ids.clone()).await;
+        for run in 0..4 {
+            let result = terminal
+                .call(
+                    TerminalArgs {
+                        background: false,
+                        ..background_args("finish at once", "exit 0")
+                    },
+                    ToolContext::new(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("run {run} should get the one word: {error}"));
+            assert!(!result.is_error(), "{result:?}");
+        }
+        assert!(
+            terminal.job_registry().list().await.is_empty(),
+            "a returned result leaves nothing to address"
+        );
+        assert_eq!(&*ids.lease().expect("river is free"), "river");
+    }
+
+    /// A background job keeps its task id while the agent can still address
+    /// it, and gives it back once its completion is delivered; after that,
+    /// the id answers as an unknown task and can be leased again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_finished_background_job_gives_its_id_back_once_its_completion_is_delivered() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let ids = AnyIdAllocator::new(aither_core::WordAllocator::new(["river", "stone"]));
+        let (_cache, terminal) = terminal_leasing_from(dir.path(), ids.clone()).await;
+        let receiver = terminal.background_receiver();
+        let jobs = terminal.job_registry();
+        terminal
+            .run_background(background_args("print a line", "echo done"))
+            .await
+            .expect("terminal call should succeed");
+        let [started] = <[_; 1]>::try_from(receiver.take_started()).expect("one started task");
+        assert_eq!(started.task_id, "river");
+        assert_eq!(started.output_file.url, "outputs/stone.txt");
+
+        let completed = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
+            .await
+            .expect("the job should deliver its completion")
+            .expect("the completion channel stays open");
+        let pending = jobs
+            .get_by_task_id("river")
+            .await
+            .expect("an undelivered completion keeps the job");
+        assert!(pending.status.completion_pending(), "{pending:?}");
+        assert!(
+            ids.lease().is_err(),
+            "the job and its output hold both words"
+        );
+
+        drop(completed);
+        assert!(jobs.list().await.is_empty(), "a delivered job is forgotten");
+        assert!(matches!(
+            jobs.terminal_read("river", 0, 1024).await,
+            Err(crate::TerminalReadError::Failed(_))
+        ));
+        assert!(!jobs.kill_by_task_id("river").await);
+        // The job's flow lets go of the word as it ends.
+        for _ in 0..500 {
+            if let Ok(again) = ids.lease() {
+                assert_eq!(&*again, "river");
+                return;
+            }
+            async_io::Timer::after(Duration::from_millis(10)).await;
+        }
+        panic!("a delivered job keeps its word");
+    }
+
     /// A child terminal's `terminal_input` and `terminal_read` reach its own
     /// job.
     #[cfg(unix)]
@@ -8423,7 +8588,8 @@ mod tests {
         .await;
         assert_eq!(input["ok"], true, "child terminal_input failed: {input}");
 
-        wait_for_completed_task(&receiver, &echo_id).await;
+        // Held, so the job is still addressable while it is read.
+        let _completed = wait_for_completed_task(&receiver, &echo_id).await;
         let echoed =
             query_control(child.registry(), "terminal_read", &["--task-id", &echo_id]).await;
         assert_eq!(echoed["ok"], true, "child terminal_read failed: {echoed}");
@@ -9247,17 +9413,15 @@ mod tests {
         );
 
         // The agent takes the completion; the registry serves the take
-        // before the list that follows it.
+        // before the list that follows it, and forgets the job.
         drop(completed);
         let taken = jobs.list().await;
-        assert_eq!(
-            taken[0].status,
-            JobStatus::Completed {
-                exit_code: 3,
-                delivery: crate::Delivery::Taken
-            }
-        );
+        assert!(taken.is_empty(), "{taken:?}");
         assert!(!host_sees_owed_turn(&taken), "{taken:?}");
+        assert!(
+            jobs.get_by_task_id(&task_id).await.is_none(),
+            "a delivered job's id is unknown"
+        );
     }
 
     #[cfg(unix)]
@@ -14029,7 +14193,15 @@ mod tests {
         assert!(parent.container_probe().is_some());
         assert!(parent.job_memory().has_container());
 
-        assert_eq!(exit_code_of(&parent, "echo marked-command").await, 0);
+        // A background job, whose completion is held so the registry still
+        // keeps it to be read.
+        let receiver = parent.background_receiver();
+        parent
+            .run_background(background_args("mark", "echo marked-command"))
+            .await
+            .expect("terminal call should succeed");
+        let task_id = started_task_id(&receiver);
+        let _completed = wait_for_completed_task(&receiver, &task_id).await;
 
         let scripts = scripts.lock().unwrap().clone();
         let script = scripts

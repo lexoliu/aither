@@ -187,7 +187,7 @@ pub use audio::{AudioGenerator, AudioTranscriber};
 #[doc(inline)]
 pub use embedding::EmbeddingModel;
 #[doc(inline)]
-pub use ids::{AnyIdAllocator, IdAllocator, IdLease, IdsExhausted, WordAllocator};
+pub use ids::{AnyIdAllocator, IdAllocator, IdLease, IdsExhausted, WeakIdLease, WordAllocator};
 #[doc(inline)]
 pub use image::ImageGenerator;
 #[doc(inline)]
