@@ -306,10 +306,11 @@ impl ProgressSink for JobOutput {
         }
         .render()
         .expect("command progress template must render");
-        // A job that is gone has no output to show it in; progress is advisory.
-        if let Some(job) = self.jobs.get_by_task_id(&self.task_id).await {
-            self.jobs.append_stdout(job.pid, line.into_bytes()).await;
-        }
+        // A job still registering holds the line until it has, so no report
+        // is lost to the gap between its process starting and its registration.
+        self.jobs
+            .append_task_stdout(&self.task_id, line.into_bytes())
+            .await;
     }
 }
 
