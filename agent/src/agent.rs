@@ -8593,10 +8593,23 @@ mod tests {
         )
         .await
         .expect("compact returns at once");
-        let aither_core::llm::ToolResult::Text { text } = result else {
-            panic!("compact answers in text: {result:?}");
-        };
-        text
+        match result {
+            aither_core::llm::ToolResult::Text { text } => {
+                assert!(
+                    text.contains("Compaction started"),
+                    "only a started compaction answers in plain text: {text}"
+                );
+                text
+            }
+            aither_core::llm::ToolResult::Error { message } => {
+                assert!(
+                    !message.contains("Compaction started"),
+                    "a started compaction is not an error: {message}"
+                );
+                message
+            }
+            other => panic!("compact answers in text or a typed error: {other:?}"),
+        }
     }
 
     /// Calling `compact` starts the compaction at the next request boundary
