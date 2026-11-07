@@ -6,7 +6,7 @@
 //! line when one is given. Zero matches is a conflict and more than one is
 //! ambiguous; the matcher never picks an occurrence on its own.
 
-use std::{borrow::Cow, collections::HashSet};
+use std::{borrow::Cow, collections::HashSet, ops::Range};
 
 use crate::{
     error::PatchError,
@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// How lines are compared.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Whitespace {
     /// Byte-for-byte equality.
     Strict,
@@ -40,20 +40,99 @@ impl Whitespace {
     }
 }
 
-/// Applies `hunks` to `file` and returns the patched lines.
+/// Matches `hunks` strictly first and leniently when the strict match is a
+/// conflict or ambiguous, returning the start index of each hunk and the
+/// mode that placed them.
+pub fn place_tolerant(
+    path: &str,
+    file: &[String],
+    hunks: &[Hunk],
+) -> Result<(Vec<usize>, Whitespace), PatchError> {
+    match place_hunks(path, file, hunks, Whitespace::Strict) {
+        Err(PatchError::Conflict { .. } | PatchError::Ambiguous { .. }) => {
+            place_hunks(path, file, hunks, Whitespace::Lenient)
+                .map(|placement| (placement, Whitespace::Lenient))
+        }
+        other => other.map(|placement| (placement, Whitespace::Strict)),
+    }
+}
+
+/// Applies `hunks` with [`place_tolerant`] and returns the patched lines.
+pub fn apply_tolerant(
+    path: &str,
+    file: &[String],
+    hunks: &[Hunk],
+) -> Result<Vec<String>, PatchError> {
+    place_tolerant(path, file, hunks).map(|(placement, _)| build(file, hunks, &placement))
+}
+
+/// Where each hunk of an update landed in a file, found without changing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Located {
+    /// The comparison that placed the hunks: [`Whitespace::Strict`] when an
+    /// exact match placed them, [`Whitespace::Lenient`] when only the
+    /// whitespace-tolerant fallback did or when no placement was found.
+    pub whitespace: Whitespace,
+    /// One entry per hunk, in order: the lines of the current file its old
+    /// side occupies (zero-based, end exclusive; empty for a pure insertion),
+    /// or `None` when the hunk is unlocated.
+    pub ranges: Vec<Option<Range<usize>>>,
+}
+
+/// Locates every hunk of an update in `file` without applying anything.
+///
+/// This is the matching [`apply_tolerant`] performs, strict first and then
+/// whitespace-tolerant: when the hunks place together, every range is the one
+/// the patch would change. When they do not place together, each hunk is
+/// located on its own and is `None` unless it matches exactly one place.
+#[must_use]
+pub fn locate_hunks(file: &[String], hunks: &[Hunk]) -> Located {
+    if let Ok((placement, whitespace)) = place_tolerant("", file, hunks) {
+        return Located {
+            whitespace,
+            ranges: hunks
+                .iter()
+                .zip(placement)
+                .map(|(hunk, start)| Some(start..start + old_len(hunk)))
+                .collect(),
+        };
+    }
+    let ranges = hunks
+        .iter()
+        .map(|hunk| {
+            place_tolerant("", file, std::slice::from_ref(hunk))
+                .ok()
+                .map(|(placement, _)| placement[0]..placement[0] + old_len(hunk))
+        })
+        .collect();
+    Located {
+        whitespace: Whitespace::Lenient,
+        ranges,
+    }
+}
+
+/// The number of file lines a hunk's old side spans.
+fn old_len(hunk: &Hunk) -> usize {
+    hunk.lines
+        .iter()
+        .filter(|line| line.old_side().is_some())
+        .count()
+}
+
+/// Finds the one consistent placement of `hunks`: the start index of each.
 ///
 /// The hunks are placed in file order, each at or after the previous hunk's
-/// end and after its `@@` anchor line. The patch applies only when exactly one
-/// placement of all hunks is consistent, so a hunk that is ambiguous alone is
-/// resolved by the hunks after it.
+/// end and after its `@@` anchor line. A placement exists only when exactly
+/// one placement of all hunks is consistent, so a hunk that is ambiguous alone
+/// is resolved by the hunks after it.
 ///
 /// `path` only labels errors.
-pub fn apply_hunks(
+fn place_hunks(
     path: &str,
     file: &[String],
     hunks: &[Hunk],
     mode: Whitespace,
-) -> Result<Vec<String>, PatchError> {
+) -> Result<Vec<usize>, PatchError> {
     let keys: Vec<Cow<'_, str>> = file.iter().map(|line| mode.key(line)).collect();
     let olds: Vec<Vec<Cow<'_, str>>> = hunks
         .iter()
@@ -86,7 +165,7 @@ pub fn apply_hunks(
                 reason,
             })
         }
-        [only] => Ok(build(file, hunks, only)),
+        [only] => Ok(only.clone()),
         [first, second, ..] => {
             let index = first
                 .iter()
@@ -286,7 +365,7 @@ fn diagnose(
 
 #[cfg(test)]
 mod tests {
-    use super::{Whitespace, apply_hunks};
+    use super::{Whitespace, build, place_hunks};
     use crate::parse::{Action, parse};
 
     fn run(file: &str, hunks: &str, mode: Whitespace) -> Result<String, String> {
@@ -295,8 +374,8 @@ mod tests {
             panic!("expected update");
         };
         let lines: Vec<String> = file.lines().map(String::from).collect();
-        apply_hunks("f", &lines, &hunks, mode)
-            .map(|out| out.join("\n"))
+        place_hunks("f", &lines, &hunks, mode)
+            .map(|placement| build(&lines, &hunks, &placement).join("\n"))
             .map_err(|error| error.to_string())
     }
 
