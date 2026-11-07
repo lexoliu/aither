@@ -9,8 +9,8 @@
 //! both implement over the same [`AgentSettings`]. An option added there is
 //! set the same way on either builder.
 
-#[cfg(feature = "skills")]
 use std::marker::PhantomData;
+#[cfg(feature = "skills")]
 use std::sync::Arc;
 
 use aither_core::{
