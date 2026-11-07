@@ -1,11 +1,13 @@
 //! The text the model reads for what the sandbox refuses and announces.
 //!
-//! The sandbox raises every refusal and notice as typed data: a
-//! [`PollRefusal`], a [`CommandRefusal`], a [`MonitorStarted`] and so on. The
-//! [`SandboxNotices`] set on the [`ToolRegistryBuilder`] turns each into the
-//! natural language the model reads; [`DefaultSandboxNotices`] renders the
-//! sandbox's own wording. An embedder rewords a family by overriding its one
-//! method and keeps the default for the rest.
+//! The sandbox raises every refusal and notice as typed data: an
+//! [`UnchangedTaskRead`], a [`CommandBlocked`], a [`MonitorStarted`] and so
+//! on. The [`SandboxNotices`] set on the [`ToolRegistryBuilder`] turns each
+//! into the natural language the model reads; [`DefaultSandboxNotices`]
+//! renders the sandbox's own wording. An embedder rewords a family by
+//! overriding its one method and keeps the default for the rest. A
+//! [`CommandPolicy`](crate::CommandPolicy) refusal carries its own text and
+//! has no family here.
 //!
 //! [`ToolRegistryBuilder`]: crate::ToolRegistryBuilder
 
@@ -15,9 +17,8 @@ use std::sync::Arc;
 use askama::Template;
 
 use crate::command::CommandBlocked;
-use crate::kill_guard::CommandRefusal;
+use crate::job_registry::UnchangedTaskRead;
 use crate::monitor::{MAX_TIMEOUT_SECS, MonitorRefusal};
-use crate::poll_guard::PollRefusal;
 use crate::terminal::TimeoutKill;
 
 /// A `monitor` call that started watching a task.
@@ -47,31 +48,9 @@ pub enum CommandKilled<'a> {
 }
 
 #[derive(Template)]
-#[template(path = "sleep_refused.txt")]
-struct SleepRefused;
-
-#[derive(Template)]
-#[template(path = "unchanged_file_read.txt")]
-struct UnchangedFileRead<'a> {
-    paths: &'a [std::path::PathBuf],
-}
-
-#[derive(Template)]
 #[template(path = "unchanged_task_read.txt")]
-struct UnchangedTaskRead<'a> {
+struct UnchangedTaskReadTemplate<'a> {
     task_id: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "kill_by_name_refused.txt")]
-struct KillByName<'a> {
-    program: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "unparsable_command_refused.txt")]
-struct Unparsable<'a> {
-    reason: &'a str,
 }
 
 #[derive(Template)]
@@ -123,23 +102,12 @@ fn rendered(template: &impl Template) -> String {
 /// aither-agent's `Notices` extends this trait, so one value an embedder
 /// gives the agent builder renders the sandbox's families too.
 pub trait SandboxNotices: Send + Sync + 'static {
-    /// A command refused because it waits by polling: a foreground `sleep`,
-    /// or a re-read of a file or of a task's output that has not changed.
-    fn poll_refusal(&self, refusal: &PollRefusal) -> String {
-        match refusal {
-            PollRefusal::Sleep => rendered(&SleepRefused),
-            PollRefusal::UnchangedFileRead { paths } => rendered(&UnchangedFileRead { paths }),
-            PollRefusal::UnchangedTaskRead { task_id } => rendered(&UnchangedTaskRead { task_id }),
-        }
-    }
-
-    /// A command refused because it kills processes by name or pattern, or
-    /// because it is not valid shell and so cannot be checked for that.
-    fn command_refusal(&self, refusal: &CommandRefusal) -> String {
-        match refusal {
-            CommandRefusal::KillByName { program } => rendered(&KillByName { program }),
-            CommandRefusal::Unparsable { reason } => rendered(&Unparsable { reason }),
-        }
+    /// A `terminal_read` refused because the task's output has not changed
+    /// since its last read.
+    fn unchanged_task_read(&self, read: &UnchangedTaskRead) -> String {
+        rendered(&UnchangedTaskReadTemplate {
+            task_id: &read.task_id,
+        })
     }
 
     /// A command the terminal's command gate blocked, wrapping the reason
@@ -231,7 +199,7 @@ impl fmt::Debug for AnySandboxNotices {
 ///
 /// Tools return it as their error, so an agent loop tells one refusal from
 /// another, and from any other failure, by downcasting to
-/// `Refused<PollRefusal>`, `Refused<CommandRefusal>` and so on.
+/// `Refused<UnchangedTaskRead>`, `Refused<CommandBlocked>` and so on.
 #[derive(Debug)]
 pub struct Refused<R> {
     reason: R,
@@ -277,8 +245,14 @@ mod tests {
     struct Terse;
 
     impl SandboxNotices for Terse {
-        fn poll_refusal(&self, refusal: &PollRefusal) -> String {
-            format!("no polling ({})", refusal.is_unchanged_read())
+        fn unchanged_task_read(&self, read: &UnchangedTaskRead) -> String {
+            format!("no news from {}", read.task_id)
+        }
+    }
+
+    fn unchanged() -> UnchangedTaskRead {
+        UnchangedTaskRead {
+            task_id: "amber-forest-thunder-pearl".into(),
         }
     }
 
@@ -286,26 +260,28 @@ mod tests {
     fn an_override_replaces_its_family_and_keeps_the_rest() {
         let notices = AnySandboxNotices::new(Terse);
         assert_eq!(
-            notices.poll_refusal(&PollRefusal::Sleep),
-            "no polling (false)"
+            notices.unchanged_task_read(&unchanged()),
+            "no news from amber-forest-thunder-pearl"
         );
+        let blocked = CommandBlocked {
+            reason: "not today".into(),
+        };
         assert_eq!(
-            notices.command_refusal(&CommandRefusal::KillByName {
-                program: "pkill".into()
-            }),
-            DefaultSandboxNotices.command_refusal(&CommandRefusal::KillByName {
-                program: "pkill".into()
-            }),
+            notices.command_blocked(&blocked),
+            DefaultSandboxNotices.command_blocked(&blocked),
         );
     }
 
     #[test]
     fn a_refusal_carries_its_reason_and_rendered_text() {
         let notices = AnySandboxNotices::default();
-        let refused =
-            Refused::rendered(PollRefusal::Sleep, |refusal| notices.poll_refusal(refusal));
-        assert!(matches!(refused.reason(), PollRefusal::Sleep));
-        assert!(refused.to_string().contains("`sleep` in the foreground"));
+        let refused = Refused::rendered(unchanged(), |read| notices.unchanged_task_read(read));
+        assert_eq!(refused.reason(), &unchanged());
+        assert!(
+            refused
+                .to_string()
+                .contains("'amber-forest-thunder-pearl' produced no new output")
+        );
     }
 
     #[test]
