@@ -128,7 +128,7 @@ impl<'a> LiveUpdate<'a> {
 }
 
 /// The unified diff from `before` to `after`.
-fn unified_diff(before: &str, after: &str) -> String {
+pub(crate) fn unified_diff(before: &str, after: &str) -> String {
     similar::TextDiff::from_lines(before, after)
         .unified_diff()
         .context_radius(2)
