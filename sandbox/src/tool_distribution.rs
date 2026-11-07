@@ -79,6 +79,8 @@ pub struct PinnedArtifact<P> {
     pub url: ToolArtifactLocation,
     /// SHA-256 of the complete artifact, before extraction.
     pub sha256: String,
+    /// Length in bytes of the complete artifact, before extraction.
+    pub size: u64,
     /// Artifact encoding and executable member.
     pub encoding: ToolArtifactFormat,
 }
@@ -484,6 +486,7 @@ async fn package_artifacts<P: Distributed>(
                 let tool = artifact.tool.into();
                 let bytes = load_artifact(&artifact, &directory.join("artifacts")).await?;
                 let sha256 = digest(&bytes);
+                let size = bytes.len() as u64;
                 let name = hex::encode(sha256);
                 let path = directory.join(&name);
                 blocking::unblock(move || {
@@ -512,6 +515,7 @@ async fn package_artifacts<P: Distributed>(
                 .await?;
                 artifact.url = ToolArtifactLocation::Bundled(name.clone().into());
                 artifact.sha256 = name;
+                artifact.size = size;
                 artifact.encoding = ToolArtifactFormat::Executable;
                 Ok::<_, ToolRuntimeError>(artifact)
             }
@@ -530,10 +534,10 @@ async fn load_artifact<P: Distributed>(
     let mut expected = [0; 32];
     hex::decode_to_slice(&artifact.sha256, &mut expected)?;
     let path = cache_root.join(hex::encode(expected));
-    let encoded = match read_artifact_file(&path, tool).await {
+    let encoded = match read_artifact_file(&path, tool, artifact.size).await {
         Ok(encoded) => encoded,
         Err(ToolRuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            let encoded = download_artifact(tool, &artifact.url).await?;
+            let encoded = download_artifact(tool, &artifact.url, artifact.size).await?;
             if digest(&encoded) != expected {
                 return Err(ToolRuntimeError::Integrity { tool });
             }
@@ -550,7 +554,7 @@ async fn load_artifact<P: Distributed>(
                 }
             })
             .await?;
-            read_artifact_file(&path, tool).await?
+            read_artifact_file(&path, tool, artifact.size).await?
         }
         Err(error) => return Err(error),
     };
@@ -561,24 +565,45 @@ async fn load_artifact<P: Distributed>(
     blocking::unblock(move || extract_executable(&encoding, &encoded)).await
 }
 
+/// Reads a file the manifest pins at `size` bytes, rejecting any other length
+/// before the content is hashed.
 async fn read_artifact_file(
     path: &Path,
     tool: DistributedTool,
+    size: u64,
 ) -> Result<Vec<u8>, ToolRuntimeError> {
     let file = async_fs::File::open(path).await?;
     let mut bytes = Vec::new();
-    file.take(64 * 1024 * 1024 + 1)
+    file.take(size.saturating_add(1))
         .read_to_end(&mut bytes)
         .await?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err(ToolRuntimeError::ArtifactTooLarge(tool));
-    }
+    check_size(tool, size, &bytes)?;
     Ok(bytes)
+}
+
+/// Rejects `bytes` unless it is exactly the pinned `size`; a read bounded to
+/// `size + 1` bytes that overran reports that longer length.
+const fn check_size(
+    tool: DistributedTool,
+    size: u64,
+    bytes: &[u8],
+) -> Result<(), ToolRuntimeError> {
+    let actual = bytes.len() as u64;
+    if actual == size {
+        Ok(())
+    } else {
+        Err(ToolRuntimeError::ArtifactSize {
+            tool,
+            expected: size,
+            actual,
+        })
+    }
 }
 
 async fn download_artifact(
     tool: DistributedTool,
     location: &ToolArtifactLocation,
+    size: u64,
 ) -> Result<Vec<u8>, ToolRuntimeError> {
     let url = location.download_url(tool)?;
     let encoded = match url.scheme() {
@@ -586,14 +611,12 @@ async fn download_artifact(
             let path = url
                 .to_file_path()
                 .map_err(|()| ToolRuntimeError::ArtifactSource(tool))?;
-            read_artifact_file(&path, tool).await?
+            read_artifact_file(&path, tool, size).await?
         }
-        "https" => download_with_retry(url.as_str(), DOWNLOAD_RETRY).await?,
+        "https" => download_with_retry(url.as_str(), size, DOWNLOAD_RETRY).await?,
         _ => return Err(ToolRuntimeError::ArtifactSource(tool)),
     };
-    if encoded.len() > 64 * 1024 * 1024 {
-        return Err(ToolRuntimeError::ArtifactTooLarge(tool));
-    }
+    check_size(tool, size, &encoded)?;
     Ok(encoded)
 }
 
@@ -618,7 +641,11 @@ const DOWNLOAD_RETRY: DownloadRetry = DownloadRetry {
 };
 
 /// Fetches `url` once, bounded by the attempt deadline.
-async fn download_once(url: &str, timeout: Duration) -> Result<Vec<u8>, ToolRuntimeError> {
+async fn download_once(
+    url: &str,
+    size: u64,
+    timeout: Duration,
+) -> Result<Vec<u8>, ToolRuntimeError> {
     futures_lite::future::or(
         async {
             let mut client = zenwave::client();
@@ -630,7 +657,7 @@ async fn download_once(url: &str, timeout: Duration) -> Result<Vec<u8>, ToolRunt
             response
                 .into_body()
                 .into_reader()
-                .take(64 * 1024 * 1024 + 1)
+                .take(size.saturating_add(1))
                 .read_to_end(&mut bytes)
                 .await?;
             Ok(bytes)
@@ -667,11 +694,15 @@ fn is_transient(error: &ToolRuntimeError) -> bool {
 
 /// Downloads `url`, retrying transient failures with exponential backoff and
 /// failing with the last error once the attempts are spent.
-async fn download_with_retry(url: &str, retry: DownloadRetry) -> Result<Vec<u8>, ToolRuntimeError> {
+async fn download_with_retry(
+    url: &str,
+    size: u64,
+    retry: DownloadRetry,
+) -> Result<Vec<u8>, ToolRuntimeError> {
     let mut backoff = retry.initial_backoff;
     let mut attempt = 1;
     loop {
-        match download_once(url, retry.attempt_timeout).await {
+        match download_once(url, size, retry.attempt_timeout).await {
             Err(error) if attempt < retry.attempts && is_transient(&error) => {
                 tracing::warn!(
                     %error,
@@ -689,12 +720,10 @@ async fn download_with_retry(url: &str, retry: DownloadRetry) -> Result<Vec<u8>,
     }
 }
 
-fn read_executable(reader: impl Read) -> Result<Vec<u8>, ToolRuntimeError> {
+/// Reads an archive member in full: the archive's pinned hash fixes its content.
+fn read_executable(mut reader: impl Read) -> Result<Vec<u8>, ToolRuntimeError> {
     let mut bytes = Vec::new();
-    reader.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err(ToolRuntimeError::InvalidArchive);
-    }
+    reader.read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -797,6 +826,7 @@ pub mod tests {
                     target: target.clone(),
                     url: url(&path),
                     sha256: hex::encode(digest(&bytes)),
+                    size: bytes.len() as u64,
                     encoding: ToolArtifactFormat::Executable,
                 }
             })
@@ -1074,6 +1104,7 @@ pub mod tests {
                     target: ToolTarget::native().unwrap(),
                     url: ToolArtifactLocation::Download(Url::from_file_path(&binary).unwrap()),
                     sha256: hex::encode(digest(bytes)),
+                    size: bytes.len() as u64,
                     encoding: ToolArtifactFormat::Executable,
                 })
                 .collect(),
@@ -1112,7 +1143,7 @@ pub mod tests {
                 .unwrap()
                 .catalog()
         );
-        async_fs::write(relocated.path().join(name), b"tampered")
+        async_fs::write(relocated.path().join(name), b"verified artifact fixtur3")
             .await
             .unwrap();
         assert!(matches!(
@@ -1136,6 +1167,7 @@ pub mod tests {
                 target: ToolTarget::native().unwrap(),
                 url: ToolArtifactLocation::Bundled("../outside".into()),
                 sha256: "00".repeat(32),
+                size: 1,
                 encoding: ToolArtifactFormat::Executable,
             }],
             host_programs: Vec::new(),
@@ -1162,6 +1194,7 @@ pub mod tests {
                     Url::parse("https://user:secret@example.com/tool").unwrap(),
                 ),
                 sha256: "00".repeat(32),
+                size: 1,
                 encoding: ToolArtifactFormat::Executable,
             }],
             host_programs: Vec::new(),
@@ -1290,6 +1323,7 @@ pub mod tests {
                         target,
                         url: ToolArtifactLocation::Download(Url::from_file_path(&archive).unwrap()),
                         sha256: hex::encode(digest(&encoded)),
+                        size: encoded.len() as u64,
                         encoding: ToolArtifactFormat::TarXz {
                             executable: "repo-search/search".into(),
                         },
@@ -1380,9 +1414,9 @@ pub mod tests {
         let fixture = HostFixture::new().await;
         let target = ToolTarget::native().unwrap();
         let cache = fixture.directory.path().join("cache");
-        async_fs::write(&fixture.archive, tar_xz("repo-search/search", b"tampered"))
-            .await
-            .unwrap();
+        let mut tampered = async_fs::read(&fixture.archive).await.unwrap();
+        *tampered.last_mut().unwrap() ^= 1;
+        async_fs::write(&fixture.archive, tampered).await.unwrap();
         assert!(matches!(
             fixture
                 .distribution
@@ -1468,7 +1502,7 @@ pub mod tests {
             format!(
                 r#"{{"artifacts":[],"host_programs":[{{"tool":"repo_search","version":"0.0.3",
                 "target":{{"os":"linux","arch":"x86_64"}},"url":"https://example.com/search.tar.xz",
-                "sha256":"{}","encoding":{{"format":"executable"}}{entry}}}]}}"#,
+                "sha256":"{}","size":1,"encoding":{{"format":"executable"}}{entry}}}]}}"#,
                 "0".repeat(64)
             )
         };
@@ -1605,7 +1639,7 @@ pub mod tests {
             Some((200, b"payload")),
         ])
         .await;
-        let bytes = download_with_retry(&url, FAST_RETRY).await.unwrap();
+        let bytes = download_with_retry(&url, 7, FAST_RETRY).await.unwrap();
         assert_eq!(bytes, b"payload");
         assert_eq!(server.await.unwrap(), 4);
     }
@@ -1613,7 +1647,7 @@ pub mod tests {
     #[tokio::test]
     async fn a_permanent_status_is_tried_exactly_once() {
         let (url, server) = serve(vec![Some((404, b"missing"))]).await;
-        let error = download_with_retry(&url, FAST_RETRY).await.unwrap_err();
+        let error = download_with_retry(&url, 7, FAST_RETRY).await.unwrap_err();
         assert!(error.to_string().contains("404"), "{error}");
         assert!(!is_transient(&error));
         assert_eq!(server.await.unwrap(), 1);
@@ -1628,8 +1662,60 @@ pub mod tests {
             Some((502, b"")),
         ])
         .await;
-        let error = download_with_retry(&url, FAST_RETRY).await.unwrap_err();
+        let error = download_with_retry(&url, 7, FAST_RETRY).await.unwrap_err();
         assert!(error.to_string().contains("502"), "{error}");
         assert_eq!(server.await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_download_longer_than_its_pinned_size_is_rejected_before_hashing() {
+        let (url, server) = serve(vec![Some((200, b"payload and more"))]).await;
+        let tool = DistributedTool::Command(ManagedTool::Ripgrep);
+        // The body read stops one byte past the pin instead of buffering it all.
+        let bytes = download_with_retry(&url, 7, FAST_RETRY).await.unwrap();
+        assert_eq!(bytes.len(), 8);
+        let error = check_size(tool, 7, &bytes).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ToolRuntimeError::ArtifactSize {
+                    tool: DistributedTool::Command(ManagedTool::Ripgrep),
+                    expected: 7,
+                    actual: 8,
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cached_file_of_the_wrong_size_is_rejected_before_hashing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        let tool = DistributedTool::Command(ManagedTool::Ripgrep);
+        async_fs::write(&path, b"payload").await.unwrap();
+        assert_eq!(
+            read_artifact_file(&path, tool, 7).await.unwrap(),
+            b"payload"
+        );
+        for pinned in [6, 8] {
+            let error = read_artifact_file(&path, tool, pinned).await.unwrap_err();
+            assert!(
+                matches!(error, ToolRuntimeError::ArtifactSize { expected, .. } if expected == pinned),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_executable_over_64_mib_extracts_from_a_hash_verified_archive() {
+        let executable = vec![7_u8; 64 * 1024 * 1024 + 1];
+        let encoded = tar_xz("repo-search-x/search", &executable);
+        let encoding = ToolArtifactFormat::TarXz {
+            executable: "repo-search-x/search".into(),
+        };
+        let extracted = extract_executable(&encoding, &encoded).unwrap();
+        assert!(extracted == executable);
     }
 }

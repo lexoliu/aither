@@ -56,9 +56,10 @@ name="bash-${version}-${target}"
 (cd "$out_dir" && "${checksum[@]}" "$name.tar.gz" > "$name.tar.gz.sha256")
 bytes="$(wc -c < "$bin" | tr -d '[:space:]')"
 sha="$(cut -d' ' -f1 "$out_dir/$name.tar.gz.sha256")"
+size="$(wc -c < "$out_dir/$name.tar.gz" | tr -d '[:space:]')"
 
 jq -n --arg name bash --arg version "$version" --arg target "$target" \
-    --arg file "$name.tar.gz" --arg sha256 "$sha" --argjson executable_bytes "$bytes" \
-    '{name: $name, version: $version, target: $target, file: $file, sha256: $sha256, executable_bytes: $executable_bytes}' \
+    --arg file "$name.tar.gz" --arg sha256 "$sha" --argjson size "$size" --argjson executable_bytes "$bytes" \
+    '{name: $name, version: $version, target: $target, file: $file, sha256: $sha256, size: $size, executable_bytes: $executable_bytes}' \
     > "$out_dir/$name.json"
 cat "$out_dir/$name.json"; echo
