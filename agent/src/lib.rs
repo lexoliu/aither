@@ -88,9 +88,8 @@ pub mod specialized;
 
 // Subagent definitions
 pub use subagent_file::{
-    BUNDLED_SUBAGENTS, BundledSubagent, DefinitionError, LOCAL_SUBAGENTS_DIR,
-    RESERVED_SUBAGENT_NAMES, ResolveError, SubagentAccess, SubagentDefinition,
-    install_bundled_subagents, validate_subagent_name,
+    DefinitionError, LOCAL_SUBAGENTS_DIR, RESERVED_SUBAGENT_NAMES, ResolveError, SubagentAccess,
+    SubagentDefinition, validate_subagent_name,
 };
 
 // Re-export tool crates

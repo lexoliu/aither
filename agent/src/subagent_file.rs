@@ -12,11 +12,12 @@
 //! '''
 //! ```
 //!
-//! `subagent <name>` looks `<name>.toml` up in the global subagents
-//! directory the host configures, then in `agents/` under the calling
-//! terminal's working directory; a global definition shadows a local one of
-//! the same name.
+//! aither bundles none: the embedder supplies its definitions to the
+//! `SubagentTool`, and `subagent <name>` looks a name up among them first,
+//! then as `<name>.toml` in `agents/` under the calling terminal's working
+//! directory; an embedder's definition shadows a local one of the same name.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use async_fs as fs;
@@ -131,74 +132,6 @@ impl SubagentDefinition {
     }
 }
 
-/// A subagent shipped with aither, for the host to keep in its global
-/// subagents directory.
-#[derive(Debug, Clone, Copy)]
-pub struct BundledSubagent {
-    /// Its name, which its file is named after.
-    pub name: &'static str,
-    /// Its TOML definition.
-    pub source: &'static str,
-}
-
-impl BundledSubagent {
-    /// Its parsed definition.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the bundled definition is invalid.
-    #[must_use]
-    pub fn definition(&self) -> SubagentDefinition {
-        SubagentDefinition::parse(self.source)
-            .unwrap_or_else(|error| panic!("bundled subagent '{}': {error}", self.name))
-    }
-}
-
-/// The subagents shipped with aither.
-pub const BUNDLED_SUBAGENTS: [BundledSubagent; 6] = [
-    BundledSubagent {
-        name: "explore",
-        source: include_str!("../subagents/explore.toml"),
-    },
-    BundledSubagent {
-        name: "research",
-        source: include_str!("../subagents/research.toml"),
-    },
-    BundledSubagent {
-        name: "audit",
-        source: include_str!("../subagents/audit.toml"),
-    },
-    BundledSubagent {
-        name: "review",
-        source: include_str!("../subagents/review.toml"),
-    },
-    BundledSubagent {
-        name: "plan",
-        source: include_str!("../subagents/plan.toml"),
-    },
-    BundledSubagent {
-        name: "general",
-        source: include_str!("../subagents/general.toml"),
-    },
-];
-
-/// Writes every bundled subagent into the global subagents directory `dir`,
-/// creating it, and overwriting the bundled files so they match this build.
-///
-/// # Errors
-///
-/// Returns an error when the directory or a file cannot be written.
-pub async fn install_bundled_subagents(dir: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dir).await?;
-    futures::future::try_join_all(
-        BUNDLED_SUBAGENTS
-            .iter()
-            .map(|bundled| fs::write(definition_path(dir, bundled.name), bundled.source)),
-    )
-    .await?;
-    Ok(())
-}
-
 fn definition_path(dir: &Path, name: &str) -> PathBuf {
     let mut file_name = String::with_capacity(name.len() + 5);
     file_name.push_str(name);
@@ -212,17 +145,14 @@ pub enum ResolveError {
     /// The name cannot name a subagent.
     #[error(transparent)]
     Name(#[from] DefinitionError),
-    /// Neither place holds the name.
+    /// Neither the embedder's definitions nor the working directory hold the name.
     #[error(
-        "no subagent '{name}': neither the global subagents directory {} nor {} holds {name}.toml",
-        global.display(),
+        "no subagent '{name}': the embedder defines none of that name and {} holds no {name}.toml",
         local.display()
     )]
     NotFound {
         /// The name looked up.
         name: String,
-        /// The global subagents directory.
-        global: PathBuf,
         /// The working directory's `agents/`.
         local: PathBuf,
     },
@@ -255,8 +185,8 @@ pub enum ResolveError {
 /// The two places a subagent name resolves in.
 #[derive(Debug, Clone, Copy)]
 pub struct SubagentLookup<'a> {
-    /// The global subagents directory.
-    pub global: &'a Path,
+    /// The definitions the embedder supplied, by name.
+    pub definitions: &'a BTreeMap<String, SubagentDefinition>,
     /// The working directory whose `agents/` is looked in second.
     pub working_dir: &'a Path,
 }
@@ -275,18 +205,18 @@ impl SubagentLookup<'_> {
         self.working_dir.join(LOCAL_SUBAGENTS_DIR)
     }
 
-    /// The definition `name` resolves to: the global one, else the working
+    /// The definition `name` resolves to: the embedder's, else the working
     /// directory's.
     pub async fn resolve(&self, name: &str) -> Result<SubagentDefinition, ResolveError> {
         validate_subagent_name(name)?;
-        for dir in [self.global.to_path_buf(), self.local()] {
-            if let Some(definition) = load(&definition_path(&dir, name), name).await? {
-                return Ok(definition);
-            }
+        if let Some(definition) = self.definitions.get(name) {
+            return Ok(definition.clone());
+        }
+        if let Some(definition) = load(&definition_path(&self.local(), name), name).await? {
+            return Ok(definition);
         }
         Err(ResolveError::NotFound {
             name: name.to_string(),
-            global: self.global.to_path_buf(),
             local: self.local(),
         })
     }
@@ -294,12 +224,12 @@ impl SubagentLookup<'_> {
     /// Every name that resolves, by name, with what each resolves to.
     pub async fn resolvable(&self) -> Vec<Listed> {
         let local_dir = self.local();
-        let (global, local) = futures::join!(names_in(self.global), names_in(&local_dir));
+        let local = names_in(&local_dir).await;
         let unshadowed: Vec<String> = local
             .into_iter()
-            .filter(|name| !global.contains(name))
+            .filter(|name| !self.definitions.contains_key(name))
             .collect();
-        let mut names = global;
+        let mut names: Vec<String> = self.definitions.keys().cloned().collect();
         names.extend(unshadowed);
         names.sort();
         futures::future::join_all(names.into_iter().map(|name| async move {
@@ -421,45 +351,21 @@ You review.
         }
     }
 
-    #[test]
-    fn every_bundled_subagent_parses_with_its_stated_tier_and_access() {
-        let stated = BUNDLED_SUBAGENTS.map(|bundled| {
-            let definition = bundled.definition();
-            assert_eq!(definition.name, bundled.name);
-            (bundled.name, definition.tier, definition.access)
-        });
-        assert_eq!(
-            stated,
-            [
-                ("explore", Some(ModelTier::Fast), SubagentAccess::ReadOnly),
-                ("research", Some(ModelTier::Fast), SubagentAccess::ReadOnly),
-                ("audit", Some(ModelTier::Advanced), SubagentAccess::ReadOnly),
-                (
-                    "review",
-                    Some(ModelTier::Advanced),
-                    SubagentAccess::ReadOnly
-                ),
-                ("plan", Some(ModelTier::Advanced), SubagentAccess::ReadOnly),
-                ("general", None, SubagentAccess::Worktrees),
-            ]
-        );
-    }
-
-    #[test]
-    fn explore_searches_cheaply_and_research_names_no_websearch_command() {
-        let explore = BUNDLED_SUBAGENTS[0].definition().prompt;
-        for tool in [
-            "`search`",
-            "`rg`",
-            "`ast-grep`",
-            "JSON",
-            "transcripts",
-            "databases",
-        ] {
-            assert!(explore.contains(tool), "explore's prompt names {tool}");
-        }
-        let research = BUNDLED_SUBAGENTS[1].definition().prompt;
-        assert!(!research.contains("websearch"), "{research}");
+    fn definitions<'a>(
+        named: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> BTreeMap<String, SubagentDefinition> {
+        named
+            .into_iter()
+            .map(|(name, description)| {
+                let definition = SubagentDefinition::parse(
+                    &DEFINITION
+                        .replace("\"reviewer\"", &format!("\"{name}\""))
+                        .replace("Reviews a change.", description),
+                )
+                .unwrap();
+                (name.to_string(), definition)
+            })
+            .collect()
     }
 
     fn write(dir: &Path, name: &str, description: &str) {
@@ -474,22 +380,21 @@ You review.
     }
 
     #[tokio::test]
-    async fn a_global_name_shadows_the_working_directorys_and_both_places_are_named_when_neither_has_it()
-     {
-        let global = tempfile::tempdir().unwrap();
+    async fn an_embedder_name_shadows_the_working_directorys_and_the_lookup_says_where_it_looked() {
         let work = tempfile::tempdir().unwrap();
         let local = work.path().join(LOCAL_SUBAGENTS_DIR);
-        write(global.path(), "shared", "the global one");
+        let definitions =
+            definitions([("shared", "the embedder one"), ("only-embedder", "defined")]);
         write(&local, "shared", "the local one");
         write(&local, "only-local", "the local one");
         let lookup = SubagentLookup {
-            global: global.path(),
+            definitions: &definitions,
             working_dir: work.path(),
         };
 
         assert_eq!(
             lookup.resolve("shared").await.unwrap().description,
-            "the global one"
+            "the embedder one"
         );
         assert_eq!(
             lookup.resolve("only-local").await.unwrap().description,
@@ -499,8 +404,7 @@ You review.
         assert_eq!(
             missing,
             format!(
-                "no subagent 'missing': neither the global subagents directory {} nor {} holds missing.toml",
-                global.path().display(),
+                "no subagent 'missing': the embedder defines none of that name and {} holds no missing.toml",
                 local.display()
             )
         );
@@ -518,24 +422,26 @@ You review.
         assert_eq!(
             listed,
             [
+                ("only-embedder".to_string(), "defined".to_string()),
                 ("only-local".to_string(), "the local one".to_string()),
-                ("shared".to_string(), "the global one".to_string()),
+                ("shared".to_string(), "the embedder one".to_string()),
             ]
         );
     }
 
     #[tokio::test]
-    async fn a_definition_named_unlike_its_file_is_refused() {
-        let global = tempfile::tempdir().unwrap();
-        write(global.path(), "inner", "described");
+    async fn a_definition_file_named_unlike_its_file_is_refused() {
+        let work = tempfile::tempdir().unwrap();
+        let local = work.path().join(LOCAL_SUBAGENTS_DIR);
+        write(&local, "inner", "described");
         std::fs::rename(
-            definition_path(global.path(), "inner"),
-            definition_path(global.path(), "outer"),
+            definition_path(&local, "inner"),
+            definition_path(&local, "outer"),
         )
         .unwrap();
-        let work = tempfile::tempdir().unwrap();
+        let none = BTreeMap::new();
         let lookup = SubagentLookup {
-            global: global.path(),
+            definitions: &none,
             working_dir: work.path(),
         };
         let error = lookup.resolve("outer").await.unwrap_err();
@@ -545,22 +451,19 @@ You review.
     }
 
     #[tokio::test]
-    async fn installing_writes_every_bundled_subagent_over_a_stale_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        let global = dir.path().join("subagents");
-        std::fs::create_dir_all(&global).unwrap();
-        std::fs::write(definition_path(&global, "explore"), "stale").unwrap();
-        install_bundled_subagents(&global).await.unwrap();
+    async fn no_definitions_resolve_and_list_nothing() {
         let work = tempfile::tempdir().unwrap();
+        let none = BTreeMap::new();
         let lookup = SubagentLookup {
-            global: &global,
+            definitions: &none,
             working_dir: work.path(),
         };
-        for bundled in BUNDLED_SUBAGENTS {
-            assert_eq!(
-                lookup.resolve(bundled.name).await.unwrap(),
-                bundled.definition()
-            );
+        assert!(lookup.resolvable().await.is_empty());
+        for bundled_name in ["explore", "research", "audit", "review", "plan", "general"] {
+            assert!(matches!(
+                lookup.resolve(bundled_name).await,
+                Err(ResolveError::NotFound { .. })
+            ));
         }
     }
 }

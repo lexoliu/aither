@@ -57,26 +57,15 @@ Run `<command> -h` or `--help` for usage details. Use `--` to end option parsing
 
 **Syntax:** `subagent <name> --prompt-file "<path>"`
 
-`<name>` is a subagent definition: a global one first, else `agents/<name>.toml` in the working directory. `subagent` alone lists the names that resolve. The definition fixes the subagent's role, its model and what it may write:
-
-| Name | Model | Writes |
-| --- | --- | --- |
-| `explore` | fast | its own scratch directory |
-| `research` | fast | its own scratch directory |
-| `audit` | advanced | its own scratch directory |
-| `review` | advanced | its own scratch directory |
-| `plan` | advanced | its own scratch directory |
-| `general` | routed by the fast model | its own scratch directory and the worktrees granted with `--worktrees` / `--commit-worktrees` |
-| `fork` | yours, continuing your context | its own scratch directory and the worktrees granted |
+`<name>` is a subagent definition: one the host provides first, else `agents/<name>.toml` in the working directory. `subagent` alone lists the names that resolve, each with when to use it. The definition fixes the subagent's role, its model and what it may write: a read-only subagent writes only its own scratch directory, and one that may write worktrees also writes those granted with `--worktrees` / `--commit-worktrees`. `fork` runs on your model and continues your context, writing its own scratch directory and the worktrees granted.
 
 Every subagent reads the whole workspace and keeps its own working files in its own scratch directory; it cannot start subagents. The brief is read from a file: write it to a file first, then pass its path via `--prompt-file`. Inline prompt text is rejected.
 
 **Examples:**
 
 ```bash
-subagent research --prompt-file "prompts/research.md"
-subagent explore --prompt-file "prompts/explore.md"
-subagent general --prompt-file "prompts/fix.md" --commit-worktrees "wt/fix"
+subagent <name> --prompt-file "prompts/task.md"
+subagent <name> --prompt-file "prompts/fix.md" --commit-worktrees "wt/fix"
 subagent external --agent codex --prompt-file "prompts/port.md" --worktrees "wt/port"
 ```
 

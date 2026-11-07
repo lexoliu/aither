@@ -260,8 +260,8 @@ pub trait AgentOptions: sealed::Sealed + Sized {
     /// # Example
     ///
     /// ```rust,ignore
-    /// // Create an explore subagent using the balanced model
-    /// let explore_agent = Agent::builder(opus)
+    /// // Create an agent that reasons on the balanced model
+    /// let balanced_agent = Agent::builder(opus)
     ///     .balanced_model(sonnet, Parameters::default())
     ///     .fast_model(haiku, Parameters::default())
     ///     .tier(ModelTier::Balanced)  // Use sonnet for reasoning

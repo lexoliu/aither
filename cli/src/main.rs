@@ -573,20 +573,10 @@ async fn build_agent(
         }
     }
 
-    // The bundled subagents are kept in the global subagents directory,
-    // overwritten so they match this build; only the main agent gets the
-    // `subagent` command.
-    let global_subagents = workdir_parent.join("subagents");
-    aither_agent::install_bundled_subagents(&global_subagents)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to install the bundled subagents into {}",
-                global_subagents.display()
-            )
-        })?;
-    let subagent_tool =
-        SubagentTool::new(cloud, global_subagents).with_base_dir(builder.sandbox_dir().to_string());
+    // aither defines no subagents: the CLI has the built-in routes and the
+    // working directory's `agents/`. Only the main agent gets the `subagent`
+    // command.
+    let subagent_tool = SubagentTool::new(cloud).with_base_dir(builder.sandbox_dir().to_string());
     builder = builder.subagents(subagent_tool, SUBAGENT_DESCRIPTION);
 
     // Add system prompt
