@@ -226,7 +226,7 @@ impl Agent {
             .register_at(
                 JobPlace::Container,
                 pid,
-                task_id,
+                &aither_sandbox::test_ids::lease(task_id),
                 "exec",
                 task_id,
                 ScriptLanguage::Shell,
@@ -260,7 +260,7 @@ impl Agent {
             .register_at(
                 JobPlace::Remote,
                 pid,
-                task_id,
+                &aither_sandbox::test_ids::lease(task_id),
                 "exec",
                 task_id,
                 ScriptLanguage::Shell,
@@ -289,7 +289,14 @@ impl Agent {
         let sleeper = Sleeper::start();
         let pid = sleeper.pid();
         self.registry
-            .register(pid, task_id, "exec", task_id, TerminalMode::Sandboxed, None)
+            .register(
+                pid,
+                &aither_sandbox::test_ids::lease(task_id),
+                "exec",
+                task_id,
+                TerminalMode::Sandboxed,
+                None,
+            )
             .await;
         self.footprints.by_pid.lock().unwrap().insert(pid, bytes);
         self.sleepers.push(sleeper);
@@ -496,9 +503,9 @@ async fn the_machine_over_physical_memory_costs_the_largest_contributor_only_whi
     let machine = Machine::default();
     let mut big = Agent::new(50 * GIB, Some((&machine, "big")));
     let mut small = Agent::new(50 * GIB, Some((&machine, "small")));
-    big.job("big-1", 25 * GIB).await;
-    big.job("big-2", 10 * GIB).await;
-    small.job("small-1", 20 * GIB).await;
+    big.job("anchor", 25 * GIB).await;
+    big.job("bridge", 10 * GIB).await;
+    small.job("canyon", 20 * GIB).await;
     // Both publish; 55 GiB together on a machine of 50.
     for agent in [&mut big, &mut small] {
         agent
@@ -536,7 +543,7 @@ async fn the_machine_over_physical_memory_costs_the_largest_contributor_only_whi
     assert!(
         big_events.iter().any(|event| matches!(
             event,
-            HostLoadEvent::MemoryFinalWarning { job, .. } if job.task_id == "big-1"
+            HostLoadEvent::MemoryFinalWarning { job, .. } if job.task_id == "anchor"
         )),
         "{big_events:?}"
     );
@@ -549,20 +556,20 @@ async fn the_machine_over_physical_memory_costs_the_largest_contributor_only_whi
     assert!(
         matches!(
             killed.as_slice(),
-            [HostLoadEvent::JobKilledForMemory { task_id, .. }] if task_id == "big-1"
+            [HostLoadEvent::JobKilledForMemory { task_id, .. }] if task_id == "anchor"
         ),
         "{killed:?}"
     );
     assert!(matches!(
-        big.status("big-1").await,
+        big.status("anchor").await,
         JobStatus::Killed {
             cause: KillCause::MemoryRunaway { .. },
             ..
         }
     ));
-    assert_eq!(big.status("big-2").await, JobStatus::Running);
+    assert_eq!(big.status("bridge").await, JobStatus::Running);
     // The killed processes hold nothing now: 30 GiB together fits.
-    let killed_pid = big.registry.get_by_task_id("big-1").await.unwrap().pid;
+    let killed_pid = big.registry.get_by_task_id("anchor").await.unwrap().pid;
     big.footprints.by_pid.lock().unwrap().insert(killed_pid, 0);
     clock.advance(600);
     for agent in [&mut big, &mut small] {
@@ -577,7 +584,7 @@ async fn the_machine_over_physical_memory_costs_the_largest_contributor_only_whi
             "the machine fits again: {events:?}"
         );
     }
-    assert_eq!(small.status("small-1").await, JobStatus::Running);
+    assert_eq!(small.status("canyon").await, JobStatus::Running);
 }
 
 #[tokio::test]
@@ -586,8 +593,8 @@ async fn kills_continue_down_the_contributors_while_both_conditions_hold() {
     let machine = Machine::default();
     let mut first = Agent::new(20 * GIB, Some((&machine, "first")));
     let mut second = Agent::new(20 * GIB, Some((&machine, "second")));
-    let first_pid = first.job("first-1", 15 * GIB).await;
-    second.job("second-1", 12 * GIB).await;
+    let first_pid = first.job("first", 15 * GIB).await;
+    second.job("second", 12 * GIB).await;
     let critical = Some(MemoryPressure::Critical);
 
     // 27 GiB together on 20: the first contributes the most.
@@ -611,7 +618,7 @@ async fn kills_continue_down_the_contributors_while_both_conditions_hold() {
     first.guard.observe(clock.now(), critical).await;
     first.footprints.by_pid.lock().unwrap().insert(first_pid, 0);
     assert!(matches!(
-        first.status("first-1").await,
+        first.status("first").await,
         JobStatus::Killed {
             cause: KillCause::MemoryRunaway { .. },
             ..
@@ -636,14 +643,14 @@ async fn kills_continue_down_the_contributors_while_both_conditions_hold() {
     assert!(
         next.iter().any(|event| matches!(
             event,
-            HostLoadEvent::MemoryFinalWarning { job, .. } if job.task_id == "second-1"
+            HostLoadEvent::MemoryFinalWarning { job, .. } if job.task_id == "second"
         )),
         "{next:?}"
     );
     clock.advance(60);
     second_only.guard.observe(clock.now(), critical).await;
     assert!(matches!(
-        second_only.status("second-1").await,
+        second_only.status("second").await,
         JobStatus::Killed {
             cause: KillCause::MemoryRunaway { .. },
             ..

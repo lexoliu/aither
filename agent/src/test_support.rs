@@ -3,6 +3,13 @@
 /// The `CPython` version the baseline fixture's `uv` installs and reports.
 const BASELINE_PYTHON_VERSION: &str = "3.13.1";
 
+/// An output store in `dir`, leasing from the default allocator.
+pub async fn output_store(dir: impl Into<std::path::PathBuf>) -> aither_sandbox::OutputStore {
+    aither_sandbox::OutputStore::new(dir, aither_core::AnyIdAllocator::default())
+        .await
+        .expect("the output directory can be created")
+}
+
 /// Drives `run` to its end without looking at its events.
 pub async fn finish_run(
     run: crate::Run<impl std::future::Future<Output = Result<(), crate::AgentError>>>,

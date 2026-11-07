@@ -922,7 +922,7 @@ where
             aither_sandbox::AnySandboxNotices::default(),
         )));
         let terminal = self.terminal_tool.clone().with_registry(Arc::new(
-            ToolRegistryBuilder::new().build(self.terminal_tool.outputs_dir()),
+            ToolRegistryBuilder::new().build(self.terminal_tool.output_store().clone()),
         ));
         definitions.push(ToolDefinition::new(&terminal));
         definitions.push(ToolDefinition::new(&aither_sandbox::MonitorTool::new(
@@ -984,7 +984,7 @@ where
             });
         }
         let registry =
-            std::sync::Arc::new(registry_builder.build(self.terminal_tool.outputs_dir()));
+            std::sync::Arc::new(registry_builder.build(self.terminal_tool.output_store().clone()));
 
         let commands = crate::command_catalog::CommandCatalog::new(
             self.tool_descriptions,
@@ -1888,7 +1888,7 @@ mod tests {
                 Event::ToolCall(aither_core::llm::ToolCall::new(
                     "stop",
                     "terminal_kill",
-                    serde_json::json!({ "task_id": "background-task" }),
+                    serde_json::json!({ "task_id": "background" }),
                 ))
             } else {
                 Event::Text("done".into())
@@ -1920,7 +1920,7 @@ mod tests {
         let jobs = terminal_tool.job_registry();
         jobs.register(
             424_242,
-            "background-task",
+            &aither_sandbox::test_ids::lease("background"),
             "execution",
             "sleep 60",
             aither_sandbox::TerminalMode::Sandboxed,

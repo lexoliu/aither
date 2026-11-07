@@ -203,6 +203,9 @@ pub enum SubagentGrantError {
         /// The failure.
         source: io::Error,
     },
+    /// Every model-facing id is leased, so the subagent's space has no name.
+    #[error(transparent)]
+    SpaceName(#[from] aither_core::IdsExhausted),
     /// The embedder's [`SubagentSpaces`] could not prepare the subagent's
     /// space. The space was removed.
     #[error("cannot prepare the subagent space {}: {source}", .space.display())]

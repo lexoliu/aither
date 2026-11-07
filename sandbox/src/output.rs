@@ -6,13 +6,18 @@
 //!   immediately; text keeps a preview in the result
 
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     io::Cursor,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
-use aither_core::llm::{CommandStream, StoredFile};
+use aither_core::{
+    AnyIdAllocator, IdLease,
+    llm::{CommandStream, StoredFile},
+};
 use async_fs as fs;
+use futures_lite::{AsyncWriteExt as _, StreamExt as _};
 use image::{GenericImageView, ImageFormat, ImageReader, imageops::FilterType};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -89,17 +94,6 @@ fn stored_file(url: String, path: &Path) -> StoredFile {
     }
 }
 
-/// Internal reference to a stored output.
-#[derive(Debug, Clone)]
-pub struct OutputRef {
-    /// How the output was delivered
-    pub stream: CommandStream,
-    /// Detected or specified format
-    pub format: OutputFormat,
-    /// Size in bytes
-    pub size: usize,
-}
-
 /// Maximum output size (in bytes) delivered inline to the model.
 /// Outputs exceeding this are saved to file; the model still receives a
 /// head+tail preview capped at this budget together with the file reference,
@@ -125,7 +119,7 @@ struct CutText<'a> {
 /// original: when it is not smaller the original is returned inline and
 /// uncut, and nothing is written to disk.
 async fn cut_text_output(
-    dir: &Path,
+    store: &OutputStore,
     format: OutputFormat,
     cut: CutText<'_>,
 ) -> std::io::Result<CommandStream> {
@@ -135,7 +129,6 @@ async fn cut_text_output(
         max_lines,
         byte_budget,
     } = cut;
-    let (url, path) = allocate_file(dir, data, format);
 
     let folded = crate::output_compress::folded_code_content(text)
         .filter(|folded| folded.len() <= byte_budget);
@@ -144,95 +137,107 @@ async fn cut_text_output(
             .trim_end_matches('\n')
             .to_owned()
     });
-    let stream = CommandStream::Stored {
-        file: stored_file(url, &path),
-        preview,
-        truncated: true,
+    let ext = extension_for_data(data, format);
+
+    // Names a file of an earlier store holds stay leased until a free one is
+    // found, so the allocator hands out another.
+    let mut taken = Vec::new();
+    let delivered = loop {
+        let name = store.name(ext, &mut taken).await?;
+        let stream = CommandStream::Stored {
+            file: stored_file(name.url.clone(), &name.path),
+            preview: preview.clone(),
+            truncated: true,
+        };
+
+        let rendered_len = stream.render_for_model().len();
+        if rendered_len >= data.len() {
+            debug!(
+                original = data.len(),
+                cut = rendered_len,
+                "cut form is not smaller than the output, returning it inline"
+            );
+            break Ok(CommandStream::Inline {
+                text: text.to_owned(),
+            });
+        }
+
+        match write_new(&name.path, data).await {
+            Ok(()) => {
+                debug!(size = data.len(), format = ?format, "saved output");
+                store.keep(name);
+                break Ok(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                taken.push(name.lease);
+            }
+            Err(error) => break Err(error),
+        }
     };
-
-    let rendered_len = stream.render_for_model().len();
-    if rendered_len >= data.len() {
-        debug!(
-            original = data.len(),
-            cut = rendered_len,
-            "cut form is not smaller than the output, returning it inline"
-        );
-        return Ok(CommandStream::Inline {
-            text: text.to_owned(),
-        });
-    }
-
-    fs::write(&path, data).await?;
-    debug!(size = data.len(), format = ?format, "saved output");
-    Ok(stream)
+    drop(taken);
+    delivered
 }
 
-/// Manages output storage for terminal executions.
+/// A file name leased for an output, before the file exists.
+struct OutputName {
+    lease: IdLease,
+    /// The name as results spell it, `outputs/<word>.<ext>`.
+    url: String,
+    path: PathBuf,
+}
+
+/// Stores the outputs too large for a result, each in a file named by a word
+/// leased from the store's [`AnyIdAllocator`].
+///
+/// A stored output is addressed by its path for as long as the store lives,
+/// so its word stays leased until the last clone of the store drops. A word
+/// naming a file already in the directory, left by an earlier store, is
+/// skipped whatever that file's extension, so one word never names two files.
+#[derive(Clone, Debug)]
+pub struct OutputStore(Arc<StoreInner>);
+
 #[derive(Debug)]
-pub struct OutputStore {
+struct StoreInner {
     /// Base directory for outputs (e.g., $WORKDIR/outputs)
     dir: PathBuf,
-    /// Tracked output entries by ID
-    entries: HashMap<String, OutputRef>,
-    /// Counter for unique IDs
-    next_id: u64,
+    ids: AnyIdAllocator,
+    /// The words of the files this store wrote.
+    names: Mutex<Vec<IdLease>>,
+    /// The words naming the files the directory held when this store first
+    /// named one: what earlier stores left.
+    earlier: async_lock::OnceCell<HashSet<String>>,
 }
 
 impl OutputStore {
-    /// Creates a new output store in the given directory.
+    /// Creates an output store in `dir`, naming its files with words leased
+    /// from `ids`.
     ///
     /// # Errors
     ///
     /// Returns an error if the directory cannot be created.
-    pub async fn new(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
+    pub async fn new(dir: impl Into<PathBuf>, ids: AnyIdAllocator) -> std::io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir).await?;
-        Ok(Self {
+        Ok(Self::at(dir, ids))
+    }
+
+    /// An output store in `dir`, which exists.
+    pub(crate) fn at(dir: PathBuf, ids: AnyIdAllocator) -> Self {
+        Self(Arc::new(StoreInner {
             dir,
-            entries: HashMap::new(),
-            next_id: 0,
-        })
+            ids,
+            names: Mutex::new(Vec::new()),
+            earlier: async_lock::OnceCell::new(),
+        }))
     }
 
     /// Returns the base directory path.
     #[must_use]
     pub fn dir(&self) -> &Path {
-        &self.dir
+        &self.0.dir
     }
 
     /// Saves output data and returns the stream the result carries.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if file creation fails (for large outputs).
-    pub async fn save(
-        &mut self,
-        data: &[u8],
-        format: OutputFormat,
-        resolution: MediaResolution,
-    ) -> std::io::Result<CommandStream> {
-        let stream = Self::save_to_dir(&self.dir, data, format, resolution).await?;
-
-        // Track the reference
-        let id = format!("output_{}", self.next_id);
-        self.next_id += 1;
-
-        let format = if format == OutputFormat::Auto {
-            detect_format(data)
-        } else {
-            format
-        };
-        let output_ref = OutputRef {
-            stream: stream.clone(),
-            format,
-            size: data.len(),
-        };
-        self.entries.insert(id, output_ref);
-
-        Ok(stream)
-    }
-
-    /// Saves output data to a directory.
     ///
     /// Uses the system-wide `INLINE_OUTPUT_LIMIT` constant:
     /// - Empty data → an empty `Inline` stream
@@ -243,13 +248,14 @@ impl OutputStore {
     /// # Errors
     ///
     /// Returns an error if file creation fails.
-    pub async fn save_to_dir(
-        dir: &Path,
+    pub async fn save(
+        &self,
         data: &[u8],
         format: OutputFormat,
         resolution: MediaResolution,
     ) -> std::io::Result<CommandStream> {
-        Self::save_to_dir_with_limit(dir, data, format, resolution, Some(INLINE_OUTPUT_LIMIT)).await
+        self.save_with_limit(data, format, resolution, Some(INLINE_OUTPUT_LIMIT))
+            .await
     }
 
     /// Saves output data with an explicit size limit.
@@ -260,8 +266,8 @@ impl OutputStore {
     /// # Errors
     ///
     /// Returns an error if file creation fails.
-    pub async fn save_to_dir_with_limit(
-        dir: &Path,
+    pub async fn save_with_limit(
+        &self,
         data: &[u8],
         format: OutputFormat,
         resolution: MediaResolution,
@@ -279,14 +285,14 @@ impl OutputStore {
 
         let exceeds_limit = limit.is_some_and(|max| data.len() > max);
         if exceeds_limit && !matches!(format, OutputFormat::Image) {
-            return save_large_output(dir, data, format).await;
+            return save_large_output(self, data, format).await;
         }
 
         match format {
-            OutputFormat::Text | OutputFormat::Auto => save_text_output(dir, data, format).await,
+            OutputFormat::Text | OutputFormat::Auto => save_text_output(self, data, format).await,
             OutputFormat::Image => {
                 let prepared = prepare_image_for_context(data, resolution)?;
-                let (url, path) = create_file(dir, &prepared.bytes, format).await?;
+                let (url, path) = self.create(&prepared.bytes, format).await?;
                 Ok(CommandStream::Image {
                     media_type: prepared.media_type,
                     file: stored_file(url, &path),
@@ -294,43 +300,106 @@ impl OutputStore {
             }
             OutputFormat::Video | OutputFormat::Binary => {
                 // Binary/video are always Stored
-                save_large_output(dir, data, format).await
+                save_large_output(self, data, format).await
             }
         }
     }
 
-    /// Retrieves an output reference by ID.
-    #[must_use]
-    pub fn get(&self, id: &str) -> Option<&OutputRef> {
-        self.entries.get(id)
-    }
-
-    /// Allocates a URL for text content without writing to disk.
+    /// Saves text output with a line-count limit.
     ///
-    /// This is used during context compaction to allocate URLs for
-    /// tool output content before calling the fast LLM.
-    ///
-    /// Returns the allocated URL (e.g., "outputs/amber-oak-swift-river.txt").
-    #[must_use]
-    pub fn allocate_text_url(&self) -> String {
-        let name = generate_word_filename();
-        format!("outputs/{name}.txt")
-    }
-
-    /// Writes text content to a URL path.
-    ///
-    /// Call this only for URLs that were actually referenced in the
-    /// compacted summary.
+    /// When the output exceeds `max_lines` (or the byte limit), the full content
+    /// is saved to a file and the returned content carries a head+tail preview
+    /// within the caller's budget plus the file reference and read guidance.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be written.
-    pub async fn write_text(&self, url: &str, content: &str) -> std::io::Result<PathBuf> {
-        let filename = url.strip_prefix("outputs/").unwrap_or(url);
-        let filepath = self.dir.join(filename);
-        fs::write(&filepath, content.as_bytes()).await?;
-        debug!(url = %url, size = content.len(), "wrote text output");
-        Ok(filepath)
+    /// Returns an error if file creation fails.
+    pub async fn save_text_with_line_limit(
+        &self,
+        data: &[u8],
+        format: OutputFormat,
+        resolution: MediaResolution,
+        max_lines: usize,
+        byte_limit: Option<usize>,
+    ) -> std::io::Result<CommandStream> {
+        if data.is_empty() {
+            return Ok(empty_stream());
+        }
+
+        let format = if format == OutputFormat::Auto {
+            detect_format(data)
+        } else {
+            format
+        };
+
+        // For non-text formats, fall back to the standard byte-based logic
+        if !matches!(format, OutputFormat::Text | OutputFormat::Auto) {
+            return self
+                .save_with_limit(data, format, resolution, byte_limit)
+                .await;
+        }
+
+        let text = String::from_utf8_lossy(data);
+        let line_count = text.lines().count();
+
+        // Check byte limit first
+        let exceeds_bytes = byte_limit.is_some_and(|max| data.len() > max);
+        let exceeds_lines = line_count > max_lines;
+
+        if !exceeds_bytes && !exceeds_lines {
+            return Ok(CommandStream::Inline {
+                text: text.into_owned(),
+            });
+        }
+
+        // Cut: store the full output and hand the model a preview within its
+        // requested budget so it never has to re-read blind, unless the preview
+        // would not be smaller than the output.
+        let byte_budget = byte_limit.unwrap_or(INLINE_OUTPUT_LIMIT);
+        cut_text_output(
+            self,
+            format,
+            CutText {
+                data,
+                text: &text,
+                max_lines,
+                byte_budget,
+            },
+        )
+        .await
+    }
+
+    /// Saves raw data to a file without any processing, returning its URL
+    /// and absolute path.
+    ///
+    /// Used to preserve the original of a lossy compression stage alongside
+    /// the reduced version the model reads, and to create the file a
+    /// background job's output is redirected to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file creation fails.
+    pub async fn save_raw(&self, data: &[u8]) -> std::io::Result<(String, PathBuf)> {
+        let (url, path) = self.create(data, OutputFormat::Text).await?;
+        debug!(url = %url, size = data.len(), "saved raw output");
+        Ok((url, path))
+    }
+
+    /// Saves a binary payload, with an image extension when `mime` is an
+    /// image the bytes confirm.
+    ///
+    /// Returns the relative URL and the absolute path of the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file creation fails.
+    pub async fn save_binary(&self, data: &[u8], mime: &str) -> std::io::Result<(String, PathBuf)> {
+        let format = if mime.starts_with("image/") {
+            OutputFormat::Image
+        } else {
+            OutputFormat::Binary
+        };
+        self.create(data, format).await
     }
 
     /// Reads the raw data for a stored output URL.
@@ -340,61 +409,98 @@ impl OutputStore {
     /// Returns an error if the file cannot be read.
     pub async fn read(&self, url: &str) -> std::io::Result<Vec<u8>> {
         let filename = url.strip_prefix("outputs/").unwrap_or(url);
-        let filepath = self.dir.join(filename);
+        let filepath = self.dir().join(filename);
         fs::read(&filepath).await
     }
 
-    /// Cleans up all stored outputs.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if files cannot be deleted.
-    pub async fn cleanup(&mut self) -> std::io::Result<()> {
-        for (_, output_ref) in self.entries.drain() {
-            if let Some(filepath) = stored_path(&output_ref.stream)
-                && let Err(e) = fs::remove_file(&filepath).await
-            {
-                tracing::warn!(path = %filepath.display(), error = %e, "failed to remove output file");
+    /// Leases the name of a file with extension `ext`, under a word no file
+    /// an earlier store left is named by. A word skipped goes into `taken`,
+    /// whose leases the caller holds until it found a free name, so the
+    /// allocator hands out another.
+    async fn name(&self, ext: &str, taken: &mut Vec<IdLease>) -> std::io::Result<OutputName> {
+        let earlier = self
+            .0
+            .earlier
+            .get_or_try_init(|| earlier_words(self.dir()))
+            .await?;
+        let lease = loop {
+            let lease = self.0.ids.lease().map_err(std::io::Error::other)?;
+            if earlier.contains(lease.as_str()) {
+                taken.push(lease);
+            } else {
+                break lease;
             }
-        }
-        Ok(())
+        };
+        let filename = format!("{lease}.{ext}");
+        Ok(OutputName {
+            url: format!("outputs/{filename}"),
+            path: self.dir().join(filename),
+            lease,
+        })
+    }
+
+    /// Keeps the word of a file this store wrote leased for the store's life.
+    fn keep(&self, name: OutputName) {
+        self.0
+            .names
+            .lock()
+            .expect("output names lock poisoned")
+            .push(name.lease);
+    }
+
+    /// Creates a file holding `data` under a leased name.
+    async fn create(
+        &self,
+        data: &[u8],
+        format: OutputFormat,
+    ) -> std::io::Result<(String, PathBuf)> {
+        let ext = extension_for_data(data, format);
+        // Held until a free name is found, as in `cut_text_output`.
+        let mut taken = Vec::new();
+        let created = loop {
+            let name = self.name(ext, &mut taken).await?;
+            match write_new(&name.path, data).await {
+                Ok(()) => {
+                    debug!(url = %name.url, size = data.len(), format = ?format, "saved output");
+                    let created = (name.url.clone(), name.path.clone());
+                    self.keep(name);
+                    break Ok(created);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    taken.push(name.lease);
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        drop(taken);
+        created
     }
 }
 
-/// Saves raw data to a file without any processing, returning its URL and
-/// absolute path.
-///
-/// Used to preserve the original of a lossy compression stage alongside the
-/// reduced version the model reads.
-///
-/// # Errors
-///
-/// Returns an error if file creation fails.
-pub async fn save_raw_to_file(dir: &Path, data: &[u8]) -> std::io::Result<(String, PathBuf)> {
-    let (url, path) = create_file(dir, data, OutputFormat::Text).await?;
-    debug!(url = %url, size = data.len(), "saved raw output");
-    Ok((url, path))
+/// The words naming the files in `dir`: each name up to its first `.`.
+async fn earlier_words(dir: &Path) -> std::io::Result<HashSet<String>> {
+    let mut entries = fs::read_dir(dir).await?;
+    let mut words = HashSet::new();
+    while let Some(entry) = entries.try_next().await? {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(word) = name.split('.').next() {
+            words.insert(word.to_owned());
+        }
+    }
+    Ok(words)
 }
 
-/// Saves a binary payload into `dir` under a four-random-words name, with an
-/// image extension when `mime` is an image the bytes confirm.
-///
-/// Returns the relative URL and the absolute path of the file.
-///
-/// # Errors
-///
-/// Returns an error if file creation fails.
-pub async fn save_binary_to_file(
-    dir: &Path,
-    data: &[u8],
-    mime: &str,
-) -> std::io::Result<(String, PathBuf)> {
-    let format = if mime.starts_with("image/") {
-        OutputFormat::Image
-    } else {
-        OutputFormat::Binary
-    };
-    create_file(dir, data, format).await
+/// Writes `data` to a new file at `path`, failing with
+/// [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when one is there.
+async fn write_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await?;
+    file.write_all(data).await?;
+    file.flush().await
 }
 
 /// Saves text output with simple size-based classification.
@@ -402,7 +508,7 @@ pub async fn save_binary_to_file(
 /// - Below `INLINE_OUTPUT_LIMIT` → show inline
 /// - Above `INLINE_OUTPUT_LIMIT` → save to file, return a head+tail preview plus file reference
 async fn save_text_output(
-    dir: &Path,
+    store: &OutputStore,
     data: &[u8],
     format: OutputFormat,
 ) -> std::io::Result<CommandStream> {
@@ -411,80 +517,21 @@ async fn save_text_output(
             text: String::from_utf8_lossy(data).into_owned(),
         })
     } else {
-        save_large_output(dir, data, format).await
+        save_large_output(store, data, format).await
     }
-}
-
-/// Saves text output with a line-count limit.
-///
-/// When the output exceeds `max_lines` (or the byte limit), the full content
-/// is saved to a file and the returned content carries a head+tail preview
-/// within the caller's budget plus the file reference and read guidance.
-pub async fn save_text_with_line_limit(
-    dir: &Path,
-    data: &[u8],
-    format: OutputFormat,
-    resolution: MediaResolution,
-    max_lines: usize,
-    byte_limit: Option<usize>,
-) -> std::io::Result<CommandStream> {
-    if data.is_empty() {
-        return Ok(empty_stream());
-    }
-
-    let format = if format == OutputFormat::Auto {
-        detect_format(data)
-    } else {
-        format
-    };
-
-    // For non-text formats, fall back to the standard byte-based logic
-    if !matches!(format, OutputFormat::Text | OutputFormat::Auto) {
-        return OutputStore::save_to_dir_with_limit(dir, data, format, resolution, byte_limit)
-            .await;
-    }
-
-    let text = String::from_utf8_lossy(data);
-    let line_count = text.lines().count();
-
-    // Check byte limit first
-    let exceeds_bytes = byte_limit.is_some_and(|max| data.len() > max);
-    let exceeds_lines = line_count > max_lines;
-
-    if !exceeds_bytes && !exceeds_lines {
-        return Ok(CommandStream::Inline {
-            text: text.into_owned(),
-        });
-    }
-
-    // Cut: store the full output and hand the model a preview within its
-    // requested budget so it never has to re-read blind, unless the preview
-    // would not be smaller than the output.
-    let byte_budget = byte_limit.unwrap_or(INLINE_OUTPUT_LIMIT);
-    cut_text_output(
-        dir,
-        format,
-        CutText {
-            data,
-            text: &text,
-            max_lines,
-            byte_budget,
-        },
-    )
-    .await
 }
 
 /// Saves output that exceeds limit - stores full content, returning a
 /// preview plus the file reference for text formats.
 async fn save_large_output(
-    dir: &Path,
+    store: &OutputStore,
     data: &[u8],
     format: OutputFormat,
 ) -> std::io::Result<CommandStream> {
     if matches!(format, OutputFormat::Text | OutputFormat::Auto) {
         let text = String::from_utf8_lossy(data);
         return cut_text_output(
-            dir,
+            store,
             format,
             CutText {
                 data,
@@ -497,7 +544,7 @@ async fn save_large_output(
     }
 
     // Binary/video/image just get the file path.
-    let (url, path) = create_file(dir, data, format).await?;
+    let (url, path) = store.create(data, format).await?;
     Ok(CommandStream::Stored {
         file: stored_file(url, &path),
         preview: String::new(),
@@ -552,35 +599,8 @@ fn prepare_image_for_context(
     })
 }
 
-/// Picks the four-random-words name a file for `data` will have, without
-/// writing it.
-fn allocate_file(dir: &Path, data: &[u8], format: OutputFormat) -> (String, PathBuf) {
-    let ext = extension_for_data(data, format);
-    let name = generate_word_filename();
-    let filename = format!("{name}.{ext}");
-    (format!("outputs/{filename}"), dir.join(&filename))
-}
-
-/// Creates a file with a four-random-words name.
-async fn create_file(
-    dir: &Path,
-    data: &[u8],
-    format: OutputFormat,
-) -> std::io::Result<(String, PathBuf)> {
-    let (url, filepath) = allocate_file(dir, data, format);
-    fs::write(&filepath, data).await?;
-    debug!(url = %url, size = data.len(), format = ?format, "saved output");
-
-    Ok((url, filepath))
-}
-
 fn io_error(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(error.to_string())
-}
-
-/// Generates a filename using four random words.
-pub fn generate_word_filename() -> String {
-    crate::naming::random_word_slug(4)
 }
 
 /// Detects the output format from content.
@@ -700,10 +720,79 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_generate_word_filename() {
-        let name = generate_word_filename();
-        assert_eq!(name.split('-').count(), 4, "Should have 4 words: {name}");
+    /// A store in `dir` leasing from the default allocator.
+    fn store(dir: &Path) -> OutputStore {
+        OutputStore::at(dir.to_path_buf(), AnyIdAllocator::default())
+    }
+
+    #[tokio::test]
+    async fn a_stored_file_is_named_by_a_word_leased_until_the_store_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = crate::test_ids::RecordingIds::default();
+        let store = OutputStore::at(dir.path().to_path_buf(), ids.allocator());
+
+        let (url, path) = store.save_raw(b"kept").await.unwrap();
+        let [word] = ids.leased().try_into().expect("one lease");
+        assert_eq!(url, format!("outputs/{word}.txt"));
+        assert_eq!(path, dir.path().join(format!("{word}.txt")));
+
+        // An output returned inline names no file and keeps no lease.
+        store
+            .save(b"short", OutputFormat::Text, MediaResolution::Auto)
+            .await
+            .unwrap();
+        assert_eq!(ids.live(), std::slice::from_ref(&word));
+
+        let clone = store.clone();
+        drop(store);
+        assert_eq!(
+            ids.live(),
+            std::slice::from_ref(&word),
+            "a clone still addresses it"
+        );
+        drop(clone);
+        assert_eq!(ids.released(), [word]);
+    }
+
+    #[tokio::test]
+    async fn a_name_a_file_already_holds_is_skipped_and_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = crate::test_ids::RecordingIds::default();
+        // The recording allocator's first two words, taken by an earlier
+        // store: one by a file of another extension.
+        std::fs::write(dir.path().join("alfa.png"), "earlier").unwrap();
+        std::fs::write(dir.path().join("bravo.txt"), "earlier").unwrap();
+        let store = OutputStore::at(dir.path().to_path_buf(), ids.allocator());
+
+        let (url, _) = store.save_raw(b"new").await.unwrap();
+        assert_eq!(url, "outputs/charlie.txt");
+        assert!(!dir.path().join("alfa.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("bravo.txt")).unwrap(),
+            "earlier"
+        );
+        assert_eq!(ids.released(), ["alfa", "bravo"]);
+        assert_eq!(ids.live(), ["charlie"]);
+    }
+
+    /// A file of the same name that appears after the store looked at its
+    /// directory is not overwritten either.
+    #[tokio::test]
+    async fn a_name_a_file_takes_later_is_skipped_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = crate::test_ids::RecordingIds::default();
+        let store = OutputStore::at(dir.path().to_path_buf(), ids.allocator());
+        let (first, _) = store.save_raw(b"first").await.unwrap();
+        assert_eq!(first, "outputs/alfa.txt");
+
+        std::fs::write(dir.path().join("bravo.txt"), "later").unwrap();
+        let (second, _) = store.save_raw(b"second").await.unwrap();
+        assert_eq!(second, "outputs/charlie.txt");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("bravo.txt")).unwrap(),
+            "later"
+        );
+        assert_eq!(ids.released(), ["bravo"]);
     }
 
     #[tokio::test]
@@ -711,15 +800,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let jpeg = encode_test_image(1200, 900, ImageFormat::Jpeg);
 
-        let stream = OutputStore::save_to_dir_with_limit(
-            dir.path(),
-            &jpeg,
-            OutputFormat::Image,
-            MediaResolution::Low,
-            None,
-        )
-        .await
-        .unwrap();
+        let stream = store(dir.path())
+            .save_with_limit(&jpeg, OutputFormat::Image, MediaResolution::Low, None)
+            .await
+            .unwrap();
 
         let CommandStream::Image { media_type, file } = stream else {
             panic!("expected a stored image");
@@ -752,10 +836,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let png = encode_test_image(8, 8, ImageFormat::Png);
 
-        let stream =
-            OutputStore::save_to_dir(dir.path(), &png, OutputFormat::Auto, MediaResolution::Auto)
-                .await
-                .unwrap();
+        let stream = store(dir.path())
+            .save(&png, OutputFormat::Auto, MediaResolution::Auto)
+            .await
+            .unwrap();
 
         let CommandStream::Image { media_type, file } = stream else {
             panic!("expected a stored image");
@@ -787,16 +871,16 @@ mod tests {
         }
         assert!(data.len() > INLINE_OUTPUT_LIMIT);
 
-        let entry = save_text_with_line_limit(
-            dir.path(),
-            data.as_bytes(),
-            OutputFormat::Text,
-            MediaResolution::Auto,
-            10_000,
-            Some(INLINE_OUTPUT_LIMIT),
-        )
-        .await
-        .unwrap();
+        let entry = store(dir.path())
+            .save_text_with_line_limit(
+                data.as_bytes(),
+                OutputFormat::Text,
+                MediaResolution::Auto,
+                10_000,
+                Some(INLINE_OUTPUT_LIMIT),
+            )
+            .await
+            .unwrap();
 
         let rendered = entry.render_for_model();
         let CommandStream::Stored {
@@ -825,16 +909,16 @@ mod tests {
         let pad = "p".repeat(400);
         let data = format!("alpha{pad}\nbeta{pad}\ngamma{pad}\ndelta{pad}\n").repeat(2);
 
-        let entry = save_text_with_line_limit(
-            dir.path(),
-            data.as_bytes(),
-            OutputFormat::Text,
-            MediaResolution::Auto,
-            3,
-            Some(INLINE_OUTPUT_LIMIT),
-        )
-        .await
-        .unwrap();
+        let entry = store(dir.path())
+            .save_text_with_line_limit(
+                data.as_bytes(),
+                OutputFormat::Text,
+                MediaResolution::Auto,
+                3,
+                Some(INLINE_OUTPUT_LIMIT),
+            )
+            .await
+            .unwrap();
 
         let CommandStream::Stored { preview: text, .. } = entry else {
             panic!("expected stored entry with text content");
@@ -863,16 +947,16 @@ mod tests {
         data.push_str("error: test failed\n");
         let total_lines = data.lines().count();
 
-        let entry = save_text_with_line_limit(
-            dir.path(),
-            data.as_bytes(),
-            OutputFormat::Text,
-            MediaResolution::Auto,
-            usize::MAX,
-            Some(INLINE_OUTPUT_LIMIT),
-        )
-        .await
-        .unwrap();
+        let entry = store(dir.path())
+            .save_text_with_line_limit(
+                data.as_bytes(),
+                OutputFormat::Text,
+                MediaResolution::Auto,
+                usize::MAX,
+                Some(INLINE_OUTPUT_LIMIT),
+            )
+            .await
+            .unwrap();
 
         let CommandStream::Stored {
             preview: text,
@@ -931,16 +1015,16 @@ mod tests {
             data
         });
 
-        let entry = save_text_with_line_limit(
-            dir.path(),
-            data.as_bytes(),
-            OutputFormat::Text,
-            MediaResolution::Auto,
-            200,
-            Some(INLINE_OUTPUT_LIMIT),
-        )
-        .await
-        .unwrap();
+        let entry = store(dir.path())
+            .save_text_with_line_limit(
+                data.as_bytes(),
+                OutputFormat::Text,
+                MediaResolution::Auto,
+                200,
+                Some(INLINE_OUTPUT_LIMIT),
+            )
+            .await
+            .unwrap();
 
         let CommandStream::Inline { text } = entry else {
             panic!("expected the original inline");
@@ -954,16 +1038,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data = "a reasonably long line of command output text\n".repeat(1000);
 
-        let entry = save_text_with_line_limit(
-            dir.path(),
-            data.as_bytes(),
-            OutputFormat::Text,
-            MediaResolution::Auto,
-            200,
-            Some(INLINE_OUTPUT_LIMIT),
-        )
-        .await
-        .unwrap();
+        let entry = store(dir.path())
+            .save_text_with_line_limit(
+                data.as_bytes(),
+                OutputFormat::Text,
+                MediaResolution::Auto,
+                200,
+                Some(INLINE_OUTPUT_LIMIT),
+            )
+            .await
+            .unwrap();
 
         let CommandStream::Stored {
             preview: text,
@@ -984,14 +1068,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data = "x".repeat(INLINE_OUTPUT_LIMIT * 2);
 
-        let entry = OutputStore::save_to_dir(
-            dir.path(),
-            data.as_bytes(),
-            OutputFormat::Text,
-            MediaResolution::Auto,
-        )
-        .await
-        .unwrap();
+        let entry = store(dir.path())
+            .save(data.as_bytes(), OutputFormat::Text, MediaResolution::Auto)
+            .await
+            .unwrap();
 
         let CommandStream::Stored { preview: text, .. } = entry else {
             panic!("expected stored entry with text content");
@@ -1023,16 +1103,16 @@ mod tests {
         let data = rust_source(40);
         assert!(data.lines().count() > 200);
 
-        let entry = save_text_with_line_limit(
-            dir.path(),
-            data.as_bytes(),
-            OutputFormat::Text,
-            MediaResolution::Auto,
-            200,
-            Some(INLINE_OUTPUT_LIMIT),
-        )
-        .await
-        .unwrap();
+        let entry = store(dir.path())
+            .save_text_with_line_limit(
+                data.as_bytes(),
+                OutputFormat::Text,
+                MediaResolution::Auto,
+                200,
+                Some(INLINE_OUTPUT_LIMIT),
+            )
+            .await
+            .unwrap();
 
         let CommandStream::Stored {
             preview: text,
@@ -1056,16 +1136,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data = rust_source(3);
 
-        let entry = save_text_with_line_limit(
-            dir.path(),
-            data.as_bytes(),
-            OutputFormat::Text,
-            MediaResolution::Auto,
-            200,
-            Some(INLINE_OUTPUT_LIMIT),
-        )
-        .await
-        .unwrap();
+        let entry = store(dir.path())
+            .save_text_with_line_limit(
+                data.as_bytes(),
+                OutputFormat::Text,
+                MediaResolution::Auto,
+                200,
+                Some(INLINE_OUTPUT_LIMIT),
+            )
+            .await
+            .unwrap();
 
         let CommandStream::Inline { text } = entry else {
             panic!("expected the source inline");

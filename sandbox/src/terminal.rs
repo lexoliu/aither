@@ -6,9 +6,11 @@
 //! syntax falls back to a real shell when needed.
 //! Commands run in a sandbox with configurable permission modes.
 //!
-//! Each `TerminalTool` creates a shared working directory with four random words
-//! (e.g., `amber-forest-thunder-pearl/`). All terminal executions share this
-//! directory, but each execution gets a fresh sandbox (new TTY/process).
+//! Each `TerminalTool` works in one shared working directory. All terminal
+//! executions share this directory, but each execution gets a fresh sandbox
+//! (new TTY/process). The ids the model addresses — task ids, stored output
+//! names, subagent spaces — are leased from the terminal's
+//! [`AnyIdAllocator`](aither_core::AnyIdAllocator).
 
 use crate::foreground_wait::ForegroundWait;
 use crate::grants::{GitDirAccess, GrantSet, TerminalGrants};
@@ -38,6 +40,7 @@ use aither_core::llm::{
     CommandOutcome, CommandResult, CommandStream, Interruption, IntoToolResult, StoredFile, Tool,
     ToolResult,
 };
+use aither_core::{AnyIdAllocator, IdLease, IdsExhausted};
 use askama::Template;
 use async_channel::{Receiver, Sender};
 use async_io::Async;
@@ -68,10 +71,7 @@ use crate::{
         AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandRole, GateDecision, ToolRegistry,
     },
     job_registry::{JobRegistry, JobStatus, PendingCompletion, job_registry_channel},
-    output::{
-        INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, save_raw_to_file,
-        stored_path,
-    },
+    output::{INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, stored_path},
     permission::{PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode},
     process_tree::{JobMarker, JobProcess, JobTree},
     script_language::ScriptLanguage,
@@ -121,11 +121,6 @@ where
         definition,
         handler,
     }
-}
-
-/// Generate a random four-word ID (e.g., "amber-forest-thunder-pearl").
-fn random_task_id() -> String {
-    crate::naming::random_word_slug(4)
 }
 
 /// Opens a daily-rotated network audit log under `dir`, creating the directory if needed.
@@ -624,7 +619,7 @@ impl Default for TerminalLimits {
 /// it into a durable system alert.
 #[derive(Debug, Clone)]
 pub struct LongRunningJob {
-    /// Task ID of the job (four random words like "amber-forest-thunder-pearl").
+    /// Task ID of the job, a word leased from the terminal's id allocator.
     pub task_id: String,
     /// The script the job runs.
     pub script: String,
@@ -774,7 +769,7 @@ impl From<CompletedCommand> for CommandResult {
 /// event.
 #[derive(Debug, Clone)]
 pub struct StartedBackgroundTask {
-    /// Task ID of the job (four random words like "amber-forest-thunder-pearl").
+    /// Task ID of the job, a word leased from the terminal's id allocator.
     pub task_id: String,
     /// First lines of the redirected output; empty when nothing was written yet.
     pub output_preview: String,
@@ -820,7 +815,7 @@ impl BackgroundStartup {
 /// A completed background task result.
 #[derive(Debug)]
 pub struct CompletedTask {
-    /// The task ID (four random words like "amber-forest-thunder-pearl").
+    /// The task ID, a word leased from the terminal's id allocator.
     pub task_id: String,
     /// The original script that was executed.
     pub script: String,
@@ -831,9 +826,9 @@ pub struct CompletedTask {
     pub kill: Option<crate::KillCause>,
     /// Set when the kill was the `timeout` bound passing.
     pub timeout_kill: Option<TimeoutKill>,
-    /// Keeps the job reading [`Delivery::Pending`](crate::Delivery) in its
-    /// registry until the agent takes the completion by dropping it; `None`
-    /// for a command the registry never registered.
+    /// Keeps the job in its registry, and its task id leased, until the agent
+    /// takes the completion by dropping it; `None` for a command the registry
+    /// never registered and for one whose call returned its result.
     pub pending: Option<PendingCompletion>,
 }
 
@@ -1267,9 +1262,17 @@ pub struct TerminalBinding {
     role: CommandRole,
     observer: Option<AnyCommandObserver>,
     executor: Arc<executor_core::AnyExecutor>,
+    ids: AnyIdAllocator,
 }
 
 impl TerminalBinding {
+    /// The allocator the terminal leases its model-facing ids from, for a
+    /// command bound to it that names things for the model too.
+    #[must_use]
+    pub const fn id_allocator(&self) -> &AnyIdAllocator {
+        &self.ids
+    }
+
     /// The executor the terminal runs its tasks on, for work that must
     /// outlive the call that started it.
     #[must_use]
@@ -1375,6 +1378,9 @@ pub enum TerminalRunError {
     /// refused permission or a failed execution.
     #[error(transparent)]
     Terminal(#[from] TerminalError),
+    /// Every model-facing id is leased, so the command has no task id.
+    #[error(transparent)]
+    Ids(#[from] IdsExhausted),
 }
 
 /// Runs scripts on the terminal that serves a terminal-bound command.
@@ -1467,9 +1473,10 @@ impl RegistryState for Running {
 
 /// The terminal tool for executing scripts in a sandbox.
 ///
-/// Creates a shared working directory with four random words that persists
-/// across all executions. Each execution creates a fresh sandbox but shares
-/// the working directory.
+/// Creates a shared working directory that persists across all executions,
+/// named by heel with four random words; that name is not one of the leased
+/// model-facing ids. Each execution creates a fresh sandbox but shares the
+/// working directory.
 ///
 /// The executor type `E` determines how async tasks are spawned for the IPC server.
 /// Use `TokioExecutor` when running in a tokio runtime.
@@ -1517,6 +1524,8 @@ impl RegistryState for Launching {
 /// What a subagent's terminal holds that the main agent's does not.
 #[derive(Clone, Debug)]
 struct SubagentAuthority {
+    /// Keeps the word naming its space leased while the terminal lives.
+    _space_name: IdLease,
     /// The worktrees it may commit in, with their git data; it hands on no
     /// other commit grant.
     committing: Vec<CommittingWorktree>,
@@ -1588,14 +1597,19 @@ struct ContainerCarry {
 
 /// The terminal tool for executing scripts in a sandbox.
 pub struct TerminalTool<P, E, State = Unconfigured> {
-    /// Shared working directory (four random words, e.g., `amber-forest-thunder-pearl/`)
+    /// Shared working directory, named by heel with four random words (e.g.,
+    /// `amber-forest-thunder-pearl/`) rather than a leased id.
     working_dir: PathBuf,
     /// Runtime registry for container and ssh execution metadata.
     shell_sessions: ShellSessionRegistry,
     /// Permission handler wrapped in Arc for sharing between parent and child tools.
     permission_handler: Arc<P>,
     executor: E,
-    output_store: Arc<OutputStore>,
+    /// Leases the words naming what the model addresses: task ids, stored
+    /// outputs and subagent spaces. Shared with the output store and every
+    /// subagent terminal launched from this one.
+    ids: AnyIdAllocator,
+    output_store: OutputStore,
     job_registry: JobRegistry,
     /// Channel for receiving completed background tasks.
     completed_rx: Receiver<CompletedTask>,
@@ -1655,6 +1669,7 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             shell_sessions: self.shell_sessions.clone(),
             permission_handler: self.permission_handler.clone(),
             executor: self.executor.clone(),
+            ids: self.ids.clone(),
             output_store: self.output_store.clone(),
             job_registry: self.job_registry.clone(),
             completed_rx: self.completed_rx.clone(),
@@ -1737,10 +1752,23 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
         self
     }
 
+    /// Leases every word this terminal names something with for the model —
+    /// a command's task id, a stored output's file name, a subagent's space —
+    /// from `ids`, as do the subagent terminals launched from it and the
+    /// `subagent` command bound to it. A terminal given none leases from its
+    /// own [`AnyIdAllocator::default`].
+    #[must_use]
+    pub fn with_id_allocator(mut self, ids: AnyIdAllocator) -> Self {
+        self.output_store = OutputStore::at(self.output_store.dir().to_path_buf(), ids.clone());
+        self.ids = ids;
+        self
+    }
+
     /// Creates a new terminal tool with permission handler and executor.
     ///
-    /// Creates a random four-word working directory under the specified parent directory.
-    /// The executor is used to spawn async tasks for the IPC server.
+    /// Creates a working directory under the specified parent directory, which
+    /// heel names with four random words (not a leased id). The executor is
+    /// used to spawn async tasks for the IPC server.
     ///
     /// # Errors
     /// Returns an error when the working directory or output store cannot be created.
@@ -1754,7 +1782,8 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
         // Ensure parent directory exists
         async_fs::create_dir_all(parent_dir).await?;
 
-        // Create random four-word working directory
+        // heel names the working directory with four random words; it is
+        // not a leased model-facing id.
         let working_dir = WorkingDir::random_in(parent_dir).map_err(|e| {
             TerminalError::SandboxSetup(format!("failed to create working dir: {e}"))
         })?;
@@ -1765,11 +1794,8 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
         info!(working_dir = %working_dir_path.display(), "created terminal tool working directory");
 
         // Create outputs directory inside working dir
-        let outputs_dir = working_dir_path.join("outputs");
-        async_fs::create_dir_all(&outputs_dir).await?;
-
-        // Create output store
-        let output_store = Arc::new(OutputStore::new(&outputs_dir).await?);
+        let ids = AnyIdAllocator::default();
+        let output_store = OutputStore::new(working_dir_path.join("outputs"), ids.clone()).await?;
 
         // Start job registry service
         let (job_registry, job_registry_service) = job_registry_channel();
@@ -1789,6 +1815,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             shell_sessions: ShellSessionRegistry::new(ShellRuntimeAvailability::default()),
             permission_handler: Arc::new(permission_handler),
             executor,
+            ids,
             output_store,
             job_registry,
             completed_rx,
@@ -1838,11 +1865,8 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             dunce::simplified(&async_fs::canonicalize(working_dir.as_ref()).await?).to_path_buf();
 
         // Create outputs directory inside working dir
-        let outputs_dir = working_dir_path.join("outputs");
-        async_fs::create_dir_all(&outputs_dir).await?;
-
-        // Create output store
-        let output_store = Arc::new(OutputStore::new(&outputs_dir).await?);
+        let ids = AnyIdAllocator::default();
+        let output_store = OutputStore::new(working_dir_path.join("outputs"), ids.clone()).await?;
 
         // Start job registry service
         let (job_registry, job_registry_service) = job_registry_channel();
@@ -1862,6 +1886,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             shell_sessions: ShellSessionRegistry::new(ShellRuntimeAvailability::default()),
             permission_handler: Arc::new(permission_handler),
             executor,
+            ids,
             output_store,
             job_registry,
             completed_rx,
@@ -1898,6 +1923,7 @@ impl<P, E, State> TerminalTool<P, E, State> {
             shell_sessions: self.shell_sessions,
             permission_handler: self.permission_handler,
             executor: self.executor,
+            ids: self.ids,
             output_store: self.output_store,
             job_registry: self.job_registry,
             completed_rx: self.completed_rx,
@@ -1940,7 +1966,7 @@ where
     pub fn with_registry(self, registry: Arc<ToolRegistry>) -> TerminalTool<P, E, Configured> {
         let registry = Arc::new(
             Arc::unwrap_or_clone(registry)
-                .with_terminal_controls(self.job_registry(), self.outputs_dir()),
+                .with_terminal_controls(self.job_registry(), self.output_store.clone()),
         );
         self.map_state(|Unconfigured| Launching { registry })
             .into_served()
@@ -1985,6 +2011,7 @@ where
                 role: self.registry.registry.role(),
                 observer: self.registry.registry.observer().cloned(),
                 executor: Arc::new(executor_core::AnyExecutor::new(self.executor.clone())),
+                ids: self.ids.clone(),
             };
             let registry = ToolRegistry::clone(&self.registry.registry).bind(&served);
             binding = Some(served);
@@ -2353,8 +2380,13 @@ where
     }
 
     /// Returns the output store.
-    pub const fn output_store(&self) -> &Arc<OutputStore> {
+    pub const fn output_store(&self) -> &OutputStore {
         &self.output_store
+    }
+
+    /// The allocator this terminal leases its model-facing ids from.
+    pub const fn id_allocator(&self) -> &AnyIdAllocator {
+        &self.ids
     }
 
     /// Returns the job registry handle.
@@ -2523,17 +2555,38 @@ where
         gate: Option<AnyCommandGate>,
         caller: Option<&Path>,
     ) -> Result<TerminalTool<P, E, Configured>, SubagentGrantError> {
-        let space = spaces_root.join(crate::naming::random_word_slug(4));
-        let container = mount
-            .as_ref()
-            .map(|mount| container_confinement_for(mount, &space, &granted.writable))
-            .transpose()?;
-        async_fs::create_dir_all(&space)
+        async_fs::create_dir_all(&spaces_root)
             .await
             .map_err(|source| SubagentGrantError::Space {
-                path: space.clone(),
+                path: spaces_root.clone(),
                 source,
             })?;
+        // The space is named by a leased word the subagent's terminal holds
+        // for as long as it lives. A word a space of an earlier terminal
+        // already has stays leased until a free one is found, so the
+        // allocator hands out another.
+        let mut taken = Vec::new();
+        let (space_name, space, container) = loop {
+            let name = self.ids.lease()?;
+            let space = spaces_root.join(name.as_str());
+            let container = mount
+                .as_ref()
+                .map(|mount| container_confinement_for(mount, &space, &granted.writable))
+                .transpose()?;
+            match async_fs::create_dir(&space).await {
+                Ok(()) => break (name, space, container),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    taken.push(name);
+                }
+                Err(source) => {
+                    return Err(SubagentGrantError::Space {
+                        path: space,
+                        source,
+                    });
+                }
+            }
+        };
+        drop(taken);
         let prepared = match &self.subagent_spaces {
             Some(spaces) => {
                 let launcher = &authority[0];
@@ -2596,7 +2649,7 @@ where
             self.registry
                 .registry()
                 .for_subagent(observer, gate)
-                .with_terminal_controls(job_registry.clone(), self.outputs_dir()),
+                .with_terminal_controls(job_registry.clone(), self.output_store.clone()),
         );
         let launching = TerminalTool {
             working_dir: space,
@@ -2606,6 +2659,7 @@ where
                 .for_subagent()
                 .map_or_else(|| self.permission_handler.clone(), Arc::new),
             executor: self.executor.clone(),
+            ids: self.ids.clone(),
             output_store: self.output_store.clone(),
             job_registry,
             completed_rx,
@@ -2620,6 +2674,7 @@ where
             permission_tx,
             grants,
             subagent: Some(SubagentAuthority {
+                _space_name: space_name,
                 committing: granted.committing,
                 git,
                 container,
@@ -2967,13 +3022,14 @@ where
             None => registry,
         });
         let (result_tx, result_rx) = async_channel::bounded(1);
+        let (taken_tx, taken_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
         // Every job gets a real stdin pipe: a foreground command that blocks
         // on it promotes to a background task the model can feed through
         // `terminal_input`, and a blocked episode raises an alert.
         let stdin_alerts = Some(StdinAlerts {
             tx: self.alert_tx.clone(),
-            task_id: task_id.clone(),
+            task_id: task_id.to_string(),
             script: script.clone(),
         });
         let timeout_watch = self.spawn_kill_watchdog(&task_id, timeout);
@@ -3020,10 +3076,11 @@ where
                 background_startup,
                 expect,
                 resolution,
-                store_dir: self.output_store.dir().to_path_buf(),
+                outputs: self.output_store.clone(),
                 max_lines,
                 raw,
                 result_tx,
+                taken: taken_rx,
                 completed_tx,
                 running_tasks,
                 network_audit: self.network_audit.clone(),
@@ -3039,6 +3096,7 @@ where
             result: result_rx,
             startup: startup_rx,
             timeout_watch,
+            taken: taken_tx,
         }
     }
 }
@@ -3097,7 +3155,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         if arguments.background {
             return background_terminal_result(
                 &self.job_registry,
-                &prepared.store_dir,
+                &prepared.outputs,
                 &prepared.task_id,
                 prepared.max_lines,
                 &self.started_tx,
@@ -3122,22 +3180,26 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                         stderr: result.stderr,
                         interruptions: result.interruptions,
                         outcome: CommandOutcome::Killed {
-                            task_id: prepared.task_id.clone(),
+                            task_id: prepared.task_id.to_string(),
                             notice: self.kill_notice(spawned.timeout_watch.kill().as_ref()),
                         },
                     }
                 } else {
                     CommandResult::from(result)
                 };
+                spawned.took_result().await;
                 command.into_tool_result()
             }
-            Some(Err(err)) => Err(anyhow::anyhow!(err)),
+            Some(Err(err)) => {
+                spawned.took_result().await;
+                Err(anyhow::anyhow!(err))
+            }
             // The command outlived its foreground window: promote it to a
             // background task.
             None => {
                 background_terminal_result(
                     &self.job_registry,
-                    &prepared.store_dir,
+                    &prepared.outputs,
                     &prepared.task_id,
                     prepared.max_lines,
                     &self.started_tx,
@@ -3454,7 +3516,9 @@ where
         &self,
         admission: Admission<'_>,
     ) -> Result<ExecutionPreparation, TerminalRunError> {
-        let task_id = random_task_id();
+        // Leased for as long as the command can be addressed: the registry
+        // keeps a clone once the job is registered.
+        let task_id = self.ids.lease()?;
         let policies = self.registry.registry().policies();
         self.check_policies(&task_id, &admission)
             .await
@@ -3468,7 +3532,7 @@ where
             target,
             execution_id: format!("exec-{task_id}"),
             task_id,
-            store_dir: self.output_store.dir().to_path_buf(),
+            outputs: self.output_store.clone(),
             max_lines,
         })
     }
@@ -3596,17 +3660,18 @@ where
         }
         // The run is never announced as a background task, so its end is
         // told to the caller alone, however long it takes.
-        let result = spawned
-            .result
-            .recv()
-            .await
-            .map_err(|_| TerminalError::Execution("the run ended without a result".to_string()))?
-            .map_err(TerminalError::Execution)?;
+        let result =
+            spawned.result.recv().await.map_err(|_| {
+                TerminalError::Execution("the run ended without a result".to_string())
+            });
         let killed = self
             .job_registry
             .get_by_task_id_settled(&prepared.task_id)
             .await
             .is_some_and(|job| matches!(job.status, JobStatus::Killed { .. }));
+        let timeout_kill = spawned.timeout_watch.kill();
+        spawned.took_result().await;
+        let result = result?.map_err(TerminalError::Execution)?;
         if !killed {
             return Ok(CommandResult::from(result));
         }
@@ -3615,8 +3680,8 @@ where
             stderr: result.stderr,
             interruptions: result.interruptions,
             outcome: CommandOutcome::Killed {
-                notice: self.kill_notice(spawned.timeout_watch.kill().as_ref()),
-                task_id: prepared.task_id,
+                notice: self.kill_notice(timeout_kill.as_ref()),
+                task_id: prepared.task_id.to_string(),
             },
         })
     }
@@ -3625,14 +3690,19 @@ where
     ///
     /// The returned watch holds the job's start time and, once the watchdog
     /// issues the kill, the time it did.
-    fn spawn_kill_watchdog(&self, task_id: &str, timeout: Duration) -> Arc<TimeoutWatch> {
+    fn spawn_kill_watchdog(&self, task_id: &IdLease, timeout: Duration) -> Arc<TimeoutWatch> {
         let watch = Arc::new(TimeoutWatch::new(timeout));
         let job_registry = self.job_registry.clone();
-        let task_id = task_id.to_string();
+        // Weak, so a job that ended gives its word back before the timer
+        // fires; a word that went back may name another job by then.
+        let task_id = task_id.downgrade();
         let recorded = watch.clone();
         self.executor
             .spawn(async move {
                 async_io::Timer::after(timeout).await;
+                let Some(task_id) = task_id.upgrade() else {
+                    return;
+                };
                 if let Some(job) = job_registry.get_by_task_id(&task_id).await
                     && matches!(job.status, JobStatus::Running)
                 {
@@ -3648,20 +3718,24 @@ where
 
     /// Emits one [`LongRunningJob`] when the job crosses the configured
     /// long-running threshold.
-    fn spawn_long_job_alert(&self, task_id: &str) {
+    fn spawn_long_job_alert(&self, task_id: &IdLease) {
         let job_registry = self.job_registry.clone();
         let alert_tx = self.alert_tx.clone();
-        let task_id = task_id.to_string();
+        // Weak for the same reason as the watchdog's.
+        let task_id = task_id.downgrade();
         let alert_after = self.limits.long_job_alert;
         self.executor
             .spawn(async move {
                 async_io::Timer::after(alert_after).await;
+                let Some(task_id) = task_id.upgrade() else {
+                    return;
+                };
                 if let Some(job) = job_registry.get_by_task_id(&task_id).await
                     && matches!(job.status, JobStatus::Running)
                 {
                     let _ = alert_tx
                         .send(JobAlert::LongRunning(LongRunningJob {
-                            task_id,
+                            task_id: task_id.to_string(),
                             script: job.script,
                             elapsed: job.started_at.elapsed(),
                         }))
@@ -3685,9 +3759,9 @@ struct Admission<'a> {
 
 struct ExecutionPreparation {
     target: ExecutionTarget,
-    task_id: String,
+    task_id: IdLease,
     execution_id: String,
-    store_dir: PathBuf,
+    outputs: OutputStore,
     max_lines: usize,
 }
 
@@ -3748,13 +3822,13 @@ async fn wait_for_foreground_result(
 
 async fn background_terminal_result(
     job_registry: &JobRegistry,
-    store_dir: &Path,
+    outputs: &OutputStore,
     task_id: &str,
     max_lines: usize,
     started_tx: &Sender<StartedBackgroundTask>,
 ) -> aither_core::Result<ToolResult> {
     let redirect =
-        start_background_output_redirect(job_registry, store_dir, task_id, max_lines).await?;
+        start_background_output_redirect(job_registry, outputs, task_id, max_lines).await?;
     let _ = started_tx
         .send(StartedBackgroundTask {
             task_id: task_id.to_string(),
@@ -3795,11 +3869,11 @@ struct BackgroundRedirect {
 
 async fn start_background_output_redirect(
     job_registry: &JobRegistry,
-    store_dir: &Path,
+    outputs: &OutputStore,
     task_id: &str,
     max_lines: usize,
 ) -> Result<BackgroundRedirect, anyhow::Error> {
-    let (url, output_path) = save_raw_to_file(store_dir, &[]).await?;
+    let (url, output_path) = outputs.save_raw(&[]).await?;
     let file = StoredFile {
         url,
         path: output_path.display().to_string(),
@@ -3837,7 +3911,7 @@ struct StandaloneExecution<P, E> {
     registry: Arc<ToolRegistry>,
     permission_handler: Arc<P>,
     job_registry: JobRegistry,
-    task_id: String,
+    task_id: IdLease,
     execution_id: String,
     background: bool,
     carry: Option<CwdCarry>,
@@ -3857,7 +3931,7 @@ struct StandaloneExecution<P, E> {
     heel: SharedHeelBinary,
     expect: OutputFormat,
     resolution: MediaResolution,
-    store_dir: PathBuf,
+    outputs: OutputStore,
     max_lines: usize,
     raw: bool,
 }
@@ -3872,7 +3946,7 @@ struct StandaloneStart<'a, P, E> {
     registry: &'a Arc<ToolRegistry>,
     permission_handler: Arc<P>,
     job_registry: &'a JobRegistry,
-    task_id: &'a str,
+    task_id: &'a IdLease,
     execution_id: &'a str,
     carry: Option<&'a CwdCarry>,
     script: &'a str,
@@ -3898,7 +3972,7 @@ struct LocalBackgroundExecution<'a, E> {
     env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
     registry: &'a Arc<ToolRegistry>,
-    task_id: &'a str,
+    task_id: &'a IdLease,
     execution_id: &'a str,
     carry: Option<&'a CwdCarry>,
     script: &'a str,
@@ -3918,7 +3992,7 @@ struct ContainerBackgroundExecution<'a, E> {
     executor: E,
     env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     registry: &'a Arc<ToolRegistry>,
-    task_id: &'a str,
+    task_id: &'a IdLease,
     execution_id: &'a str,
     script: &'a str,
     language: ScriptLanguage,
@@ -3941,7 +4015,7 @@ struct ContainerBackgroundExecution<'a, E> {
 
 struct SshBackgroundExecution<'a> {
     prepared_tools: &'a PreparedTools<PathBuf>,
-    task_id: &'a str,
+    task_id: &'a IdLease,
     execution_id: &'a str,
     script: &'a str,
     language: ScriptLanguage,
@@ -3957,7 +4031,7 @@ struct CompletedProcessOutput<'a> {
     pid: u32,
     output: std::process::Output,
     background_output: bool,
-    store_dir: &'a Path,
+    outputs: &'a OutputStore,
     expect: OutputFormat,
     resolution: MediaResolution,
     max_lines: usize,
@@ -3991,7 +4065,7 @@ struct ExecutionTarget {
 
 struct TerminalSpawnRequest {
     target: ExecutionTarget,
-    task_id: String,
+    task_id: IdLease,
     execution_id: String,
     script: String,
     language: ScriptLanguage,
@@ -4010,6 +4084,23 @@ struct SpawnedTerminal {
     result: Receiver<Result<CompletedCommand, String>>,
     startup: Receiver<Result<(), String>>,
     timeout_watch: Arc<TimeoutWatch>,
+    /// Tells the job's flow the call returned its result itself; dropped
+    /// unsent, the job is a background task whose completion the agent takes.
+    taken: Sender<Sender<()>>,
+}
+
+impl SpawnedTerminal {
+    /// The call returns the job's result itself: nothing addresses the job
+    /// once it does, so its flow takes the completion on the agent's behalf.
+    /// Returns once the flow ended and the registry forgot the job, so the
+    /// task id is back with the allocator when the call returns.
+    async fn took_result(self) {
+        let (done_tx, done_rx) = async_channel::bounded(1);
+        // A flow that ended without a result no longer listens.
+        if self.taken.send(done_tx).await.is_ok() {
+            let _ = done_rx.recv().await;
+        }
+    }
 }
 
 struct SpawnedTerminalTask<P, E> {
@@ -4021,7 +4112,7 @@ struct SpawnedTerminalTask<P, E> {
     registry: Arc<ToolRegistry>,
     permission_handler: Arc<P>,
     job_registry: JobRegistry,
-    task_id: String,
+    task_id: IdLease,
     execution_id: String,
     background: bool,
     timeout_watch: Arc<TimeoutWatch>,
@@ -4037,10 +4128,12 @@ struct SpawnedTerminalTask<P, E> {
     background_startup: BackgroundStartup,
     expect: OutputFormat,
     resolution: MediaResolution,
-    store_dir: PathBuf,
+    outputs: OutputStore,
     max_lines: usize,
     raw: bool,
     result_tx: Sender<Result<CompletedCommand, String>>,
+    /// Whether the call took the result: see [`SpawnedTerminal::took_result`].
+    taken: Receiver<Sender<()>>,
     completed_tx: Sender<CompletedTask>,
     running_tasks: Arc<AtomicUsize>,
     env_source: Option<Arc<dyn TerminalEnvSource>>,
@@ -4084,10 +4177,11 @@ where
         background_startup,
         expect,
         resolution,
-        store_dir,
+        outputs,
         max_lines,
         raw,
         result_tx,
+        taken,
         completed_tx,
         running_tasks,
         network_audit,
@@ -4129,7 +4223,7 @@ where
         heel,
         expect,
         resolution,
-        store_dir,
+        outputs,
         max_lines,
         raw,
     })
@@ -4153,29 +4247,44 @@ where
         Err(err) => Err(err.to_string()),
     };
     let _ = result_tx.send(quick_result).await;
+    // The call answers at once, taking the result or leaving it to a
+    // background task.
+    let foreground = taken.recv().await.ok();
     // A kill's signal can end the process before the kill records its
-    // outcome, so the registry settles the ending once no kill is in flight;
-    // the job reads its completion pending from the moment it ended.
+    // outcome, so the registry settles the ending once no kill is in flight.
     let ending = match &result {
         Ok(command) => Ok(command.exit_code),
         Err(error) => Err(error.to_string()),
     };
     let owed = status_registry.owe_completion(&task_id, ending).await;
     let kill = owed.as_ref().and_then(|owed| owed.kill);
+    let mut pending = owed.map(|owed| owed.pending);
+    // A result the call returned leaves nothing for the agent to take: the
+    // completion is taken here, so the registry forgets the job.
+    if foreground.is_some()
+        && let Some(pending) = pending.take()
+    {
+        pending.take().await;
+    }
     // Every job reports completion; the agent reinjects the result only for
     // tasks it saw promoted or detached (`take_started`), so a plain
     // foreground result is not delivered twice.
     let _ = completed_tx
         .send(CompletedTask {
-            task_id,
+            task_id: task_id.to_string(),
             script,
             result,
             kill,
             timeout_kill: timeout_watch.kill().filter(|_| kill.is_some()),
-            pending: owed.map(|owed| owed.pending),
+            pending,
         })
         .await;
     running_tasks.fetch_sub(1, Ordering::AcqRel);
+    // The flow's own hold on the word ends before the call returns.
+    drop(task_id);
+    if let Some(done) = foreground {
+        let _ = done.send(()).await;
+    }
 }
 
 /// Standalone script execution that can be spawned in a background task.
@@ -4217,7 +4326,7 @@ where
         heel,
         expect,
         resolution,
-        store_dir,
+        outputs,
         max_lines,
         raw,
     } = request;
@@ -4268,7 +4377,7 @@ where
         pid,
         output,
         background_output: background,
-        store_dir: &store_dir,
+        outputs: &outputs,
         expect,
         resolution,
         max_lines,
@@ -4460,7 +4569,7 @@ async fn save_completed_process_output(
         pid,
         output,
         background_output,
-        store_dir,
+        outputs,
         expect,
         resolution,
         max_lines,
@@ -4472,7 +4581,7 @@ async fn save_completed_process_output(
         &output.stdout,
         CompletedStdoutFormat {
             background_output,
-            store_dir,
+            outputs,
             expect,
             resolution,
             max_lines,
@@ -4480,7 +4589,7 @@ async fn save_completed_process_output(
         },
     )
     .await?;
-    let stderr = save_completed_stderr(job_registry, pid, store_dir, &output.stderr).await?;
+    let stderr = save_completed_stderr(job_registry, pid, outputs, &output.stderr).await?;
     let exit_code = output.status.code().unwrap_or(-1);
 
     Ok(CompletedCommand {
@@ -4493,7 +4602,7 @@ async fn save_completed_process_output(
 
 struct CompletedStdoutFormat<'a> {
     background_output: bool,
-    store_dir: &'a Path,
+    outputs: &'a OutputStore,
     expect: OutputFormat,
     resolution: MediaResolution,
     max_lines: usize,
@@ -4510,18 +4619,19 @@ async fn save_completed_stdout(
     let data_to_save = if format.background_output {
         Cow::Borrowed(stdout)
     } else {
-        compressed_stdout_data(format.store_dir, stdout, format.expect, format.raw).await?
+        compressed_stdout_data(format.outputs, stdout, format.expect, format.raw).await?
     };
 
-    match crate::output::save_text_with_line_limit(
-        format.store_dir,
-        data_to_save.as_ref(),
-        format.expect,
-        format.resolution,
-        format.max_lines,
-        byte_limit,
-    )
-    .await
+    match format
+        .outputs
+        .save_text_with_line_limit(
+            data_to_save.as_ref(),
+            format.expect,
+            format.resolution,
+            format.max_lines,
+            byte_limit,
+        )
+        .await
     {
         Ok(entry) => Ok(entry),
         Err(err) => {
@@ -4536,7 +4646,7 @@ async fn save_completed_stdout(
 /// `raw: true` bypasses it entirely, as do non-text formats and output that
 /// is not valid UTF-8, so the model sees exactly the bytes the command wrote.
 async fn compressed_stdout_data<'a>(
-    store_dir: &Path,
+    outputs: &OutputStore,
     stdout: &'a [u8],
     expect: OutputFormat,
     raw: bool,
@@ -4549,7 +4659,7 @@ async fn compressed_stdout_data<'a>(
         return Ok(Cow::Borrowed(stdout));
     };
 
-    let cleaned = crate::output_compress::compress_text(store_dir, text)
+    let cleaned = crate::output_compress::compress_text(outputs, text)
         .await
         .map_err(TerminalError::Io)?;
     Ok(cleaned.map_or(Cow::Borrowed(stdout), |cleaned| {
@@ -4560,20 +4670,20 @@ async fn compressed_stdout_data<'a>(
 async fn save_completed_stderr(
     job_registry: &JobRegistry,
     pid: u32,
-    store_dir: &Path,
+    outputs: &OutputStore,
     stderr: &[u8],
 ) -> Result<Option<CommandStream>, TerminalError> {
     if stderr.is_empty() {
         return Ok(None);
     }
-    match OutputStore::save_to_dir_with_limit(
-        store_dir,
-        stderr,
-        OutputFormat::Text,
-        MediaResolution::Auto,
-        Some(INLINE_OUTPUT_LIMIT),
-    )
-    .await
+    match outputs
+        .save_with_limit(
+            stderr,
+            OutputFormat::Text,
+            MediaResolution::Auto,
+            Some(INLINE_OUTPUT_LIMIT),
+        )
+        .await
     {
         Ok(entry) => Ok(Some(entry)),
         Err(err) => {
@@ -6728,6 +6838,12 @@ mod tests {
     #[cfg(unix)]
     mod progress;
 
+    /// An output store in `dir`, which exists, leasing from the default
+    /// allocator.
+    fn test_outputs(dir: impl Into<PathBuf>) -> OutputStore {
+        OutputStore::at(dir.into(), AnyIdAllocator::default())
+    }
+
     /// A stdin whose drop reports that the writer thread holding it ended.
     struct DropSignal(async_channel::Sender<()>);
 
@@ -6759,7 +6875,7 @@ mod tests {
         registry
             .register(
                 9001,
-                "task-writer",
+                &crate::test_ids::lease("writer"),
                 "exec-writer",
                 "cat",
                 TerminalMode::Sandboxed,
@@ -6770,7 +6886,7 @@ mod tests {
         let input_tx = spawn_terminal_stdin_writer(DropSignal(ended_tx), FeedCounter::default());
         registry.attach_terminal_input(9001, input_tx).await;
         registry
-            .terminal_input("task-writer", b"hi\n".to_vec())
+            .terminal_input("writer", b"hi\n".to_vec())
             .await
             .expect("a running job takes input");
         assert!(ended_rx.is_empty(), "the writer lives while the job runs");
@@ -7003,7 +7119,7 @@ mod tests {
             .adopt_prepared_tools(prepared)
             .await
             .expect("a prepared registry should be adopted");
-        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.output_store().clone()));
         let terminal = terminal.with_registry(registry);
         let result = terminal
             .call(
@@ -7050,7 +7166,7 @@ mod tests {
             .adopt_prepared_tools(prepared)
             .await
             .expect("a prepared registry should be adopted");
-        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.output_store().clone()));
         let terminal = terminal.with_registry(registry);
         let _ = terminal
             .call(
@@ -7135,7 +7251,7 @@ mod tests {
         assert_eq!(authorizer.connects.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(authorizer.installs.load(AtomicOrdering::SeqCst), 0);
 
-        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.output_store().clone()));
         let terminal = terminal.with_registry(registry);
         let result = terminal
             .call(
@@ -7881,7 +7997,7 @@ mod tests {
         .adopt_prepared_tools(shell_sessions)
         .await
         .expect("prepared tools should be adopted");
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let result = tool
             .ensure_permission_allowed(TerminalMode::Unsafe, "make install", ScriptLanguage::Shell)
@@ -8013,7 +8129,7 @@ mod tests {
             tool.prepared_tools_context(),
             Err(ToolRuntimeError::NotInitialized(_))
         ));
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         assert!(matches!(
             tool.resolve_default_target(),
@@ -8039,7 +8155,7 @@ mod tests {
         tool.job_registry()
             .register(
                 424_242,
-                "parent-task",
+                &crate::test_ids::lease("parent"),
                 "parent-execution",
                 "sleep 30",
                 TerminalMode::Sandboxed,
@@ -8047,7 +8163,8 @@ mod tests {
             )
             .await;
 
-        let parent_registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let parent_registry =
+            Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let parent = tool.with_registry(parent_registry);
         let child = parent
             .subagent_without_grant()
@@ -8061,7 +8178,7 @@ mod tests {
         for name in ["terminal_kill", "terminal_input", "terminal_read"] {
             assert!(child.registry().is_tool_configured(name));
         }
-        let args = vec!["--task-id".to_string(), "parent-task".to_string()];
+        let args = vec!["--task-id".to_string(), "parent".to_string()];
         let parent_output = serde_json::to_value(
             parent
                 .registry()
@@ -8153,7 +8270,9 @@ mod tests {
                 dir: binding.working_dir().to_path_buf(),
             });
         });
-        let parent = tool.with_registry(Arc::new(builder.build(dir.path().join("outputs"))));
+        let parent = tool.with_registry(Arc::new(
+            builder.build(test_outputs(dir.path().join("outputs"))),
+        ));
 
         // What the usage names is read when the call fails, not when the
         // terminal bound the command.
@@ -8248,13 +8367,202 @@ mod tests {
                 container: false,
                 ssh: false,
             });
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let parent = tool.with_registry(registry);
         let child = parent
             .subagent_without_grant()
             .await
             .expect("an empty grant is always given");
         ((dir, cache), parent, child)
+    }
+
+    /// A command's task id, the file its background output goes to and a
+    /// subagent's space are each named by a word leased from the terminal's
+    /// allocator, which the subagent's terminal shares; the stored output and
+    /// the space give their words back once the terminals holding them drop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_facing_names_are_leased_from_the_terminal_allocator() {
+        let ids = crate::test_ids::RecordingIds::default();
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .with_id_allocator(ids.allocator())
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
+            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                local: true,
+                container: false,
+                ssh: false,
+            });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
+        let terminal = tool.with_registry(registry);
+
+        let receiver = terminal.background_receiver();
+        terminal
+            .run_background(background_args("print a line", "echo leased"))
+            .await
+            .expect("terminal call should succeed");
+        let [started] = <[_; 1]>::try_from(receiver.take_started()).expect("one started task");
+        assert_eq!(ids.leased(), ["alfa", "bravo"]);
+        assert_eq!(started.task_id, "alfa");
+        assert_eq!(started.output_file.url, "outputs/bravo.txt");
+        receiver.recv().await.expect("the job completes");
+
+        let child = terminal
+            .subagent_without_grant()
+            .await
+            .expect("an empty grant is always given");
+        assert_eq!(ids.leased(), ["alfa", "bravo", "charlie"]);
+        assert_eq!(
+            child
+                .working_dir()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("charlie")
+        );
+        // The child's terminal and the commands bound to the parent lease
+        // from the same allocator.
+        let from_child = child.id_allocator().lease().expect("a free word");
+        let from_binding = terminal
+            .binding()
+            .id_allocator()
+            .lease()
+            .expect("a free word");
+        assert_eq!((&*from_child, &*from_binding), ("delta", "echo"));
+        drop((from_child, from_binding));
+
+        drop((child, terminal, receiver));
+        for _ in 0..500 {
+            let released = ids.released();
+            if released.iter().any(|word| word == "bravo")
+                && released.iter().any(|word| word == "charlie")
+            {
+                return;
+            }
+            async_io::Timer::after(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the output file and the space keep their words: {:?} released",
+            ids.released()
+        );
+    }
+
+    /// A configured terminal leasing its model-facing names from `ids`.
+    #[cfg(unix)]
+    async fn terminal_leasing_from(
+        dir: &Path,
+        ids: AnyIdAllocator,
+    ) -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+    ) {
+        let (cache, shell_sessions) = prepared_test_registry().await;
+        let tool = TerminalTool::new_exact(
+            dir,
+            TestPermissionHandler::default(),
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .with_id_allocator(ids)
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+            local: true,
+            container: false,
+            ssh: false,
+        });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
+        (cache, tool.with_registry(registry))
+    }
+
+    /// A foreground command gives its task id back by the time its call
+    /// returns, so commands run one after another never exhaust the words.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_commands_one_after_another_never_exhaust_the_ids() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let ids = AnyIdAllocator::new(aither_core::WordAllocator::new(["river"]));
+        let (_cache, terminal) = terminal_leasing_from(dir.path(), ids.clone()).await;
+        for run in 0..4 {
+            let result = terminal
+                .call(
+                    TerminalArgs {
+                        background: false,
+                        ..background_args("finish at once", "exit 0")
+                    },
+                    ToolContext::new(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("run {run} should get the one word: {error}"));
+            assert!(!result.is_error(), "{result:?}");
+        }
+        assert!(
+            terminal.job_registry().list().await.is_empty(),
+            "a returned result leaves nothing to address"
+        );
+        assert_eq!(&*ids.lease().expect("river is free"), "river");
+    }
+
+    /// A background job keeps its task id while the agent can still address
+    /// it, and gives it back once its completion is delivered; after that,
+    /// the id answers as an unknown task and can be leased again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_finished_background_job_gives_its_id_back_once_its_completion_is_delivered() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let ids = AnyIdAllocator::new(aither_core::WordAllocator::new(["river", "stone"]));
+        let (_cache, terminal) = terminal_leasing_from(dir.path(), ids.clone()).await;
+        let receiver = terminal.background_receiver();
+        let jobs = terminal.job_registry();
+        terminal
+            .run_background(background_args("print a line", "echo done"))
+            .await
+            .expect("terminal call should succeed");
+        let [started] = <[_; 1]>::try_from(receiver.take_started()).expect("one started task");
+        assert_eq!(started.task_id, "river");
+        assert_eq!(started.output_file.url, "outputs/stone.txt");
+
+        let completed = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
+            .await
+            .expect("the job should deliver its completion")
+            .expect("the completion channel stays open");
+        let pending = jobs
+            .get_by_task_id("river")
+            .await
+            .expect("an undelivered completion keeps the job");
+        assert!(pending.status.completion_pending(), "{pending:?}");
+        assert!(
+            ids.lease().is_err(),
+            "the job and its output hold both words"
+        );
+
+        drop(completed);
+        assert!(jobs.list().await.is_empty(), "a delivered job is forgotten");
+        assert!(matches!(
+            jobs.terminal_read("river", 0, 1024).await,
+            Err(crate::TerminalReadError::Failed(_))
+        ));
+        assert!(!jobs.kill_by_task_id("river").await);
+        // The job's flow lets go of the word as it ends.
+        for _ in 0..500 {
+            if let Ok(again) = ids.lease() {
+                assert_eq!(&*again, "river");
+                return;
+            }
+            async_io::Timer::after(Duration::from_millis(10)).await;
+        }
+        panic!("a delivered job keeps its word");
     }
 
     /// A child terminal's `terminal_input` and `terminal_read` reach its own
@@ -8290,7 +8598,8 @@ mod tests {
         .await;
         assert_eq!(input["ok"], true, "child terminal_input failed: {input}");
 
-        wait_for_completed_task(&receiver, &echo_id).await;
+        // Held, so the job is still addressable while it is read.
+        let _completed = wait_for_completed_task(&receiver, &echo_id).await;
         let echoed =
             query_control(child.registry(), "terminal_read", &["--task-id", &echo_id]).await;
         assert_eq!(echoed["ok"], true, "child terminal_read failed: {echoed}");
@@ -8449,7 +8758,7 @@ mod tests {
             .adopt_prepared_tools(shell_sessions)
             .await
             .expect("prepared tools should be adopted");
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let job_registry = tool.job_registry();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
@@ -8462,7 +8771,7 @@ mod tests {
             registry,
             permission_handler: Arc::new(TestPermissionHandler::default()),
             job_registry,
-            task_id: "task-test".to_string(),
+            task_id: crate::test_ids::lease("probe"),
             execution_id: "exec-test".to_string(),
             background: false,
             carry: None,
@@ -8484,7 +8793,7 @@ mod tests {
             heel: SharedHeelBinary::default(),
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
-            store_dir: tool.outputs_dir(),
+            outputs: tool.output_store().clone(),
             max_lines: 50,
             raw: false,
         })
@@ -8567,7 +8876,7 @@ mod tests {
             written.display(),
             refused.display(),
         );
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let job_registry = tool.job_registry();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
@@ -8580,7 +8889,7 @@ mod tests {
             registry,
             permission_handler: Arc::new(TestPermissionHandler::default()),
             job_registry,
-            task_id: "task-policy".to_string(),
+            task_id: crate::test_ids::lease("policy"),
             execution_id: "exec-policy".to_string(),
             background: false,
             carry: None,
@@ -8602,7 +8911,7 @@ mod tests {
             heel: SharedHeelBinary::default(),
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
-            store_dir: tool.outputs_dir(),
+            outputs: tool.output_store().clone(),
             max_lines: 50,
             raw: false,
         })
@@ -8664,7 +8973,7 @@ mod tests {
             .adopt_prepared_tools(shell_sessions)
             .await
             .expect("prepared tools should be adopted");
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
             working_dir: tool.working_dir().clone(),
@@ -8676,7 +8985,7 @@ mod tests {
             registry,
             permission_handler: Arc::new(TestPermissionHandler::default()),
             job_registry: tool.job_registry(),
-            task_id: "task-grants".to_string(),
+            task_id: crate::test_ids::lease("grants"),
             execution_id: "exec-grants".to_string(),
             background: false,
             carry: None,
@@ -8698,7 +9007,7 @@ mod tests {
             heel: SharedHeelBinary::default(),
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
-            store_dir: tool.outputs_dir(),
+            outputs: tool.output_store().clone(),
             max_lines: 200,
             raw: false,
         })
@@ -9009,7 +9318,7 @@ mod tests {
                 container: false,
                 ssh: false,
             });
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
 
         let result = tool
@@ -9074,7 +9383,7 @@ mod tests {
                 container: false,
                 ssh: false,
             });
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let receiver = tool.background_receiver();
         let jobs = tool.job_registry();
@@ -9114,17 +9423,15 @@ mod tests {
         );
 
         // The agent takes the completion; the registry serves the take
-        // before the list that follows it.
+        // before the list that follows it, and forgets the job.
         drop(completed);
         let taken = jobs.list().await;
-        assert_eq!(
-            taken[0].status,
-            JobStatus::Completed {
-                exit_code: 3,
-                delivery: crate::Delivery::Taken
-            }
-        );
+        assert!(taken.is_empty(), "{taken:?}");
         assert!(!host_sees_owed_turn(&taken), "{taken:?}");
+        assert!(
+            jobs.get_by_task_id(&task_id).await.is_none(),
+            "a delivered job's id is unknown"
+        );
     }
 
     #[cfg(unix)]
@@ -9148,7 +9455,7 @@ mod tests {
                 container: false,
                 ssh: false,
             });
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let background_receiver = tool.background_receiver();
         let input_tool = InputTerminalTool::new(tool.job_registry());
@@ -9222,7 +9529,7 @@ mod tests {
                 container: false,
                 ssh: false,
             });
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let child_pid_path = dir.path().join("child.pid");
 
@@ -9489,7 +9796,7 @@ mod tests {
         .adopt_prepared_tools(shell_sessions)
         .await
         .expect("prepared tools should be adopted");
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
 
         let code = "import os\nprint(os.getcwd())";
@@ -9600,7 +9907,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let registry = Arc::new(ToolRegistryBuilder::new().build(dir.path()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(test_outputs(dir.path())));
         let (job_registry, job_registry_service) = job_registry_channel();
         tokio::spawn(async move { job_registry_service.serve().await });
         let container_tools =
@@ -9620,7 +9927,7 @@ mod tests {
             executor: executor_core::tokio::TokioGlobal,
             env_source: &None,
             registry: &registry,
-            task_id: "task-test",
+            task_id: &crate::test_ids::lease("probe"),
             execution_id: "exec-test",
             script: "cat",
             language: ScriptLanguage::Shell,
@@ -9631,7 +9938,7 @@ mod tests {
             job_registry: &job_registry,
             stdin_alerts: Some(StdinAlerts {
                 tx: alert_tx.clone(),
-                task_id: "task-test".to_string(),
+                task_id: "probe".to_string(),
                 script: "cat".to_string(),
             }),
             lifetime: JobLifetime::Foreground { alerts: alert_tx },
@@ -9747,7 +10054,7 @@ mod tests {
             crate::jobserver::job_broker_channel(pool, dir.path().join("commands"))
                 .expect("broker should start");
         tokio::spawn(async move { service.serve().await });
-        let registry = Arc::new(ToolRegistryBuilder::new().build(dir.path()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(test_outputs(dir.path())));
         let (job_registry, job_registry_service) = job_registry_channel();
         tokio::spawn(async move { job_registry_service.serve().await });
         let container_tools =
@@ -9781,7 +10088,7 @@ mod tests {
             executor: executor_core::tokio::TokioGlobal,
             env_source: &None,
             registry: &registry,
-            task_id: "task-test",
+            task_id: &crate::test_ids::lease("probe"),
             execution_id: "exec-test",
             script: "make",
             language: ScriptLanguage::Shell,
@@ -9926,7 +10233,7 @@ mod tests {
     ) {
         let (cache, tool) =
             unconfigured_test_terminal(dir, foreground_wait, timeout_cap, alert_after).await;
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         (cache, tool.with_registry(registry))
     }
 
@@ -10805,7 +11112,7 @@ mod tests {
             .await
             .expect("prepared tools should be adopted")
             .with_process_priority(priority);
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         (cache, tool.with_registry(registry))
     }
 
@@ -11129,7 +11436,7 @@ mod tests {
         let outputs = tempfile::tempdir().expect("outputs dir should be created");
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(ProbeEchoTool);
-        let registry = Arc::new(builder.build(outputs.path()));
+        let registry = Arc::new(builder.build(test_outputs(outputs.path())));
         let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
         let bridge = start_container_ipc_bridge(
             executor_core::tokio::TokioGlobal,
@@ -11457,7 +11764,9 @@ mod tests {
             .adopt_prepared_tools(shell_sessions)
             .await
             .expect("prepared tools should be adopted");
-        let parent = tool.with_registry(Arc::new(ToolRegistryBuilder::new().build(dir.path())));
+        let parent = tool.with_registry(Arc::new(
+            ToolRegistryBuilder::new().build(test_outputs(dir.path())),
+        ));
         let child = parent
             .subagent_without_grant()
             .await
@@ -11520,7 +11829,7 @@ mod tests {
             ));
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(ProbeEchoTool);
-        let registry = Arc::new(builder.build(tool.outputs_dir()));
+        let registry = Arc::new(builder.build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
 
         let result = tool
@@ -11786,7 +12095,7 @@ mod tests {
             filling,
             seen,
         });
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         (cache, tool.with_registry(registry), seen_rx)
     }
 
@@ -13213,7 +13522,9 @@ mod tests {
                 binding: binding.clone(),
             }
         });
-        let parent = tool.with_registry(Arc::new(builder.build(dir.path().join("outputs"))));
+        let parent = tool.with_registry(Arc::new(
+            builder.build(test_outputs(dir.path().join("outputs"))),
+        ));
 
         // The main agent launches the subagent through the command.
         let sibling_arg = sibling.to_str().unwrap();
@@ -13305,7 +13616,9 @@ mod tests {
         .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.sandboxed_only(|sandboxed| sandboxed.configure_tool(SandboxedUname));
-        let tool = tool.with_registry(Arc::new(builder.build(dir.path().join("outputs"))));
+        let tool = tool.with_registry(Arc::new(
+            builder.build(test_outputs(dir.path().join("outputs"))),
+        ));
 
         let sandboxed = tool
             .call(
@@ -13362,7 +13675,9 @@ mod tests {
         .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.main_only(|reserved| reserved.configure_tool(ProbeEchoTool));
-        let parent = tool.with_registry(Arc::new(builder.build(dir.path().join("outputs"))));
+        let parent = tool.with_registry(Arc::new(
+            builder.build(test_outputs(dir.path().join("outputs"))),
+        ));
         assert_eq!(parent.registry().role(), crate::CommandRole::Main);
 
         let child = launch(&parent, SubagentGrant::new()).await.unwrap();
@@ -13497,7 +13812,9 @@ mod tests {
                 runner: binding.runner().clone(),
             }
         });
-        let terminal = tool.with_registry(Arc::new(builder.build(dir.path().join("outputs"))));
+        let terminal = tool.with_registry(Arc::new(
+            builder.build(test_outputs(dir.path().join("outputs"))),
+        ));
         terminal.grants().add_writable(clone.path());
 
         let clone_dir = std::fs::canonicalize(clone.path()).unwrap();
@@ -13639,7 +13956,7 @@ mod tests {
         builder.observe_commands(crate::AnyCommandObserver::new(IdentityObserver(observer)));
         (
             cache,
-            tool.with_registry(Arc::new(builder.build(dir.join("outputs")))),
+            tool.with_registry(Arc::new(builder.build(test_outputs(dir.join("outputs"))))),
         )
     }
 
@@ -13869,7 +14186,9 @@ mod tests {
         .adopt_prepared_tools(shell_sessions)
         .await
         .expect("prepared tools should be adopted");
-        let parent = tool.with_registry(Arc::new(ToolRegistryBuilder::new().build(dir)));
+        let parent = tool.with_registry(Arc::new(
+            ToolRegistryBuilder::new().build(test_outputs(dir)),
+        ));
         (scripts, parent)
     }
 
@@ -13884,7 +14203,15 @@ mod tests {
         assert!(parent.container_probe().is_some());
         assert!(parent.job_memory().has_container());
 
-        assert_eq!(exit_code_of(&parent, "echo marked-command").await, 0);
+        // A background job, whose completion is held so the registry still
+        // keeps it to be read.
+        let receiver = parent.background_receiver();
+        parent
+            .run_background(background_args("mark", "echo marked-command"))
+            .await
+            .expect("terminal call should succeed");
+        let task_id = started_task_id(&receiver);
+        let _completed = wait_for_completed_task(&receiver, &task_id).await;
 
         let scripts = scripts.lock().unwrap().clone();
         let script = scripts
@@ -14075,7 +14402,7 @@ mod tests {
             });
         let mut registry = ToolRegistryBuilder::new();
         configure(&mut registry);
-        let registry = Arc::new(registry.build(tool.outputs_dir()));
+        let registry = Arc::new(registry.build(tool.output_store().clone()));
         (cache, tool.with_registry(registry))
     }
 

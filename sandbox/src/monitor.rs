@@ -162,6 +162,9 @@ pub enum MonitorRefusal {
 /// Everything a running monitor needs to know to watch and report.
 struct Watch {
     task_id: String,
+    /// Keeps the job, and its word, until the pump reports its end, so a
+    /// completion the agent took first still leaves the pump its status.
+    held: Option<crate::job_registry::JobWatch>,
     registry: JobRegistry,
     alerts: async_channel::Sender<JobAlert>,
     interval: Duration,
@@ -341,9 +344,11 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<
                 });
             }
         };
+        let registry = self.terminal.job_registry();
         let watch = Watch {
+            held: registry.watch(&task_id).await,
             task_id: task_id.clone(),
-            registry: self.terminal.job_registry(),
+            registry,
             alerts: self.terminal.job_alert_sender(),
             interval: Duration::from_secs(args.interval_secs),
             deadline: Instant::now() + Duration::from_secs(args.timeout_secs),
@@ -379,6 +384,7 @@ async fn send(alerts: &async_channel::Sender<JobAlert>, alert: JobAlert) {
 async fn watch_task(watch: Watch) {
     let Watch {
         task_id,
+        held: _held,
         registry,
         alerts,
         interval,
