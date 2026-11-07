@@ -341,8 +341,10 @@ pub struct FinishedToolCall {
     id: String,
     name: String,
     result: aither_core::llm::ToolResult,
-    /// The call was refused for re-reading output that had not changed
-    /// ([`aither_sandbox::PollRefusal::is_unchanged_read`]).
+    /// The call was refused for re-reading output that had not changed: a
+    /// `terminal_read` of a task with no new output
+    /// ([`aither_sandbox::UnchangedTaskRead`]) or a script a command policy
+    /// refused as one ([`aither_sandbox::PolicyRefusal::is_unchanged_read`]).
     unchanged_read: bool,
 }
 
@@ -1732,8 +1734,11 @@ where
                     Ok(result) => (result, false),
                     Err(error) => {
                         let unchanged_read = error
-                            .downcast_ref::<aither_sandbox::Refused<aither_sandbox::PollRefusal>>()
-                            .is_some_and(|refused| refused.reason().is_unchanged_read());
+                            .downcast_ref::<aither_sandbox::Refused<aither_sandbox::UnchangedTaskRead>>()
+                            .is_some()
+                            || error
+                                .downcast_ref::<aither_sandbox::PolicyRefusal>()
+                                .is_some_and(aither_sandbox::PolicyRefusal::is_unchanged_read);
                         let mut message = String::from("Error: ");
                         message.push_str(error.to_string().as_str());
                         (aither_core::llm::ToolResult::error(message), unchanged_read)

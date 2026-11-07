@@ -1956,21 +1956,33 @@ mod tests {
         );
     }
 
-    /// Notices that reword the terminal's poll refusals.
-    struct NoPolling;
+    /// An embedder's policy refusing a foreground `sleep` in its own words.
+    struct NoSleep;
 
-    impl aither_sandbox::SandboxNotices for NoPolling {
-        fn poll_refusal(&self, refusal: &aither_sandbox::PollRefusal) -> String {
-            match refusal {
-                aither_sandbox::PollRefusal::Sleep => {
-                    "Not run: wait for the job's completion instead of sleeping.".to_string()
-                }
-                other => aither_sandbox::DefaultSandboxNotices.poll_refusal(other),
-            }
+    impl aither_sandbox::CommandPolicy for NoSleep {
+        type State = ();
+
+        fn check(
+            &self,
+            script: &aither_sandbox::ScriptCheck<'_>,
+            (): &(),
+        ) -> impl std::future::Future<Output = aither_sandbox::PolicyDecision> + Send {
+            let sleeps = matches!(
+                script.shell,
+                Some(Ok(shell)) if shell
+                    .commands()
+                    .iter()
+                    .any(|command| !command.is_background() && command.program() == "sleep")
+            );
+            std::future::ready(if sleeps {
+                aither_sandbox::PolicyDecision::Refuse(aither_sandbox::PolicyRefusal::new(
+                    "Not run: wait for the job's completion instead of sleeping.",
+                ))
+            } else {
+                aither_sandbox::PolicyDecision::Allow
+            })
         }
     }
-
-    impl crate::Notices for NoPolling {}
 
     /// Asks for one foreground `sleep`, then stops.
     #[derive(Clone)]
@@ -2021,28 +2033,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_terminal_refusal_reaches_the_conversation_in_the_embedders_words() {
+    async fn a_command_policy_refusal_reaches_the_conversation_in_the_embedders_words() {
         let source = tempdir().unwrap();
         let binary = compile_baseline_fixture(source.path()).await;
         let distribution = fixture_distribution(&binary, "1.0.0").await;
         let cache = crate::test_support::TempDir::new();
         let dir = tempdir().unwrap();
         let (requests, captured) = async_channel::bounded(8);
-        // Set after the builder registered its tools: they render through it
-        // all the same.
-        let mut agent = TerminalAgentBuilder::new(
+        let mut builder = TerminalAgentBuilder::new(
             SleepLlm {
                 requests,
                 turns: Arc::default(),
             },
             noop_terminal(dir.path()).await,
         )
-        .max_iterations(3)
-        .notices(crate::AnyNotices::new(NoPolling))
-        .initialize_tools(&distribution, cache.path())
-        .await
-        .unwrap()
-        .build();
+        .max_iterations(3);
+        builder.tool_registry_mut().command_policy(NoSleep);
+        let mut agent = builder
+            .initialize_tools(&distribution, cache.path())
+            .await
+            .unwrap()
+            .build();
 
         let _ = crate::test_support::finish_run(agent.run("Wait for the build", [])).await;
 
@@ -2057,10 +2068,6 @@ mod tests {
         assert!(
             transcript.contains("Not run: wait for the job's completion instead of sleeping."),
             "the embedder's refusal reached the model: {transcript}"
-        );
-        assert!(
-            !transcript.contains("only serves polling"),
-            "aither's own wording stayed out: {transcript}"
         );
     }
 }

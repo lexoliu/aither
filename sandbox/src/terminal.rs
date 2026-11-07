@@ -61,7 +61,8 @@ use tracing::{debug, info, warn};
 #[cfg(all(unix, feature = "jobserver"))]
 use crate::jobserver::{JobBroker, JobPool, job_broker_channel};
 use crate::{
-    CommandRefusal, ContainerPath, MountRoot, PreparedTools, ToolDistribution, ToolRuntimeError,
+    ContainerPath, MountRoot, PolicyRefusal, PreparedTools, ScriptOrigin, ScriptOutcome,
+    ToolDistribution, ToolRuntimeError,
     builtin::builtin_router,
     command::{
         AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandRole, GateDecision, ToolRegistry,
@@ -301,10 +302,7 @@ fn direct_command(script: &str) -> Result<Option<(String, Vec<String>)>, Termina
         return Ok(None);
     }
     let (program, args) = parse_direct_command(script)?;
-    if looks_like_env_assignment(&program)
-        || is_shell_builtin(&program)
-        || crate::tool_runtime::is_blocked_command(&program)
-    {
+    if looks_like_env_assignment(&program) || is_shell_builtin(&program) {
         return Ok(None);
     }
     Ok(Some((program, args)))
@@ -1360,9 +1358,9 @@ pub enum TerminalRunError {
         /// The longest timeout the terminal accepts.
         cap: Duration,
     },
-    /// The kill guard refused the script.
+    /// A command policy refused the script.
     #[error(transparent)]
-    Refused(crate::Refused<CommandRefusal>),
+    Refused(PolicyRefusal),
     /// The terminal's command gate blocked the script.
     #[error(transparent)]
     Blocked(crate::Refused<CommandBlocked>),
@@ -2949,7 +2947,6 @@ where
             raw,
             background,
             timeout,
-            file_reads,
             carry,
             call,
         } = request;
@@ -3005,7 +3002,6 @@ where
                 execution_id,
                 background,
                 timeout_watch: timeout_watch.clone(),
-                file_reads,
                 carry,
                 carried_dir: self.carried_dir.clone(),
                 alert_tx: self.alert_tx.clone(),
@@ -3064,7 +3060,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                 cap.as_secs()
             ));
         }
-        let prepared = self.prepare_execution(&arguments).await?;
+        let prepared = self.prepare_execution(&arguments, cx.identity()).await?;
         // A detached job cannot report a directory carry: its final
         // directory is unknowable when the call returns.
         let carry = if arguments.background {
@@ -3085,7 +3081,6 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             raw: arguments.raw,
             background: arguments.background,
             timeout,
-            file_reads: prepared.file_reads,
             carry: carry.clone(),
             call: cx.identity().cloned(),
         });
@@ -3409,98 +3404,117 @@ where
         self.notices().command_killed(&killed)
     }
 
-    /// Refuses `script` when it kills by name or is not valid shell.
-    fn check_kills(&self, script: &str) -> Result<(), crate::Refused<CommandRefusal>> {
-        crate::kill_guard::check(script).map_err(|refusal| {
-            crate::Refused::rendered(refusal, |refusal| self.notices().command_refusal(refusal))
-        })
-    }
-
-    /// `refusal`, rendered for the model.
-    fn refuse_poll(&self, refusal: crate::PollRefusal) -> crate::Refused<crate::PollRefusal> {
-        crate::Refused::rendered(refusal, |refusal| self.notices().poll_refusal(refusal))
-    }
-
-    /// Shared front half of every `terminal` call: argument validation,
-    /// the agent's polling guards, then [`Self::admit_command`].
+    /// Shared front half of every `terminal` call: argument validation, then
+    /// [`Self::admit_command`].
     async fn prepare_execution(
         &self,
         arguments: &TerminalArgs,
+        call: Option<&CallIdentity>,
     ) -> anyhow::Result<ExecutionPreparation> {
         if arguments.description.trim().is_empty() {
             return Err(anyhow::anyhow!("terminal description must not be empty"));
         }
-        // The one entry every foreground, background and subagent command on
-        // every backend passes through, ahead of permission and execution.
-        // The guards read shell syntax, so Python source skips them.
-        let shell = arguments.language == ScriptLanguage::Shell;
-        if shell {
-            self.check_kills(&arguments.script)?;
-        }
-        // A foreground `sleep` only waits on something else — the detached
-        // form (`background: true`) stays allowed as a timer or inside a
-        // waiting script.
-        if shell && !arguments.background && crate::poll_guard::contains_sleep(&arguments.script) {
-            return Err(self.refuse_poll(crate::PollRefusal::Sleep).into());
-        }
-        // A command that only re-reads files unchanged since their last read
-        // is polling; refuse it ahead of permission like the other blocks.
-        let file_reads = if shell {
-            self.fingerprint_reads(&arguments.script).await
+        let origin = if arguments.background {
+            ScriptOrigin::Background
         } else {
-            Vec::new()
+            ScriptOrigin::Foreground
         };
-        if !file_reads.is_empty()
-            && self
-                .job_registry
-                .file_reads_unchanged(file_reads.clone())
-                .await
-        {
-            return Err(self
-                .refuse_poll(crate::PollRefusal::UnchangedFileRead {
-                    paths: file_reads.iter().map(|(path, _)| path.clone()).collect(),
-                })
-                .into());
-        }
-        let prepared = self
-            .admit_command(
-                &arguments.script,
-                arguments.language,
-                arguments.mode,
-                arguments.ssh_server_id.as_deref(),
-                arguments.max_lines,
-            )
-            .await?;
-        Ok(ExecutionPreparation {
-            file_reads,
-            ..prepared
+        self.admit_command(Admission {
+            script: &arguments.script,
+            language: arguments.language,
+            mode: arguments.mode,
+            ssh_server_id: arguments.ssh_server_id.as_deref(),
+            max_lines: arguments.max_lines,
+            origin,
+            call,
+        })
+        .await
+        .map_err(|error| match error {
+            // Kept unwrapped, so the agent loop recognises the refusal.
+            TerminalRunError::Refused(refusal) => anyhow::Error::from(refusal),
+            other => anyhow::Error::from(other),
         })
     }
 
-    /// The terminal's policy for a command, whoever runs it: the command
-    /// gate, target resolution, the read-only tools check and permission;
-    /// then the spawned job's ids.
+    /// The terminal's policy for a command, whoever runs it — the one entry
+    /// every foreground, background, subagent and run command on every
+    /// backend passes through: the command policies, the command gate,
+    /// target resolution, the read-only tools check and permission; then
+    /// the spawned job's ids.
+    ///
+    /// Every script the policies were asked about is reported to them once
+    /// it ends; one admission fails is reported here, unrun.
     async fn admit_command(
         &self,
-        script: &str,
-        language: ScriptLanguage,
-        mode: TerminalExecutionMode,
-        ssh_server_id: Option<&str>,
-        max_lines: u32,
+        admission: Admission<'_>,
     ) -> Result<ExecutionPreparation, TerminalRunError> {
+        let task_id = random_task_id();
+        let policies = self.registry.registry().policies();
+        self.check_policies(&task_id, &admission)
+            .await
+            .map_err(TerminalRunError::Refused)?;
+        let admitted = self.admit_checked(&admission).await;
+        if admitted.is_err() {
+            policies.ended(&task_id, ScriptOutcome::NotRun).await;
+        }
+        let (target, max_lines) = admitted?;
+        Ok(ExecutionPreparation {
+            target,
+            execution_id: format!("exec-{task_id}"),
+            task_id,
+            store_dir: self.output_store.dir().to_path_buf(),
+            max_lines,
+        })
+    }
+
+    /// Puts the script to the registry's command policies, the shell parsed
+    /// once for all of them. A refused script is reported to them, unrun.
+    async fn check_policies(
+        &self,
+        task_id: &str,
+        admission: &Admission<'_>,
+    ) -> Result<(), PolicyRefusal> {
+        let policies = self.registry.registry().policies();
+        if policies.is_empty() {
+            return Ok(());
+        }
+        let shell = (admission.language == ScriptLanguage::Shell)
+            .then(|| crate::ShellScript::parse(admission.script));
+        let check = crate::ScriptCheck {
+            task_id,
+            script: admission.script,
+            language: admission.language,
+            shell: shell.as_ref().map(Result::as_ref),
+            origin: admission.origin,
+            role: self.registry.registry().role(),
+            working_dir: &self.working_dir,
+            call: admission.call,
+        };
+        let checked = policies.check(&check).await;
+        if checked.is_err() {
+            policies.ended(task_id, ScriptOutcome::NotRun).await;
+        }
+        checked
+    }
+
+    /// The rest of admission once the policies allowed the script.
+    async fn admit_checked(
+        &self,
+        admission: &Admission<'_>,
+    ) -> Result<(ExecutionTarget, usize), TerminalRunError> {
         // Ahead of target resolution and permission, so a blocked command
         // never asks the user for anything. The decision carries no grant.
         // The gate reads shell syntax, so Python source skips it.
-        if language == ScriptLanguage::Shell
+        if admission.language == ScriptLanguage::Shell
             && let Some(gate) = self.registry.registry().gate()
-            && let GateDecision::Block { reason } = gate.check(script).await
+            && let GateDecision::Block { reason } = gate.check(admission.script).await
         {
             return Err(TerminalRunError::Blocked(crate::Refused::rendered(
                 CommandBlocked { reason },
                 |blocked| self.notices().command_blocked(blocked),
             )));
         }
-        let target = self.resolve_execution_target(mode, ssh_server_id)?;
+        let target = self.resolve_execution_target(admission.mode, admission.ssh_server_id)?;
         if let ExecutionBackend::Local(tools) = &target.backend {
             tools
                 .ensure_readonly(
@@ -3510,17 +3524,9 @@ where
                 .await
                 .map_err(TerminalError::from)?;
         }
-        self.ensure_permission_allowed(target.mode, script, language)
+        self.ensure_permission_allowed(target.mode, admission.script, admission.language)
             .await?;
-        let task_id = random_task_id();
-        Ok(ExecutionPreparation {
-            file_reads: Vec::new(),
-            target,
-            execution_id: format!("exec-{task_id}"),
-            task_id,
-            store_dir: self.output_store.dir().to_path_buf(),
-            max_lines: max_lines.min(MAX_LINES_CEILING) as usize,
-        })
+        Ok((target, admission.max_lines.min(MAX_LINES_CEILING) as usize))
     }
 
     /// Runs `run` to its end on this terminal; see [`TerminalRunner::run`].
@@ -3529,8 +3535,6 @@ where
         if run.timeout.is_zero() || run.timeout > cap {
             return Err(TerminalRunError::Timeout { cap });
         }
-        self.check_kills(&run.script)
-            .map_err(TerminalRunError::Refused)?;
         // A run starts in a host directory, so it resolves the terminal's
         // home backend, never an SSH server.
         let mode = match run.mode {
@@ -3538,15 +3542,27 @@ where
             TerminalMode::Unsafe => TerminalExecutionMode::Unsafe,
         };
         let prepared = self
-            .admit_command(
-                &run.script,
-                ScriptLanguage::Shell,
+            .admit_command(Admission {
+                script: &run.script,
+                language: ScriptLanguage::Shell,
                 mode,
-                None,
-                default_max_lines(),
-            )
+                ssh_server_id: None,
+                max_lines: default_max_lines(),
+                origin: ScriptOrigin::Run,
+                call: None,
+            })
             .await?;
-        let start = run_start(&prepared.target, run.working_dir)?;
+        let start = match run_start(&prepared.target, run.working_dir) {
+            Ok(start) => start,
+            Err(error) => {
+                self.registry
+                    .registry()
+                    .policies()
+                    .ended(&prepared.task_id, ScriptOutcome::NotRun)
+                    .await;
+                return Err(error);
+            }
+        };
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
             task_id: prepared.task_id.clone(),
@@ -3559,7 +3575,6 @@ where
             raw: false,
             background: false,
             timeout: run.timeout,
-            file_reads: Vec::new(),
             carry: Some(start),
             call: None,
         });
@@ -3598,28 +3613,6 @@ where
                 task_id: prepared.task_id,
             },
         })
-    }
-
-    /// The `(len, modified)` fingerprint of every file `script` would read,
-    /// relative paths resolved against the working directory. Only files
-    /// that exist now are fingerprinted — everything else stays untracked.
-    async fn fingerprint_reads(
-        &self,
-        script: &str,
-    ) -> Vec<(std::path::PathBuf, crate::job_registry::FileFingerprint)> {
-        let mut reads = Vec::new();
-        for target in crate::poll_guard::file_reads(script) {
-            let mut path = std::path::PathBuf::from(&target);
-            if path.is_relative() {
-                path = self.working_dir.join(path);
-            }
-            if let Ok(meta) = async_fs::metadata(&path).await
-                && meta.is_file()
-            {
-                reads.push((path, (meta.len(), meta.modified().ok())));
-            }
-        }
-        reads
     }
 
     /// Kills the job through the registry once its timeout passes.
@@ -3673,12 +3666,18 @@ where
     }
 }
 
-/// A command's file reads with the fingerprints taken at admission.
-type FileReads = Vec<(std::path::PathBuf, crate::job_registry::FileFingerprint)>;
+/// What [`TerminalTool::admit_command`] admits: a script and how it came.
+struct Admission<'a> {
+    script: &'a str,
+    language: ScriptLanguage,
+    mode: TerminalExecutionMode,
+    ssh_server_id: Option<&'a str>,
+    max_lines: u32,
+    origin: ScriptOrigin,
+    call: Option<&'a CallIdentity>,
+}
 
 struct ExecutionPreparation {
-    /// Fingerprinted at admission, recorded once the command exits 0.
-    file_reads: FileReads,
     target: ExecutionTarget,
     task_id: String,
     execution_id: String,
@@ -3835,7 +3834,6 @@ struct StandaloneExecution<P, E> {
     task_id: String,
     execution_id: String,
     background: bool,
-    file_reads: FileReads,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     alert_tx: Sender<JobAlert>,
@@ -3997,9 +3995,6 @@ struct TerminalSpawnRequest {
     raw: bool,
     background: bool,
     timeout: Duration,
-    /// Files the command reads, recorded for the unchanged-file guard once
-    /// it exits 0.
-    file_reads: FileReads,
     carry: Option<CwdCarry>,
     /// The `terminal` call this execution belongs to.
     call: Option<CallIdentity>,
@@ -4024,7 +4019,6 @@ struct SpawnedTerminalTask<P, E> {
     execution_id: String,
     background: bool,
     timeout_watch: Arc<TimeoutWatch>,
-    file_reads: FileReads,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     alert_tx: Sender<JobAlert>,
@@ -4072,7 +4066,6 @@ where
         execution_id,
         background,
         timeout_watch,
-        file_reads,
         carry,
         carried_dir,
         alert_tx,
@@ -4099,6 +4092,7 @@ where
         outages,
     } = task;
     let status_registry = job_registry.clone();
+    let policies = registry.policies().clone();
     let result = execute_script_standalone(StandaloneExecution {
         working_dir,
         writable_paths,
@@ -4112,7 +4106,6 @@ where
         task_id: task_id.clone(),
         execution_id,
         background,
-        file_reads,
         carry,
         carried_dir,
         alert_tx,
@@ -4140,6 +4133,14 @@ where
         interruptions,
         ..command
     });
+    // Ahead of the result, so what a policy records of this end holds for
+    // the agent's next call.
+    let outcome = result
+        .as_ref()
+        .map_or(ScriptOutcome::Failed, |command| ScriptOutcome::Exited {
+            code: command.exit_code,
+        });
+    policies.ended(&task_id, outcome).await;
 
     let quick_result = match &result {
         Ok(ok) => Ok(ok.clone()),
@@ -4193,7 +4194,6 @@ where
         task_id,
         execution_id,
         background,
-        file_reads,
         carry,
         carried_dir,
         alert_tx,
@@ -4275,11 +4275,6 @@ where
 
     let output_path = stored_path(&result.stdout);
     job_registry.complete(pid, exit_code, output_path).await;
-    // Only a read that succeeded counts for the unchanged-file guard: a
-    // denied or failed read must run again and show its failure.
-    if exit_code == 0 && !file_reads.is_empty() {
-        job_registry.record_file_reads(file_reads).await;
-    }
 
     // The command's directory report arrives with its end, whether the call
     // answered in the foreground window or the command promoted: the task
@@ -7319,9 +7314,12 @@ mod tests {
     }
 
     #[test]
-    fn blocked_commands_always_run_in_the_shell() {
+    fn host_programs_run_without_a_shell() {
         for name in ["grep", "sed", "awk", "find"] {
-            assert_eq!(direct_command(&format!("{name} x")).unwrap(), None);
+            assert_eq!(
+                direct_command(&format!("{name} x")).unwrap(),
+                Some((name.to_string(), vec!["x".to_string()]))
+            );
         }
     }
 
@@ -8457,7 +8455,6 @@ mod tests {
             task_id: "task-test".to_string(),
             execution_id: "exec-test".to_string(),
             background: false,
-            file_reads: Vec::new(),
             carry: None,
             carried_dir: None,
             alert_tx: async_channel::unbounded().0,
@@ -8576,7 +8573,6 @@ mod tests {
             task_id: "task-policy".to_string(),
             execution_id: "exec-policy".to_string(),
             background: false,
-            file_reads: Vec::new(),
             carry: None,
             carried_dir: None,
             alert_tx: async_channel::unbounded().0,
@@ -8673,7 +8669,6 @@ mod tests {
             task_id: "task-grants".to_string(),
             execution_id: "exec-grants".to_string(),
             background: false,
-            file_reads: Vec::new(),
             carry: None,
             carried_dir: None,
             alert_tx: async_channel::unbounded().0,
@@ -11604,48 +11599,6 @@ mod tests {
         .await
     }
 
-    /// A read that failed is not recorded by the unchanged-file guard, so a
-    /// plain retry runs and shows the failure again; a read that succeeded
-    /// is, so its unchanged re-read is refused.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn only_a_successful_read_arms_the_unchanged_file_guard() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, tool) = authority_terminal(dir.path()).await;
-        let denied = tool.working_dir().join("denied.txt");
-        std::fs::write(&denied, "secret").expect("fixture should be written");
-        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))
-            .expect("fixture should be locked");
-        let readable = tool.working_dir().join("readable.txt");
-        std::fs::write(&readable, "content").expect("fixture should be written");
-
-        let first = exit_code_of(&tool, "cat denied.txt").await;
-        if first == 0 {
-            // Running as a user the mode does not bind: nothing is denied.
-            return;
-        }
-        assert_eq!(
-            exit_code_of(&tool, "cat denied.txt").await,
-            first,
-            "a plain retry of a failed read runs and fails again"
-        );
-
-        assert_eq!(exit_code_of(&tool, "cat readable.txt").await, 0);
-        let refusal = tool
-            .call(
-                terminal_args("re-read", "cat readable.txt"),
-                ToolContext::new(),
-            )
-            .await
-            .expect_err("an unchanged re-read of a successful read is refused");
-        assert!(
-            refusal.to_string().contains("unchanged"),
-            "unexpected refusal: {refusal}"
-        );
-    }
-
     /// A script the sandboxed command writes into its working directory and
     /// chmods executes — writable space also carries EXEC.
     #[cfg(unix)]
@@ -14083,10 +14036,12 @@ mod tests {
         );
     }
 
-    /// A configured local terminal in `dir`, for the kill-guard tests.
+    /// A configured local terminal in `dir` whose registry `configure` set
+    /// up, for the command policy tests.
     #[cfg(unix)]
-    async fn kill_guard_tool(
+    async fn policy_tool(
         dir: &Path,
+        configure: impl FnOnce(&mut ToolRegistryBuilder),
     ) -> (
         crate::tool_runtime::tests::UnlockingTempDir,
         TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
@@ -14108,92 +14063,207 @@ mod tests {
                 container: false,
                 ssh: false,
             });
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let mut registry = ToolRegistryBuilder::new();
+        configure(&mut registry);
+        let registry = Arc::new(registry.build(tool.outputs_dir()));
         (cache, tool.with_registry(registry))
     }
 
-    /// Name- and pattern-based kills are refused before anything of the
-    /// command runs, in the foreground and the background alike.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn name_based_kills_are_refused_before_they_run() {
-        let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, tool) = kill_guard_tool(dir.path()).await;
-        let marker = dir.path().join("ran");
-        for killer in [
-            "pkill -f anything",
-            "killall anything",
-            "/usr/bin/pkill -f anything",
-            "/usr/bin/killall anything",
-            "sudo pkill anything",
-            "env FOO=1 nice timeout 5 /usr/bin/killall anything",
-            "echo anything | xargs pkill",
-            "sh -c 'killall anything'",
-            "echo $(pkill anything)",
-            "(pkill anything)",
-        ] {
-            let script = format!("touch {}; {killer}", marker.display());
-            let error = tool
-                .call(
-                    terminal_args("name-based kill", &script),
-                    ToolContext::new(),
-                )
-                .await
-                .expect_err("a name-based kill must be refused");
-            assert!(
-                error.to_string().contains("kill that PID"),
-                "`{killer}` refusal must tell the agent to kill by PID: {error}"
-            );
-            let error = tool
-                .run_background(terminal_args("name-based kill", &script))
-                .await
-                .expect_err("a background name-based kill must be refused");
-            assert!(
-                error.to_string().contains("kill that PID"),
-                "`{killer}` background refusal must tell the agent to kill by PID: {error}"
-            );
-            assert!(
-                !marker.exists(),
-                "`{killer}` must be refused before any part of the command runs"
-            );
+    /// Refuses every shell script that runs `program`, and reports how each
+    /// script it was asked about ended.
+    struct RefuseProgram {
+        program: &'static str,
+        ends: async_channel::Sender<crate::ScriptOutcome>,
+    }
+
+    impl RefuseProgram {
+        fn refusal(&self) -> String {
+            format!(
+                "`{}` does not run here; kill the PID you started.",
+                self.program
+            )
         }
     }
 
-    /// Words that only mention a killer, and kills by PID, still run.
+    impl crate::CommandPolicy for RefuseProgram {
+        type State = ();
+
+        fn check(
+            &self,
+            script: &crate::ScriptCheck<'_>,
+            _state: &(),
+        ) -> impl Future<Output = crate::PolicyDecision> + Send {
+            let runs = matches!(
+                script.shell,
+                Some(Ok(shell)) if shell.commands().iter().any(|command| command.program() == self.program)
+            );
+            std::future::ready(if runs {
+                crate::PolicyDecision::Refuse(PolicyRefusal::new(self.refusal()))
+            } else {
+                crate::PolicyDecision::Allow
+            })
+        }
+
+        async fn ended(&self, end: &crate::ScriptEnd<'_>, _state: &()) {
+            self.ends
+                .send(end.outcome)
+                .await
+                .expect("the test holds the receiver");
+        }
+    }
+
+    /// Refuses a script identical to the agent's last one that exited 0;
+    /// a script that failed is not remembered.
+    struct RefuseRepeat;
+
+    #[derive(Default)]
+    struct Repeats {
+        /// Task id → script, for the scripts allowed and not yet ended.
+        pending: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        last_success: std::sync::Mutex<Option<String>>,
+    }
+
+    impl crate::CommandPolicy for RefuseRepeat {
+        type State = Repeats;
+
+        fn check(
+            &self,
+            script: &crate::ScriptCheck<'_>,
+            state: &Repeats,
+        ) -> impl Future<Output = crate::PolicyDecision> + Send {
+            let decision = if state.last_success.lock().unwrap().as_deref() == Some(script.script) {
+                crate::PolicyDecision::Refuse(PolicyRefusal::unchanged_read(
+                    "It would print what it printed last time.",
+                ))
+            } else {
+                state
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .insert(script.task_id.to_string(), script.script.to_string());
+                crate::PolicyDecision::Allow
+            };
+            std::future::ready(decision)
+        }
+
+        fn ended(
+            &self,
+            end: &crate::ScriptEnd<'_>,
+            state: &Repeats,
+        ) -> impl Future<Output = ()> + Send {
+            let script = state.pending.lock().unwrap().remove(end.task_id);
+            if end.outcome == (crate::ScriptOutcome::Exited { code: 0 }) {
+                *state.last_success.lock().unwrap() = script;
+            }
+            std::future::ready(())
+        }
+    }
+
+    /// A policy's refusal is what the caller reads, before any part of the
+    /// script runs, in the foreground and the background alike; the policy
+    /// is told the script never ran.
     #[cfg(unix)]
     #[tokio::test]
-    async fn kill_by_pid_and_mentions_of_killers_still_run() {
+    async fn a_policy_refusal_reaches_the_caller_before_the_script_runs() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, tool) = kill_guard_tool(dir.path()).await;
+        let (ends, ended) = async_channel::unbounded();
+        let policy = RefuseProgram {
+            program: "pkill",
+            ends,
+        };
+        let text = policy.refusal();
+        let (_cache, tool) =
+            policy_tool(dir.path(), |registry| registry.command_policy(policy)).await;
+        let marker = dir.path().join("ran");
+        let script = format!("touch {}; sudo env pkill anything", marker.display());
 
-        let result = tool
+        let error = tool
             .call(
-                terminal_args("mention a killer", "echo pkill killall"),
+                terminal_args("name-based kill", &script),
                 ToolContext::new(),
             )
             .await
-            .expect("a mention of a killer must not be refused");
-        assert!(
-            render_terminal_result(&result).contains("pkill killall"),
-            "{}",
-            render_terminal_result(&result)
-        );
+            .expect_err("the policy refuses the script");
+        assert_eq!(error.to_string(), text);
+        let refusal = error
+            .downcast_ref::<PolicyRefusal>()
+            .expect("the refusal stays typed for the agent loop");
+        assert!(!refusal.is_unchanged_read());
+        let error = tool
+            .run_background(terminal_args("name-based kill", &script))
+            .await
+            .expect_err("the policy refuses the background script");
+        assert_eq!(error.to_string(), text);
+        assert!(!marker.exists(), "no part of a refused script runs");
+        assert_eq!(ended.try_recv(), Ok(crate::ScriptOutcome::NotRun));
+        assert_eq!(ended.try_recv(), Ok(crate::ScriptOutcome::NotRun));
 
         let result = tool
             .call(
+                terminal_args("mention a killer", "echo pkill; exit 3"),
+                ToolContext::new(),
+            )
+            .await
+            .expect("a script that only names the program runs");
+        assert!(render_terminal_result(&result).contains("pkill"));
+        assert_eq!(
+            ended.try_recv(),
+            Ok(crate::ScriptOutcome::Exited { code: 3 }),
+            "the policy learns how the script ended before its result returns"
+        );
+    }
+
+    /// With no policy the sandbox refuses nothing: `grep` and a foreground
+    /// `sleep` run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn with_no_policy_grep_and_a_foreground_sleep_run() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = policy_tool(dir.path(), |_| {}).await;
+        let result = tool
+            .call(
                 terminal_args(
-                    "kill by pid",
-                    "sleep 300 & pid=$!; kill $pid; wait $pid; echo \"status=$?\"",
+                    "grep and sleep",
+                    "printf 'needle\\n' | grep needle; sleep 1; echo slept",
                 ),
                 ToolContext::new(),
             )
             .await
-            .expect("kill by PID must not be refused");
-        assert!(
-            render_terminal_result(&result).contains("status=143"),
-            "kill <pid> must terminate the process it names: {}",
-            render_terminal_result(&result)
+            .expect("nothing is refused");
+        let rendered = render_terminal_result(&result);
+        assert!(rendered.contains("needle"), "{rendered}");
+        assert!(rendered.contains("slept"), "{rendered}");
+    }
+
+    /// A policy keeps state for its agent across calls, and learns of each
+    /// end before the call returns: a repeat of a script that succeeded is
+    /// refused, a failed one runs again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_policy_state_follows_each_script_to_its_end() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = policy_tool(dir.path(), |registry| {
+            registry.command_policy(RefuseRepeat);
+        })
+        .await;
+        assert_eq!(exit_code_of(&tool, "exit 3").await, 3);
+        assert_eq!(
+            exit_code_of(&tool, "exit 3").await,
+            3,
+            "a failed script is not remembered, so it runs again"
         );
+        assert_eq!(exit_code_of(&tool, "echo once").await, 0);
+        let error = tool
+            .call(terminal_args("again", "echo once"), ToolContext::new())
+            .await
+            .expect_err("a repeat of a successful script is refused");
+        assert!(
+            error
+                .downcast_ref::<PolicyRefusal>()
+                .is_some_and(PolicyRefusal::is_unchanged_read),
+            "{error}"
+        );
+        assert_eq!(exit_code_of(&tool, "echo twice").await, 0);
     }
 
     use crate::monitor::{MonitorArgs, MonitorEnd, MonitorSource, MonitorTool};

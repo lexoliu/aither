@@ -237,7 +237,7 @@ impl Tool for ReadTerminalDeltaTool {
                 // Kept typed, so the agent loop recognises the refused poll.
                 TerminalReadError::Refused(refusal) => {
                     anyhow::Error::from(crate::Refused::rendered(refusal, |refusal| {
-                        self.notices.poll_refusal(refusal)
+                        self.notices.unchanged_task_read(refusal)
                     }))
                 }
                 TerminalReadError::Failed(message) => anyhow::Error::msg(message),

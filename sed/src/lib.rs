@@ -45,6 +45,17 @@ enum Request {
     },
 }
 
+/// Whether `aither-sed` implements `args` (the program name excluded), the
+/// same check [`run`] makes before it reads anything: a host's `sed` given
+/// arguments this accepts prints the same lines.
+///
+/// # Errors
+/// Returns [`Unsupported`] for an option or script outside the implemented
+/// forms.
+pub fn supports(args: Vec<OsString>) -> Result<(), Unsupported> {
+    parse_arguments(args).map(drop)
+}
+
 /// Runs `aither-sed` with `args` (the program name excluded) and returns its
 /// exit status. Lines go to `stdout`, diagnostics to `stderr`.
 pub fn run(
