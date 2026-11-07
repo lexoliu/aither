@@ -488,7 +488,8 @@ async fn build_agent(
     args: &Args,
 ) -> Result<Agent<CloudProvider, CloudProvider, CloudProvider, aither_agent::HCons<DebugHook, ()>>>
 {
-    // Create terminal tool (creates random four-word working dir under system temp)
+    // Create terminal tool (heel names its working dir under system temp with
+    // four random words; the ids the model reads are leased words)
     // Uses interactive permission handler:
     // - Sandboxed: always allow (no prompt)
     // - Network: ask once, then remember

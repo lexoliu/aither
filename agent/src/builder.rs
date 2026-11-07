@@ -26,8 +26,9 @@ use crate::{
     agent::Agent,
     config::{AgentConfig, AgentKind},
     context::{
-        AnyContextSource, Context, ContextPolicy, ContextSource, ExternalContent, ExternalSlot,
-        HandoffDocument, HandoffSchema, InstructionSlot, SystemLayout,
+        AnyContextSource, AnyStableContextSource, Context, ContextPolicy, ContextSource,
+        ExternalContent, ExternalSlot, HandoffDocument, HandoffSchema, InstructionSlot,
+        StableContextSource, SystemLayout,
     },
     hook::{HCons, Hook},
     model_group::ModelTier,
@@ -103,6 +104,7 @@ pub struct AgentSettings {
     pub(crate) prompt_cache: crate::context::PromptCache,
     pub(crate) clock: crate::AnyClock,
     pub(crate) context_sources: Vec<AnyContextSource>,
+    pub(crate) stable_sources: Vec<AnyStableContextSource>,
     /// The agent's working document and what the host gives it.
     pub(crate) document: crate::working_document::DocumentWiring,
     /// The embedder's stop rule; without one a run ends whenever the model
@@ -137,6 +139,7 @@ impl Default for AgentSettings {
             prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
             clock: crate::AnyClock::default(),
             context_sources: Vec::new(),
+            stable_sources: Vec::new(),
             document: crate::working_document::DocumentWiring::default(),
             stop_hook: None,
             fork_source: None,
@@ -362,6 +365,31 @@ pub trait AgentOptions: sealed::Sealed + Sized {
         self.settings()
             .context_sources
             .push(AnyContextSource::new(source));
+        self
+    }
+
+    /// Registers a source rendered into the cacheable prefix, after the
+    /// system prompt and before the handoff, for content too large to resend
+    /// uncached in every request's tail.
+    ///
+    /// Blocks render in registration order. A change after a request carried
+    /// the block reaches the model as the alert the source writes for it,
+    /// and the new block replaces the old one at the next reassembly or
+    /// compaction (see [`StableContextSource`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a stable source with the same
+    /// [`TAG`](StableContextSource::TAG) is already registered.
+    #[must_use]
+    fn stable_context_source<S: StableContextSource>(mut self, source: S) -> Self {
+        let sources = &mut self.settings().stable_sources;
+        assert!(
+            sources.iter().all(|registered| registered.tag() != S::TAG),
+            "stable context source `{}` is registered twice",
+            S::TAG
+        );
+        sources.push(AnyStableContextSource::new(source));
         self
     }
 
@@ -1002,8 +1030,9 @@ where
     /// Registers the terminal tool for command execution in a sandbox.
     ///
     /// The terminal tool enables command execution with configurable permission modes
-    /// (sandboxed, network, unsafe). It creates its own working directory with
-    /// four random words and manages output storage internally.
+    /// (sandboxed, network, unsafe). It creates its own working directory,
+    /// which heel names with four random words (not a leased id), and manages
+    /// output storage internally.
     ///
     /// This also captures the background task receiver for polling completed
     /// background tasks during the agent loop.
@@ -1148,6 +1177,7 @@ where
             prompt_cache,
             clock,
             context_sources,
+            stable_sources,
             document,
             stop_hook,
             fork_source,
@@ -1197,6 +1227,7 @@ where
             budget,
             prompt_cache,
             context_sources,
+            stable_sources,
             reassembled: false,
             prefix_rewrites: crate::context::PrefixRewrites::default(),
             requests_sent: 0,
@@ -1470,7 +1501,7 @@ mod tests {
             .await
             .unwrap();
         let registry =
-            std::sync::Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+            std::sync::Arc::new(ToolRegistryBuilder::new().build(terminal.output_store().clone()));
         let terminal = terminal.with_registry(registry);
         let subagent = terminal
             .binding()

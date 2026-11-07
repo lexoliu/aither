@@ -87,6 +87,23 @@ impl BlockKind for External {
     }
 }
 
+/// Blocks stable context sources render: placed after the system prompt and
+/// before the handoff, in the cacheable prefix (see
+/// [`StableContextSource`](crate::StableContextSource)).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Sourced;
+
+impl sealed::Sealed for Sourced {}
+
+impl BlockKind for Sourced {
+    type Content = String;
+    const REGION: &'static str = "stable source";
+
+    fn text(content: &Self::Content) -> &str {
+        content
+    }
+}
+
 /// The identity of a system block within its region.
 ///
 /// The slot's type names its region, so a block can only be inserted where
@@ -104,6 +121,10 @@ pub type InstructionSlot = Slot<Instruction>;
 
 /// The slot of an external-content block.
 pub type ExternalSlot = Slot<External>;
+
+/// The slot of a stable context source's block, named by its
+/// [`TAG`](crate::StableContextSource::TAG).
+pub type SourcedSlot = Slot<Sourced>;
 
 impl<K> Slot<K> {
     /// A slot named `name`. The name is also the tag a tagged block renders
@@ -265,6 +286,7 @@ pub struct SystemRegion<K: BlockKind> {
 
 /// One live block's change, as the model is told it: the text it knew and
 /// the text it is to know.
+#[derive(Debug)]
 pub(crate) struct TextChange {
     pub(crate) before: String,
     pub(crate) after: String,
@@ -288,6 +310,13 @@ impl<K: BlockKind> SystemRegion<K> {
         self.order = order;
         for slot in self.blocks.keys().chain(self.staged.keys()) {
             self.assert_placed(slot);
+        }
+    }
+
+    /// Appends `slot` to the region's order unless it is already placed.
+    pub(crate) fn place(&mut self, slot: Slot<K>) {
+        if !self.order.contains(&slot) {
+            self.order.push(slot);
         }
     }
 

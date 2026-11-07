@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?
     .initialize_tools(&distribution, &PathBuf::from(cache))
     .await?;
-    let registry = ToolRegistryBuilder::new().build(terminal.outputs_dir());
+    let registry = ToolRegistryBuilder::new().build(terminal.output_store().clone());
     let terminal = terminal.with_registry(std::sync::Arc::new(registry));
     let arguments: TerminalArgs = serde_json::from_value(serde_json::json!({
         "description": "Verify prepared search, JSON and edit commands",

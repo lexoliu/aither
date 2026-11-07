@@ -166,6 +166,7 @@ extern crate alloc;
 pub mod audio;
 /// Text embeddings.
 pub mod embedding;
+pub mod ids;
 /// Text-to-image generation.
 ///
 /// Contains [`ImageGenerator`] trait for creating images from text.
@@ -185,6 +186,8 @@ use alloc::string::String;
 pub use audio::{AudioGenerator, AudioTranscriber};
 #[doc(inline)]
 pub use embedding::EmbeddingModel;
+#[doc(inline)]
+pub use ids::{AnyIdAllocator, IdAllocator, IdLease, IdsExhausted, WeakIdLease, WordAllocator};
 #[doc(inline)]
 pub use image::ImageGenerator;
 #[doc(inline)]

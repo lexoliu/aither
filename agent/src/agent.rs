@@ -18,9 +18,9 @@ use crate::{
     compaction_state::CompactionState,
     config::{AgentConfig, AgentKind, BackgroundJobPolicy},
     context::{
-        AnyContextSource, BackgroundJobs, Block, CacheLifetime, CompactionFork,
-        CompletedCompaction, Context, ContextBudget, HandoffDocument, InstructionSlot,
-        PendingCompaction, PrefixChain, PrefixRewrites, PromptCache, PromptPrefix,
+        AnyContextSource, AnyStableContextSource, BackgroundJobs, Block, CacheLifetime,
+        CompactionFork, CompletedCompaction, Context, ContextBudget, HandoffDocument,
+        InstructionSlot, PendingCompaction, PrefixChain, PrefixRewrites, PromptCache, PromptPrefix,
         recovery::{SpillLimits, clean_for_recovery},
         restore_context,
     },
@@ -151,6 +151,8 @@ pub struct BackgroundWake {
     /// [`Delivery::Pending`](aither_sandbox::Delivery) in its registry until
     /// this is dropped, so a host that drops the wake only once the turn it
     /// starts is visible never reads a finished job with nothing owed.
+    /// Dropped, the registry forgets the jobs and their ids go back to the
+    /// allocator.
     pub pending: Vec<aither_sandbox::PendingCompletion>,
 }
 
@@ -888,6 +890,10 @@ pub struct Agent<
     /// Sources rendered into the volatile tail of every request.
     pub(crate) context_sources: Vec<AnyContextSource>,
 
+    /// Sources rendered into the cacheable prefix, after the system prompt,
+    /// in this order.
+    pub(crate) stable_sources: Vec<AnyStableContextSource>,
+
     /// Whether the window was rewritten since the sources last heard a
     /// request begin, which wipes every durable alert they pushed before.
     pub(crate) reassembled: bool,
@@ -1062,6 +1068,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             budget: ContextBudget::default(),
             prompt_cache,
             context_sources: Vec::new(),
+            stable_sources: Vec::new(),
             reassembled: false,
             prefix_rewrites: PrefixRewrites::default(),
             requests_sent: 0,
@@ -2266,7 +2273,9 @@ where
         // included; only a job the model knows as a background task is
         // announced, since a foreground result already returned through the
         // tool call.
-        if !self.detached_task_ids.contains(&task.task_id) {
+        // Its id goes back to the allocator with the completion, so a later
+        // job leasing the word again is not taken for this one.
+        if !self.detached_task_ids.remove(&task.task_id) {
             return false;
         }
         let result_msg = self.notices.background_finished(&task);
@@ -3177,6 +3186,31 @@ where
         }
     }
 
+    /// Brings every stable source's block to what it renders now.
+    ///
+    /// The blocks are prefix content: a change the model has not heard of is
+    /// announced once, by the alert the source writes for it, and the next
+    /// reassembly folds the new block into the prefix. Rendering is
+    /// concurrent because the sources are independent.
+    async fn sync_stable_sources(&mut self) {
+        let rendered = futures::future::join_all(
+            self.stable_sources
+                .iter()
+                .map(AnyStableContextSource::render),
+        )
+        .await;
+        for (source, desired) in self.stable_sources.iter().zip(rendered) {
+            // An empty block costs a message and says nothing.
+            let desired = desired.filter(|content| !content.is_empty());
+            if let Some(alert) = self
+                .context
+                .update_stable(&source.slot(), desired, |change| source.announce(change))
+            {
+                self.budget.append(alert);
+            }
+        }
+    }
+
     /// Collects the durable alerts sources raise as a request begins.
     ///
     /// Tells the sources whether the window was reassembled since the last
@@ -3185,6 +3219,7 @@ where
         self.push_injected_context();
         self.push_host_load_alerts();
         self.sync_command_table();
+        self.sync_stable_sources().await;
         let reassembled = std::mem::take(&mut self.reassembled);
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_request(reassembled).await {
@@ -5490,7 +5525,7 @@ mod tests {
         let mut builder = ToolRegistryBuilder::new();
         builder.kept_through_compaction(|kept| kept.configure_tool(Command("ask_user")));
         builder.configure_tool(Command("ls"));
-        let registry = builder.build(dir.path());
+        let registry = builder.build(crate::test_support::output_store(dir.path()).await);
         let in_call = |id: &str| {
             registry.for_call(CallIdentity::new(ToolCallId::new(id), AgentIdentity::Main))
         };
@@ -6631,6 +6666,121 @@ mod tests {
         assert!(!second.first_request);
         assert_eq!(second.chain.first_divergence(&first.chain), None);
         assert_eq!(second.rewrites, PrefixRewrites::default());
+    }
+
+    /// A stable source of linked issues whose content a test changes.
+    #[derive(Clone)]
+    struct LinkedIssues(Arc<std::sync::Mutex<String>>);
+
+    impl crate::StableContextSource for LinkedIssues {
+        const TAG: &'static str = "linked_issues";
+
+        fn render(&self) -> impl Future<Output = Option<String>> + Send {
+            std::future::ready(Some(self.0.lock().expect("issues lock").clone()))
+        }
+
+        fn announce(&self, change: &crate::StableChange<'_>) -> Block {
+            Block::new("linked_issues_changed", change.diff())
+        }
+    }
+
+    /// The next request and the prompt prefix the agent reports for it.
+    async fn next_request(agent: &mut Agent<ScriptedLlm>) -> (LLMRequest, PromptPrefix) {
+        let (sender, events) = async_channel::unbounded();
+        let request = agent
+            .prepare_request(&EventSink { sender })
+            .await
+            .expect("request boundary")
+            .expect("a request goes out");
+        let prefix = std::iter::from_fn(|| events.try_recv().ok())
+            .find_map(|timed| match timed.event {
+                AgentEvent::PromptPrefix(prefix) => Some(prefix),
+                _ => None,
+            })
+            .expect("every request reports its prompt prefix");
+        (request, prefix)
+    }
+
+    /// Where the request carries the issues block, which must sit among the
+    /// leading system messages, ahead of the conversation.
+    fn issues_block(request: &LLMRequest, content: &str) -> usize {
+        let messages = request.messages();
+        let index = messages
+            .iter()
+            .position(|message| message.content() == content)
+            .expect("the request carries the issues block");
+        assert!(
+            messages[..=index]
+                .iter()
+                .all(|message| message.role() == Role::System),
+            "the block is prefix content"
+        );
+        index
+    }
+
+    /// The issues alerts a request carries.
+    fn issues_alerts(request: &LLMRequest) -> usize {
+        request
+            .messages()
+            .iter()
+            .filter(|message| message.content().contains("+issue #23: closed"))
+            .count()
+    }
+
+    /// The prefix-stability invariant with a stable source: unchanged, its
+    /// block keeps every request's prefix; changed, the prefix still holds
+    /// and the change is one alert; the compaction folds the new block in.
+    #[tokio::test]
+    async fn a_stable_source_keeps_the_prompt_prefix_until_compaction() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let issues = Arc::new(std::sync::Mutex::new("issue #23: open\n".to_string()));
+        let mut agent = Agent::builder(llm)
+            .stable_context_source(LinkedIssues(issues.clone()))
+            .build();
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        let (first, first_prefix) = next_request(&mut agent).await;
+        let index = issues_block(&first, "issue #23: open\n");
+
+        agent.push_message(Message::assistant("hi"));
+        agent.push_message(Message::user("and again"));
+        let (second, second_prefix) = next_request(&mut agent).await;
+        assert_eq!(
+            second_prefix.chain.first_divergence(&first_prefix.chain),
+            None
+        );
+        assert_eq!(issues_block(&second, "issue #23: open\n"), index);
+
+        *issues.lock().expect("issues lock") = "issue #23: closed\n".to_string();
+        agent.push_message(Message::assistant("noted"));
+        agent.push_message(Message::user("is it done?"));
+        let (third, third_prefix) = next_request(&mut agent).await;
+        assert_eq!(
+            third_prefix.chain.first_divergence(&second_prefix.chain),
+            None
+        );
+        assert_eq!(third_prefix.rewrites, PrefixRewrites::default());
+        assert_eq!(issues_block(&third, "issue #23: open\n"), index);
+        assert_eq!(issues_alerts(&third), 1);
+
+        agent.push_message(Message::assistant("it is"));
+        agent.push_message(Message::user("thanks"));
+        let (fourth, fourth_prefix) = next_request(&mut agent).await;
+        assert_eq!(
+            fourth_prefix.chain.first_divergence(&third_prefix.chain),
+            None
+        );
+        assert_eq!(issues_alerts(&fourth), 1, "the change is announced once");
+
+        agent
+            .compact(None)
+            .await
+            .expect("compaction runs")
+            .expect("there is something to compact");
+        let (compacted, compacted_prefix) = next_request(&mut agent).await;
+        assert!(compacted_prefix.rewrites.compacted);
+        assert_eq!(issues_block(&compacted, "issue #23: closed\n"), index);
+        assert_eq!(issues_alerts(&compacted), 0, "the alert went with the fold");
     }
 
     /// A compaction is reported once, with the next request, and that
@@ -8416,7 +8566,7 @@ mod tests {
             "the build failed".to_string(),
         ]);
         drain_run(agent.run("build it", std::iter::empty())).await;
-        agent.detached_task_ids.insert("task-build".to_string());
+        agent.detached_task_ids.insert("build".to_string());
 
         let waiting = tokio::spawn(async move {
             let wake = agent.wait_background().await;
@@ -8424,7 +8574,7 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         sender
-            .send_completed(finished("task-build", "linker error"))
+            .send_completed(finished("build", "linker error"))
             .await;
         let (mut agent, wake) = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
@@ -8444,7 +8594,7 @@ mod tests {
         );
         assert_eq!(
             agent.work_events.take(),
-            vec![crate::WorkEvent::JobFinished("task-build".to_string())],
+            vec![crate::WorkEvent::JobFinished("build".to_string())],
             "the finished job reaches the working document's inbox"
         );
 
@@ -8496,12 +8646,12 @@ mod tests {
     #[tokio::test]
     async fn a_wake_keeps_its_completions_pending_until_the_host_drops_it() {
         let (mut agent, sender, _llm) = detached_agent(Vec::new());
-        agent.detached_task_ids.insert("task-build".to_string());
+        agent.detached_task_ids.insert("build".to_string());
         let (jobs, service) = aither_sandbox::job_registry_channel();
         tokio::spawn(service.serve());
         jobs.register(
             41,
-            "task-build",
+            &aither_sandbox::test_ids::lease("build"),
             "exec",
             "make",
             aither_sandbox::TerminalMode::Sandboxed,
@@ -8509,10 +8659,10 @@ mod tests {
         )
         .await;
         let owed = jobs
-            .owe_completion("task-build", Err("linker error".to_string()))
+            .owe_completion("build", Err("linker error".to_string()))
             .await
             .expect("the job is registered");
-        let mut task = finished("task-build", "linker error");
+        let mut task = finished("build", "linker error");
         task.pending = Some(owed.pending);
         sender.send_completed(task).await;
 
@@ -8524,9 +8674,13 @@ mod tests {
         let status = jobs.get(41).await.expect("job should exist").status;
         assert!(status.completion_pending(), "{status:?}");
 
+        // Taken, the job leaves the registry and its id is unknown.
         drop(wake);
-        let status = jobs.get(41).await.expect("job should exist").status;
-        assert_eq!(status.delivery(), Some(aither_sandbox::Delivery::Taken));
+        assert!(jobs.get(41).await.is_none());
+        assert!(
+            !agent.detached_task_ids.contains("build"),
+            "the announced id may name a later job"
+        );
     }
 
     /// The idle wait gives the event up when it is dropped before anything

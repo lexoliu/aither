@@ -1,17 +1,19 @@
 //! Recognizing the output URLs the sandbox hands back.
 //!
 //! When a terminal command produces more output than belongs in the window,
-//! the sandbox writes it to `outputs/` under a four-word name and reports the
-//! path instead of the content, relative (`outputs/<name>`) in some notices
-//! and absolute inside the session's outputs directory in others. Those paths
-//! are the only way the model can get back to the full output, so compaction
-//! has to find them in a conversation that is about to be thrown away and
-//! carry them into the handoff's file index.
+//! the sandbox writes it to `outputs/` under a name leased from its id
+//! allocator and reports the path instead of the content, relative
+//! (`outputs/<name>`) in some notices and absolute inside the session's
+//! outputs directory in others. Those paths are the only way the model can get
+//! back to the full output, so compaction has to find them in a conversation
+//! that is about to be thrown away and carry them into the handoff's file
+//! index.
 //!
-//! Recognition is by shape rather than by bookkeeping: four lowercase
-//! hyphenated words and an alphanumeric extension. Anything else that happens
-//! to start with `outputs/` — a directory the model mentioned, a path it
-//! invented — is not a real artifact and is not worth a line in the handoff.
+//! Recognition is by shape rather than by bookkeeping: one lowercase word, the
+//! shape every leased id has, and an alphanumeric extension. Anything else
+//! that happens to start with `outputs/` — a directory the model mentioned, a
+//! path it invented — is not a real artifact and is not worth a line in the
+//! handoff.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -31,12 +33,12 @@ const fn is_path_punctuation(c: char) -> bool {
 /// use std::path::Path;
 /// use aither_agent::extract_referenced_urls;
 ///
-/// let text = "Output saved to outputs/amber-oak-swift-river.txt (5000 bytes)";
+/// let text = "Output saved to outputs/river.txt (5000 bytes)";
 /// let urls = extract_referenced_urls(text, None);
-/// assert!(urls.contains("outputs/amber-oak-swift-river.txt"));
+/// assert!(urls.contains("outputs/river.txt"));
 ///
 /// let dir = Path::new("/work/outputs");
-/// let saved = dir.join("bold-creek-calm-dawn.txt").display().to_string();
+/// let saved = dir.join("creek.txt").display().to_string();
 /// let text = format!("saved to {saved}.");
 /// let urls = extract_referenced_urls(&text, Some(dir));
 /// assert!(urls.contains(&saved));
@@ -70,20 +72,17 @@ pub fn extract_referenced_urls(text: &str, outputs_dir: Option<&Path>) -> HashSe
     urls
 }
 
-/// Whether `filename` matches the sandbox's `word-word-word-word.ext` shape.
+/// Whether `filename` matches the sandbox's `word.ext` shape: one lowercase
+/// word, as every leased id is, and an alphanumeric extension.
 #[must_use]
 pub fn is_valid_output_filename(filename: &str) -> bool {
     let Some((name, extension)) = filename.rsplit_once('.') else {
         return false;
     };
-    if extension.is_empty() || !extension.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return false;
-    }
-    let parts: Vec<&str> = name.split('-').collect();
-    parts.len() == 4
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_lowercase()))
+    !extension.is_empty()
+        && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        && !name.is_empty()
+        && name.bytes().all(|byte| byte.is_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -92,23 +91,24 @@ mod tests {
 
     #[test]
     fn extracts_every_referenced_output() {
-        let text = "The agent read config from outputs/amber-oak-swift-river.txt and saved data to outputs/bold-creek-calm-dawn.json.";
+        let text =
+            "The agent read config from outputs/river.txt and saved data to outputs/creek.json.";
         let urls = extract_referenced_urls(text, None);
         assert_eq!(urls.len(), 2);
-        assert!(urls.contains("outputs/amber-oak-swift-river.txt"));
-        assert!(urls.contains("outputs/bold-creek-calm-dawn.json"));
+        assert!(urls.contains("outputs/river.txt"));
+        assert!(urls.contains("outputs/creek.json"));
     }
 
     #[test]
     fn surrounding_punctuation_is_stripped() {
-        let text = r#"See "outputs/jade-mist-clear-pool.txt" for details."#;
-        assert!(extract_referenced_urls(text, None).contains("outputs/jade-mist-clear-pool.txt"));
+        let text = r#"See "outputs/pool.txt" for details."#;
+        assert!(extract_referenced_urls(text, None).contains("outputs/pool.txt"));
     }
 
     #[test]
     fn the_saved_output_notice_the_sandbox_renders_is_found() {
         let dir = Path::new("/home/me/My Sessions/s1/outputs");
-        let path = dir.join("amber-oak-swift-river.txt");
+        let path = dir.join("river.txt");
         let notice =
             aither_sandbox::output_saved_text("preview line", &path.to_string_lossy(), 900, 48_000);
         let urls = extract_referenced_urls(&notice, Some(dir));
@@ -121,24 +121,23 @@ mod tests {
 
     #[test]
     fn absolute_paths_outside_the_outputs_directory_are_ignored() {
-        let text =
-            "saved to /elsewhere/outputs/amber-oak-swift-river.txt and /work/outputs/not-valid.txt";
+        let text = "saved to /elsewhere/outputs/river.txt and /work/outputs/not-valid.txt";
         assert!(extract_referenced_urls(text, Some(Path::new("/work/outputs"))).is_empty());
     }
 
     #[test]
     fn paths_that_are_not_artifacts_are_ignored() {
-        let text = "Not valid: outputs/single.txt outputs/two-words.txt outputs/ outputs/one-two-three.txt";
+        let text = "Not valid: outputs/two-words.txt outputs/ outputs/Notes.txt outputs/draft2.txt outputs/river";
         assert!(extract_referenced_urls(text, None).is_empty());
     }
 
     #[test]
     fn the_filename_shape_is_enforced() {
-        assert!(is_valid_output_filename("amber-oak-swift-river.txt"));
-        assert!(is_valid_output_filename("bold-creek-calm-dawn.json"));
-        assert!(!is_valid_output_filename("single.txt"));
+        assert!(is_valid_output_filename("river.txt"));
+        assert!(is_valid_output_filename("creek.json"));
         assert!(!is_valid_output_filename("two-words.txt"));
-        assert!(!is_valid_output_filename("no-extension"));
-        assert!(!is_valid_output_filename("Upper-Case-Words.txt"));
+        assert!(!is_valid_output_filename("no_extension"));
+        assert!(!is_valid_output_filename("Upper.txt"));
+        assert!(!is_valid_output_filename(".txt"));
     }
 }

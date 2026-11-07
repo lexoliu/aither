@@ -57,10 +57,8 @@ async fn terminal(
     .await;
     let mut builder = ToolRegistryBuilder::new();
     builder.configure_tool(probe);
-    (
-        cache,
-        tool.with_registry(Arc::new(builder.build(dir.join("outputs")))),
-    )
+    let registry = Arc::new(builder.build(tool.output_store().clone()));
+    (cache, tool.with_registry(registry))
 }
 
 /// The positions of `needles` in `text`, which must hold each of them.

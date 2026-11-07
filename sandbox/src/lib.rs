@@ -12,10 +12,12 @@
 //! use aither_sandbox::{TerminalTool, ToolRegistryBuilder, permission::NoopPermissionHandler};
 //! use std::sync::Arc;
 //!
-//! // Creates a random four-word working directory (e.g., amber-forest-thunder-pearl/)
-//! // with outputs/ subdirectory and IPC command wrapper scripts
+//! // Creates a working directory heel names with four random words (e.g.,
+//! // amber-forest-thunder-pearl/), not a leased id, with an outputs/
+//! // subdirectory and IPC command wrapper scripts; the ids the model reads are
+//! // leased from `with_id_allocator`'s allocator
 //! let tool = TerminalTool::new_in(std::env::temp_dir(), NoopPermissionHandler, executor).await?;
-//! let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+//! let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
 //! let tool = tool.with_registry(registry);
 //!
 //! // Access the working directory path
@@ -63,7 +65,6 @@ mod grants;
 mod heel_binary;
 mod memory;
 pub mod monitor;
-mod naming;
 mod notices;
 mod outage;
 mod output;
@@ -102,6 +103,11 @@ pub mod permission;
 /// Isolated git for tests, shared with dependent crates through the `test-git` feature.
 #[cfg(any(test, feature = "test-git"))]
 pub mod test_git;
+
+/// Id allocators for tests, shared with dependent crates through the
+/// `test-ids` feature.
+#[cfg(any(test, feature = "test-ids"))]
+pub mod test_ids;
 
 pub use bollard_exec::BollardContainerExec;
 pub use command::{

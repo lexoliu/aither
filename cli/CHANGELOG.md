@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/May-Agent/aither/compare/cli-v0.22.0...cli-v0.23.0) - 2026-11-07
+
+### Added
+
+- *(agent)* [**breaking**] replace the tasks.md protocol with a general working-document mechanism
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into feat/596-tasks-protocol
+- Merge pull request #607 from May-Agent/feat/606-patch-api
+
 ## [0.22.0](https://github.com/May-Agent/aither/compare/cli-v0.21.0...cli-v0.22.0) - 2026-11-07
 
 ### Added

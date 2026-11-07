@@ -443,7 +443,7 @@ mod tests {
             ),
             (
                 "subagent",
-                r#"{"name":"resume","id":3,"prompt_file":"tmp/follow-up.md"}"#,
+                r#"{"name":"resume","id":"river","prompt_file":"tmp/follow-up.md"}"#,
                 "Continuing subagent",
                 ToolKind::Other,
             ),

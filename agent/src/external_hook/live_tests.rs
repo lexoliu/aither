@@ -706,7 +706,7 @@ async fn through_the_bridge(hooks: &LiveHooks, argv: &[&str]) -> aither_sandbox:
     let mut builder = aither_sandbox::ToolRegistryBuilder::new();
     builder.configure_tool(HookTestTool::new(hooks.clone()));
     let outputs = tempfile::tempdir().unwrap();
-    let registry = builder.build(outputs.path());
+    let registry = builder.build(crate::test_support::output_store(outputs.path()).await);
     let argv: Vec<String> = argv.iter().map(ToString::to_string).collect();
     bounded(registry.query_tool_handler("hook_test", &argv)).await
 }

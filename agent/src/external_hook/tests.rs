@@ -356,7 +356,8 @@ async fn an_ipc_call_event_carries_the_resolved_name_arguments_and_result() {
     let mut builder = ToolRegistryBuilder::new();
     builder.configure_tool(EchoTool);
     builder.observe_commands(hooks.command_observer());
-    let registry = builder.build(dir.path().join("outputs"));
+    let registry =
+        builder.build(crate::test_support::output_store(dir.path().join("outputs")).await);
 
     let args = ["--text".to_string(), "hi there".to_string()];
     let envelope = bounded(registry.query_tool_handler("echo", &args)).await;
@@ -421,7 +422,8 @@ async fn an_ipc_call_answers_before_a_slow_hook_finishes_and_its_context_arrives
     let mut builder = ToolRegistryBuilder::new();
     builder.configure_tool(EchoTool);
     builder.observe_commands(hooks.command_observer());
-    let registry = builder.build(dir.path().join("outputs"));
+    let registry =
+        builder.build(crate::test_support::output_store(dir.path().join("outputs")).await);
 
     let started = Instant::now();
     let args = ["--text".to_string(), "hi".to_string()];

@@ -143,7 +143,7 @@ async fn terminal(
     );
     let mut builder = ToolRegistryBuilder::new();
     builder.gate_commands(hooks.command_gate());
-    let registry = Arc::new(builder.build(terminal.outputs_dir()));
+    let registry = Arc::new(builder.build(terminal.output_store().clone()));
     (terminal.with_registry(registry), hooks)
 }
 
