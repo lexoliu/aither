@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/May-Agent/aither/compare/patch-v0.22.0...patch-v0.23.0) - 2026-11-07
+
+### Added
+
+- *(patch)* export the parsed patch and a read-only hunk locate
+
+### Fixed
+
+- *(patch)* size the release's tool entries from its assets when composing the verify manifest
+- *(sandbox)* [**breaking**] pin each tool artifact's byte size instead of capping at 64 MiB
+
+### Other
+
+- merge main into dev after v0.22.0
+- *(patch)* drop the test-only apply_hunks
+
 ## [0.22.0](https://github.com/May-Agent/aither/compare/patch-v0.21.0...patch-v0.22.0) - 2026-11-07
 
 ### Other

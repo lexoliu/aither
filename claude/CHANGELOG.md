@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/May-Agent/aither/compare/claude-v0.22.0...claude-v0.23.0) - 2026-11-07
+
+### Fixed
+
+- *(claude)* index the sent message list and keep the live tail out of system
+
+### Other
+
+- merge main into dev after v0.22.0
+
 ## [0.22.0](https://github.com/May-Agent/aither/compare/claude-v0.21.0...claude-v0.22.0) - 2026-11-07
 
 ### Added
