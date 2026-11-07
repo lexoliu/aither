@@ -793,7 +793,7 @@ impl PermissionPauseTracker {
 ///
 /// Each agent uses one tier for its main reasoning loop (set via `tier()`):
 /// - Main agent: typically `ModelTier::Advanced`
-/// - Explore subagent: `ModelTier::Balanced` (cheaper but capable)
+/// - A subagent whose definition states it: `ModelTier::Balanced` (cheaper but capable)
 /// - Quick tasks: `ModelTier::Fast`
 ///
 /// Compaction runs on the session's own tier, so it reads the conversation's
@@ -813,8 +813,8 @@ impl PermissionPauseTracker {
 ///     .fast_model(haiku, haiku_parameters)
 ///     .build();
 ///
-/// // Subagent using balanced tier
-/// let explore_agent = Agent::builder(opus)
+/// // Agent using the balanced tier
+/// let balanced_agent = Agent::builder(opus)
 ///     .balanced_model(sonnet, sonnet_parameters)
 ///     .fast_model(haiku, haiku_parameters)
 ///     .tier(ModelTier::Balanced)  // Use sonnet for reasoning

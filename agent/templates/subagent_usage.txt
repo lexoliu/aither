@@ -1,4 +1,4 @@
-Name the subagent to run: `subagent <name> --prompt-file <path>`. These names resolve, global subagents first, then those in `agents/` under the working directory:
+Name the subagent to run: `subagent <name> --prompt-file <path>`. These names resolve, those the host provides first, then those in `agents/` under the working directory:
 {% for listed in subagents %}- {{ listed.name }}: {% match listed.description %}{% when Ok(description) %}{{ description }}{% when Err(error) %}{{ error }}{% endmatch %}
 {% endfor %}- fork: {{ fork }}
 Continue a finished subagent with `subagent resume --id <id> --prompt-file <path>`.{% if !externals.is_empty() %}

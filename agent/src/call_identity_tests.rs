@@ -145,14 +145,12 @@ async fn a_subagent_dispatches_its_calls_as_that_subagent_started_by_the_calling
     let recorder = IdentityRecorder::default();
     let child_recorder = recorder.clone();
     let dir = tempfile::tempdir().expect("temp dir");
-    let global = dir.path().join("global");
-    std::fs::create_dir_all(&global).expect("create global subagents dir");
-    std::fs::write(
-        global.join("worker.toml"),
+    let worker = crate::SubagentDefinition::parse(
         "name = \"worker\"\ndescription = \"worker for identity tests\"\ntier = \"fast\"\naccess = \"read_only\"\nprompt = '''\nProbe.\n'''\n",
     )
-    .expect("write definition");
-    let tool = SubagentTool::new(llm, global)
+    .expect("parse definition");
+    let tool = SubagentTool::new(llm)
+        .with_definitions([worker])
         .with_base_dir(dir.path())
         .with_agent_setup("worker", move |builder| {
             builder.tool(child_recorder.clone())
