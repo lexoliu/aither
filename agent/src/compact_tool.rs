@@ -176,9 +176,16 @@ impl Tool for CompactTool {
         _args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        Ok(ToolResult::text(
-            self.notices.compact(&self.signal.request()),
-        ))
+        let request = self.signal.request();
+        let text = self.notices.compact(&request);
+        // A refusal is a typed tool error, so an embedder tells it from a
+        // start without reading the wording; the model reads the same text.
+        Ok(match request {
+            CompactRequest::Started => ToolResult::text(text),
+            CompactRequest::InFlight
+            | CompactRequest::Settled
+            | CompactRequest::BelowFloor { .. } => ToolResult::error(text),
+        })
     }
 }
 
