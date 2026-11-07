@@ -1709,6 +1709,10 @@ pub mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::manual_assert_eq,
+        reason = "assert_eq! would print 64 MiB of bytes on failure"
+    )]
     fn an_executable_over_64_mib_extracts_from_a_hash_verified_archive() {
         let executable = vec![7_u8; 64 * 1024 * 1024 + 1];
         let encoded = tar_xz("repo-search-x/search", &executable);

@@ -34,7 +34,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aither_core::llm::tool::ToolResultPart;
+use aither_core::IdLease;
+use aither_core::llm::tool::{Progress, ProgressSink, ToolResultPart};
 use aither_core::llm::{CallIdentity, IntoToolResult, Tool, ToolCallId, ToolContext, ToolResult};
 
 use crate::command_set::{AnyCommandSet, CommandSet};
@@ -275,9 +276,55 @@ impl CommandEnvelope {
     }
 }
 
+/// The progress line a command's report becomes in its terminal job's output.
+#[derive(Template)]
+#[template(path = "command_progress.txt", escape = "none")]
+struct CommandProgressTemplate<'a> {
+    done: f64,
+    total: Option<f64>,
+    message: Option<&'a str>,
+}
+
+/// The output stream of the terminal job a registry serves, where the
+/// progress its commands report is written as it happens.
+///
+/// It holds the job's lease, so the job's word names no other job while a
+/// command can still report to it.
+#[derive(Debug, Clone)]
+pub struct JobOutput {
+    jobs: crate::job_registry::JobRegistry,
+    task_id: IdLease,
+}
+
+impl JobOutput {
+    pub const fn new(jobs: crate::job_registry::JobRegistry, task_id: IdLease) -> Self {
+        Self { jobs, task_id }
+    }
+}
+
+impl ProgressSink for JobOutput {
+    async fn report(&mut self, progress: Progress) {
+        let line = CommandProgressTemplate {
+            done: progress.progress(),
+            total: progress.total(),
+            message: progress.message(),
+        }
+        .render()
+        .expect("command progress template must render");
+        // A job still registering holds the line until it has, so no report
+        // is lost to the gap between its process starting and its registration.
+        self.jobs
+            .append_task_stdout(&self.task_id, line.into_bytes())
+            .await;
+    }
+}
+
 /// Who invoked a command and from where.
 #[derive(Debug, Clone, Default)]
 struct Caller {
+    /// The output of the terminal job whose script invoked the command; `None`
+    /// outside a terminal job.
+    output: Option<JobOutput>,
     /// The `terminal` call whose script invoked the command; `None` outside
     /// a terminal call.
     call: Option<CallIdentity>,
@@ -288,10 +335,12 @@ struct Caller {
 
 impl Caller {
     /// The context a tool runs with when this caller invoked it. A shell
-    /// invocation has nowhere to show progress, but the call whose script ran
-    /// it and the directory the script was in are known.
+    /// invocation shows progress in its terminal job's output, and the call
+    /// whose script ran it and the directory the script was in are known.
     fn into_context(self) -> ToolContext {
-        let mut cx = ToolContext::new();
+        let mut cx = self
+            .output
+            .map_or_else(ToolContext::new, ToolContext::with_progress);
         if let Some(identity) = self.call {
             cx = cx.with_identity(identity);
         }
@@ -1251,6 +1300,7 @@ impl ToolRegistryBuilder {
             policies: crate::policy::CommandPolicies::new(self.policies),
             notices: self.notices,
             call: None,
+            output: None,
             committed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -1475,6 +1525,9 @@ pub struct ToolRegistry {
     /// The `terminal` call this registry serves, once [`Self::for_call`] has
     /// bound it to one.
     call: Option<CallIdentity>,
+    /// The output of the terminal job this registry serves, once
+    /// [`Self::for_job`] has bound it to one.
+    output: Option<JobOutput>,
     /// The commands whose exchanges are kept through compaction.
     kept: Arc<HashSet<String>>,
     /// Reports each `terminal` call a kept command succeeded in.
@@ -1608,7 +1661,18 @@ impl ToolRegistry {
             policies: self.policies.for_agent(),
             notices: self.notices.clone(),
             call: None,
+            output: None,
             committed: self.committed.clone(),
+        }
+    }
+
+    /// The registry that serves one terminal job: this registry's commands,
+    /// each writing the progress it reports to `output`.
+    #[must_use]
+    pub fn for_job(&self, output: JobOutput) -> Self {
+        Self {
+            output: Some(output),
+            ..self.clone()
         }
     }
 
@@ -1756,6 +1820,7 @@ impl ToolRegistry {
         working_dir: Option<&Path>,
     ) -> CommandEnvelope {
         let caller = Caller {
+            output: self.output.clone(),
             call: self.call.clone(),
             working_dir: working_dir.map(|dir| dir.to_string_lossy().into_owned()),
         };

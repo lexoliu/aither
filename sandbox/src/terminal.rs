@@ -3010,7 +3010,13 @@ where
         // bridge, is served from this one registry, so each command its script
         // runs, a detached job's included, is told the id of this call, and
         // only the commands that answer in its mode are there.
-        let registry = self.registry().in_mode(mode);
+        let registry = self
+            .registry()
+            .in_mode(mode)
+            .for_job(crate::command::JobOutput::new(
+                self.job_registry.clone(),
+                task_id.clone(),
+            ));
         let registry = Arc::new(match call {
             Some(call) => registry.for_call(call),
             None => registry,
@@ -6828,6 +6834,9 @@ mod tests {
 
     #[cfg(all(unix, feature = "connectivity"))]
     mod outage;
+
+    #[cfg(unix)]
+    mod progress;
 
     /// An output store in `dir`, which exists, leasing from the default
     /// allocator.

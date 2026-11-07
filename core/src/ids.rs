@@ -129,6 +129,13 @@ impl IdLease {
         &self.0.word
     }
 
+    /// Whether `other` is a clone of this lease, not merely a lease of the
+    /// same word: a word released and leased again names something else.
+    #[must_use]
+    pub fn same_lease(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// A reference to this lease that does not keep the word leased.
     #[must_use]
     pub fn downgrade(&self) -> WeakIdLease {
@@ -148,6 +155,15 @@ impl WeakIdLease {
     #[must_use]
     pub fn upgrade(&self) -> Option<IdLease> {
         self.0.upgrade().map(IdLease)
+    }
+
+    /// Whether this refers to `lease` itself, not merely to a lease of the
+    /// same word.
+    #[must_use]
+    pub fn refers_to(&self, lease: &IdLease) -> bool {
+        // The weak reference keeps the lease's allocation, so no later lease
+        // can share its address.
+        core::ptr::eq(self.0.as_ptr(), Arc::as_ptr(&lease.0))
     }
 }
 
@@ -337,6 +353,30 @@ mod tests {
         assert_eq!(
             &*ids.lease().expect("released with the last clone"),
             "river"
+        );
+    }
+
+    #[test]
+    fn only_clones_are_the_same_lease() {
+        let ids = AnyIdAllocator::new(WordAllocator::new(["river"]));
+        let lease = ids.lease().expect("a free word");
+        assert!(lease.same_lease(&lease.clone()));
+        drop(lease);
+        let again = ids.lease().expect("river is free again");
+        let other = AnyIdAllocator::new(WordAllocator::new(["river"]))
+            .lease()
+            .expect("a free word");
+        assert_eq!(again.as_str(), other.as_str());
+        assert!(!again.same_lease(&other), "a word alone is not the lease");
+
+        let weak = again.downgrade();
+        assert!(weak.refers_to(&again));
+        assert!(!weak.refers_to(&other));
+        drop(again);
+        let after = ids.lease().expect("river is free again");
+        assert!(
+            !weak.refers_to(&after),
+            "a released lease is not its successor"
         );
     }
 

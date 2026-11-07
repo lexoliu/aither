@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use aither_core::IdLease;
+use aither_core::{IdLease, WeakIdLease};
 use async_channel::{Receiver, Sender, WeakSender};
 use futures_lite::io::AsyncWriteExt;
 
@@ -405,6 +405,13 @@ enum JobRequest {
         task_id: String,
         reply: Sender<Option<JobInfo>>,
     },
+    /// Appends `chunk` to the stdout of task `task_id`, replying once it is
+    /// in; a task not registered yet gets it when it registers.
+    AppendTaskStdout {
+        task_id: IdLease,
+        chunk: Vec<u8>,
+        reply: Sender<()>,
+    },
     OweCompletion {
         task_id: String,
         ending: Result<i32, String>,
@@ -701,6 +708,25 @@ impl JobRegistry {
             chunk,
         })
         .await;
+    }
+
+    /// Appends stdout bytes to task `task_id`, returning once they are in its
+    /// output. A task whose job is not registered yet (its process may already
+    /// be running a command) gets them as it registers, ahead of anything the
+    /// process wrote later; one the registry already forgot drops them, since
+    /// nothing can read them.
+    ///
+    /// `task_id` is the job's own lease, which the bytes hold until they are
+    /// in: its word cannot name a later job while they are on their way.
+    pub async fn append_task_stdout(&self, task_id: &IdLease, chunk: Vec<u8>) {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::AppendTaskStdout {
+            task_id: task_id.clone(),
+            chunk,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await;
     }
 
     /// Marks stdout stream closed.
@@ -1075,6 +1101,93 @@ impl JobRegistry {
     }
 }
 
+/// Stdout appends for tasks the registry holds no job for: those whose job is
+/// not registered yet wait for it, those whose job it already forgot are
+/// dropped.
+///
+/// Both refer to their job's lease weakly. The sender of an append holds the
+/// lease until it is answered, so while one waits its word names that job
+/// alone; once the lease ends, what waited for it goes with it, and a later
+/// job leasing the same word never receives it.
+#[derive(Default)]
+struct ParkedOutput {
+    /// Appends waiting for their job to register, by its task id.
+    by_task: HashMap<String, Parked>,
+    /// Forgotten jobs whose lease something still holds, such as a command
+    /// that may still report progress.
+    forgotten: Vec<WeakIdLease>,
+}
+
+/// The appends waiting for one job, in arrival order.
+struct Parked {
+    lease: WeakIdLease,
+    appends: Vec<ParkedAppend>,
+}
+
+/// One parked append: its bytes and the reply that releases its sender.
+type ParkedAppend = (Vec<u8>, Sender<()>);
+
+impl ParkedOutput {
+    /// Parks an append to task `task_id`, whose job is not registered. Hands
+    /// back the reply when the registry already forgot that job, for the
+    /// sender to be released without its bytes going anywhere.
+    fn park(&mut self, task_id: &IdLease, chunk: Vec<u8>, reply: Sender<()>) -> Option<Sender<()>> {
+        self.prune();
+        if self
+            .forgotten
+            .iter()
+            .any(|forgotten| forgotten.refers_to(task_id))
+        {
+            return Some(reply);
+        }
+        let parked = self
+            .by_task
+            .entry(task_id.to_string())
+            .or_insert_with(|| Parked {
+                lease: task_id.downgrade(),
+                appends: Vec::new(),
+            });
+        assert!(
+            parked.lease.refers_to(task_id),
+            "two live leases share the task id '{task_id}'"
+        );
+        parked.appends.push((chunk, reply));
+        None
+    }
+
+    /// Takes the appends waiting for task `task_id`, which is registering, in
+    /// arrival order.
+    fn take(&mut self, task_id: &IdLease) -> Vec<ParkedAppend> {
+        self.prune();
+        self.by_task
+            .remove(task_id.as_str())
+            .map(|parked| {
+                assert!(
+                    parked.lease.refers_to(task_id),
+                    "two live leases share the task id '{task_id}'"
+                );
+                parked.appends
+            })
+            .unwrap_or_default()
+    }
+
+    /// Records that the registry forgot the job of task `task_id`, so what is
+    /// still sent to it is dropped instead of waiting for it.
+    fn forgot(&mut self, task_id: &IdLease) {
+        self.prune();
+        self.forgotten.push(task_id.downgrade());
+    }
+
+    /// Drops what refers to a lease that ended: no sender of an append to it
+    /// is left, and its word may name another job.
+    fn prune(&mut self) {
+        self.by_task
+            .retain(|_, parked| parked.lease.upgrade().is_some());
+        self.forgotten
+            .retain(|forgotten| forgotten.upgrade().is_some());
+    }
+}
+
 /// Per-session read tracking behind the unchanged-read refusal: what each
 /// task's last `terminal_read` returned with.
 #[derive(Default)]
@@ -1088,14 +1201,15 @@ impl JobRegistryService {
     pub async fn serve(self) {
         let mut jobs: HashMap<u32, JobState> = HashMap::new();
         let mut reads = ReadTracker::default();
+        let mut parked = ParkedOutput::default();
 
         while let Ok(command) = self.rx.recv().await {
             match command {
                 JobCommand::State(command) => {
-                    handle_state_command(&mut jobs, &mut reads, command).await;
+                    handle_state_command(&mut jobs, &mut reads, &mut parked, command).await;
                 }
                 JobCommand::Request(request) => {
-                    handle_job_request(&mut jobs, &mut reads, &self.tx, request).await;
+                    handle_job_request(&mut jobs, &mut reads, &mut parked, &self.tx, request).await;
                 }
             }
         }
@@ -1105,6 +1219,7 @@ impl JobRegistryService {
 async fn handle_state_command(
     jobs: &mut HashMap<u32, JobState>,
     reads: &mut ReadTracker,
+    parked: &mut ParkedOutput,
     command: StateCommand,
 ) {
     match command {
@@ -1119,6 +1234,11 @@ async fn handle_state_command(
             process_tree,
             place,
         } => {
+            // A job this one replaces under the same pid is forgotten with it.
+            if let Some(replaced) = jobs.get(&pid) {
+                parked.forgot(&replaced.task_id);
+            }
+            let waiting = parked.take(&task_id);
             register_job(
                 jobs,
                 pid,
@@ -1132,6 +1252,10 @@ async fn handle_state_command(
             );
             if let Some(job) = jobs.get_mut(&pid) {
                 job.process_tree = process_tree;
+            }
+            for (chunk, reply) in waiting {
+                append_terminal_output(jobs, pid, TerminalStream::Stdout, chunk).await;
+                let _ = reply.send(()).await;
             }
         }
         StateCommand::AttachTerminalInput { pid, input_tx } => {
@@ -1167,12 +1291,14 @@ async fn handle_state_command(
         // The command's lease kept the word from naming another job, so the
         // job found by it is the one the command is about. A job whose pid a
         // later job reused left the registry with it; nothing reads it.
-        StateCommand::TakeCompletion { task_id } => take_completion(jobs, reads, &task_id),
+        StateCommand::TakeCompletion { task_id } => {
+            take_completion(jobs, reads, parked, &task_id);
+        }
         StateCommand::Unwatch { task_id } => {
             if let Some(pid) = find_pid_by_task_id(jobs, &task_id) {
                 let job = jobs.get_mut(&pid).expect("the pid was just found");
                 job.watchers -= 1;
-                forget_if_done(jobs, reads, pid);
+                forget_if_done(jobs, reads, parked, pid);
             }
         }
     }
@@ -1180,13 +1306,20 @@ async fn handle_state_command(
 
 /// Forgets job `pid` once nothing can address it any more: it finished, its
 /// agent took the completion and nothing watches it. Its task id then goes
-/// back to the allocator, and a later read of it answers as for any unknown
-/// task.
-fn forget_if_done(jobs: &mut HashMap<u32, JobState>, reads: &mut ReadTracker, pid: u32) {
+/// back to the allocator once nothing else holds it, a later read of it
+/// answers as for any unknown task, and progress still reported to it is
+/// dropped.
+fn forget_if_done(
+    jobs: &mut HashMap<u32, JobState>,
+    reads: &mut ReadTracker,
+    parked: &mut ParkedOutput,
+    pid: u32,
+) {
     let job = &jobs[&pid];
     if job.info.status.delivery() == Some(Delivery::Taken) && job.watchers == 0 {
         let job = jobs.remove(&pid).expect("the job is registered");
         reads.delta_reads.remove(job.task_id.as_str());
+        parked.forgot(&job.task_id);
         tracing::debug!(pid = %pid, task_id = %job.task_id, "forgot finished job");
     }
 }
@@ -1195,10 +1328,27 @@ fn forget_if_done(jobs: &mut HashMap<u32, JobState>, reads: &mut ReadTracker, pi
 async fn handle_job_request(
     jobs: &mut HashMap<u32, JobState>,
     reads: &mut ReadTracker,
+    parked: &mut ParkedOutput,
     tx: &WeakSender<JobCommand>,
     request: JobRequest,
 ) {
     match request {
+        JobRequest::AppendTaskStdout {
+            task_id,
+            chunk,
+            reply,
+        } => {
+            if let Some(pid) = find_pid_by_task_id(jobs, &task_id) {
+                assert!(
+                    jobs[&pid].task_id.same_lease(&task_id),
+                    "two live leases share the task id '{task_id}'"
+                );
+                append_terminal_output(jobs, pid, TerminalStream::Stdout, chunk).await;
+                let _ = reply.send(()).await;
+            } else if let Some(reply) = parked.park(&task_id, chunk, reply) {
+                let _ = reply.send(()).await;
+            }
+        }
         JobRequest::List { reply } => {
             let items = jobs.values().map(|state| state.info.clone()).collect();
             let _ = reply.send(items).await;
@@ -1293,7 +1443,7 @@ async fn handle_job_request(
             let _ = reply.send(has_running_job(jobs)).await;
         }
         JobRequest::TakeCompletion { task_id, reply } => {
-            take_completion(jobs, reads, &task_id);
+            take_completion(jobs, reads, parked, &task_id);
             let _ = reply.send(()).await;
         }
         JobRequest::Watch { task_id, reply } => {
@@ -1419,10 +1569,15 @@ fn finish(job: &mut JobState, end: JobEnd) {
 
 /// Marks the completion of task `task_id` taken, the agent having dropped
 /// its [`PendingCompletion`], and forgets the job when nothing watches it.
-fn take_completion(jobs: &mut HashMap<u32, JobState>, reads: &mut ReadTracker, task_id: &str) {
+fn take_completion(
+    jobs: &mut HashMap<u32, JobState>,
+    reads: &mut ReadTracker,
+    parked: &mut ParkedOutput,
+    task_id: &str,
+) {
     if let Some(pid) = find_pid_by_task_id(jobs, task_id) {
         mark_taken(jobs.get_mut(&pid).expect("the pid was just found"));
-        forget_if_done(jobs, reads, pid);
+        forget_if_done(jobs, reads, parked, pid);
     }
 }
 
@@ -2121,6 +2276,103 @@ mod tests {
             .terminal_read("river", 0, 1024)
             .await
             .expect("a new job under a reused word reads afresh");
+    }
+
+    #[tokio::test]
+    async fn task_output_appended_before_registration_lands_first_and_in_order() {
+        let registry = spawn_registry();
+        let early = lease("early");
+        let appends = {
+            let registry = registry.clone();
+            let early = early.clone();
+            tokio::spawn(async move {
+                registry.append_task_stdout(&early, b"one\n".to_vec()).await;
+                registry.append_task_stdout(&early, b"two\n".to_vec()).await;
+            })
+        };
+        // The appends are parked: the job does not exist, and their sender
+        // is still waiting for it.
+        tokio::task::yield_now().await;
+        assert!(!appends.is_finished());
+        assert!(registry.get_by_task_id("early").await.is_none());
+
+        registry
+            .register(9, &early, "exec-e", "run", TerminalMode::Sandboxed, None)
+            .await;
+        appends.await.expect("appends are released by registration");
+        registry.append_stdout(9, b"three\n".to_vec()).await;
+
+        let (stdout, _) = registry.terminal_output(9).await.expect("job exists");
+        assert_eq!(stdout, b"one\ntwo\nthree\n");
+    }
+
+    /// Parked progress refers to its job's lease weakly: it never keeps the
+    /// word leased, and once the lease ends it goes with it, so a later job
+    /// leasing the same word starts with none of it.
+    #[tokio::test]
+    async fn parked_output_never_reaches_a_later_job_under_the_same_word() {
+        let ids = aither_core::AnyIdAllocator::new(aither_core::WordAllocator::new(["river"]));
+        let registry = spawn_registry();
+        let first = ids.lease().unwrap();
+        let reporter = {
+            let registry = registry.clone();
+            let first = first.clone();
+            tokio::spawn(async move {
+                registry
+                    .append_task_stdout(&first, b"stale\n".to_vec())
+                    .await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!reporter.is_finished(), "the report is parked");
+        drop(first);
+        assert!(ids.lease().is_err(), "the waiting reporter holds river");
+
+        // The first job never registers; its reporter goes away.
+        reporter.abort();
+        assert!(reporter.await.unwrap_err().is_cancelled());
+        let second = ids.lease().expect("parked output holds no lease");
+        registry
+            .register(2, &second, "exec", "run", TerminalMode::Sandboxed, None)
+            .await;
+        registry
+            .append_task_stdout(&second, b"fresh\n".to_vec())
+            .await;
+
+        let (stdout, _) = registry.terminal_output(2).await.expect("job exists");
+        assert_eq!(stdout, b"fresh\n");
+    }
+
+    /// Progress a command reports after its job was forgotten is dropped:
+    /// its sender is released at once, and the word goes back to the
+    /// allocator when the command lets go of it.
+    #[tokio::test]
+    async fn output_for_a_forgotten_job_is_dropped() {
+        let ids = aither_core::AnyIdAllocator::new(aither_core::WordAllocator::new(["river"]));
+        let registry = spawn_registry();
+        let river = ids.lease().unwrap();
+        registry
+            .register(1, &river, "exec", "run", TerminalMode::Sandboxed, None)
+            .await;
+        registry.complete(1, 0, None).await;
+        drop(registry.owe_completion("river", Ok(0)).await.unwrap());
+        assert!(registry.list().await.is_empty(), "the job is forgotten");
+
+        // Answered at once, not parked for a registration that never comes.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            registry.append_task_stdout(&river, b"late\n".to_vec()),
+        )
+        .await
+        .expect("a report to a forgotten job is answered");
+        assert!(registry.get_by_task_id("river").await.is_none());
+        drop(river);
+        let again = ids.lease().expect("nothing kept river");
+        registry
+            .register(2, &again, "exec", "run", TerminalMode::Sandboxed, None)
+            .await;
+        let (stdout, _) = registry.terminal_output(2).await.expect("job exists");
+        assert!(stdout.is_empty(), "the late report reached no job");
     }
 
     #[tokio::test]
