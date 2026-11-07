@@ -105,6 +105,8 @@ pub struct AgentSettings {
     pub(crate) fork_source: Option<crate::fork::ForkSource>,
     /// Who the built agent's tool calls are made by.
     pub(crate) identity: aither_core::llm::AgentIdentity,
+    /// What renders every alert, notice, reminder and refusal.
+    pub(crate) notices: crate::AnyNotices,
     #[cfg(feature = "skills")]
     pub(crate) skill_registry: Option<Arc<SkillRegistry>>,
 }
@@ -131,6 +133,7 @@ impl Default for AgentSettings {
             tasks: crate::tasks::TasksWiring::default(),
             fork_source: None,
             identity: aither_core::llm::AgentIdentity::Main,
+            notices: crate::AnyNotices::default(),
             #[cfg(feature = "skills")]
             skill_registry: None,
         }
@@ -157,10 +160,49 @@ struct Wiring {
     /// Directory files are restored from after a forked compaction: the
     /// directory the agent's terminal works in.
     restore_dir: Option<std::path::PathBuf>,
-    /// What the `compact` tool shares with the built agent, once registered.
+    /// What the `compact` tool shares with the built agent; the tool is
+    /// registered at build, over the notices the options settled on.
     compact_signal: Option<std::sync::Arc<crate::compact_tool::CompactSignal>>,
     /// The window state a fork inherits, which replaces initialization.
     inherited: Option<Inherited>,
+    /// The tools a fork runs, built at build over the notices the options
+    /// settled on; they replace every other tool.
+    fork_tools: Option<ForkTools>,
+}
+
+/// The tools a fork inherits: the main agent's definitions, run by the
+/// fork's own terminal.
+struct ForkTools {
+    definitions: Vec<ToolDefinition>,
+    terminal: aither_sandbox::DynTerminalTool,
+}
+
+/// The built agent's tools: a fork's inherited set in place of `tools`, or
+/// `tools` with the `compact` tool over `compact`, each rendering through
+/// `notices`.
+///
+/// # Panics
+///
+/// Panics if `compact` is set and `tools` already holds a tool named
+/// `compact`.
+fn assemble_tools(
+    mut tools: AgentTools,
+    fork: Option<ForkTools>,
+    compact: Option<&std::sync::Arc<crate::compact_tool::CompactSignal>>,
+    notices: &crate::AnyNotices,
+) -> AgentTools {
+    if let Some(fork) = fork {
+        return AgentTools::forked(&fork.definitions, fork.terminal, compact, notices);
+    }
+    if let Some(signal) = compact {
+        tools
+            .register(crate::compact_tool::CompactTool::new(
+                std::sync::Arc::clone(signal),
+                notices.clone(),
+            ))
+            .expect("a tool named `compact` is already registered");
+    }
+    tools
 }
 
 /// What a fork carries over from the main agent besides its context.
@@ -228,6 +270,26 @@ pub trait AgentOptions: sealed::Sealed + Sized {
     #[must_use]
     fn identity(mut self, identity: aither_core::llm::AgentIdentity) -> Self {
         self.settings().identity = identity;
+        self
+    }
+
+    /// Renders every alert, notice, reminder and refusal the model reads
+    /// through `notices`: the agent's own, those of the tools the builder
+    /// registers (`compact`, the terminal controls, `monitor`) and, on a
+    /// [`TerminalAgentBuilder`](crate::TerminalAgentBuilder), the terminal's
+    /// and its subagents'. [`DefaultNotices`](crate::DefaultNotices) by
+    /// default.
+    ///
+    /// Objects built outside the builder take the same value themselves: a
+    /// hand-built [`ToolRegistryBuilder`](aither_sandbox::ToolRegistryBuilder)
+    /// through `notices(notices.sandbox())`, and
+    /// [`ExternalHooks::with_notices`](crate::ExternalHooks::with_notices).
+    /// A refusal a check returns to the embedder, such as a
+    /// [`SecretRefusal`](crate::SecretRefusal), is data the embedder renders
+    /// with the same value.
+    #[must_use]
+    fn notices(mut self, notices: crate::AnyNotices) -> Self {
+        self.settings().notices = notices;
         self
     }
 
@@ -712,9 +774,18 @@ where
     ///
     /// Panics if a tool named `compact` is already registered.
     pub fn compact_tool(mut self) -> Self {
-        let signal = std::sync::Arc::new(crate::compact_tool::CompactSignal::default());
-        self.wiring.compact_signal = Some(std::sync::Arc::clone(&signal));
-        self.tool(crate::compact_tool::CompactTool::new(signal))
+        assert!(
+            self.wiring.compact_signal.is_none()
+                && !self
+                    .wiring
+                    .tools
+                    .definitions()
+                    .iter()
+                    .any(|definition| definition.name() == crate::compact_tool::COMPACT_TOOL_NAME),
+            "a tool named `compact` is already registered"
+        );
+        self.wiring.compact_signal = Some(std::sync::Arc::default());
+        self
     }
 
     /// Makes the built agent a fork of the main agent that sent `fork`.
@@ -763,8 +834,10 @@ where
             .iter()
             .any(|definition| definition.name() == crate::compact_tool::COMPACT_TOOL_NAME)
             .then(std::sync::Arc::default);
-        wiring.tools =
-            AgentTools::forked(&fork.definitions, terminal, wiring.compact_signal.as_ref());
+        wiring.fork_tools = Some(ForkTools {
+            definitions: fork.definitions.clone(),
+            terminal,
+        });
         self
     }
 
@@ -775,6 +848,11 @@ where
         self.wiring.restore_dir = Some(path.clone());
         self.wiring.sandbox_dir = Some(path);
         self
+    }
+
+    /// What renders the built agent's notices, as the options set it so far.
+    pub(crate) const fn chosen_notices(&self) -> &crate::AnyNotices {
+        &self.settings.notices
     }
 
     /// Whether the instruction block in `slot` is already set.
@@ -976,7 +1054,18 @@ where
     /// order the tool registry holds them.
     #[must_use]
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.wiring.tools.active_definitions()
+        if let Some(fork) = &self.wiring.fork_tools {
+            return fork.definitions.clone();
+        }
+        let mut definitions = self.wiring.tools.active_definitions();
+        if let Some(signal) = &self.wiring.compact_signal {
+            definitions.push(ToolDefinition::new(&crate::compact_tool::CompactTool::new(
+                std::sync::Arc::clone(signal),
+                self.settings.notices.clone(),
+            )));
+            definitions.sort_by(|a, b| a.name().cmp(b.name()));
+        }
+        definitions
     }
 
     /// Builds the agent.
@@ -992,6 +1081,7 @@ where
             tasks,
             fork_source,
             identity,
+            notices,
             #[cfg(feature = "skills")]
             skill_registry,
         } = self.settings;
@@ -1008,12 +1098,14 @@ where
             restore_dir,
             compact_signal,
             inherited,
+            fork_tools,
         } = self.wiring;
+        let tools = assemble_tools(tools, fork_tools, compact_signal.as_ref(), &notices);
         // Every agent with a sandbox, a fork included, keeps its own
         // `tasks.md` there.
         let tasks_document = sandbox_dir
             .clone()
-            .map(|dir| tasks.document(dir, config.tasks_line_limit));
+            .map(|dir| tasks.document(dir, config.tasks_line_limit, notices.clone()));
         Agent {
             warmth: crate::CacheWarmth::new(prompt_cache.lifetime(), clock),
             advanced: std::sync::Arc::new(self.advanced),
@@ -1067,6 +1159,7 @@ where
             compaction_warning: crate::agent::CompactionWarning::Armed,
             kept_exchanges: std::collections::HashSet::new(),
             identity,
+            notices,
             connectivity,
             last_request: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),

@@ -49,35 +49,43 @@ struct RefusalTemplate<'a> {
     refusal: &'a LanguageRefusal,
 }
 
-impl std::fmt::Display for LanguageRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let text = RefusalTemplate { refusal: self }
-            .render()
-            .expect("language refusal template must render");
-        f.write_str(&text)
-    }
+/// aither's wording of a language refusal.
+pub fn default_refusal(refusal: &LanguageRefusal) -> String {
+    crate::notices::rendered(&RefusalTemplate { refusal })
 }
 
-impl std::error::Error for LanguageRefusal {}
-
-/// A one-shot alert about a lapse of language.
+/// A one-shot alert about a lapse of language, rendered by
+/// [`Notices::language_alerts`](crate::Notices::language_alerts).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LanguageAlert {
     /// A question was refused; ask it again.
-    AskAgain { language: Language },
+    AskAgain {
+        /// The communication language.
+        language: Language,
+    },
     /// A reply was not in the communication language.
-    Reply { language: Language },
+    Reply {
+        /// The communication language.
+        language: Language,
+    },
     /// A change to a record was not in the working language.
     Record {
+        /// The working language.
         language: Language,
+        /// The record that changed, such as `tasks.md`.
         document: String,
     },
 }
 
 #[derive(Template)]
 #[template(path = "language_alert.txt", escape = "none")]
-pub struct LanguageAlertsTemplate<'a> {
-    pub alerts: &'a [LanguageAlert],
+struct LanguageAlertsTemplate<'a> {
+    alerts: &'a [LanguageAlert],
+}
+
+/// aither's wording of the language alerts raised since the last request.
+pub fn default_alerts(alerts: &[LanguageAlert]) -> String {
+    crate::notices::rendered(&LanguageAlertsTemplate { alerts })
 }
 
 #[derive(Template)]
@@ -262,7 +270,8 @@ mod tests {
         let refusal = guard
             .check_question(["Which database should we use?", "PostgreSQL", "MySQL"])
             .unwrap_err();
-        assert!(refusal.to_string().contains("Chinese"), "{refusal}");
+        let text = default_refusal(&refusal);
+        assert!(text.contains("Chinese"), "{text}");
         assert_eq!(guard.take_alerts().len(), 1);
 
         guard
@@ -295,7 +304,8 @@ mod tests {
         let refusal = guard
             .check_working("数据库迁移完成了，请检查结果。", WorkingText::Public)
             .unwrap_err();
-        assert!(refusal.to_string().contains("English"), "{refusal}");
+        let text = default_refusal(&refusal);
+        assert!(text.contains("English"), "{text}");
         guard
             .check_working(
                 "Migrate the database to `PostgreSQL` 16.",

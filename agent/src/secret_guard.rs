@@ -143,30 +143,13 @@ pub struct SecretFinding {
     pub range: Range<usize>,
 }
 
-/// Why [`SecretGuard::check`] refused a text.
+/// Why [`SecretGuard::check`] refused a text; the caller renders what the
+/// model reads with [`Notices::secret_refusal`](crate::Notices::secret_refusal).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretRefusal {
     /// Every secret found, in text order.
     pub findings: Vec<SecretFinding>,
 }
-
-#[derive(Template)]
-#[template(path = "secret_refusal.txt", escape = "none")]
-struct RefusalTemplate<'a> {
-    findings: &'a [SecretFinding],
-}
-
-impl std::fmt::Display for SecretRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        RefusalTemplate {
-            findings: &self.findings,
-        }
-        .render_into(f)
-        .map_err(|_| std::fmt::Error)
-    }
-}
-
-impl std::error::Error for SecretRefusal {}
 
 #[derive(Template)]
 #[template(path = "secret_placeholder.txt", escape = "none")]

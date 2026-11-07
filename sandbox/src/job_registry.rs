@@ -205,8 +205,10 @@ pub struct TerminalDelta {
 /// Why [`JobRegistry::terminal_read`] returned no delta.
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalReadError {
-    /// The read would return what the task's last read returned.
-    #[error(transparent)]
+    /// The read would return what the task's last read returned; the
+    /// caller renders it through its
+    /// [`SandboxNotices`](crate::SandboxNotices).
+    #[error("refused as a poll: {0:?}")]
     Refused(PollRefusal),
     /// The read could not be served, such as an unknown task id.
     #[error("{0}")]

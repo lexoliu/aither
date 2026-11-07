@@ -1,7 +1,6 @@
 //! Lifecycle hooks: event-driven external hooks that can only add context.
 
 use aither_sandbox::{AnyCommandObserver, CommandCall, CommandObserver};
-use askama::Template;
 use executor_core::Executor;
 use serde::{Deserialize, Serialize};
 
@@ -39,8 +38,9 @@ pub enum LifecycleKind {
 }
 
 impl LifecycleKind {
-    /// What happened, as the context alert says it.
-    pub(super) const fn occasion(self) -> &'static str {
+    /// What happened, as aither's context alert says it.
+    #[must_use]
+    pub const fn occasion(self) -> &'static str {
         match self {
             Self::SessionStart => "the session started",
             Self::BeforeCompaction => "a compaction was about to start",
@@ -225,30 +225,23 @@ pub struct InjectedContext {
     context: String,
 }
 
-#[derive(Template)]
-#[template(path = "lifecycle_context.txt", escape = "none")]
-struct LifecycleContextTemplate<'a> {
-    hook: &'a str,
-    event: &'a str,
-    context: &'a str,
-}
-
 impl InjectedContext {
-    /// The alert the model reads.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the alert template fails to render, which it cannot for
-    /// text input.
+    /// The hook that added it.
     #[must_use]
-    pub fn alert_text(&self) -> String {
-        LifecycleContextTemplate {
-            hook: &self.hook,
-            event: self.event.occasion(),
-            context: &self.context,
-        }
-        .render()
-        .expect("lifecycle context template must render")
+    pub fn hook(&self) -> &str {
+        &self.hook
+    }
+
+    /// The event it was added at.
+    #[must_use]
+    pub const fn event(&self) -> LifecycleKind {
+        self.event
+    }
+
+    /// The context the hook printed.
+    #[must_use]
+    pub fn context(&self) -> &str {
+        &self.context
     }
 }
 
@@ -275,13 +268,35 @@ pub struct ExternalHooks {
     user: Option<UserPause>,
     inbox: async_channel::Sender<InjectedContext>,
     outbox: async_channel::Receiver<InjectedContext>,
+    /// Renders what the model reads of a command hook's block and a
+    /// reviewer's denial.
+    notices: crate::AnyNotices,
 }
 
 impl ExternalHooks {
     /// The scope of the main agent, running the hooks of `live`.
     #[must_use]
     pub fn new(live: &LiveHooks) -> Self {
-        Self::scope(live.clone(), HookRole::Main, None)
+        Self::scope(
+            live.clone(),
+            HookRole::Main,
+            None,
+            crate::AnyNotices::default(),
+        )
+    }
+
+    /// Renders the refusals the model reads of a blocking command hook and a
+    /// denying reviewer through `notices`, the agent's;
+    /// [`DefaultNotices`](crate::DefaultNotices) by default. Subagent scopes
+    /// keep it.
+    #[must_use]
+    pub fn with_notices(mut self, notices: crate::AnyNotices) -> Self {
+        self.notices = notices;
+        self
+    }
+
+    pub(super) const fn notices(&self) -> &crate::AnyNotices {
+        &self.notices
     }
 
     /// A scope with no hooks, for an agent whose host configured none.
@@ -310,7 +325,12 @@ impl ExternalHooks {
         self.user.as_ref()
     }
 
-    fn scope(live: LiveHooks, role: HookRole, user: Option<UserPause>) -> Self {
+    fn scope(
+        live: LiveHooks,
+        role: HookRole,
+        user: Option<UserPause>,
+        notices: crate::AnyNotices,
+    ) -> Self {
         let (inbox, outbox) = async_channel::unbounded();
         Self {
             live,
@@ -318,6 +338,7 @@ impl ExternalHooks {
             user,
             inbox,
             outbox,
+            notices,
         }
     }
 
@@ -325,7 +346,12 @@ impl ExternalHooks {
     /// inbox of its own.
     #[must_use]
     pub fn for_subagent(&self) -> Self {
-        Self::scope(self.live.clone(), HookRole::Subagent, self.user.clone())
+        Self::scope(
+            self.live.clone(),
+            HookRole::Subagent,
+            self.user.clone(),
+            self.notices.clone(),
+        )
     }
 
     /// The role of the agent this scope belongs to.

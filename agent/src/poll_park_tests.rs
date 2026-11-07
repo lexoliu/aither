@@ -130,7 +130,10 @@ async fn polling_agent(
     let mut agent = AgentBuilder::new(llm)
         .agent_kind(crate::AgentKind::Chatbot)
         .background_jobs(policy)
-        .tool(ReadTerminalDeltaTool::new(registry.clone()))
+        .tool(ReadTerminalDeltaTool::new(
+            registry.clone(),
+            aither_sandbox::AnySandboxNotices::default(),
+        ))
         .build();
     agent.background_receiver = Some(receiver);
     // `terminal` detached the task earlier, so the model knows it.

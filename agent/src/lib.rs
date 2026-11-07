@@ -65,6 +65,7 @@ pub mod language;
 #[cfg(test)]
 mod midstream_retry_tests;
 mod model_group;
+pub mod notices;
 mod output_urls;
 #[cfg(test)]
 mod poll_park_tests;
@@ -113,7 +114,7 @@ pub use builder::{AgentBuilder, AgentOptions, AgentSettings};
 pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
 pub use clock::{AnyClock, Clock, Instant, ManualClock, SystemClock};
-pub use compact_tool::{CompactArgs, CompactSignal, CompactTool};
+pub use compact_tool::{CompactArgs, CompactRequest, CompactSignal, CompactTool};
 pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy};
 #[cfg(feature = "skills")]
 pub use context::ActiveSkills;
@@ -132,8 +133,8 @@ pub use disk::{
 pub use error::AgentError;
 pub use event::{AgentEvent, TimedEvent};
 pub use external_hook::{
-    ExternalHooks, HookTestTool, HooksConfig, LifecycleHookConfig, LiveHooks, ReviewedPermission,
-    ReviewerConfig,
+    ExternalHooks, HookTestTool, HooksConfig, InjectedContext, LifecycleHookConfig, LiveHooks,
+    ReviewedPermission, ReviewerConfig,
 };
 pub use fork::{ForkSnapshot, ForkSource};
 pub use hook::{
@@ -146,15 +147,21 @@ pub use host_load::{
 };
 pub use judgment::{JudgmentError, judge};
 #[cfg(feature = "languages")]
-pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
+pub use language::{
+    Language, LanguageAlert, LanguageGuard, LanguageRefusal, Languages, WorkingText,
+};
+pub use notices::{
+    AnyNotices, CancelledToolCall, CommandHookRefusal, DefaultNotices, ForkToolRefusal, Notices,
+    PreCompaction, ReviewerDenial, TasksAlert,
+};
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
 pub use runaway::RunawayGuard;
 pub use secret_guard::{
     Guarded, SecretFinding, SecretGuard, SecretKind, SecretRefusal, SecretShape,
 };
 pub use tasks::{
-    AnyWorkTracker, TaskEvent, TaskEvents, WorkItem, WorkRef, WorkState, WorkTracker,
-    WorkTrackerError,
+    AnyWorkTracker, TaskEvent, TaskEvents, TasksAlertItem, WorkItem, WorkRef, WorkState,
+    WorkTracker, WorkTrackerError,
 };
 pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};
 pub use tools::AgentTools;

@@ -12,18 +12,17 @@
 //! traversal, so `sleep` in a string or a file name does not trigger it.
 
 use std::cell::{Cell, RefCell};
-use std::fmt::{self, Display};
 use std::path::PathBuf;
-
-use askama::Template;
 
 use crate::kill_guard::{file_name, walk_invocations};
 
 /// A call refused because it waits or re-reads instead of using the
 /// mechanism that reports the change.
 ///
-/// Tools return it as their error, so an agent loop can tell a refused poll
-/// from any other failure by downcasting.
+/// Tools return it as their error inside a [`Refused`](crate::Refused), so
+/// an agent loop can tell a refused poll from any other failure by
+/// downcasting; [`SandboxNotices::poll_refusal`](crate::SandboxNotices::poll_refusal)
+/// renders its text.
 #[derive(Debug)]
 pub enum PollRefusal {
     /// The command invokes `sleep` in a foreground call.
@@ -52,35 +51,6 @@ impl PollRefusal {
             Self::UnchangedFileRead { .. } | Self::UnchangedTaskRead { .. }
         )
     }
-}
-
-#[derive(Template)]
-#[template(path = "sleep_refused.txt")]
-struct SleepRefusedTemplate;
-
-#[derive(Template)]
-#[template(path = "unchanged_file_read.txt")]
-struct UnchangedFileReadTemplate<'a> {
-    paths: &'a [PathBuf],
-}
-
-impl Display for PollRefusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rendered = match self {
-            Self::Sleep => SleepRefusedTemplate.render(),
-            Self::UnchangedFileRead { paths } => UnchangedFileReadTemplate { paths }.render(),
-            Self::UnchangedTaskRead { task_id } => UnchangedTaskReadTemplate { task_id }.render(),
-        };
-        f.write_str(&rendered.map_err(|_| fmt::Error)?)
-    }
-}
-
-impl std::error::Error for PollRefusal {}
-
-#[derive(Template)]
-#[template(path = "unchanged_task_read.txt")]
-struct UnchangedTaskReadTemplate<'a> {
-    task_id: &'a str,
 }
 
 /// Whether `script` invokes `sleep` anywhere the script itself would wait on

@@ -160,6 +160,9 @@ pub struct AskUserTool {
     hooks: Option<ExternalHooks>,
     #[cfg(feature = "languages")]
     languages: Option<LanguageGuard>,
+    /// Renders its refusals.
+    #[cfg_attr(not(feature = "languages"), allow(dead_code))]
+    notices: crate::AnyNotices,
 }
 
 impl AskUserTool {
@@ -172,7 +175,16 @@ impl AskUserTool {
             hooks: None,
             #[cfg(feature = "languages")]
             languages: None,
+            notices: crate::AnyNotices::default(),
         }
+    }
+
+    /// Renders its refusals through `notices`, the agent's;
+    /// [`DefaultNotices`](crate::DefaultNotices) by default.
+    #[must_use]
+    pub fn with_notices(mut self, notices: crate::AnyNotices) -> Self {
+        self.notices = notices;
+        self
     }
 
     /// Refuses a question, or options, not in the communication language
@@ -213,7 +225,7 @@ impl Tool for AskUserTool {
                 let parts = std::iter::once(question.question.as_str())
                     .chain(question.option.iter().map(String::as_str));
                 if let Err(refusal) = guard.check_question(parts) {
-                    return Ok(ToolResult::error(refusal.to_string()));
+                    return Ok(ToolResult::error(self.notices.language_refusal(&refusal)));
                 }
             }
         }

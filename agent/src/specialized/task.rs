@@ -338,8 +338,10 @@ struct ForkRefusedTemplate<'a> {
     reason: &'a ForkRefusal,
 }
 
-/// Why a fork was not started.
-enum ForkRefusal {
+/// Why a fork was not started, rendered by
+/// [`Notices::fork_refusal`](crate::Notices::fork_refusal).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForkRefusal {
     /// The tool is not bound to a terminal to launch from.
     NoTerminal,
     /// The main agent has published no request.
@@ -361,14 +363,9 @@ enum ForkRefusal {
     },
 }
 
-impl ForkRefusal {
-    fn into_error(self) -> anyhow::Error {
-        anyhow::anyhow!(
-            ForkRefusedTemplate { reason: &self }
-                .render()
-                .expect("fork refusal template must render")
-        )
-    }
+/// aither's wording of a fork refusal.
+pub(crate) fn default_fork_refusal(refusal: &ForkRefusal) -> String {
+    crate::notices::rendered(&ForkRefusedTemplate { reason: refusal })
 }
 
 /// Structured response the fast model returns when routing a prompt.
@@ -937,6 +934,9 @@ pub struct SubagentTool<LLM> {
     /// Holds subagent prompts to the working language.
     #[cfg(feature = "languages")]
     languages: Option<crate::LanguageGuard>,
+    /// Renders the tool's refusals and every notice of the subagents it
+    /// builds.
+    notices: crate::AnyNotices,
 }
 
 impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
@@ -983,7 +983,18 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             task_events: None,
             #[cfg(feature = "languages")]
             languages: None,
+            notices: crate::AnyNotices::default(),
         }
+    }
+
+    /// Renders the tool's refusals, and every alert, notice and refusal of
+    /// the subagents it builds, through `notices`.
+    /// [`TerminalAgentBuilder::subagents`](crate::TerminalAgentBuilder::subagents)
+    /// sets the main agent's.
+    #[must_use]
+    pub fn with_notices(mut self, notices: crate::AnyNotices) -> Self {
+        self.notices = notices;
+        self
     }
 
     /// Sets the directory relative prompt paths resolve against, and whose
@@ -1078,6 +1089,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             task_events: self.task_events.clone(),
             #[cfg(feature = "languages")]
             languages: self.languages.clone(),
+            notices: self.notices.clone(),
         }
     }
 
@@ -1480,7 +1492,13 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         }
         #[cfg(feature = "languages")]
         if let Some(guard) = &self.languages {
-            guard.check_working(prompt, crate::WorkingText::Internal)?;
+            guard
+                .check_working(prompt, crate::WorkingText::Internal)
+                .map_err(|refusal| {
+                    aither_sandbox::Refused::rendered(refusal, |refusal| {
+                        self.notices.language_refusal(refusal)
+                    })
+                })?;
         }
         Ok(prompt.to_string())
     }
@@ -1520,20 +1538,25 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
     /// within 10% of its compaction point.
     fn fork_snapshot(&self) -> anyhow::Result<Arc<ForkSnapshot>> {
         if self.binding.is_none() {
-            return Err(ForkRefusal::NoTerminal.into_error());
+            return Err(self.refuse_fork(ForkRefusal::NoTerminal));
         }
         let snapshot = self
             .fork_source
             .latest()
-            .ok_or_else(|| ForkRefusal::NothingSent.into_error())?;
+            .ok_or_else(|| self.refuse_fork(ForkRefusal::NothingSent))?;
         if !snapshot.allows_fork() {
-            return Err(ForkRefusal::NearCompaction {
+            return Err(self.refuse_fork(ForkRefusal::NearCompaction {
                 usage: snapshot.usage() * 100.0,
                 compaction: snapshot.compaction_usage() * 100.0,
-            }
-            .into_error());
+            }));
         }
         Ok(snapshot)
+    }
+
+    /// The error refusing a fork for `refusal`, rendered for the model.
+    fn refuse_fork(&self, refusal: ForkRefusal) -> anyhow::Error {
+        aither_sandbox::Refused::rendered(refusal, |refusal| self.notices.fork_refusal(refusal))
+            .into()
     }
 
     /// Launches the terminal a subagent holding `grant` works from, within the
@@ -1656,11 +1679,10 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
             Some(fork) => {
                 let resolved = self.select_model(prompt, Some(fork.tier())).await?;
                 if resolved.1 != fork.model() {
-                    return Err(ForkRefusal::OtherModel {
+                    return Err(self.refuse_fork(ForkRefusal::OtherModel {
                         main: fork.model().to_string(),
                         fork: resolved.1,
-                    }
-                    .into_error());
+                    }));
                 }
                 resolved
             }
@@ -1669,7 +1691,8 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
         // A fork's builder takes the main agent's parameters over these when
         // it is made a fork of it.
         let selected = crate::AgentBuilder::new(self.model_for(tier).clone())
-            .request_parameters(self.parameters.get(tier).clone());
+            .request_parameters(self.parameters.get(tier).clone())
+            .notices(self.notices.clone());
 
         let agent_builder = match source {
             Source::Definition { definition, setup } => {
@@ -4634,7 +4657,10 @@ mod tests {
                 .tool(aither_sandbox::builtin::InputTerminalTool::new(
                     jobs.clone(),
                 ))
-                .tool(aither_sandbox::builtin::ReadTerminalDeltaTool::new(jobs))
+                .tool(aither_sandbox::builtin::ReadTerminalDeltaTool::new(
+                    jobs,
+                    aither_sandbox::AnySandboxNotices::default(),
+                ))
                 .fork_source(source)
                 .build()
         }

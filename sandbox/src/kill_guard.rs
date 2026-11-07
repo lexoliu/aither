@@ -17,9 +17,8 @@
 //! shell's stdin cannot be resolved and is not refused.
 
 use std::cell::Cell;
-use std::fmt::{self, Display};
+use std::fmt::Display;
 
-use askama::Template;
 use brush_parser::ast::{
     self, AndOrList, Assignment, AssignmentValue, Command, CommandPrefixOrSuffixItem,
     CompoundCommand, CompoundList, ExtendedTestExpr, IoFileRedirectTarget, IoRedirect, Pipeline,
@@ -33,6 +32,9 @@ use brush_parser::{Parser, ParserOptions, SourceInfo};
 const MAX_DEPTH: usize = 32;
 
 /// Why a command was refused before it ran.
+///
+/// [`SandboxNotices::command_refusal`](crate::SandboxNotices::command_refusal)
+/// renders its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandRefusal {
     /// The command invokes a program that kills by name or pattern.
@@ -47,30 +49,6 @@ pub enum CommandRefusal {
         reason: String,
     },
 }
-
-#[derive(Template)]
-#[template(path = "kill_by_name_refused.txt")]
-struct KillByNameTemplate<'a> {
-    program: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "unparsable_command_refused.txt")]
-struct UnparsableTemplate<'a> {
-    reason: &'a str,
-}
-
-impl Display for CommandRefusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rendered = match self {
-            Self::KillByName { program } => KillByNameTemplate { program }.render(),
-            Self::Unparsable { reason } => UnparsableTemplate { reason }.render(),
-        };
-        f.write_str(&rendered.map_err(|_| fmt::Error)?)
-    }
-}
-
-impl std::error::Error for CommandRefusal {}
 
 /// Refuses `script` when any command in it kills by name or pattern.
 ///
@@ -808,7 +786,7 @@ mod tests {
     fn refused_program(script: &str) -> Option<String> {
         match check(script) {
             Err(CommandRefusal::KillByName { program }) => Some(program),
-            Err(other) => panic!("`{script}` should parse: {other}"),
+            Err(other) => panic!("`{script}` should parse: {other:?}"),
             Ok(()) => None,
         }
     }
@@ -1101,16 +1079,16 @@ mod tests {
 
     #[test]
     fn refusal_tells_the_agent_to_kill_by_pid() {
-        let kill = CommandRefusal::KillByName {
+        use crate::notices::{DefaultSandboxNotices, SandboxNotices};
+
+        let kill = DefaultSandboxNotices.command_refusal(&CommandRefusal::KillByName {
             program: "pkill".to_string(),
-        }
-        .to_string();
+        });
         assert!(kill.contains("pkill"), "{kill}");
         assert!(kill.contains("PID"), "{kill}");
-        let parse = CommandRefusal::Unparsable {
+        let parse = DefaultSandboxNotices.command_refusal(&CommandRefusal::Unparsable {
             reason: "syntax error".to_string(),
-        }
-        .to_string();
+        });
         assert!(parse.contains("syntax error"), "{parse}");
     }
 }
