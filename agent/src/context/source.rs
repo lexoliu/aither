@@ -10,10 +10,18 @@
 //! hosts register whatever else they need with
 //! [`AgentOptions::context_source`](crate::AgentOptions::context_source).
 //!
-//! Every source renders into the *tail* of the request, never into the middle
-//! of it. The prefix a provider has cached stays byte-identical as the
-//! conversation grows, and content that changes on every single request is
-//! the last thing the model reads.
+//! A source declares its placement by the trait it implements:
+//!
+//! - a [`ContextSource`] renders into the *tail* of the request, never into
+//!   the middle of it, so content that changes on every single request is
+//!   the last thing the model reads and the cached prefix never moves;
+//! - a [`StableContextSource`] renders into the cacheable prefix, after the
+//!   system prompt and before the handoff, for large content that rarely
+//!   changes and would cost full input price on every request in the tail.
+//!   A change to it never rewrites a prefix the provider may hold: it is
+//!   staged, announced once by the alert the source writes for it, and
+//!   folded in at the next reassembly or compaction, exactly like a staged
+//!   system block (see [`Context::update_live`](crate::Context::update_live)).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -249,6 +257,160 @@ impl AnyContextSource {
     /// See [`ContextSource::on_final_turn`].
     pub fn on_final_turn(&mut self) -> impl Future<Output = Option<Block>> + Send + '_ {
         self.inner.on_final_turn()
+    }
+}
+
+/// A change to a [`StableContextSource`]'s block, as the model is to be told
+/// it: from the content it knows — the prefix's block with every change
+/// announced since applied — to the content just rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StableChange<'a> {
+    before: &'a str,
+    after: &'a str,
+}
+
+impl<'a> StableChange<'a> {
+    pub(crate) const fn new(before: &'a str, after: &'a str) -> Self {
+        Self { before, after }
+    }
+
+    /// The content the model knows; empty when the source had no block.
+    #[must_use]
+    pub const fn before(&self) -> &'a str {
+        self.before
+    }
+
+    /// The content the source rendered; empty when its block goes away.
+    #[must_use]
+    pub const fn after(&self) -> &'a str {
+        self.after
+    }
+
+    /// The unified diff from [`before`](Self::before) to
+    /// [`after`](Self::after), for the source's alert to carry.
+    #[must_use]
+    pub fn diff(&self) -> String {
+        super::live::unified_diff(self.before, self.after)
+    }
+}
+
+/// Supplies context that lives in the cacheable prefix of every request:
+/// after the system prompt, before the handoff.
+///
+/// While nothing has carried the prefix — the start of a session, or right
+/// after a reassembly or compaction — the rendered block is written into it.
+/// Once a request has, a change is staged instead: the prefix stays
+/// byte-identical, the alert [`announce`](Self::announce) writes for the
+/// change is appended to the conversation once, and the next reassembly or
+/// compaction folds the new block in and drops every such alert. A render
+/// that matches what the model knows announces nothing, so a source is
+/// rendered before every request at no cost to the cache.
+///
+/// The agent keeps the version the model has seen, so a source needs no
+/// commit step.
+///
+/// # Example
+///
+/// ```
+/// use aither_agent::{Block, StableChange, StableContextSource};
+///
+/// struct LinkedIssues(String);
+///
+/// impl StableContextSource for LinkedIssues {
+///     const TAG: &'static str = "linked_issues";
+///
+///     async fn render(&self) -> Option<String> {
+///         Some(self.0.clone())
+///     }
+///
+///     fn announce(&self, change: &StableChange<'_>) -> Block {
+///         Block::new("linked_issues_changed", change.diff())
+///     }
+/// }
+/// ```
+pub trait StableContextSource: Send + Sync + 'static {
+    /// The block's identity: its slot in the prefix. Unique among the
+    /// stable sources an agent holds.
+    const TAG: &'static str;
+
+    /// Renders the block's current content; `None` removes the block.
+    ///
+    /// Polled at every request boundary, so it may read files or query
+    /// registries; it must not block.
+    fn render(&self) -> impl Future<Output = Option<String>> + Send;
+
+    /// The durable alert telling the model of `change`, appended to the
+    /// conversation once while the prefix keeps the earlier version.
+    fn announce(&self, change: &StableChange<'_>) -> Block;
+}
+
+/// Object-safe twin of [`StableContextSource`].
+trait StableContextSourceImpl: Send + Sync {
+    fn tag(&self) -> &'static str;
+
+    fn render<'a>(&'a self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
+
+    fn announce(&self, change: &StableChange<'_>) -> Block;
+}
+
+impl<T: StableContextSource> StableContextSourceImpl for T {
+    fn tag(&self) -> &'static str {
+        T::TAG
+    }
+
+    fn render<'a>(&'a self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(StableContextSource::render(self))
+    }
+
+    fn announce(&self, change: &StableChange<'_>) -> Block {
+        StableContextSource::announce(self, change)
+    }
+}
+
+/// A type-erased [`StableContextSource`], so an agent can hold a
+/// heterogeneous set.
+pub struct AnyStableContextSource {
+    inner: Box<dyn StableContextSourceImpl>,
+}
+
+impl std::fmt::Debug for AnyStableContextSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnyStableContextSource")
+            .field("tag", &self.tag())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnyStableContextSource {
+    /// Erases the concrete type of `source`.
+    #[must_use]
+    pub fn new<T: StableContextSource>(source: T) -> Self {
+        Self {
+            inner: Box::new(source),
+        }
+    }
+
+    /// See [`StableContextSource::TAG`].
+    #[must_use]
+    pub fn tag(&self) -> &'static str {
+        self.inner.tag()
+    }
+
+    /// The slot the source's block takes in the prefix.
+    pub(crate) fn slot(&self) -> super::SourcedSlot {
+        super::SourcedSlot::new(self.tag())
+    }
+
+    /// See [`StableContextSource::render`].
+    pub fn render(&self) -> impl Future<Output = Option<String>> + Send + '_ {
+        self.inner.render()
+    }
+
+    /// See [`StableContextSource::announce`].
+    #[must_use]
+    pub fn announce(&self, change: &StableChange<'_>) -> Block {
+        self.inner.announce(change)
     }
 }
 

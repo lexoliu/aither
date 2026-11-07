@@ -10,6 +10,8 @@
 //! ┌───────────────────────────────┐
 //! │ system blocks (stable prefix) │  rewritten only by reassembly
 //! ├───────────────────────────────┤
+//! │ stable source blocks          │  rewritten only by reassembly
+//! ├───────────────────────────────┤
 //! │ handoff document              │  replaced only by compaction
 //! ├───────────────────────────────┤
 //! │ conversation items (seq 1..n) │  append-only
@@ -45,9 +47,10 @@ use aither_core::llm::{Message, Role, ToolCall};
 
 use super::compaction::Handoff;
 use super::live::{LiveContent, LiveUpdate};
-use super::source::Block;
+use super::source::{Block, StableChange};
 use super::system::{
-    External, Instruction, SystemLayout, SystemRegion, TaggedBlockTemplate, render_prefix,
+    External, Instruction, Sourced, SourcedSlot, SystemLayout, SystemRegion, TaggedBlockTemplate,
+    render_prefix,
 };
 
 /// Tombstone text left in place of a superseded tool result.
@@ -139,6 +142,13 @@ pub struct Context {
     #[serde(default = "default_external")]
     external: SystemRegion<External>,
 
+    /// The blocks stable context sources render, one system message each
+    /// after the system prefix, in the order the sources were registered.
+    /// A change made after a request carried them is staged like a live
+    /// system block's.
+    #[serde(default = "default_sourced")]
+    sourced: SystemRegion<Sourced>,
+
     /// Compaction handoff document from the previous compaction.
     ///
     /// Rendered immediately after the stable system prefix.
@@ -172,6 +182,10 @@ fn default_external() -> SystemRegion<External> {
     SystemRegion::with_order(SystemLayout::default().into_regions().1)
 }
 
+const fn default_sourced() -> SystemRegion<Sourced> {
+    SystemRegion::with_order(Vec::new())
+}
+
 impl Context {
     /// Creates a new empty context with the default [`SystemLayout`].
     #[must_use]
@@ -186,6 +200,7 @@ impl Context {
         Self {
             instructions: SystemRegion::with_order(instructions),
             external: SystemRegion::with_order(external),
+            sourced: default_sourced(),
             handoff: None,
             items: Vec::new(),
             next_seq: 0,
@@ -279,10 +294,40 @@ impl Context {
         self.prefix_sent = true;
     }
 
-    /// Returns the number of persistent system blocks.
+    /// The blocks stable context sources rendered, as the prefix holds them.
+    #[must_use]
+    pub const fn stable_blocks(&self) -> &SystemRegion<Sourced> {
+        &self.sourced
+    }
+
+    /// Brings the stable source block in `slot` to `desired` (`None` removes
+    /// it), the way [`update_live`](Self::update_live) brings a system block.
+    ///
+    /// A slot seen for the first time takes its place after every slot seen
+    /// before it, so blocks render in the order their sources are synced.
+    /// Before any request has carried the prefix the block is written into
+    /// it. After, the prefix is left byte-identical, the change is staged for
+    /// the next reassembly, and the alert `announce` writes for it is
+    /// appended — removed, like every live-content alert, by that
+    /// reassembly. Returns the alert's length when one was appended.
+    pub(crate) fn update_stable(
+        &mut self,
+        slot: &SourcedSlot,
+        desired: Option<String>,
+        announce: impl FnOnce(&StableChange<'_>) -> Block,
+    ) -> Option<usize> {
+        self.sourced.place(slot.clone());
+        let change = self.sourced.change(slot, desired, self.prefix_sent)?;
+        let alert = announce(&StableChange::new(&change.before, &change.after));
+        self.push_item(Message::system(alert.content()), ItemKind::LiveAlert);
+        Some(alert.len())
+    }
+
+    /// Returns the number of persistent system blocks, stable source blocks
+    /// included.
     #[must_use]
     pub fn system_block_count(&self) -> usize {
-        self.instructions.len() + self.external.len()
+        self.instructions.len() + self.external.len() + self.sourced.len()
     }
 
     /// Renders the cacheable system prefix: the instruction blocks, then the
@@ -292,23 +337,27 @@ impl Context {
         render_prefix(&self.instructions, &self.external)
     }
 
-    /// Returns a stable fingerprint of the rendered system prefix.
+    /// Returns a stable fingerprint of the rendered system prefix and the
+    /// stable source blocks after it.
     ///
-    /// The fingerprint changes if and only if the prefix's bytes change.
-    /// Hosts can use this to detect cache-invalidating modifications to the
-    /// stable system prefix (for example, to track KV-cache hit rate over
-    /// time).
+    /// The fingerprint changes if and only if those bytes change. Hosts can
+    /// use this to detect cache-invalidating modifications to the stable
+    /// prefix (for example, to track KV-cache hit rate over time).
     #[must_use]
     pub fn stable_prefix_fingerprint(&self) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.system_prefix().hash(&mut hasher);
+        for (_, block) in self.sourced.iter() {
+            block.hash(&mut hasher);
+        }
         hasher.finish()
     }
 
-    /// Whether any system block rewrite is waiting for reassembly.
+    /// Whether any system block or stable source block rewrite is waiting
+    /// for reassembly.
     #[must_use]
     pub fn has_staged_system_updates(&self) -> bool {
-        self.instructions.has_staged() || self.external.has_staged()
+        self.instructions.has_staged() || self.external.has_staged() || self.sourced.has_staged()
     }
 
     // ── Handoff ───────────────────────────────────────────────────────
@@ -477,20 +526,27 @@ impl Context {
     ///
     /// Layout:
     /// 1. persistent system blocks, as one cacheable system message,
-    /// 2. the compaction handoff, if any,
-    /// 3. the append-only conversation,
-    /// 4. one system message holding every live tail block.
+    /// 2. each stable source block, as a system message of its own,
+    /// 3. the compaction handoff, if any,
+    /// 4. the append-only conversation,
+    /// 5. one system message holding every live tail block.
     ///
-    /// Steps 1-3 are byte-identical to the previous request whenever nothing
+    /// Steps 1-4 are byte-identical to the previous request whenever nothing
     /// was staged or compacted, which is exactly the condition a provider
     /// prefix cache needs.
     #[must_use]
     pub fn build_request(&self, tail: &[Block]) -> Vec<Message> {
-        let mut messages = Vec::with_capacity(self.items.len() + 3);
+        let mut messages = Vec::with_capacity(self.items.len() + self.sourced.len() + 3);
 
         if let Some(prefix) = self.system_prefix() {
             messages.push(Message::system(prefix));
         }
+
+        messages.extend(
+            self.sourced
+                .iter()
+                .map(|(_, block)| Message::system(block.as_str())),
+        );
 
         if let Some(handoff) = &self.handoff {
             messages.push(Message::system(handoff.render()));
@@ -527,11 +583,12 @@ impl Context {
     #[must_use]
     pub fn stable_chars(&self) -> usize {
         let blocks = self.system_prefix().map_or(0, |prefix| prefix.len());
+        let sourced: usize = self.sourced.iter().map(|(_, block)| block.len()).sum();
         let handoff = self
             .handoff
             .as_ref()
             .map_or(0, |handoff| handoff.render().len());
-        blocks + handoff
+        blocks + sourced + handoff
     }
 
     /// The number of characters the conversation renders to.
@@ -560,6 +617,7 @@ impl Context {
     pub fn clear_all(&mut self) {
         self.instructions.clear();
         self.external.clear();
+        self.sourced.clear();
         self.prefix_sent = false;
         self.clear_history();
     }
@@ -707,6 +765,7 @@ impl Context {
         for (applied, freed) in [
             self.instructions.apply_staged(),
             self.external.apply_staged(),
+            self.sourced.apply_staged(),
         ] {
             report.staged_updates_applied += applied;
             report.bytes_freed += freed;
@@ -1276,14 +1335,25 @@ mod tests {
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
+        assert_eq!(set_issues(&mut context, "#23 open"), None);
         context.push(Message::user("first"));
 
         let before = context.build_request(&[Block::new("tasks", "<tasks>v1</tasks>")]);
         let prefix_len = before.len() - 1;
+        context.mark_prefix_sent();
 
         context.push(Message::assistant("answer"));
+        // A stable source rendered again, unchanged and then changed: the
+        // change is appended, the block the prefix holds stays.
+        assert_eq!(set_issues(&mut context, "#23 open"), None);
+        assert!(set_issues(&mut context, "#23 closed").is_some());
         context.push(Message::user("second"));
         let after = context.build_request(&[Block::new("tasks", "<tasks>v2</tasks>")]);
+        assert_eq!(
+            before[1].content(),
+            "#23 open",
+            "the stable block is cached"
+        );
 
         for index in 0..prefix_len {
             assert_eq!(
@@ -1293,6 +1363,96 @@ mod tests {
             );
         }
         assert!(after.last().expect("tail present").content().contains("v2"));
+    }
+
+    const ISSUES: SourcedSlot = SourcedSlot::new("linked_issues");
+
+    /// The alert a stable source of linked issues writes for a change.
+    fn announce_issues(change: &StableChange<'_>) -> Block {
+        Block::new("linked_issues_changed", change.diff())
+    }
+
+    fn set_issues(context: &mut Context, text: &str) -> Option<usize> {
+        context.update_stable(&ISSUES, Some(text.to_owned()), announce_issues)
+    }
+
+    /// A stable source's block is prefix content: after the system prompt,
+    /// before the handoff and the conversation.
+    #[test]
+    fn a_stable_block_sits_between_the_system_prompt_and_the_handoff() {
+        let mut context = Context::new();
+        context
+            .instructions_mut()
+            .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
+        context.set_handoff(Handoff::new("summary"));
+        context.push(Message::user("hello"));
+        assert_eq!(set_issues(&mut context, "#23 open"), None);
+
+        let messages = context.build_request(&[Block::new("tasks", "<tasks>todo</tasks>")]);
+
+        assert_eq!(messages.len(), 5);
+        assert!(messages[0].content().contains("be useful"));
+        assert_eq!(messages[1].role(), Role::System);
+        assert_eq!(messages[1].content(), "#23 open");
+        assert!(messages[2].content().contains("summary"));
+        assert_eq!(messages[3].content(), "hello");
+        assert!(messages[4].content().contains("todo"));
+        assert!(context.stable_chars() >= "#23 open".len());
+    }
+
+    /// While the block is cached, a change is one alert and the prefix keeps
+    /// the old block; reassembly folds the new one in and drops the alert.
+    #[test]
+    fn a_stable_change_is_announced_once_and_folded_in_at_reassembly() {
+        let mut context = Context::new();
+        assert_eq!(set_issues(&mut context, "#23 open\n"), None);
+        context.mark_prefix_sent();
+        let fingerprint = context.stable_prefix_fingerprint();
+
+        assert_eq!(set_issues(&mut context, "#23 open\n"), None);
+        assert!(set_issues(&mut context, "#23 closed\n").is_some());
+        // Rendering the same change again announces nothing.
+        assert_eq!(set_issues(&mut context, "#23 closed\n"), None);
+
+        let alerts = live_alerts(&context);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("\n-#23 open\n+#23 closed\n"));
+        assert_eq!(context.build_messages()[0].content(), "#23 open\n");
+        assert_eq!(context.stable_prefix_fingerprint(), fingerprint);
+        assert!(context.has_staged_system_updates());
+
+        let report = context.reassemble();
+        assert_eq!(report.staged_updates_applied, 1);
+        assert_eq!(context.build_messages()[0].content(), "#23 closed\n");
+        assert_eq!(context.build_messages().len(), 1, "the alert is gone");
+        assert_ne!(context.stable_prefix_fingerprint(), fingerprint);
+        assert_eq!(set_issues(&mut context, "#23 closed\n"), None);
+    }
+
+    /// A compaction folds the staged block in, its alert does not outlive
+    /// it, and a block the source stopped rendering leaves the prefix there
+    /// too.
+    #[test]
+    fn a_compaction_folds_a_stable_change_in_and_drops_its_alert() {
+        const PRS: SourcedSlot = SourcedSlot::new("linked_prs");
+        let mut context = Context::new();
+        set_issues(&mut context, "#23 open");
+        context.update_stable(&PRS, Some("#40 draft".to_owned()), announce_issues);
+        context.mark_prefix_sent();
+        context.push(Message::user("before the fork"));
+        assert!(set_issues(&mut context, "#23 closed").is_some());
+        let fork_point = context.fork_point();
+        assert!(context.update_stable(&PRS, None, announce_issues).is_some());
+        assert_eq!(context.build_messages()[1].content(), "#40 draft");
+
+        context.reassemble_below(fork_point);
+        context.apply_handoff(handoff(), fork_point, 0);
+
+        assert_eq!(live_alerts(&context), Vec::<String>::new());
+        let messages = context.build_messages();
+        assert_eq!(messages[0].content(), "#23 closed");
+        assert!(messages[1].content().contains("handoff"));
+        assert_eq!(context.stable_blocks().len(), 1);
     }
 
     const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");

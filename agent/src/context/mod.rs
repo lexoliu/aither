@@ -21,7 +21,8 @@
 //! - [`reassembly`] re-reads what the handoff named, within budget;
 //! - [`source`] is how everything ambient — working documents, running jobs,
 //!   active skills — reaches the model without the agent loop knowing about
-//!   any of it in particular;
+//!   any of it in particular, in the tail or, for content that rarely
+//!   changes, in the cacheable prefix;
 //! - [`live`] is how prefix content that changes mid-session — `AGENTS.md`,
 //!   the command table — reaches the model as one diff while the prefix is
 //!   cached and as its clean version after the next reassembly.
@@ -50,12 +51,15 @@ pub use live::{LiveContent, LiveUpdate};
 pub use policy::ContextPolicy;
 pub use prefix::{PrefixBlock, PrefixChain, PrefixRewrites, PromptPrefix};
 pub use reassembly::restore_context;
-pub use source::{AnyContextSource, Block, ContextSource};
+pub use source::{
+    AnyContextSource, AnyStableContextSource, Block, ContextSource, StableChange,
+    StableContextSource,
+};
 #[cfg(feature = "skills")]
 pub use sources::ActiveSkills;
 pub use sources::BackgroundJobs;
 pub use system::{
     BlockKind, External, ExternalContent, ExternalSlot, Instruction, InstructionSlot, Slot,
-    SystemLayout, SystemRegion,
+    Sourced, SourcedSlot, SystemLayout, SystemRegion,
 };
 pub use window::{Context, ContextCheckpoint, ContextItem, ReassemblyReport};
