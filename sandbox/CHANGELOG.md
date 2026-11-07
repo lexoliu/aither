@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/May-Agent/aither/compare/sandbox-v0.22.0...sandbox-v0.23.0) - 2026-11-07
+
+### Added
+
+- *(sandbox)* variadic positional arguments and negative numbers in the CLI bridge
+- *(sandbox)* [**breaking**] command refusals become embedder policies behind CommandPolicy
+- *(agent)* [**breaking**] render every alert, notice and refusal through embedder-supplied Notices
+
+### Fixed
+
+- *(sandbox)* [**breaking**] pin each tool artifact's byte size instead of capping at 64 MiB
+- *(sandbox)* count a process reaped mid-read of /proc as dead in the exec wrapper tests
+
+### Other
+
+- Merge pull request #615 from May-Agent/feat/598-command-policy
+- merge main into dev after v0.22.0
+- Merge pull request #612 from May-Agent/feat/595-notices
+
 ## [0.22.0](https://github.com/May-Agent/aither/compare/sandbox-v0.21.0...sandbox-v0.22.0) - 2026-11-07
 
 ### Added
