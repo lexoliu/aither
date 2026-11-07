@@ -340,6 +340,13 @@ enum JobRequest {
         task_id: String,
         reply: Sender<Option<JobInfo>>,
     },
+    /// Appends `chunk` to the stdout of task `task_id`, replying once it is
+    /// in; a task not registered yet gets it when it registers.
+    AppendTaskStdout {
+        task_id: String,
+        chunk: Vec<u8>,
+        reply: Sender<()>,
+    },
     OweCompletion {
         task_id: String,
         ending: Result<i32, String>,
@@ -621,6 +628,21 @@ impl JobRegistry {
             chunk,
         })
         .await;
+    }
+
+    /// Appends stdout bytes to task `task_id`, returning once they are in its
+    /// output. A task whose job is not registered yet (its process may already
+    /// be running a command) gets them as it registers, ahead of anything the
+    /// process wrote later.
+    pub async fn append_task_stdout(&self, task_id: &str, chunk: Vec<u8>) {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::AppendTaskStdout {
+            task_id: task_id.to_string(),
+            chunk,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await;
     }
 
     /// Marks stdout stream closed.
@@ -982,6 +1004,16 @@ impl JobRegistry {
     }
 }
 
+/// Stdout appends for tasks whose job is not registered yet, by task id, in
+/// arrival order, each with the reply that releases its sender.
+#[derive(Default)]
+struct ParkedOutput {
+    by_task: HashMap<String, Vec<ParkedAppend>>,
+}
+
+/// One parked append: its bytes and the reply that releases its sender.
+type ParkedAppend = (Vec<u8>, Sender<()>);
+
 /// Per-session read tracking behind the unchanged-read refusal: what each
 /// task's last `terminal_read` returned with.
 #[derive(Default)]
@@ -995,21 +1027,26 @@ impl JobRegistryService {
     pub async fn serve(self) {
         let mut jobs: HashMap<u32, JobState> = HashMap::new();
         let mut reads = ReadTracker::default();
+        let mut parked = ParkedOutput::default();
 
         while let Ok(command) = self.rx.recv().await {
             match command {
                 JobCommand::State(command) => {
-                    handle_state_command(&mut jobs, command).await;
+                    handle_state_command(&mut jobs, &mut parked, command).await;
                 }
                 JobCommand::Request(request) => {
-                    handle_job_request(&mut jobs, &mut reads, &self.tx, request).await;
+                    handle_job_request(&mut jobs, &mut reads, &mut parked, &self.tx, request).await;
                 }
             }
         }
     }
 }
 
-async fn handle_state_command(jobs: &mut HashMap<u32, JobState>, command: StateCommand) {
+async fn handle_state_command(
+    jobs: &mut HashMap<u32, JobState>,
+    parked: &mut ParkedOutput,
+    command: StateCommand,
+) {
     match command {
         StateCommand::Register {
             pid,
@@ -1022,6 +1059,7 @@ async fn handle_state_command(jobs: &mut HashMap<u32, JobState>, command: StateC
             process_tree,
             place,
         } => {
+            let waiting = parked.by_task.remove(&task_id);
             register_job(
                 jobs,
                 pid,
@@ -1035,6 +1073,10 @@ async fn handle_state_command(jobs: &mut HashMap<u32, JobState>, command: StateC
             );
             if let Some(job) = jobs.get_mut(&pid) {
                 job.process_tree = process_tree;
+            }
+            for (chunk, reply) in waiting.into_iter().flatten() {
+                append_terminal_output(jobs, pid, TerminalStream::Stdout, chunk).await;
+                let _ = reply.send(()).await;
             }
         }
         StateCommand::AttachTerminalInput { pid, input_tx } => {
@@ -1083,10 +1125,27 @@ async fn handle_state_command(jobs: &mut HashMap<u32, JobState>, command: StateC
 async fn handle_job_request(
     jobs: &mut HashMap<u32, JobState>,
     reads: &mut ReadTracker,
+    parked: &mut ParkedOutput,
     tx: &WeakSender<JobCommand>,
     request: JobRequest,
 ) {
     match request {
+        JobRequest::AppendTaskStdout {
+            task_id,
+            chunk,
+            reply,
+        } => {
+            if let Some(pid) = find_pid_by_task_id(jobs, &task_id) {
+                append_terminal_output(jobs, pid, TerminalStream::Stdout, chunk).await;
+                let _ = reply.send(()).await;
+            } else {
+                parked
+                    .by_task
+                    .entry(task_id)
+                    .or_default()
+                    .push((chunk, reply));
+            }
+        }
         JobRequest::List { reply } => {
             let items = jobs.values().map(|state| state.info.clone()).collect();
             let _ = reply.send(items).await;
@@ -1879,6 +1938,43 @@ mod tests {
             .spawn(async move { service.serve().await })
             .detach();
         registry
+    }
+
+    #[tokio::test]
+    async fn task_output_appended_before_registration_lands_first_and_in_order() {
+        let registry = spawn_registry();
+        let appends = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .append_task_stdout("task-early", b"one\n".to_vec())
+                    .await;
+                registry
+                    .append_task_stdout("task-early", b"two\n".to_vec())
+                    .await;
+            })
+        };
+        // The appends are parked: the job does not exist, and their sender
+        // is still waiting for it.
+        tokio::task::yield_now().await;
+        assert!(!appends.is_finished());
+        assert!(registry.get_by_task_id("task-early").await.is_none());
+
+        registry
+            .register(
+                9,
+                "task-early",
+                "exec-e",
+                "run",
+                TerminalMode::Sandboxed,
+                None,
+            )
+            .await;
+        appends.await.expect("appends are released by registration");
+        registry.append_stdout(9, b"three\n".to_vec()).await;
+
+        let (stdout, _) = registry.terminal_output(9).await.expect("job exists");
+        assert_eq!(stdout, b"one\ntwo\nthree\n");
     }
 
     #[tokio::test]

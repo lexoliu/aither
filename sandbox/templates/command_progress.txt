@@ -1,0 +1,2 @@
+progress: {{ done }}{% if let Some(total) = total %}/{{ total }}{% endif %}{% if let Some(message) = message %} - {{ message }}{% endif %}
+
