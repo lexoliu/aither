@@ -1,4 +1,4 @@
-//! References to tracked work as `tasks.md` writes them.
+//! References to tracked work, and the words of a row's text.
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -14,8 +14,8 @@ pub enum WorkKind {
 
 /// A reference to an issue or a pull request.
 ///
-/// `tasks.md` writes one as `#12` or `owner/repo#12` for an issue, and as
-/// `PR #12` or `PR owner/repo#12` for a pull request. An unqualified
+/// [`parse_all`](Self::parse_all) reads `#12` or `owner/repo#12` as an
+/// issue, and `PR #12` or `PR owner/repo#12` as a pull request. An unqualified
 /// reference means the session's own repository; what that is, and where
 /// the item lives, is the [`WorkTracker`](super::WorkTracker)'s business.
 ///
@@ -121,7 +121,7 @@ impl WorkRef {
     pub fn parse_all(text: &str) -> Vec<Self> {
         let mut references = Vec::new();
         let mut previous: Option<&str> = None;
-        for token in tokens(text) {
+        for token in words(text) {
             let pull_request = previous.is_some_and(|word| word.eq_ignore_ascii_case("PR"));
             if let Some(reference) = parse_token(token, pull_request) {
                 references.push(reference);
@@ -146,7 +146,11 @@ impl fmt::Display for WorkRef {
 
 /// The words of `text`, split at whitespace and at the punctuation that
 /// surrounds a reference in prose or markdown.
-pub fn tokens(text: &str) -> impl Iterator<Item = &str> {
+///
+/// [`DocumentRow::names`](super::DocumentRow::names) matches ids against
+/// them; a schema reads the payload of its own marks with them, so markdown
+/// and punctuation around a word do not hide it.
+pub fn words(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| {
         c.is_whitespace()
             || matches!(

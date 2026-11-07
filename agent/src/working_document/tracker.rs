@@ -1,7 +1,7 @@
-//! Where the issues and pull requests `tasks.md` names live.
+//! Where the issues and pull requests a working document names live.
 //!
 //! The harness knows no forge: the host implements [`WorkTracker`] over its
-//! own issue and pull-request backends, and the tasks document asks it what
+//! own issue and pull-request backends, and the working document asks it what
 //! state an item is in and what hangs under a root.
 
 use std::collections::{HashMap, HashSet};
@@ -135,7 +135,7 @@ pub enum WorkTrackerError {
     },
 }
 
-/// Reads the issues and pull requests `tasks.md` names.
+/// Reads the issues and pull requests a working document names.
 pub trait WorkTracker: Send + Sync + 'static {
     /// The item `reference` names in full, with its relations.
     fn item(

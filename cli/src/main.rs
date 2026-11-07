@@ -604,7 +604,7 @@ const SUBAGENT_DESCRIPTION: &str = "Run a named subagent, fork your context, or 
 
 /// Run a single prompt and exit (headless mode).
 async fn run_headless(cloud: CloudProvider, args: &Args, prompt: &str) -> Result<()> {
-    let mut agent = build_agent(cloud, args).await?;
+    let mut agent = Box::pin(build_agent(cloud, args)).await?;
 
     match Box::pin(agent.query(prompt)).await {
         Ok(response) => {
@@ -619,7 +619,7 @@ async fn run_headless(cloud: CloudProvider, args: &Args, prompt: &str) -> Result
 }
 
 async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
-    let mut agent = build_agent(cloud, args).await?;
+    let mut agent = Box::pin(build_agent(cloud, args)).await?;
 
     println!("Agent ready. Type your message or a command.\n");
 

@@ -1,8 +1,0 @@
-<tasks_document>
-{% if let Some(tasks) = tasks %}Contents of tasks.md:
-{{ tasks }}
-{% endif %}{% if let Some(changes) = changes %}Changes to tasks.md since it was last shown:
-{{ changes }}
-{% endif %}{% if let Some(trees) = trees %}The issues under the roots of tasks.md, with their sub-issues and the issues they are blocked by:
-{{ trees }}
-{% endif %}</tasks_document>

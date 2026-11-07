@@ -16,8 +16,8 @@ pub struct AgentCheckpoint {
     pub context_window: ContextWindowSnapshot,
     /// Whether background work was still active when the checkpoint was exported.
     pub has_background_tasks: bool,
-    /// What the conversation holds of `tasks.md`; `None` when it holds
-    /// nothing, so a restored agent shows the document whole.
+    /// What the conversation holds of the working document; `None` when it
+    /// holds nothing, so a restored agent shows the document whole.
     #[serde(default)]
-    pub tasks: Option<crate::tasks::TasksCheckpoint>,
+    pub document: Option<crate::working_document::DocumentCheckpoint>,
 }

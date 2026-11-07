@@ -972,7 +972,11 @@ where
         if let Some(subagents) = self.subagents {
             let subagents = (*subagents)
                 .with_handoff::<Schema>()
-                .with_notices(notices.clone());
+                .with_notices(notices.clone())
+                .with_working_document(
+                    self.inner.chosen_document().cloned(),
+                    self.inner.chosen_stop_hook().cloned(),
+                );
             registry_builder.main_exclusive(|main| {
                 main.configure_terminal_bound_usage_tool("subagent", move |binding| {
                     subagents.for_terminal(binding)
@@ -1338,7 +1342,7 @@ mod tests {
         );
     }
     #[test]
-    fn continuation_block_holds_work_an_open_question_blocks() {
+    fn the_prompt_carries_no_working_document_protocol() {
         let prompt = SystemPrompt {
             os: String::new(),
             os_version: String::new(),
@@ -1354,20 +1358,9 @@ mod tests {
         }
         .render()
         .unwrap();
-        assert!(prompt.contains("<continuation>\nIf work is blocked by a missing user decision, use `ask_user`. A row waiting on an open question — or on anything else the run cannot resolve — is marked `BLOCKING <request_id or reason>` in tasks.md; blocked rows wait instead of holding the turn. A mark naming a request that is no longer open does not hold.\nDo not stop while a row under Doing or Queued that nothing blocks remains.\n</continuation>"));
-        assert!(!prompt.contains("use `ask_user` and continue"));
-        // The format names its sections and requires the document current
-        // before a compaction.
-        for needle in [
-            "## Roots — ",
-            "## Doing — ",
-            "## Queued — ",
-            "## Notes — ",
-            "## Decisions — ",
-            "rows are not checkboxes",
-            "before calling `compact`",
-        ] {
-            assert!(prompt.contains(needle), "missing {needle:?}");
+        // The embedder states the protocol of its own working document.
+        for needle in ["tasks.md", "BLOCKING", "## Doing"] {
+            assert!(!prompt.contains(needle), "{needle:?} in {prompt}");
         }
     }
 

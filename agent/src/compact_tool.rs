@@ -233,7 +233,7 @@ mod tests {
     fn the_description_asks_for_a_clean_point_and_tidy_notes() {
         let tool = CompactTool::new(std::sync::Arc::default(), crate::AnyNotices::default());
         let description = tool.description();
-        for needle in ["clean point", "topic", "`tasks.md`", "verbatim"] {
+        for needle in ["clean point", "topic", "notes", "verbatim"] {
             assert!(description.contains(needle), "{needle}: {description}");
         }
     }

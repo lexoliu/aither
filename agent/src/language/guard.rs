@@ -72,7 +72,7 @@ pub enum LanguageAlert {
     Record {
         /// The working language.
         language: Language,
-        /// The record that changed, such as `tasks.md`.
+        /// The record that changed: the working document's name.
         document: String,
     },
 }
@@ -96,7 +96,7 @@ struct TranslateTemplate {
 
 /// The language checks of one session, cloned into every place that writes.
 ///
-/// The agent loop checks replies and `tasks.md` with it; a harness command
+/// The agent loop checks replies and the working document with it; a harness command
 /// that takes text from the agent holds a clone and calls
 /// [`check_working`](Self::check_working) before it acts, as the `issue`,
 /// pull request and agent-message commands do. The clones share the user's

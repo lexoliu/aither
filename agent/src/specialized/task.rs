@@ -932,9 +932,13 @@ pub struct SubagentTool<LLM, Schema = HandoffDocument> {
     /// The external hooks of the agent this tool serves: told when a
     /// subagent starts and stops, and the parent of each subagent's own scope.
     hooks: Option<ExternalHooks>,
-    /// The main agent's tasks inbox, told when a subagent starts and
-    /// finishes.
-    task_events: Option<crate::tasks::TaskEvents>,
+    /// The main agent's working-document inbox, told when a subagent starts
+    /// and finishes.
+    work_events: Option<crate::working_document::WorkEvents>,
+    /// The working document every subagent keeps in its own space.
+    document: Option<crate::working_document::DocumentSpec>,
+    /// The stop rule every subagent's run follows.
+    stop_hook: Option<crate::AnyStopHook>,
     /// Holds subagent prompts to the working language.
     #[cfg(feature = "languages")]
     languages: Option<crate::LanguageGuard>,
@@ -984,7 +988,9 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             finished: Arc::new(FinishedSubagents::new()),
             fork_source: ForkSource::default(),
             hooks: None,
-            task_events: None,
+            work_events: None,
+            document: None,
+            stop_hook: None,
             #[cfg(feature = "languages")]
             languages: None,
             notices: crate::AnyNotices::default(),
@@ -1018,7 +1024,9 @@ impl<LLM: Clone + Sync, Schema> SubagentTool<LLM, Schema> {
             finished: Arc::new(FinishedSubagents::new()),
             fork_source: self.fork_source,
             hooks: self.hooks,
-            task_events: self.task_events,
+            work_events: self.work_events,
+            document: self.document,
+            stop_hook: self.stop_hook,
             #[cfg(feature = "languages")]
             languages: self.languages,
             notices: self.notices,
@@ -1124,30 +1132,47 @@ impl<LLM: Clone + Sync, Schema> SubagentTool<LLM, Schema> {
             finished: Arc::new(FinishedSubagents::new()),
             fork_source: self.fork_source.clone(),
             hooks: ExternalHooks::of_observer(binding.observer()).or_else(|| self.hooks.clone()),
-            task_events: self.task_events.clone(),
+            work_events: self.work_events.clone(),
             #[cfg(feature = "languages")]
             languages: self.languages.clone(),
             notices: self.notices.clone(),
+            document: self.document.clone(),
+            stop_hook: self.stop_hook.clone(),
         }
     }
 
     /// Records each subagent's start and finish on `events`, the inbox of
-    /// the main agent's `tasks.md`, so a row waiting on a subagent follows
-    /// it.
+    /// the main agent's working document, so a row waiting on a subagent
+    /// follows it.
     #[must_use]
-    pub fn with_task_events(mut self, events: crate::tasks::TaskEvents) -> Self {
-        self.task_events = Some(events);
+    pub fn with_work_events(mut self, events: crate::working_document::WorkEvents) -> Self {
+        self.work_events = Some(events);
         self
     }
 
-    /// Records `event` on the main agent's tasks inbox, when there is one.
-    fn record(&self, event: crate::tasks::TaskEvent) {
-        if let Some(events) = &self.task_events {
+    /// Has every subagent keep the working document `spec` describes, in
+    /// its own space, and decide through `stop_hook` whether its run ends.
+    /// [`TerminalAgentBuilder::subagents`](crate::TerminalAgentBuilder::subagents)
+    /// sets the main agent's.
+    #[must_use]
+    pub fn with_working_document(
+        mut self,
+        spec: Option<crate::working_document::DocumentSpec>,
+        stop_hook: Option<crate::AnyStopHook>,
+    ) -> Self {
+        self.document = spec;
+        self.stop_hook = stop_hook;
+        self
+    }
+
+    /// Records `event` on the main agent's inbox, when there is one.
+    fn record(&self, event: crate::working_document::WorkEvent) {
+        if let Some(events) = &self.work_events {
             events.record(event);
         }
     }
 
-    /// Tells the hooks and the tasks inbox that `subagent` starts on `prompt`.
+    /// Tells the hooks and the main agent's inbox that `subagent` starts on `prompt`.
     async fn announce_start(&self, subagent: &str, prompt: &str) {
         if let Some(hooks) = &self.hooks {
             hooks
@@ -1157,7 +1182,7 @@ impl<LLM: Clone + Sync, Schema> SubagentTool<LLM, Schema> {
                 })
                 .await;
         }
-        self.record(crate::tasks::TaskEvent::SubagentStarted(
+        self.record(crate::working_document::WorkEvent::SubagentStarted(
             subagent.to_string(),
         ));
     }
@@ -1728,9 +1753,15 @@ impl<LLM: LanguageModel + Clone + Sync + 'static, Schema: HandoffSchema> Subagen
         };
         // A fork's builder takes the main agent's parameters over these when
         // it is made a fork of it.
-        let selected = crate::AgentBuilder::new(self.model_for(tier).clone())
+        let mut selected = crate::AgentBuilder::new(self.model_for(tier).clone())
             .request_parameters(self.parameters.get(tier).clone())
             .notices(self.notices.clone());
+        if let Some(spec) = &self.document {
+            selected = selected.working_document(spec.clone());
+        }
+        if let Some(hook) = &self.stop_hook {
+            selected = selected.stop_hook(hook.clone());
+        }
 
         let agent_builder = match source {
             Source::Definition { definition, setup } => {
@@ -2038,7 +2069,7 @@ where
             .run(&run_prompt(&prompt, resumed, &working_copies), cancel_rx)
             .await;
         let body = hold.finish();
-        self.record(crate::tasks::TaskEvent::SubagentFinished(
+        self.record(crate::working_document::WorkEvent::SubagentFinished(
             subagent_id.clone(),
         ));
         if let Some(hooks) = &self.hooks {
@@ -4694,6 +4725,7 @@ mod tests {
                         .with_context_policy(policy),
                 )
                 .agent_kind(crate::AgentKind::Chatbot)
+                .working_document(tasks_document())
                 .dyn_terminal(self.terminal.clone().to_dyn())
                 .compact_tool()
                 .tool(aither_sandbox::builtin::KillTerminalTool::new(jobs.clone()))
@@ -6022,10 +6054,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Writes a finished item: an unchecked one would rightly hold the
-    /// probe's final turn open.
-    /// Writes a well-formed `tasks.md` whose only content holds no turn open,
-    /// so the subagent ends after its two requests.
+    /// The working document the fixture's agents keep: `tasks.md`, read by
+    /// the test schema.
+    fn tasks_document() -> crate::DocumentSpec {
+        crate::DocumentSpec::new("tasks.md", crate::working_document::test_schema::ListSchema)
+    }
+
+    /// Writes a `tasks.md` with no open row, so the subagent ends after its
+    /// two requests.
     const TASKS_PROBE: &str =
         "printf '%s\\n' '## Notes' 'SUBAGENT-TASK' > tasks.md && echo written";
     const SUBAGENT_TASKS: &str = "## Notes\nSUBAGENT-TASK\n";
@@ -6054,6 +6090,7 @@ mod tests {
             seen: seen_tx,
         };
         let tool = SubagentTool::new(llm.clone(), fixture.bundled.global())
+            .with_working_document(Some(tasks_document()), None)
             .for_terminal(fixture.terminal.binding());
         let mut main = fixture.main_agent(llm, tool.fork_source(), crate::ContextPolicy::default());
         main.query("look around").await.expect("main run");

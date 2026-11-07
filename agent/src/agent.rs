@@ -520,6 +520,13 @@ struct EmittedCheckpoint {
     message_count: usize,
 }
 
+/// A stop hook's reminder, as the model reads it.
+#[derive(Template)]
+#[template(path = "system_reminder.txt", escape = "none")]
+struct SystemReminderTemplate {
+    content: String,
+}
+
 #[derive(Template)]
 #[template(path = "background_started_reminder.txt", escape = "none")]
 struct BackgroundStartedReminderTemplate<'a> {
@@ -944,17 +951,22 @@ pub struct Agent<
     /// and is dropped.
     pub(crate) detached_task_ids: HashSet<String>,
 
-    /// Optional sandbox directory for working-doc supervision (`tasks.md`).
+    /// The directory the agent's terminal works in, which holds its working
+    /// document.
     pub(crate) sandbox_dir: Option<PathBuf>,
 
-    /// What the host gives the `tasks.md` supervision; the agent records its
-    /// finished background jobs on its events.
-    pub(crate) tasks: crate::tasks::TasksWiring,
+    /// The inbox of the working document's events; the agent records its
+    /// finished background jobs there.
+    pub(crate) work_events: crate::working_document::WorkEvents,
 
-    /// The source supervising `tasks.md` in the sandbox, owned apart from
+    /// The source watching the working document, owned apart from
     /// [`context_sources`](Self::context_sources) because what it showed
-    /// travels in the agent's checkpoint.
-    pub(crate) tasks_document: Option<crate::tasks::TasksDocument>,
+    /// travels in the agent's checkpoint and its review reaches the stop
+    /// hook; `None` when the host keeps none.
+    pub(crate) working_document: Option<crate::working_document::WorkingDocument>,
+
+    /// The embedder's stop rule, asked each time the model ends its turn.
+    pub(crate) stop_hook: Option<crate::AnyStopHook>,
 
     /// Directory files are restored from after a forked compaction.
     pub(crate) restore_dir: Option<PathBuf>,
@@ -1070,8 +1082,9 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             job_registry: None,
             detached_task_ids: HashSet::new(),
             sandbox_dir: None,
-            tasks: crate::tasks::TasksWiring::default(),
-            tasks_document: None,
+            work_events: crate::working_document::WorkEvents::default(),
+            working_document: None,
+            stop_hook: None,
             restore_dir: None,
             last_request: None,
             cache_keep_alive: CacheKeepAliveState::default(),
@@ -1526,7 +1539,9 @@ where
             self.enforce_reply_language(&response_text, events).await;
         }
         events.emit(AgentEvent::turn_complete(turn, false));
-        if self.push_final_turn_alerts().await {
+        let objected = self.push_final_turn_alerts().await;
+        let (review, held) = self.decide_stop(&response_text, turn).await;
+        if objected || held {
             // The alerts stay in the conversation either way; a host that has
             // a message waiting ends the run here so the message travels with
             // them in the next request instead of one request later.
@@ -1534,6 +1549,7 @@ where
                 assistant_text: &response_text,
                 turn,
                 message_count: self.context.len_recent(),
+                document: review.as_ref(),
             };
             if self.hooks.on_turn_boundary(&boundary_ctx).await == TurnBoundaryAction::EndTurn {
                 return Ok(TurnControl::Break {
@@ -1909,6 +1925,7 @@ where
             assistant_text: response_text,
             turn,
             message_count: self.context.len_recent(),
+            document: None,
         };
         let checkpoint = self
             .emit_checkpoint(CheckpointReason::TurnBoundary, response_text, turn)
@@ -2254,9 +2271,10 @@ where
         }
         let result_msg = self.notices.background_finished(&task);
         self.context.push(Message::system(&result_msg));
-        self.tasks
-            .events
-            .record(crate::tasks::TaskEvent::JobFinished(task.task_id.clone()));
+        self.work_events
+            .record(crate::working_document::WorkEvent::JobFinished(
+                task.task_id.clone(),
+            ));
         events.emit(AgentEvent::background_task_completed(
             task.task_id,
             result_msg,
@@ -3173,7 +3191,7 @@ where
                 self.push_source_alert(&block);
             }
         }
-        if let Some(document) = self.tasks_document.as_mut()
+        if let Some(document) = self.working_document.as_mut()
             && let Some(block) =
                 crate::context::ContextSource::on_request(document, reassembled).await
         {
@@ -3195,7 +3213,7 @@ where
                 self.push_source_alert(&block);
             }
         }
-        if let Some(document) = self.tasks_document.as_mut()
+        if let Some(document) = self.working_document.as_mut()
             && let Some(block) = crate::context::ContextSource::on_tool_turn_end(document).await
         {
             self.push_source_alert(&block);
@@ -3214,13 +3232,55 @@ where
                 pushed = true;
             }
         }
-        if let Some(document) = self.tasks_document.as_mut()
-            && let Some(block) = crate::context::ContextSource::on_final_turn(document).await
+        pushed
+    }
+
+    /// Reviews the working document as the model ends its turn, asks the
+    /// stop hook whether the run ends, and pushes the document's alert and
+    /// the hook's reminder.
+    ///
+    /// Returns the review, for the turn-boundary hooks, and whether the stop
+    /// hook holds the run.
+    async fn decide_stop(
+        &mut self,
+        response_text: &str,
+        turn: usize,
+    ) -> (Option<crate::working_document::DocumentReview>, bool) {
+        let review = match self.working_document.as_mut() {
+            Some(document) => Some(document.review().await),
+            None => None,
+        };
+        let decision = match &self.stop_hook {
+            Some(hook) => {
+                let ctx = TurnBoundaryContext {
+                    assistant_text: response_text,
+                    turn,
+                    message_count: self.context.len_recent(),
+                    document: review.as_ref(),
+                };
+                hook.on_turn_end(&ctx).await
+            }
+            None => crate::StopDecision::End,
+        };
+        let held = matches!(decision, crate::StopDecision::Hold { .. });
+        if let (Some(document), Some(review)) = (&self.working_document, &review)
+            && let Some(block) = document.alert(review, held)
         {
             self.push_source_alert(&block);
-            pushed = true;
         }
-        pushed
+        if let crate::StopDecision::Hold {
+            reminder: Some(reminder),
+        } = decision
+        {
+            let block = Block::new(
+                "system_reminder",
+                SystemReminderTemplate { content: reminder }
+                    .render()
+                    .expect("system reminder template must render"),
+            );
+            self.push_source_alert(&block);
+        }
+        (review, held)
     }
 
     /// Returns the current conversation history.
@@ -3261,10 +3321,10 @@ where
                 .background_receiver
                 .as_ref()
                 .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running),
-            tasks: self
-                .tasks_document
+            document: self
+                .working_document
                 .as_ref()
-                .and_then(crate::tasks::TasksDocument::checkpoint),
+                .and_then(crate::working_document::WorkingDocument::checkpoint),
         })
     }
 
@@ -3275,9 +3335,9 @@ where
     /// Returns an error when the checkpoint cannot be restored into this agent.
     pub fn restore_checkpoint(&mut self, checkpoint: AgentCheckpoint) -> Result<(), AgentError> {
         self.context.restore(checkpoint.context);
-        // The restored conversation holds what its tasks document showed.
-        if let Some(document) = self.tasks_document.as_mut() {
-            document.restore(checkpoint.tasks);
+        // The restored conversation holds what its working document showed.
+        if let Some(document) = self.working_document.as_mut() {
+            document.restore(checkpoint.document);
         }
         // Everything below belongs to the window just replaced: its fork
         // point, its failure, its parked tool results and its last request
@@ -3469,7 +3529,9 @@ where
             self.context_sources
                 .push(AnyContextSource::new(crate::language::LanguageAlerts::new(
                     guard,
-                    self.sandbox_dir.clone(),
+                    self.working_document
+                        .as_ref()
+                        .map(|document| document.file().clone()),
                     self.notices.clone(),
                 )));
         }
@@ -3877,10 +3939,10 @@ where
         let tool_surface_hash = self.tool_surface_hash();
         let tail = self.render_tail().await;
         let window = self.context_window_snapshot(&tail);
-        let tasks = self
-            .tasks_document
+        let document = self
+            .working_document
             .as_ref()
-            .and_then(crate::tasks::TasksDocument::checkpoint);
+            .and_then(crate::working_document::WorkingDocument::checkpoint);
         let checkpoint_ctx = CheckpointContext {
             reason,
             assistant_text,
@@ -3893,7 +3955,7 @@ where
                 .as_ref()
                 .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running),
             window: &window,
-            tasks: tasks.as_ref(),
+            document: document.as_ref(),
         };
         if let Some(reason) = self.hooks.on_checkpoint(&checkpoint_ctx).await {
             return Err(AgentError::HookRejected {
@@ -5194,7 +5256,7 @@ mod tests {
                 messages: Vec::new(),
             },
             has_background_tasks: false,
-            tasks: None,
+            document: None,
         }
     }
 
@@ -5480,38 +5542,58 @@ mod tests {
         assert_eq!(results, ["kept", "native"]);
     }
 
-    fn tasks_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
-        tasks_agent_on(dir, crate::tasks::TaskEvents::new())
-    }
-
-    fn tasks_agent_on(
-        dir: &std::path::Path,
-        events: crate::tasks::TaskEvents,
-    ) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+    fn plan_builder(dir: &std::path::Path) -> crate::AgentBuilder<MockLlm, MockLlm, MockLlm, ()> {
         Agent::builder(MockLlm {
             context_length: 1_000_000,
         })
         .sandbox_dir(dir)
-        .task_events(events)
+        .working_document(crate::DocumentSpec::new(
+            "plan.md",
+            crate::working_document::test_schema::ListSchema,
+        ))
+    }
+
+    fn plan_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+        plan_builder(dir).build()
+    }
+
+    /// An agent keeping a working document named `tasks.md`, read by the
+    /// test schema.
+    fn tasks_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+        Agent::builder(MockLlm {
+            context_length: 1_000_000,
+        })
+        .sandbox_dir(dir)
+        .working_document(crate::DocumentSpec::new(
+            "tasks.md",
+            crate::working_document::test_schema::ListSchema,
+        ))
         .build()
     }
 
+    fn holding_plan_agent(dir: &std::path::Path) -> Agent<MockLlm, MockLlm, MockLlm, ()> {
+        plan_builder(dir)
+            .stop_hook(crate::AnyStopHook::new(
+                crate::working_document::test_schema::HoldOpenRows,
+            ))
+            .build()
+    }
+
     /// An event the host records on the inbox it gave the builder reaches
-    /// the agent's tasks document, and its alert the conversation, once.
+    /// the agent's working document, and its alert the conversation, once.
     #[tokio::test]
     async fn tool_turn_alerts_from_sources_reach_the_conversation() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir should exist");
-        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- #3 PR #12 open\n")
-            .expect("write tasks.md");
-        let events = crate::tasks::TaskEvents::new();
-        let mut agent = tasks_agent_on(dir.path(), events.clone());
+        std::fs::write(dir.path().join("plan.md"), "* #3 PR #12 open\n").expect("write plan.md");
+        let events = crate::WorkEvents::new();
+        let mut agent = plan_builder(dir.path()).work_events(events.clone()).build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_request_alerts().await;
 
-        events.record(crate::tasks::TaskEvent::PullRequestMerged(
-            crate::tasks::WorkRef::pull_request(12),
+        events.record(crate::WorkEvent::PullRequestMerged(
+            crate::WorkRef::pull_request(12),
         ));
         for _ in 0..3 {
             agent.push_request_alerts().await;
@@ -5527,25 +5609,84 @@ mod tests {
         assert_eq!(alerts, 1, "an unrecorded event alerts exactly once");
     }
 
+    /// Without a stop hook, the working document holds no run: the turn the
+    /// model ends ends the run, whatever rows are open.
     #[tokio::test]
-    async fn final_turn_alerts_keep_the_loop_running() {
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("tempdir should exist");
-        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- pending\n")
-            .expect("write tasks.md");
-        let mut agent = tasks_agent(dir.path());
+    async fn without_a_stop_hook_a_turn_ends_regardless_of_open_rows() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("plan.md"), "* pending\n[ ] broken\n")
+            .expect("write plan.md");
+        let mut agent = plan_agent(dir.path());
         agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_request_alerts().await;
 
+        let control = agent
+            .finish_no_tool_turn("done".to_string(), 1, &EventSink::discarding())
+            .await
+            .expect("the turn finishes");
         assert!(
-            agent.push_final_turn_alerts().await,
-            "an actionable row must object to the model stopping"
+            matches!(
+                control,
+                TurnControl::Break {
+                    stop_reason: StopReason::NoToolCalls,
+                    ..
+                }
+            ),
+            "the run ends"
+        );
+        let messages = agent.context().conversation_messages();
+        let alert = messages
+            .iter()
+            .find(|message| message.content().contains("<document_alert>"))
+            .expect("the document's finding still reaches the conversation");
+        assert!(
+            !alert.content().contains("before ending the turn"),
+            "{}",
+            alert.content()
         );
     }
 
-    /// A host with a message waiting ends the run a stop-gate alert would
-    /// keep going, so the message reaches the next request together with the
-    /// alert, which stays in the conversation.
+    /// A stop hook that holds keeps the run going, with its reminder.
+    #[tokio::test]
+    async fn a_stop_hook_holds_the_run_with_its_reminder() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        std::fs::write(dir.path().join("plan.md"), "* pending\n").expect("write plan.md");
+        let mut agent = holding_plan_agent(dir.path());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_request_alerts().await;
+
+        let control = agent
+            .finish_no_tool_turn("done".to_string(), 1, &EventSink::discarding())
+            .await
+            .expect("the turn finishes");
+        assert!(matches!(control, TurnControl::Continue), "the run goes on");
+        let reminder = format!(
+            "<system_reminder>{}</system_reminder>",
+            crate::working_document::test_schema::CONTINUE
+        );
+        assert!(
+            agent
+                .context()
+                .conversation_messages()
+                .iter()
+                .any(|message| message.content() == reminder),
+            "the reminder reaches the conversation"
+        );
+
+        std::fs::write(dir.path().join("plan.md"), "~ done\n").expect("write plan.md");
+        let control = agent
+            .finish_no_tool_turn("done".to_string(), 2, &EventSink::discarding())
+            .await
+            .expect("the turn finishes");
+        assert!(
+            matches!(control, TurnControl::Break { .. }),
+            "nothing open, the run ends"
+        );
+    }
+
+    /// A host with a message waiting ends the run a stop hook would keep
+    /// going, so the message reaches the next request together with the
+    /// reminder, which stays in the conversation.
     #[tokio::test]
     async fn a_waiting_message_ends_the_run_a_final_turn_alert_keeps_going() {
         use tempfile::tempdir;
@@ -5561,14 +5702,13 @@ mod tests {
         }
 
         let dir = tempdir().expect("tempdir should exist");
-        std::fs::write(dir.path().join("tasks.md"), "## Doing\n- pending\n")
-            .expect("write tasks.md");
-        let mut agent = Agent::builder(MockLlm {
-            context_length: 1_000_000,
-        })
-        .sandbox_dir(dir.path())
-        .hook(MessageWaiting)
-        .build();
+        std::fs::write(dir.path().join("plan.md"), "* pending\n").expect("write plan.md");
+        let mut agent = plan_builder(dir.path())
+            .stop_hook(crate::AnyStopHook::new(
+                crate::working_document::test_schema::HoldOpenRows,
+            ))
+            .hook(MessageWaiting)
+            .build();
         agent.ensure_initialized().await.expect("agent initializes");
 
         let control = agent
@@ -5588,10 +5728,10 @@ mod tests {
         );
         let messages = agent.context().conversation_messages();
         assert!(
-            messages
-                .iter()
-                .any(|message| message.content().contains("tasks.md still has rows")),
-            "the alert stays for the next request: {messages:?}"
+            messages.iter().any(|message| message
+                .content()
+                .contains(crate::working_document::test_schema::CONTINUE)),
+            "the reminder stays for the next request: {messages:?}"
         );
     }
 
@@ -7757,7 +7897,7 @@ mod tests {
         );
         let tail = agent.render_tail().await;
         assert!(
-            tail.iter().all(|block| block.tag() != "tasks_document"),
+            tail.iter().all(|block| block.tag() != "working_document"),
             "the tail must never carry the document"
         );
     }
@@ -8303,11 +8443,9 @@ mod tests {
             wake.events
         );
         assert_eq!(
-            agent.tasks.events.take(),
-            vec![crate::tasks::TaskEvent::JobFinished(
-                "task-build".to_string()
-            )],
-            "the finished job reaches the tasks inbox"
+            agent.work_events.take(),
+            vec![crate::WorkEvent::JobFinished("task-build".to_string())],
+            "the finished job reaches the working document's inbox"
         );
 
         let events = drain_run(agent.resume()).await;
@@ -8642,14 +8780,14 @@ mod tests {
             .filter(|message| {
                 message.role() == aither_core::llm::Role::System
                     && message.content().contains("`compact`")
-                    && message.content().contains("`tasks.md`")
+                    && message.content().contains("records you keep")
                     && message.content().contains("notes")
             })
             .count()
     }
 
     /// Crossing the warning distance yields exactly one alert naming
-    /// `compact` and `tasks.md`; crossing again after a compaction brought
+    /// `compact` and the records to save; crossing again after a compaction brought
     /// usage back down yields one more.
     #[tokio::test]
     async fn crossing_the_warning_distance_raises_one_alert() {

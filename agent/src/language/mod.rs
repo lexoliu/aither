@@ -88,7 +88,7 @@ impl FromStr for Language {
 ///
 /// The communication language is the one the agent talks to the user in:
 /// replies and the questions it asks. The working language, English by
-/// default, is the one it writes in for others to read: `tasks.md`, prompts
+/// default, is the one it writes in for others to read: its working document, prompts
 /// and messages to subagents and other agents, issue and pull request text.
 /// Both are inactive while the communication language is unset or English,
 /// and the working language is enforced only once the communication language
