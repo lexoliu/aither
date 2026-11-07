@@ -508,6 +508,10 @@ impl JobBrokerService {
                 finishing: false,
             },
         );
+        // A new fifo is empty and no readiness source reports that on every
+        // platform, so it is fed at registration. When the pool is empty, the
+        // next token written back fires the pool's read end.
+        self.feed();
         Ok(CommandFifo {
             id,
             // A `Register` came from a live `JobBroker`, so the channel is
@@ -977,6 +981,22 @@ mod tests {
             Ok(TokenRead::Token)
         ));
         assert_eq!(harness.in_pool(), 3);
+    }
+
+    #[tokio::test]
+    async fn command_registered_after_the_first_loop_receives_tokens() {
+        const POOL: usize = 2;
+        let harness = Harness::new(POOL);
+        // The service spends the pool's one edge-triggered readiness event
+        // on its first loop, before any command fifo exists.
+        async_io::Timer::after(Duration::from_millis(50)).await;
+        let (_lease, child) = harness.command().await;
+        let mut held = 0;
+        settle("late command to hold every token", || {
+            take_all(&child, &mut held);
+            held == POOL
+        })
+        .await;
     }
 
     #[tokio::test]
