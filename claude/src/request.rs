@@ -1467,6 +1467,38 @@ mod tests {
         );
     }
 
+    /// Clearing the effort after a Low update sends the model's documented
+    /// default as a new effort-only message, which overrides Low; every
+    /// earlier message serializes byte for byte as before.
+    #[tokio::test]
+    async fn clearing_after_a_low_update_sends_the_models_default() {
+        let default = aither_models::default_reasoning_effort("claude-opus-5-5")
+            .expect("Claude Opus 5.5 has a documented default");
+        let low = vec![
+            Message::user("Plan the migration."),
+            Message::assistant("Here is the plan."),
+            Message::configuration(ReasoningEffort::Low),
+            Message::user("Rename the config file."),
+            Message::assistant("Renamed."),
+        ];
+        let mut cleared = low.clone();
+        cleared.push(Message::configuration(default));
+        cleared.push(Message::user("Now review the whole migration."));
+
+        let (_, before) = wire(&low).await;
+        let (_, after) = wire(&cleared).await;
+        assert_eq!(
+            before[..],
+            after[..before.len()],
+            "earlier bytes are unchanged"
+        );
+        assert_eq!(
+            after[before.len()],
+            r#"{"role":"system","content":[],"output_config":{"effort":"medium"}}"#,
+            "the update to the default follows, overriding Low"
+        );
+    }
+
     #[test]
     fn an_effort_update_cannot_turn_thinking_off_or_go_below_low() {
         assert!(MessagePayload::effort_update(ReasoningEffort::None).is_err());

@@ -1643,6 +1643,45 @@ mod tests {
         assert_eq!(value["reasoning"]["effort"], "high");
     }
 
+    /// Clearing the effort after a Low update sends the model's documented
+    /// default as a new `configuration_update`, which overrides Low; every
+    /// earlier item serializes byte for byte as before.
+    #[test]
+    fn clearing_after_a_low_update_sends_the_models_default() {
+        let default = aither_models::default_reasoning_effort("gpt-6-sol")
+            .expect("GPT-6 Sol has a documented default");
+        let low = vec![
+            Message::user("Plan the migration."),
+            Message::assistant("Here is the plan."),
+            Message::configuration(ReasoningEffort::Low),
+            Message::user("Rename the config file."),
+            Message::assistant("Renamed."),
+        ];
+        let mut cleared = low.clone();
+        cleared.push(Message::configuration(default));
+        cleared.push(Message::user("Now review the whole migration."));
+        let serialized = |messages: &[Message]| -> Vec<String> {
+            to_responses_input(messages)
+                .expect("responses input")
+                .iter()
+                .map(|item| serde_json::to_string(item).expect("item serializes"))
+                .collect()
+        };
+
+        let before = serialized(&low);
+        let after = serialized(&cleared);
+        assert_eq!(
+            before[..],
+            after[..before.len()],
+            "earlier bytes are unchanged"
+        );
+        assert_eq!(
+            after[before.len()],
+            r#"{"type":"configuration_update","reasoning":{"effort":"medium"}}"#,
+            "the update to the default follows, overriding Low"
+        );
+    }
+
     /// Chat Completions has no form for an effort update.
     #[tokio::test]
     async fn chat_completions_rejects_an_effort_update() {

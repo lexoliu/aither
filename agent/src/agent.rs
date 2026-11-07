@@ -1222,7 +1222,7 @@ where
         }
         self.settle_interrupted_tool_calls();
         // An effort change lands before the user message it applies to.
-        self.settle_effort();
+        self.settle_effort()?;
         self.context.push(
             self.timestamped_user_message(&prompt)
                 .with_attachments(attachments),
@@ -2553,7 +2553,11 @@ where
     /// ([`Ability::PerMessageEffort`](aither_core::llm::model::Ability::PerMessageEffort)):
     /// the next request carries the update inside the conversation, before
     /// the next user message when one starts the turn, and the request-level
-    /// effort stays as the first request sent it. Any other model, and any
+    /// effort stays as the first request sent it. Clearing the effort there
+    /// is an update to the model's documented default
+    /// ([`Profile::default_reasoning_effort`](aither_core::llm::model::Profile::default_reasoning_effort));
+    /// with none recorded, the next turn fails with [`AgentError::Config`]
+    /// rather than leave the earlier level in force. Any other model, and any
     /// other parameter, takes the new value at the request level, which
     /// restarts the cache.
     pub fn set_parameters(&mut self, tier: ModelTier, parameters: Parameters) {
@@ -2610,26 +2614,51 @@ where
     }
 
     /// Brings the effort in force to the one the agent's own tier wants:
-    /// appends a per-message update when its model takes one, and otherwise
-    /// settles the request-level effort.
+    /// appends a per-message update when its model takes one, clearing the
+    /// effort to the model's default level, and otherwise settles the
+    /// request-level effort.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Config`] when the effort is cleared on a model
+    /// that takes per-message updates but whose default effort is not
+    /// recorded, while another level is in force: no update can undo it.
     ///
     /// # Panics
     ///
     /// Panics before the agent is initialized, since only the model's profile
     /// says how an effort change is sent.
-    fn settle_effort(&mut self) {
-        assert!(
-            self.profile.is_some(),
-            "the effort is settled only by an initialized agent, which has its profile"
-        );
-        let update = self.effort.plan(
-            self.own_parameters().reasoning_effort,
-            self.takes_per_message_effort(),
-            self.context.configured_effort(),
-        );
+    fn settle_effort(&mut self) -> Result<(), AgentError> {
+        let profile = self
+            .profile
+            .as_ref()
+            .expect("the effort is settled only by an initialized agent, which has its profile");
+        let changes = if profile.abilities.contains(&Ability::PerMessageEffort) {
+            crate::effort::EffortChanges::PerMessage {
+                default: profile.default_reasoning_effort,
+            }
+        } else {
+            crate::effort::EffortChanges::RequestLevel
+        };
+        let update = self
+            .effort
+            .plan(
+                self.own_parameters().reasoning_effort,
+                changes,
+                self.context.configured_effort(),
+            )
+            .map_err(|crate::effort::UnknownDefaultEffort| {
+                AgentError::Config(format!(
+                    "the reasoning effort was cleared, but model '{}' takes effort changes \
+                     inside the conversation and its default effort is not recorded, so no \
+                     update can undo the level in force; set an explicit effort",
+                    profile.name
+                ))
+            })?;
         if let Some(effort) = update {
             self.context.push(Message::configuration(effort));
         }
+        Ok(())
     }
 
     /// The parameters of the agent's own requests as they are sent: its
@@ -3399,7 +3428,7 @@ where
     ) -> Result<Option<LLMRequest>, AgentError> {
         self.apply_completed_compaction().await;
         self.rebuild_if_cache_is_cold().await?;
-        self.settle_effort();
+        self.settle_effort()?;
         self.push_request_alerts().await;
 
         let definitions = self.tools.active_definitions();
@@ -5774,6 +5803,7 @@ mod tests {
     struct ScriptedLlm {
         context_length: u32,
         abilities: Vec<Ability>,
+        default_effort: Option<aither_core::llm::model::ReasoningEffort>,
         requests: Arc<std::sync::Mutex<Vec<LLMRequest>>>,
         responses: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     }
@@ -5783,6 +5813,7 @@ mod tests {
             Self {
                 context_length,
                 abilities: Vec::new(),
+                default_effort: None,
                 requests: Arc::new(std::sync::Mutex::new(Vec::new())),
                 responses: Arc::new(std::sync::Mutex::new(responses.into_iter().collect())),
             }
@@ -5791,6 +5822,15 @@ mod tests {
         /// The same mock, reporting `ability` in its profile.
         fn with_ability(mut self, ability: Ability) -> Self {
             self.abilities.push(ability);
+            self
+        }
+
+        /// The same mock, reporting `effort` as its default in its profile.
+        const fn with_default_effort(
+            mut self,
+            effort: aither_core::llm::model::ReasoningEffort,
+        ) -> Self {
+            self.default_effort = Some(effort);
             self
         }
 
@@ -5820,14 +5860,11 @@ mod tests {
             &self,
         ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
             let context_length = self.context_length;
-            std::future::ready(Ok(ModelProfile::new(
-                "mock",
-                "test",
-                "mock-model",
-                "mock model",
-                context_length,
-            )
-            .with_abilities(self.abilities.clone())))
+            let mut profile =
+                ModelProfile::new("mock", "test", "mock-model", "mock model", context_length)
+                    .with_abilities(self.abilities.clone());
+            profile.default_reasoning_effort = self.default_effort;
+            std::future::ready(Ok(profile))
         }
     }
 
@@ -5895,6 +5932,88 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// Clearing the effort after a Low update, on a model that takes
+    /// per-message updates, sends an update to the model's default that
+    /// overrides Low, with the request-level effort and every earlier message
+    /// unchanged. The defaults are the documented ones of Claude Opus 5.5 and
+    /// GPT-6 Sol, as their clients report them.
+    #[tokio::test]
+    async fn clearing_the_effort_after_an_update_restores_the_models_default() {
+        for (model, default) in [
+            ("claude-opus-5-5", ReasoningEffort::Medium),
+            ("gpt-6-sol", ReasoningEffort::Medium),
+        ] {
+            let llm = ScriptedLlm::new(
+                1_000_000,
+                ["one".to_string(), "two".to_string(), "three".to_string()],
+            )
+            .with_ability(Ability::PerMessageEffort)
+            .with_default_effort(default);
+            let mut agent = Agent::builder(llm.clone())
+                .request_parameters(effort(ReasoningEffort::High))
+                .build();
+            agent.query("first").await.expect("the first turn runs");
+            agent.set_parameters(ModelTier::Advanced, effort(ReasoningEffort::Low));
+            agent.query("second").await.expect("the second turn runs");
+            agent.set_parameters(ModelTier::Advanced, Parameters::default());
+            agent.query("third").await.expect("the third turn runs");
+
+            let [_, low, cleared]: [LLMRequest; 3] = llm
+                .recorded()
+                .try_into()
+                .expect("three turns, three requests");
+            assert_eq!(
+                cleared.parameters().reasoning_effort,
+                Some(ReasoningEffort::High),
+                "{model}: the request-level effort stays as first sent"
+            );
+            let end = user_message_index(&low, "second");
+            assert_eq!(
+                low.messages()[..=end],
+                cleared.messages()[..=end],
+                "{model}: earlier messages are unchanged"
+            );
+            let user = user_message_index(&cleared, "third");
+            assert_eq!(
+                cleared.messages()[user - 1],
+                Message::configuration(default),
+                "{model}: the update to the default precedes the next user message"
+            );
+            let updates: Vec<_> = cleared
+                .messages()
+                .iter()
+                .filter_map(Message::configured_effort)
+                .collect();
+            assert_eq!(
+                updates.last(),
+                Some(&default),
+                "{model}: the default overrides Low"
+            );
+        }
+    }
+
+    /// Clearing the effort on a per-message model whose default is not
+    /// recorded fails rather than leaving the earlier update in force.
+    #[tokio::test]
+    async fn clearing_the_effort_without_a_known_default_fails() {
+        let llm = ScriptedLlm::new(1_000_000, ["one".to_string(), "two".to_string()])
+            .with_ability(Ability::PerMessageEffort);
+        let mut agent = Agent::builder(llm.clone())
+            .request_parameters(effort(ReasoningEffort::High))
+            .build();
+        agent.query("first").await.expect("the first turn runs");
+        agent.set_parameters(ModelTier::Advanced, effort(ReasoningEffort::Low));
+        agent.query("second").await.expect("the second turn runs");
+        agent.set_parameters(ModelTier::Advanced, Parameters::default());
+
+        let error = agent
+            .query("third")
+            .await
+            .expect_err("no update can undo Low");
+        assert!(matches!(error, AgentError::Config(_)), "{error}");
+        assert_eq!(llm.recorded().len(), 2, "nothing more is sent");
     }
 
     /// Without per-message updates the new effort goes at the request level.

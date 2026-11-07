@@ -349,6 +349,7 @@ impl LanguageModel for Claude {
             if takes_per_message_effort(&cfg) {
                 profile.abilities.push(Ability::PerMessageEffort);
             }
+            profile.default_reasoning_effort = aither_models::default_reasoning_effort(&cfg.model);
 
             for ability in &cfg.native_abilities {
                 if !profile.abilities.contains(ability) {
