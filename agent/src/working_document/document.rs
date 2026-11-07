@@ -207,6 +207,7 @@ impl WorkingDocument {
         self
     }
 
+    #[cfg(feature = "languages")]
     pub(crate) const fn file(&self) -> &DocumentFile {
         &self.file
     }
