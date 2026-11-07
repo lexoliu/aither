@@ -920,6 +920,7 @@ pub struct ToolRegistryBuilder {
     sets: Vec<AnyCommandSet>,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
+    policies: Vec<crate::AnyCommandPolicy>,
     kept: HashSet<String>,
     notices: crate::AnySandboxNotices,
 }
@@ -1214,6 +1215,15 @@ impl ToolRegistryBuilder {
         self.gate = Some(gate);
     }
 
+    /// Puts every script the registry's terminals run, the main agent's and
+    /// every subagent's, to `policy` before it runs; see
+    /// [`CommandPolicy`](crate::CommandPolicy). Policies are asked in the
+    /// order they are added, and each agent's terminal binds every one to
+    /// fresh state.
+    pub fn command_policy(&mut self, policy: impl crate::CommandPolicy) {
+        self.policies.push(crate::AnyCommandPolicy::new(policy));
+    }
+
     /// Renders every refusal and notice of the registry, and of the terminals
     /// and terminal controls serving it, through `notices`; the sandbox's own
     /// wording ([`DefaultSandboxNotices`](crate::DefaultSandboxNotices)) by
@@ -1241,6 +1251,7 @@ impl ToolRegistryBuilder {
             mode: None,
             observer: self.observer,
             gate: self.gate,
+            policies: crate::policy::CommandPolicies::new(self.policies),
             notices: self.notices,
             call: None,
             committed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1444,6 +1455,9 @@ pub struct ToolRegistry {
     mode: Option<TerminalMode>,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
+    /// The command policies, bound to the state of the agent this registry
+    /// serves; every view of the registry for that agent shares them.
+    policies: crate::policy::CommandPolicies,
     /// Renders the refusals and notices of the registry and its terminals.
     notices: crate::AnySandboxNotices,
     /// The `terminal` call this registry serves, once [`Self::for_call`] has
@@ -1579,6 +1593,7 @@ impl ToolRegistry {
             mode: None,
             observer,
             gate,
+            policies: self.policies.for_agent(),
             notices: self.notices.clone(),
             call: None,
             committed: self.committed.clone(),
@@ -1624,6 +1639,12 @@ impl ToolRegistry {
     #[must_use]
     pub const fn gate(&self) -> Option<&AnyCommandGate> {
         self.gate.as_ref()
+    }
+
+    /// The command policies every script of the terminal serving this
+    /// registry is put to, bound to its agent's state.
+    pub(crate) const fn policies(&self) -> &crate::policy::CommandPolicies {
+        &self.policies
     }
 
     /// The observer told about the calls this registry serves.

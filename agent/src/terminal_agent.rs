@@ -164,7 +164,9 @@ pub struct Prepared;
 /// preparation. `Balanced`, `Fast` and `Compactor` are the models of the
 /// agent's balanced and fast tiers and of its compactions, `LLM` until
 /// [`balanced_model`](Self::balanced_model), [`fast_model`](Self::fast_model)
-/// or [`compaction_model`](Self::compaction_model) sets another.
+/// or [`compaction_model`](Self::compaction_model) sets another. `Schema` is
+/// the handoff compactions ask for, [`HandoffDocument`](crate::HandoffDocument)
+/// until [`handoff`](Self::handoff) sets another.
 ///
 /// Every agent-level option is a method of [`AgentOptions`], shared with
 /// [`AgentBuilder`].
@@ -177,12 +179,13 @@ pub struct TerminalAgentBuilder<
     Balanced = LLM,
     Fast = Balanced,
     Compactor = LLM,
+    Schema = crate::HandoffDocument,
 > where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
-    inner: AgentBuilder<LLM, Balanced, Fast, H, Compactor>,
+    inner: AgentBuilder<LLM, Balanced, Fast, H, Compactor, Schema>,
     terminal_tool: TerminalTool<P, E, Unconfigured>,
     registry_builder: ToolRegistryBuilder,
     tool_descriptions: Vec<(String, String)>,
@@ -222,8 +225,8 @@ impl Default for HostLoadSetup {
     }
 }
 
-impl<LLM, P, E, H, S, Balanced, Fast, Compactor> std::fmt::Debug
-    for TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor>
+impl<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema> std::fmt::Debug
+    for TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
@@ -279,8 +282,8 @@ where
     }
 }
 
-impl<LLM, P, E, H, S, Balanced, Fast, Compactor> sealed::Sealed
-    for TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor>
+impl<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema> sealed::Sealed
+    for TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
@@ -292,8 +295,8 @@ where
 }
 
 /// The terminal agent's options are its inner [`AgentBuilder`]'s settings.
-impl<LLM, P, E, H, S, Balanced, Fast, Compactor> AgentOptions
-    for TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor>
+impl<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema> AgentOptions
+    for TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
@@ -301,8 +304,8 @@ where
 {
 }
 
-impl<LLM, P, E, H, S, Balanced, Fast, Compactor>
-    TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor>
+impl<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema>
+    TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
@@ -311,15 +314,16 @@ where
     Fast: LanguageModel,
     Compactor: LanguageModel,
     H: Hook,
+    Schema: crate::HandoffSchema,
 {
-    /// Moves every part into a builder with another hook chain, models or
-    /// state.
-    fn rebuild<NH, NS, NB, NF, NC>(
+    /// Moves every part into a builder with another hook chain, models,
+    /// handoff schema or state.
+    fn rebuild<NH, NS, NB, NF, NC, NSchema>(
         self,
         inner: impl FnOnce(
-            AgentBuilder<LLM, Balanced, Fast, H, Compactor>,
-        ) -> AgentBuilder<LLM, NB, NF, NH, NC>,
-    ) -> TerminalAgentBuilder<LLM, P, E, NH, NS, NB, NF, NC> {
+            AgentBuilder<LLM, Balanced, Fast, H, Compactor, Schema>,
+        ) -> AgentBuilder<LLM, NB, NF, NH, NC, NSchema>,
+    ) -> TerminalAgentBuilder<LLM, P, E, NH, NS, NB, NF, NC, NSchema> {
         TerminalAgentBuilder {
             inner: inner(self.inner),
             terminal_tool: self.terminal_tool,
@@ -670,8 +674,17 @@ where
     pub fn hook<NH: Hook>(
         self,
         hook: NH,
-    ) -> TerminalAgentBuilder<LLM, P, E, crate::HCons<NH, H>, S, Balanced, Fast, Compactor> {
+    ) -> TerminalAgentBuilder<LLM, P, E, crate::HCons<NH, H>, S, Balanced, Fast, Compactor, Schema>
+    {
         self.rebuild(|inner| inner.hook(hook))
+    }
+
+    /// Sets the handoff schema every compaction asks the model for; see
+    /// [`AgentBuilder::handoff`].
+    pub fn handoff<NSchema: crate::HandoffSchema>(
+        self,
+    ) -> TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor, NSchema> {
+        self.rebuild(AgentBuilder::handoff::<NSchema>)
     }
 
     /// Sets the balanced tier's model and the parameters of the requests
@@ -680,7 +693,7 @@ where
         self,
         model: NB,
         parameters: aither_core::llm::model::Parameters,
-    ) -> TerminalAgentBuilder<LLM, P, E, H, S, NB, Fast, Compactor> {
+    ) -> TerminalAgentBuilder<LLM, P, E, H, S, NB, Fast, Compactor, Schema> {
         self.rebuild(|inner| inner.balanced_model(model, parameters))
     }
 
@@ -690,7 +703,7 @@ where
         self,
         model: NF,
         parameters: aither_core::llm::model::Parameters,
-    ) -> TerminalAgentBuilder<LLM, P, E, H, S, Balanced, NF, Compactor> {
+    ) -> TerminalAgentBuilder<LLM, P, E, H, S, Balanced, NF, Compactor, Schema> {
         self.rebuild(|inner| inner.fast_model(model, parameters))
     }
 
@@ -701,7 +714,7 @@ where
         self,
         model: NC,
         parameters: aither_core::llm::model::Parameters,
-    ) -> TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, NC> {
+    ) -> TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, NC, Schema> {
         self.rebuild(|inner| inner.compaction_model(model, parameters))
     }
 
@@ -944,7 +957,7 @@ where
     /// # Panics
     ///
     /// Panics if the `knowledge_and_time` prompt template fails to render.
-    pub fn build(self) -> Agent<LLM, Balanced, Fast, H, Compactor>
+    pub fn build(self) -> Agent<LLM, Balanced, Fast, H, Compactor, Schema>
     where
         LLM: 'static,
     {
@@ -958,6 +971,7 @@ where
         registry_builder.notices(notices.sandbox());
         if let Some(subagents) = self.subagents {
             let subagents = (*subagents)
+                .with_handoff::<Schema>()
                 .with_notices(notices.clone())
                 .with_working_document(
                     self.inner.chosen_document().cloned(),
@@ -1049,8 +1063,8 @@ where
     }
 }
 
-impl<LLM, P, E, H, Balanced, Fast, Compactor>
-    TerminalAgentBuilder<LLM, P, E, H, Unprepared, Balanced, Fast, Compactor>
+impl<LLM, P, E, H, Balanced, Fast, Compactor, Schema>
+    TerminalAgentBuilder<LLM, P, E, H, Unprepared, Balanced, Fast, Compactor, Schema>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
@@ -1059,6 +1073,7 @@ where
     Fast: LanguageModel,
     Compactor: LanguageModel,
     H: Hook,
+    Schema: crate::HandoffSchema,
 {
     /// Sets runtime shell backend availability for `terminal`.
     #[must_use]
@@ -1119,7 +1134,7 @@ where
         distribution: &ToolDistribution,
         cache_root: &std::path::Path,
     ) -> Result<
-        TerminalAgentBuilder<LLM, P, E, H, Prepared, Balanced, Fast, Compactor>,
+        TerminalAgentBuilder<LLM, P, E, H, Prepared, Balanced, Fast, Compactor, Schema>,
         ToolRuntimeError,
     > {
         self.terminal_tool = self
@@ -1145,7 +1160,7 @@ where
         mut self,
         sessions: ShellSessionRegistry,
     ) -> Result<
-        TerminalAgentBuilder<LLM, P, E, H, Prepared, Balanced, Fast, Compactor>,
+        TerminalAgentBuilder<LLM, P, E, H, Prepared, Balanced, Fast, Compactor, Schema>,
         ToolRuntimeError,
     > {
         self.terminal_tool = self.terminal_tool.adopt_prepared_tools(sessions).await?;
@@ -1153,8 +1168,8 @@ where
     }
 }
 
-impl<LLM, P, E, H, Balanced, Fast, Compactor>
-    TerminalAgentBuilder<LLM, P, E, H, Prepared, Balanced, Fast, Compactor>
+impl<LLM, P, E, H, Balanced, Fast, Compactor, Schema>
+    TerminalAgentBuilder<LLM, P, E, H, Prepared, Balanced, Fast, Compactor, Schema>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
@@ -1950,21 +1965,33 @@ mod tests {
         );
     }
 
-    /// Notices that reword the terminal's poll refusals.
-    struct NoPolling;
+    /// An embedder's policy refusing a foreground `sleep` in its own words.
+    struct NoSleep;
 
-    impl aither_sandbox::SandboxNotices for NoPolling {
-        fn poll_refusal(&self, refusal: &aither_sandbox::PollRefusal) -> String {
-            match refusal {
-                aither_sandbox::PollRefusal::Sleep => {
-                    "Not run: wait for the job's completion instead of sleeping.".to_string()
-                }
-                other => aither_sandbox::DefaultSandboxNotices.poll_refusal(other),
-            }
+    impl aither_sandbox::CommandPolicy for NoSleep {
+        type State = ();
+
+        fn check(
+            &self,
+            script: &aither_sandbox::ScriptCheck<'_>,
+            (): &(),
+        ) -> impl std::future::Future<Output = aither_sandbox::PolicyDecision> + Send {
+            let sleeps = matches!(
+                script.shell,
+                Some(Ok(shell)) if shell
+                    .commands()
+                    .iter()
+                    .any(|command| !command.is_background() && command.program() == "sleep")
+            );
+            std::future::ready(if sleeps {
+                aither_sandbox::PolicyDecision::Refuse(aither_sandbox::PolicyRefusal::new(
+                    "Not run: wait for the job's completion instead of sleeping.",
+                ))
+            } else {
+                aither_sandbox::PolicyDecision::Allow
+            })
         }
     }
-
-    impl crate::Notices for NoPolling {}
 
     /// Asks for one foreground `sleep`, then stops.
     #[derive(Clone)]
@@ -2015,28 +2042,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_terminal_refusal_reaches_the_conversation_in_the_embedders_words() {
+    async fn a_command_policy_refusal_reaches_the_conversation_in_the_embedders_words() {
         let source = tempdir().unwrap();
         let binary = compile_baseline_fixture(source.path()).await;
         let distribution = fixture_distribution(&binary, "1.0.0").await;
         let cache = crate::test_support::TempDir::new();
         let dir = tempdir().unwrap();
         let (requests, captured) = async_channel::bounded(8);
-        // Set after the builder registered its tools: they render through it
-        // all the same.
-        let mut agent = TerminalAgentBuilder::new(
+        let mut builder = TerminalAgentBuilder::new(
             SleepLlm {
                 requests,
                 turns: Arc::default(),
             },
             noop_terminal(dir.path()).await,
         )
-        .max_iterations(3)
-        .notices(crate::AnyNotices::new(NoPolling))
-        .initialize_tools(&distribution, cache.path())
-        .await
-        .unwrap()
-        .build();
+        .max_iterations(3);
+        builder.tool_registry_mut().command_policy(NoSleep);
+        let mut agent = builder
+            .initialize_tools(&distribution, cache.path())
+            .await
+            .unwrap()
+            .build();
 
         let _ = crate::test_support::finish_run(agent.run("Wait for the build", [])).await;
 
@@ -2051,10 +2077,6 @@ mod tests {
         assert!(
             transcript.contains("Not run: wait for the job's completion instead of sleeping."),
             "the embedder's refusal reached the model: {transcript}"
-        );
-        assert!(
-            !transcript.contains("only serves polling"),
-            "aither's own wording stayed out: {transcript}"
         );
     }
 }

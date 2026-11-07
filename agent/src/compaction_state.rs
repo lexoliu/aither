@@ -7,7 +7,7 @@
 //! the state held, and a handoff forked from an older window is therefore
 //! never applied on top of a newer one.
 
-use crate::context::{CompletedCompaction, HandoffDocument, PendingCompaction};
+use crate::context::{CompletedCompaction, PendingCompaction};
 
 /// Where the agent's compaction stands.
 #[derive(Debug, Default)]
@@ -56,12 +56,9 @@ impl CompactionState {
         }
     }
 
-    /// Records that a compaction forked at `fork_point` finished.
-    pub fn land(&mut self, fork_point: u64, handoff: HandoffDocument) {
-        *self = Self::Landed(CompletedCompaction {
-            fork_point,
-            handoff,
-        });
+    /// Records that a compaction finished.
+    pub fn land(&mut self, completed: CompletedCompaction) {
+        *self = Self::Landed(completed);
     }
 
     /// The finished compaction, if one waits, left in place.

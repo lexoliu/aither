@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use super::{EXIT_OK, EXIT_UNREADABLE_INPUT, EXIT_UNSUPPORTED, VERSION, run};
+use super::{EXIT_OK, EXIT_UNREADABLE_INPUT, EXIT_UNSUPPORTED, VERSION, run, supports};
 
 /// Files `a` (five lines), `b` (three), `nonl` (two, the last without a
 /// newline) and `empty`, in a directory of their own.
@@ -295,6 +295,10 @@ fn everything_else_fails_with_the_message() {
         let (status, stdout, stderr) = sed(directory.path(), args, "");
         assert_eq!(status, EXIT_UNSUPPORTED, "{args:?}: {stderr}");
         assert!(stdout.is_empty(), "{args:?}");
+        assert!(
+            supports(args.iter().map(OsString::from).collect()).is_err(),
+            "{args:?}"
+        );
         assert_eq!(
             stderr,
             "`sed` in scripts only prints line ranges (`sed -n 'N,Mp' file`). \
@@ -305,6 +309,21 @@ fn everything_else_fails_with_the_message() {
     // Nothing was edited.
     let (_, kept, _) = sed(directory.path(), &["-n", "1,$p", "a"], "");
     assert_eq!(String::from_utf8_lossy(&kept), "a1\na2\na3\na4\na5\n");
+}
+
+#[test]
+fn supports_accepts_the_line_range_forms() {
+    for args in [
+        &["-n", "2,3p", "a"][..],
+        &["-n", "$p"],
+        &["--quiet", "-e", "1p;4,$p", "a", "b"],
+        &["--version"],
+    ] {
+        assert!(
+            supports(args.iter().map(OsString::from).collect()).is_ok(),
+            "{args:?}"
+        );
+    }
 }
 
 #[test]

@@ -9,6 +9,7 @@
 //! both implement over the same [`AgentSettings`]. An option added there is
 //! set the same way on either builder.
 
+use std::marker::PhantomData;
 #[cfg(feature = "skills")]
 use std::sync::Arc;
 
@@ -26,7 +27,7 @@ use crate::{
     config::{AgentConfig, AgentKind},
     context::{
         AnyContextSource, Context, ContextPolicy, ContextSource, ExternalContent, ExternalSlot,
-        InstructionSlot, SystemLayout,
+        HandoffDocument, HandoffSchema, InstructionSlot, SystemLayout,
     },
     hook::{HCons, Hook},
     model_group::ModelTier,
@@ -74,6 +75,7 @@ pub struct AgentBuilder<
     Fast = Balanced,
     H = (),
     Compactor = Advanced,
+    Schema = HandoffDocument,
 > {
     advanced: Advanced,
     balanced: Balanced,
@@ -84,6 +86,8 @@ pub struct AgentBuilder<
     hooks: H,
     settings: AgentSettings,
     wiring: Wiring,
+    /// The handoff schema compactions ask for; no value is held.
+    handoff_schema: PhantomData<fn() -> Schema>,
 }
 
 /// What the [`AgentOptions`] of a builder set.
@@ -209,16 +213,17 @@ fn assemble_tools(
     tools
 }
 
-/// What a fork carries over from the main agent besides its context.
-#[derive(Clone)]
+/// What a fork carries over from the main agent besides its context; the
+/// default is what an agent that is no fork starts from.
+#[derive(Clone, Default)]
 struct Inherited {
     budget: crate::context::ContextBudget,
     profile: Option<aither_core::llm::model::Profile>,
     effort: crate::effort::EffortAnchor,
 }
 
-impl<Advanced, Balanced, Fast, H, Compactor> std::fmt::Debug
-    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+impl<Advanced, Balanced, Fast, H, Compactor, Schema> std::fmt::Debug
+    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor, Schema>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentBuilder")
@@ -585,16 +590,16 @@ pub trait AgentOptions: sealed::Sealed + Sized {
     }
 }
 
-impl<Advanced, Balanced, Fast, H, Compactor> sealed::Sealed
-    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+impl<Advanced, Balanced, Fast, H, Compactor, Schema> sealed::Sealed
+    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor, Schema>
 {
     fn settings(&mut self) -> &mut AgentSettings {
         &mut self.settings
     }
 }
 
-impl<Advanced, Balanced, Fast, H, Compactor> AgentOptions
-    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+impl<Advanced, Balanced, Fast, H, Compactor, Schema> AgentOptions
+    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor, Schema>
 {
 }
 
@@ -611,18 +616,42 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             hooks: (),
             settings: AgentSettings::default(),
             wiring: Wiring::default(),
+            handoff_schema: PhantomData,
         }
     }
 }
 
-impl<Advanced, Balanced, Fast, H, Compactor> AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+impl<Advanced, Balanced, Fast, H, Compactor, Schema>
+    AgentBuilder<Advanced, Balanced, Fast, H, Compactor, Schema>
 where
     Advanced: LanguageModel,
     Balanced: LanguageModel,
     Fast: LanguageModel,
     Compactor: LanguageModel,
     H: Hook,
+    Schema: HandoffSchema,
 {
+    /// Sets the handoff schema every compaction asks the model for, in place
+    /// of [`HandoffDocument`].
+    ///
+    /// The schema's type is the structured output the model fills; its
+    /// [`HandoffSchema`] implementation gives the instruction, the retry,
+    /// the validation and the text the conversation reads after the handoff.
+    pub fn handoff<S2: HandoffSchema>(
+        self,
+    ) -> AgentBuilder<Advanced, Balanced, Fast, H, Compactor, S2> {
+        AgentBuilder {
+            advanced: self.advanced,
+            balanced: self.balanced,
+            fast: self.fast,
+            compaction_model: self.compaction_model,
+            hooks: self.hooks,
+            settings: self.settings,
+            wiring: self.wiring,
+            handoff_schema: PhantomData,
+        }
+    }
+
     /// Sets the balanced model for moderate tasks (e.g., subagents), and the
     /// parameters of the requests aither sends it.
     ///
@@ -632,7 +661,7 @@ where
         mut self,
         model: B2,
         parameters: Parameters,
-    ) -> AgentBuilder<Advanced, B2, Fast, H, Compactor> {
+    ) -> AgentBuilder<Advanced, B2, Fast, H, Compactor, Schema> {
         self.settings.parameters.set_balanced(parameters);
         AgentBuilder {
             advanced: self.advanced,
@@ -642,6 +671,7 @@ where
             hooks: self.hooks,
             settings: self.settings,
             wiring: self.wiring,
+            handoff_schema: PhantomData,
         }
     }
 
@@ -654,7 +684,7 @@ where
         mut self,
         model: F2,
         parameters: Parameters,
-    ) -> AgentBuilder<Advanced, Balanced, F2, H, Compactor> {
+    ) -> AgentBuilder<Advanced, Balanced, F2, H, Compactor, Schema> {
         self.settings.parameters.set_fast(parameters);
         AgentBuilder {
             advanced: self.advanced,
@@ -664,6 +694,7 @@ where
             hooks: self.hooks,
             settings: self.settings,
             wiring: self.wiring,
+            handoff_schema: PhantomData,
         }
     }
 
@@ -683,7 +714,7 @@ where
         self,
         model: C2,
         parameters: Parameters,
-    ) -> AgentBuilder<Advanced, Balanced, Fast, H, C2> {
+    ) -> AgentBuilder<Advanced, Balanced, Fast, H, C2, Schema> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: self.balanced,
@@ -695,6 +726,7 @@ where
             hooks: self.hooks,
             settings: self.settings,
             wiring: self.wiring,
+            handoff_schema: PhantomData,
         }
     }
 
@@ -715,7 +747,7 @@ where
     pub fn hook<NH: Hook>(
         self,
         hook: NH,
-    ) -> AgentBuilder<Advanced, Balanced, Fast, HCons<NH, H>, Compactor> {
+    ) -> AgentBuilder<Advanced, Balanced, Fast, HCons<NH, H>, Compactor, Schema> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: self.balanced,
@@ -724,6 +756,7 @@ where
             hooks: HCons::new(hook, self.hooks),
             settings: self.settings,
             wiring: self.wiring,
+            handoff_schema: PhantomData,
         }
     }
 
@@ -1106,7 +1139,7 @@ where
     }
 
     /// Builds the agent.
-    pub fn build(self) -> Agent<Advanced, Balanced, Fast, H, Compactor> {
+    pub fn build(self) -> Agent<Advanced, Balanced, Fast, H, Compactor, Schema> {
         let AgentSettings {
             parameters,
             tier,
@@ -1139,6 +1172,13 @@ where
             fork_tools,
         } = self.wiring;
         let tools = assemble_tools(tools, fork_tools, compact_signal.as_ref(), &notices);
+        // A fork starts initialized, from what the main agent carried over.
+        let initialized = inherited.is_some();
+        let Inherited {
+            budget,
+            profile,
+            effort,
+        } = inherited.unwrap_or_default();
         Agent {
             warmth: crate::CacheWarmth::new(prompt_cache.lifetime(), clock),
             advanced: std::sync::Arc::new(self.advanced),
@@ -1154,11 +1194,7 @@ where
             tier,
             tools,
             hooks: self.hooks,
-            budget: inherited
-                .as_ref()
-                .map_or_else(crate::context::ContextBudget::default, |inherited| {
-                    inherited.budget
-                }),
+            budget,
             prompt_cache,
             context_sources,
             reassembled: false,
@@ -1169,13 +1205,9 @@ where
             tool_results: std::collections::VecDeque::new(),
             config,
             context,
-            initialized: inherited.is_some(),
-            effort: inherited
-                .as_ref()
-                .map_or_else(crate::effort::EffortAnchor::default, |inherited| {
-                    inherited.effort
-                }),
-            profile: inherited.and_then(|inherited| inherited.profile),
+            initialized,
+            effort,
+            profile,
             compaction_profile: None,
             background_receiver,
             permission_receiver,
@@ -1207,6 +1239,7 @@ where
             active_skills: crate::context::ActiveSkills::new(),
             #[cfg(feature = "skills")]
             active_allowed_tools: None,
+            handoff_schema: PhantomData,
         }
     }
 }

@@ -43,7 +43,8 @@ pub use budget::ContextBudget;
 pub use cache::{CacheLifetime, PromptCache};
 pub use compaction::{
     CompactionError, CompactionFork, CompletedCompaction, ContextFile, Handoff, HandoffDocument,
-    LineRange, PendingCompaction, SkillCatalogEntry, build_file_index,
+    HandoffPrompt, HandoffSchema, InvalidHandoff, LineRange, PendingCompaction, Restoration,
+    SkillCatalogEntry, build_file_index,
 };
 pub use live::{LiveContent, LiveUpdate};
 pub use policy::ContextPolicy;

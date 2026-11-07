@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0](https://github.com/May-Agent/aither/compare/sandbox-v0.21.0...sandbox-v0.22.0) - 2026-11-07
+
+### Added
+
+- change a running agent's model, effort and grants in place
+- *(sandbox)* broker jobserver tokens into container sessions
+- *(sandbox)* run Python through terminal's language argument
+- *(agent)* [**breaking**] watch the disk of the home environment, a container's filesystem included, never a remote host's
+
+### Fixed
+
+- name the script language in the container jobserver test
+- *(sandbox)* resolve the terminal working directory once
+- *(sandbox)* log failed commands
+
+### Other
+
+- Merge pull request #591 from May-Agent/feat/589-in-place-changes
+- Merge remote-tracking branch 'origin/dev' into feat/221-container-jobserver
+- Merge pull request #587 from May-Agent/feat/214-python-language
+- Merge pull request #586 from May-Agent/fix/508-resolved-workdir
+- Merge pull request #584 from May-Agent/fix/583-command-failure-log
+- Merge remote-tracking branch 'origin/dev' into feat/545-disk-pressure
+- Merge branch 'feat/171-runaway-guard' into feat/545-disk-pressure
+
 ## [0.21.0](https://github.com/May-Agent/aither/compare/sandbox-v0.20.0...sandbox-v0.21.0) - 2026-11-06
 
 ### Fixed

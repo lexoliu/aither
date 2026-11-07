@@ -56,11 +56,11 @@
 {% endif %}
 
 ## Materials Already On Disk
-{% if handoff.file_index.is_empty() %}
+{% if file_index.is_empty() %}
 - None recorded.
 {% else %}
 These results were already produced and saved. Read the file instead of redoing the work.
-{% for item in handoff.file_index %}
+{% for item in file_index %}
 - {{ item }}
 {% endfor %}
 {% endif %}

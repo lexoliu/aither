@@ -1,1 +1,0 @@
-`{{ name }}` is not available in scripts. Use {{ replacement }}.
