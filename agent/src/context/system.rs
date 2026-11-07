@@ -87,9 +87,8 @@ impl BlockKind for External {
     }
 }
 
-/// Blocks stable context sources render: placed after the system prompt and
-/// before the handoff, in the cacheable prefix (see
-/// [`StableContextSource`](crate::StableContextSource)).
+/// Blocks live sources render: placed after the system prompt and before the
+/// handoff, in the cacheable prefix (see [`LiveSource`](crate::LiveSource)).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sourced;
 
@@ -97,7 +96,7 @@ impl sealed::Sealed for Sourced {}
 
 impl BlockKind for Sourced {
     type Content = String;
-    const REGION: &'static str = "stable source";
+    const REGION: &'static str = "live source";
 
     fn text(content: &Self::Content) -> &str {
         content
@@ -122,8 +121,8 @@ pub type InstructionSlot = Slot<Instruction>;
 /// The slot of an external-content block.
 pub type ExternalSlot = Slot<External>;
 
-/// The slot of a stable context source's block, named by its
-/// [`TAG`](crate::StableContextSource::TAG).
+/// The slot of a live source's block, named by its
+/// [`TAG`](crate::LiveSource::TAG).
 pub type SourcedSlot = Slot<Sourced>;
 
 impl<K> Slot<K> {

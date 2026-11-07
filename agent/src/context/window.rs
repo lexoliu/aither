@@ -10,7 +10,7 @@
 //! ┌───────────────────────────────┐
 //! │ system blocks (stable prefix) │  rewritten only by reassembly
 //! ├───────────────────────────────┤
-//! │ stable source blocks          │  rewritten only by reassembly
+//! │ live source blocks            │  rewritten only by reassembly
 //! ├───────────────────────────────┤
 //! │ handoff document              │  replaced only by compaction
 //! ├───────────────────────────────┤
@@ -47,7 +47,7 @@ use aither_core::llm::{Message, Role, ToolCall};
 
 use super::compaction::Handoff;
 use super::live::{LiveContent, LiveUpdate};
-use super::source::{Block, StableChange};
+use super::source::{Block, LiveChange};
 use super::system::{
     External, Instruction, Sourced, SourcedSlot, SystemLayout, SystemRegion, TaggedBlockTemplate,
     render_prefix,
@@ -77,11 +77,18 @@ pub struct ContextItem {
     /// never tombstoned or spilled.
     #[serde(default)]
     kept: bool,
-    /// Whether this is the alert announcing a change to live content: the
-    /// next reassembly folds the change into the prefix, so it removes the
-    /// alert whatever its position.
+    /// Whether the next reassembly removes this alert whatever its
+    /// position, because what it says is restated from the source after
+    /// it: a live-content diff, whose change the reassembly folds into the
+    /// prefix, or a state alert, whose current value the next request
+    /// writes again when it is not the normal one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     live: bool,
+    /// Whether no request has carried this item yet. A reassembly or
+    /// compaction keeps an undelivered alert, so an event recorded while
+    /// the agent waited still reaches the model with the next request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    undelivered: bool,
 }
 
 impl ContextItem {
@@ -123,8 +130,9 @@ enum ItemKind {
     Ordinary,
     /// A tool result closing an exchange kept verbatim through compaction.
     Kept,
-    /// The alert announcing a change to live content.
-    LiveAlert,
+    /// An alert its source restates after a reassembly: a live-content
+    /// diff or a state alert.
+    Restated,
 }
 
 /// The entire context window state. Fully serializable for persistence.
@@ -142,8 +150,8 @@ pub struct Context {
     #[serde(default = "default_external")]
     external: SystemRegion<External>,
 
-    /// The blocks stable context sources render, one system message each
-    /// after the system prefix, in the order the sources were registered.
+    /// The blocks live sources render, one system message each after the
+    /// system prefix, in the order the sources were registered.
     /// A change made after a request carried them is staged like a live
     /// system block's.
     #[serde(default = "default_sourced")]
@@ -284,23 +292,27 @@ impl Context {
         let Some(alert) = live.into_alert(content) else {
             return false;
         };
-        self.push_item(Message::system(alert), ItemKind::LiveAlert);
+        self.push_item(Message::system(alert), ItemKind::Restated);
         true
     }
 
     /// Records that a request carried the current system prefix, which a
-    /// provider may now cache.
-    pub(crate) const fn mark_prefix_sent(&mut self) {
+    /// provider may now cache, and every item in the window, which the
+    /// model has now been delivered.
+    pub(crate) fn mark_prefix_sent(&mut self) {
         self.prefix_sent = true;
+        for item in &mut self.items {
+            item.undelivered = false;
+        }
     }
 
-    /// The blocks stable context sources rendered, as the prefix holds them.
+    /// The blocks live sources rendered, as the prefix holds them.
     #[must_use]
-    pub const fn stable_blocks(&self) -> &SystemRegion<Sourced> {
+    pub const fn live_source_blocks(&self) -> &SystemRegion<Sourced> {
         &self.sourced
     }
 
-    /// Brings the stable source block in `slot` to `desired` (`None` removes
+    /// Brings the live source block in `slot` to `desired` (`None` removes
     /// it), the way [`update_live`](Self::update_live) brings a system block.
     ///
     /// A slot seen for the first time takes its place after every slot seen
@@ -310,20 +322,27 @@ impl Context {
     /// the next reassembly, and the alert `announce` writes for it is
     /// appended — removed, like every live-content alert, by that
     /// reassembly. Returns the alert's length when one was appended.
-    pub(crate) fn update_stable(
+    pub(crate) fn update_live_source(
         &mut self,
         slot: &SourcedSlot,
         desired: Option<String>,
-        announce: impl FnOnce(&StableChange<'_>) -> Block,
+        announce: impl FnOnce(&LiveChange<'_>) -> Block,
     ) -> Option<usize> {
         self.sourced.place(slot.clone());
         let change = self.sourced.change(slot, desired, self.prefix_sent)?;
-        let alert = announce(&StableChange::new(&change.before, &change.after));
-        self.push_item(Message::system(alert.content()), ItemKind::LiveAlert);
+        let alert = announce(&LiveChange::new(&change.before, &change.after));
+        self.push_item(Message::system(alert.content()), ItemKind::Restated);
         Some(alert.len())
     }
 
-    /// Returns the number of persistent system blocks, stable source blocks
+    /// Appends a state alert: removed by the next reassembly whatever its
+    /// position, since the state source restates the current value after
+    /// it when that is not the normal one.
+    pub(crate) fn push_state_alert(&mut self, block: &Block) -> u64 {
+        self.push_item(Message::system(block.content()), ItemKind::Restated)
+    }
+
+    /// Returns the number of persistent system blocks, live source blocks
     /// included.
     #[must_use]
     pub fn system_block_count(&self) -> usize {
@@ -338,7 +357,7 @@ impl Context {
     }
 
     /// Returns a stable fingerprint of the rendered system prefix and the
-    /// stable source blocks after it.
+    /// live source blocks after it.
     ///
     /// The fingerprint changes if and only if those bytes change. Hosts can
     /// use this to detect cache-invalidating modifications to the stable
@@ -353,7 +372,7 @@ impl Context {
         hasher.finish()
     }
 
-    /// Whether any system block or stable source block rewrite is waiting
+    /// Whether any system block or live source block rewrite is waiting
     /// for reassembly.
     #[must_use]
     pub fn has_staged_system_updates(&self) -> bool {
@@ -405,7 +424,8 @@ impl Context {
             message,
             committed_at: Timestamp::now(),
             kept: matches!(kind, ItemKind::Kept),
-            live: matches!(kind, ItemKind::LiveAlert),
+            live: matches!(kind, ItemKind::Restated),
+            undelivered: true,
         });
         seq
     }
@@ -526,7 +546,7 @@ impl Context {
     ///
     /// Layout:
     /// 1. persistent system blocks, as one cacheable system message,
-    /// 2. each stable source block, as a system message of its own,
+    /// 2. each live source block, as a system message of its own,
     /// 3. the compaction handoff, if any,
     /// 4. the append-only conversation,
     /// 5. one system message holding every live tail block.
@@ -659,6 +679,9 @@ impl Context {
     /// above `fork_point` are kept: they arrived while the handoff was being
     /// written and are not described by it.
     ///
+    /// An alert below the fork that no request has carried yet stays too:
+    /// the model has not seen it, whatever the handoff says of it.
+    ///
     /// The user's own words outlive the handoff beside it, verbatim and in
     /// order: every `ask_user` exchange from below the fork, whatever its
     /// size, and the newest user messages that fit `user_message_chars`
@@ -705,6 +728,11 @@ impl Context {
                     }
                 }
                 Message::Tool { .. } if item.kept => kept.push(item.clone()),
+                // An alert no request carried yet, an event recorded while
+                // the agent waited, still owes the model its delivery.
+                message if message.role() == Role::System && item.undelivered => {
+                    kept.push(item.clone());
+                }
                 _ => {}
             }
         }
@@ -753,12 +781,16 @@ impl Context {
     }
 
     /// [`reassemble`](Self::reassemble) that removes only the durable system
-    /// alerts numbered below `fork_point`, and every live-content alert.
+    /// alerts numbered below `fork_point`, and every live-content and state
+    /// alert.
     ///
     /// Applying a compaction handoff uses it: alerts at or after the fork
     /// arrived while the handoff was written, are not described by it and
     /// must reach the model. A live-content alert is the exception: the
-    /// change it announced is folded into the prefix here.
+    /// change it announced is folded into the prefix here; so is a state
+    /// alert, whose source restates the current value after it. An alert no
+    /// request has carried yet stays wherever it is, so an event is dropped
+    /// only once it was delivered.
     pub fn reassemble_below(&mut self, fork_point: u64) -> ReassemblyReport {
         let mut report = ReassemblyReport::default();
 
@@ -775,7 +807,9 @@ impl Context {
         let mut system_messages_pruned = 0usize;
         let mut removed_bytes = 0usize;
         self.items.retain(|item| {
-            if item.message.role() == Role::System && (item.seq < fork_point || item.live) {
+            if item.message.role() == Role::System
+                && (item.live || (item.seq < fork_point && !item.undelivered))
+            {
                 system_messages_pruned += 1;
                 removed_bytes += item.message.content().len();
                 false
@@ -1343,10 +1377,13 @@ mod tests {
         context.mark_prefix_sent();
 
         context.push(Message::assistant("answer"));
-        // A stable source rendered again, unchanged and then changed: the
+        // A live source rendered again, unchanged and then changed: the
         // change is appended, the block the prefix holds stays.
         assert_eq!(set_issues(&mut context, "#23 open"), None);
         assert!(set_issues(&mut context, "#23 closed").is_some());
+        // A state alert and an event are appended like any alert.
+        context.push_state_alert(&Block::new("memory", "memory is critically tight"));
+        context.push_block_alert(&Block::new("job", "job 7 was killed"));
         context.push(Message::user("second"));
         let after = context.build_request(&[Block::new("tasks", "<tasks>v2</tasks>")]);
         assert_eq!(
@@ -1367,19 +1404,19 @@ mod tests {
 
     const ISSUES: SourcedSlot = SourcedSlot::new("linked_issues");
 
-    /// The alert a stable source of linked issues writes for a change.
-    fn announce_issues(change: &StableChange<'_>) -> Block {
+    /// The alert a live source of linked issues writes for a change.
+    fn announce_issues(change: &LiveChange<'_>) -> Block {
         Block::new("linked_issues_changed", change.diff())
     }
 
     fn set_issues(context: &mut Context, text: &str) -> Option<usize> {
-        context.update_stable(&ISSUES, Some(text.to_owned()), announce_issues)
+        context.update_live_source(&ISSUES, Some(text.to_owned()), announce_issues)
     }
 
-    /// A stable source's block is prefix content: after the system prompt,
+    /// A live source's block is prefix content: after the system prompt,
     /// before the handoff and the conversation.
     #[test]
-    fn a_stable_block_sits_between_the_system_prompt_and_the_handoff() {
+    fn a_live_block_sits_between_the_system_prompt_and_the_handoff() {
         let mut context = Context::new();
         context
             .instructions_mut()
@@ -1403,7 +1440,7 @@ mod tests {
     /// While the block is cached, a change is one alert and the prefix keeps
     /// the old block; reassembly folds the new one in and drops the alert.
     #[test]
-    fn a_stable_change_is_announced_once_and_folded_in_at_reassembly() {
+    fn a_live_change_is_announced_once_and_folded_in_at_reassembly() {
         let mut context = Context::new();
         assert_eq!(set_issues(&mut context, "#23 open\n"), None);
         context.mark_prefix_sent();
@@ -1433,16 +1470,20 @@ mod tests {
     /// it, and a block the source stopped rendering leaves the prefix there
     /// too.
     #[test]
-    fn a_compaction_folds_a_stable_change_in_and_drops_its_alert() {
+    fn a_compaction_folds_a_live_change_in_and_drops_its_alert() {
         const PRS: SourcedSlot = SourcedSlot::new("linked_prs");
         let mut context = Context::new();
         set_issues(&mut context, "#23 open");
-        context.update_stable(&PRS, Some("#40 draft".to_owned()), announce_issues);
+        context.update_live_source(&PRS, Some("#40 draft".to_owned()), announce_issues);
         context.mark_prefix_sent();
         context.push(Message::user("before the fork"));
         assert!(set_issues(&mut context, "#23 closed").is_some());
         let fork_point = context.fork_point();
-        assert!(context.update_stable(&PRS, None, announce_issues).is_some());
+        assert!(
+            context
+                .update_live_source(&PRS, None, announce_issues)
+                .is_some()
+        );
         assert_eq!(context.build_messages()[1].content(), "#40 draft");
 
         context.reassemble_below(fork_point);
@@ -1452,7 +1493,7 @@ mod tests {
         let messages = context.build_messages();
         assert_eq!(messages[0].content(), "#23 closed");
         assert!(messages[1].content().contains("handoff"));
-        assert_eq!(context.stable_blocks().len(), 1);
+        assert_eq!(context.live_source_blocks().len(), 1);
     }
 
     const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");
@@ -1966,10 +2007,50 @@ mod tests {
         assert_eq!(context.recent()[1].content(), answer);
     }
 
+    /// A state alert goes with any reassembly, before or after the fork,
+    /// since its source restates the current value after it.
+    #[test]
+    fn every_reassembly_removes_the_state_alerts() {
+        let mut context = Context::new();
+        context.push_state_alert(&Block::new("memory", "critical"));
+        context.mark_prefix_sent();
+        let fork_point = context.fork_point();
+        context.push_state_alert(&Block::new("memory", "warning"));
+        context.mark_prefix_sent();
+
+        let report = context.reassemble_below(fork_point);
+
+        assert_eq!(report.system_messages_pruned, 2);
+        assert_eq!(context.len_recent(), 0);
+    }
+
+    /// An event no request has carried survives a reassembly and a
+    /// compaction's apply, wherever it sits; once delivered it goes.
+    #[test]
+    fn an_undelivered_event_outlives_reassembly_until_a_request_carries_it() {
+        let mut context = Context::new();
+        context.push(Message::user("build it"));
+        context.push(Message::system("delivered: the build started"));
+        context.mark_prefix_sent();
+        context.push(Message::system("undelivered: the build failed"));
+        let fork_point = context.fork_point();
+
+        context.reassemble_below(fork_point);
+        context.apply_handoff(handoff(), fork_point, 0);
+
+        let kept: Vec<_> = context.recent().iter().map(|m| m.content()).collect();
+        assert_eq!(kept, ["undelivered: the build failed"]);
+
+        context.mark_prefix_sent();
+        context.reassemble();
+        assert_eq!(context.len_recent(), 0, "delivered, it is dropped");
+    }
+
     #[test]
     fn reassembling_below_a_fork_keeps_the_later_alerts() {
         let mut context = Context::new();
         context.push(Message::system("old"));
+        context.mark_prefix_sent();
         let fork_point = context.fork_point();
         context.push(Message::system("new"));
 
@@ -1995,6 +2076,7 @@ mod tests {
             vec![tool_call("b", "read", serde_json::json!({"path": "x"}))],
         ));
         context.push(Message::tool("b", "second read ".repeat(32)));
+        context.mark_prefix_sent();
 
         let estimate = context.estimate_reassembly_savings();
         let report = context.reassemble();

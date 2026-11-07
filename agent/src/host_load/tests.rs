@@ -220,14 +220,14 @@ async fn the_task_delivers_events_once_and_stops_with_the_receiver() {
         .start_after(Duration::ZERO)
         .poll_interval(Duration::from_millis(5));
     let monitor = HostLoadMonitor::new(host, config, ForegroundWait::new(NORMAL_WAIT));
-    let events = spawn(
+    let channels = spawn(
         &executor_core::tokio::TokioGlobal,
         monitor,
         None,
         AnyClock::default(),
     );
 
-    let first = tokio::time::timeout(Duration::from_secs(10), events.recv())
+    let first = tokio::time::timeout(Duration::from_secs(10), channels.conditions.recv())
         .await
         .expect("the event arrives")
         .expect("the task is running");
@@ -239,7 +239,34 @@ async fn the_task_delivers_events_once_and_stops_with_the_receiver() {
         }
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(events.is_empty(), "a persisting condition raises nothing");
+    assert!(
+        channels.conditions.is_empty(),
+        "a persisting condition raises nothing"
+    );
+    assert!(channels.events.is_empty(), "a condition is no event");
+}
+
+/// A condition goes to the state the agent keeps; a final warning and a
+/// kill are events.
+#[tokio::test]
+async fn conditions_and_events_go_through_their_own_channels() {
+    let (senders, channels) = channels();
+    let high = HostLoadEvent::LoadHigh {
+        load: MachineLoad(2.0),
+        foreground_wait: Duration::from_secs(60),
+    };
+    let killed = HostLoadEvent::JobKilledForMemory {
+        domain: aither_sandbox::MemoryDomain::Machine,
+        task_id: "amber-forest-thunder-pearl".to_string(),
+        command: "cargo build".to_string(),
+        footprint: aither_sandbox::MemorySize(8 << 30),
+        capacity: aither_sandbox::MemorySize(32 << 30),
+    };
+    senders.send(high.clone()).await;
+    senders.send(killed.clone()).await;
+    assert_eq!(channels.conditions.try_recv(), Ok(high));
+    assert_eq!(channels.events.try_recv(), Ok(killed));
+    assert!(channels.conditions.is_empty() && channels.events.is_empty());
 }
 
 #[test]

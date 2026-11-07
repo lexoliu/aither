@@ -26,9 +26,9 @@ use crate::{
     agent::Agent,
     config::{AgentConfig, AgentKind},
     context::{
-        AnyContextSource, AnyStableContextSource, Context, ContextPolicy, ContextSource,
-        ExternalContent, ExternalSlot, HandoffDocument, HandoffSchema, InstructionSlot,
-        StableContextSource, SystemLayout,
+        AnyContextSource, AnyEventSource, AnyLiveSource, AnyStateSource, Context, ContextPolicy,
+        ContextSource, EventSource, ExternalContent, ExternalSlot, HandoffDocument, HandoffSchema,
+        InstructionSlot, LiveSource, StateSource, SystemLayout,
     },
     hook::{HCons, Hook},
     model_group::ModelTier,
@@ -104,7 +104,9 @@ pub struct AgentSettings {
     pub(crate) prompt_cache: crate::context::PromptCache,
     pub(crate) clock: crate::AnyClock,
     pub(crate) context_sources: Vec<AnyContextSource>,
-    pub(crate) stable_sources: Vec<AnyStableContextSource>,
+    pub(crate) live_sources: Vec<AnyLiveSource>,
+    pub(crate) state_sources: Vec<AnyStateSource>,
+    pub(crate) event_sources: Vec<AnyEventSource>,
     /// The agent's working document and what the host gives it.
     pub(crate) document: crate::working_document::DocumentWiring,
     /// The embedder's stop rule; without one a run ends whenever the model
@@ -139,7 +141,9 @@ impl Default for AgentSettings {
             prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
             clock: crate::AnyClock::default(),
             context_sources: Vec::new(),
-            stable_sources: Vec::new(),
+            live_sources: Vec::new(),
+            state_sources: Vec::new(),
+            event_sources: Vec::new(),
             document: crate::working_document::DocumentWiring::default(),
             stop_hook: None,
             fork_source: None,
@@ -163,7 +167,7 @@ struct Wiring {
     kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
     /// The commands the terminal runs, kept current in the command table.
     commands: Option<crate::command_catalog::CommandCatalog>,
-    host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
+    host_load: Option<crate::host_load::HostLoadChannels>,
     job_registry: Option<JobRegistry>,
     /// Directory the agent's working document is kept in: the directory its
     /// terminal works in.
@@ -368,28 +372,55 @@ pub trait AgentOptions: sealed::Sealed + Sized {
         self
     }
 
-    /// Registers a source rendered into the cacheable prefix, after the
-    /// system prompt and before the handoff, for content too large to resend
-    /// uncached in every request's tail.
+    /// Registers live content: a source rendered into the cacheable prefix,
+    /// after the system prompt and before the handoff, for content too large
+    /// to resend uncached in every request's tail.
     ///
     /// Blocks render in registration order. A change after a request carried
-    /// the block reaches the model as the alert the source writes for it,
-    /// and the new block replaces the old one at the next reassembly or
-    /// compaction (see [`StableContextSource`]).
+    /// the block reaches the model as the diff alert the source writes for
+    /// it, and the new block replaces the old one at the next reassembly or
+    /// compaction (see [`LiveSource`]).
     ///
     /// # Panics
     ///
-    /// Panics if a stable source with the same
-    /// [`TAG`](StableContextSource::TAG) is already registered.
+    /// Panics if a live source with the same [`TAG`](LiveSource::TAG) is
+    /// already registered.
     #[must_use]
-    fn stable_context_source<S: StableContextSource>(mut self, source: S) -> Self {
-        let sources = &mut self.settings().stable_sources;
+    fn live_source<S: LiveSource>(mut self, source: S) -> Self {
+        let sources = &mut self.settings().live_sources;
         assert!(
             sources.iter().all(|registered| registered.tag() != S::TAG),
-            "stable context source `{}` is registered twice",
+            "live source `{}` is registered twice",
             S::TAG
         );
-        sources.push(AnyStableContextSource::new(source));
+        sources.push(AnyLiveSource::new(source));
+        self
+    }
+
+    /// Registers state: keyed conditions the model is told about, as a
+    /// request is assembled, only when a value differs from the one it last
+    /// saw (see [`StateSource`]).
+    ///
+    /// Sources are read in registration order, after the built-in host load
+    /// state.
+    #[must_use]
+    fn state_source<S: StateSource>(mut self, source: S) -> Self {
+        self.settings()
+            .state_sources
+            .push(AnyStateSource::new(source));
+        self
+    }
+
+    /// Registers events, each told to the model once with the next request
+    /// (see [`EventSource`]).
+    ///
+    /// Sources are read in registration order, after the built-in host
+    /// events.
+    #[must_use]
+    fn event_source<S: EventSource>(mut self, source: S) -> Self {
+        self.settings()
+            .event_sources
+            .push(AnyEventSource::new(source));
         self
     }
 
@@ -1099,9 +1130,10 @@ where
         self
     }
 
-    /// Starts a [`HostLoadMonitor`](crate::HostLoadMonitor) on `executor` and
-    /// tells the agent, once per event, when machine load becomes high and when
-    /// it ends.
+    /// Starts a [`HostLoadMonitor`](crate::HostLoadMonitor) on `executor`
+    /// and keeps machine load, memory and disk pressure as state the agent
+    /// is told about when a level differs from the one it last saw (see
+    /// [`StateSource`]).
     ///
     /// With `memory`, the same readings drive the agent's
     /// [`RunawayGuard`](crate::RunawayGuard): memory warnings listing its
@@ -1121,7 +1153,7 @@ where
         R: crate::HostReader,
         E: executor_core::Executor,
     {
-        self.wiring.host_load_events = Some(crate::host_load::spawn(
+        self.wiring.host_load = Some(crate::host_load::spawn(
             executor,
             monitor,
             memory.map(crate::RunawayGuard::new),
@@ -1167,6 +1199,9 @@ where
     }
 
     /// Builds the agent.
+    // One line per field of the settings, the wiring and the agent they
+    // assemble; splitting it would only scatter that list.
+    #[allow(clippy::too_many_lines)]
     pub fn build(self) -> Agent<Advanced, Balanced, Fast, H, Compactor, Schema> {
         let AgentSettings {
             parameters,
@@ -1176,7 +1211,9 @@ where
             prompt_cache,
             clock,
             context_sources,
-            stable_sources,
+            live_sources,
+            mut state_sources,
+            mut event_sources,
             document,
             stop_hook,
             fork_source,
@@ -1192,7 +1229,7 @@ where
             permission_receiver,
             kept_receiver,
             commands,
-            host_load_events,
+            host_load,
             job_registry,
             sandbox_dir,
             restore_dir,
@@ -1200,14 +1237,13 @@ where
             inherited,
             fork_tools,
         } = self.wiring;
+        if let Some(channels) = host_load {
+            channels.register(&notices, &mut state_sources, &mut event_sources);
+        }
         let tools = assemble_tools(tools, fork_tools, compact_signal.as_ref(), &notices);
         // A fork starts initialized, from what the main agent carried over.
         let initialized = inherited.is_some();
-        let Inherited {
-            budget,
-            profile,
-            effort,
-        } = inherited.unwrap_or_default();
+        let inherited = inherited.unwrap_or_default();
         Agent {
             warmth: crate::CacheWarmth::new(prompt_cache.lifetime(), clock),
             advanced: std::sync::Arc::new(self.advanced),
@@ -1223,11 +1259,14 @@ where
             tier,
             tools,
             hooks: self.hooks,
-            budget,
+            budget: inherited.budget,
             prompt_cache,
             context_sources,
-            stable_sources,
+            live_sources,
+            state_sources,
+            event_sources,
             reassembled: false,
+            last_run: crate::agent::LastRun::Finished,
             prefix_rewrites: crate::context::PrefixRewrites::default(),
             requests_sent: 0,
             compaction: crate::compaction_state::CompactionState::default(),
@@ -1236,14 +1275,13 @@ where
             config,
             context,
             initialized,
-            effort,
-            profile,
+            effort: inherited.effort,
+            profile: inherited.profile,
             compaction_profile: None,
             background_receiver,
             permission_receiver,
             kept_receiver,
             commands,
-            host_load_events,
             job_registry,
             detached_task_ids: std::collections::HashSet::new(),
             // Every agent with a sandbox, a fork included, keeps its own

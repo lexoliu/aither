@@ -230,7 +230,7 @@ async fn a_detached_run_ends_on_a_refused_reread_and_the_completion_resumes_it()
     let wake = tokio::time::timeout(Duration::from_secs(20), agent.wait_background())
         .await
         .expect("the completion wakes the idle agent");
-    assert!(wake.needs_model, "the completion is news for the model");
+    assert!(wake.starts_run, "the completion is news for the model");
     drop(wake);
     tokio::time::timeout(
         Duration::from_secs(20),

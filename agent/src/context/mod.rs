@@ -21,8 +21,11 @@
 //! - [`reassembly`] re-reads what the handoff named, within budget;
 //! - [`source`] is how everything ambient — working documents, running jobs,
 //!   active skills — reaches the model without the agent loop knowing about
-//!   any of it in particular, in the tail or, for content that rarely
-//!   changes, in the cacheable prefix;
+//!   any of it in particular, in the tail or, for live content, in the
+//!   cacheable prefix;
+//! - [`state`] tells the model of keyed conditions — memory pressure,
+//!   machine load — only when their value differs from what it last saw;
+//! - [`event`] tells it of each thing that happened once;
 //! - [`live`] is how prefix content that changes mid-session — `AGENTS.md`,
 //!   the command table — reaches the model as one diff while the prefix is
 //!   cached and as its clean version after the next reassembly.
@@ -30,6 +33,7 @@
 pub mod budget;
 pub mod cache;
 pub mod compaction;
+pub mod event;
 pub mod live;
 pub mod policy;
 pub mod prefix;
@@ -37,6 +41,7 @@ pub mod reassembly;
 pub(crate) mod recovery;
 pub mod source;
 pub mod sources;
+pub mod state;
 pub mod system;
 pub mod window;
 
@@ -47,17 +52,16 @@ pub use compaction::{
     HandoffPrompt, HandoffSchema, InvalidHandoff, LineRange, PendingCompaction, Restoration,
     SkillCatalogEntry, build_file_index,
 };
+pub use event::{AnyEventSource, EventSource};
 pub use live::{LiveContent, LiveUpdate};
 pub use policy::ContextPolicy;
 pub use prefix::{PrefixBlock, PrefixChain, PrefixRewrites, PromptPrefix};
 pub use reassembly::restore_context;
-pub use source::{
-    AnyContextSource, AnyStableContextSource, Block, ContextSource, StableChange,
-    StableContextSource,
-};
+pub use source::{AnyContextSource, AnyLiveSource, Block, ContextSource, LiveChange, LiveSource};
 #[cfg(feature = "skills")]
 pub use sources::ActiveSkills;
 pub use sources::BackgroundJobs;
+pub use state::{AnyStateSource, StateChange, StateSource};
 pub use system::{
     BlockKind, External, ExternalContent, ExternalSlot, Instruction, InstructionSlot, Slot,
     Sourced, SourcedSlot, SystemLayout, SystemRegion,

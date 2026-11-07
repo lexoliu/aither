@@ -118,13 +118,13 @@ pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy};
 #[cfg(feature = "skills")]
 pub use context::ActiveSkills;
 pub use context::{
-    AnyContextSource, AnyStableContextSource, BackgroundJobs, Block, CompactionError,
-    CompletedCompaction, Context, ContextBudget, ContextCheckpoint, ContextFile, ContextItem,
-    ContextPolicy, ContextSource, ExternalContent, ExternalSlot, Handoff, HandoffDocument,
-    HandoffPrompt, HandoffSchema, InstructionSlot, InvalidHandoff, LineRange, LiveContent,
-    LiveUpdate, PrefixBlock, PrefixChain, PrefixRewrites, PromptCache, PromptPrefix,
-    ReassemblyReport, Restoration, SkillCatalogEntry, Sourced, SourcedSlot, StableChange,
-    StableContextSource, SystemLayout,
+    AnyContextSource, AnyEventSource, AnyLiveSource, AnyStateSource, BackgroundJobs, Block,
+    CompactionError, CompletedCompaction, Context, ContextBudget, ContextCheckpoint, ContextFile,
+    ContextItem, ContextPolicy, ContextSource, EventSource, ExternalContent, ExternalSlot, Handoff,
+    HandoffDocument, HandoffPrompt, HandoffSchema, InstructionSlot, InvalidHandoff, LineRange,
+    LiveChange, LiveContent, LiveSource, LiveUpdate, PrefixBlock, PrefixChain, PrefixRewrites,
+    PromptCache, PromptPrefix, ReassemblyReport, Restoration, SkillCatalogEntry, Sourced,
+    SourcedSlot, StateChange, StateSource, SystemLayout,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use disk::{

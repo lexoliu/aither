@@ -10,18 +10,26 @@
 //! hosts register whatever else they need with
 //! [`AgentOptions::context_source`](crate::AgentOptions::context_source).
 //!
-//! A source declares its placement by the trait it implements:
+//! A source declares how its content reaches the model by the trait it
+//! implements:
 //!
 //! - a [`ContextSource`] renders into the *tail* of the request, never into
 //!   the middle of it, so content that changes on every single request is
 //!   the last thing the model reads and the cached prefix never moves;
-//! - a [`StableContextSource`] renders into the cacheable prefix, after the
-//!   system prompt and before the handoff, for large content that rarely
-//!   changes and would cost full input price on every request in the tail.
-//!   A change to it never rewrites a prefix the provider may hold: it is
-//!   staged, announced once by the alert the source writes for it, and
-//!   folded in at the next reassembly or compaction, exactly like a staged
-//!   system block (see [`Context::update_live`](crate::Context::update_live)).
+//! - a [`LiveSource`] is *live content*: it renders into the cacheable
+//!   prefix, after the system prompt and before the handoff, for large
+//!   content that rarely changes and would cost full input price on every
+//!   request in the tail. The agent keeps the version the model has seen. A
+//!   change to it never rewrites a prefix the provider may hold: it is
+//!   staged, announced once as the diff alert the source writes for it, and
+//!   folded in at the next reassembly or compaction, which drops the diffs,
+//!   exactly like a staged system block (see
+//!   [`Context::update_live`](crate::Context::update_live));
+//! - a [`StateSource`](super::StateSource) is *state*: keyed conditions with
+//!   a latest value, told to the model only when the value differs from the
+//!   one it last saw;
+//! - an [`EventSource`](super::EventSource) is *events*: each delivered
+//!   once, and never restated.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -260,16 +268,16 @@ impl AnyContextSource {
     }
 }
 
-/// A change to a [`StableContextSource`]'s block, as the model is to be told
+/// A change to a [`LiveSource`]'s block, as the model is to be told
 /// it: from the content it knows — the prefix's block with every change
 /// announced since applied — to the content just rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StableChange<'a> {
+pub struct LiveChange<'a> {
     before: &'a str,
     after: &'a str,
 }
 
-impl<'a> StableChange<'a> {
+impl<'a> LiveChange<'a> {
     pub(crate) const fn new(before: &'a str, after: &'a str) -> Self {
         Self { before, after }
     }
@@ -294,8 +302,9 @@ impl<'a> StableChange<'a> {
     }
 }
 
-/// Supplies context that lives in the cacheable prefix of every request:
-/// after the system prompt, before the handoff.
+/// Supplies live content: context that lives in the cacheable prefix of
+/// every request, after the system prompt and before the handoff, and
+/// changes while the session runs.
 ///
 /// While nothing has carried the prefix — the start of a session, or right
 /// after a reassembly or compaction — the rendered block is written into it.
@@ -312,25 +321,25 @@ impl<'a> StableChange<'a> {
 /// # Example
 ///
 /// ```
-/// use aither_agent::{Block, StableChange, StableContextSource};
+/// use aither_agent::{Block, LiveChange, LiveSource};
 ///
 /// struct LinkedIssues(String);
 ///
-/// impl StableContextSource for LinkedIssues {
+/// impl LiveSource for LinkedIssues {
 ///     const TAG: &'static str = "linked_issues";
 ///
 ///     async fn render(&self) -> Option<String> {
 ///         Some(self.0.clone())
 ///     }
 ///
-///     fn announce(&self, change: &StableChange<'_>) -> Block {
+///     fn announce(&self, change: &LiveChange<'_>) -> Block {
 ///         Block::new("linked_issues_changed", change.diff())
 ///     }
 /// }
 /// ```
-pub trait StableContextSource: Send + Sync + 'static {
+pub trait LiveSource: Send + Sync + 'static {
     /// The block's identity: its slot in the prefix. Unique among the
-    /// stable sources an agent holds.
+    /// live sources an agent holds.
     const TAG: &'static str;
 
     /// Renders the block's current content; `None` removes the block.
@@ -341,57 +350,57 @@ pub trait StableContextSource: Send + Sync + 'static {
 
     /// The durable alert telling the model of `change`, appended to the
     /// conversation once while the prefix keeps the earlier version.
-    fn announce(&self, change: &StableChange<'_>) -> Block;
+    fn announce(&self, change: &LiveChange<'_>) -> Block;
 }
 
-/// Object-safe twin of [`StableContextSource`].
-trait StableContextSourceImpl: Send + Sync {
+/// Object-safe twin of [`LiveSource`].
+trait LiveSourceImpl: Send + Sync {
     fn tag(&self) -> &'static str;
 
     fn render<'a>(&'a self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 
-    fn announce(&self, change: &StableChange<'_>) -> Block;
+    fn announce(&self, change: &LiveChange<'_>) -> Block;
 }
 
-impl<T: StableContextSource> StableContextSourceImpl for T {
+impl<T: LiveSource> LiveSourceImpl for T {
     fn tag(&self) -> &'static str {
         T::TAG
     }
 
     fn render<'a>(&'a self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
-        Box::pin(StableContextSource::render(self))
+        Box::pin(LiveSource::render(self))
     }
 
-    fn announce(&self, change: &StableChange<'_>) -> Block {
-        StableContextSource::announce(self, change)
+    fn announce(&self, change: &LiveChange<'_>) -> Block {
+        LiveSource::announce(self, change)
     }
 }
 
-/// A type-erased [`StableContextSource`], so an agent can hold a
+/// A type-erased [`LiveSource`], so an agent can hold a
 /// heterogeneous set.
-pub struct AnyStableContextSource {
-    inner: Box<dyn StableContextSourceImpl>,
+pub struct AnyLiveSource {
+    inner: Box<dyn LiveSourceImpl>,
 }
 
-impl std::fmt::Debug for AnyStableContextSource {
+impl std::fmt::Debug for AnyLiveSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("AnyStableContextSource")
+            .debug_struct("AnyLiveSource")
             .field("tag", &self.tag())
             .finish_non_exhaustive()
     }
 }
 
-impl AnyStableContextSource {
+impl AnyLiveSource {
     /// Erases the concrete type of `source`.
     #[must_use]
-    pub fn new<T: StableContextSource>(source: T) -> Self {
+    pub fn new<T: LiveSource>(source: T) -> Self {
         Self {
             inner: Box::new(source),
         }
     }
 
-    /// See [`StableContextSource::TAG`].
+    /// See [`LiveSource::TAG`].
     #[must_use]
     pub fn tag(&self) -> &'static str {
         self.inner.tag()
@@ -402,14 +411,14 @@ impl AnyStableContextSource {
         super::SourcedSlot::new(self.tag())
     }
 
-    /// See [`StableContextSource::render`].
+    /// See [`LiveSource::render`].
     pub fn render(&self) -> impl Future<Output = Option<String>> + Send + '_ {
         self.inner.render()
     }
 
-    /// See [`StableContextSource::announce`].
+    /// See [`LiveSource::announce`].
     #[must_use]
-    pub fn announce(&self, change: &StableChange<'_>) -> Block {
+    pub fn announce(&self, change: &LiveChange<'_>) -> Block {
         self.inner.announce(change)
     }
 }
