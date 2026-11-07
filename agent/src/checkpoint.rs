@@ -18,6 +18,6 @@ pub struct AgentCheckpoint {
     pub has_background_tasks: bool,
     /// What the conversation holds of the working document; `None` when it
     /// holds nothing, so a restored agent shows the document whole.
-    #[serde(default, rename = "tasks")]
+    #[serde(default)]
     pub document: Option<crate::working_document::DocumentCheckpoint>,
 }

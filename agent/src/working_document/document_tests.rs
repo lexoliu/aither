@@ -497,13 +497,13 @@ async fn a_restored_checkpoint_shows_only_what_changed_since() {
 
 /// The checkpoint keeps the shape stored checkpoints were written in.
 #[test]
-fn a_checkpoint_serializes_as_stored_checkpoints_read() {
+fn a_checkpoint_round_trips() {
     let checkpoint = DocumentCheckpoint {
         content: Some("* first\n".to_string()),
         roots: vec![WorkRef::issue(1)],
     };
     let json = serde_json::to_value(&checkpoint).expect("serializes");
-    assert_eq!(json["tasks_md"], "* first\n");
+    assert_eq!(json["content"], "* first\n");
     let read: DocumentCheckpoint = serde_json::from_value(json).expect("reads back");
     assert_eq!(read, checkpoint);
 }

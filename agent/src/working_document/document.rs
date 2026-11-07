@@ -101,7 +101,6 @@ struct Judged {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DocumentCheckpoint {
     /// The document as last shown; `None` when it was absent.
-    #[serde(rename = "tasks_md")]
     content: Option<String>,
     /// The roots whose trees the conversation holds.
     roots: Vec<WorkRef>,
