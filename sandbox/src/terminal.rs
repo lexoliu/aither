@@ -7074,6 +7074,7 @@ mod tests {
                     url::Url::from_file_path(&path).unwrap(),
                 ),
                 sha256: hex::encode(crate::tool_runtime::digest(script)),
+                size: script.len() as u64,
                 encoding: crate::ToolArtifactFormat::Executable,
             })
             .collect::<Vec<_>>();

@@ -165,6 +165,7 @@ async fn fixture_artifacts(
                 url::Url::from_file_path(binary).unwrap(),
             ),
             sha256: hex::encode(sha2::Sha256::digest(&bytes)),
+            size: bytes.len() as u64,
             encoding: ToolArtifactFormat::Executable,
         })
         .collect()

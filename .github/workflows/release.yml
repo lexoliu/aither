@@ -263,6 +263,7 @@ jobs:
             include "targets";
             ([.artifacts[].sha256] | all(test("^[0-9a-f]{64}$"))) and
             ([.host_programs[] | .sha256, .executable_sha256] | all(test("^[0-9a-f]{64}$"))) and
+            ([.artifacts[], .host_programs[]] | all(.size | type == "number" and . > 0 and . == floor)) and
             (. as $manifest | $built[0].tools | all(
               . as $listed
               | ([$manifest.artifacts[] | select(.tool == $listed.tool) | .target] | sort)

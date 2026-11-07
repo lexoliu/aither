@@ -39,6 +39,7 @@ entries() {
             target: $platform,
             url: "\($base)/\($m.file)",
             sha256: $m.sha256,
+            size: $m.size,
             encoding: {
                 format: "tar_gzip",
                 executable: (if $platform.os == "windows" then "\($tool).exe" else $tool end)
