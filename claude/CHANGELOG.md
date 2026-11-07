@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0](https://github.com/May-Agent/aither/compare/claude-v0.21.0...claude-v0.22.0) - 2026-11-07
+
+### Added
+
+- change a running agent's model, effort and grants in place
+
+### Fixed
+
+- clear the reasoning effort to the model's default on per-message models
+
 ## [0.15.0](https://github.com/May-Agent/aither/compare/claude-v0.14.1...claude-v0.15.0) - 2026-11-04
 
 ### Fixed
