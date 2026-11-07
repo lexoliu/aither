@@ -2117,7 +2117,9 @@ where
     /// grandchildren — has exited. Commands never see the shared pool
     /// directly, so killed commands cannot leak tokens.
     ///
-    /// Only local executions can open a host fifo; container and SSH
+    /// A container command's fifo is made inside the container, where its
+    /// `MAKEFLAGS` names it, and brokered against the same pool by a relay
+    /// run with the image's managed `python3`, with the same accounting. SSH
     /// commands fail while a pool is configured rather than running
     /// unbounded.
     ///
@@ -3923,6 +3925,10 @@ struct ContainerBackgroundExecution<'a, E> {
     lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
     priority: ProcessPriority,
+    /// The command's jobserver fifo inside the container, held until its
+    /// exec has ended.
+    #[cfg(all(unix, feature = "jobserver"))]
+    job_fifo: Option<crate::container_jobserver::ContainerJobFifo>,
 }
 
 struct SshBackgroundExecution<'a> {
@@ -4296,25 +4302,6 @@ where
     Ok(result)
 }
 
-/// Creates the private jobserver fifo for one command under the broker.
-///
-/// Only local commands can open a host fifo. Container and SSH executions
-/// fail rather than running unbounded while a pool is configured.
-#[cfg(all(unix, feature = "jobserver"))]
-async fn open_command_fifo(
-    broker: &JobBroker,
-    backend: &ExecutionBackend,
-) -> Result<crate::jobserver::CommandFifo, TerminalError> {
-    match backend {
-        ExecutionBackend::Local(_) => Ok(broker.open_fifo().await?),
-        ExecutionBackend::Container { .. } | ExecutionBackend::Ssh { .. } => {
-            Err(TerminalError::Execution(
-                "jobserver token pools are supported for local executions only".into(),
-            ))
-        }
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 async fn start_standalone_execution<P, E>(
     request: StandaloneStart<'_, P, E>,
@@ -4323,11 +4310,6 @@ where
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
-    #[cfg(all(unix, feature = "jobserver"))]
-    let job_fifo = match request.jobserver {
-        Some(broker) => Some(open_command_fifo(broker, request.backend).await?),
-        None => None,
-    };
     let prepared_tools = match request.backend {
         ExecutionBackend::Local(tools) => tools,
         ExecutionBackend::Container {
@@ -4335,6 +4317,21 @@ where
             tools,
             confinement,
         } => {
+            // The command's fifo lives in the container's kernel, brokered
+            // by a relay run with the image's managed `python3`.
+            #[cfg(all(unix, feature = "jobserver"))]
+            let job_fifo = match request.jobserver {
+                Some(broker) => Some(
+                    crate::container_jobserver::open_container_job_fifo(
+                        broker,
+                        runtime,
+                        &tools.bin_dir().join("python3"),
+                        request.executor.clone(),
+                    )
+                    .await?,
+                ),
+                None => None,
+            };
             let ipc_commands = request.registry.registered_tool_names();
             return execute_container_background(ContainerBackgroundExecution {
                 executor: request.executor,
@@ -4355,6 +4352,8 @@ where
                 lifetime: request.lifetime,
                 background_startup: request.background_startup,
                 priority: request.priority,
+                #[cfg(all(unix, feature = "jobserver"))]
+                job_fifo,
             })
             .await;
         }
@@ -4363,6 +4362,14 @@ where
             runtime,
             tools,
         } => {
+            // The remote host is outside the pool's reach; running there
+            // unbounded would defeat it.
+            #[cfg(all(unix, feature = "jobserver"))]
+            if request.jobserver.is_some() {
+                return Err(TerminalError::Execution(
+                    "jobserver token pools are not supported for SSH executions".into(),
+                ));
+            }
             return execute_ssh_background(SshBackgroundExecution {
                 prepared_tools: tools,
                 task_id: request.task_id,
@@ -4377,6 +4384,11 @@ where
             })
             .await;
         }
+    };
+    #[cfg(all(unix, feature = "jobserver"))]
+    let job_fifo = match request.jobserver {
+        Some(broker) => Some(broker.open_fifo().await?),
+        None => None,
     };
     let local = LocalBackgroundExecution {
         prepared_tools,
@@ -5580,6 +5592,26 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         &launch_script(context.language, context.script, context.task_id)?,
     )?;
     let script = inject_env_exports(script, context.env_source.as_ref())?;
+    // Exported ahead of the embedder's variables, which win as they do for
+    // a local command.
+    #[cfg(all(unix, feature = "jobserver"))]
+    let script = match &context.job_fifo {
+        Some(fifo) => {
+            let environment: Arc<dyn TerminalEnvSource> = Arc::new(fifo.environment());
+            inject_env_exports(script, Some(&environment))?
+        }
+        None => script,
+    };
+    #[cfg(all(unix, feature = "jobserver"))]
+    let confinement = job_confinement(
+        context.confinement,
+        context
+            .job_fifo
+            .as_ref()
+            .map(crate::container_jobserver::ContainerJobFifo::path),
+    );
+    #[cfg(not(all(unix, feature = "jobserver")))]
+    let confinement = context.confinement.cloned();
     let script = mark_container_job(script, context.task_id)?;
     // A foreground command gets no input channel: the dropped sender is the
     // EOF its stdin reads. StdinAlerts may ride along either way; they are
@@ -5639,7 +5671,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         context.priority,
         context.prepared_tools.bin_dir(),
         working_dir,
-        context.confinement,
+        confinement.as_ref(),
     )?;
 
     let execution = exec
@@ -5656,6 +5688,10 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
     if let Some(bridge) = ipc_bridge {
         bridge.stop().await;
     }
+    // The exec has ended, killed or not: the relay stops feeding the fifo and
+    // returns its tokens once the job's last process holding it is gone.
+    #[cfg(all(unix, feature = "jobserver"))]
+    drop(context.job_fifo);
 
     record_container_exec_outcome(context.job_registry, pid, &context.lifetime, execution).await
 }
@@ -6025,6 +6061,19 @@ pub const CONTAINER_EXEC_WORKING_DIR: &str = "/workspace";
 struct ContainerConfinement {
     working_dir: ContainerPath,
     writable: Vec<ContainerPath>,
+}
+
+/// A container command's sandbox: a subagent's confinement plus write access
+/// to the command's jobserver fifo, which its build tools write tokens back
+/// to. An unconfined command already reaches the fifo.
+#[cfg(all(unix, feature = "jobserver"))]
+fn job_confinement(
+    confinement: Option<&ContainerConfinement>,
+    job_fifo: Option<&ContainerPath>,
+) -> Option<ContainerConfinement> {
+    let mut confinement = confinement?.clone();
+    confinement.writable.extend(job_fifo.cloned());
+    Some(confinement)
 }
 
 /// Where a container command runs: the mounted tools, the exec's working
@@ -9581,10 +9630,179 @@ mod tests {
             priority: ProcessPriority::default(),
             confinement: None,
             carry: None,
+            #[cfg(all(unix, feature = "jobserver"))]
+            job_fifo: None,
         })
         .await
         .expect("a foreground container exec should complete");
         assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// A subagent's command in a container gets write access to its
+    /// jobserver fifo on top of its confinement; an unconfined command gets
+    /// no grants at all.
+    #[cfg(all(unix, feature = "jobserver"))]
+    #[test]
+    fn container_job_fifo_is_granted_to_a_confined_command() {
+        let fifo = ContainerPath::new("/tmp/aither-jobserver-1.fifo").unwrap();
+        let confinement = ContainerConfinement {
+            working_dir: ContainerPath::new("/workspace/.subagents/a").unwrap(),
+            writable: vec![ContainerPath::new("/workspace/.subagents/a").unwrap()],
+        };
+        assert_eq!(job_confinement(None, Some(&fifo)), None);
+        let confined = job_confinement(Some(&confinement), Some(&fifo)).unwrap();
+        let tools_dir = container_tools_dir();
+        let wrapped = wrap_container_script(
+            "make",
+            &[],
+            None,
+            ProcessPriority::default(),
+            &tools_dir,
+            "/workspace",
+            Some(&confined),
+        )
+        .unwrap();
+        assert!(
+            wrapped.contains(
+                "--grant '/workspace/.subagents/a=rw' --grant '/tmp/aither-jobserver-1.fifo=rw'"
+            ),
+            "{wrapped}"
+        );
+        assert_eq!(
+            job_confinement(Some(&confinement), None).as_ref(),
+            Some(&confinement)
+        );
+    }
+
+    /// With a pool configured, a container command's script exports the
+    /// jobserver variables naming its own fifo inside the container, and the
+    /// fifo's relay is told once the command's exec ends.
+    /// Captures each command's script; plays a jobserver relay that reports
+    /// ready and records what the host tells it.
+    #[cfg(all(unix, feature = "jobserver"))]
+    struct CapturingExec {
+        scripts: Sender<String>,
+        relay_heard: Sender<Vec<u8>>,
+    }
+
+    #[cfg(all(unix, feature = "jobserver"))]
+    impl crate::ContainerExec for CapturingExec {
+        async fn exec(
+            &self,
+            _container_id: &str,
+            script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _lifetime: ExecLifetime,
+        ) -> Result<ContainerExecOutcome, String> {
+            self.scripts.send(script.to_string()).await.unwrap();
+            Ok(ContainerExecOutcome::Completed {
+                output: std::process::Output {
+                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                killed: Vec::new(),
+            })
+        }
+
+        async fn exec_streamed(
+            &self,
+            _container_id: &str,
+            _script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            stdin_rx: Receiver<Vec<u8>>,
+            stdout: Sender<Vec<u8>>,
+        ) -> Result<ContainerExecOutcome, String> {
+            stdout.send(b"R".to_vec()).await.unwrap();
+            while let Ok(message) = stdin_rx.recv().await {
+                let finished = message == b"F";
+                self.relay_heard.send(message).await.unwrap();
+                if finished {
+                    break;
+                }
+            }
+            Err("the relay exits".to_string())
+        }
+    }
+
+    #[cfg(all(unix, feature = "jobserver"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn container_command_environment_names_its_own_fifo() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let pool = crate::jobserver::JobPool::create_fifo(dir.path().join("pool.fifo"), 2)
+            .expect("pool should be created");
+        let (broker, service) =
+            crate::jobserver::job_broker_channel(pool, dir.path().join("commands"))
+                .expect("broker should start");
+        tokio::spawn(async move { service.serve().await });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(dir.path()));
+        let (job_registry, job_registry_service) = job_registry_channel();
+        tokio::spawn(async move { job_registry_service.serve().await });
+        let container_tools =
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
+        let (scripts_tx, scripts) = async_channel::unbounded();
+        let (heard_tx, heard) = async_channel::unbounded();
+        let runtime = ContainerShellRuntime::new(
+            "aither-test-jobserver",
+            crate::ContainerIpcRoute::new(
+                "host.docker.internal",
+                crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
+                    .expect("loopback binds the bridge"),
+            ),
+            crate::AnyContainerExec::new(Arc::new(CapturingExec {
+                scripts: scripts_tx,
+                relay_heard: heard_tx,
+            })),
+        );
+        let job_fifo = crate::container_jobserver::open_container_job_fifo(
+            &broker,
+            &runtime,
+            &container_tools.bin_dir().join("python3"),
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("the relay reports ready");
+        let fifo_path = job_fifo.path().clone();
+        let (startup_tx, _startup_rx) = async_channel::bounded(1);
+        let (alert_tx, _alert_rx) = async_channel::unbounded();
+        execute_container_background(ContainerBackgroundExecution {
+            executor: executor_core::tokio::TokioGlobal,
+            env_source: &None,
+            registry: &registry,
+            task_id: "task-test",
+            execution_id: "exec-test",
+            script: "make",
+            language: ScriptLanguage::Shell,
+            mode: TerminalMode::Sandboxed,
+            container_runtime: &runtime,
+            prepared_tools: &container_tools,
+            ipc_commands: &[],
+            job_registry: &job_registry,
+            stdin_alerts: None,
+            lifetime: JobLifetime::Foreground { alerts: alert_tx },
+            background_startup: &BackgroundStartup::new(startup_tx),
+            priority: ProcessPriority::default(),
+            confinement: None,
+            carry: None,
+            job_fifo: Some(job_fifo),
+        })
+        .await
+        .expect("the container exec completes");
+
+        let script = scripts.recv().await.expect("the command ran");
+        let flags = format!("'-j --jobserver-auth=fifo:{fifo_path}'");
+        for name in ["MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS"] {
+            assert!(
+                script.contains(&format!("export {name}={flags}\n")),
+                "{name} names the container fifo: {script}"
+            );
+        }
+        assert!(!script.contains(dir.path().to_str().unwrap()));
+        // The relay asked for nothing, so all it hears is the finish.
+        assert_eq!(heard.recv().await.unwrap(), b"F");
     }
 
     /// A job whose `reader` script blocks on stdin yields exactly one alert
