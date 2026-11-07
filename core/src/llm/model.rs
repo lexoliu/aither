@@ -1357,6 +1357,10 @@ pub struct Profile {
     pub context_length: u32,
     /// Optional pricing information for the model.
     pub pricing: Option<Pricing>,
+    /// The reasoning effort the model runs at when a request sets none, as
+    /// its vendor documents it; `None` when no default is recorded.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Pricing information for a model's various capabilities (unit: USD).
@@ -1477,7 +1481,16 @@ impl Profile {
             abilities: Vec::new(),
             context_length,
             pricing: None,
+            default_reasoning_effort: None,
         }
+    }
+
+    /// Records the reasoning effort the model runs at when a request sets
+    /// none.
+    #[must_use]
+    pub const fn with_default_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.default_reasoning_effort = Some(effort);
+        self
     }
 
     /// Adds a single ability to the profile.
@@ -1591,6 +1604,10 @@ pub enum Ability {
     PromptCaching,
     /// The model supports assistant prefill (pre-filling assistant responses).
     AssistantPrefill,
+    /// The model takes a reasoning effort change inside the conversation, as a
+    /// [`Message::Configuration`](crate::llm::Message::Configuration), without
+    /// the request-level effort changing — so the prompt cache stays warm.
+    PerMessageEffort,
 }
 
 #[cfg(test)]

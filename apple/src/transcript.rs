@@ -88,6 +88,11 @@ pub fn prepare(messages: &[Message]) -> Result<Prepared, AppleError> {
             ));
         }
         match message {
+            Message::Configuration { .. } => {
+                return Err(unsupported(
+                    "the on-device model takes no per-message effort update",
+                ));
+            }
             Message::System { content } => {
                 if seen_content {
                     return Err(unsupported(

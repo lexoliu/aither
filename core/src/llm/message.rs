@@ -8,6 +8,7 @@ use mime::Mime;
 use url::Url;
 
 use super::event::ToolCall;
+use super::model::ReasoningEffort;
 use super::reasoning::ReasoningState;
 
 /// A typed media attachment supplied with a user message.
@@ -92,6 +93,9 @@ pub enum Role {
     System,
     /// Tool message - output from tool/function calls.
     Tool,
+    /// Configuration update - a change to how the model works from this
+    /// point of the conversation on, carrying no text.
+    Configuration,
 }
 
 impl core::fmt::Display for Role {
@@ -101,6 +105,7 @@ impl core::fmt::Display for Role {
             Self::Assistant => "Assistant",
             Self::System => "System",
             Self::Tool => "Tool",
+            Self::Configuration => "Configuration",
         })
     }
 }
@@ -159,6 +164,19 @@ pub enum Message {
         /// ID of the tool call this is responding to.
         tool_call_id: String,
     },
+    /// A reasoning effort change for the rest of the conversation, sent in
+    /// the provider's per-message form: an effort-only `system` message on
+    /// Claude, a `configuration_update` input item on the `OpenAI` Responses
+    /// API.
+    ///
+    /// It leaves the request-level effort and every earlier byte of the
+    /// request as they were, so the prompt cache stays warm. Only models with
+    /// [`Ability::PerMessageEffort`](crate::llm::model::Ability::PerMessageEffort)
+    /// accept it; a provider that cannot express it rejects the request.
+    Configuration {
+        /// The reasoning effort from this point of the conversation on.
+        reasoning_effort: ReasoningEffort,
+    },
 }
 
 impl Message {
@@ -170,10 +188,12 @@ impl Message {
             Self::Assistant { .. } => Role::Assistant,
             Self::System { .. } => Role::System,
             Self::Tool { .. } => Role::Tool,
+            Self::Configuration { .. } => Role::Configuration,
         }
     }
 
-    /// Returns the text content of the message.
+    /// Returns the text content of the message; a configuration update has
+    /// none.
     #[must_use]
     pub fn content(&self) -> &str {
         match self {
@@ -181,6 +201,24 @@ impl Message {
             | Self::Assistant { content, .. }
             | Self::System { content }
             | Self::Tool { content, .. } => content,
+            Self::Configuration { .. } => "",
+        }
+    }
+
+    /// Creates a configuration update setting the reasoning effort from this
+    /// point of the conversation on.
+    #[must_use]
+    pub const fn configuration(reasoning_effort: ReasoningEffort) -> Self {
+        Self::Configuration { reasoning_effort }
+    }
+
+    /// The reasoning effort a configuration update sets; `None` for every
+    /// other message.
+    #[must_use]
+    pub const fn configured_effort(&self) -> Option<ReasoningEffort> {
+        match self {
+            Self::Configuration { reasoning_effort } => Some(*reasoning_effort),
+            _ => None,
         }
     }
 

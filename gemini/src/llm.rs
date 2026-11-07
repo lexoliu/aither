@@ -465,6 +465,11 @@ async fn messages_to_gemini(
             flush_tool_results(&mut contents, &mut pending_results);
         }
         match message.role() {
+            Role::Configuration => {
+                return Err(GeminiError::Api(
+                    "Gemini takes no per-message effort update".to_string(),
+                ));
+            }
             Role::System => system_parts.push(Part::text(message.content())),
             Role::User => {
                 let attachments = message.attachments();

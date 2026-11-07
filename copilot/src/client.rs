@@ -383,6 +383,9 @@ async fn to_chat_messages(messages: &[Message]) -> Result<Vec<ChatMessagePayload
     let mut payloads = Vec::with_capacity(messages.len());
     for msg in messages {
         let (role, tool_calls, tool_call_id) = match msg.role() {
+            Role::Configuration => {
+                return Err("Copilot takes no per-message effort update".to_string());
+            }
             Role::System => ("system", None, None),
             Role::User => ("user", None, None),
             Role::Assistant => {

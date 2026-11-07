@@ -39,9 +39,9 @@ use crate::{
 use aither_core::{
     LanguageModel,
     llm::{
-        Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, RetryPolicy,
+        Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, RetryPolicy, Role,
         StoredFile, ToolCall,
-        model::{Parameters, Profile as ModelProfile},
+        model::{Ability, Parameters, Profile as ModelProfile},
     },
 };
 use askama::Template;
@@ -795,6 +795,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// The parameters of the requests sent on each tier's model.
     pub(crate) parameters: TierParameters,
 
+    /// The request-level reasoning effort the agent's own requests carry.
+    pub(crate) effort: crate::effort::EffortAnchor,
+
     /// Whether the idle compaction already ran since the last request, so one
     /// idle gap compacts once.
     pub(crate) idle_compacted: bool,
@@ -972,6 +975,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             fast: Arc::new(llm),
             compaction_model: None,
             parameters: TierParameters::default(),
+            effort: crate::effort::EffortAnchor::default(),
             idle_compacted: false,
             tier: ModelTier::default(),
             tools: AgentTools::new(),
@@ -1217,6 +1221,8 @@ where
             events.emit(event);
         }
         self.settle_interrupted_tool_calls();
+        // An effort change lands before the user message it applies to.
+        self.settle_effort()?;
         self.context.push(
             self.timestamped_user_message(&prompt)
                 .with_attachments(attachments),
@@ -2491,7 +2497,7 @@ where
             .await;
         let tail = self.render_tail().await;
         let definitions = self.tools.active_definitions();
-        let messages = self.context.build_request(&tail);
+        let messages = self.request_messages(&tail);
         let request = self.compaction_request(messages, definitions);
         #[cfg(feature = "skills")]
         let skills = self.skill_catalog();
@@ -2528,6 +2534,153 @@ where
         self.parameters.get(self.tier)
     }
 
+    /// The parameters of the requests sent on `tier`'s model.
+    #[must_use]
+    pub fn parameters(&self, tier: ModelTier) -> &Parameters {
+        self.parameters.get(tier)
+    }
+
+    /// Changes the parameters of the requests sent on `tier`'s model, from
+    /// the next request on.
+    ///
+    /// The advanced tier's parameters are also those of every tier still on
+    /// the model the agent was created with, as
+    /// [`AgentOptions::request_parameters`](crate::AgentOptions::request_parameters)
+    /// sets them; a balanced or fast tier gets parameters of its own.
+    ///
+    /// A reasoning effort change on the agent's own tier keeps the prompt
+    /// cache warm when the model takes per-message effort updates
+    /// ([`Ability::PerMessageEffort`](aither_core::llm::model::Ability::PerMessageEffort)):
+    /// the next request carries the update inside the conversation, before
+    /// the next user message when one starts the turn, and the request-level
+    /// effort stays as the first request sent it. Clearing the effort there
+    /// is an update to the model's documented default
+    /// ([`Profile::default_reasoning_effort`](aither_core::llm::model::Profile::default_reasoning_effort));
+    /// with none recorded, the next turn fails with [`AgentError::Config`]
+    /// rather than leave the earlier level in force. Any other model, and any
+    /// other parameter, takes the new value at the request level, which
+    /// restarts the cache.
+    pub fn set_parameters(&mut self, tier: ModelTier, parameters: Parameters) {
+        match tier {
+            ModelTier::Advanced => self.parameters.set_shared(parameters),
+            ModelTier::Balanced => self.parameters.set_balanced(parameters),
+            ModelTier::Fast => self.parameters.set_fast(parameters),
+        }
+    }
+
+    /// Replaces the advanced tier's model.
+    ///
+    /// The next request on the tier goes to `model`; history, context and
+    /// background jobs stay. A new model reads none of the old one's prompt
+    /// cache, so the change applies at once. A compaction already running
+    /// finishes on the model it started on.
+    pub fn set_advanced_model(&mut self, model: Advanced) {
+        self.advanced = Arc::new(model);
+        self.replaced_model(ModelTier::Advanced);
+    }
+
+    /// Replaces the balanced tier's model, as
+    /// [`set_advanced_model`](Self::set_advanced_model) does the advanced
+    /// tier's.
+    pub fn set_balanced_model(&mut self, model: Balanced) {
+        self.balanced = Arc::new(model);
+        self.replaced_model(ModelTier::Balanced);
+    }
+
+    /// Replaces the fast tier's model, as
+    /// [`set_advanced_model`](Self::set_advanced_model) does the advanced
+    /// tier's.
+    pub fn set_fast_model(&mut self, model: Fast) {
+        self.fast = Arc::new(model);
+        self.replaced_model(ModelTier::Fast);
+    }
+
+    /// Forgets what belonged to the replaced model of `tier` when it is the
+    /// agent's own: its profile, fetched again before the next request, and
+    /// the last request, which a keep-alive would otherwise send it.
+    fn replaced_model(&mut self, tier: ModelTier) {
+        if tier == self.tier {
+            self.profile = None;
+            self.last_request = None;
+        }
+    }
+
+    /// Whether the agent's own model takes reasoning effort changes inside
+    /// the conversation.
+    fn takes_per_message_effort(&self) -> bool {
+        self.profile
+            .as_ref()
+            .is_some_and(|profile| profile.abilities.contains(&Ability::PerMessageEffort))
+    }
+
+    /// Brings the effort in force to the one the agent's own tier wants:
+    /// appends a per-message update when its model takes one, clearing the
+    /// effort to the model's default level, and otherwise settles the
+    /// request-level effort.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Config`] when the effort is cleared on a model
+    /// that takes per-message updates but whose default effort is not
+    /// recorded, while another level is in force: no update can undo it.
+    ///
+    /// # Panics
+    ///
+    /// Panics before the agent is initialized, since only the model's profile
+    /// says how an effort change is sent.
+    fn settle_effort(&mut self) -> Result<(), AgentError> {
+        let profile = self
+            .profile
+            .as_ref()
+            .expect("the effort is settled only by an initialized agent, which has its profile");
+        let changes = if profile.abilities.contains(&Ability::PerMessageEffort) {
+            crate::effort::EffortChanges::PerMessage {
+                default: profile.default_reasoning_effort,
+            }
+        } else {
+            crate::effort::EffortChanges::RequestLevel
+        };
+        let update = self
+            .effort
+            .plan(
+                self.own_parameters().reasoning_effort,
+                changes,
+                self.context.configured_effort(),
+            )
+            .map_err(|crate::effort::UnknownDefaultEffort| {
+                AgentError::Config(format!(
+                    "the reasoning effort was cleared, but model '{}' takes effort changes \
+                     inside the conversation and its default effort is not recorded, so no \
+                     update can undo the level in force; set an explicit effort",
+                    profile.name
+                ))
+            })?;
+        if let Some(effort) = update {
+            self.context.push(Message::configuration(effort));
+        }
+        Ok(())
+    }
+
+    /// The parameters of the agent's own requests as they are sent: its
+    /// tier's, with the request-level effort [`settle_effort`](Self::settle_effort)
+    /// settled on.
+    fn request_parameters(&self) -> Parameters {
+        let mut parameters = self.own_parameters().clone();
+        parameters.reasoning_effort = self.effort.request_effort(parameters.reasoning_effort);
+        parameters
+    }
+
+    /// The window as a request to the agent's own model carries it, with the
+    /// live `tail`: its effort updates are left out when the model cannot
+    /// read them.
+    fn request_messages(&self, tail: &[Block]) -> Vec<Message> {
+        let mut messages = self.context.build_request(tail);
+        if !self.takes_per_message_effort() {
+            messages.retain(|message| message.role() != Role::Configuration);
+        }
+        messages
+    }
+
     /// The session's outputs directory, where saved command outputs are
     /// written, when the agent has a sandbox.
     fn outputs_dir(&self) -> Option<PathBuf> {
@@ -2539,18 +2692,25 @@ where
     /// model's, under the cache controls the requests that wrote the prefix
     /// carry, so a compaction on the session's own model is served from that
     /// cache.
+    ///
+    /// `messages` is the window as the session model's requests carry it. A
+    /// compaction model runs at its own effort, so the session's effort
+    /// updates are left out of its request.
     fn compaction_request(
         &self,
-        messages: Vec<Message>,
+        mut messages: Vec<Message>,
         definitions: Vec<aither_core::llm::tool::ToolDefinition>,
     ) -> LLMRequest {
+        if self.compaction_model.is_some() {
+            messages.retain(|message| message.role() != Role::Configuration);
+        }
+        let parameters = self.compaction_model.as_ref().map_or_else(
+            || self.request_parameters(),
+            |compactor| (*compactor.parameters).clone(),
+        );
         let parameters = self
-            .compaction_model
-            .as_ref()
-            .map_or_else(|| self.own_parameters(), |compactor| &*compactor.parameters);
-        let parameters =
-            self.prompt_cache
-                .apply(parameters.clone(), &messages, !definitions.is_empty());
+            .prompt_cache
+            .apply(parameters, &messages, !definitions.is_empty());
         LLMRequest::new(messages)
             .with_parameters(parameters)
             .with_tool_definitions(definitions)
@@ -3089,11 +3249,30 @@ where
     }
 
     /// Ensures the agent is initialized (profiles fetched, static blocks set up).
+    ///
+    /// The profile is fetched again after the agent's own model was
+    /// replaced.
     async fn ensure_initialized(&mut self) -> Result<(), AgentError> {
+        if self.profile.is_none() {
+            self.load_profile().await?;
+        }
         if self.initialized {
             return Ok(());
         }
 
+        self.register_builtin_context_sources();
+
+        // Populate static system blocks in Context from AgentConfig.
+        // These form the stable, cacheable prefix.
+        self.populate_system_blocks();
+
+        self.initialized = true;
+        Ok(())
+    }
+
+    /// Fetches the profile of the agent's own model and sizes the window to
+    /// it.
+    async fn load_profile(&mut self) -> Result<(), AgentError> {
         // The window the current tier sees is the only one the budget may
         // spend: compaction replays the main request's prefix through the
         // same model, so no second profile is involved.
@@ -3126,14 +3305,6 @@ where
         }
         self.budget.set_window(profile.context_length);
         self.profile = Some(profile);
-
-        self.register_builtin_context_sources();
-
-        // Populate static system blocks in Context from AgentConfig.
-        // These form the stable, cacheable prefix.
-        self.populate_system_blocks();
-
-        self.initialized = true;
         Ok(())
     }
 
@@ -3257,17 +3428,18 @@ where
     ) -> Result<Option<LLMRequest>, AgentError> {
         self.apply_completed_compaction().await;
         self.rebuild_if_cache_is_cold().await?;
+        self.settle_effort()?;
         self.push_request_alerts().await;
 
         let definitions = self.tools.active_definitions();
         let mut tail = self.render_tail().await;
-        let mut messages = self.context.build_request(&tail);
+        let mut messages = self.request_messages(&tail);
         self.budget
             .observe_assembled(request_chars(&messages, &definitions));
 
         self.sync_compact_signal();
         if self.raise_precompaction_alert() {
-            messages = self.context.build_request(&tail);
+            messages = self.request_messages(&tail);
             self.budget
                 .observe_assembled(request_chars(&messages, &definitions));
         }
@@ -3306,7 +3478,7 @@ where
             }
             self.push_request_alerts().await;
             tail = self.render_tail().await;
-            messages = self.context.build_request(&tail);
+            messages = self.request_messages(&tail);
             self.budget
                 .observe_assembled(request_chars(&messages, &definitions));
             // A landed compaction is still no guarantee the rebuilt request
@@ -3336,9 +3508,9 @@ where
         self.requests_sent += 1;
         self.prompt_cache
             .observe_prefix(self.context.stable_prefix_fingerprint());
-        let parameters =
-            self.prompt_cache
-                .apply(self.own_parameters().clone(), &messages, has_tools);
+        let parameters = self
+            .prompt_cache
+            .apply(self.request_parameters(), &messages, has_tools);
         let request = LLMRequest::new(messages)
             .with_parameters(parameters)
             .with_tool_definitions(definitions);
@@ -3424,6 +3596,7 @@ where
                 .clone()
                 .expect("a request is only sent by an initialized agent, which has its profile"),
             request_parameters: self.own_parameters().clone(),
+            effort: self.effort,
             context_policy: self.config.context_policy,
             definitions: definitions.to_vec(),
             usage: self.budget.usage(),
@@ -5635,6 +5808,8 @@ mod tests {
     #[derive(Clone)]
     struct ScriptedLlm {
         context_length: u32,
+        abilities: Vec<Ability>,
+        default_effort: Option<aither_core::llm::model::ReasoningEffort>,
         requests: Arc<std::sync::Mutex<Vec<LLMRequest>>>,
         responses: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     }
@@ -5643,9 +5818,26 @@ mod tests {
         fn new(context_length: u32, responses: impl IntoIterator<Item = String>) -> Self {
             Self {
                 context_length,
+                abilities: Vec::new(),
+                default_effort: None,
                 requests: Arc::new(std::sync::Mutex::new(Vec::new())),
                 responses: Arc::new(std::sync::Mutex::new(responses.into_iter().collect())),
             }
+        }
+
+        /// The same mock, reporting `ability` in its profile.
+        fn with_ability(mut self, ability: Ability) -> Self {
+            self.abilities.push(ability);
+            self
+        }
+
+        /// The same mock, reporting `effort` as its default in its profile.
+        const fn with_default_effort(
+            mut self,
+            effort: aither_core::llm::model::ReasoningEffort,
+        ) -> Self {
+            self.default_effort = Some(effort);
+            self
         }
 
         fn recorded(&self) -> Vec<LLMRequest> {
@@ -5674,14 +5866,265 @@ mod tests {
             &self,
         ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
             let context_length = self.context_length;
-            std::future::ready(Ok(ModelProfile::new(
-                "mock",
-                "test",
-                "mock-model",
-                "mock model",
-                context_length,
-            )))
+            let mut profile =
+                ModelProfile::new("mock", "test", "mock-model", "mock model", context_length)
+                    .with_abilities(self.abilities.clone());
+            profile.default_reasoning_effort = self.default_effort;
+            std::future::ready(Ok(profile))
         }
+    }
+
+    use aither_core::llm::model::ReasoningEffort;
+
+    /// Parameters asking for `effort` and nothing else.
+    fn effort(effort: ReasoningEffort) -> Parameters {
+        Parameters::default().reasoning_effort(effort)
+    }
+
+    /// The index of the user message whose text starts with `prompt`.
+    fn user_message_index(request: &LLMRequest, prompt: &str) -> usize {
+        request
+            .messages()
+            .iter()
+            .position(|message| {
+                message.role() == Role::User && message.content().starts_with(prompt)
+            })
+            .unwrap_or_else(|| panic!("the request carries the user message {prompt:?}"))
+    }
+
+    /// An effort change on a model that takes per-message updates leaves the
+    /// request-level effort and every earlier message as the first request
+    /// sent them, and carries the change as an update before the next user
+    /// message.
+    #[tokio::test]
+    async fn an_effort_change_on_a_per_message_model_keeps_the_prefix() {
+        let llm = ScriptedLlm::new(1_000_000, ["one".to_string(), "two".to_string()])
+            .with_ability(Ability::PerMessageEffort);
+        let mut agent = Agent::builder(llm.clone())
+            .request_parameters(effort(ReasoningEffort::High))
+            .build();
+        agent.query("first").await.expect("the first turn runs");
+        agent.set_parameters(ModelTier::Advanced, effort(ReasoningEffort::Low));
+        agent.query("second").await.expect("the second turn runs");
+
+        let [first, second]: [LLMRequest; 2] =
+            llm.recorded().try_into().expect("two turns, two requests");
+        assert_eq!(
+            first.parameters().reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(
+            second.parameters().reasoning_effort,
+            Some(ReasoningEffort::High),
+            "the request-level effort stays as first sent"
+        );
+        let end = user_message_index(&first, "first");
+        assert_eq!(
+            first.messages()[..=end],
+            second.messages()[..=end],
+            "the system prefix and earlier messages are unchanged"
+        );
+        let user = user_message_index(&second, "second");
+        assert_eq!(
+            second.messages()[user - 1],
+            Message::configuration(ReasoningEffort::Low),
+            "the update precedes the next user message"
+        );
+        assert_eq!(
+            second
+                .messages()
+                .iter()
+                .filter(|message| message.role() == Role::Configuration)
+                .count(),
+            1
+        );
+    }
+
+    /// Clearing the effort after a Low update, on a model that takes
+    /// per-message updates, sends an update to the model's default that
+    /// overrides Low, with the request-level effort and every earlier message
+    /// unchanged. The defaults are the documented ones of Claude Opus 5.5 and
+    /// GPT-6 Sol, as their clients report them.
+    #[tokio::test]
+    async fn clearing_the_effort_after_an_update_restores_the_models_default() {
+        for (model, default) in [
+            ("claude-opus-5-5", ReasoningEffort::Medium),
+            ("gpt-6-sol", ReasoningEffort::Medium),
+        ] {
+            let llm = ScriptedLlm::new(
+                1_000_000,
+                ["one".to_string(), "two".to_string(), "three".to_string()],
+            )
+            .with_ability(Ability::PerMessageEffort)
+            .with_default_effort(default);
+            let mut agent = Agent::builder(llm.clone())
+                .request_parameters(effort(ReasoningEffort::High))
+                .build();
+            agent.query("first").await.expect("the first turn runs");
+            agent.set_parameters(ModelTier::Advanced, effort(ReasoningEffort::Low));
+            agent.query("second").await.expect("the second turn runs");
+            agent.set_parameters(ModelTier::Advanced, Parameters::default());
+            agent.query("third").await.expect("the third turn runs");
+
+            let [_, low, cleared]: [LLMRequest; 3] = llm
+                .recorded()
+                .try_into()
+                .expect("three turns, three requests");
+            assert_eq!(
+                cleared.parameters().reasoning_effort,
+                Some(ReasoningEffort::High),
+                "{model}: the request-level effort stays as first sent"
+            );
+            let end = user_message_index(&low, "second");
+            assert_eq!(
+                low.messages()[..=end],
+                cleared.messages()[..=end],
+                "{model}: earlier messages are unchanged"
+            );
+            let user = user_message_index(&cleared, "third");
+            assert_eq!(
+                cleared.messages()[user - 1],
+                Message::configuration(default),
+                "{model}: the update to the default precedes the next user message"
+            );
+            let updates: Vec<_> = cleared
+                .messages()
+                .iter()
+                .filter_map(Message::configured_effort)
+                .collect();
+            assert_eq!(
+                updates.last(),
+                Some(&default),
+                "{model}: the default overrides Low"
+            );
+        }
+    }
+
+    /// Clearing the effort on a per-message model whose default is not
+    /// recorded fails rather than leaving the earlier update in force.
+    #[tokio::test]
+    async fn clearing_the_effort_without_a_known_default_fails() {
+        let llm = ScriptedLlm::new(1_000_000, ["one".to_string(), "two".to_string()])
+            .with_ability(Ability::PerMessageEffort);
+        let mut agent = Agent::builder(llm.clone())
+            .request_parameters(effort(ReasoningEffort::High))
+            .build();
+        agent.query("first").await.expect("the first turn runs");
+        agent.set_parameters(ModelTier::Advanced, effort(ReasoningEffort::Low));
+        agent.query("second").await.expect("the second turn runs");
+        agent.set_parameters(ModelTier::Advanced, Parameters::default());
+
+        let error = agent
+            .query("third")
+            .await
+            .expect_err("no update can undo Low");
+        assert!(matches!(error, AgentError::Config(_)), "{error}");
+        assert_eq!(llm.recorded().len(), 2, "nothing more is sent");
+    }
+
+    /// Without per-message updates the new effort goes at the request level.
+    #[tokio::test]
+    async fn an_effort_change_elsewhere_moves_the_request_level_effort() {
+        let llm = ScriptedLlm::new(1_000_000, ["one".to_string(), "two".to_string()]);
+        let mut agent = Agent::builder(llm.clone())
+            .request_parameters(effort(ReasoningEffort::High))
+            .build();
+        agent.query("first").await.expect("the first turn runs");
+        agent.set_parameters(ModelTier::Advanced, effort(ReasoningEffort::Low));
+        agent.query("second").await.expect("the second turn runs");
+
+        let [_, second]: [LLMRequest; 2] =
+            llm.recorded().try_into().expect("two turns, two requests");
+        assert_eq!(
+            second.parameters().reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
+        assert!(
+            second
+                .messages()
+                .iter()
+                .all(|message| message.role() != Role::Configuration),
+            "no update reaches a model that cannot read it"
+        );
+    }
+
+    /// A compaction restates the effort in force: the update it would drop
+    /// is kept after the handoff.
+    #[tokio::test]
+    async fn a_compaction_restates_the_effort_in_force() {
+        let llm = ScriptedLlm::new(
+            1_000_000,
+            [
+                "one".to_string(),
+                "two".to_string(),
+                HANDOFF_JSON.to_string(),
+                "three".to_string(),
+            ],
+        )
+        .with_ability(Ability::PerMessageEffort);
+        let mut agent = Agent::builder(llm.clone())
+            .request_parameters(effort(ReasoningEffort::High))
+            .build();
+        agent.query("first").await.expect("the first turn runs");
+        agent.set_parameters(ModelTier::Advanced, effort(ReasoningEffort::Low));
+        agent.query("second").await.expect("the second turn runs");
+        agent.compact(None).await.expect("compaction succeeds");
+        agent.query("third").await.expect("the third turn runs");
+
+        let after = llm.recorded().pop().expect("the turn after compaction");
+        assert_eq!(
+            after.parameters().reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+        let updates: Vec<_> = after
+            .messages()
+            .iter()
+            .filter_map(Message::configured_effort)
+            .collect();
+        assert_eq!(updates, [ReasoningEffort::Low], "the update survives once");
+    }
+
+    /// A replaced model takes the next request, with the history the old one
+    /// built; a model that reads no updates gets the effort at the request
+    /// level and no update.
+    #[tokio::test]
+    async fn a_replaced_model_takes_the_next_request_with_the_history() {
+        let old = ScriptedLlm::new(1_000_000, ["one".to_string(), "two".to_string()])
+            .with_ability(Ability::PerMessageEffort);
+        let new = ScriptedLlm::new(500_000, ["three".to_string()]);
+        let mut agent = Agent::builder(old.clone())
+            .request_parameters(effort(ReasoningEffort::High))
+            .build();
+        agent.query("first").await.expect("the first turn runs");
+        agent.set_parameters(ModelTier::Advanced, effort(ReasoningEffort::Low));
+        agent.query("second").await.expect("the second turn runs");
+
+        agent.set_advanced_model(new.clone());
+        agent
+            .query("third")
+            .await
+            .expect("the turn on the new model runs");
+
+        assert_eq!(old.recorded().len(), 2, "the old model is asked no more");
+        let [request]: [LLMRequest; 1] = new.recorded().try_into().expect("one request");
+        for prompt in ["first", "second", "third"] {
+            user_message_index(&request, prompt);
+        }
+        assert_eq!(
+            request.parameters().reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
+        assert!(
+            request
+                .messages()
+                .iter()
+                .all(|message| message.role() != Role::Configuration)
+        );
+        assert_eq!(
+            agent.profile().map(|profile| profile.context_length),
+            Some(500_000),
+            "the window is the new model's"
+        );
     }
 
     const HANDOFF_JSON: &str = r#"{"current_task":"keep going","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["continue"],"recovery_hints":[],"skills":[]}"#;

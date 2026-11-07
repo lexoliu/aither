@@ -40,6 +40,7 @@ use askama::Template;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+use aither_core::llm::model::ReasoningEffort;
 use aither_core::llm::{Message, Role, ToolCall};
 
 use super::compaction::{Handoff, HandoffDocument};
@@ -434,6 +435,16 @@ impl Context {
         self.items.iter().map(|item| &item.message).collect()
     }
 
+    /// The reasoning effort the window's last configuration update set, if
+    /// it holds one.
+    #[must_use]
+    pub fn configured_effort(&self) -> Option<ReasoningEffort> {
+        self.items
+            .iter()
+            .rev()
+            .find_map(|item| item.message.configured_effort())
+    }
+
     /// Returns the latest conversation message.
     #[must_use]
     pub fn last(&self) -> Option<&Message> {
@@ -600,6 +611,9 @@ impl Context {
     /// size, and the newest user messages that fit `user_message_chars`
     /// characters. An exchange is the question and its answer together, so it
     /// is kept or dropped whole, and it is dropped never.
+    ///
+    /// The last configuration update below the fork is kept too, in its
+    /// place, so the effort it set stays in force: the handoff restates it.
     pub fn apply_handoff(
         &mut self,
         handoff: &HandoffDocument,
@@ -645,6 +659,9 @@ impl Context {
                 Message::Tool { .. } if item.kept => kept.push(item.clone()),
                 _ => {}
             }
+        }
+        if let Some(update) = below().rfind(|item| item.message.role() == Role::Configuration) {
+            kept.push(update.clone());
         }
 
         let mut remaining = user_message_chars;
@@ -1563,6 +1580,31 @@ mod tests {
                 .handoff()
                 .is_some_and(|handoff| handoff.render().contains("task"))
         );
+    }
+
+    /// Only the last effort update below the fork survives a handoff, in its
+    /// place before the newer items, so the effort in force is unchanged.
+    #[test]
+    fn a_handoff_keeps_the_last_effort_update_below_the_fork() {
+        use aither_core::llm::model::ReasoningEffort;
+        let mut context = Context::new();
+        context.push(Message::configuration(ReasoningEffort::Low));
+        context.push(Message::user("old work"));
+        context.push(Message::configuration(ReasoningEffort::Medium));
+        let fork = context.fork_point();
+        context.push(Message::user("new request"));
+
+        context.apply_handoff(&handoff(), fork, 0);
+
+        let recent: Vec<_> = context.recent().into_iter().cloned().collect();
+        assert_eq!(
+            recent,
+            [
+                Message::configuration(ReasoningEffort::Medium),
+                Message::user("new request"),
+            ]
+        );
+        assert_eq!(context.configured_effort(), Some(ReasoningEffort::Medium));
     }
 
     fn handoff() -> HandoffDocument {

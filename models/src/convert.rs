@@ -120,6 +120,54 @@ pub fn strip_provider_prefix(litellm_key: &str) -> &str {
     litellm_key
 }
 
+/// The Claude models Anthropic's effort documentation lists for a
+/// per-message effort change (an effort-only `system` message under the
+/// `mid-conversation-output-config-2026-07-01` beta). `LiteLLM` carries no
+/// such flag, so it is curated here.
+const ANTHROPIC_PER_MESSAGE_EFFORT_MODELS: &[&str] = &[
+    "claude-fable-5-1",
+    "claude-mythos-5-1",
+    "claude-opus-5-5",
+    "claude-opus-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+];
+
+/// The platforms Anthropic documents the per-message effort change on: the
+/// Claude API and Google Cloud.
+const ANTHROPIC_PER_MESSAGE_EFFORT_PLATFORMS: &[&str] = &["anthropic", "vertex_ai"];
+
+/// The first GPT generation `OpenAI` documents the Responses API
+/// `configuration_update` input item for; every later generation takes it.
+const OPENAI_FIRST_PER_MESSAGE_EFFORT_GENERATION: u32 = 6;
+
+/// Whether the vendor documents a per-message reasoning effort change for
+/// `canonical_id` on the platform `provider` names.
+#[must_use]
+pub fn takes_per_message_effort(provider: &str, canonical_id: &str) -> bool {
+    if ANTHROPIC_PER_MESSAGE_EFFORT_PLATFORMS.contains(&provider) {
+        // Vertex AI pins a version after `@`.
+        let model = canonical_id
+            .split_once('@')
+            .map_or(canonical_id, |(model, _)| model);
+        return ANTHROPIC_PER_MESSAGE_EFFORT_MODELS.contains(&model);
+    }
+    if provider == "openai" {
+        return gpt_generation(canonical_id)
+            .is_some_and(|generation| generation >= OPENAI_FIRST_PER_MESSAGE_EFFORT_GENERATION);
+    }
+    false
+}
+
+/// The major generation of a `gpt-<N>…` model id.
+fn gpt_generation(model: &str) -> Option<u32> {
+    let rest = model.strip_prefix("gpt-")?;
+    let digits = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest.get(..digits)?.parse().ok()
+}
+
 /// Map a `LiteLLM` `litellm_provider` string to a provider tag.
 #[must_use]
 pub fn parse_provider(provider_str: &str) -> String {
@@ -247,6 +295,9 @@ pub fn convert_litellm_entry(key: &str, raw: &RawLiteLLMEntry) -> Option<Convert
     }
     if mode == "image_generation" {
         abilities.push("ImageGeneration");
+    }
+    if takes_per_message_effort(&provider, &canonical_id) {
+        abilities.push("PerMessageEffort");
     }
 
     Some(ConvertedEntry {

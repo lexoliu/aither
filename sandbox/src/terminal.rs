@@ -14517,6 +14517,36 @@ mod tests {
         );
     }
 
+    /// A grant taken back no longer reaches the next command: the write the
+    /// grant allowed is denied again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_removed_grant_is_gone_from_the_next_command() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let outside = tempfile::tempdir().expect("outside dir should be created");
+        tool.grants().add_writable(outside.path());
+        assert_eq!(
+            exit_code_of(
+                &tool,
+                &format!("touch '{}'", outside.path().join("granted.txt").display())
+            )
+            .await,
+            0,
+            "the granted dir is writable"
+        );
+        tool.grants().remove_writable(outside.path());
+        assert_ne!(
+            exit_code_of(
+                &tool,
+                &format!("touch '{}'", outside.path().join("revoked.txt").display())
+            )
+            .await,
+            0,
+            "the command after the removal is denied the write"
+        );
+    }
+
     /// Cloned terminals share one grant store: a grant added through the
     /// original's handle reaches the clone's next command.
     #[cfg(unix)]
