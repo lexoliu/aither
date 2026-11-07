@@ -2,6 +2,9 @@ use std::{collections::HashSet, future::Future, pin::Pin, sync::Arc};
 
 use async_channel::{Receiver, Sender};
 
+use askama::Template as _;
+
+use crate::ContainerPath;
 use crate::stdin_watch::StdinWatchSignal;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -366,10 +369,7 @@ impl ContainerShellRuntime {
     /// the container's memory and disk asks it.
     #[must_use]
     pub fn probe(&self) -> ContainerProbe {
-        ContainerProbe {
-            exec: self.exec(),
-            container_id: self.container_id.clone(),
-        }
+        ContainerProbe::from_parts(self.exec(), self.container_id.clone())
     }
 }
 
@@ -393,6 +393,22 @@ pub enum ContainerProbeError {
     /// The script answered bytes that are not text.
     #[error("the probe answered bytes that are not UTF-8")]
     NotText,
+    /// The script answered text that is not what it was asked for.
+    #[error("the probe answered `{0}`, which is not understood")]
+    Unreadable(String),
+}
+
+/// The free bytes `df -Pk` reports: the `Available` column, in KiB, of its
+/// last line.
+fn free_bytes_from_df(output: &str) -> Option<u64> {
+    let kib: u64 = output
+        .lines()
+        .last()?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
+    kib.checked_mul(1024)
 }
 
 /// Runs short read-only scripts inside a container and returns what they
@@ -401,6 +417,16 @@ pub enum ContainerProbeError {
 pub struct ContainerProbe {
     exec: Arc<dyn ContainerExecImpl>,
     container_id: String,
+    /// The directory the agent works in inside the container.
+    home: ContainerPath,
+}
+
+/// `df` over the filesystem holding a path, in POSIX format.
+#[derive(askama::Template)]
+#[template(path = "container_disk_free.sh", escape = "none")]
+struct DiskFreeScript<'a> {
+    /// The path, quoted for the shell.
+    path: std::borrow::Cow<'a, str>,
 }
 
 impl std::fmt::Debug for ContainerProbe {
@@ -413,12 +439,55 @@ impl std::fmt::Debug for ContainerProbe {
 
 impl ContainerProbe {
     /// A probe of container `container_id` through `exec`.
+    ///
+    /// The agent's home directory in the container is the one commands run
+    /// in until [`Self::with_home`] says otherwise.
     #[must_use]
     pub fn new(exec: &AnyContainerExec, container_id: impl Into<String>) -> Self {
+        Self::from_parts(Arc::clone(&exec.inner), container_id.into())
+    }
+
+    fn from_parts(exec: Arc<dyn ContainerExecImpl>, container_id: String) -> Self {
         Self {
-            exec: Arc::clone(&exec.inner),
-            container_id: container_id.into(),
+            exec,
+            container_id,
+            home: ContainerPath::new(crate::terminal::CONTAINER_EXEC_WORKING_DIR)
+                .expect("the container working directory is absolute"),
         }
+    }
+
+    /// Names the directory the agent works in inside the container.
+    #[must_use]
+    pub fn with_home(mut self, home: ContainerPath) -> Self {
+        self.home = home;
+        self
+    }
+
+    /// The directory the agent works in inside the container.
+    #[must_use]
+    pub const fn home(&self) -> &ContainerPath {
+        &self.home
+    }
+
+    /// The bytes free to the container's processes on the filesystem that
+    /// holds the agent's home directory, as that filesystem reports them:
+    /// bounded by its own size limit when the container has one.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the container cannot run `df` or answers something else.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the built-in probe template does not render.
+    pub async fn free_bytes(&self) -> Result<u64, ContainerProbeError> {
+        let script = DiskFreeScript {
+            path: shell_words::quote(self.home.as_str()),
+        }
+        .render()
+        .expect("the disk probe template renders");
+        let output = self.read(&script).await?;
+        free_bytes_from_df(&output).ok_or(ContainerProbeError::Unreadable(output))
     }
 
     /// Runs `script` in the container's root directory and returns its
@@ -1014,6 +1083,102 @@ fn normalize_arch(raw: &str) -> &str {
         "x86_64" | "amd64" => "x86_64",
         "aarch64" | "arm64" => "arm64",
         other => other,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod disk_probe_tests {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::sync::Mutex;
+
+    use async_channel::{Receiver, Sender};
+
+    use super::*;
+
+    /// Answers `df` the way a container would, and records what it ran.
+    struct Df {
+        answer: &'static str,
+        exit: i32,
+        scripts: Mutex<Vec<String>>,
+    }
+
+    impl ContainerExec for Df {
+        fn exec(
+            &self,
+            _container_id: &str,
+            script: &str,
+            working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _lifetime: ExecLifetime,
+        ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
+            self.scripts
+                .lock()
+                .unwrap()
+                .push(format!("{working_dir}: {script}"));
+            std::future::ready(Ok(ContainerExecOutcome::Completed {
+                output: std::process::Output {
+                    status: std::process::ExitStatus::from_raw(self.exit << 8),
+                    stdout: self.answer.as_bytes().to_vec(),
+                    stderr: b"df: no such directory".to_vec(),
+                },
+                killed: Vec::new(),
+            }))
+        }
+
+        fn exec_streamed(
+            &self,
+            _container_id: &str,
+            _script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _stdout: Sender<Vec<u8>>,
+        ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
+            std::future::ready(Err("a probe is never streamed".to_string()))
+        }
+    }
+
+    fn probe(answer: &'static str, exit: i32) -> (Arc<Df>, ContainerProbe) {
+        let df = Arc::new(Df {
+            answer,
+            exit,
+            scripts: Mutex::new(Vec::new()),
+        });
+        let exec = AnyContainerExec::new(Arc::clone(&df));
+        (df, ContainerProbe::new(&exec, "box"))
+    }
+
+    const DF: &str = "Filesystem 1024-blocks Used Available Capacity Mounted on\noverlay 10485760 4194304 6291456 41% /workspace\n";
+
+    #[tokio::test]
+    async fn the_container_reports_the_free_space_of_its_home_filesystem() {
+        let (df, probe) = probe(DF, 0);
+        assert_eq!(probe.free_bytes().await.unwrap(), 6_291_456 * 1024);
+        let scripts = df.scripts.lock().unwrap();
+        assert_eq!(*scripts, ["/: df -Pk -- /workspace"]);
+    }
+
+    #[tokio::test]
+    async fn a_home_with_spaces_is_quoted_for_the_shell() {
+        let (df, probe) = probe(DF, 0);
+        let probe = probe.with_home(ContainerPath::new("/my work").unwrap());
+        probe.free_bytes().await.unwrap();
+        assert_eq!(*df.scripts.lock().unwrap(), ["/: df -Pk -- '/my work'"]);
+    }
+
+    #[tokio::test]
+    async fn a_df_that_fails_or_answers_something_else_is_an_error() {
+        let (_, failing) = probe("", 1);
+        assert!(matches!(
+            failing.free_bytes().await,
+            Err(ContainerProbeError::Failed { .. })
+        ));
+        let (_, odd) = probe("all clear\n", 0);
+        assert!(matches!(
+            odd.free_bytes().await,
+            Err(ContainerProbeError::Unreadable(_))
+        ));
     }
 }
 

@@ -48,6 +48,8 @@ mod config;
 mod connectivity;
 pub mod context;
 mod context_window;
+mod disk;
+mod effort;
 mod error;
 mod event;
 pub mod external_hook;
@@ -57,6 +59,7 @@ mod hook;
 mod host_load;
 #[cfg(test)]
 mod idle_compaction_tests;
+mod judgment;
 #[cfg(feature = "languages")]
 pub mod language;
 #[cfg(test)]
@@ -68,6 +71,7 @@ mod poll_park_tests;
 mod pressure;
 mod request_parameters;
 mod runaway;
+pub mod secret_guard;
 mod subagent_file;
 pub mod tasks;
 mod terminal_agent;
@@ -121,6 +125,10 @@ pub use context::{
     TasksDocument,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
+pub use disk::{
+    AnyDiskReader, ContainerDisk, DiskPressure, DiskReader, DiskReaderImpl, DiskThresholds,
+    SystemDisk,
+};
 pub use error::AgentError;
 pub use event::{AgentEvent, TimedEvent};
 pub use external_hook::{
@@ -136,10 +144,14 @@ pub use host_load::{
     AnyHostReader, HostLoadConfig, HostLoadEvent, HostLoadMonitor, HostReader, HostSample,
     MachineLoad, MemoryPressure, ReadError, SystemReader, UnwatchedHost,
 };
+pub use judgment::{JudgmentError, judge};
 #[cfg(feature = "languages")]
 pub use language::{Language, LanguageGuard, LanguageRefusal, Languages, WorkingText};
 pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
 pub use runaway::RunawayGuard;
+pub use secret_guard::{
+    Guarded, SecretFinding, SecretGuard, SecretKind, SecretRefusal, SecretShape,
+};
 pub use tasks::{
     AnyWorkTracker, TaskEvent, TaskEvents, WorkItem, WorkRef, WorkState, WorkTracker,
     WorkTrackerError,

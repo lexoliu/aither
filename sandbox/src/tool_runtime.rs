@@ -1827,9 +1827,15 @@ pub mod tests {
     /// The `CPython` version the fixture `uv` installs.
     pub const FIXTURE_PYTHON_VERSION: &str = "3.13.1";
 
-    /// The interpreter the fixture `uv` installs: a script reporting `version`.
+    /// The interpreter the fixture `uv` installs: a script reporting
+    /// `version`, which runs anything else under the host's `python3` so
+    /// tests of Python scripts execute real code.
     pub fn fixture_interpreter(version: &str) -> Vec<u8> {
-        format!("#!/bin/sh\nprintf '%s\\n' 'Python {version}'\n").into_bytes()
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version) printf '%s\\n' 'Python {version}'; exit 0;; esac\n\
+             PATH=/usr/bin:/bin exec python3 \"$@\"\n"
+        )
+        .into_bytes()
     }
 
     /// The manifest pin matching what the fixture `uv` installs on `target`.

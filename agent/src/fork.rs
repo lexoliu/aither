@@ -31,6 +31,9 @@ pub struct ForkSnapshot {
     /// The main agent's model, whose name identifies it.
     pub(crate) profile: Profile,
     pub(crate) request_parameters: Parameters,
+    /// The request-level effort the main agent sends, so the fork's first
+    /// request carries the same and reads the main agent's cache.
+    pub(crate) effort: crate::effort::EffortAnchor,
     pub(crate) context_policy: ContextPolicy,
     pub(crate) definitions: Vec<ToolDefinition>,
     /// Window usage the request was sent at.

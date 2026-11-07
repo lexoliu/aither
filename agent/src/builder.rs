@@ -168,6 +168,7 @@ struct Wiring {
 struct Inherited {
     budget: crate::context::ContextBudget,
     profile: Option<aither_core::llm::model::Profile>,
+    effort: crate::effort::EffortAnchor,
 }
 
 impl<Advanced, Balanced, Fast, H, Compactor> std::fmt::Debug
@@ -745,6 +746,7 @@ where
         wiring.inherited = Some(Inherited {
             budget: fork.budget,
             profile: Some(fork.profile.clone()),
+            effort: fork.effort,
         });
         wiring.background_receiver = Some(terminal.background_receiver());
         wiring.permission_receiver = Some(terminal.permission_receiver());
@@ -929,22 +931,20 @@ where
     /// [`RunawayGuard`](crate::RunawayGuard): memory warnings listing its
     /// jobs, a final warning before a runaway job is killed, and the kill.
     ///
-    /// The monitor lengthens `foreground_wait` while high load lasts and runs
-    /// until the agent is dropped. It reads the builder's
+    /// The monitor, which may also watch the agent's volume
+    /// ([`with_disk`](crate::HostLoadMonitor::with_disk)), runs until the
+    /// agent is dropped. It reads the builder's
     /// [`clock`](AgentOptions::clock), so set the clock first.
     pub fn host_load<R, E>(
         mut self,
         executor: &E,
-        reader: R,
-        config: crate::HostLoadConfig,
-        foreground_wait: aither_sandbox::ForegroundWait,
+        monitor: crate::HostLoadMonitor<R>,
         memory: Option<aither_sandbox::JobMemory>,
     ) -> Self
     where
         R: crate::HostReader,
         E: executor_core::Executor,
     {
-        let monitor = crate::HostLoadMonitor::new(reader, config, foreground_wait);
         self.wiring.host_load_events = Some(crate::host_load::spawn(
             executor,
             monitor,
@@ -1045,6 +1045,11 @@ where
             config,
             context,
             initialized: inherited.is_some(),
+            effort: inherited
+                .as_ref()
+                .map_or_else(crate::effort::EffortAnchor::default, |inherited| {
+                    inherited.effort
+                }),
             profile: inherited.and_then(|inherited| inherited.profile),
             background_receiver,
             permission_receiver,

@@ -318,6 +318,11 @@ fn run_response_generation(
             "attachments are not supported by aither-llama".to_string(),
         ));
     }
+    if messages.iter().any(|msg| msg.role() == Role::Configuration) {
+        return Err(LlamaError::Unsupported(
+            "per-message effort updates are not supported by aither-llama".to_string(),
+        ));
+    }
 
     let tool_defs = filter_tool_definitions(tool_defs, &parameters.tool_choice);
     let template = resolve_chat_template(model, cfg)?;
@@ -525,6 +530,9 @@ fn messages_to_openai(messages: &[Message]) -> Vec<OpenAIMessage> {
                 Role::Assistant => "assistant",
                 Role::System => "system",
                 Role::Tool => "tool",
+                Role::Configuration => {
+                    unreachable!("run_response_generation rejects configuration updates")
+                }
             };
 
             let tool_calls = if msg.tool_calls().is_empty() {

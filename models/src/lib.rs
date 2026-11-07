@@ -15,6 +15,7 @@
 //! ```
 
 pub mod convert;
+mod effort;
 mod registry;
 #[cfg(feature = "remote")]
 pub mod remote;
@@ -22,6 +23,7 @@ pub(crate) mod tier;
 pub mod types;
 
 pub use aither_core::llm::model::Ability;
+pub use effort::default_reasoning_effort;
 pub use registry::ModelRegistry;
 pub use tier::ModelTier;
 pub use types::{ModelEntry, ModelMode, Pricing, Provider};

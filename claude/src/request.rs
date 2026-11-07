@@ -191,10 +191,51 @@ pub fn build_output_config(
 /// Individual message in Claude format.
 #[derive(Debug, Clone, Serialize)]
 pub struct MessagePayload {
-    /// Role: "user" or "assistant".
+    /// Role: "user", "assistant", or "system" for an effort-only message.
     pub role: &'static str,
-    /// Message content.
+    /// Message content; empty on an effort-only system message.
     pub content: ContentPayload,
+    /// The effort for the rest of the conversation, on an effort-only
+    /// system message (beta [`MID_CONVERSATION_OUTPUT_CONFIG_BETA`]).
+    ///
+    /// [`MID_CONVERSATION_OUTPUT_CONFIG_BETA`]: crate::constant::MID_CONVERSATION_OUTPUT_CONFIG_BETA
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfigPayload>,
+}
+
+impl MessagePayload {
+    /// The effort-only system message changing the effort to `effort` for
+    /// the rest of the conversation, leaving every earlier byte, and the
+    /// request-level effort, as they were.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an effort Claude cannot set per message:
+    /// `Minimal`, which Claude does not have, and `None`, which Claude
+    /// expresses only as request-level `thinking: {"type": "disabled"}`.
+    pub fn effort_update(effort: ReasoningEffort) -> Result<Self, ClaudeError> {
+        let level = claude_effort(effort)?.ok_or_else(|| {
+            ClaudeError::Api(
+                "Claude turns thinking off only at the request level; a per-message \
+                 effort update cannot set effort None"
+                    .to_string(),
+            )
+        })?;
+        Ok(Self {
+            role: "system",
+            content: ContentPayload::Blocks(Vec::new()),
+            output_config: Some(OutputConfigPayload {
+                effort: Some(level),
+            }),
+        })
+    }
+
+    /// Whether this is an effort-only system message, which needs
+    /// [`MID_CONVERSATION_OUTPUT_CONFIG_BETA`](crate::constant::MID_CONVERSATION_OUTPUT_CONFIG_BETA).
+    #[must_use]
+    pub const fn is_effort_update(&self) -> bool {
+        self.output_config.is_some()
+    }
 }
 
 /// Message content - either a simple string or array of content blocks.
@@ -485,14 +526,24 @@ pub async fn to_claude_messages(
                 };
                 claude_messages.push(MessagePayload {
                     role: "user",
+                    output_config: None,
                     content,
                 });
             }
             Role::Assistant => {
                 claude_messages.push(MessagePayload {
                     role: "assistant",
+                    output_config: None,
                     content: build_assistant_content(message),
                 });
+            }
+            Role::Configuration => {
+                let effort = message
+                    .configured_effort()
+                    .expect("a configuration message carries its effort");
+                claude_messages.push(
+                    MessagePayload::effort_update(effort).map_err(|error| error.to_string())?,
+                );
             }
         }
     }
@@ -1370,6 +1421,90 @@ mod tests {
             ClaudePromptCacheTtl, Parameters, ToolChoice,
         },
     };
+
+    /// The serialized system prompt and messages of a conversation.
+    async fn wire(messages: &[Message]) -> (String, Vec<String>) {
+        let (system, encoded) = to_claude_messages(messages)
+            .await
+            .expect("encode Claude messages");
+        (
+            serde_json::to_string(&system).expect("system serializes"),
+            encoded
+                .iter()
+                .map(|message| serde_json::to_string(message).expect("message serializes"))
+                .collect(),
+        )
+    }
+
+    /// An effort change goes as an effort-only system message after the
+    /// earlier messages, which serialize byte for byte as before; the
+    /// request-level effort is the caller's, unchanged.
+    #[tokio::test]
+    async fn an_effort_update_is_an_effort_only_system_message_after_an_unchanged_prefix() {
+        let before = vec![
+            Message::system("You are terse."),
+            Message::user("Plan the migration."),
+            Message::assistant("Here is the plan."),
+        ];
+        let mut after = before.clone();
+        after.push(Message::configuration(ReasoningEffort::Low));
+        after.push(Message::user("Now rename the config file."));
+
+        let (system_before, messages_before) = wire(&before).await;
+        let (system_after, messages_after) = wire(&after).await;
+        assert_eq!(
+            system_before, system_after,
+            "the system prompt is unchanged"
+        );
+        assert_eq!(
+            messages_before[..],
+            messages_after[..messages_before.len()],
+            "earlier messages are byte-identical"
+        );
+        assert_eq!(
+            messages_after[messages_before.len()],
+            r#"{"role":"system","content":[],"output_config":{"effort":"low"}}"#
+        );
+    }
+
+    /// Clearing the effort after a Low update sends the model's documented
+    /// default as a new effort-only message, which overrides Low; every
+    /// earlier message serializes byte for byte as before.
+    #[tokio::test]
+    async fn clearing_after_a_low_update_sends_the_models_default() {
+        let default = aither_models::default_reasoning_effort("claude-opus-5-5")
+            .expect("Claude Opus 5.5 has a documented default");
+        let low = vec![
+            Message::user("Plan the migration."),
+            Message::assistant("Here is the plan."),
+            Message::configuration(ReasoningEffort::Low),
+            Message::user("Rename the config file."),
+            Message::assistant("Renamed."),
+        ];
+        let mut cleared = low.clone();
+        cleared.push(Message::configuration(default));
+        cleared.push(Message::user("Now review the whole migration."));
+
+        let (_, before) = wire(&low).await;
+        let (_, after) = wire(&cleared).await;
+        assert_eq!(
+            before[..],
+            after[..before.len()],
+            "earlier bytes are unchanged"
+        );
+        assert_eq!(
+            after[before.len()],
+            r#"{"role":"system","content":[],"output_config":{"effort":"medium"}}"#,
+            "the update to the default follows, overriding Low"
+        );
+    }
+
+    #[test]
+    fn an_effort_update_cannot_turn_thinking_off_or_go_below_low() {
+        assert!(MessagePayload::effort_update(ReasoningEffort::None).is_err());
+        assert!(MessagePayload::effort_update(ReasoningEffort::Minimal).is_err());
+    }
+
     #[tokio::test]
     async fn assistant_tool_calls_are_encoded_as_tool_use_blocks() {
         let messages = vec![Message::assistant_with_tool_calls(
@@ -1757,6 +1892,7 @@ mod tests {
         let mut system = Some(SystemPayload::Text("You are helpful".to_string()));
         let mut messages = vec![MessagePayload {
             role: "user",
+            output_config: None,
             content: ContentPayload::Text("Hello".to_string()),
         }];
         let mut tools = None;
@@ -1773,6 +1909,7 @@ mod tests {
         let mut system = None;
         let mut messages = vec![MessagePayload {
             role: "assistant",
+            output_config: None,
             content: ContentPayload::Blocks(vec![ContentBlock::ToolUse {
                 id: "call_1".to_string(),
                 name: "search".to_string(),
@@ -1809,6 +1946,7 @@ mod tests {
         let mut system = None;
         let mut messages = vec![MessagePayload {
             role: "user",
+            output_config: None,
             content: ContentPayload::Text("hello".to_string()),
         }];
         let mut tools = None;
@@ -1831,6 +1969,7 @@ mod tests {
         let mut system = Some(SystemPayload::Text("You are helpful".to_string()));
         let mut messages = vec![MessagePayload {
             role: "user",
+            output_config: None,
             content: ContentPayload::Text("Tell me about Mars".to_string()),
         }];
         let mut tools = Some(vec![ToolPayload::Custom(CustomToolPayload {
@@ -1868,6 +2007,7 @@ mod tests {
         let mut system = Some(SystemPayload::Text("System".to_string()));
         let mut messages = vec![MessagePayload {
             role: "user",
+            output_config: None,
             content: ContentPayload::Text("Hello".to_string()),
         }];
         let mut tools = Some(vec![ToolPayload::Custom(CustomToolPayload {
@@ -1908,6 +2048,7 @@ mod tests {
         let mut messages = vec![
             MessagePayload {
                 role: "assistant",
+                output_config: None,
                 content: ContentPayload::Blocks(vec![ContentBlock::ToolUse {
                     id: "call_1".to_string(),
                     name: "search".to_string(),
@@ -1917,6 +2058,7 @@ mod tests {
             },
             MessagePayload {
                 role: "user",
+                output_config: None,
                 content: ContentPayload::Text("Final user message".to_string()),
             },
         ];

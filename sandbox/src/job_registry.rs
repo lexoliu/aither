@@ -14,6 +14,7 @@ use crate::memory::MemoryDomain;
 use crate::permission::TerminalMode;
 use crate::poll_guard::PollRefusal;
 use crate::process_tree::{JobMarker, JobTree, KillTreeError, ProcessScanner};
+use crate::script_language::ScriptLanguage;
 
 /// Information about a running or completed background job.
 #[derive(Debug, Clone)]
@@ -26,6 +27,8 @@ pub struct JobInfo {
     pub execution_key: String,
     /// The script that was executed.
     pub script: String,
+    /// The language of `script`.
+    pub language: ScriptLanguage,
     /// The permission mode used.
     pub mode: TerminalMode,
     /// When the job was started.
@@ -268,6 +271,7 @@ enum StateCommand {
         task_id: String,
         execution_key: String,
         script: String,
+        language: ScriptLanguage,
         mode: TerminalMode,
         output_path: Option<PathBuf>,
         process_tree: Option<JobTree>,
@@ -503,6 +507,7 @@ impl JobRegistry {
             task_id,
             execution_key,
             script,
+            ScriptLanguage::Shell,
             mode,
             output_path,
             None,
@@ -512,7 +517,9 @@ impl JobRegistry {
     }
 
     /// Registers a new running job like [`Self::register`], for a job that
-    /// runs at `place` instead of on this machine.
+    /// runs at `place` instead of on this machine, with `script` in
+    /// `language`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn register_at(
         &self,
         place: JobPlace,
@@ -520,10 +527,21 @@ impl JobRegistry {
         task_id: &str,
         execution_key: &str,
         script: &str,
+        language: ScriptLanguage,
         mode: TerminalMode,
     ) {
-        self.register_with_tree(pid, task_id, execution_key, script, mode, None, None, place)
-            .await;
+        self.register_with_tree(
+            pid,
+            task_id,
+            execution_key,
+            script,
+            language,
+            mode,
+            None,
+            None,
+            place,
+        )
+        .await;
     }
 
     /// Registers a new running job whose process tree was started with
@@ -536,6 +554,7 @@ impl JobRegistry {
         task_id: &str,
         execution_key: &str,
         script: &str,
+        language: ScriptLanguage,
         mode: TerminalMode,
         output_path: Option<PathBuf>,
         process_tree: Option<JobTree>,
@@ -547,6 +566,7 @@ impl JobRegistry {
             task_id: task_id.to_string(),
             execution_key: execution_key.to_string(),
             script: script.to_string(),
+            language,
             mode,
             output_path,
             process_tree,
@@ -1032,6 +1052,7 @@ async fn handle_state_command(
             task_id,
             execution_key,
             script,
+            language,
             mode,
             output_path,
             process_tree,
@@ -1043,6 +1064,7 @@ async fn handle_state_command(
                 task_id,
                 execution_key,
                 script,
+                language,
                 mode,
                 output_path,
                 place,
@@ -1229,6 +1251,7 @@ fn register_job(
     task_id: String,
     execution_key: String,
     script: String,
+    language: ScriptLanguage,
     mode: TerminalMode,
     output_path: Option<PathBuf>,
     place: JobPlace,
@@ -1239,6 +1262,7 @@ fn register_job(
         task_id,
         execution_key,
         script,
+        language,
         mode,
         started_at: Instant::now(),
         status: JobStatus::Running,
@@ -2298,6 +2322,7 @@ mod tests {
             "task".to_string(),
             "exec".to_string(),
             "true".to_string(),
+            ScriptLanguage::Shell,
             TerminalMode::Sandboxed,
             None,
             JobPlace::Host,
@@ -2568,6 +2593,7 @@ mod tests {
             "task-twice".to_string(),
             "exec".to_string(),
             "run".to_string(),
+            ScriptLanguage::Shell,
             TerminalMode::Sandboxed,
             None,
             JobPlace::Host,

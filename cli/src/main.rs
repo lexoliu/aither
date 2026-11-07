@@ -43,14 +43,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aither_agent::sandbox::{
-    ToolRegistryBuilder, cli_to_json,
+    ScriptLanguage, ToolRegistryBuilder, cli_to_json,
     permission::{PermissionError, PermissionHandler, TerminalMode},
     schema_to_help,
 };
 use aither_agent::specialized::SubagentTool;
 use aither_agent::{Agent, AgentOptions, Hook, TerminalAgentBuilder};
 use aither_core::LanguageModel;
-use aither_core::llm::{Role, ToolResult};
+use aither_core::llm::ToolResult;
 use aither_mcp::{McpConnection, McpServersConfig};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -114,6 +114,7 @@ impl PermissionHandler for InteractivePermissionHandler {
         &self,
         mode: TerminalMode,
         script: &str,
+        language: ScriptLanguage,
     ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(match mode {
             TerminalMode::Sandboxed => Ok(true), // Always allow
@@ -122,7 +123,7 @@ impl PermissionHandler for InteractivePermissionHandler {
                 let mode_desc = mode.description();
                 let display_script = script.trim().replace('\n', "; ");
                 eprintln!("\n\x1b[33m⚠ Permission request: {mode_desc}\x1b[0m");
-                eprintln!("\x1b[2mScript:\x1b[22m {display_script}");
+                eprintln!("\x1b[2mScript ({language:?}):\x1b[22m {display_script}");
                 eprint!("\x1b[33mAllow? [y/N]: \x1b[0m");
                 io::stderr().flush().ok();
 
@@ -151,6 +152,7 @@ impl PermissionHandler for InteractivePermissionHandler {
         &self,
         _mode: TerminalMode,
         _script: &str,
+        _language: ScriptLanguage,
     ) -> impl std::future::Future<Output = bool> + Send {
         std::future::ready(true)
     }
@@ -700,12 +702,7 @@ where
     } else {
         println!("Conversation history ({} messages):", history.len());
         for msg in &history {
-            let role = match msg.role() {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-                Role::System => "System",
-                Role::Tool => "Tool",
-            };
+            let role = msg.role();
             let content = truncate(msg.content(), 100);
             println!("  [{role}] {content}");
         }

@@ -392,6 +392,7 @@ fn parse_ability(s: &str) -> Option<Ability> {
         "ComputerUse" => Some(Ability::ComputerUse),
         "PromptCaching" => Some(Ability::PromptCaching),
         "AssistantPrefill" => Some(Ability::AssistantPrefill),
+        "PerMessageEffort" => Some(Ability::PerMessageEffort),
         _ => None,
     }
 }
@@ -411,6 +412,39 @@ pub mod tests {
         registry
             .lookup(query)
             .map(|entry| entry.litellm_id().to_owned())
+    }
+
+    /// Per-message effort follows the vendors' documented model lists, on
+    /// the platforms they document it for.
+    #[test]
+    fn per_message_effort_follows_the_documented_models_and_platforms() {
+        use crate::convert::takes_per_message_effort;
+        for (id, expected) in [
+            ("claude-opus-5-5", true),
+            ("claude-sonnet-5-5", true),
+            ("claude-fable-5-1", true),
+            ("claude-sonnet-5", false),
+            ("claude-fable-5", false),
+            ("gpt-6-sol", true),
+            ("gpt-6.1-sol", true),
+            ("gpt-5", false),
+        ] {
+            let entry = crate::lookup(id).unwrap_or_else(|| panic!("{id} is in the snapshot"));
+            assert_eq!(
+                entry.has_ability(Ability::PerMessageEffort),
+                expected,
+                "{id}"
+            );
+        }
+        assert!(takes_per_message_effort(
+            "vertex_ai",
+            "claude-opus-5-5@default"
+        ));
+        assert!(!takes_per_message_effort(
+            "bedrock",
+            "anthropic.claude-opus-5-5"
+        ));
+        assert!(!takes_per_message_effort("azure", "gpt-6-sol"));
     }
 
     #[test]

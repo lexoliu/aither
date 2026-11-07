@@ -17,7 +17,7 @@ use std::time::Instant;
 use aither_core::llm::{AgentIdentity, CallIdentity, SubagentIdentity, ToolContext};
 use aither_core::{
     LanguageModel,
-    llm::{Tool, ToolResult, model::Parameters, oneshot},
+    llm::{Tool, ToolResult, model::Parameters},
 };
 use aither_sandbox::{
     CommandRole, CommandUsage, CommitLedger, CommitLedgerError, CommitMark, DynTerminalTool,
@@ -1862,13 +1862,15 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentTool<LLM> {
                     description: &fast.description,
                 },
             ],
-        }
-        .render()
-        .map_err(|error| anyhow::anyhow!("failed to render the subagent router prompt: {error}"))?;
-
-        let request = oneshot(system, prompt.to_string())
-            .with_parameters(self.parameters.get(ModelTier::Fast).clone());
-        let routing: SubagentRouting = self.fast.generate(request).await.map_err(|error| {
+        };
+        let routing: SubagentRouting = crate::judge(
+            &self.fast,
+            self.parameters.get(ModelTier::Fast).clone(),
+            &system,
+            prompt,
+        )
+        .await
+        .map_err(|error| {
             anyhow::anyhow!("the fast model failed to route the subagent prompt: {error}")
         })?;
 
@@ -4508,6 +4510,7 @@ mod tests {
             &self,
             mode: aither_sandbox::TerminalMode,
             script: &str,
+            _language: aither_sandbox::ScriptLanguage,
         ) -> impl std::future::Future<
             Output = Result<bool, aither_sandbox::permission::PermissionError>,
         > + Send {

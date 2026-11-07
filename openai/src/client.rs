@@ -405,6 +405,11 @@ impl LanguageModel for OpenAI {
                 context_length,
             )
             .with_ability(Ability::ToolUse);
+            if takes_per_message_effort(&cfg) {
+                profile.abilities.push(Ability::PerMessageEffort);
+            }
+            profile.default_reasoning_effort =
+                aither_models::default_reasoning_effort(&cfg.chat_model);
             for ability in &cfg.native_abilities {
                 if !profile.abilities.contains(ability) {
                     profile.abilities.push(*ability);
@@ -413,6 +418,20 @@ impl LanguageModel for OpenAI {
             Ok(profile)
         }
     }
+}
+
+/// Whether this client's model takes a `configuration_update` input item:
+/// the registry lists the model for it, and the client sends it through
+/// `OpenAI`'s own Responses API. Chat Completions has no such item, and an
+/// `OpenAI`-compatible endpoint behind another base URL does not document one.
+///
+/// aither sends neither `truncation: "auto"` nor server-side compaction, which
+/// `OpenAI` does not combine with configuration updates.
+fn takes_per_message_effort(cfg: &Config) -> bool {
+    cfg.api_kind == ApiKind::Responses
+        && cfg.base_url.trim_end_matches('/') == DEFAULT_BASE_URL
+        && aither_models::lookup(&cfg.chat_model)
+            .is_some_and(|entry| entry.has_ability(Ability::PerMessageEffort))
 }
 
 /// Fetch context window size from the models API.
@@ -1488,6 +1507,25 @@ mod tests {
             let _ = stream.flush();
         });
         format!("http://{addr}")
+    }
+
+    /// Per-message effort is `OpenAI`'s own Responses API's, on the
+    /// generations the registry lists.
+    #[test]
+    fn per_message_effort_is_the_responses_apis_on_the_listed_models() {
+        let model = |name: &str| OpenAI::builder("key").model(name).build();
+        assert!(takes_per_message_effort(&model("gpt-6-sol").config()));
+        assert!(!takes_per_message_effort(&model("gpt-5").config()));
+        assert!(!takes_per_message_effort(
+            &model("gpt-6-sol")
+                .with_api(ApiKind::ChatCompletions)
+                .config()
+        ));
+        assert!(!takes_per_message_effort(
+            &model("gpt-6-sol")
+                .with_base_url(OPENROUTER_BASE_URL)
+                .config()
+        ));
     }
 
     #[tokio::test]
