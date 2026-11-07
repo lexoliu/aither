@@ -970,7 +970,9 @@ where
         let mut registry_builder = self.registry_builder;
         registry_builder.notices(notices.sandbox());
         if let Some(subagents) = self.subagents {
-            let subagents = (*subagents).with_notices(notices.clone());
+            let subagents = (*subagents)
+                .with_handoff::<Schema>()
+                .with_notices(notices.clone());
             registry_builder.main_exclusive(|main| {
                 main.configure_terminal_bound_usage_tool("subagent", move |binding| {
                     subagents.for_terminal(binding)
