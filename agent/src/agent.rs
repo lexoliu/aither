@@ -63,7 +63,7 @@ enum TurnStep {
     /// The model turn completed.
     Turn(Result<ModelTurn, AgentError>),
     /// The forked compaction landed while the turn was still running.
-    Compacted(Result<HandoffDocument, crate::context::CompactionError>),
+    Compacted(Result<CompletedCompaction, crate::context::CompactionError>),
 }
 
 /// The number of characters an assembled request renders to, tool calls
@@ -809,8 +809,19 @@ impl PermissionPauseTracker {
 ///     .tier(ModelTier::Balanced)  // Use sonnet for reasoning
 ///     .build();
 /// ```
+///
+/// `Schema` is the [`HandoffSchema`](crate::HandoffSchema) every compaction
+/// asks the model for; [`HandoffDocument`] unless the builder's
+/// [`handoff`](crate::AgentBuilder::handoff) sets another.
 #[derive(Debug)]
-pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compactor = Advanced> {
+pub struct Agent<
+    Advanced,
+    Balanced = Advanced,
+    Fast = Balanced,
+    H = (),
+    Compactor = Advanced,
+    Schema = HandoffDocument,
+> {
     /// Primary LLM for main reasoning (most capable).
     /// The advanced reasoning model, behind an Arc so a forked compaction
     /// can own it while the run continues.
@@ -1000,6 +1011,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
     /// Exact tool-name allowlist derived from activated skills.
     #[cfg(feature = "skills")]
     pub(crate) active_allowed_tools: Option<HashSet<String>>,
+
+    /// The schema compactions ask for; no value is held.
+    pub(crate) handoff_schema: std::marker::PhantomData<fn() -> Schema>,
 }
 
 impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
@@ -1071,6 +1085,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             active_skills: ActiveSkills::new(),
             #[cfg(feature = "skills")]
             active_allowed_tools: None,
+            handoff_schema: std::marker::PhantomData,
         }
     }
 }
@@ -1082,8 +1097,10 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
     }
 }
 
-impl<Advanced, Balanced, Fast, H, Compactor> Agent<Advanced, Balanced, Fast, H, Compactor>
+impl<Advanced, Balanced, Fast, H, Compactor, Schema>
+    Agent<Advanced, Balanced, Fast, H, Compactor, Schema>
 where
+    Schema: crate::HandoffSchema,
     Advanced: LanguageModel + 'static,
     Balanced: LanguageModel + 'static,
     // Compaction runs as an owned future that outlives the turn it races
@@ -1437,7 +1454,6 @@ where
         events: &EventSink,
     ) -> Result<ModelTurn, AgentError> {
         let mut pending = self.compaction.take_running();
-        let fork_point = pending.as_ref().map(PendingCompaction::fork_point);
         let mut landed = None;
 
         let turn = {
@@ -1464,13 +1480,13 @@ where
             }
         };
 
-        match (landed, fork_point) {
-            (Some(Ok(handoff)), Some(fork_point)) => self.compaction.land(fork_point, handoff),
-            (Some(Err(error)), _) => {
+        match landed {
+            Some(Ok(completed)) => self.compaction.land(completed),
+            Some(Err(error)) => {
                 tracing::warn!(%error, "forked compaction failed");
                 self.compaction_failure = Some(error);
             }
-            (Some(Ok(_)), None) | (None, _) => {}
+            None => {}
         }
         self.compaction.resume(pending);
         turn
@@ -2508,7 +2524,7 @@ where
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
         let skills = Vec::new();
-        let fork = CompactionFork::new(
+        let fork = CompactionFork::<Schema>::new(
             &request,
             self.context.fork_point(),
             self.context.handoff_file_index(),
@@ -2517,14 +2533,13 @@ where
         )
         .map_err(AgentError::from)?
         .with_outputs_dir(self.outputs_dir());
-        let fork_point = fork.fork_point();
-        let handoff = self
+        let completed = self
             .compaction_future(fork)
             .await
             .map_err(AgentError::from)?;
-        let summary = handoff.render_markdown();
+        let summary = completed.handoff.text().to_string();
 
-        self.compaction.land(fork_point, handoff);
+        self.compaction.land(completed);
         self.apply_completed_compaction().await;
 
         Ok(Some(CompactResult {
@@ -2761,8 +2776,8 @@ where
     /// or else the session's own tier.
     async fn compaction_future(
         &self,
-        fork: CompactionFork,
-    ) -> Result<HandoffDocument, crate::context::CompactionError> {
+        fork: CompactionFork<Schema>,
+    ) -> Result<CompletedCompaction, crate::context::CompactionError> {
         if let Some(compactor) = &self.compaction_model {
             return fork.run(Arc::clone(&compactor.model)).await;
         }
@@ -2775,7 +2790,7 @@ where
 
     /// Starts `fork` in the background on the compaction model: the
     /// configured one, or else the session's own tier.
-    fn start_pending_compaction(&self, fork: CompactionFork) -> PendingCompaction {
+    fn start_pending_compaction(&self, fork: CompactionFork<Schema>) -> PendingCompaction {
         if let Some(compactor) = &self.compaction_model {
             return PendingCompaction::start(fork, Arc::clone(&compactor.model));
         }
@@ -2865,7 +2880,7 @@ where
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
         let skills = Vec::new();
-        match CompactionFork::new(
+        match CompactionFork::<Schema>::new(
             request,
             self.context.fork_point(),
             self.context.handoff_file_index(),
@@ -2919,6 +2934,7 @@ where
             return;
         };
         let handoff = completed.handoff.clone();
+        let restoration = completed.restoration.clone();
         let restored = match self.restore_dir.clone() {
             Some(restore_dir) => {
                 let tokens = self
@@ -2929,7 +2945,14 @@ where
                 let skills = self.skill_catalog();
                 #[cfg(not(feature = "skills"))]
                 let skills = Vec::new();
-                restore_context(&handoff, &[restore_dir], &skills, budget_chars).await
+                restore_context(
+                    &restoration,
+                    handoff.file_index(),
+                    &[restore_dir],
+                    &skills,
+                    budget_chars,
+                )
+                .await
             }
             None => None,
         };
@@ -2946,7 +2969,7 @@ where
             .budget
             .chars_for_tokens(self.config.context_policy.user_message_budget);
         self.context
-            .apply_handoff(&handoff, fork_point, user_message_chars);
+            .apply_handoff(handoff, fork_point, user_message_chars);
         if let Some(block) = restored {
             self.context.push_block_alert(&block);
         }
@@ -2987,10 +3010,9 @@ where
     async fn make_room(&mut self, events: &EventSink) -> Result<bool, AgentError> {
         let mut failure = self.compaction_failure.take().map(AgentError::from);
         if let Some(mut pending) = self.compaction.take_running() {
-            let fork_point = pending.fork_point();
             match pending.wait().await {
-                Ok(handoff) => {
-                    self.compaction.land(fork_point, handoff);
+                Ok(completed) => {
+                    self.compaction.land(completed);
                     self.apply_completed_compaction().await;
                     return Ok(true);
                 }
@@ -4042,6 +4064,15 @@ mod tests {
     use aither_sandbox::{CompletedCommand, CompletedTask, TerminalError};
     use futures_core::Stream;
 
+    /// Lands `document` as a compaction forked at `fork_point` finished.
+    fn land_document(
+        compaction: &mut crate::compaction_state::CompactionState,
+        fork_point: u64,
+        document: HandoffDocument,
+    ) {
+        compaction.land(CompletedCompaction::new(fork_point, document, Vec::new()));
+    }
+
     /// aither's wording of a finished background task.
     fn format_background_task_result(task: &CompletedTask) -> String {
         crate::Notices::background_finished(&crate::DefaultNotices, task)
@@ -4691,7 +4722,7 @@ mod tests {
         let mut agent = Agent::new(MockLlm {
             context_length: 1_000_000,
         });
-        agent.context_mut().set_handoff("resume here");
+        agent.context_mut().set_handoff(Handoff::new("resume here"));
 
         let snapshot = agent
             .snapshot_context_window()
@@ -5254,7 +5285,8 @@ mod tests {
         agent.push_message(Message::user("before"));
         let checkpoint = agent.export_checkpoint().await.expect("checkpoint");
         agent.push_message(Message::user("after"));
-        agent.compaction.land(
+        land_document(
+            &mut agent.compaction,
             agent.context.fork_point(),
             HandoffDocument {
                 current_task: "stale".to_string(),
@@ -5276,8 +5308,14 @@ mod tests {
         agent.push_message(Message::user("after"));
         let tail = agent.render_tail().await;
         let request = LLMRequest::new(agent.context.build_request(&tail));
-        let fork = CompactionFork::new(&request, agent.context.fork_point(), &[], None, &[])
-            .expect("fork");
+        let fork = CompactionFork::<HandoffDocument>::new(
+            &request,
+            agent.context.fork_point(),
+            &[],
+            None,
+            &[],
+        )
+        .expect("fork");
         agent.compaction.start(PendingCompaction::start(fork, llm));
         agent.compaction_failure = Some(crate::context::CompactionError::Empty);
         agent.idle_compacted = true;
@@ -5428,9 +5466,7 @@ mod tests {
             .expect("results apply");
 
         let fork = agent.context.fork_point();
-        agent
-            .context
-            .apply_handoff(&crate::context::HandoffDocument::default(), fork, 0);
+        agent.context.apply_handoff(Handoff::new("task"), fork, 0);
 
         let kept = agent.context.recent();
         let ids: Vec<&str> = kept[0].tool_calls().iter().map(|c| c.id.as_str()).collect();
@@ -6239,6 +6275,139 @@ mod tests {
         assert_eq!(updates, [ReasoningEffort::Low], "the update survives once");
     }
 
+    /// An embedder's handoff: decisions quoted verbatim, files named by path.
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct QuotedHandoff {
+        goal: String,
+        quoted_decisions: Vec<String>,
+        files: Vec<String>,
+    }
+
+    impl crate::HandoffSchema for QuotedHandoff {
+        fn instruction(prompt: &crate::HandoffPrompt<'_>) -> String {
+            assert!(prompt.focus.is_none(), "no focus was given");
+            "Write the quoted handoff.".to_string()
+        }
+
+        fn retry(reason: &str) -> String {
+            reason.to_owned()
+        }
+
+        fn validate(&self) -> Result<(), crate::InvalidHandoff> {
+            if self.quoted_decisions.is_empty() {
+                return Err(crate::InvalidHandoff::new("no decision was quoted"));
+            }
+            Ok(())
+        }
+
+        fn render(&self, file_index: &[String]) -> String {
+            std::iter::once(self.goal.as_str())
+                .chain(self.quoted_decisions.iter().map(String::as_str))
+                .chain(file_index.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        fn into_restoration(self) -> crate::Restoration {
+            crate::Restoration {
+                context_files: self
+                    .files
+                    .into_iter()
+                    .map(|path| crate::ContextFile {
+                        path,
+                        lines: None,
+                        why: "named by the handoff".to_string(),
+                    })
+                    .collect(),
+                skills: Vec::new(),
+            }
+        }
+    }
+
+    /// A compaction with the embedder's own handoff asks with its schema and
+    /// instruction, retries with its prompt after its validation fails,
+    /// renders its text into the window, restores the files it named, and
+    /// survives a checkpoint.
+    #[tokio::test]
+    async fn a_custom_handoff_round_trips_through_compaction_and_restore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "restored marker text").expect("write");
+        let llm = ScriptedLlm::new(
+            1_000_000,
+            [
+                r#"{"goal":"ship the parser","quoted_decisions":[],"files":[]}"#.to_string(),
+                r#"{"goal":"ship the parser","quoted_decisions":["\"use the PEG grammar\""],"files":["notes.txt"]}"#
+                    .to_string(),
+            ],
+        );
+        let mut agent = Agent::builder(llm.clone())
+            .handoff::<QuotedHandoff>()
+            .build();
+        agent.restore_dir = Some(dir.path().to_path_buf());
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("build the parser"));
+
+        let result = agent
+            .compact(None)
+            .await
+            .expect("compaction succeeds")
+            .expect("there was a conversation to compact");
+
+        let requests = llm.recorded();
+        assert_eq!(requests.len(), 2, "one attempt and one retry");
+        let asked: Vec<&str> = requests[0]
+            .messages()
+            .iter()
+            .map(Message::content)
+            .collect();
+        assert!(asked.contains(&"Write the quoted handoff."), "{asked:?}");
+        assert!(
+            asked
+                .iter()
+                .any(|content| content.contains("quoted_decisions")),
+            "the structured output carries the embedder's schema: {asked:?}"
+        );
+        assert_eq!(
+            requests[1].messages().last().map(Message::content),
+            Some("no decision was quoted"),
+            "the retry is the embedder's, quoting its validation"
+        );
+
+        assert_eq!(result.summary, "ship the parser\n\"use the PEG grammar\"");
+        let handoff = agent
+            .context()
+            .handoff()
+            .cloned()
+            .expect("the handoff is in the window");
+        assert_eq!(handoff.text(), result.summary);
+        let request = agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary")
+            .expect("request after compaction");
+        let sent: Vec<&str> = request.messages().iter().map(Message::content).collect();
+        assert!(
+            sent.iter()
+                .any(|content| content.contains("\"use the PEG grammar\"")),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|content| content.contains("restored marker text")),
+            "the file the handoff named is restored: {sent:?}"
+        );
+
+        let checkpoint = agent.export_checkpoint().await.expect("checkpoint");
+        let json = serde_json::to_string(&checkpoint).expect("checkpoint serializes");
+        let checkpoint: crate::AgentCheckpoint =
+            serde_json::from_str(&json).expect("checkpoint deserializes");
+        let mut restored = Agent::builder(llm).handoff::<QuotedHandoff>().build();
+        restored
+            .restore_checkpoint(checkpoint)
+            .expect("checkpoint restores");
+        assert_eq!(restored.context().handoff(), Some(&handoff));
+    }
+
     /// A replaced model takes the next request, with the history the old one
     /// built; a model that reads no updates gets the effort at the request
     /// level and no update.
@@ -6426,7 +6595,7 @@ mod tests {
         let config = scaled_config();
         let (mut agent, _window) = window_for_usage(&config, &[Message::user("hello")], 75).await;
         agent.ensure_initialized().await.expect("agent initializes");
-        agent.context_mut().set_handoff("resume here");
+        agent.context_mut().set_handoff(Handoff::new("resume here"));
         agent.push_message(Message::user("hello"));
 
         let request = agent
@@ -6509,8 +6678,14 @@ mod tests {
         // Seed an in-flight compaction the way prepare_request would.
         let tail = agent.render_tail().await;
         let request = LLMRequest::new(agent.context.build_request(&tail));
-        let fork = CompactionFork::new(&request, agent.context.fork_point(), &[], None, &[])
-            .expect("fork");
+        let fork = CompactionFork::<HandoffDocument>::new(
+            &request,
+            agent.context.fork_point(),
+            &[],
+            None,
+            &[],
+        )
+        .expect("fork");
         agent
             .compaction
             .start(PendingCompaction::start(fork, llm.clone()));
@@ -6554,7 +6729,8 @@ mod tests {
         let mut agent = tasks_agent(dir.path());
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
-        agent.compaction.land(
+        land_document(
+            &mut agent.compaction,
             agent.context.fork_point(),
             HandoffDocument {
                 current_task: "keep going".to_string(),
@@ -6590,7 +6766,8 @@ mod tests {
         // Two more items land while the hypothetical compaction runs.
         agent.push_message(Message::assistant("during one"));
         agent.push_message(Message::user("during two"));
-        agent.compaction.land(
+        land_document(
+            &mut agent.compaction,
             fork_point,
             HandoffDocument {
                 current_task: "keep going".to_string(),
@@ -6632,7 +6809,8 @@ mod tests {
         agent.push_system_alert("background job 7 completed");
         agent.push_message(Message::user("during"));
         agent.push_system_alert("hook context injected mid-turn");
-        agent.compaction.land(
+        land_document(
+            &mut agent.compaction,
             fork_point,
             HandoffDocument {
                 current_task: "keep going".to_string(),
@@ -6671,7 +6849,8 @@ mod tests {
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("before the fork"));
         let fork_point = agent.context.fork_point();
-        agent.compaction.land(
+        land_document(
+            &mut agent.compaction,
             fork_point,
             HandoffDocument {
                 current_task: "keep going".to_string(),
@@ -6720,8 +6899,14 @@ mod tests {
         // Fork the way prepare_request does, around a real assembled request.
         let tail = agent.render_tail().await;
         let main = LLMRequest::new(agent.context.build_request(&tail));
-        let fork =
-            CompactionFork::new(&main, agent.context.fork_point(), &[], None, &[]).expect("fork");
+        let fork = CompactionFork::<HandoffDocument>::new(
+            &main,
+            agent.context.fork_point(),
+            &[],
+            None,
+            &[],
+        )
+        .expect("fork");
         agent
             .compaction
             .start(PendingCompaction::start(fork, llm.clone()));
@@ -7034,8 +7219,14 @@ mod tests {
 
         let tail = agent.render_tail().await;
         let request = LLMRequest::new(agent.context.build_request(&tail));
-        let fork = CompactionFork::new(&request, agent.context.fork_point(), &[], None, &[])
-            .expect("fork");
+        let fork = CompactionFork::<HandoffDocument>::new(
+            &request,
+            agent.context.fork_point(),
+            &[],
+            None,
+            &[],
+        )
+        .expect("fork");
         agent
             .compaction
             .start(PendingCompaction::start(fork, stale.clone()));
@@ -7053,10 +7244,12 @@ mod tests {
         for prompt in ["go on", "and again"] {
             let _ = crate::test_support::finish_run(agent.run(prompt, std::iter::empty())).await;
         }
-        let Some(Handoff::Document(document)) = agent.context().handoff() else {
-            panic!("the manual handoff stays in the window");
-        };
-        assert_eq!(document.current_task, "manual");
+        let handoff = agent
+            .context()
+            .handoff()
+            .expect("the manual handoff stays in the window");
+        assert!(handoff.text().contains("manual"), "{}", handoff.text());
+        assert!(!handoff.text().contains("stale"), "{}", handoff.text());
         assert!(stale.recorded().is_empty(), "the stale fork never ran");
     }
 
@@ -7641,7 +7834,8 @@ mod tests {
             .expect("first request");
 
         agent.push_message(Message::assistant("done"));
-        agent.compaction.land(
+        land_document(
+            &mut agent.compaction,
             agent.context.fork_point(),
             HandoffDocument {
                 current_task: "keep going".to_string(),
@@ -8288,9 +8482,8 @@ mod tests {
 
         // The compaction lands while turns run; the next boundary applies it.
         let mut pending = agent.compaction.take_running().expect("in flight");
-        let fork_point = pending.fork_point();
-        let handoff = pending.wait().await.expect("handoff");
-        agent.compaction.land(fork_point, handoff);
+        let completed = pending.wait().await.expect("handoff");
+        agent.compaction.land(completed);
         assert!(agent.context().handoff().is_none());
         agent
             .prepare_request(&EventSink::discarding())
@@ -8313,9 +8506,8 @@ mod tests {
             .await
             .expect("request boundary");
         let mut pending = agent.compaction.take_running().expect("in flight");
-        let fork_point = pending.fork_point();
-        let handoff = pending.wait().await.expect("handoff");
-        agent.compaction.land(fork_point, handoff);
+        let completed = pending.wait().await.expect("handoff");
+        agent.compaction.land(completed);
         agent
             .prepare_request(&EventSink::discarding())
             .await
