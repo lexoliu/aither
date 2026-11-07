@@ -279,6 +279,11 @@ impl<'tools> LLMRequestWithTools<'tools> {
         &self.inner
     }
 
+    /// Returns the inner request for modification, keeping its tool registry.
+    pub const fn request_mut(&mut self) -> &mut LLMRequest {
+        &mut self.inner
+    }
+
     /// Returns the tool registry.
     #[must_use]
     pub const fn tools(&mut self) -> &mut Tools {

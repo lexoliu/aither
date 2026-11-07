@@ -94,6 +94,7 @@ dependencies = [
 name = "aither-agent"
 version = "0.21.0"
 dependencies = [
+ "aho-corasick",
  "aither-attachments",
  "aither-command",
  "aither-connectivity",
@@ -127,6 +128,7 @@ dependencies = [
  "libc",
  "notify",
  "num-traits",
+ "regex",
  "rustix",
  "schemars 1.2.3",
  "serde",
@@ -594,6 +596,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tree-sitter",
  "typed-path",
  "url",

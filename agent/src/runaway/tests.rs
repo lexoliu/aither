@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use aither_sandbox::{
     AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, CgroupMemory, ContainerMemory,
     FootprintError, FootprintReader, FootprintRegistry, JobMemory, JobPlace, JobRegistry,
-    JobStatus, KillCause, MemoryDomain, ResponseWindow, TerminalMode, job_registry_channel,
+    JobStatus, KillCause, MemoryDomain, ResponseWindow, ScriptLanguage, TerminalMode,
+    job_registry_channel,
 };
 
 use super::*;
@@ -228,6 +229,7 @@ impl Agent {
                 task_id,
                 "exec",
                 task_id,
+                ScriptLanguage::Shell,
                 TerminalMode::Sandboxed,
             )
             .await;
@@ -261,6 +263,7 @@ impl Agent {
                 task_id,
                 "exec",
                 task_id,
+                ScriptLanguage::Shell,
                 TerminalMode::Sandboxed,
             )
             .await;

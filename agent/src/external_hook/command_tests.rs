@@ -8,7 +8,8 @@ use std::time::Duration;
 use aither_core::llm::{Tool, ToolContext, ToolResult};
 use aither_sandbox::permission::{PermissionError, PermissionHandler, TerminalMode};
 use aither_sandbox::{
-    DynTerminalTool, DynToolHandler, SubagentGrant, TerminalTool, ToolRegistryBuilder,
+    DynTerminalTool, DynToolHandler, ScriptLanguage, SubagentGrant, TerminalTool,
+    ToolRegistryBuilder,
 };
 use executor_core::tokio::TokioGlobal;
 
@@ -46,6 +47,7 @@ impl PermissionHandler for SandboxOnly {
         &self,
         mode: TerminalMode,
         script: &str,
+        _language: ScriptLanguage,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
         self.asked.lock().unwrap().push((mode, script.to_string()));
         std::future::ready(Ok(mode == TerminalMode::Sandboxed))

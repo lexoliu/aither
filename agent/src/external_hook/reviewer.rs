@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use aither_sandbox::ScriptLanguage;
 use aither_sandbox::permission::{
     PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode,
 };
@@ -25,7 +26,7 @@ pub struct ReviewerConfig {
 /// What a reviewer reads on stdin.
 ///
 /// The role of the agent that asked, and the request, which is either a command escalation (`"kind":"command"` with
-/// `mode` and `script`) or a network domain (`"kind":"domain"` with `domain`
+/// `mode`, `script` and its `language`) or a network domain (`"kind":"domain"` with `domain`
 /// and `port`).
 #[derive(Debug, Serialize)]
 pub struct ReviewRequest<'a> {
@@ -149,16 +150,22 @@ impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P>
         self.hooks.review(*request).await
     }
 
-    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
-        self.inner.check(mode, script).await
+    async fn check(
+        &self,
+        mode: TerminalMode,
+        script: &str,
+        language: ScriptLanguage,
+    ) -> Result<bool, PermissionError> {
+        self.inner.check(mode, script, language).await
     }
 
     fn will_wait_for_approval(
         &self,
         mode: TerminalMode,
         script: &str,
+        language: ScriptLanguage,
     ) -> impl Future<Output = bool> + Send {
-        self.inner.will_wait_for_approval(mode, script)
+        self.inner.will_wait_for_approval(mode, script, language)
     }
 
     fn for_subagent(&self) -> Option<Self> {

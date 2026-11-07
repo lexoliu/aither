@@ -4510,6 +4510,7 @@ mod tests {
             &self,
             mode: aither_sandbox::TerminalMode,
             script: &str,
+            _language: aither_sandbox::ScriptLanguage,
         ) -> impl std::future::Future<
             Output = Result<bool, aither_sandbox::permission::PermissionError>,
         > + Send {
