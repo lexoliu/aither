@@ -40,24 +40,6 @@ impl Whitespace {
     }
 }
 
-/// Applies `hunks` to `file` and returns the patched lines.
-///
-/// The hunks are placed in file order, each at or after the previous hunk's
-/// end and after its `@@` anchor line. The patch applies only when exactly one
-/// placement of all hunks is consistent, so a hunk that is ambiguous alone is
-/// resolved by the hunks after it.
-///
-/// `path` only labels errors.
-#[cfg(test)]
-pub fn apply_hunks(
-    path: &str,
-    file: &[String],
-    hunks: &[Hunk],
-    mode: Whitespace,
-) -> Result<Vec<String>, PatchError> {
-    place_hunks(path, file, hunks, mode).map(|placement| build(file, hunks, &placement))
-}
-
 /// Matches `hunks` strictly first and leniently when the strict match is a
 /// conflict or ambiguous, returning the start index of each hunk and the
 /// mode that placed them.
@@ -99,7 +81,7 @@ pub struct Located {
 
 /// Locates every hunk of an update in `file` without applying anything.
 ///
-/// This is the matching [`apply_hunks`] performs, strict first and then
+/// This is the matching [`apply_tolerant`] performs, strict first and then
 /// whitespace-tolerant: when the hunks place together, every range is the one
 /// the patch would change. When they do not place together, each hunk is
 /// located on its own and is `None` unless it matches exactly one place.
@@ -138,6 +120,13 @@ fn old_len(hunk: &Hunk) -> usize {
 }
 
 /// Finds the one consistent placement of `hunks`: the start index of each.
+///
+/// The hunks are placed in file order, each at or after the previous hunk's
+/// end and after its `@@` anchor line. A placement exists only when exactly
+/// one placement of all hunks is consistent, so a hunk that is ambiguous alone
+/// is resolved by the hunks after it.
+///
+/// `path` only labels errors.
 fn place_hunks(
     path: &str,
     file: &[String],
@@ -376,7 +365,7 @@ fn diagnose(
 
 #[cfg(test)]
 mod tests {
-    use super::{Whitespace, apply_hunks};
+    use super::{Whitespace, build, place_hunks};
     use crate::parse::{Action, parse};
 
     fn run(file: &str, hunks: &str, mode: Whitespace) -> Result<String, String> {
@@ -385,8 +374,8 @@ mod tests {
             panic!("expected update");
         };
         let lines: Vec<String> = file.lines().map(String::from).collect();
-        apply_hunks("f", &lines, &hunks, mode)
-            .map(|out| out.join("\n"))
+        place_hunks("f", &lines, &hunks, mode)
+            .map(|placement| build(&lines, &hunks, &placement).join("\n"))
             .map_err(|error| error.to_string())
     }
 
