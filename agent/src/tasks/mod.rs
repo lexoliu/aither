@@ -13,7 +13,8 @@ pub mod format;
 mod reference;
 mod tracker;
 
-pub use document::{TasksCheckpoint, TasksDocument};
+pub(crate) use document::default_alert;
+pub use document::{TasksAlertItem, TasksCheckpoint, TasksDocument};
 pub use events::{TaskEvent, TaskEvents};
 pub use format::{LineViolation, Row, Section, TasksFile, Violation};
 pub use reference::{WorkKind, WorkRef};
@@ -39,8 +40,10 @@ impl TasksWiring {
         &self,
         sandbox_dir: std::path::PathBuf,
         line_limit: usize,
+        notices: crate::AnyNotices,
     ) -> TasksDocument {
-        let mut document = TasksDocument::new(sandbox_dir, line_limit, self.events.clone());
+        let mut document =
+            TasksDocument::new(sandbox_dir, line_limit, self.events.clone()).with_notices(notices);
         if let Some(resolver) = self.blocker_resolver.clone() {
             document = document.with_blocker_resolver(resolver);
         }

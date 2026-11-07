@@ -188,6 +188,10 @@ pub struct TerminalAgentBuilder<
     tool_descriptions: Vec<(String, String)>,
     skills: Vec<SkillInfo>,
     host_load: HostLoadSetup,
+    /// The `subagent` command, registered at build with the agent's notices.
+    /// Boxed: the tool is large, and the builder moves by value through
+    /// every step and across the awaits of its preparation.
+    subagents: Option<Box<crate::specialized::SubagentTool<LLM>>>,
     state: PhantomData<S>,
 }
 
@@ -256,17 +260,11 @@ where
             ssh: false,
         });
 
-        let job_registry = terminal_tool.job_registry();
-        let kill_terminal_tool = KillTerminalTool::new(job_registry.clone());
-        let input_terminal_tool = InputTerminalTool::new(job_registry.clone());
-        let read_terminal_delta_tool = ReadTerminalDeltaTool::new(job_registry);
         terminal_tool = terminal_tool.with_shell_sessions(shell_sessions);
 
-        let inner = AgentBuilder::new(llm)
-            .tool(kill_terminal_tool)
-            .tool(input_terminal_tool)
-            .tool(read_terminal_delta_tool)
-            .compact_tool();
+        // The terminal controls are registered at build, over the notices
+        // the options settle on.
+        let inner = AgentBuilder::new(llm).compact_tool();
 
         Self {
             inner,
@@ -275,6 +273,7 @@ where
             tool_descriptions,
             skills: Vec::new(),
             host_load: HostLoadSetup::default(),
+            subagents: None,
             state: PhantomData,
         }
     }
@@ -328,6 +327,7 @@ where
             tool_descriptions: self.tool_descriptions,
             skills: self.skills,
             host_load: self.host_load,
+            subagents: self.subagents,
             state: PhantomData,
         }
     }
@@ -572,11 +572,7 @@ where
         self.inner = self.inner.fork_source(subagents.fork_source());
         self.tool_descriptions
             .push(("subagent".to_string(), description.into()));
-        self.registry_builder.main_exclusive(|main| {
-            main.configure_terminal_bound_usage_tool("subagent", move |binding| {
-                subagents.for_terminal(binding)
-            });
-        });
+        self.subagents = Some(Box::new(subagents));
         self
     }
 
@@ -905,6 +901,13 @@ where
     #[must_use]
     pub fn native_tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = self.inner.tool_definitions();
+        let jobs = self.terminal_tool.job_registry();
+        definitions.push(ToolDefinition::new(&KillTerminalTool::new(jobs.clone())));
+        definitions.push(ToolDefinition::new(&InputTerminalTool::new(jobs.clone())));
+        definitions.push(ToolDefinition::new(&ReadTerminalDeltaTool::new(
+            jobs,
+            aither_sandbox::AnySandboxNotices::default(),
+        )));
         let terminal = self.terminal_tool.clone().with_registry(Arc::new(
             ToolRegistryBuilder::new().build(self.terminal_tool.outputs_dir()),
         ));
@@ -941,16 +944,28 @@ where
     /// # Panics
     ///
     /// Panics if the `knowledge_and_time` prompt template fails to render.
-    pub fn build(self) -> Agent<LLM, Balanced, Fast, H, Compactor> {
+    pub fn build(self) -> Agent<LLM, Balanced, Fast, H, Compactor>
+    where
+        LLM: 'static,
+    {
         // Render knowledge/time guidance against the actual command registry so
         // it never references a command that was not registered.
         let websearch_command = self.has_command("websearch");
+        let notices = self.inner.chosen_notices().clone();
 
         // Build registry
-        let registry = std::sync::Arc::new(
-            self.registry_builder
-                .build(self.terminal_tool.outputs_dir()),
-        );
+        let mut registry_builder = self.registry_builder;
+        registry_builder.notices(notices.sandbox());
+        if let Some(subagents) = self.subagents {
+            let subagents = (*subagents).with_notices(notices.clone());
+            registry_builder.main_exclusive(|main| {
+                main.configure_terminal_bound_usage_tool("subagent", move |binding| {
+                    subagents.for_terminal(binding)
+                });
+            });
+        }
+        let registry =
+            std::sync::Arc::new(registry_builder.build(self.terminal_tool.outputs_dir()));
 
         let commands = crate::command_catalog::CommandCatalog::new(
             self.tool_descriptions,
@@ -959,7 +974,13 @@ where
         // Configure terminal tool
         let terminal_tool = self.terminal_tool.with_registry(registry);
 
-        let inner = self.inner.command_catalog(commands);
+        let job_registry = terminal_tool.job_registry();
+        let inner = self
+            .inner
+            .tool(KillTerminalTool::new(job_registry.clone()))
+            .tool(InputTerminalTool::new(job_registry.clone()))
+            .tool(ReadTerminalDeltaTool::new(job_registry, notices.sandbox()))
+            .command_catalog(commands);
         let inner = if inner.has_instruction(&InstructionSlot::KNOWLEDGE_AND_TIME) {
             inner
         } else {
@@ -1932,6 +1953,114 @@ mod tests {
         assert!(
             transcript.contains("' terminated."),
             "native terminal_kill reported the kill: {transcript}"
+        );
+    }
+
+    /// Notices that reword the terminal's poll refusals.
+    struct NoPolling;
+
+    impl aither_sandbox::SandboxNotices for NoPolling {
+        fn poll_refusal(&self, refusal: &aither_sandbox::PollRefusal) -> String {
+            match refusal {
+                aither_sandbox::PollRefusal::Sleep => {
+                    "Not run: wait for the job's completion instead of sleeping.".to_string()
+                }
+                other => aither_sandbox::DefaultSandboxNotices.poll_refusal(other),
+            }
+        }
+    }
+
+    impl crate::Notices for NoPolling {}
+
+    /// Asks for one foreground `sleep`, then stops.
+    #[derive(Clone)]
+    struct SleepLlm {
+        requests: async_channel::Sender<LLMRequest>,
+        turns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LanguageModel for SleepLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            self.requests
+                .try_send(request)
+                .expect("record model request");
+            let turn = self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let event = if turn == 0 {
+                Event::ToolCall(aither_core::llm::ToolCall::new(
+                    "wait",
+                    "terminal",
+                    serde_json::json!({
+                        "description": "Wait for the build",
+                        "script": "sleep 5",
+                        "mode": "sandboxed",
+                        "timeout": 30
+                    }),
+                ))
+            } else {
+                Event::Text("done".into())
+            };
+            futures_lite::stream::once(Ok(event))
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                100_000,
+            )))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_refusal_reaches_the_conversation_in_the_embedders_words() {
+        let source = tempdir().unwrap();
+        let binary = compile_baseline_fixture(source.path()).await;
+        let distribution = fixture_distribution(&binary, "1.0.0").await;
+        let cache = crate::test_support::TempDir::new();
+        let dir = tempdir().unwrap();
+        let (requests, captured) = async_channel::bounded(8);
+        // Set after the builder registered its tools: they render through it
+        // all the same.
+        let mut agent = TerminalAgentBuilder::new(
+            SleepLlm {
+                requests,
+                turns: Arc::default(),
+            },
+            noop_terminal(dir.path()).await,
+        )
+        .max_iterations(3)
+        .notices(crate::AnyNotices::new(NoPolling))
+        .initialize_tools(&distribution, cache.path())
+        .await
+        .unwrap()
+        .build();
+
+        let _ = crate::test_support::finish_run(agent.run("Wait for the build", [])).await;
+
+        let _ = captured.try_recv().expect("first request");
+        let reply = captured.try_recv().expect("the refusal reached the model");
+        let transcript = reply
+            .messages()
+            .iter()
+            .map(aither_core::llm::Message::content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("Not run: wait for the job's completion instead of sleeping."),
+            "the embedder's refusal reached the model: {transcript}"
+        );
+        assert!(
+            !transcript.contains("only serves polling"),
+            "aither's own wording stayed out: {transcript}"
         );
     }
 }

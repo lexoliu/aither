@@ -13,8 +13,8 @@ mod watch;
 use std::fmt;
 use std::str::FromStr;
 
-pub(crate) use guard::{LanguageAlert, LanguageAlertsTemplate, translate};
-pub use guard::{LanguageGuard, LanguageRefusal, WorkingText};
+pub use guard::{LanguageAlert, LanguageGuard, LanguageRefusal, WorkingText};
+pub(crate) use guard::{default_alerts, default_refusal, translate};
 pub(crate) use watch::LanguageAlerts;
 use whatlang::Lang;
 

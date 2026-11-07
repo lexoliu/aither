@@ -131,24 +131,6 @@ impl CompactSignal {
 #[template(path = "compact_description.txt", escape = "none")]
 struct CompactDescription;
 
-#[derive(Template)]
-#[template(path = "compact_started.txt", escape = "none")]
-struct CompactStarted;
-
-#[derive(Template)]
-#[template(path = "compact_in_flight.txt", escape = "none")]
-struct CompactInFlight;
-
-#[derive(Template)]
-#[template(path = "compact_settled.txt", escape = "none")]
-struct CompactSettled;
-
-#[derive(Template)]
-#[template(path = "compact_below_floor.txt", escape = "none")]
-struct CompactBelowFloor {
-    floor: usize,
-}
-
 /// Starts compaction of the conversation so far.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CompactArgs {}
@@ -157,13 +139,19 @@ pub struct CompactArgs {}
 #[derive(Debug, Clone)]
 pub struct CompactTool {
     signal: std::sync::Arc<CompactSignal>,
+    /// Renders the result of each call.
+    notices: crate::AnyNotices,
 }
 
 impl CompactTool {
-    /// Creates the tool over the `signal` its agent reads.
+    /// Creates the tool over the `signal` its agent reads, its results
+    /// rendered through `notices`.
     #[must_use]
-    pub(crate) const fn new(signal: std::sync::Arc<CompactSignal>) -> Self {
-        Self { signal }
+    pub(crate) const fn new(
+        signal: std::sync::Arc<CompactSignal>,
+        notices: crate::AnyNotices,
+    ) -> Self {
+        Self { signal, notices }
     }
 }
 
@@ -188,14 +176,9 @@ impl Tool for CompactTool {
         _args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        let text = match self.signal.request() {
-            CompactRequest::Started => CompactStarted.render(),
-            CompactRequest::InFlight => CompactInFlight.render(),
-            CompactRequest::Settled => CompactSettled.render(),
-            CompactRequest::BelowFloor { floor } => CompactBelowFloor { floor }.render(),
-        }
-        .expect("compact result template must render");
-        Ok(ToolResult::text(text))
+        Ok(ToolResult::text(
+            self.notices.compact(&self.signal.request()),
+        ))
     }
 }
 
@@ -248,7 +231,7 @@ mod tests {
 
     #[test]
     fn the_description_asks_for_a_clean_point_and_tidy_notes() {
-        let tool = CompactTool::new(std::sync::Arc::default());
+        let tool = CompactTool::new(std::sync::Arc::default(), crate::AnyNotices::default());
         let description = tool.description();
         for needle in ["clean point", "topic", "`tasks.md`", "verbatim"] {
             assert!(description.contains(needle), "{needle}: {description}");

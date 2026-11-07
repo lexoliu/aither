@@ -519,12 +519,6 @@ struct EmittedCheckpoint {
 }
 
 #[derive(Template)]
-#[template(path = "precompaction_alert.txt", escape = "none")]
-struct PreCompactionAlertTemplate {
-    remaining_tokens: usize,
-}
-
-#[derive(Template)]
 #[template(path = "background_started_reminder.txt", escape = "none")]
 struct BackgroundStartedReminderTemplate<'a> {
     task_id: &'a str,
@@ -556,13 +550,6 @@ struct UserMessageTimeTemplate<'a> {
 struct LanguagesTemplate {
     communication: crate::Language,
     working: crate::Language,
-}
-
-/// The result given to a tool call whose run was cancelled before it finished.
-#[derive(Template)]
-#[template(path = "tool_call_cancelled.txt", escape = "none")]
-struct ToolCallCancelledTemplate<'a> {
-    tool: &'a str,
 }
 
 #[derive(Template)]
@@ -641,9 +628,64 @@ enum MonitorEndText<'a> {
 }
 
 fn job_alert_text(alert: &JobAlertText<'_>) -> String {
-    JobAlertTemplate { alert }
-        .render()
-        .expect("job alert template must render")
+    crate::notices::rendered(&JobAlertTemplate { alert })
+}
+
+/// aither's wording of a background job alert.
+pub fn default_job_alert(alert: &JobAlert) -> String {
+    let text = match alert {
+        JobAlert::DescendantsKilled(killed) => JobAlertText::DescendantsKilled {
+            processes: &killed.processes,
+            omitted: killed.omitted,
+        },
+        JobAlert::DirectoryReset(reset) => JobAlertText::DirectoryReset {
+            dir: reset.dir.display().to_string(),
+            reason: reset.reason,
+        },
+        JobAlert::LongRunning(job) => JobAlertText::LongRunning {
+            task_id: &job.task_id,
+            elapsed: format_job_elapsed(job.elapsed),
+        },
+        JobAlert::StdinBlocked(job) => JobAlertText::StdinBlocked {
+            task_id: &job.task_id,
+        },
+        JobAlert::StdinProbeFailed(job) => JobAlertText::StdinProbeFailed {
+            task_id: &job.task_id,
+            error: &job.error,
+        },
+        JobAlert::MonitorIncrement(increment) => JobAlertText::MonitorIncrement {
+            task_id: &increment.task_id,
+            lines: &increment.lines,
+        },
+        JobAlert::MonitorStalled(stalled) => JobAlertText::MonitorStalled {
+            task_id: &stalled.task_id,
+            stall_secs: stalled.stall_secs,
+        },
+        JobAlert::MonitorEnded(ended) => JobAlertText::MonitorEnded {
+            task_id: &ended.task_id,
+            end: match &ended.end {
+                MonitorEnd::Exited { exit_code } => MonitorEndText::Exited {
+                    exit_code: *exit_code,
+                },
+                MonitorEnd::StopMatched { line } => MonitorEndText::StopMatched { line },
+                MonitorEnd::TimedOut => MonitorEndText::TimedOut,
+                MonitorEnd::Killed => MonitorEndText::Killed,
+                MonitorEnd::Failed { error } => MonitorEndText::Failed { error },
+                MonitorEnd::Lost => MonitorEndText::Lost,
+            },
+        },
+    };
+    job_alert_text(&text)
+}
+
+/// aither's wording of the reminder after a command moved to the
+/// background.
+pub fn default_background_started(task: &aither_sandbox::StartedBackgroundTask) -> String {
+    crate::notices::rendered(&BackgroundStartedReminderTemplate {
+        task_id: &task.task_id,
+        output_preview: &task.output_preview,
+        output_file: &task.output_file,
+    })
 }
 
 /// What a killed memory runaway held, as the text reports it.
@@ -934,6 +976,8 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = (), Compact
 
     /// The agent every tool call of this loop is made by.
     pub(crate) identity: aither_core::llm::AgentIdentity,
+    /// Renders every alert, notice, reminder and refusal the model reads.
+    pub(crate) notices: crate::AnyNotices,
 
     /// Rolling KV-cache statistics accumulated from emitted `Usage` events.
     ///
@@ -1019,6 +1063,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             compact_signal: None,
             compaction_warning: CompactionWarning::Armed,
             identity: aither_core::llm::AgentIdentity::Main,
+            notices: crate::AnyNotices::default(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -1506,13 +1551,10 @@ where
         else {
             return;
         };
-        self.push_system_alert(
-            crate::language::LanguageAlertsTemplate {
-                alerts: &[crate::language::LanguageAlert::Reply { language }],
-            }
-            .render()
-            .expect("language alert template must render"),
-        );
+        let alert = self
+            .notices
+            .language_alerts(&[crate::language::LanguageAlert::Reply { language }]);
+        self.push_system_alert(alert);
         match crate::language::translate(
             self.fast.as_ref(),
             self.parameters.get(ModelTier::Fast),
@@ -1556,9 +1598,9 @@ where
                 .and_then(|index| parked.remove(index));
             let content = match finished {
                 Some(Ok(finished)) => finished.result.render_for_model(),
-                _ => ToolCallCancelledTemplate { tool: &call.name }
-                    .render()
-                    .expect("tool call cancelled template must render"),
+                _ => self
+                    .notices
+                    .tool_call_cancelled(&crate::CancelledToolCall { tool: &call.name }),
             };
             self.context.push(Message::tool(&call.id, content));
         }
@@ -1690,8 +1732,8 @@ where
                     Ok(result) => (result, false),
                     Err(error) => {
                         let unchanged_read = error
-                            .downcast_ref::<aither_sandbox::PollRefusal>()
-                            .is_some_and(aither_sandbox::PollRefusal::is_unchanged_read);
+                            .downcast_ref::<aither_sandbox::Refused<aither_sandbox::PollRefusal>>()
+                            .is_some_and(|refused| refused.reason().is_unchanged_read());
                         let mut message = String::from("Error: ");
                         message.push_str(error.to_string().as_str());
                         (aither_core::llm::ToolResult::error(message), unchanged_read)
@@ -1810,13 +1852,7 @@ where
         };
         for started in receiver.take_started() {
             self.detached_task_ids.insert(started.task_id.clone());
-            let reminder = BackgroundStartedReminderTemplate {
-                task_id: &started.task_id,
-                output_preview: &started.output_preview,
-                output_file: &started.output_file,
-            }
-            .render()
-            .expect("background started reminder template must render");
+            let reminder = self.notices.background_started(&started);
             self.context.push(Message::system(&reminder));
             events.emit(AgentEvent::background_task_started(
                 started.task_id,
@@ -1945,7 +1981,7 @@ where
                     needs_model |= self.push_completed_task_event(*task, events);
                 }
                 Some(BackgroundTaskEvent::Alert(alert)) => {
-                    if self.push_job_alert(alert) {
+                    if self.push_job_alert(&alert) {
                         return Ok(true);
                     }
                 }
@@ -2100,7 +2136,7 @@ where
         };
         let mut wake = false;
         for alert in receiver.take_job_alerts() {
-            wake |= self.push_job_alert(alert);
+            wake |= self.push_job_alert(&alert);
         }
         wake
     }
@@ -2113,91 +2149,54 @@ where
             return;
         };
         while let Ok(event) = receiver.try_recv() {
-            self.push_system_alert(event.alert_text());
+            let alert = self.notices.host_load(&event);
+            self.push_system_alert(alert);
         }
     }
 
     /// Pushes one durable alert for a background job alert; returns whether
     /// it is a job blocked on stdin, which wakes a parked wait.
-    fn push_job_alert(&mut self, alert: JobAlert) -> bool {
-        match alert {
+    fn push_job_alert(&mut self, alert: &JobAlert) -> bool {
+        let wakes = match alert {
             JobAlert::DescendantsKilled(killed) => {
                 tracing::info!(
                     killed = killed.processes.len() + killed.omitted,
                     "foreground command left processes running; killed"
                 );
-                self.push_system_alert(job_alert_text(&JobAlertText::DescendantsKilled {
-                    processes: &killed.processes,
-                    omitted: killed.omitted,
-                }));
                 false
             }
             JobAlert::DirectoryReset(reset) => {
                 tracing::info!(dir = %reset.dir.display(), reason = ?reset.reason, "carried working directory reset");
-                self.push_system_alert(job_alert_text(&JobAlertText::DirectoryReset {
-                    dir: reset.dir.display().to_string(),
-                    reason: reset.reason,
-                }));
                 false
             }
             JobAlert::LongRunning(job) => {
                 tracing::info!(task_id = %job.task_id, "background job crossed long-running threshold");
-                self.push_system_alert(job_alert_text(&JobAlertText::LongRunning {
-                    task_id: &job.task_id,
-                    elapsed: format_job_elapsed(job.elapsed),
-                }));
                 false
             }
             JobAlert::StdinBlocked(job) => {
                 tracing::info!(task_id = %job.task_id, "background job is blocked on stdin");
-                self.push_system_alert(job_alert_text(&JobAlertText::StdinBlocked {
-                    task_id: &job.task_id,
-                }));
                 true
             }
             JobAlert::StdinProbeFailed(job) => {
                 tracing::warn!(task_id = %job.task_id, error = %job.error, "stdin watch failed");
-                self.push_system_alert(job_alert_text(&JobAlertText::StdinProbeFailed {
-                    task_id: &job.task_id,
-                    error: &job.error,
-                }));
                 false
             }
             JobAlert::MonitorIncrement(increment) => {
                 tracing::info!(task_id = %increment.task_id, lines = increment.lines.len(), "monitor increment delivered");
-                self.push_system_alert(job_alert_text(&JobAlertText::MonitorIncrement {
-                    task_id: &increment.task_id,
-                    lines: &increment.lines,
-                }));
                 true
             }
             JobAlert::MonitorStalled(stalled) => {
                 tracing::info!(task_id = %stalled.task_id, "monitor reports a stall");
-                self.push_system_alert(job_alert_text(&JobAlertText::MonitorStalled {
-                    task_id: &stalled.task_id,
-                    stall_secs: stalled.stall_secs,
-                }));
                 true
             }
             JobAlert::MonitorEnded(ended) => {
                 tracing::info!(task_id = %ended.task_id, "monitor ended");
-                let end = match &ended.end {
-                    MonitorEnd::Exited { exit_code } => MonitorEndText::Exited {
-                        exit_code: *exit_code,
-                    },
-                    MonitorEnd::StopMatched { line } => MonitorEndText::StopMatched { line },
-                    MonitorEnd::TimedOut => MonitorEndText::TimedOut,
-                    MonitorEnd::Killed => MonitorEndText::Killed,
-                    MonitorEnd::Failed { error } => MonitorEndText::Failed { error },
-                    MonitorEnd::Lost => MonitorEndText::Lost,
-                };
-                self.push_system_alert(job_alert_text(&JobAlertText::MonitorEnded {
-                    task_id: &ended.task_id,
-                    end,
-                }));
                 true
             }
-        }
+        };
+        let text = self.notices.job_alert(alert);
+        self.push_system_alert(text);
+        wakes
     }
 
     /// Records every queued completion; returns whether any was announced,
@@ -2232,7 +2231,7 @@ where
         if !self.detached_task_ids.contains(&task.task_id) {
             return false;
         }
-        let result_msg = format_background_task_result(&task);
+        let result_msg = self.notices.background_finished(&task);
         self.context.push(Message::system(&result_msg));
         self.tasks
             .events
@@ -2387,7 +2386,7 @@ where
                 pending.extend(task.pending.take());
                 self.push_completed_task_event(*task, &sink)
             }
-            BackgroundTaskEvent::Alert(alert) => self.push_job_alert(alert),
+            BackgroundTaskEvent::Alert(alert) => self.push_job_alert(&alert),
         };
         let (announced, drained) = self.drain_background_receiver(&receiver, &sink);
         needs_model |= announced;
@@ -3128,7 +3127,8 @@ where
     /// delivered, so it reaches the model once.
     fn push_injected_context(&mut self) {
         for injected in self.hooks.take_injected_context() {
-            self.push_system_alert(injected.alert_text());
+            let alert = self.notices.lifecycle_context(&injected);
+            self.push_system_alert(alert);
         }
     }
 
@@ -3443,6 +3443,7 @@ where
                 .push(AnyContextSource::new(crate::language::LanguageAlerts::new(
                     guard,
                     self.sandbox_dir.clone(),
+                    self.notices.clone(),
                 )));
         }
         if let Some(job_registry) = self.job_registry.clone() {
@@ -3622,11 +3623,9 @@ where
         if self.compaction_in_flight() {
             return false;
         }
-        let alert = PreCompactionAlertTemplate {
+        let alert = self.notices.precompaction(&crate::PreCompaction {
             remaining_tokens: policy.compact_point(window).saturating_sub(tokens),
-        }
-        .render()
-        .expect("pre-compaction alert template must render");
+        });
         self.push_system_alert(alert);
         true
     }
@@ -3883,16 +3882,17 @@ where
 }
 
 /// Formats a completed background task result as a system message.
-fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String {
+/// aither's wording of a finished background task; `timeout` states the
+/// timeout kill, when there was one.
+pub fn default_background_finished(
+    task: &aither_sandbox::CompletedTask,
+    timeout: Option<&str>,
+) -> String {
     let error_text;
-    let timeout_notice = task
-        .timeout_kill
-        .as_ref()
-        .map(aither_sandbox::TimeoutKill::notice);
     let (outcome, output, stderr) = match &task.result {
         Ok(command) if task.kill.is_some() => (
             BackgroundOutcome::Killed {
-                timeout: timeout_notice.as_deref(),
+                timeout,
                 runaway: match task.kill {
                     Some(aither_sandbox::KillCause::MemoryRunaway {
                         footprint_bytes,
@@ -4041,6 +4041,11 @@ mod tests {
     use crate::Handoff;
     use aither_sandbox::{CompletedCommand, CompletedTask, TerminalError};
     use futures_core::Stream;
+
+    /// aither's wording of a finished background task.
+    fn format_background_task_result(task: &CompletedTask) -> String {
+        crate::Notices::background_finished(&crate::DefaultNotices, task)
+    }
 
     fn inline(text: &str) -> CommandStream {
         CommandStream::Inline {
@@ -5624,6 +5629,100 @@ mod tests {
         assert_eq!(mentions(&mut agent, "load has ended").await, 1);
         assert_eq!(mentions(&mut agent, "load has ended").await, 1);
         assert_eq!(mentions(&mut agent, "load is high").await, 1);
+    }
+
+    /// Notices that reword the host load and job alert families and keep
+    /// aither's wording for the rest.
+    struct Reworded;
+
+    impl aither_sandbox::SandboxNotices for Reworded {}
+
+    impl crate::Notices for Reworded {
+        fn host_load(&self, event: &crate::HostLoadEvent) -> String {
+            match event {
+                crate::HostLoadEvent::LoadHigh { load, .. } => {
+                    format!("Reworded: the host runs at {}%.", load.percent())
+                }
+                _ => crate::DefaultNotices.host_load(event),
+            }
+        }
+
+        fn job_alert(&self, alert: &JobAlert) -> String {
+            match alert {
+                JobAlert::StdinBlocked(job) => format!("Reworded: {} waits on stdin.", job.task_id),
+                _ => crate::DefaultNotices.job_alert(alert),
+            }
+        }
+    }
+
+    /// The system messages of the next request that contain `text`.
+    async fn system_mentions(agent: &mut Agent<MockLlm>, text: &str) -> usize {
+        let request = agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary")
+            .expect("a fresh window must accept a request");
+        request
+            .messages()
+            .iter()
+            .filter(|message| {
+                message.role() == aither_core::llm::Role::System && message.content().contains(text)
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_host_load_alert_reaches_the_conversation_in_the_embedders_words() {
+        let (events, receiver) = async_channel::unbounded();
+        let mut agent = Agent::builder(MockLlm {
+            context_length: 200_000,
+        })
+        .notices(crate::AnyNotices::new(Reworded))
+        .build();
+        agent.host_load_events = Some(receiver);
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        events
+            .send(crate::HostLoadEvent::LoadHigh {
+                load: crate::MachineLoad(1.8),
+                foreground_wait: Duration::from_secs(90),
+            })
+            .await
+            .expect("agent listens");
+        assert_eq!(
+            system_mentions(&mut agent, "Reworded: the host runs at 180%.").await,
+            1
+        );
+        assert_eq!(system_mentions(&mut agent, "load is high").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_job_alert_reaches_the_conversation_in_the_embedders_words() {
+        let (sender, receiver) = aither_sandbox::background_task_channel();
+        let mut agent = Agent::builder(MockLlm {
+            context_length: 200_000,
+        })
+        .notices(crate::AnyNotices::new(Reworded))
+        .build();
+        agent.background_receiver = Some(receiver);
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        sender
+            .send_alert(JobAlert::StdinBlocked(aither_sandbox::StdinBlockedJob {
+                task_id: "amber-forest-thunder-pearl".to_string(),
+                script: "cat".to_string(),
+            }))
+            .await;
+        agent.push_completed_background_events(&EventSink::discarding());
+        assert_eq!(
+            system_mentions(
+                &mut agent,
+                "Reworded: amber-forest-thunder-pearl waits on stdin."
+            )
+            .await,
+            1
+        );
+        assert_eq!(system_mentions(&mut agent, "terminal_input").await, 0);
     }
 
     /// A job blocked on stdin can never complete, so its alert must end the
@@ -8142,7 +8241,11 @@ mod tests {
                 .as_ref()
                 .expect("compact_tool arms the signal"),
         );
-        (agent, crate::compact_tool::CompactTool::new(signal))
+        let notices = agent.notices.clone();
+        (
+            agent,
+            crate::compact_tool::CompactTool::new(signal, notices),
+        )
     }
 
     async fn call_compact(tool: &crate::compact_tool::CompactTool) -> String {

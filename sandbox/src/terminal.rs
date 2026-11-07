@@ -318,8 +318,10 @@ fn runs_in_shell(script: &str) -> bool {
 
 /// A command killed because its `timeout` bound passed, with the UTC times it
 /// started and was killed at.
-#[derive(Debug, Clone, PartialEq, Eq, Template)]
-#[template(path = "command_timed_out.txt", escape = "none")]
+///
+/// [`SandboxNotices::command_killed`](crate::SandboxNotices::command_killed)
+/// renders the sentence the model reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeoutKill {
     /// The `timeout` the command was bounded by.
     pub timeout: Duration,
@@ -327,31 +329,6 @@ pub struct TimeoutKill {
     pub started: jiff::Timestamp,
     /// When the kill was issued.
     pub killed: jiff::Timestamp,
-}
-
-impl TimeoutKill {
-    fn started_utc(&self) -> String {
-        Self::utc(self.started)
-    }
-
-    fn killed_utc(&self) -> String {
-        Self::utc(self.killed)
-    }
-
-    fn utc(at: jiff::Timestamp) -> String {
-        at.strftime("%Y-%m-%d %H:%M:%S UTC").to_string()
-    }
-
-    /// The sentence stating the timeout and both times, as the model reads it.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the template fails to render, which is a bug in the template.
-    #[must_use]
-    pub fn notice(&self) -> String {
-        self.render()
-            .expect("failed to render command_timed_out template")
-    }
 }
 
 /// What the kill watchdog of one job records: when the job started, and when
@@ -1385,10 +1362,10 @@ pub enum TerminalRunError {
     },
     /// The kill guard refused the script.
     #[error(transparent)]
-    Refused(#[from] CommandRefusal),
+    Refused(crate::Refused<CommandRefusal>),
     /// The terminal's command gate blocked the script.
     #[error(transparent)]
-    Blocked(#[from] CommandBlocked),
+    Blocked(crate::Refused<CommandBlocked>),
     /// The terminal runs in a container that declares no workspace mount,
     /// so no host directory maps into it.
     #[error("the container declares no workspace mount, so a run cannot start in a host directory")]
@@ -2788,6 +2765,7 @@ where
         let commit_ledger = self.commit_ledger();
         let prepared_space = self.prepared_space();
         let role = self.registry().role();
+        let notices = self.registry().notices().clone();
         let prepared_tools = self
             .shell_sessions
             .prepared_catalog()
@@ -2807,6 +2785,7 @@ where
             commit_ledger,
             prepared_space,
             role,
+            notices,
         }
     }
 }
@@ -3143,10 +3122,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                         interruptions: result.interruptions,
                         outcome: CommandOutcome::Killed {
                             task_id: prepared.task_id.clone(),
-                            notice: spawned.timeout_watch.kill().map_or_else(
-                                || "Killed before its timeout bound passed.".to_string(),
-                                |kill| kill.notice(),
-                            ),
+                            notice: self.kill_notice(spawned.timeout_watch.kill().as_ref()),
                         },
                     }
                 } else {
@@ -3419,6 +3395,32 @@ where
     E: Executor + Clone + 'static,
     S: RegistryState,
 {
+    /// What renders this terminal's refusals and notices: its registry's.
+    pub(crate) fn notices(&self) -> &crate::AnySandboxNotices {
+        self.registry.registry().notices()
+    }
+
+    /// Why a foreground command that was killed was killed, as the model
+    /// reads it in the command's result.
+    fn kill_notice(&self, kill: Option<&TimeoutKill>) -> String {
+        let killed = kill.map_or(crate::CommandKilled::BeforeTimeout, |kill| {
+            crate::CommandKilled::TimedOut(kill)
+        });
+        self.notices().command_killed(&killed)
+    }
+
+    /// Refuses `script` when it kills by name or is not valid shell.
+    fn check_kills(&self, script: &str) -> Result<(), crate::Refused<CommandRefusal>> {
+        crate::kill_guard::check(script).map_err(|refusal| {
+            crate::Refused::rendered(refusal, |refusal| self.notices().command_refusal(refusal))
+        })
+    }
+
+    /// `refusal`, rendered for the model.
+    fn refuse_poll(&self, refusal: crate::PollRefusal) -> crate::Refused<crate::PollRefusal> {
+        crate::Refused::rendered(refusal, |refusal| self.notices().poll_refusal(refusal))
+    }
+
     /// Shared front half of every `terminal` call: argument validation,
     /// the agent's polling guards, then [`Self::admit_command`].
     async fn prepare_execution(
@@ -3433,13 +3435,13 @@ where
         // The guards read shell syntax, so Python source skips them.
         let shell = arguments.language == ScriptLanguage::Shell;
         if shell {
-            crate::kill_guard::check(&arguments.script)?;
+            self.check_kills(&arguments.script)?;
         }
         // A foreground `sleep` only waits on something else — the detached
         // form (`background: true`) stays allowed as a timer or inside a
         // waiting script.
         if shell && !arguments.background && crate::poll_guard::contains_sleep(&arguments.script) {
-            return Err(crate::poll_guard::PollRefusal::Sleep.into());
+            return Err(self.refuse_poll(crate::PollRefusal::Sleep).into());
         }
         // A command that only re-reads files unchanged since their last read
         // is polling; refuse it ahead of permission like the other blocks.
@@ -3454,10 +3456,11 @@ where
                 .file_reads_unchanged(file_reads.clone())
                 .await
         {
-            return Err(crate::poll_guard::PollRefusal::UnchangedFileRead {
-                paths: file_reads.iter().map(|(path, _)| path.clone()).collect(),
-            }
-            .into());
+            return Err(self
+                .refuse_poll(crate::PollRefusal::UnchangedFileRead {
+                    paths: file_reads.iter().map(|(path, _)| path.clone()).collect(),
+                })
+                .into());
         }
         let prepared = self
             .admit_command(
@@ -3492,7 +3495,10 @@ where
             && let Some(gate) = self.registry.registry().gate()
             && let GateDecision::Block { reason } = gate.check(script).await
         {
-            return Err(CommandBlocked { reason }.into());
+            return Err(TerminalRunError::Blocked(crate::Refused::rendered(
+                CommandBlocked { reason },
+                |blocked| self.notices().command_blocked(blocked),
+            )));
         }
         let target = self.resolve_execution_target(mode, ssh_server_id)?;
         if let ExecutionBackend::Local(tools) = &target.backend {
@@ -3523,7 +3529,8 @@ where
         if run.timeout.is_zero() || run.timeout > cap {
             return Err(TerminalRunError::Timeout { cap });
         }
-        crate::kill_guard::check(&run.script)?;
+        self.check_kills(&run.script)
+            .map_err(TerminalRunError::Refused)?;
         // A run starts in a host directory, so it resolves the terminal's
         // home backend, never an SSH server.
         let mode = match run.mode {
@@ -3587,11 +3594,8 @@ where
             stderr: result.stderr,
             interruptions: result.interruptions,
             outcome: CommandOutcome::Killed {
+                notice: self.kill_notice(spawned.timeout_watch.kill().as_ref()),
                 task_id: prepared.task_id,
-                notice: spawned.timeout_watch.kill().map_or_else(
-                    || "Killed before its timeout bound passed.".to_string(),
-                    |kill| kill.notice(),
-                ),
             },
         })
     }
@@ -6709,10 +6713,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::ToolRegistryBuilder;
     #[cfg(unix)]
     use crate::builtin::{InputTerminalArgs, InputTerminalTool};
     use crate::output::empty_stream;
+    use crate::{SandboxNotices, ToolRegistryBuilder};
     #[cfg(unix)]
     use heel::DenyAll;
     use heel::NiceLevel;
@@ -10583,7 +10587,7 @@ mod tests {
             killed: "2026-11-04T12:01:31Z".parse().expect("valid timestamp"),
         };
         assert_eq!(
-            kill.notice(),
+            crate::DefaultSandboxNotices.command_killed(&crate::CommandKilled::TimedOut(&kill)),
             "Its 90s timeout bound passed; it started at 2026-11-04 12:00:00 UTC \
              and was killed at 2026-11-04 12:01:31 UTC."
         );
@@ -10645,7 +10649,8 @@ mod tests {
             "{kill:?}"
         );
         assert!(
-            kill.notice()
+            crate::DefaultSandboxNotices
+                .command_killed(&crate::CommandKilled::TimedOut(&kill))
                 .starts_with("Its 1s timeout bound passed; it started at ")
         );
     }

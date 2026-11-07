@@ -8,14 +8,6 @@ use aither_core::llm::tool::{
 };
 #[cfg(feature = "mcp")]
 use aither_mcp::{McpConnection, McpToolService};
-use askama::Template;
-
-/// The refusal of a main-agent tool called in a fork.
-#[derive(askama::Template)]
-#[template(path = "fork_tool_refused.txt", escape = "none")]
-struct ForkToolRefused<'a> {
-    name: &'a str,
-}
 
 /// Tools registry used by the agent.
 ///
@@ -110,6 +102,7 @@ impl AgentTools {
         definitions: &[ToolDefinition],
         terminal: aither_sandbox::DynTerminalTool,
         compact: Option<&std::sync::Arc<crate::compact_tool::CompactSignal>>,
+        notices: &crate::AnyNotices,
     ) -> Self {
         use futures_core::Future;
         use std::pin::Pin;
@@ -127,7 +120,13 @@ impl AgentTools {
             let handler = handlers.remove(&name);
             let compact = compact
                 .filter(|_| name == crate::compact_tool::COMPACT_TOOL_NAME)
-                .map(|signal| crate::compact_tool::CompactTool::new(std::sync::Arc::clone(signal)));
+                .map(|signal| {
+                    crate::compact_tool::CompactTool::new(
+                        std::sync::Arc::clone(signal),
+                        notices.clone(),
+                    )
+                });
+            let notices = notices.clone();
             tools
                 .eager
                 .register_dyn(
@@ -147,9 +146,8 @@ impl AgentTools {
                             });
                         }
                         let Some(handler) = handler.clone() else {
-                            let refusal = ForkToolRefused { name: &name }
-                                .render()
-                                .expect("fork tool refusal template must render");
+                            let refusal =
+                                notices.fork_tool_refusal(&crate::ForkToolRefusal { tool: &name });
                             return Box::pin(async move { Err(anyhow::anyhow!(refusal)) });
                         };
                         let args = args.to_string();

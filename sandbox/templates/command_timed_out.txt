@@ -1,1 +1,1 @@
-Its {{ timeout.as_secs() }}s timeout bound passed; it started at {{ started_utc() }} and was killed at {{ killed_utc() }}.
+{% match killed %}{% when CommandKilled::TimedOut(kill) %}Its {{ kill.timeout.as_secs() }}s timeout bound passed; it started at {{ kill.started.strftime("%Y-%m-%d %H:%M:%S UTC") }} and was killed at {{ kill.killed.strftime("%Y-%m-%d %H:%M:%S UTC") }}.{% when CommandKilled::BeforeTimeout %}Killed before its timeout bound passed.{% endmatch %}

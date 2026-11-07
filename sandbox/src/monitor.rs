@@ -8,23 +8,23 @@
 //! merges increments into the next turn boundary and wakes an idle agent.
 
 use std::borrow::Cow;
-use std::fmt::{self, Display};
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use aither_core::llm::{CommandOutcome, Tool, ToolContext, ToolResult};
-use askama::Template;
 use executor_core::{Executor, Task};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::job_registry::{JobRegistry, JobStatus};
+use crate::notices::{MonitorStarted, Refused};
 use crate::output::{MediaResolution, OutputFormat};
 use crate::permission::PermissionHandler;
 use crate::script_language::ScriptLanguage;
 use crate::terminal::{Configured, JobAlert, TerminalArgs, TerminalExecutionMode, TerminalTool};
 
 /// The longest a monitor may run: two hours, the same cap `terminal` has.
-const MAX_TIMEOUT_SECS: u64 = 7200;
+pub(crate) const MAX_TIMEOUT_SECS: u64 = 7200;
 
 const fn default_interval_secs() -> u64 {
     10
@@ -159,36 +159,6 @@ pub enum MonitorRefusal {
     },
 }
 
-#[derive(Template)]
-#[template(path = "monitor_refused.txt", escape = "none")]
-struct MonitorRefusedTemplate<'a> {
-    reason: &'a str,
-}
-
-impl Display for MonitorRefusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let reason = match self {
-            Self::TimeoutOutOfRange => {
-                format!("timeout_secs must be between 1 and {MAX_TIMEOUT_SECS}")
-            }
-            Self::IntervalTooSmall => "interval_secs must be at least 1".to_string(),
-            Self::BadRegex { argument, reason } => {
-                format!("{argument} is not a valid regex: {reason}")
-            }
-            Self::UnreadableFile { file } => format!(
-                "`{file}` is not readable inside the sandbox: give a path under the working directory or a readable mount"
-            ),
-            Self::StartFailed { reason } => reason.clone(),
-        };
-        let rendered = MonitorRefusedTemplate { reason: &reason }
-            .render()
-            .map_err(|_| fmt::Error)?;
-        f.write_str(&rendered)
-    }
-}
-
-impl std::error::Error for MonitorRefusal {}
-
 /// Everything a running monitor needs to know to watch and report.
 struct Watch {
     task_id: String,
@@ -300,11 +270,28 @@ where
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
+        let notices = self.terminal.notices();
+        let interval_secs = args.interval_secs;
+        match self.start(args).await {
+            Ok(task_id) => Ok(ToolResult::text(notices.monitor_started(&MonitorStarted {
+                task_id: &task_id,
+                interval_secs,
+            }))),
+            Err(refusal) => {
+                Err(Refused::rendered(refusal, |refusal| notices.monitor_refusal(refusal)).into())
+            }
+        }
+    }
+}
+
+impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<P, E> {
+    /// Starts the watched job and its pump; returns the job's task id.
+    async fn start(&self, args: MonitorArgs) -> Result<String, MonitorRefusal> {
         if args.timeout_secs == 0 || args.timeout_secs > MAX_TIMEOUT_SECS {
-            return Err(MonitorRefusal::TimeoutOutOfRange.into());
+            return Err(MonitorRefusal::TimeoutOutOfRange);
         }
         if args.interval_secs == 0 {
-            return Err(MonitorRefusal::IntervalTooSmall.into());
+            return Err(MonitorRefusal::IntervalTooSmall);
         }
         let compile = |argument: &'static str, pattern: &Option<String>| {
             pattern
@@ -351,8 +338,7 @@ where
             _ => {
                 return Err(MonitorRefusal::StartFailed {
                     reason: "the monitored job did not start detached".to_string(),
-                }
-                .into());
+                });
             }
         };
         let watch = Watch {
@@ -370,22 +356,8 @@ where
             .executor()
             .spawn(async move { watch_task(watch).await })
             .detach();
-        Ok(ToolResult::text(
-            MonitorStartedTemplate {
-                task_id: &task_id,
-                interval_secs: args.interval_secs,
-            }
-            .render()
-            .expect("monitor started template must render"),
-        ))
+        Ok(task_id)
     }
-}
-
-#[derive(Template)]
-#[template(path = "monitor_started.txt", escape = "none")]
-struct MonitorStartedTemplate<'a> {
-    task_id: &'a str,
-    interval_secs: u64,
 }
 
 /// Trailing bytes of a line without its `\n` yet; kept across polls.

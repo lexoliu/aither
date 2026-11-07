@@ -485,31 +485,14 @@ pub enum GateDecision {
     },
 }
 
-/// A command the gate blocked, as the refusal the model reads in place of
-/// the command's result.
+/// A command the gate blocked; the model reads its refusal, rendered by
+/// [`SandboxNotices::command_blocked`](crate::SandboxNotices::command_blocked),
+/// in place of the command's result.
 #[derive(Debug)]
 pub struct CommandBlocked {
+    /// Why the gate blocked it.
     pub reason: String,
 }
-
-#[derive(Template)]
-#[template(path = "command_blocked.txt")]
-struct CommandBlockedTemplate<'a> {
-    reason: &'a str,
-}
-
-impl std::fmt::Display for CommandBlocked {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let rendered = CommandBlockedTemplate {
-            reason: &self.reason,
-        }
-        .render()
-        .map_err(|_| std::fmt::Error)?;
-        f.write_str(&rendered)
-    }
-}
-
-impl std::error::Error for CommandBlocked {}
 
 /// Decides whether a shell command may run, before it does.
 ///
@@ -663,18 +646,6 @@ struct Resolved<'a> {
     stdin_arg: Option<&'a str>,
 }
 
-#[derive(Template)]
-#[template(path = "reserved_for_main.txt", escape = "none")]
-struct ReservedForMainTemplate<'a> {
-    name: &'a str,
-}
-
-fn reserved_for_main_text(name: &str) -> String {
-    ReservedForMainTemplate { name }
-        .render()
-        .expect("reserved-for-main template must render")
-}
-
 use crate::output::{INLINE_OUTPUT_LIMIT, generate_word_filename};
 use crate::permission::TerminalMode;
 use crate::terminal::TerminalBinding;
@@ -823,6 +794,8 @@ pub struct DynTerminalTool {
     pub(crate) commit_ledger: Option<crate::subagent::CommitLedger>,
     pub(crate) prepared_space: Option<crate::subagent::PreparedSpace>,
     pub(crate) role: CommandRole,
+    /// The terminal registry's notices, which its controls render through.
+    pub(crate) notices: crate::AnySandboxNotices,
 }
 
 impl DynTerminalTool {
@@ -906,7 +879,10 @@ impl DynTerminalTool {
         vec![
             erase_terminal_tool(KillTerminalTool::new(self.job_registry.clone())),
             erase_terminal_tool(InputTerminalTool::new(self.job_registry.clone())),
-            erase_terminal_tool(ReadTerminalDeltaTool::new(self.job_registry.clone())),
+            erase_terminal_tool(ReadTerminalDeltaTool::new(
+                self.job_registry.clone(),
+                self.notices.clone(),
+            )),
         ]
     }
 
@@ -945,6 +921,7 @@ pub struct ToolRegistryBuilder {
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
     kept: HashSet<String>,
+    notices: crate::AnySandboxNotices,
 }
 
 impl ToolRegistryBuilder {
@@ -1237,6 +1214,14 @@ impl ToolRegistryBuilder {
         self.gate = Some(gate);
     }
 
+    /// Renders every refusal and notice of the registry, and of the terminals
+    /// and terminal controls serving it, through `notices`; the sandbox's own
+    /// wording ([`DefaultSandboxNotices`](crate::DefaultSandboxNotices)) by
+    /// default. A subagent's registry keeps its parent's.
+    pub fn notices(&mut self, notices: crate::AnySandboxNotices) {
+        self.notices = notices;
+    }
+
     /// Builds an immutable main-agent registry with a concrete output
     /// directory; [`ToolRegistry::for_subagent`] derives the subagent view.
     /// Terminal-bound commands are built when a terminal serves it.
@@ -1256,6 +1241,7 @@ impl ToolRegistryBuilder {
             mode: None,
             observer: self.observer,
             gate: self.gate,
+            notices: self.notices,
             call: None,
             committed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
@@ -1458,6 +1444,8 @@ pub struct ToolRegistry {
     mode: Option<TerminalMode>,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
+    /// Renders the refusals and notices of the registry and its terminals.
+    notices: crate::AnySandboxNotices,
     /// The `terminal` call this registry serves, once [`Self::for_call`] has
     /// bound it to one.
     call: Option<CallIdentity>,
@@ -1507,7 +1495,10 @@ impl ToolRegistry {
         let mut controls = ToolRegistryBuilder::new();
         controls.configure_tool(crate::builtin::KillTerminalTool::new(jobs.clone()));
         controls.configure_tool(crate::builtin::InputTerminalTool::new(jobs.clone()));
-        controls.configure_tool(crate::builtin::ReadTerminalDeltaTool::new(jobs));
+        controls.configure_tool(crate::builtin::ReadTerminalDeltaTool::new(
+            jobs,
+            self.notices.clone(),
+        ));
         self.entries.extend(controls.entries);
         self.output_dir = output_dir;
         self
@@ -1550,6 +1541,13 @@ impl ToolRegistry {
         self.role
     }
 
+    /// What renders the refusals and notices of this registry and of the
+    /// terminals serving it.
+    #[must_use]
+    pub const fn notices(&self) -> &crate::AnySandboxNotices {
+        &self.notices
+    }
+
     /// The registry a subagent's terminal serves: the same commands, each
     /// resolved to its subagent-role handler, with terminal-bound commands
     /// left for the subagent's terminal to build. Asking a subagent registry
@@ -1581,6 +1579,7 @@ impl ToolRegistry {
             mode: None,
             observer,
             gate,
+            notices: self.notices.clone(),
             call: None,
             committed: self.committed.clone(),
         }
@@ -1703,9 +1702,10 @@ impl ToolRegistry {
                 handler: Some(handler),
                 ..
             }) => self.run(tool_name, handler, args, working_dir).await,
-            Some(Resolved { handler: None, .. }) => {
-                CommandEnvelope::failure(reserved_for_main_text(tool_name))
-            }
+            Some(Resolved { handler: None, .. }) => CommandEnvelope::failure(
+                self.notices
+                    .reserved_for_main(&crate::notices::ReservedForMain { command: tool_name }),
+            ),
             None => match self.set_entry(tool_name) {
                 Some(entry) => self.run(tool_name, &entry.handler, args, working_dir).await,
                 None => CommandEnvelope::failure(unknown_command_text(tool_name)),

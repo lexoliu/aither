@@ -2,9 +2,7 @@
 
 use std::path::PathBuf;
 
-use askama::Template;
-
-use super::guard::{LanguageAlert, LanguageAlertsTemplate};
+use super::guard::LanguageAlert;
 use super::{LanguageGuard, WorkingText};
 use crate::context::{Block, ContextSource};
 use crate::working_docs;
@@ -22,14 +20,21 @@ pub struct LanguageAlerts {
     sandbox_dir: Option<PathBuf>,
     /// `tasks.md` as last observed; `None` until the session start has.
     seen: Option<working_docs::WorkingDocsSnapshot>,
+    /// Renders the alerts.
+    notices: crate::AnyNotices,
 }
 
 impl LanguageAlerts {
-    pub(crate) const fn new(guard: LanguageGuard, sandbox_dir: Option<PathBuf>) -> Self {
+    pub(crate) const fn new(
+        guard: LanguageGuard,
+        sandbox_dir: Option<PathBuf>,
+        notices: crate::AnyNotices,
+    ) -> Self {
         Self {
             guard,
             sandbox_dir,
             seen: None,
+            notices,
         }
     }
 
@@ -70,10 +75,10 @@ impl ContextSource for LanguageAlerts {
         if alerts.is_empty() {
             return None;
         }
-        let content = LanguageAlertsTemplate { alerts: &alerts }
-            .render()
-            .expect("language alert template must render");
-        Some(Block::new("system-reminder", content))
+        Some(Block::new(
+            "system-reminder",
+            self.notices.language_alerts(&alerts),
+        ))
     }
 }
 
@@ -85,7 +90,11 @@ mod tests {
     fn source(dir: &std::path::Path) -> (LanguageAlerts, LanguageGuard) {
         let guard = LanguageGuard::new(Languages::new("Chinese".parse().unwrap()));
         (
-            LanguageAlerts::new(guard.clone(), Some(dir.to_path_buf())),
+            LanguageAlerts::new(
+                guard.clone(),
+                Some(dir.to_path_buf()),
+                crate::AnyNotices::default(),
+            ),
             guard,
         )
     }

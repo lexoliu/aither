@@ -65,6 +65,7 @@ mod kill_guard;
 mod memory;
 pub mod monitor;
 mod naming;
+mod notices;
 mod outage;
 mod output;
 mod output_compress;
@@ -143,6 +144,10 @@ pub use monitor::{
 };
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
+};
+pub use notices::{
+    AnySandboxNotices, CommandKilled, DefaultSandboxNotices, MonitorStarted, Refused,
+    ReservedForMain, SandboxNotices,
 };
 pub use output::{MediaResolution, OutputFormat, OutputStore};
 pub use permission::{PermissionHandler, PermissionRequest, Review, TerminalMode};

@@ -43,36 +43,65 @@ struct IssueTreesTemplate<'a> {
     unresolved: &'a [WorkTrackerError],
 }
 
-/// One thing a tasks alert says.
-enum AlertItem {
+/// One thing a tasks alert says, rendered by
+/// [`Notices::tasks_alert`](crate::Notices::tasks_alert).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TasksAlertItem {
     /// An event the turn left `tasks.md` unchanged after, with the rows
     /// naming its subject; none for an event that opens work no row carries.
-    Event { event: TaskEvent, rows: Vec<String> },
+    Event {
+        /// The event.
+        event: TaskEvent,
+        /// The rows naming its subject, as written.
+        rows: Vec<String>,
+    },
     /// A row naming a finished issue or pull request.
     Stale {
+        /// The row, as written.
         row: String,
+        /// The issue or pull request it names.
         reference: WorkRef,
+        /// The state that item is in.
         state: WorkState,
     },
     /// A row whose `BLOCKING` mark no longer waits on anything.
-    DeadMark { row: String, mark: String },
+    DeadMark {
+        /// The row, as written.
+        row: String,
+        /// The mark's payload.
+        mark: String,
+    },
     /// A line breaking the format.
-    Malformed { line: usize, violation: Violation },
+    Malformed {
+        /// The 1-based line number.
+        line: usize,
+        /// How it breaks the format.
+        violation: Violation,
+    },
     /// The document grew past its line limit.
-    OverLimit { lines: usize, limit: usize },
+    OverLimit {
+        /// How many lines it has.
+        lines: usize,
+        /// Its limit.
+        limit: usize,
+    },
 }
 
 #[derive(Template)]
 #[template(path = "tasks_alert.txt", escape = "none")]
 struct TasksAlertTemplate<'a> {
-    items: &'a [AlertItem],
+    items: &'a [TasksAlertItem],
     /// Whether the alert holds the run open at its end.
     gate: bool,
 }
 
-#[derive(Template)]
-#[template(path = "tasks_continue.txt", escape = "none")]
-struct TasksContinueTemplate;
+/// aither's wording of a tasks alert.
+pub fn default_alert(alert: &crate::notices::TasksAlert<'_>) -> String {
+    crate::notices::rendered(&TasksAlertTemplate {
+        items: alert.items,
+        gate: alert.gate,
+    })
+}
 
 #[derive(Template)]
 #[template(path = "system_reminder.txt", escape = "none")]
@@ -106,7 +135,7 @@ type Statuses = HashMap<WorkRef, Result<WorkStatus, WorkTrackerError>>;
 /// stale-row check does not name those again.
 #[derive(Default)]
 struct Judged {
-    items: Vec<AlertItem>,
+    items: Vec<TasksAlertItem>,
     /// Row lines and the references an event named on them.
     named_references: Vec<(usize, WorkRef)>,
     /// Row lines and the ids an event named on them.
@@ -180,6 +209,8 @@ pub struct TasksDocument {
     checked: Option<String>,
     /// Whether the document is past its line limit and was told so.
     over_limit: bool,
+    /// Renders its alerts and reminders.
+    notices: crate::AnyNotices,
 }
 
 impl TasksDocument {
@@ -199,7 +230,16 @@ impl TasksDocument {
             pending: Vec::new(),
             checked: None,
             over_limit: false,
+            notices: crate::AnyNotices::default(),
         }
+    }
+
+    /// Renders its alerts and reminders through `notices`;
+    /// [`DefaultNotices`](crate::DefaultNotices) by default.
+    #[must_use]
+    pub fn with_notices(mut self, notices: crate::AnyNotices) -> Self {
+        self.notices = notices;
+        self
     }
 
     /// Resolves `BLOCKING` mark payloads through `resolver`: a mark it
@@ -328,7 +368,7 @@ impl TasksDocument {
             {
                 continue;
             }
-            judged.items.push(AlertItem::Event { event, rows });
+            judged.items.push(TasksAlertItem::Event { event, rows });
         }
         judged
     }
@@ -428,7 +468,7 @@ fn stale_rows(
     statuses: &Statuses,
     marks: &Marks,
     judged: &Judged,
-) -> Vec<AlertItem> {
+) -> Vec<TasksAlertItem> {
     let mut items = Vec::new();
     for row in file.rows() {
         for reference in row.references() {
@@ -442,7 +482,7 @@ fn stale_rows(
             if let Some(Ok(status)) = statuses.get(&reference)
                 && status.state.is_done()
             {
-                items.push(AlertItem::Stale {
+                items.push(TasksAlertItem::Stale {
                     row: row.summary().to_string(),
                     reference,
                     state: status.state,
@@ -456,7 +496,7 @@ fn stale_rows(
                 .iter()
                 .any(|(line, named)| *line == row.line() && named == mark)
         {
-            items.push(AlertItem::DeadMark {
+            items.push(TasksAlertItem::DeadMark {
                 row: row.summary().to_string(),
                 mark: mark.to_string(),
             });
@@ -514,23 +554,21 @@ fn log_unreadable(statuses: &Statuses, marks: &Marks) {
 }
 
 /// Renders `items` as one alert, or nothing when there are none.
-fn alert(items: &[AlertItem], gate: bool) -> Option<Block> {
+fn alert(notices: &crate::AnyNotices, items: &[TasksAlertItem], gate: bool) -> Option<Block> {
     if items.is_empty() {
         return None;
     }
     Some(Block::new(
         "tasks_alert",
-        TasksAlertTemplate { items, gate }
-            .render()
-            .expect("tasks alert template must render"),
+        notices.tasks_alert(&crate::notices::TasksAlert { items, gate }),
     ))
 }
 
 /// The format violations of `file`, as alert items.
-fn malformed(file: &TasksFile) -> impl Iterator<Item = AlertItem> + '_ {
+fn malformed(file: &TasksFile) -> impl Iterator<Item = TasksAlertItem> + '_ {
     file.violations()
         .iter()
-        .map(|violation| AlertItem::Malformed {
+        .map(|violation| TasksAlertItem::Malformed {
             line: violation.line,
             violation: violation.violation.clone(),
         })
@@ -603,7 +641,7 @@ impl ContextSource for TasksDocument {
         if file.lines() > self.line_limit {
             if !self.over_limit {
                 self.over_limit = true;
-                items.push(AlertItem::OverLimit {
+                items.push(TasksAlertItem::OverLimit {
                     lines: file.lines(),
                     limit: self.line_limit,
                 });
@@ -611,7 +649,7 @@ impl ContextSource for TasksDocument {
         } else {
             self.over_limit = false;
         }
-        alert(&items, false)
+        alert(&self.notices, &items, false)
     }
 
     async fn on_final_turn(&mut self) -> Option<Block> {
@@ -628,7 +666,7 @@ impl ContextSource for TasksDocument {
         let mut items = judged.items;
         items.extend(malformed(&file));
         items.extend(stale);
-        if let Some(block) = alert(&items, true) {
+        if let Some(block) = alert(&self.notices, &items, true) {
             return Some(block);
         }
         if !has_actionable_rows(&file, &statuses, &marks) {
@@ -637,9 +675,7 @@ impl ContextSource for TasksDocument {
         Some(Block::new(
             "system_reminder",
             SystemReminderTemplate {
-                content: TasksContinueTemplate
-                    .render()
-                    .expect("tasks continue template must render"),
+                content: self.notices.tasks_continue(),
             }
             .render()
             .expect("system reminder template must render"),

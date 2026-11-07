@@ -6,7 +6,6 @@ use aither_sandbox::ScriptLanguage;
 use aither_sandbox::permission::{
     PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode,
 };
-use askama::Template;
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::ExternalHooks;
@@ -54,13 +53,6 @@ pub enum ReviewAnswer {
     Pass {},
 }
 
-#[derive(Template)]
-#[template(path = "reviewer_denial.txt", escape = "none")]
-struct ReviewerDenialTemplate<'a> {
-    reviewer: &'a str,
-    reason: &'a str,
-}
-
 impl ExternalHooks {
     /// Runs the reviewers in order until one approves or denies.
     ///
@@ -88,14 +80,12 @@ impl ExternalHooks {
             match answer {
                 Run::Answered(ReviewAnswer::Approve {}) => return Review::Approved,
                 Run::Answered(ReviewAnswer::Deny { reason }) => {
-                    return Review::Denied(
-                        ReviewerDenialTemplate {
+                    return Review::Denied(self.notices().reviewer_denial(
+                        &crate::ReviewerDenial {
                             reviewer: &reviewer.config.name,
                             reason: &reason,
-                        }
-                        .render()
-                        .expect("reviewer denial template must render"),
-                    );
+                        },
+                    ));
                 }
                 Run::Answered(ReviewAnswer::Pass {}) | Run::Gone => {}
                 Run::Failed(failure) => tracing::warn!(
