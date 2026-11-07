@@ -239,7 +239,13 @@ impl LanguageModel for Codex {
             )
             .with_ability(Ability::ToolUse);
             if let Some(entry) = entry {
-                for ability in entry.abilities() {
+                // The registry's per-message effort is the public Responses
+                // API's; the ChatGPT backend does not document it.
+                for ability in entry
+                    .abilities()
+                    .iter()
+                    .filter(|ability| **ability != Ability::PerMessageEffort)
+                {
                     if !profile.abilities.contains(ability) {
                         profile.abilities.push(*ability);
                     }

@@ -14,6 +14,11 @@ pub const DEFAULT_IDLE_TIMEOUT: core::time::Duration = core::time::Duration::fro
 /// Required API version header value.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// The beta that lets an effort-only `system` message in `messages` change
+/// the effort for the rest of the conversation without restarting the prompt
+/// cache.
+pub const MID_CONVERSATION_OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-config-2026-07-01";
+
 // =============================================================================
 // Model Identifiers
 // =============================================================================

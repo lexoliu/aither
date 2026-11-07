@@ -292,6 +292,13 @@ pub async fn to_chat_messages(
             Role::Assistant => "assistant",
             Role::System => "system",
             Role::Tool => "tool",
+            Role::Configuration => {
+                return Err(OpenAIError::Api(
+                    "Chat Completions has no per-message effort update; the Responses API's \
+                     configuration_update carries it"
+                        .to_string(),
+                ));
+            }
         };
 
         let tool_call_id = message.tool_call_id().map(String::from);
@@ -618,6 +625,20 @@ pub enum ResponsesInputItem {
         call_id: String,
         output: String,
     },
+    /// A reasoning effort change for the rest of the conversation, leaving
+    /// the request-level `reasoning.effort` and the cached prefix as they
+    /// were. It stays in the input of every later request.
+    ConfigurationUpdate {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        reasoning: ConfigurationReasoning,
+    },
+}
+
+/// The reasoning settings a `configuration_update` input item changes.
+#[derive(Debug, Serialize, Clone)]
+pub struct ConfigurationReasoning {
+    effort: &'static str,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -999,6 +1020,17 @@ pub fn to_responses_input(messages: &[Message]) -> Result<Vec<ResponsesInputItem
                     message.content().to_string(),
                 ));
             }
+            Role::Configuration => {
+                let effort = message
+                    .configured_effort()
+                    .expect("a configuration message carries its effort");
+                items.push(ResponsesInputItem::ConfigurationUpdate {
+                    kind: "configuration_update",
+                    reasoning: ConfigurationReasoning {
+                        effort: openai_effort(effort),
+                    },
+                });
+            }
         }
     }
 
@@ -1025,7 +1057,9 @@ fn validate_responses_input(items: &[ResponsesInputItem]) -> Result<(), OpenAIEr
             }
             // Reasoning items carry no call_id to validate; they are replayed
             // verbatim or not at all.
-            ResponsesInputItem::Message { .. } | ResponsesInputItem::Reasoning { .. } => {}
+            ResponsesInputItem::Message { .. }
+            | ResponsesInputItem::Reasoning { .. }
+            | ResponsesInputItem::ConfigurationUpdate { .. } => {}
         }
     }
     Ok(())
@@ -1560,6 +1594,60 @@ mod tests {
         let unset = chat_request_with_tool(&Parameters::default());
         assert_eq!(unset.get("reasoning_effort"), None);
         assert_eq!(unset.get("reasoning"), None);
+    }
+
+    /// An effort change goes as a `configuration_update` item after the
+    /// earlier items, which serialize byte for byte as before, while the
+    /// request-level `reasoning.effort` stays the caller's.
+    #[test]
+    fn an_effort_update_is_a_configuration_update_after_an_unchanged_prefix() {
+        let before = vec![
+            Message::system("You are terse."),
+            Message::user("Plan the migration."),
+            Message::assistant("Here is the plan."),
+        ];
+        let mut after = before.clone();
+        after.push(Message::configuration(ReasoningEffort::Low));
+        after.push(Message::user("Now rename the config file."));
+        let serialized = |messages: &[Message]| -> Vec<String> {
+            to_responses_input(messages)
+                .expect("responses input")
+                .iter()
+                .map(|item| serde_json::to_string(item).expect("item serializes"))
+                .collect()
+        };
+
+        let items_before = serialized(&before);
+        let items_after = serialized(&after);
+        assert_eq!(
+            items_before[..],
+            items_after[..items_before.len()],
+            "earlier items are byte-identical"
+        );
+        assert_eq!(
+            items_after[items_before.len()],
+            r#"{"type":"configuration_update","reasoning":{"effort":"low"}}"#
+        );
+
+        let snapshot =
+            ParameterSnapshot::from(&Parameters::default().reasoning_effort(ReasoningEffort::High));
+        let request = ResponsesRequest::new(
+            "gpt-6-sol".to_string(),
+            to_responses_input(&after).expect("responses input"),
+            &snapshot,
+            None,
+            None,
+            false,
+        );
+        let value = serde_json::to_value(&request).expect("request serializes");
+        assert_eq!(value["reasoning"]["effort"], "high");
+    }
+
+    /// Chat Completions has no form for an effort update.
+    #[tokio::test]
+    async fn chat_completions_rejects_an_effort_update() {
+        let messages = [Message::configuration(ReasoningEffort::Low)];
+        assert!(to_chat_messages(&messages).await.is_err());
     }
 
     /// The Responses API nests effort and summary under `reasoning`.

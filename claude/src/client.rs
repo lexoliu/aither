@@ -17,13 +17,14 @@ use zenwave::{Client, client, header};
 
 use crate::{
     constant::{
-        ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_TOKENS, DEFAULT_MODEL,
+        ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_TOKENS,
+        DEFAULT_MODEL, MID_CONVERSATION_OUTPUT_CONFIG_BETA,
     },
     error::ClaudeError,
     request::{
-        MessagesRequest, ParameterSnapshot, apply_cache_strategy, build_output_config,
-        build_thinking, convert_native_tools, convert_tools, filter_tool_definitions,
-        to_claude_messages, tool_choice_payload,
+        MessagePayload, MessagesRequest, ParameterSnapshot, apply_cache_strategy,
+        build_output_config, build_thinking, convert_native_tools, convert_tools,
+        filter_tool_definitions, to_claude_messages, tool_choice_payload,
     },
     response::{MessagesResponse, StreamState, parse_event, response_events, should_skip_event},
 };
@@ -194,6 +195,10 @@ impl LanguageModel for Claude {
             };
 
             debug!("Claude request: {:?}", request_body);
+            let effort_updates = request_body
+                .messages
+                .iter()
+                .any(MessagePayload::is_effort_update);
 
             let endpoint = cfg.request_url("/v1/messages");
             let mut backend = client();
@@ -212,6 +217,13 @@ impl LanguageModel for Claude {
                     }
                 })
                 .and_then(|b| b.header(header::USER_AGENT.as_str(), "aither-claude/0.1"))
+                .and_then(|b| {
+                    if effort_updates {
+                        b.header("anthropic-beta", MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+                    } else {
+                        Ok(b)
+                    }
+                })
                 .and_then(|b| b.json_body(&request_body))
             {
                 Ok(b) => b,
@@ -334,6 +346,9 @@ impl LanguageModel for Claude {
                 context_length,
             )
             .with_abilities([Ability::ToolUse, Ability::Vision]);
+            if takes_per_message_effort(&cfg) {
+                profile.abilities.push(Ability::PerMessageEffort);
+            }
 
             for ability in &cfg.native_abilities {
                 if !profile.abilities.contains(ability) {
@@ -343,6 +358,16 @@ impl LanguageModel for Claude {
             Ok(profile)
         }
     }
+}
+
+/// Whether this client's model takes a per-message effort change: the
+/// registry lists the model for it, and the client talks to the Claude API
+/// itself, one of the platforms Anthropic documents the beta on (a proxy
+/// behind another base URL is not).
+fn takes_per_message_effort(cfg: &Config) -> bool {
+    cfg.base_url.trim_end_matches('/') == CLAUDE_BASE_URL
+        && aither_models::lookup(&cfg.model)
+            .is_some_and(|entry| entry.has_ability(Ability::PerMessageEffort))
 }
 
 fn native_tool_name_enabled(snapshot: &ParameterSnapshot, name: &str) -> bool {
@@ -524,4 +549,141 @@ impl Config {
 
 fn sanitize_model(model: impl Into<String>) -> String {
     model.into().trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aither_core::llm::{Message, model::Parameters, model::ReasoningEffort};
+
+    /// A loopback server that records the one request it receives, headers
+    /// and body, and answers it with an error.
+    fn capturing_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub server");
+        let addr = listener.local_addr().expect("stub server address");
+        let (sender, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept the request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 8192];
+            let body_start = loop {
+                let read = stream.read(&mut chunk).expect("read the request");
+                request.extend_from_slice(chunk.get(..read).expect("read within the chunk"));
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let head =
+                String::from_utf8_lossy(request.get(..body_start).expect("head")).into_owned();
+            let length = head.lines().find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|length| length.trim().parse::<usize>().expect("a numeric length"))
+            });
+            let complete = |request: &[u8]| {
+                length.map_or_else(
+                    || request.ends_with(b"0\r\n\r\n"),
+                    |length| request.len() >= body_start + length,
+                )
+            };
+            while !complete(&request) {
+                let read = stream.read(&mut chunk).expect("read the body");
+                request.extend_from_slice(chunk.get(..read).expect("read within the chunk"));
+            }
+            let raw = String::from_utf8_lossy(request.get(body_start..).expect("body"));
+            let body = if length.is_some() {
+                raw.into_owned()
+            } else {
+                dechunk(&raw)
+            };
+            sender
+                .send(format!("{head}{body}"))
+                .expect("the test is listening");
+            let _ = stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            );
+        });
+        (format!("http://{addr}"), received)
+    }
+
+    /// The payload of a chunked transfer-encoded body.
+    fn dechunk(mut raw: &str) -> String {
+        let mut body = String::new();
+        loop {
+            let (size, rest) = raw.split_once("\r\n").expect("a chunk size line");
+            let size = usize::from_str_radix(size.trim(), 16).expect("a hex chunk size");
+            if size == 0 {
+                return body;
+            }
+            body.push_str(rest.get(..size).expect("the chunk is complete"));
+            raw = rest
+                .get(size..)
+                .and_then(|rest| rest.strip_prefix("\r\n"))
+                .expect("the chunk ends with CRLF");
+        }
+    }
+
+    /// A request carrying an effort update sends the beta header and the
+    /// effort-only system message, with the request-level effort as given.
+    #[tokio::test]
+    async fn an_effort_update_sends_the_beta_and_the_per_message_form() {
+        let (base_url, received) = capturing_server();
+        let client = Claude::builder("key")
+            .base_url(base_url)
+            .model("claude-opus-5-5")
+            .build();
+        let request = LLMRequest::new(vec![
+            Message::user("Plan the migration."),
+            Message::assistant("Here is the plan."),
+            Message::configuration(ReasoningEffort::Low),
+            Message::user("Now rename the config file."),
+        ])
+        .with_parameters(
+            Parameters::default()
+                .reasoning_effort(ReasoningEffort::High)
+                .stream(false),
+        );
+        let stream = client.respond(request);
+        futures_lite::pin!(stream);
+        let _ = stream.next().await;
+
+        let sent = received.recv().expect("the request arrives");
+        let (head, body) = sent.split_once("\r\n\r\n").expect("head and body");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("anthropic-beta: mid-conversation-output-config-2026-07-01"),
+            "{head}"
+        );
+        let body: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(
+            body["messages"][2],
+            serde_json::json!({"role": "system", "content": [], "output_config": {"effort": "low"}})
+        );
+    }
+
+    #[test]
+    fn per_message_effort_is_the_claude_apis_on_the_listed_models() {
+        let config = |model: &str, base_url: &str| {
+            Claude::builder("key")
+                .model(model)
+                .base_url(base_url)
+                .build()
+                .config()
+        };
+        assert!(takes_per_message_effort(&config(
+            "claude-opus-5-5",
+            CLAUDE_BASE_URL
+        )));
+        assert!(!takes_per_message_effort(&config(
+            "claude-sonnet-5",
+            CLAUDE_BASE_URL
+        )));
+        assert!(!takes_per_message_effort(&config(
+            "claude-opus-5-5",
+            "https://openrouter.ai/api/v1"
+        )));
+    }
 }

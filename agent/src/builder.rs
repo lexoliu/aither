@@ -168,6 +168,7 @@ struct Wiring {
 struct Inherited {
     budget: crate::context::ContextBudget,
     profile: Option<aither_core::llm::model::Profile>,
+    effort: crate::effort::EffortAnchor,
 }
 
 impl<Advanced, Balanced, Fast, H, Compactor> std::fmt::Debug
@@ -745,6 +746,7 @@ where
         wiring.inherited = Some(Inherited {
             budget: fork.budget,
             profile: Some(fork.profile.clone()),
+            effort: fork.effort,
         });
         wiring.background_receiver = Some(terminal.background_receiver());
         wiring.permission_receiver = Some(terminal.permission_receiver());
@@ -1043,6 +1045,11 @@ where
             config,
             context,
             initialized: inherited.is_some(),
+            effort: inherited
+                .as_ref()
+                .map_or_else(crate::effort::EffortAnchor::default, |inherited| {
+                    inherited.effort
+                }),
             profile: inherited.and_then(|inherited| inherited.profile),
             background_receiver,
             permission_receiver,

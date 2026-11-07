@@ -332,6 +332,8 @@ impl SecretGuard {
                         self.redact_value(&mut call.arguments, &mut tally);
                     }
                 }
+                // An effort level carries no text.
+                Message::Configuration { .. } => {}
             }
         }
         tally.log("a model request");

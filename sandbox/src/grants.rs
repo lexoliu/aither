@@ -155,6 +155,25 @@ impl TerminalGrants {
         });
     }
 
+    /// Takes back the readable grant of `path`, with the same "from the next
+    /// launch on" semantics as [`Self::add_readable`]: commands and shells
+    /// already running keep the grants they launched with. A writable grant
+    /// of the same path is a grant of its own and stays. On a subagent's
+    /// view this removes only its own grant, never one its parent holds.
+    pub fn remove_readable(&self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        self.update_own(|set| set.readable.retain(|entry| *entry != path));
+    }
+
+    /// Takes back the writable grant of `path`, with the same "from the next
+    /// launch on" semantics as [`Self::add_readable`]. Nothing of it is left
+    /// readable: read access stays only through a readable grant of the
+    /// path.
+    pub fn remove_writable(&self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        self.update_own(|set| set.writable.retain(|entry| *entry != path));
+    }
+
     /// One consistent view of the grants, taken at launch time.
     ///
     /// For a derived handle this merges the parent's current readable
@@ -182,5 +201,52 @@ impl TerminalGrants {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removing_a_grant_takes_it_back_from_the_next_snapshot() {
+        let grants = TerminalGrants::new();
+        grants.add_readable("/data/readable");
+        grants.add_writable("/data/writable");
+        let launched = grants.snapshot();
+
+        grants.remove_readable("/data/readable");
+        grants.remove_writable("/data/writable");
+
+        let next = grants.snapshot();
+        assert!(next.readable.is_empty(), "{next:?}");
+        assert!(next.writable.is_empty(), "{next:?}");
+        assert_eq!(launched.readable, [PathBuf::from("/data/readable")]);
+        assert_eq!(launched.writable, [PathBuf::from("/data/writable")]);
+    }
+
+    #[test]
+    fn removing_one_kind_of_grant_leaves_the_other() {
+        let grants = TerminalGrants::new();
+        grants.add_writable("/data/shared");
+        grants.remove_readable("/data/shared");
+        assert_eq!(grants.snapshot().writable, [PathBuf::from("/data/shared")]);
+
+        grants.add_readable("/data/other");
+        grants.remove_writable("/data/other");
+        assert_eq!(grants.snapshot().readable, [PathBuf::from("/data/other")]);
+    }
+
+    #[test]
+    fn a_subagent_removes_only_its_own_grants() {
+        let parent = TerminalGrants::new();
+        parent.add_readable("/data/parent");
+        let child = TerminalGrants::derived(&parent, vec!["/data/child".into()], Vec::new());
+
+        child.remove_readable("/data/parent");
+        child.remove_readable("/data/child");
+
+        assert_eq!(child.snapshot().readable, [PathBuf::from("/data/parent")]);
+        assert_eq!(parent.snapshot().readable, [PathBuf::from("/data/parent")]);
     }
 }

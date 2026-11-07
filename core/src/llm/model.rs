@@ -1591,6 +1591,10 @@ pub enum Ability {
     PromptCaching,
     /// The model supports assistant prefill (pre-filling assistant responses).
     AssistantPrefill,
+    /// The model takes a reasoning effort change inside the conversation, as a
+    /// [`Message::Configuration`](crate::llm::Message::Configuration), without
+    /// the request-level effort changing — so the prompt cache stays warm.
+    PerMessageEffort,
 }
 
 #[cfg(test)]

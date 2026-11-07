@@ -50,7 +50,7 @@ use aither_agent::sandbox::{
 use aither_agent::specialized::SubagentTool;
 use aither_agent::{Agent, AgentOptions, Hook, TerminalAgentBuilder};
 use aither_core::LanguageModel;
-use aither_core::llm::{Role, ToolResult};
+use aither_core::llm::ToolResult;
 use aither_mcp::{McpConnection, McpServersConfig};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -700,12 +700,7 @@ where
     } else {
         println!("Conversation history ({} messages):", history.len());
         for msg in &history {
-            let role = match msg.role() {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-                Role::System => "System",
-                Role::Tool => "Tool",
-            };
+            let role = msg.role();
             let content = truncate(msg.content(), 100);
             println!("  [{role}] {content}");
         }
