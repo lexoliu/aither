@@ -9775,6 +9775,7 @@ mod tests {
             task_id: "task-test",
             execution_id: "exec-test",
             script: "make",
+            language: ScriptLanguage::Shell,
             mode: TerminalMode::Sandboxed,
             container_runtime: &runtime,
             prepared_tools: &container_tools,
